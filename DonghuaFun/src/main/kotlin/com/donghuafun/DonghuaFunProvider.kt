@@ -99,3 +99,24 @@ class DonghuaFunProvider : MainAPI() {
         return true
     }
 }
+package com.donghuafun
+
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.Qualities
+import org.jsoup.nodes.Element
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.plugins.Plugin
+import android.content.Context
+
+class DonghuaFunProvider : MainAPI() {
+    // ... all of your provider scraper logic goes here ...
+}
+
+// Adding the Plugin registration class at the bottom of the same file
+@CloudstreamPlugin
+class DonghuaFunPlugin: Plugin() {
+    override fun load(context: Context) {
+        registerMainAPI(DonghuaFunProvider())
+    }
+}
