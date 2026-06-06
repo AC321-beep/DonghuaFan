@@ -1,8 +1,5 @@
-plugins {
-    kotlin("jvm")
-}
-
 cloudstream {
+    // Points directly to your localized plugin initialization class file
     mainClass = "com.donghuafun.DonghuaFunPlugin"
 }
 
