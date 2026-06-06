@@ -4,7 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import org.jsoup.nodes.Element
-import java.net.URI
+import org.jsoup.Jsoup
 
 class DonghuaFunProvider : MainAPI() {
     override var mainUrl = "https://donghuafun.com"
@@ -13,7 +13,6 @@ class DonghuaFunProvider : MainAPI() {
     override var lang = "zh"
     override val hasMainPage = true
 
-    // phisher98 Helper: Centralized CSS parsing item mapper
     private fun Element.toSearchResult(): AnimeSearchResponse? {
         val title = this.selectFirst(".title, h2, .entry-title")?.text()?.trim() ?: return null
         val href = this.selectFirst("a")?.attr("href") ?: return null
@@ -25,13 +24,11 @@ class DonghuaFunProvider : MainAPI() {
         }
     }
 
-    // 1. MAIN PAGE HOMEPAGE SLIDER & GRIDS
     override suspend fun getMainPage(page: Int, request: HomePageRequest): HomePageResponse? {
         val url = if (page > 1) "$mainUrl/page/$page/" else mainUrl
         val html = app.get(url).text
-        val document = org.jsoup.Jsoup.parse(html)
+        val document = Jsoup.parse(html)
 
-        // Maps out the standard layout update blocks
         val elements = document.select(".listupd .bs, .listupd article, .post-item")
         val items = elements.mapNotNull { it.toSearchResult() }
 
@@ -41,27 +38,24 @@ class DonghuaFunProvider : MainAPI() {
         )
     }
 
-    // 2. SEARCH ELEMENT PARSING
     override suspend fun search(query: String): List<SearchResponse> {
         val searchUrl = "$mainUrl/?s=$query"
         val html = app.get(searchUrl).text
-        val document = org.jsoup.Jsoup.parse(html)
+        val document = Jsoup.parse(html)
 
         return document.select(".listupd .bs, .result-item, article").mapNotNull {
             it.toSearchResult()
         }
     }
 
-    // 3. ANIME DETAILS & EPISODE REVERSAL LIST
     override suspend fun load(url: String): LoadResponse? {
         val html = app.get(url).text
-        val document = org.jsoup.Jsoup.parse(html)
+        val document = Jsoup.parse(html)
 
         val title = document.selectFirst("h1.entry-title, .title-name")?.text()?.trim() ?: return null
         val poster = document.selectFirst(".thumb img, .poster img")?.attr("src")
         val description = document.selectFirst(".entry-content, .synopsis")?.text()?.trim()
 
-        // phisher98 Pattern: Maps chronological order indexing for multi-episode modules
         val episodes = document.select(".eplister li, .listeps li").mapIndexed { index, element ->
             val linkElement = element.selectFirst("a")
             val epHref = linkElement?.attr("href") ?: url
@@ -71,7 +65,7 @@ class DonghuaFunProvider : MainAPI() {
                 this.name = epName
                 this.episode = index + 1
             }
-        }.reversed() // Keeps the streaming layout index tracking natural from episode 1 up
+        }.reversed()
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
@@ -80,7 +74,6 @@ class DonghuaFunProvider : MainAPI() {
         }
     }
 
-    // 4. PLAYER IFRAME EXTRACTOR DELEGATION
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -88,15 +81,13 @@ class DonghuaFunProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val html = app.get(data).text
-        val document = org.jsoup.Jsoup.parse(html)
+        val document = Jsoup.parse(html)
 
-        // Evaluates active inner iframe elements containing third party players
         document.select("iframe, .embed-container iframe").forEach { iframe ->
             val sourceUrl = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
             if (sourceUrl.isNotEmpty() && !sourceUrl.contains("about:blank")) {
                 val cleanUrl = fixUrl(sourceUrl)
 
-                // If direct link player asset is found
                 if (cleanUrl.contains(".m3u8") || cleanUrl.contains(".mp4")) {
                     callback.invoke(
                         ExtractorLink(
@@ -109,7 +100,6 @@ class DonghuaFunProvider : MainAPI() {
                         )
                     )
                 } else {
-                    // phisher98 Method: Leverages native multi-host fallback engine lookup
                     loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
                 }
             }
