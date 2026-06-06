@@ -1,4 +1,4 @@
-name: Build
+name: Build and Deploy
 
 on:
   push:
@@ -11,24 +11,19 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+      # Updated from v3 to v4 to fix the Node.js deprecation warning
+      - name: Checkout Repo
+        uses: actions/checkout@v4
 
+      # Updated from v3 to v4 to fix the Node.js deprecation warning
       - name: Set up JDK 17
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
-          java-version: 17
-          distribution: temurin
+          distribution: 'zulu'
+          java-version: '17'
 
-      - name: Make gradlew executable
+      - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Build plugins
-        run: ./gradlew make makePluginsJson
-
-      - name: Push builds
-        uses: JamesIves/github-pages-deploy-action@v4
-        with:
-          branch: builds
-          folder: builds
-          clean: false
+      - name: Build with Gradle
+        run: ./gradlew make
