@@ -5,7 +5,6 @@ on:
     branches:
       - master
 
-# Clears the warning by forcing the runner to utilize Node.js 24
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -22,13 +21,18 @@ jobs:
           distribution: 'zulu'
           java-version: '17'
 
+      # Fix: Downloads a 100% clean wrapper jar to overwrite the broken one
+      - name: Fix and Regenerate Gradle Wrapper
+        run: |
+          mkdir -p gradle/wrapper
+          curl -L -o gradle/wrapper/gradle-wrapper.jar https://github.com/gradle/gradle/raw/v8.4.0/gradle/wrapper/gradle-wrapper.jar
+
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
       - name: Build Plugins
         run: ./gradlew make makePluginsJson
 
-      # Make sure this deployment step matches your template
       - name: Push builds
         uses: JamesIves/github-pages-deploy-action@v4
         with:
