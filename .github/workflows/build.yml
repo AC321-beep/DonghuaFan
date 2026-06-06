@@ -21,7 +21,6 @@ jobs:
           distribution: 'zulu'
           java-version: '17'
 
-      # FIX: Uses the runner's native system Java compiler to build a 100% correct, platform-accurate gradle environment
       - name: Regenerate Native Gradle Wrapper
         run: gradle wrapper --gradle-version 8.4
 
