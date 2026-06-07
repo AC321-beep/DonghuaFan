@@ -13,7 +13,7 @@ class DonghuaFunProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime)
 
-    // ── URL helpers ───────────────────────────────────────────────────────────
+    // ── URL Helpers ───────────────────────────────────────────────────────────
 
     private fun detailUrlToId(url: String): String =
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
@@ -21,7 +21,7 @@ class DonghuaFunProvider : MainAPI() {
     private fun playUrl(showId: String, sid: Int, nid: Int) =
         "$mainUrl/index.php/vod/play/id/$showId/sid/$sid/nid/$nid.html"
 
-    // ── Home page ─────────────────────────────────────────────────────────────
+    // ── Home Page Routing ─────────────────────────────────────────────────────
 
     override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/type/id/20.html"          to "Trending Donghua",
@@ -37,7 +37,7 @@ class DonghuaFunProvider : MainAPI() {
         return newHomePageResponse(request.name, items)
     }
 
-    // ── Search ────────────────────────────────────────────────────────────────
+    // ── Search Logic ──────────────────────────────────────────────────────────
 
     override suspend fun search(query: String): List<SearchResponse> {
         val doc = app.get(
@@ -47,7 +47,7 @@ class DonghuaFunProvider : MainAPI() {
         return doc.parseShowCards()
     }
 
-    // ── Show detail & episode list ────────────────────────────────────────────
+    // ── Detail & Episode List Processing ──────────────────────────────────────
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
@@ -66,8 +66,8 @@ class DonghuaFunProvider : MainAPI() {
         val year = doc.selectFirst("a[href*='/year/']")?.text()?.toIntOrNull()
 
         val episodes = mutableListOf<Episode>()
-
         val serverBlocks = doc.select("div.module-player-list, ul.anthology-list-play")
+
         if (serverBlocks.isEmpty()) {
             doc.select("a[href*='/vod/play/id/$showId/']").forEach { a ->
                 val href = fixUrl(a.attr("href"))
@@ -106,7 +106,7 @@ class DonghuaFunProvider : MainAPI() {
         }
     }
 
-    // ── Video extraction ──────────────────────────────────────────────────────
+    // ── Video Link Extraction Layer ───────────────────────────────────────────
 
     override suspend fun loadLinks(
         data: String,
@@ -117,25 +117,20 @@ class DonghuaFunProvider : MainAPI() {
         val response = app.get(data)
         val html = response.text
 
-        // 1. Parse out the MacPlayer setup object containing video properties
-        val playerJson = Regex("""player_aaaa\s*=\s*(\{[^<]+?\})""")
-            .find(html)?.groupValues?.get(1)
+        // Parse out the primary MacPlayer object configuration
+        val playerJson = Regex("""player_aaaa\s*=\s*(\{[^<]+?\})""").find(html)?.groupValues?.get(1)
 
         if (playerJson != null) {
-            var videoUrl = Regex(""""url"\s*:\s*"([^"]+)"""")
-                .find(playerJson)?.groupValues?.get(1)
-                ?.replace("\\/", "/")
-
-            val videoType = Regex(""""type"\s*:\s*"([^"]+)"""")
-                .find(playerJson)?.groupValues?.get(1) ?: "m3u8"
+            var videoUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/")
+            val videoType = Regex(""""type"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: "m3u8"
 
             if (!videoUrl.isNullOrEmpty()) {
                 if (videoUrl.startsWith("//")) {
                     videoUrl = "https:$videoUrl"
                 }
 
-                // If it's a direct streamable video file asset (.m3u8 or .mp4)
-                if (videoUrl.contains(".m3u8") || videoUrl.contains(".mp4")) {
+                // Route direct streaming asset URLs (.m3u8 or .mp4 formats)
+                if (videoUrl.contains(".m3u8") || videoUrl.contains(".mp4") || videoType.contains("m3u8") || videoType.contains("hls")) {
                     val quality = when {
                         data.contains("/sid/1/") -> "4K"
                         data.contains("/sid/2/") -> "1080P ENG"
@@ -147,54 +142,32 @@ class DonghuaFunProvider : MainAPI() {
                             source = this.name,
                             name = "$name $quality",
                             url = videoUrl,
-                            type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            type = if (videoUrl.contains(".mp4")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
                         ) {
                             this.referer = mainUrl
-                            this.quality = when (quality) {
-                                "4K" -> Qualities.P2160.value
-                                else -> Qualities.P1080.value
-                            }
+                            this.quality = if (quality == "4K") Qualities.P2160.value else Qualities.P1080.value
                         }
                     )
                     return true
                 } else {
-                    // 2. If it's an embed player address (like Dailymotion), route via core Extractors
-                    return loadExtractor(videoUrl, mainUrl, subtitleCallback, callback)
+                    // Route out nested third-party web embeds (e.g. Dailymotion iframe URLs)
+                    if (loadExtractor(videoUrl, mainUrl, subtitleCallback, callback)) return true
                 }
             }
         }
 
-        // Fallback 1: Fall back to raw DOM layout frame interrogation
-        val iframeSrc = response.document
-            .selectFirst("iframe[src], iframe[data-src]")
+        // Secondary Extractor Fallback Strategy
+        val iframeSrc = response.document.selectFirst("iframe[src], iframe[data-src]")
             ?.let { it.attr("src").ifEmpty { it.attr("data-src") } }
 
         if (!iframeSrc.isNullOrEmpty()) {
             return loadExtractor(fixUrl(iframeSrc), mainUrl, subtitleCallback, callback)
         }
 
-        // Fallback 2: General fallback scan matching link paths anywhere on page
-        val directUrl = Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*""")
-            .find(html)?.value
-        if (!directUrl.isNullOrEmpty()) {
-            callback(
-                newExtractorLink(
-                    source = this.name,
-                    name = this.name,
-                    url = directUrl,
-                    type = if (directUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = mainUrl
-                    this.quality = Qualities.Unknown.value
-                }
-            )
-            return true
-        }
-
         return false
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Global Document Helpers ───────────────────────────────────────────────
 
     private fun Document.parseShowCards(): List<SearchResponse> {
         return select("a[href*='/vod/detail/id/']")
