@@ -1,6 +1,7 @@
 package com.donghuafun
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
@@ -14,6 +15,10 @@ class DonghuaFunProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime)
 
+    companion object {
+        private const val TAG = "DonghuaFun"
+    }
+
     // ── URL Helpers ───────────────────────────────────────────────────────────
 
     private fun detailUrlToId(url: String): String =
@@ -25,9 +30,9 @@ class DonghuaFunProvider : MainAPI() {
     // ── Home Page Routing ─────────────────────────────────────────────────────
 
     override val mainPage = mainPageOf(
-        "$mainUrl/index.php/vod/type/id/20.html"          to "Trending Donghua",
-        "$mainUrl/index.php/vod/show/id/20/by/hits.html"  to "Most Popular",
-        "$mainUrl/index.php/vod/show/id/20/by/time.html"  to "Recently Updated",
+        "$mainUrl/index.php/vod/type/id/20.html"         to "Trending Donghua",
+        "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
+        "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -118,61 +123,76 @@ class DonghuaFunProvider : MainAPI() {
         val response = app.get(data)
         val html = response.text
 
-        // 1. Locate the player script payload block
-        val playerJson = Regex("""player_aaaa\s*=\s*(\{[^<]+?\})""").find(html)?.groupValues?.get(1)
+        Log.d(TAG, "loadLinks URL: $data")
+        Log.d(TAG, "HTML snippet: ${html.take(2000)}")
 
-        if (playerJson != null) {
-            val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)
-            val encryptType = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        // 1. Locate player_aaaa JSON payload — use DOT_MATCHES_ALL so it handles
+        //    multiline JS blocks; try multiple key names the site may use.
+        val playerJsonRaw = listOf(
+            Regex("""player_aaaa\s*=\s*(\{.+?\})\s*;""", RegexOption.DOT_MATCHES_ALL),
+            Regex("""player_aaab\s*=\s*(\{.+?\})\s*;""", RegexOption.DOT_MATCHES_ALL),
+            Regex("""player_data\s*=\s*(\{.+?\})\s*;""", RegexOption.DOT_MATCHES_ALL),
+        ).firstNotNullOfOrNull { it.find(html)?.groupValues?.get(1) }
+
+        Log.d(TAG, "playerJson: $playerJsonRaw")
+
+        if (playerJsonRaw != null) {
+            val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""")
+                .find(playerJsonRaw)?.groupValues?.get(1)
+            val encryptType = Regex(""""encrypt"\s*:\s*(\d+)""")
+                .find(playerJsonRaw)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+
+            Log.d(TAG, "rawUrl=$rawUrl  encryptType=$encryptType")
 
             if (!rawUrl.isNullOrEmpty()) {
-                // 2. Decode the Base64 streaming token if encrypt type is flag 3
-                var videoUrl = if (encryptType == 3) {
-                    val decodedBytes = Base64.decode(rawUrl, Base64.DEFAULT)
-                    String(decodedBytes, StandardCharsets.UTF_8).replace("\\/", "/")
-                } else {
-                    rawUrl.replace("\\/", "/")
-                }
+                // 2. Decode based on encrypt flag
+                var videoUrl = decodeVideoUrl(rawUrl, encryptType)
 
-                if (videoUrl.startsWith("//")) {
-                    videoUrl = "https:$videoUrl"
-                }
+                if (videoUrl.startsWith("//")) videoUrl = "https:$videoUrl"
+                Log.d(TAG, "decoded videoUrl=$videoUrl")
 
-                // 3. Delegate directly to KSRPlayer if processing a play.donghuafun iframe
+                // 3. Delegate to KSRPlayer for play.donghuafun.com iframes
                 if (videoUrl.contains("play.donghuafun.com")) {
                     val ksr = KSRPlayer()
                     ksr.getUrl(videoUrl, data, subtitleCallback, callback)
                     return true
                 }
 
-                // 4. Fallback check if it maps straight to an unencrypted stream asset
+                // 4. Direct stream asset
                 if (videoUrl.contains(".m3u8") || videoUrl.contains(".mp4") || videoUrl.contains("playlist")) {
                     val quality = when {
                         data.contains("/sid/1/") -> "4K"
                         data.contains("/sid/2/") -> "1080P"
                         else -> "Auto"
                     }
+                    val linkType = if (videoUrl.contains(".mp4"))
+                        ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
+
                     callback(
                         newExtractorLink(
                             source = this.name,
                             name = "$name $quality",
                             url = videoUrl,
-                            type = if (videoUrl.contains(".mp4")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
+                            type = linkType
                         ) {
                             this.referer = mainUrl
                             this.quality = Qualities.P1080.value
                         }
                     )
                     return true
-                } else {
-                    if (loadExtractor(videoUrl, mainUrl, subtitleCallback, callback)) return true
                 }
+
+                // 5. Try loadExtractor for any other recognised embed
+                if (loadExtractor(videoUrl, mainUrl, subtitleCallback, callback)) return true
             }
         }
 
-        // 5. Macro DOM Fallback: Check for any explicit frame elements
-        val iframeSrc = response.document.selectFirst("iframe[src], iframe[data-src]")
+        // 6. Macro DOM Fallback: check for explicit iframe elements
+        val iframeSrc = response.document
+            .selectFirst("iframe[src], iframe[data-src]")
             ?.let { it.attr("src").ifEmpty { it.attr("data-src") } }
+
+        Log.d(TAG, "iframeSrc fallback: $iframeSrc")
 
         if (!iframeSrc.isNullOrEmpty()) {
             val cleanIframe = fixUrl(iframeSrc)
@@ -184,7 +204,36 @@ class DonghuaFunProvider : MainAPI() {
             return loadExtractor(cleanIframe, mainUrl, subtitleCallback, callback)
         }
 
+        Log.d(TAG, "No link found for: $data")
         return false
+    }
+
+    // ── Decrypt / Decode Helper ───────────────────────────────────────────────
+
+    /**
+     * Handles all known encrypt flag values used by the site:
+     *   0 = plain URL
+     *   1 = URL-encoded (percent-encoded)
+     *   2 = reversed string
+     *   3 = Base64
+     * Unknown types fall back to returning the raw value so we never silently
+     * drop a URL that might work as-is.
+     */
+    private fun decodeVideoUrl(raw: String, encryptType: Int): String {
+        return try {
+            when (encryptType) {
+                1 -> java.net.URLDecoder.decode(raw, "UTF-8")
+                2 -> raw.reversed()
+                3 -> {
+                    val bytes = Base64.decode(raw, Base64.DEFAULT)
+                    String(bytes, StandardCharsets.UTF_8)
+                }
+                else -> raw
+            }.replace("\\/", "/")
+        } catch (e: Exception) {
+            Log.e(TAG, "decodeVideoUrl failed for type=$encryptType: ${e.message}")
+            raw.replace("\\/", "/")
+        }
     }
 
     // ── Global Document Helpers ───────────────────────────────────────────────
