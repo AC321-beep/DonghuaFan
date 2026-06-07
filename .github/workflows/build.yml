@@ -1,35 +1,25 @@
 name: Build and Deploy
-
 on:
   push:
     branches:
       - master
-
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
-
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
           java-version: '17'
-
-      - name: Regenerate Native Gradle Wrapper
-        run: gradle wrapper --gradle-version 8.4
-
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
-
       - name: Build Plugins
         run: ./gradlew make makePluginsJson
-
       - name: Push builds
         uses: JamesIves/github-pages-deploy-action@v4
         with:
