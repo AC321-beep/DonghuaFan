@@ -1,13 +1,11 @@
 package com.donghuafun
 
-import android.content.Context
-import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
-import com.lagradost.cloudstream3.plugins.Plugin
+import com.lagradost.cloudstream3.plugins.PluginsPlugin
 
-@CloudstreamPlugin
-class DonghuaFunPlugin : Plugin() {
-    override fun load(context: Context) {
-        registerMainAPI(DonghuaFunProvider())
-        registerExtractorAPI(KSRPlayer())
-    }
+class DonghuaFunPlugin : PluginsPlugin() {
+    override val name = "DonghuaFun"
+    override val mainUrl = "https://donghuafun.com"
+    override val extractorApis = arrayOf(
+        DonghuaFunExtractor()
+    )
 }
