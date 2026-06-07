@@ -124,40 +124,30 @@ open class KSRPlayer : ExtractorApi() {
             }
 
             if (isPlaylist) {
-                try {
-                    // FIXED: Dropped parameter names entirely to avoid variable reference mismatch across library modifications
-                    M3u8Helper.generateM3u8(
-                        name,
-                        targetStream,
-                        "$BASE_REFERER/",
-                        playerHeaders
-                    ).forEach(callback)
-                } catch (e: Exception) {
-                    // FIXED: Using exact positional signature structure matching your wrapper
-                    callback(
-                        newExtractorLink(
-                            name,
-                            "${name} - ${source.label ?: "HLS"}",
-                            targetStream,
-                            ExtractorLinkType.M3U8
-                        ) {
-                            this.quality = mappedQuality
-                            this.referer = "$BASE_REFERER/"
-                        }
-                    )
-                }
-            } else {
-                // FIXED: Direct positional arguments for newExtractorLink (source, name, url, type)
+                // FIXED: Direct generation of ExtractorLink properties inside an absolute scope.
+                // This bypasses both M3u8Helper and newExtractorLink version conflicts completely.
                 callback(
-                    newExtractorLink(
-                        name,
-                        "${name} - ${source.label ?: "Dynamic"}",
-                        targetStream,
-                        ExtractorLinkType.VIDEO
-                    ) {
-                        this.quality = mappedQuality
-                        this.referer = "$BASE_REFERER/"
-                    }
+                    ExtractorLink(
+                        source = name,
+                        name = "${name} - ${source.label ?: "HLS"}",
+                        url = targetStream,
+                        referer = "$BASE_REFERER/",
+                        quality = mappedQuality,
+                        type = ExtractorLinkType.M3U8,
+                        headers = playerHeaders
+                    )
+                )
+            } else {
+                callback(
+                    ExtractorLink(
+                        source = name,
+                        name = "${name} - ${source.label ?: "Dynamic"}",
+                        url = targetStream,
+                        referer = "$BASE_REFERER/",
+                        quality = mappedQuality,
+                        type = ExtractorLinkType.VIDEO,
+                        headers = playerHeaders
+                    )
                 )
             }
         }
