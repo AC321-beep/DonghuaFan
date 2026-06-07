@@ -16,13 +16,16 @@ jobs:
         with:
           distribution: 'zulu'
           java-version: '17'
-      - name: Fix Gradle Wrapper JAR
-        run: |
-          curl -L -o gradle/wrapper/gradle-wrapper.jar \
-            https://github.com/gradle/gradle/raw/v8.9.0/gradle/wrapper/gradle-wrapper.jar
-          chmod +x gradlew gradle/wrapper/gradle-wrapper.jar
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.9'
+      - name: Generate Gradle Wrapper
+        run: gradle wrapper --gradle-version 8.9 --no-configuration-cache
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
       - name: Build Plugins
-        run: ./gradlew make makePluginsJson
+        run: ./gradlew make makePluginsJson --no-configuration-cache
       - name: Push builds
         uses: JamesIves/github-pages-deploy-action@v4
         with:
