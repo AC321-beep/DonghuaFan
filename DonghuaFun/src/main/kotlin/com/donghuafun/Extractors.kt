@@ -14,7 +14,8 @@ open class KSRPlayer : ExtractorApi() {
 
     companion object {
         private const val TAG = "DonghuaFun-KSR"
-        private const val TIMEOUT_MS = 10000
+        // FIXED: Added 'L' to ensure this is treated as a Long value
+        private const val TIMEOUT_MS = 10000L 
         private const val CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
         private const val CDN_REFERER = "https://play.donghuafun.com/"
         
@@ -43,7 +44,7 @@ open class KSRPlayer : ExtractorApi() {
             app.get(
                 url,
                 referer = referer ?: "https://donghuafun.com/",
-                timeout = TIMEOUT_MS,
+                timeout = TIMEOUT_MS, // Fixed parameter type match
                 headers = mapOf(
                     "User-Agent" to CHROME_UA,
                     "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -143,7 +144,6 @@ open class KSRPlayer : ExtractorApi() {
 
         Log.d(TAG, "Packaging Stream Link Resource: $streamUrl | Playlist: $isPlaylist")
         if (isPlaylist) {
-            // Safe HLS M3U8 generation layer with automated connection verification bypass timeouts
             try {
                 M3u8Helper.generateM3u8(name, streamUrl, cdnReferer).forEach(callback)
             } catch (e: Exception) {
