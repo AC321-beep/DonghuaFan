@@ -10,7 +10,7 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
 
 // =============================================================================
-// 1. DATA MODELS (Mirroring your original working Donghuastream architecture)
+// 1. DATA MODELS (Mirrors your working Donghuastream payload structure)
 // =============================================================================
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class DonghuaFunRoot(
@@ -49,7 +49,7 @@ data class FunTrack(
 )
 
 // =============================================================================
-// 2. EXTRACTOR IMPLEMENTATION
+// 2. EXTRACTOR API IMPLEMENTATION
 // =============================================================================
 open class KSRPlayer : ExtractorApi() {
     override var name = "DonghuaFun"
@@ -71,6 +71,7 @@ open class KSRPlayer : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        // Step 1: Direct JSON Endpoint Fetching
         val jsonResponse = try {
             app.get(
                 url = url,
@@ -82,6 +83,7 @@ open class KSRPlayer : ExtractorApi() {
                 )
             ).parsed<DonghuaFunRoot>()
         } catch (e: Exception) {
+            // Document scraping strategy fallback if data is loaded inline inside scripts
             val html = try {
                 app.get(url, referer = referer ?: "https://donghuafun.com/").text
             } catch (pEx: Exception) {
@@ -101,10 +103,12 @@ open class KSRPlayer : ExtractorApi() {
             }
         } ?: return
 
+        // Step 2: Extract Streaming Objects & Package Player Verifications
         jsonResponse.sources?.forEach { source ->
-            val streamUrl = source.file
-            val isPlaylist = streamUrl.contains(".m3u8") || streamUrl.contains("playlist")
+            val targetStream = source.file
+            val isPlaylist = targetStream.contains(".m3u8") || targetStream.contains("playlist")
             
+            // Critical Anti-blocking Player Configs
             val playerHeaders = mapOf(
                 "User-Agent" to CHROME_UA,
                 "Referer" to "$BASE_REFERER/",
@@ -127,38 +131,40 @@ open class KSRPlayer : ExtractorApi() {
                 try {
                     M3u8Helper.generateM3u8(
                         name = name,
-                        source = streamUrl,
+                        source = targetStream,
                         referer = "$BASE_REFERER/",
                         headers = playerHeaders
                     ).forEach(callback)
                 } catch (e: Exception) {
-                    // FIXED: Replaced standard equals assignation for 'val' inside the initialization block
+                    // Positional constructor initialization bypasses version-dependent argument renames completely
                     callback(
-                        newExtractorLink(
-                            name = "${name} - ${source.label ?: "HLS"}",
+                        ExtractorLink(
                             source = name,
-                            url = streamUrl,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.quality = mappedQuality
-                        }
+                            name = "${name} - ${source.label ?: "HLS"}",
+                            url = targetStream,
+                            referer = "$BASE_REFERER/",
+                            quality = mappedQuality,
+                            isM3u8 = true,
+                            headers = playerHeaders
+                        )
                     )
                 }
             } else {
-                // FIXED: Explicitly provide parameter fields to avoid read-only 'val' reassignments
                 callback(
-                    newExtractorLink(
-                        name = "${name} - ${source.label ?: "Dynamic"}",
+                    ExtractorLink(
                         source = name,
-                        url = streamUrl,
-                        type = ExtractorLinkType.VIDEO
-                    ) {
-                        this.quality = mappedQuality
-                    }
+                        name = "${name} - ${source.label ?: "Dynamic"}",
+                        url = targetStream,
+                        referer = "$BASE_REFERER/",
+                        quality = mappedQuality,
+                        isM3u8 = false,
+                        headers = playerHeaders
+                    )
                 )
             }
         }
 
+        // Step 3: Parse and dispatch Subtitles matching the tracking schema
         jsonResponse.tracks?.forEach { track ->
             subtitleCallback(
                 SubtitleFile(
