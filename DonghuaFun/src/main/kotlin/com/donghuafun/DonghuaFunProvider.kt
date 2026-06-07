@@ -2,6 +2,7 @@ package com.donghuafun
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.ExtractorApi.Companion.loadExtractor
 import org.jsoup.nodes.Document
 
 class DonghuaFunProvider : MainAPI() {
@@ -116,11 +117,12 @@ class DonghuaFunProvider : MainAPI() {
         val response = app.get(data)
         val html = response.text
 
+        // 1. Parse out the MacPlayer setup object containing video properties
         val playerJson = Regex("""player_aaaa\s*=\s*(\{[^<]+?\})""")
             .find(html)?.groupValues?.get(1)
 
         if (playerJson != null) {
-            val videoUrl = Regex(""""url"\s*:\s*"([^"]+)"""")
+            var videoUrl = Regex(""""url"\s*:\s*"([^"]+)"""")
                 .find(playerJson)?.groupValues?.get(1)
                 ?.replace("\\/", "/")
 
@@ -128,7 +130,12 @@ class DonghuaFunProvider : MainAPI() {
                 .find(playerJson)?.groupValues?.get(1) ?: "m3u8"
 
             if (!videoUrl.isNullOrEmpty()) {
-                if (videoUrl.startsWith("http")) {
+                if (videoUrl.startsWith("//")) {
+                    videoUrl = "https:$videoUrl"
+                }
+
+                // If it's a direct streamable video file asset (.m3u8 or .mp4)
+                if (videoUrl.contains(".m3u8") || videoUrl.contains(".mp4")) {
                     val quality = when {
                         data.contains("/sid/1/") -> "4K"
                         data.contains("/sid/2/") -> "1080P ENG"
@@ -140,8 +147,7 @@ class DonghuaFunProvider : MainAPI() {
                             source = this.name,
                             name = "$name $quality",
                             url = videoUrl,
-                            type = if (videoType.contains("m3u8") || videoType.contains("hls"))
-                                ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                         ) {
                             this.referer = mainUrl
                             this.quality = when (quality) {
@@ -152,23 +158,22 @@ class DonghuaFunProvider : MainAPI() {
                     )
                     return true
                 } else {
-                    loadExtractor(videoUrl, mainUrl, subtitleCallback, callback)
-                    return true
+                    // 2. If it's an embed player address (like Dailymotion), route via core Extractors
+                    return loadExtractor(videoUrl, mainUrl, subtitleCallback, callback)
                 }
             }
         }
 
-        // Fallback 1: iframe on the page
+        // Fallback 1: Fall back to raw DOM layout frame interrogation
         val iframeSrc = response.document
             .selectFirst("iframe[src], iframe[data-src]")
             ?.let { it.attr("src").ifEmpty { it.attr("data-src") } }
 
         if (!iframeSrc.isNullOrEmpty()) {
-            loadExtractor(fixUrl(iframeSrc), mainUrl, subtitleCallback, callback)
-            return true
+            return loadExtractor(fixUrl(iframeSrc), mainUrl, subtitleCallback, callback)
         }
 
-        // Fallback 2: raw .m3u8 / .mp4 URL anywhere in the page source
+        // Fallback 2: General fallback scan matching link paths anywhere on page
         val directUrl = Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*""")
             .find(html)?.value
         if (!directUrl.isNullOrEmpty()) {
@@ -177,8 +182,7 @@ class DonghuaFunProvider : MainAPI() {
                     source = this.name,
                     name = this.name,
                     url = directUrl,
-                    type = if (directUrl.contains(".m3u8"))
-                        ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    type = if (directUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                 ) {
                     this.referer = mainUrl
                     this.quality = Qualities.Unknown.value
