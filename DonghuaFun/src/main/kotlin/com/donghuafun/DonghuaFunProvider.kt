@@ -66,10 +66,8 @@ class DonghuaFunProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
 
-        // Try named server blocks first
         val serverBlocks = doc.select("div.module-player-list, ul.anthology-list-play")
         if (serverBlocks.isEmpty()) {
-            // Fallback: grab all play links for this show directly
             doc.select("a[href*='/vod/play/id/$showId/']").forEach { a ->
                 val href = fixUrl(a.attr("href"))
                 val epName = a.text().trim()
@@ -87,7 +85,6 @@ class DonghuaFunProvider : MainAPI() {
             }
         }
 
-        // Last resort: build episode list from EP count in the page header
         if (episodes.isEmpty() && showId.isNotEmpty()) {
             val epCountText = doc.selectFirst(".video-info-main em, .detail-status")?.text() ?: ""
             val epCount = Regex("""EP(\d+)""").find(epCountText)
@@ -119,7 +116,6 @@ class DonghuaFunProvider : MainAPI() {
         val response = app.get(data)
         val html = response.text
 
-        // MxoneCMS injects: var player_aaaa = { "url": "...", "type": "m3u8", ... }
         val playerJson = Regex("""player_aaaa\s*=\s*(\{[^<]+?\})""")
             .find(html)?.groupValues?.get(1)
 
@@ -140,21 +136,22 @@ class DonghuaFunProvider : MainAPI() {
                         else -> "Auto"
                     }
                     callback(
-                        ExtractorLink(
+                        newExtractorLink(
                             source = this.name,
                             name = "$name $quality",
                             url = videoUrl,
-                            referer = mainUrl,
-                            quality = when (quality) {
-                                "4K" -> Qualities.UHD4K.value
+                            type = if (videoType.contains("m3u8") || videoType.contains("hls"))
+                                ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = mainUrl
+                            this.quality = when (quality) {
+                                "4K" -> Qualities.P2160.value
                                 else -> Qualities.P1080.value
-                            },
-                            isM3u8 = videoType.contains("m3u8") || videoType.contains("hls")
-                        )
+                            }
+                        }
                     )
                     return true
                 } else {
-                    // External embed (Bilibili, Youku, Filemoon, etc.)
                     loadExtractor(videoUrl, mainUrl, subtitleCallback, callback)
                     return true
                 }
@@ -176,14 +173,16 @@ class DonghuaFunProvider : MainAPI() {
             .find(html)?.value
         if (!directUrl.isNullOrEmpty()) {
             callback(
-                ExtractorLink(
+                newExtractorLink(
                     source = this.name,
                     name = this.name,
                     url = directUrl,
-                    referer = mainUrl,
-                    quality = Qualities.Unknown.value,
-                    isM3u8 = directUrl.contains(".m3u8")
-                )
+                    type = if (directUrl.contains(".m3u8"))
+                        ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = mainUrl
+                    this.quality = Qualities.Unknown.value
+                }
             )
             return true
         }
