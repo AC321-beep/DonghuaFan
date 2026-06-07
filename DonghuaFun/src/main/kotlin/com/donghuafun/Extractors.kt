@@ -3,12 +3,15 @@ package com.donghuafun
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorApi
+import com.lagradost.cloudstream3.utils.ExtractorApi.Companion.loadExtractor
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+
+// ── KSR Player (play.donghuafun.com) ─────────────────────────────────────────
 
 open class KSRPlayer : ExtractorApi() {
     override var name = "DonghuaFun"
@@ -109,6 +112,34 @@ open class KSRPlayer : ExtractorApi() {
                 }
             }
             return
+        }
+
+        // Technique D: Iframe extraction without using provider fixUrl
+        val iframeSrc = response.document.selectFirst("iframe[src]")?.attr("src")
+        if (!iframeSrc.isNullOrEmpty()) {
+            var cleanIframeUrl = iframeSrc
+            if (cleanIframeUrl.startsWith("//")) {
+                cleanIframeUrl = "https:$cleanIframeUrl"
+            } else if (cleanIframeUrl.startsWith("/")) {
+                cleanIframeUrl = "https://donghuafun.com$cleanIframeUrl"
+            }
+            if (loadExtractor(cleanIframeUrl, referer ?: mainUrl, subtitleCallback, callback)) return
+        }
+
+        val directUrl = Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*""")
+            .find(html)?.value
+        if (!directUrl.isNullOrEmpty()) {
+            val isM3u8 = directUrl.contains(".m3u8")
+            if (isM3u8) {
+                M3u8Helper.generateM3u8(name, directUrl, referer ?: mainUrl).forEach(callback)
+            } else {
+                callback(
+                    newExtractorLink(name, name, directUrl, ExtractorLinkType.VIDEO) {
+                        this.referer = referer ?: mainUrl
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            }
         }
     }
 
