@@ -2,6 +2,9 @@ package com.donghuafun
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.databind.DeserializationFeature
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
@@ -11,44 +14,44 @@ import com.lagradost.cloudstream3.utils.*
 // =============================================================================
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class DonghuaFunRoot(
-    val status: String?,
-    @param:JsonProperty("server_time") val serverTime: String?,
-    val query: FunQuery?,
-    @param:JsonProperty("embed_link") val embedLink: String?,
-    @param:JsonProperty("download_link") val downloadLink: String?,
-    @param:JsonProperty("request_link") val requestLink: String?,
-    val title: String?,
-    val poster: String?,
-    val sources: List<FunSource>?,
-    val tracks: List<FunTrack>?,
+    val status: String? = null,
+    @param:JsonProperty("server_time") val serverTime: String? = null,
+    val query: FunQuery? = null,
+    @param:JsonProperty("embed_link") val embedLink: String? = null,
+    @param:JsonProperty("download_link") val downloadLink: String? = null,
+    @param:JsonProperty("request_link") val requestLink: String? = null,
+    val title: String? = null,
+    val poster: String? = null,
+    val sources: List<FunSource>? = null,
+    val tracks: List<FunTrack>? = null,
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class FunQuery(
-    val source: String?,
-    val id: String?,
-    val alt: String?,
+    val source: String? = null,
+    val id: String? = null,
+    val alt: String? = null,
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class FunSource(
     val file: String,
-    val type: String?,
-    val label: String?,
+    val type: String? = null,
+    val label: String? = null,
     val default: Boolean = false,
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class FunTrack(
     val file: String,
-    val label: String?,
-    val default: Boolean?,
+    val label: String? = null,
+    val default: Boolean? = null,
 )
 
 // =============================================================================
 // 2. EXTRACTOR IMPLEMENTATION
 // =============================================================================
-open class DonghuaFunPlayer : ExtractorApi() {
+open class KSRPlayer : ExtractorApi() { // FIXED: Renamed back to KSRPlayer to fix Plugin registration error
     override var name = "DonghuaFun"
     override var mainUrl = "https://play.donghuafun.com"
     override val requiresReferer = true
@@ -56,6 +59,11 @@ open class DonghuaFunPlayer : ExtractorApi() {
     companion object {
         private const val CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
         private const val BASE_REFERER = "https://play.donghuafun.com"
+
+        // FIXED: Explicit custom mapper implementation to bypass the unresolved 'app.mapper' error
+        val jsonMapper: ObjectMapper = ObjectMapper()
+            .registerKotlinModule()
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
     }
 
     override suspend fun getUrl(
@@ -64,7 +72,7 @@ open class DonghuaFunPlayer : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // 1. Fetch JSON data from endpoint using Cloudstream's standard mapping mechanism
+        // 1. Fetch data from endpoint
         val jsonResponse = try {
             app.get(
                 url = url,
@@ -76,29 +84,31 @@ open class DonghuaFunPlayer : ExtractorApi() {
                 )
             ).parsed<DonghuaFunRoot>()
         } catch (e: Exception) {
-            // Fallback attempt: Try to catch if data is inside an HTML container instead of direct API
-            val html = app.get(url, referer = referer ?: "https://donghuafun.com/").text
+            // Fallback: If JSON is embedded inline inside HTML source text
+            val html = try {
+                app.get(url, referer = referer ?: "https://donghuafun.com/").text
+            } catch (pEx: Exception) {
+                return
+            }
             val jsonRegex = Regex("""(?i)player_data\s*=\s*(\{.*?\}|window\.config\s*=\s*\{.*?\})""")
             val extractedJson = jsonRegex.find(html)?.groupValues?.get(1)
             
             if (extractedJson != null) {
                 try {
-                    // Manual parsing fallback if embedded inline
-                    com.lagradost.cloudstream3.app.mapper.readValue(extractedJson, DonghuaFunRoot::class.java)
+                    jsonMapper.readValue(extractedJson, DonghuaFunRoot::class.java)
                 } catch (innerEx: Exception) {
-                    return
+                    null
                 }
             } else {
-                return
+                null
             }
-        }
+        } ?: return
 
         // 2. Loop through mapped sources and pass them safely to the player engine
         jsonResponse.sources?.forEach { source ->
             val streamUrl = source.file
             val isPlaylist = streamUrl.contains(".m3u8") || streamUrl.contains("playlist")
             
-            // Core Security Headers: Passing these prevents ERROR_CODE_IO_NETWORK_CONNECTION_FAILED
             val playerHeaders = mapOf(
                 "User-Agent" to CHROME_UA,
                 "Referer" to "$BASE_REFERER/",
@@ -109,7 +119,6 @@ open class DonghuaFunPlayer : ExtractorApi() {
                 "Sec-Fetch-Dest" to "empty"
             )
 
-            // Resolve quality label
             val mappedQuality = when (source.label?.lowercase()) {
                 "1080p" -> Qualities.P1080.value
                 "720p" -> Qualities.P720.value
@@ -127,36 +136,38 @@ open class DonghuaFunPlayer : ExtractorApi() {
                         headers = playerHeaders
                     ).forEach(callback)
                 } catch (e: Exception) {
-                    // Fallback to direct raw link if master playlist helper fails
+                    // Fallback to direct raw link via non-deprecated newExtractorLink macro block
                     callback(
-                        ExtractorLink(
-                            source = name,
+                        newExtractorLink(
                             name = "${name} - ${source.label ?: "HLS"}",
-                            url = streamUrl,
-                            referer = "$BASE_REFERER/",
-                            quality = mappedQuality,
-                            isM3u8 = true,
-                            headers = playerHeaders
-                        )
+                            source = name,
+                            url = streamUrl
+                        ) {
+                            this.referer = "$BASE_REFERER/"
+                            this.quality = mappedQuality
+                            this.headers = playerHeaders
+                            this.isM3u8 = true
+                        }
                     )
                 }
             } else {
-                // Fixed compile error signature by directly using ExtractorLink instance properties
+                // FIXED: Uses the mandatory non-deprecated newExtractorLink block with aligned variables
                 callback(
-                    ExtractorLink(
-                        source = name,
+                    newExtractorLink(
                         name = "${name} - ${source.label ?: "Dynamic"}",
-                        url = streamUrl,
-                        referer = "$BASE_REFERER/",
-                        quality = mappedQuality,
-                        isM3u8 = false,
-                        headers = playerHeaders
-                    )
+                        source = name,
+                        url = streamUrl
+                    ) {
+                        this.referer = "$BASE_REFERER/"
+                        this.quality = mappedQuality
+                        this.headers = playerHeaders
+                        this.isM3u8 = false
+                    }
                 )
             }
         }
 
-        // 3. Optional Subtitles processing matching your Track schema 
+        // 3. Subtitles processing mapping
         jsonResponse.tracks?.forEach { track ->
             subtitleCallback(
                 SubtitleFile(
