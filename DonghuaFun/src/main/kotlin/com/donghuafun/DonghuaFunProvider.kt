@@ -1,11 +1,9 @@
 package com.donghuafun
 
-import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
-import java.nio.charset.StandardCharsets
 
 class DonghuaFunProvider : MainAPI() {
     override var mainUrl = "https://donghuafun.com"
@@ -17,17 +15,25 @@ class DonghuaFunProvider : MainAPI() {
 
     companion object {
         private const val TAG = "DonghuaFun"
+
+        // MacCMS v10 JSON API — returns real player_aaaa data that the
+        // play page HTML deliberately omits for SEO bots.
+        // Parameters: mid=1 (module), id=showId, sid=source, nid=episode index
+        private const val PLAYER_API = "/index.php/ajax/suggest"
     }
 
-    // ── URL Helpers ───────────────────────────────────────────────────────────
+    // ── URL Helpers ────────────────────────────────────────────────────────────
 
     private fun detailUrlToId(url: String): String =
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
-    private fun playUrl(showId: String, sid: Int, nid: Int) =
-        "$mainUrl/index.php/vod/play/id/$showId/sid/$sid/nid/$nid.html"
+    private fun sidNidFromPlayUrl(url: String): Pair<Int, Int> {
+        val sid = Regex("""/sid/(\d+)/""").find(url)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+        val nid = Regex("""/nid/(\d+)""").find(url)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+        return sid to nid
+    }
 
-    // ── Home Page Routing ─────────────────────────────────────────────────────
+    // ── Home Page ──────────────────────────────────────────────────────────────
 
     override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/type/id/20.html"         to "Trending Donghua",
@@ -39,11 +45,10 @@ class DonghuaFunProvider : MainAPI() {
         val pageUrl = if (page == 1) request.data
                       else request.data.replace(".html", "/page/$page.html")
         val doc = app.get(pageUrl).document
-        val items = doc.parseShowCards()
-        return newHomePageResponse(request.name, items)
+        return newHomePageResponse(request.name, doc.parseShowCards())
     }
 
-    // ── Search Logic ──────────────────────────────────────────────────────────
+    // ── Search ─────────────────────────────────────────────────────────────────
 
     override suspend fun search(query: String): List<SearchResponse> {
         val doc = app.get(
@@ -53,7 +58,7 @@ class DonghuaFunProvider : MainAPI() {
         return doc.parseShowCards()
     }
 
-    // ── Detail & Episode List Processing ──────────────────────────────────────
+    // ── Detail ─────────────────────────────────────────────────────────────────
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
@@ -76,18 +81,16 @@ class DonghuaFunProvider : MainAPI() {
 
         if (serverBlocks.isEmpty()) {
             doc.select("a[href*='/vod/play/id/$showId/']").forEach { a ->
-                val href = fixUrl(a.attr("href"))
-                val epName = a.text().trim()
-                episodes.add(newEpisode(href) { name = epName })
+                episodes.add(newEpisode(fixUrl(a.attr("href"))) { name = a.text().trim() })
             }
         } else {
             serverBlocks.forEachIndexed { sIdx, block ->
                 val serverName = block.previousElementSibling()?.text()?.trim()
                     ?: "Source ${sIdx + 1}"
                 block.select("a").forEach { a ->
-                    val href = fixUrl(a.attr("href"))
-                    val epName = a.text().trim()
-                    episodes.add(newEpisode(href) { name = "$epName [$serverName]" })
+                    episodes.add(newEpisode(fixUrl(a.attr("href"))) {
+                        name = "${a.text().trim()} [$serverName]"
+                    })
                 }
             }
         }
@@ -97,7 +100,7 @@ class DonghuaFunProvider : MainAPI() {
             val epCount = Regex("""EP(\d+)""").find(epCountText)
                 ?.groupValues?.get(1)?.toIntOrNull() ?: 1
             for (n in 1..epCount) {
-                episodes.add(newEpisode(playUrl(showId, 1, n)) {
+                episodes.add(newEpisode("$mainUrl/index.php/vod/play/id/$showId/sid/1/nid/$n.html") {
                     name = "EP${epCount - n + 1}"
                 })
             }
@@ -112,7 +115,7 @@ class DonghuaFunProvider : MainAPI() {
         }
     }
 
-    // ── Video Link Extraction Layer ───────────────────────────────────────────
+    // ── Link Extraction ────────────────────────────────────────────────────────
 
     override suspend fun loadLinks(
         data: String,
@@ -120,123 +123,146 @@ class DonghuaFunProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val response = app.get(data)
-        val html = response.text
+        val showId = detailUrlToId(data)
+        val (sid, nid) = sidNidFromPlayUrl(data)
 
-        Log.d(TAG, "loadLinks URL: $data")
-        Log.d(TAG, "HTML snippet: ${html.take(2000)}")
+        Log.d(TAG, "loadLinks: showId=$showId sid=$sid nid=$nid  url=$data")
 
-        // 1. Locate player_aaaa JSON payload — use DOT_MATCHES_ALL so it handles
-        //    multiline JS blocks; try multiple key names the site may use.
-        val playerJsonRaw = listOf(
-            Regex("""player_aaaa\s*=\s*(\{.+?\})\s*;""", RegexOption.DOT_MATCHES_ALL),
-            Regex("""player_aaab\s*=\s*(\{.+?\})\s*;""", RegexOption.DOT_MATCHES_ALL),
-            Regex("""player_data\s*=\s*(\{.+?\})\s*;""", RegexOption.DOT_MATCHES_ALL),
-        ).firstNotNullOfOrNull { it.find(html)?.groupValues?.get(1) }
+        // ── Strategy 1: MacCMS JSON API (the real player data source) ─────────
+        // The play page HTML is an SEO shell — player_aaaa is only in the API response.
+        if (showId.isNotEmpty()) {
+            try {
+                val apiUrl = "$mainUrl$PLAYER_API"
+                val apiResponse = app.get(
+                    apiUrl,
+                    params = mapOf(
+                        "mid"  to "1",
+                        "id"   to showId,
+                        "sid"  to sid.toString(),
+                        "nid"  to nid.toString(),
+                        "type" to "1",
+                    ),
+                    headers = mapOf(
+                        "Referer"          to data,
+                        "X-Requested-With" to "XMLHttpRequest",
+                        "Accept"           to "application/json, text/javascript, */*; q=0.01",
+                    ),
+                    referer = data,
+                )
+                val apiJson = apiResponse.text
+                Log.d(TAG, "API response: $apiJson")
 
-        Log.d(TAG, "playerJson: $playerJsonRaw")
+                if (apiJson.isNotEmpty() && apiJson != "false" && !apiJson.startsWith("<")) {
+                    if (handlePlayerJson(apiJson, data, subtitleCallback, callback)) return true
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "API call failed: ${e.message}")
+            }
+        }
+
+        // ── Strategy 2: Parse raw play page HTML as fallback ──────────────────
+        // Some MacCMS setups still inline player_aaaa in the HTML for logged-in users.
+        val html = try { app.get(data).text } catch (e: Exception) { "" }
+        Log.d(TAG, "HTML fallback snippet: ${html.take(1000)}")
+
+        val playerJsonRaw = listOf("player_aaaa", "player_aaab", "player_data")
+            .firstNotNullOfOrNull { varName ->
+                Regex("""$varName\s*=\s*(\{.+?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+                    .find(html)?.groupValues?.get(1)
+            }
 
         if (playerJsonRaw != null) {
-            val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""")
-                .find(playerJsonRaw)?.groupValues?.get(1)
-            val encryptType = Regex(""""encrypt"\s*:\s*(\d+)""")
-                .find(playerJsonRaw)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            Log.d(TAG, "Found inline playerJson: $playerJsonRaw")
+            if (handlePlayerJson(playerJsonRaw, data, subtitleCallback, callback)) return true
+        }
 
-            Log.d(TAG, "rawUrl=$rawUrl  encryptType=$encryptType")
-
-            if (!rawUrl.isNullOrEmpty()) {
-                // 2. Decode based on encrypt flag
-                var videoUrl = decodeVideoUrl(rawUrl, encryptType)
-
-                if (videoUrl.startsWith("//")) videoUrl = "https:$videoUrl"
-                Log.d(TAG, "decoded videoUrl=$videoUrl")
-
-                // 3. Delegate to KSRPlayer for play.donghuafun.com iframes
-                if (videoUrl.contains("play.donghuafun.com")) {
-                    val ksr = KSRPlayer()
-                    ksr.getUrl(videoUrl, data, subtitleCallback, callback)
-                    return true
-                }
-
-                // 4. Direct stream asset
-                if (videoUrl.contains(".m3u8") || videoUrl.contains(".mp4") || videoUrl.contains("playlist")) {
-                    val quality = when {
-                        data.contains("/sid/1/") -> "4K"
-                        data.contains("/sid/2/") -> "1080P"
-                        else -> "Auto"
-                    }
-                    val linkType = if (videoUrl.contains(".mp4"))
-                        ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
-
-                    callback(
-                        newExtractorLink(
-                            source = this.name,
-                            name = "$name $quality",
-                            url = videoUrl,
-                            type = linkType
-                        ) {
-                            this.referer = mainUrl
-                            this.quality = Qualities.P1080.value
-                        }
-                    )
-                    return true
-                }
-
-                // 5. Try loadExtractor for any other recognised embed
-                if (loadExtractor(videoUrl, mainUrl, subtitleCallback, callback)) return true
+        // ── Strategy 3: iframe scan ───────────────────────────────────────────
+        val doc = try { app.get(data).document } catch (e: Exception) { null }
+        doc?.select("iframe[src], iframe[data-src]")?.forEach { iframe ->
+            val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
+            if (src.isNotEmpty()) {
+                Log.d(TAG, "iframe fallback: $src")
+                loadExtractor(fixUrl(src), data, subtitleCallback, callback)
             }
         }
 
-        // 6. Macro DOM Fallback: check for explicit iframe elements
-        val iframeSrc = response.document
-            .selectFirst("iframe[src], iframe[data-src]")
-            ?.let { it.attr("src").ifEmpty { it.attr("data-src") } }
-
-        Log.d(TAG, "iframeSrc fallback: $iframeSrc")
-
-        if (!iframeSrc.isNullOrEmpty()) {
-            val cleanIframe = fixUrl(iframeSrc)
-            if (cleanIframe.contains("play.donghuafun.com")) {
-                val ksr = KSRPlayer()
-                ksr.getUrl(cleanIframe, data, subtitleCallback, callback)
-                return true
-            }
-            return loadExtractor(cleanIframe, mainUrl, subtitleCallback, callback)
-        }
-
-        Log.d(TAG, "No link found for: $data")
         return false
     }
 
-    // ── Decrypt / Decode Helper ───────────────────────────────────────────────
+    // ── Player JSON Handler ────────────────────────────────────────────────────
 
-    /**
-     * Handles all known encrypt flag values used by the site:
-     *   0 = plain URL
-     *   1 = URL-encoded (percent-encoded)
-     *   2 = reversed string
-     *   3 = Base64
-     * Unknown types fall back to returning the raw value so we never silently
-     * drop a URL that might work as-is.
-     */
+    private suspend fun handlePlayerJson(
+        json: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1)
+            ?: return false
+        val encryptType = Regex(""""encrypt"\s*:\s*(\d+)""").find(json)
+            ?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1) ?: ""
+
+        Log.d(TAG, "from=$from  rawUrl=$rawUrl  encrypt=$encryptType")
+
+        val videoUrl = decodeVideoUrl(rawUrl, encryptType)
+            .let { if (it.startsWith("//")) "https:$it" else it }
+
+        Log.d(TAG, "decoded videoUrl=$videoUrl")
+
+        // Dailymotion (sid/1 = 4K source in the working screenshots)
+        if (videoUrl.contains("dailymotion.com") ||
+            from.contains("dm", ignoreCase = true) ||
+            from.contains("dailymotion", ignoreCase = true)) {
+            val dmId = Regex("""dailymotion\.com/(?:video/|embed/video/)([a-zA-Z0-9]+)""")
+                .find(videoUrl)?.groupValues?.get(1)
+            val dmUrl = if (dmId != null) "https://www.dailymotion.com/video/$dmId" else videoUrl
+            Log.d(TAG, "Dailymotion: $dmUrl")
+            loadExtractor(dmUrl, referer, subtitleCallback, callback)
+            return true
+        }
+
+        // OkRu (sid/3 in the working screenshots)
+        if (videoUrl.contains("ok.ru") || from.contains("okru", ignoreCase = true)) {
+            Log.d(TAG, "OkRu: $videoUrl")
+            loadExtractor(videoUrl, referer, subtitleCallback, callback)
+            return true
+        }
+
+        // Direct .m3u8 / .mp4 stream
+        if (videoUrl.contains(".m3u8") || videoUrl.contains(".mp4")) {
+            callback(newExtractorLink(name, name, videoUrl,
+                if (videoUrl.contains(".mp4")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
+            ) {
+                this.referer = referer
+                this.quality = Qualities.P1080.value
+            })
+            return true
+        }
+
+        // Any other embed URL — let CloudStream's built-in extractors handle it
+        if (loadExtractor(videoUrl, referer, subtitleCallback, callback)) return true
+
+        return false
+    }
+
+    // ── Decode Helper ──────────────────────────────────────────────────────────
+
     private fun decodeVideoUrl(raw: String, encryptType: Int): String {
         return try {
             when (encryptType) {
                 1 -> java.net.URLDecoder.decode(raw, "UTF-8")
                 2 -> raw.reversed()
-                3 -> {
-                    val bytes = Base64.decode(raw, Base64.DEFAULT)
-                    String(bytes, StandardCharsets.UTF_8)
-                }
+                3 -> String(android.util.Base64.decode(raw, android.util.Base64.DEFAULT), Charsets.UTF_8)
                 else -> raw
             }.replace("\\/", "/")
         } catch (e: Exception) {
-            Log.e(TAG, "decodeVideoUrl failed for type=$encryptType: ${e.message}")
+            Log.e(TAG, "decode failed type=$encryptType: ${e.message}")
             raw.replace("\\/", "/")
         }
     }
 
-    // ── Global Document Helpers ───────────────────────────────────────────────
+    // ── Document Helper ────────────────────────────────────────────────────────
 
     private fun Document.parseShowCards(): List<SearchResponse> {
         return select("a[href*='/vod/detail/id/']")
@@ -244,19 +270,14 @@ class DonghuaFunProvider : MainAPI() {
             .mapNotNull { a ->
                 val href = fixUrl(a.attr("href"))
                 if (href.isEmpty()) return@mapNotNull null
-
                 val title = a.attr("title").ifEmpty {
                     a.selectFirst("img")?.attr("alt") ?: a.text()
                 }.trim()
                 if (title.isEmpty()) return@mapNotNull null
-
                 val poster = a.selectFirst("img")?.let {
                     it.attr("data-src").ifEmpty { it.attr("src") }
                 }?.let { if (it.startsWith("data:")) null else fixUrl(it) }
-
-                newAnimeSearchResponse(title, href, TvType.Anime) {
-                    this.posterUrl = poster
-                }
+                newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
             }
     }
 }
