@@ -16,8 +16,11 @@ jobs:
         with:
           distribution: 'zulu'
           java-version: '17'
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew gradle/wrapper/gradle-wrapper.jar
+      - name: Fix Gradle Wrapper JAR
+        run: |
+          curl -L -o gradle/wrapper/gradle-wrapper.jar \
+            https://github.com/gradle/gradle/raw/v8.9.0/gradle/wrapper/gradle-wrapper.jar
+          chmod +x gradlew gradle/wrapper/gradle-wrapper.jar
       - name: Build Plugins
         run: ./gradlew make makePluginsJson
       - name: Push builds
