@@ -15,9 +15,12 @@ open class KSRPlayer : ExtractorApi() {
     companion object {
         private const val TAG = "DonghuaFun-KSR"
 
-        private val CHROME_UA =
+        private const val CHROME_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
             "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+
+        // CDN referer accepted by the stream servers
+        private const val CDN_REFERER = "https://play.donghuafun.com/"
 
         /**
          * Ordered list of extraction patterns.
@@ -26,11 +29,12 @@ open class KSRPlayer : ExtractorApi() {
          * Priority 4:   atob()-wrapped Base64 blobs (very common on modern players).
          * Priority 5-6: direct URL literals with m3u8/mp4 extension.
          * Priority 7:   escaped URL literals (slashes replaced with \/).
+         * Priority 8:   playlist keyword fallback.
          *
          * Each pattern captures a single group: the raw value to decode/clean.
          */
         val STREAM_PATTERNS = listOf(
-            // 1. var url = "https://..."  or  let url = "https://..."
+            // 1. var url = "https://..."  or  let/const url = "https://..."
             Regex("""(?:var|let|const)\s+url\s*=\s*["'](https?://[^"']+)["']"""),
             // 2. { url: "https://..." }  or  "url":"https://..."
             Regex("""["']url["']\s*:\s*["'](https?://[^"']+)["']"""),
@@ -40,7 +44,7 @@ open class KSRPlayer : ExtractorApi() {
             Regex("""atob\s*\(\s*["']([A-Za-z0-9+/=]{20,})["']\s*\)"""),
             // 5. Bare https URL ending in .m3u8 or .mp4 (with optional query string)
             Regex("""(https?://[^\s"'<>\\]+\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)"""),
-            // 6. Escaped https URL  https:\/\/...\.m3u8
+            // 6. Escaped https URL  https:\/\/...\.m3u8 or .mp4
             Regex("""(https?:\\/\\/[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*)"""),
             // 7. Playlist keyword fallback
             Regex("""(https?://[^\s"'<>\\]+playlist[^\s"'<>\\]*)"""),
@@ -58,7 +62,7 @@ open class KSRPlayer : ExtractorApi() {
         val freshSessId = UUID.randomUUID().toString()
         val generatedUid = "yfwcjdv${System.currentTimeMillis()}lgdv"
 
-        // ── Step 1: Fetch the player page ────────────────────────────────────
+        // ── Step 1: Fetch the player page ─────────────────────────────────────
         val response = app.get(
             url,
             referer = referer ?: "https://donghuafun.com/",
@@ -75,14 +79,15 @@ open class KSRPlayer : ExtractorApi() {
         val html = response.text
         Log.d(TAG, "Player HTML snippet: ${html.take(3000)}")
 
-        // ── Step 2: Try all patterns against primary page ────────────────────
+        // ── Step 2: Try all patterns against the primary page ─────────────────
         val directResult = extractStreamUrl(html)
         if (directResult != null) {
-            invokeStreamLink(directResult, url, callback)
+            // Use the player page URL as CDN referer so the CDN accepts the request
+            invokeStreamLink(directResult, CDN_REFERER, callback)
             return
         }
 
-        // ── Step 3: Check for a nested iframe and recurse one level ──────────
+        // ── Step 3: Check for a nested iframe and recurse one level ───────────
         val iframeSrc = Regex("""<iframe[\s\S]*?src=["']([^"']+)["']""")
             .find(html)?.groupValues?.get(1)
 
@@ -98,14 +103,17 @@ open class KSRPlayer : ExtractorApi() {
             val subResponse = app.get(
                 nestedUrl,
                 referer = url,
-                headers = mapOf("User-Agent" to CHROME_UA)
+                headers = mapOf(
+                    "User-Agent" to CHROME_UA,
+                    "Accept"     to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                )
             )
             val subHtml = subResponse.text
             Log.d(TAG, "Nested HTML snippet: ${subHtml.take(3000)}")
 
             val nestedResult = extractStreamUrl(subHtml)
             if (nestedResult != null) {
-                invokeStreamLink(nestedResult, nestedUrl, callback)
+                invokeStreamLink(nestedResult, CDN_REFERER, callback)
                 return
             }
         }
@@ -113,12 +121,12 @@ open class KSRPlayer : ExtractorApi() {
         Log.d(TAG, "KSRPlayer: exhausted all strategies, no link found for $url")
     }
 
-    // ── Pattern Extraction Helper ─────────────────────────────────────────────
+    // ── Pattern Extraction Helper ──────────────────────────────────────────────
 
     /**
      * Runs every pattern in [STREAM_PATTERNS] against [html].
-     * For atob() matches (index 3), decodes the Base64 payload.
-     * Returns the first clean, absolute URL found; null if nothing matches.
+     * For atob() matches (index 3), Base64-decodes the captured group.
+     * Returns the first clean absolute URL found; null if nothing matches.
      */
     private fun extractStreamUrl(html: String): String? {
         for ((index, pattern) in STREAM_PATTERNS.withIndex()) {
@@ -150,24 +158,39 @@ open class KSRPlayer : ExtractorApi() {
         return null
     }
 
-    // ── Stream Link Invoker ───────────────────────────────────────────────────
+    // ── Stream Link Invoker ────────────────────────────────────────────────────
 
+    /**
+     * Delivers the resolved stream URL to CloudStream.
+     *
+     * The [cdnReferer] MUST be the player origin (play.donghuafun.com) so the
+     * CDN's hotlink protection accepts the request. Passing the episode page URL
+     * here is what caused ERROR_CODE_IO_BAD_HTTP_STATUS (2004) — the CDN saw a
+     * foreign referer and returned 403.
+     */
     private suspend fun invokeStreamLink(
         streamUrl: String,
-        referer: String,
+        cdnReferer: String,
         callback: (ExtractorLink) -> Unit
     ) {
         val cleanUrl = streamUrl.replace("\\/", "/")
         val isPlaylist = cleanUrl.contains(".m3u8") || cleanUrl.contains("playlist")
 
-        Log.d(TAG, "invokeStreamLink: $cleanUrl  playlist=$isPlaylist")
+        Log.d(TAG, "invokeStreamLink: $cleanUrl  playlist=$isPlaylist  referer=$cdnReferer")
+
+        // Headers sent with every segment/chunk request
+        val streamHeaders = mapOf(
+            "User-Agent" to CHROME_UA,
+            "Referer"    to cdnReferer,
+            "Origin"     to "https://play.donghuafun.com",
+        )
 
         if (isPlaylist) {
             M3u8Helper.generateM3u8(
                 source    = name,
                 streamUrl = cleanUrl,
-                referer   = referer,
-                headers   = mapOf("User-Agent" to CHROME_UA)
+                referer   = cdnReferer,
+                headers   = streamHeaders,
             ).forEach(callback)
         } else {
             callback(
@@ -177,9 +200,9 @@ open class KSRPlayer : ExtractorApi() {
                     url    = cleanUrl,
                     type   = ExtractorLinkType.VIDEO
                 ) {
-                    this.referer = referer
+                    this.referer = cdnReferer
                     this.quality = Qualities.P1080.value
-                    this.headers = mapOf("User-Agent" to CHROME_UA)
+                    this.headers = streamHeaders
                 }
             )
         }
