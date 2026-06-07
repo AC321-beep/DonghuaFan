@@ -125,42 +125,38 @@ open class KSRPlayer : ExtractorApi() {
 
             if (isPlaylist) {
                 try {
+                    // FIXED: Dropped parameter names entirely to avoid variable reference mismatch across library modifications
                     M3u8Helper.generateM3u8(
-                        name = name,
-                        source = targetStream,
-                        referer = "$BASE_REFERER/",
-                        headers = playerHeaders
+                        name,
+                        targetStream,
+                        "$BASE_REFERER/",
+                        playerHeaders
                     ).forEach(callback)
                 } catch (e: Exception) {
-                    // FIXED: Strictly matches the 5-parameter format defined by the compiler log
+                    // FIXED: Using exact positional signature structure matching your wrapper
                     callback(
                         newExtractorLink(
-                            source = name,
-                            name = "${name} - ${source.label ?: "HLS"}",
-                            url = targetStream,
-                            type = ExtractorLinkType.M3U8
+                            name,
+                            "${name} - ${source.label ?: "HLS"}",
+                            targetStream,
+                            ExtractorLinkType.M3U8
                         ) {
                             this.quality = mappedQuality
                             this.referer = "$BASE_REFERER/"
-                            // Uses internal map manipulation if the core reference is marked val
-                            this.headers.clear()
-                            this.headers.putAll(playerHeaders)
                         }
                     )
                 }
             } else {
-                // FIXED: Strictly matches the 5-parameter format defined by the compiler log
+                // FIXED: Direct positional arguments for newExtractorLink (source, name, url, type)
                 callback(
                     newExtractorLink(
-                        source = name,
-                        name = "${name} - ${source.label ?: "Dynamic"}",
-                        url = targetStream,
-                        type = ExtractorLinkType.VIDEO
+                        name,
+                        "${name} - ${source.label ?: "Dynamic"}",
+                        targetStream,
+                        ExtractorLinkType.VIDEO
                     ) {
                         this.quality = mappedQuality
                         this.referer = "$BASE_REFERER/"
-                        this.headers.clear()
-                        this.headers.putAll(playerHeaders)
                     }
                 )
             }
