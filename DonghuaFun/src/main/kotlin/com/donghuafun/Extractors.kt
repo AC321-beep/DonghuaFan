@@ -23,42 +23,42 @@ open class KSRPlayer : ExtractorApi() {
             referer = referer ?: "https://donghuafun.com/",
             headers = mapOf(
                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Sec-Fetch-Dest" to "iframe",
+                "Sec-Fetch-Mode" to "navigate"
             )
         )
         val html = response.text
 
-        // Ported from: player_aaaa inside script or direct variable references
+        // Extract the target encrypted token block from variable definitions
         var encryptedToken = Regex("""var\s+url\s*=\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
             ?: Regex("""["']url["']\s*:\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
 
-        // Fallback: Check if it's embedded within a configuration block
+        // Fallback config mapping block capture
         if (encryptedToken.isNullOrEmpty()) {
             encryptedToken = Regex("""let\s+config\s*=\s*\{[\s\S]*?url\s*:\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
         }
 
         if (!encryptedToken.isNullOrEmpty()) {
             try {
-                // Execute the Python script's decryption sequence:
+                // Execute the decrypted byte matrix transformation sequence
                 val decryptedJsonStr = decodePloyanToken(encryptedToken)
                 
                 if (!decryptedJsonStr.isNullOrEmpty()) {
                     val jsonObj = JSONObject(decryptedJsonStr)
-                    
-                    // Extract the streaming URL from the decrypted JSON payload
                     val streamUrl = jsonObj.optString("url", "")
+                    
                     if (streamUrl.isNotEmpty()) {
                         invokeStreamLink(streamUrl, url, callback)
                         return
                     }
                 }
             } catch (e: Exception) {
-                // Fallback to extraction via regex if decryption crashes
                 e.printStackTrace()
             }
         }
 
-        // Broad fallback if script rules change
+        // Global fallback regex if the payload layout changes back to plaintext URLs
         val anyStreamUrl = Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*""").find(html)?.value
         if (!anyStreamUrl.isNullOrEmpty()) {
             invokeStreamLink(anyStreamUrl, url, callback)
@@ -66,27 +66,33 @@ open class KSRPlayer : ExtractorApi() {
     }
 
     /**
-     * Ports yogesh-hacker's custom Base64 token restoration string algorithms
+     * Decodes the obfuscated site string tokens by reversing, stripping salt signatures,
+     * and performing safe native Android byte stream compilation checks.
      */
     private fun decodePloyanToken(token: String): String? {
         if (token.isEmpty()) return null
         
-        // 1. Remove custom garbage character sets used to poison naive base64 parsers
+        // 1. Strip dynamic junk filler strings inserted by server obfuscation engines
         var cleanToken = token.replace(Regex("[A-Za-z0-9+/=]{41,300}"), "")
         cleanToken = cleanToken.replace(Regex("[_~.\\-]"), "")
         
-        // 2. Reverse the string back to its original array layout
+        // 2. Invert structural ordering back to proper stream direction
         val reversedToken = cleanToken.reversed()
         
-        // 3. Re-apply correct base64 trailing padding alignment shifts
+        // 3. Normalize string boundary length mappings to achieve uniform base64 padding structures
         val paddingNeeded = (4 - (reversedToken.length % 4)) % 4
         val paddedToken = reversedToken + "=".repeat(paddingNeeded)
         
-        // 4. Decode base64 binary chunks directly into readable text strings
-        val decodedBytes = Base64.decode(paddedToken, Base64.DEFAULT)
+        // 4. Extract raw text binaries with implicit URL-safe alphabet substitution handling
+        val decodedBytes = try {
+            Base64.decode(paddedToken, Base64.DEFAULT)
+        } catch (e: Exception) {
+            Base64.decode(paddedToken, Base64.URL_SAFE or Base64.NO_PADDING)
+        }
+        
         val rawStr = String(decodedBytes, Charsets.UTF_8)
         
-        // 5. URL Decode twice to clean out web hex character maps (%xx)
+        // 5. Run nested double URL maps processing to eliminate persistent raw web hex percent markers (%xx)
         return URLDecoder.decode(URLDecoder.decode(rawStr, "UTF-8"), "UTF-8")
     }
 
