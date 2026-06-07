@@ -1,68 +1,17 @@
 package com.donghuafun
 
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties
-import com.fasterxml.jackson.annotation.JsonProperty
-import com.fasterxml.jackson.databind.DeserializationFeature
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 
-// =============================================================================
-// 1. DATA MODELS
-// =============================================================================
-@JsonIgnoreProperties(ignoreUnknown = true)
-data class DonghuaFunRoot(
-    val status: String? = null,
-    @param:JsonProperty("server_time") val serverTime: String? = null,
-    val query: FunQuery? = null,
-    @param:JsonProperty("embed_link") val embedLink: String? = null,
-    @param:JsonProperty("download_link") val downloadLink: String? = null,
-    @param:JsonProperty("request_link") val requestLink: String? = null,
-    val title: String? = null,
-    val poster: String? = null,
-    val sources: List<FunSource>? = null,
-    val tracks: List<FunTrack>? = null,
-)
-
-@JsonIgnoreProperties(ignoreUnknown = true)
-data class FunQuery(
-    val source: String? = null,
-    val id: String? = null,
-    val alt: String? = null,
-)
-
-@JsonIgnoreProperties(ignoreUnknown = true)
-data class FunSource(
-    val file: String,
-    val type: String? = null,
-    val label: String? = null,
-    val default: Boolean = false,
-)
-
-@JsonIgnoreProperties(ignoreUnknown = true)
-data class FunTrack(
-    val file: String,
-    val label: String? = null,
-    val default: Boolean? = null,
-)
-
-// =============================================================================
-// 2. EXTRACTOR API IMPLEMENTATION
-// =============================================================================
-open class KSRPlayer : ExtractorApi() {
+open class DonghuaFunExtractor : ExtractorApi() {
     override var name = "DonghuaFun"
-    override var mainUrl = "https://play.donghuafun.com"
+    override var mainUrl = "https://donghuafun.com"
     override val requiresReferer = true
 
     companion object {
-        private const val CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
-        private const val BASE_REFERER = "https://play.donghuafun.com"
-
-        val jsonMapper: ObjectMapper = ObjectMapper()
-            .registerKotlinModule()
-            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+        private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
     }
 
     override suspend fun getUrl(
@@ -71,94 +20,121 @@ open class KSRPlayer : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val jsonResponse = try {
-            app.get(
-                url = url,
-                referer = referer ?: "https://donghuafun.com/",
-                headers = mapOf(
-                    "User-Agent" to CHROME_UA,
-                    "Accept" to "application/json, text/javascript, */*; q=0.01",
-                    "X-Requested-With" to "XMLHttpRequest"
-                )
-            ).parsed<DonghuaFunRoot>()
+        val headers = mapOf(
+            "User-Agent" to USER_AGENT,
+            "Referer" to "https://donghuafun.com/"
+        )
+
+        // Step 1: Get HTML page
+        val html = try {
+            app.get(url, headers = headers).text
         } catch (e: Exception) {
-            val html = try {
-                app.get(url, referer = referer ?: "https://donghuafun.com/").text
-            } catch (pEx: Exception) {
-                return
-            }
-            val jsonRegex = Regex("""(?i)player_data\s*=\s*(\{.*?\}|window\.config\s*=\s*\{.*?\})""")
-            val extractedJson = jsonRegex.find(html)?.groupValues?.get(1)
+            println("Failed to get HTML: ${e.message}")
+            return
+        }
+
+        // Step 2: Extract player_aaaa JSON from script
+        val playerRegex = Regex("""var player_aaaas*=s*({[^}]+})""")
+        val playerJson = playerRegex.find(html)?.groupValues?.get(1) ?: return
+
+        println("Player JSON: $playerJson")
+
+        // Step 3: Parse video info using regex (simpler than JSON parser)
+        val videoIdRegex = Regex(""""url":"([^"]+)""")
+        val fromRegex = Regex(""""from":"([^"]+)""")
+        val serverRegex = Regex(""""server":"([^"]+)""")
+
+        val videoId = videoIdRegex.find(playerJson)?.groupValues?.get(1) ?: return
+        val from = fromRegex.find(playerJson)?.groupValues?.get(1) ?: "unknown"
+        val server = serverRegex.find(playerJson)?.groupValues?.get(1) ?: "no"
+
+        println("Video ID: $videoId")
+        println("From: $from")
+        println("Server: $server")
+
+        // Step 4: Handle Dailymotion (most common)
+        if (from.lowercase() == "dailymotion") {
+            val dailymotionUrl = "https://www.dailymotion.com/embed/video/$videoId"
             
-            if (extractedJson != null) {
-                try {
-                    jsonMapper.readValue(extractedJson, DonghuaFunRoot::class.java)
-                } catch (innerEx: Exception) {
-                    null
-                }
-            } else {
-                null
-            }
-        } ?: return
-
-        jsonResponse.sources?.forEach { source ->
-            val targetStream = source.file
-            val isPlaylist = targetStream.contains(".m3u8") || targetStream.contains("playlist")
+            // Get Dailymotion player page to extract m3u8
+            val playerHtml = app.get(dailymotionUrl, headers = headers).text
             
-            val playerHeaders = mapOf(
-                "User-Agent" to CHROME_UA,
-                "Referer" to "$BASE_REFERER/",
-                "Origin" to BASE_REFERER,
-                "Accept" to "*/*",
-                "Sec-Fetch-Mode" to "cors",
-                "Sec-Fetch-Site" to "cross-site",
-                "Sec-Fetch-Dest" to "empty"
-            )
+            // Extract m3u8 URL from Dailymotion player
+            val m3u8Regex = Regex("""(https?://[^s"']+dailymotion[^"s]*.m3u8[^s"']*)""")
+            val m3u8Urls = m3u8Regex.findAll(playerHtml).map { it.value }.toList()
 
-            val mappedQuality = when (source.label?.lowercase()) {
-                "1080p" -> Qualities.P1080.value
-                "720p" -> Qualities.P720.value
-                "480p" -> Qualities.P480.value
-                "360p" -> Qualities.P360.value
-                else -> Qualities.P1080.value
-            }
+            println("Found ${m3u8Urls.size} Dailymotion m3u8 URLs: $m3u8Urls")
 
-            if (isPlaylist) {
-                // FIXED: Direct generation of ExtractorLink properties inside an absolute scope.
-                // This bypasses both M3u8Helper and newExtractorLink version conflicts completely.
+            m3u8Urls.forEach { streamUrl ->
                 callback(
                     ExtractorLink(
                         source = name,
-                        name = "${name} - ${source.label ?: "HLS"}",
-                        url = targetStream,
-                        referer = "$BASE_REFERER/",
-                        quality = mappedQuality,
+                        name = "${name} - Dailymotion 1080p",
+                        url = streamUrl,
+                        referer = "https://www.dailymotion.com/",
+                        quality = Qualities.P1080.value,
                         type = ExtractorLinkType.M3U8,
-                        headers = playerHeaders
+                        headers = mapOf(
+                            "User-Agent" to USER_AGENT,
+                            "Referer" to "https://www.dailymotion.com/"
+                        )
                     )
                 )
-            } else {
+            }
+
+            // Fallback: Use direct Dailymotion embed URL
+            if (m3u8Urls.isEmpty()) {
                 callback(
                     ExtractorLink(
                         source = name,
-                        name = "${name} - ${source.label ?: "Dynamic"}",
-                        url = targetStream,
-                        referer = "$BASE_REFERER/",
-                        quality = mappedQuality,
+                        name = "${name} - Dailymotion",
+                        url = dailymotionUrl,
+                        referer = "https://donghuafun.com/",
+                        quality = Qualities.P720.value,
                         type = ExtractorLinkType.VIDEO,
-                        headers = playerHeaders
+                        headers = headers
                     )
                 )
             }
         }
 
-        jsonResponse.tracks?.forEach { track ->
-            subtitleCallback(
-                SubtitleFile(
-                    lang = track.label ?: "English",
-                    url = track.file
+        // Step 5: Handle other common video hosts
+        else if (from.lowercase() in listOf("vod", "mp4", "local")) {
+            // Direct video URL on same server
+            callback(
+                ExtractorLink(
+                    source = name,
+                    name = "${name} - ${from.uppercase()}",
+                    url = "https://donghuafun.com$videoId",
+                    referer = "https://donghuafun.com/",
+                    quality = Qualities.P720.value,
+                    type = ExtractorLinkType.VIDEO,
+                    headers = headers
                 )
             )
+        }
+
+        // Step 6: Fallback - scan entire HTML for m3u8 URLs
+        if (!html.contains("ExtractorLink")) {
+            val allM3u8Regex = Regex("""(https?://[^s"']+.m3u8[^s"']*)""")
+            val allM3u8Urls = allM3u8Regex.findAll(html).map { it.value }.toList()
+
+            println("Fallback: Found ${allM3u8Urls.size} m3u8 URLs in HTML")
+
+            allM3u8Urls.forEach { streamUrl ->
+                callback(
+                    ExtractorLink(
+                        source = name,
+                        name = "${name} - HLS",
+                        url = streamUrl,
+                        referer = "https://donghuafun.com/",
+                        quality = Qualities.P720.value,
+                        type = ExtractorLinkType.M3U8,
+                        headers = headers
+                    )
+                )
+                println("Added: $streamUrl")
+            }
         }
     }
 }
