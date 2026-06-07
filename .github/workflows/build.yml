@@ -40,17 +40,11 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v5
 
-      - name: Fix Gradle Wrapper JAR
-        run: |
-          cd $GITHUB_WORKSPACE/src
-          wget -q https://raw.githubusercontent.com/phisher98/cloudstream-extensions-phisher/master/gradle/wrapper/gradle-wrapper.jar \
-            -O gradle/wrapper/gradle-wrapper.jar
-          chmod +x gradlew
-          file gradle/wrapper/gradle-wrapper.jar
-
       - name: Build Plugins
         run: |
           cd $GITHUB_WORKSPACE/src
+          chmod +x gradlew
+          chmod +x gradle/wrapper/gradle-wrapper.jar
           ./gradlew make makePluginsJson
           cp **/build/*.cs3 $GITHUB_WORKSPACE/builds || true
           cp **/build/*.jar $GITHUB_WORKSPACE/builds || true
