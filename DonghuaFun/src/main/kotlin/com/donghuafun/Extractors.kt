@@ -6,8 +6,7 @@ import com.lagradost.cloudstream3.utils.*
 
 open class KSRPlayer : ExtractorApi() {
     override var name = "DonghuaFun"
-    // Set this to the exact streaming player domain
-    override var mainUrl = "https://play.donghuafun.com" 
+    override var mainUrl = "https://play.donghuafun.com"
     override val requiresReferer = true
 
     override suspend fun getUrl(
@@ -16,66 +15,75 @@ open class KSRPlayer : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Headers required to bypass basic cross-origin verification checks
+        // Send requests with proper headers pretending to be the player interface
         val response = app.get(
             url,
             referer = referer ?: "https://donghuafun.com/",
             headers = mapOf(
                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-                "Accept" to "*/*",
-                "X-Requested-With" to "XMLHttpRequest"
+                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
             )
         )
         val html = response.text
 
-        // Method 1: Extraction via raw player_aaaa mapping variable configuration
-        val playerJson = Regex("""player_aaaa\s*=\s*(\{[^<]+?\})""").find(html)?.groupValues?.get(1)
-        if (playerJson != null) {
-            var videoUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/")
-            val videoType = Regex(""""type"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: "m3u8"
+        // 1. Direct variable capture technique (Extracting raw 'url' variables from player scope)
+        val explicitUrl = Regex("""var\s+url\s*=\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+            ?: Regex("""["']url["']\s*:\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
 
-            if (!videoUrl.isNullOrEmpty()) {
-                if (videoUrl.startsWith("//")) videoUrl = "https:$videoUrl"
+        if (!explicitUrl.isNullOrEmpty()) {
+            var streamUrl = explicitUrl.replace("\\/", "/")
+            if (streamUrl.startsWith("//")) streamUrl = "https:$streamUrl"
 
-                if (videoUrl.contains(".m3u8") || videoUrl.contains(".mp4") || videoType.contains("m3u8") || videoType.contains("hls")) {
-                    if (videoUrl.contains(".mp4")) {
-                        callback(
-                            newExtractorLink(name, name, videoUrl, ExtractorLinkType.VIDEO) {
-                                this.referer = referer ?: mainUrl
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                    } else {
-                        M3u8Helper.generateM3u8(name, videoUrl, referer ?: mainUrl).forEach(callback)
+            if (streamUrl.contains(".m3u8") || streamUrl.contains(".mp4")) {
+                invokeStreamLink(streamUrl, url, callback)
+                return
+            }
+        }
+
+        // 2. Packed Script processing (Evaluating compressed script blocks)
+        val packedScript = response.document.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data()
+        if (packedScript != null) {
+            val unpacked = JsUnpacker(packedScript).unpack()
+            if (!unpacked.isNullOrEmpty()) {
+                var fileUrl = Regex("""file\s*:\s*["']([^"']+)["']""").find(unpacked)?.groupValues?.get(1)
+                    ?: Regex("""url\s*:\s*["']([^"']+)["']""").find(unpacked)?.groupValues?.get(1)
+                    ?: Regex("""src\s*:\s*["']([^"']+)["']""").find(unpacked)?.groupValues?.get(1)
+
+                if (!fileUrl.isNullOrEmpty()) {
+                    fileUrl = fileUrl.replace("\\/", "/")
+                    if (fileUrl.startsWith("//")) fileUrl = "https:$fileUrl"
+
+                    if (fileUrl.contains(".m3u8") || fileUrl.contains(".mp4")) {
+                        invokeStreamLink(fileUrl, url, callback)
+                        return
                     }
-                    return
-                } else {
-                    if (loadExtractor(videoUrl, referer ?: mainUrl, subtitleCallback, callback)) return
                 }
             }
         }
 
-        // Method 2: Fallback configuration check for nested iframes inside the player page
-        val nestedIframe = response.document.selectFirst("iframe[src]")?.attr("src")
-        if (!nestedIframe.isNullOrEmpty()) {
-            var cleanUrl = nestedIframe
-            if (cleanUrl.startsWith("//")) cleanUrl = "https:$cleanUrl"
-            if (loadExtractor(cleanUrl, url, subtitleCallback, callback)) return
+        // 3. Bruteforce regex sweep fallback
+        val anyStreamUrl = Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*""").find(html)?.value
+        if (!anyStreamUrl.isNullOrEmpty()) {
+            invokeStreamLink(anyStreamUrl, url, callback)
         }
+    }
 
-        // Method 3: Universal fallback regex scan for any direct playlist references
-        val directUrl = Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*""").find(html)?.value
-        if (!directUrl.isNullOrEmpty()) {
-            if (directUrl.contains(".m3u8")) {
-                M3u8Helper.generateM3u8(name, directUrl, referer ?: mainUrl).forEach(callback)
-            } else {
-                callback(
-                    newExtractorLink(name, name, directUrl, ExtractorLinkType.VIDEO) {
-                        this.referer = referer ?: mainUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-            }
+    private fun invokeStreamLink(streamUrl: String, referer: String, callback: (ExtractorLink) -> Unit) {
+        val isM3u8 = streamUrl.contains(".m3u8") || streamUrl.contains("playlist")
+        if (isM3u8) {
+            M3u8Helper.generateM3u8(name, streamUrl, referer).forEach(callback)
+        } else {
+            callback(
+                newExtractorLink(
+                    source = name,
+                    name = name,
+                    url = streamUrl,
+                    type = ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = referer
+                    this.quality = Qualities.P1080.value
+                }
+            )
         }
     }
 }
