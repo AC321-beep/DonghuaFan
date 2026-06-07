@@ -1,8 +1,10 @@
 package com.donghuafun
 
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
+import java.nio.charset.StandardCharsets
 
 class DonghuaFunProvider : MainAPI() {
     override var mainUrl = "https://donghuafun.com"
@@ -116,31 +118,38 @@ class DonghuaFunProvider : MainAPI() {
         val response = app.get(data)
         val html = response.text
 
-        // Parse out the primary MacPlayer object configuration
+        // 1. Locate the player script payload block
         val playerJson = Regex("""player_aaaa\s*=\s*(\{[^<]+?\})""").find(html)?.groupValues?.get(1)
 
         if (playerJson != null) {
-            var videoUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/")
-            val videoType = Regex(""""type"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: "m3u8"
+            val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)
+            val encryptType = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
-            if (!videoUrl.isNullOrEmpty()) {
+            if (!rawUrl.isNullOrEmpty()) {
+                // 2. Decode the Base64 streaming token if encrypt type is flag 3
+                var videoUrl = if (encryptType == 3) {
+                    val decodedBytes = Base64.decode(rawUrl, Base64.DEFAULT)
+                    String(decodedBytes, StandardCharsets.UTF_8).replace("\\/", "/")
+                } else {
+                    rawUrl.replace("\\/", "/")
+                }
+
                 if (videoUrl.startsWith("//")) {
                     videoUrl = "https:$videoUrl"
                 }
 
-                // Force extraction if it's our internal play.donghuafun.com domain
+                // 3. Delegate directly to KSRPlayer if processing a play.donghuafun iframe
                 if (videoUrl.contains("play.donghuafun.com")) {
                     val ksr = KSRPlayer()
                     ksr.getUrl(videoUrl, data, subtitleCallback, callback)
                     return true
                 }
 
-                // Route direct streaming asset URLs (.m3u8 or .mp4 formats)
-                if (videoUrl.contains(".m3u8") || videoUrl.contains(".mp4") || videoType.contains("m3u8") || videoType.contains("hls")) {
+                // 4. Fallback check if it maps straight to an unencrypted stream asset
+                if (videoUrl.contains(".m3u8") || videoUrl.contains(".mp4") || videoUrl.contains("playlist")) {
                     val quality = when {
                         data.contains("/sid/1/") -> "4K"
-                        data.contains("/sid/2/") -> "1080P ENG"
-                        data.contains("/sid/3/") -> "1080P Indo"
+                        data.contains("/sid/2/") -> "1080P"
                         else -> "Auto"
                     }
                     callback(
@@ -151,7 +160,7 @@ class DonghuaFunProvider : MainAPI() {
                             type = if (videoUrl.contains(".mp4")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
                         ) {
                             this.referer = mainUrl
-                            this.quality = if (quality == "4K") Qualities.P2160.value else Qualities.P1080.value
+                            this.quality = Qualities.P1080.value
                         }
                     )
                     return true
@@ -161,7 +170,7 @@ class DonghuaFunProvider : MainAPI() {
             }
         }
 
-        // Secondary Extractor Fallback Strategy
+        // 5. Macro DOM Fallback: Check for any explicit frame elements
         val iframeSrc = response.document.selectFirst("iframe[src], iframe[data-src]")
             ?.let { it.attr("src").ifEmpty { it.attr("data-src") } }
 
