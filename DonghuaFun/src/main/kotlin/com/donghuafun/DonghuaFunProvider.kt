@@ -128,6 +128,13 @@ class DonghuaFunProvider : MainAPI() {
                     videoUrl = "https:$videoUrl"
                 }
 
+                // Force extraction if it's our internal play.donghuafun.com domain
+                if (videoUrl.contains("play.donghuafun.com")) {
+                    val ksr = KSRPlayer()
+                    ksr.getUrl(videoUrl, data, subtitleCallback, callback)
+                    return true
+                }
+
                 // Route direct streaming asset URLs (.m3u8 or .mp4 formats)
                 if (videoUrl.contains(".m3u8") || videoUrl.contains(".mp4") || videoType.contains("m3u8") || videoType.contains("hls")) {
                     val quality = when {
@@ -149,7 +156,6 @@ class DonghuaFunProvider : MainAPI() {
                     )
                     return true
                 } else {
-                    // Route out nested third-party web embeds (e.g. Dailymotion iframe URLs)
                     if (loadExtractor(videoUrl, mainUrl, subtitleCallback, callback)) return true
                 }
             }
@@ -160,7 +166,13 @@ class DonghuaFunProvider : MainAPI() {
             ?.let { it.attr("src").ifEmpty { it.attr("data-src") } }
 
         if (!iframeSrc.isNullOrEmpty()) {
-            return loadExtractor(fixUrl(iframeSrc), mainUrl, subtitleCallback, callback)
+            val cleanIframe = fixUrl(iframeSrc)
+            if (cleanIframe.contains("play.donghuafun.com")) {
+                val ksr = KSRPlayer()
+                ksr.getUrl(cleanIframe, data, subtitleCallback, callback)
+                return true
+            }
+            return loadExtractor(cleanIframe, mainUrl, subtitleCallback, callback)
         }
 
         return false
