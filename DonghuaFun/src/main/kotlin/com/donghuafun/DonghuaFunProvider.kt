@@ -1,8 +1,9 @@
 package com.donghuafun
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorApi.Companion.loadExtractor
+import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 
 class DonghuaFunProvider : MainAPI() {
