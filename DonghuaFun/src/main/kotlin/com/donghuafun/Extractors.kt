@@ -51,7 +51,7 @@ data class FunTrack(
 // =============================================================================
 // 2. EXTRACTOR IMPLEMENTATION
 // =============================================================================
-open class KSRPlayer : ExtractorApi() { // FIXED: Renamed back to KSRPlayer to fix Plugin registration error
+open class KSRPlayer : ExtractorApi() {
     override var name = "DonghuaFun"
     override var mainUrl = "https://play.donghuafun.com"
     override val requiresReferer = true
@@ -60,7 +60,6 @@ open class KSRPlayer : ExtractorApi() { // FIXED: Renamed back to KSRPlayer to f
         private const val CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
         private const val BASE_REFERER = "https://play.donghuafun.com"
 
-        // FIXED: Explicit custom mapper implementation to bypass the unresolved 'app.mapper' error
         val jsonMapper: ObjectMapper = ObjectMapper()
             .registerKotlinModule()
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
@@ -72,7 +71,6 @@ open class KSRPlayer : ExtractorApi() { // FIXED: Renamed back to KSRPlayer to f
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // 1. Fetch data from endpoint
         val jsonResponse = try {
             app.get(
                 url = url,
@@ -84,7 +82,6 @@ open class KSRPlayer : ExtractorApi() { // FIXED: Renamed back to KSRPlayer to f
                 )
             ).parsed<DonghuaFunRoot>()
         } catch (e: Exception) {
-            // Fallback: If JSON is embedded inline inside HTML source text
             val html = try {
                 app.get(url, referer = referer ?: "https://donghuafun.com/").text
             } catch (pEx: Exception) {
@@ -104,7 +101,6 @@ open class KSRPlayer : ExtractorApi() { // FIXED: Renamed back to KSRPlayer to f
             }
         } ?: return
 
-        // 2. Loop through mapped sources and pass them safely to the player engine
         jsonResponse.sources?.forEach { source ->
             val streamUrl = source.file
             val isPlaylist = streamUrl.contains(".m3u8") || streamUrl.contains("playlist")
@@ -136,38 +132,33 @@ open class KSRPlayer : ExtractorApi() { // FIXED: Renamed back to KSRPlayer to f
                         headers = playerHeaders
                     ).forEach(callback)
                 } catch (e: Exception) {
-                    // Fallback to direct raw link via non-deprecated newExtractorLink macro block
+                    // FIXED: Replaced standard equals assignation for 'val' inside the initialization block
                     callback(
                         newExtractorLink(
                             name = "${name} - ${source.label ?: "HLS"}",
                             source = name,
-                            url = streamUrl
+                            url = streamUrl,
+                            type = ExtractorLinkType.M3U8
                         ) {
-                            this.referer = "$BASE_REFERER/"
                             this.quality = mappedQuality
-                            this.headers = playerHeaders
-                            this.isM3u8 = true
                         }
                     )
                 }
             } else {
-                // FIXED: Uses the mandatory non-deprecated newExtractorLink block with aligned variables
+                // FIXED: Explicitly provide parameter fields to avoid read-only 'val' reassignments
                 callback(
                     newExtractorLink(
                         name = "${name} - ${source.label ?: "Dynamic"}",
                         source = name,
-                        url = streamUrl
+                        url = streamUrl,
+                        type = ExtractorLinkType.VIDEO
                     ) {
-                        this.referer = "$BASE_REFERER/"
                         this.quality = mappedQuality
-                        this.headers = playerHeaders
-                        this.isM3u8 = false
                     }
                 )
             }
         }
 
-        // 3. Subtitles processing mapping
         jsonResponse.tracks?.forEach { track ->
             subtitleCallback(
                 SubtitleFile(
