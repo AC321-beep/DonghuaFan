@@ -150,11 +150,13 @@ open class KSRPlayer : ExtractorApi() {
         )
         Log.d(TAG, "invokeStreamLink: $streamUrl  playlist=$isPlaylist")
         if (isPlaylist) {
+            // M3u8Helper.generateM3u8 signature: (source, streamUrl, referer, quality?)
+            // Headers are NOT a parameter — pass them via the ExtractorLink builder instead.
             try {
                 val resolved = app.get(streamUrl, headers = headers, referer = cdnReferer).url
-                M3u8Helper.generateM3u8(name, resolved, cdnReferer, headers).forEach(callback)
+                M3u8Helper.generateM3u8(name, resolved, cdnReferer).forEach(callback)
             } catch (e: Exception) {
-                M3u8Helper.generateM3u8(name, streamUrl, cdnReferer, headers).forEach(callback)
+                M3u8Helper.generateM3u8(name, streamUrl, cdnReferer).forEach(callback)
             }
         } else {
             callback(newExtractorLink(name, name, streamUrl, ExtractorLinkType.VIDEO) {
