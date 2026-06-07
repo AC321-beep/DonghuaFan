@@ -14,10 +14,9 @@ open class KSRPlayer : ExtractorApi() {
 
     companion object {
         private const val TAG = "DonghuaFun-KSR"
-        // FIXED: Added 'L' to ensure this is treated as a Long value
         private const val TIMEOUT_MS = 10000L 
         private const val CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
-        private const val CDN_REFERER = "https://play.donghuafun.com/"
+        private const val CDN_REFERER = "https://play.donghuafun.com" 
         
         val STREAM_PATTERNS = listOf(
             Regex("""(?:var|let|const)\s+url\s*=\s*["'](https?://[^"']+)["']"""),
@@ -44,7 +43,7 @@ open class KSRPlayer : ExtractorApi() {
             app.get(
                 url,
                 referer = referer ?: "https://donghuafun.com/",
-                timeout = TIMEOUT_MS, // Fixed parameter type match
+                timeout = TIMEOUT_MS,
                 headers = mapOf(
                     "User-Agent" to CHROME_UA,
                     "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -62,7 +61,6 @@ open class KSRPlayer : ExtractorApi() {
 
         Log.d(TAG, "DOM Processing Stream Engine - Document Size: ${html.length} chars")
 
-        // Intercept standard embed paths
         val knownEmbeds = listOf("dailymotion.com", "ok.ru", "okru")
         for (embed in knownEmbeds) {
             if (html.contains(embed)) {
@@ -76,14 +74,12 @@ open class KSRPlayer : ExtractorApi() {
             }
         }
 
-        // Search patterns via localized document scope
         val streamUrl = extractStreamUrl(html)
         if (streamUrl != null) {
             invokeStreamLink(ensureHttps(streamUrl), CDN_REFERER, callback)
             return
         }
 
-        // Strategy Fallback: Recurse into nested sub-iframes if present
         val iframeSrc = Regex("""<iframe[\s\S]*?src=["']([^"']+)["']""").find(html)?.groupValues?.get(1)
         if (!iframeSrc.isNullOrEmpty()) {
             var nestedUrl = iframeSrc.replace("\\/", "/")
@@ -136,24 +132,35 @@ open class KSRPlayer : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val isPlaylist = streamUrl.contains(".m3u8") || streamUrl.contains("playlist")
-        val headers = mapOf(
+        
+        val playerHeaders = mapOf(
             "User-Agent" to CHROME_UA,
-            "Referer" to cdnReferer,
-            "Origin" to "https://play.donghuafun.com",
+            "Referer" to "$cdnReferer/",
+            "Origin" to cdnReferer,
+            "Accept" to "*/*",
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Site" to "cross-site",
+            "Sec-Fetch-Dest" to "empty"
         )
 
         Log.d(TAG, "Packaging Stream Link Resource: $streamUrl | Playlist: $isPlaylist")
         if (isPlaylist) {
             try {
-                M3u8Helper.generateM3u8(name, streamUrl, cdnReferer).forEach(callback)
+                M3u8Helper.generateM3u8(
+                    name = name,
+                    source = streamUrl,
+                    referer = "$cdnReferer/",
+                    headers = playerHeaders
+                ).forEach(callback)
             } catch (e: Exception) {
                 Log.e(TAG, "HLS Manifest Engine Generation Phase Fail: ${e.message}")
             }
         } else {
             callback(newExtractorLink(name, name, streamUrl, ExtractorLinkType.VIDEO) {
-                this.referer = cdnReferer
+                this.referer = "$cdnReferer/"
                 this.quality = Qualities.P1080.value
-                this.headers = headers
+                this.headers = playerHeaders
             })
         }
     }
