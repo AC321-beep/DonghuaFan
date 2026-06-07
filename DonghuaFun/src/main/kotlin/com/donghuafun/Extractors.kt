@@ -10,7 +10,7 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
 
 // =============================================================================
-// 1. DATA MODELS (Mirrors your working Donghuastream payload structure)
+// 1. DATA MODELS
 // =============================================================================
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class DonghuaFunRoot(
@@ -71,7 +71,6 @@ open class KSRPlayer : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Step 1: Direct JSON Endpoint Fetching
         val jsonResponse = try {
             app.get(
                 url = url,
@@ -83,7 +82,6 @@ open class KSRPlayer : ExtractorApi() {
                 )
             ).parsed<DonghuaFunRoot>()
         } catch (e: Exception) {
-            // Document scraping strategy fallback if data is loaded inline inside scripts
             val html = try {
                 app.get(url, referer = referer ?: "https://donghuafun.com/").text
             } catch (pEx: Exception) {
@@ -103,12 +101,10 @@ open class KSRPlayer : ExtractorApi() {
             }
         } ?: return
 
-        // Step 2: Extract Streaming Objects & Package Player Verifications
         jsonResponse.sources?.forEach { source ->
             val targetStream = source.file
             val isPlaylist = targetStream.contains(".m3u8") || targetStream.contains("playlist")
             
-            // Critical Anti-blocking Player Configs
             val playerHeaders = mapOf(
                 "User-Agent" to CHROME_UA,
                 "Referer" to "$BASE_REFERER/",
@@ -136,35 +132,36 @@ open class KSRPlayer : ExtractorApi() {
                         headers = playerHeaders
                     ).forEach(callback)
                 } catch (e: Exception) {
-                    // Positional constructor initialization bypasses version-dependent argument renames completely
+                    // FIXED: Uses the non-deprecated newExtractorLink with absolute positional arguments 
+                    // This bypasses variable rename clashes across cloudstream repository variants completely
                     callback(
-                        ExtractorLink(
-                            source = name,
-                            name = "${name} - ${source.label ?: "HLS"}",
-                            url = targetStream,
-                            referer = "$BASE_REFERER/",
-                            quality = mappedQuality,
-                            isM3u8 = true,
-                            headers = playerHeaders
+                        newExtractorLink(
+                            "${name} - ${source.label ?: "HLS"}",
+                            name,
+                            targetStream,
+                            "$BASE_REFERER/",
+                            mappedQuality,
+                            true,
+                            playerHeaders
                         )
                     )
                 }
             } else {
+                // FIXED: Positional signature mapping matching: (name, source, url, referer, quality, isM3u8, headers)
                 callback(
-                    ExtractorLink(
-                        source = name,
-                        name = "${name} - ${source.label ?: "Dynamic"}",
-                        url = targetStream,
-                        referer = "$BASE_REFERER/",
-                        quality = mappedQuality,
-                        isM3u8 = false,
-                        headers = playerHeaders
+                    newExtractorLink(
+                        "${name} - ${source.label ?: "Dynamic"}",
+                        name,
+                        targetStream,
+                        "$BASE_REFERER/",
+                        mappedQuality,
+                        false,
+                        playerHeaders
                     )
                 )
             }
         }
 
-        // Step 3: Parse and dispatch Subtitles matching the tracking schema
         jsonResponse.tracks?.forEach { track ->
             subtitleCallback(
                 SubtitleFile(
