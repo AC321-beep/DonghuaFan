@@ -11,10 +11,8 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
 // ── KSR Player (play.donghuafun.com) ─────────────────────────────────────────
-// Donghua Fun's own video player. The player page contains a packed JS block
-// (function(p,a,c,k,e,d){...}) which when unpacked reveals:
-//   sources:[{file:"https://...m3u8",type:"hls"}]
-// sid 1 = 4K, sid 2 = 1080P ENG, sid 3 = 1080P Indo
+// Donghua Fun's own video player. Enhanced to support direct video assets 
+// and handle nested third-party provider streams (e.g., Dailymotion).
 
 open class KSRPlayer : ExtractorApi() {
     override var name = "DonghuaFun"
@@ -39,24 +37,32 @@ open class KSRPlayer : ExtractorApi() {
         // Method 1: MxoneCMS player_aaaa JS variable (most common)
         val playerJson = Regex("""player_aaaa\s*=\s*(\{[^<]+?\})""").find(html)?.groupValues?.get(1)
         if (playerJson != null) {
-            val videoUrl = Regex(""""url"\s*:\s*"([^"]+)"""")
+            var videoUrl = Regex(""""url"\s*:\s*"([^"]+)"""")
                 .find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/")
             val videoType = Regex(""""type"\s*:\s*"([^"]+)"""")
                 .find(playerJson)?.groupValues?.get(1) ?: "m3u8"
 
-            if (!videoUrl.isNullOrEmpty() && videoUrl.startsWith("http")) {
-                val isM3u8 = videoType.contains("m3u8") || videoType.contains("hls") || videoUrl.contains(".m3u8")
-                if (isM3u8) {
-                    M3u8Helper.generateM3u8(name, videoUrl, referer ?: mainUrl).forEach(callback)
+            if (!videoUrl.isNullOrEmpty()) {
+                if (videoUrl.startsWith("//")) videoUrl = "https:$videoUrl"
+
+                // Check if it's a direct streamable file asset
+                if (videoUrl.contains(".m3u8") || videoUrl.contains(".mp4") || videoType.contains("m3u8") || videoType.contains("hls")) {
+                    val isM3u8 = videoType.contains("m3u8") || videoType.contains("hls") || videoUrl.contains(".m3u8")
+                    if (isM3u8) {
+                        M3u8Helper.generateM3u8(name, videoUrl, referer ?: mainUrl).forEach(callback)
+                    } else {
+                        callback(
+                            newExtractorLink(name, name, videoUrl, ExtractorLinkType.VIDEO) {
+                                this.referer = referer ?: mainUrl
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                    }
+                    return
                 } else {
-                    callback(
-                        newExtractorLink(name, name, videoUrl, ExtractorLinkType.VIDEO) {
-                            this.referer = referer ?: mainUrl
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
+                    // It's an embed provider link (e.g. Dailymotion), route to core suite
+                    if (loadExtractor(videoUrl, referer ?: mainUrl, subtitleCallback, callback)) return
                 }
-                return
             }
         }
 
@@ -66,43 +72,54 @@ open class KSRPlayer : ExtractorApi() {
         if (packedScript != null) {
             val unpacked = JsUnpacker(packedScript).unpack()
             if (unpacked != null) {
-                // Try sources:[{file:"..."}]
-                val fileUrl = Regex("""sources:\s*\[\s*\{[^}]*file\s*:\s*"([^"]+)"""")
+                var fileUrl = Regex("""sources:\s*\[\s*\{[^}]*file\s*:\s*"([^"]+)"""")
                     .find(unpacked)?.groupValues?.get(1)?.replace("\\/", "/")
                 if (!fileUrl.isNullOrEmpty()) {
-                    val isM3u8 = fileUrl.contains(".m3u8")
-                    if (isM3u8) {
-                        M3u8Helper.generateM3u8(name, fileUrl, referer ?: mainUrl).forEach(callback)
+                    if (fileUrl.startsWith("//")) fileUrl = "https:$fileUrl"
+
+                    if (fileUrl.contains(".m3u8") || fileUrl.contains(".mp4")) {
+                        val isM3u8 = fileUrl.contains(".m3u8")
+                        if (isM3u8) {
+                            M3u8Helper.generateM3u8(name, fileUrl, referer ?: mainUrl).forEach(callback)
+                        } else {
+                            callback(
+                                newExtractorLink(name, name, fileUrl, ExtractorLinkType.VIDEO) {
+                                    this.referer = referer ?: mainUrl
+                                    this.quality = Qualities.Unknown.value
+                                }
+                            )
+                        }
+                        return
                     } else {
-                        callback(
-                            newExtractorLink(name, name, fileUrl, ExtractorLinkType.VIDEO) {
-                                this.referer = referer ?: mainUrl
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
+                        if (loadExtractor(fileUrl, referer ?: mainUrl, subtitleCallback, callback)) return
                     }
-                    return
                 }
             }
         }
 
         // Method 3: KSR player API call — the player fetches stream info via AJAX
-        // Pattern: $.ajax({url:"https://play.donghuafun.com/api/..."})
         val ajaxUrl = Regex("""\$\.ajax\(\s*\{\s*url\s*:\s*"([^"]+)"""")
             .find(html)?.groupValues?.get(1)
         if (!ajaxUrl.isNullOrEmpty()) {
             val apiResp = app.get(ajaxUrl, referer = url).parsedSafe<KSRApiResponse>()
             apiResp?.sources?.firstOrNull { it.file.isNotBlank() }?.let { src ->
-                val isM3u8 = src.file.contains(".m3u8") || src.type.contains("hls")
-                if (isM3u8) {
-                    M3u8Helper.generateM3u8(name, src.file, referer ?: mainUrl).forEach(callback)
+                var srcFile = src.file
+                if (srcFile.startsWith("//")) srcFile = "https:$srcFile"
+
+                if (srcFile.contains(".m3u8") || srcFile.contains(".mp4") || src.type.contains("hls")) {
+                    val isM3u8 = srcFile.contains(".m3u8") || src.type.contains("hls")
+                    if (isM3u8) {
+                        M3u8Helper.generateM3u8(name, srcFile, referer ?: mainUrl).forEach(callback)
+                    } else {
+                        callback(
+                            newExtractorLink(name, name, srcFile, ExtractorLinkType.VIDEO) {
+                                this.referer = referer ?: mainUrl
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                    }
                 } else {
-                    callback(
-                        newExtractorLink(name, name, src.file, ExtractorLinkType.VIDEO) {
-                            this.referer = referer ?: mainUrl
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
+                    loadExtractor(srcFile, referer ?: mainUrl, subtitleCallback, callback)
                 }
             }
             apiResp?.tracks?.forEach { track ->
@@ -113,7 +130,12 @@ open class KSRPlayer : ExtractorApi() {
             return
         }
 
-        // Method 4: Last resort — scan raw HTML for any .m3u8 or .mp4 URL
+        // Method 4: Last resort — scan raw HTML for any frame elements or embedded paths
+        val iframeSrc = response.document.selectFirst("iframe[src]")?.attr("src")
+        if (!iframeSrc.isNullOrEmpty()) {
+            if (loadExtractor(fixUrl(iframeSrc), referer ?: mainUrl, subtitleCallback, callback)) return
+        }
+
         val directUrl = Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*""")
             .find(html)?.value
         if (!directUrl.isNullOrEmpty()) {
