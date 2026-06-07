@@ -15,7 +15,6 @@ open class KSRPlayer : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Send requests with proper headers pretending to be the player interface
         val response = app.get(
             url,
             referer = referer ?: "https://donghuafun.com/",
@@ -26,7 +25,7 @@ open class KSRPlayer : ExtractorApi() {
         )
         val html = response.text
 
-        // 1. Direct variable capture technique (Extracting raw 'url' variables from player scope)
+        // 1. Direct variable capture technique
         val explicitUrl = Regex("""var\s+url\s*=\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
             ?: Regex("""["']url["']\s*:\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
 
@@ -40,7 +39,7 @@ open class KSRPlayer : ExtractorApi() {
             }
         }
 
-        // 2. Packed Script processing (Evaluating compressed script blocks)
+        // 2. Packed Script processing
         val packedScript = response.document.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data()
         if (packedScript != null) {
             val unpacked = JsUnpacker(packedScript).unpack()
@@ -61,14 +60,15 @@ open class KSRPlayer : ExtractorApi() {
             }
         }
 
-        // 3. Bruteforce regex sweep fallback
+        // 3. Bruteforce fallback sweep regex
         val anyStreamUrl = Regex("""https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*""").find(html)?.value
         if (!anyStreamUrl.isNullOrEmpty()) {
             invokeStreamLink(anyStreamUrl, url, callback)
         }
     }
 
-    private fun invokeStreamLink(streamUrl: String, referer: String, callback: (ExtractorLink) -> Unit) {
+    // Added the 'suspend' keyword here to fix the compilation scope crash
+    private suspend fun invokeStreamLink(streamUrl: String, referer: String, callback: (ExtractorLink) -> Unit) {
         val isM3u8 = streamUrl.contains(".m3u8") || streamUrl.contains("playlist")
         if (isM3u8) {
             M3u8Helper.generateM3u8(name, streamUrl, referer).forEach(callback)
