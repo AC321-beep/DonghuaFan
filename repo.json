@@ -1,0 +1,8 @@
+{
+    "name": "DonghuaFun",
+    "description": "Donghua (Chinese Animation) from donghuafun.com",
+    "manifestVersion": 1,
+    "pluginLists": [
+        "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/plugins.json"
+    ]
+}
