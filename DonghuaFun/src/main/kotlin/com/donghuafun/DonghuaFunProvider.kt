@@ -18,8 +18,6 @@ class DonghuaFunProvider : MainAPI() {
         private const val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    // ── URL Helpers ────────────────────────────────────────────────────────────
-
     private fun getShowId(url: String): String {
         Regex("""/id/(\d+)\.html""").find(url)?.let { return it.groupValues[1] }
         return ""
@@ -32,8 +30,6 @@ class DonghuaFunProvider : MainAPI() {
         return Triple(sid, nid, showId)
     }
 
-    // ── Home Page ──────────────────────────────────────────────────────────────
-
     override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/type/id/20.html"         to "Latest Donghua",
         "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
@@ -41,14 +37,10 @@ class DonghuaFunProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val pageUrl = if (page == 1) request.data
-                      else request.data.replace(".html", "/page/$page.html")
-        
+        val pageUrl = if (page == 1) request.data else request.data.replace(".html", "/page/$page.html")
         val doc = app.get(pageUrl, headers = mapOf("User-Agent" to USER_AGENT)).document
         return newHomePageResponse(request.name, doc.parseShowCards())
     }
-
-    // ── Search ─────────────────────────────────────────────────────────────────
 
     override suspend fun search(query: String): List<SearchResponse> {
         val doc = app.get(
@@ -58,8 +50,6 @@ class DonghuaFunProvider : MainAPI() {
         ).document
         return doc.parseShowCards()
     }
-
-    // ── Detail ─────────────────────────────────────────────────────────────────
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = mapOf("User-Agent" to USER_AGENT)).document
@@ -79,7 +69,6 @@ class DonghuaFunProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
 
-        // Parse episodes from the anthology tabs (Source 1, 2, 3)
         val sourceTabs = doc.select(".anthology-tab .vod-playerUrl")
         val episodeContainers = doc.select(".anthology-list-box")
         
@@ -94,9 +83,7 @@ class DonghuaFunProvider : MainAPI() {
                     val epHref = fixUrl(a.attr("href"))
                     val epNum = a.select("span").first()?.text()?.trim() ?: a.text().trim()
                     if (epHref.isNotEmpty() && epNum.isNotEmpty()) {
-                        episodes.add(newEpisode(epHref) {
-                            name = "$epNum [$sourceName]"
-                        })
+                        episodes.add(newEpisode(epHref) { name = "$epNum [$sourceName]" })
                     }
                 }
             }
@@ -106,9 +93,7 @@ class DonghuaFunProvider : MainAPI() {
                 val epNum = a.text().trim().ifEmpty { 
                     Regex("""nid/(\d+)""").find(epHref)?.groupValues?.get(1)?.let { "EP$it" } ?: "Episode"
                 }
-                episodes.add(newEpisode(epHref) {
-                    name = epNum
-                })
+                episodes.add(newEpisode(epHref) { name = epNum })
             }
         }
 
@@ -125,8 +110,6 @@ class DonghuaFunProvider : MainAPI() {
             addEpisodes(DubStatus.None, episodes)
         }
     }
-
-    // ── Link Extraction ────────────────────────────────────────────────────────
 
     override suspend fun loadLinks(
         data: String,
@@ -150,7 +133,7 @@ class DonghuaFunProvider : MainAPI() {
             return false
         }
 
-        // Strategy 1: Extract player_aaaa JSON
+        // Strategy 1: player_aaaa JSON
         val scriptWithPlayer = html.select("script").firstOrNull { it.data().contains("player_aaaa") }
         if (scriptWithPlayer != null) {
             val scriptContent = scriptWithPlayer.data()
@@ -240,19 +223,14 @@ class DonghuaFunProvider : MainAPI() {
             val pattern = Regex(""""$quality":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)"""")
             pattern.find(html)?.let { match ->
                 val m3u8 = match.groupValues[1].replace("\\/", "/")
-                val link = newExtractorLink(
-                    name,
-                    "$name $quality",
-                    m3u8,
-                    ExtractorLinkType.M3U8,
-                    when (quality) {
+                val link = newExtractorLink(name, "$name $quality", m3u8, ExtractorLinkType.M3U8) {
+                    this.quality = when (quality) {
                         "1080" -> 1080
                         "720" -> 720
                         "480" -> 480
                         "380" -> 380
                         else -> 240
                     }
-                ).apply {
                     this.referer = "https://www.dailymotion.com/"
                     this.headers = headers
                 }
@@ -264,7 +242,8 @@ class DonghuaFunProvider : MainAPI() {
         if (!found) {
             val anyM3u8 = Regex("""(https?://[^\s"']+\.m3u8[^\s"']*)""").find(html)?.value?.replace("\\/", "/")
             if (anyM3u8 != null) {
-                val link = newExtractorLink(name, name, anyM3u8, ExtractorLinkType.M3U8, 720).apply {
+                val link = newExtractorLink(name, name, anyM3u8, ExtractorLinkType.M3U8) {
+                    this.quality = 720
                     this.referer = "https://www.dailymotion.com/"
                     this.headers = headers
                 }
@@ -280,9 +259,9 @@ class DonghuaFunProvider : MainAPI() {
             name,
             name,
             url,
-            if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-            1080
-        ).apply {
+            if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+        ) {
+            this.quality = 1080
             this.referer = referer
             this.headers = headers
         }
