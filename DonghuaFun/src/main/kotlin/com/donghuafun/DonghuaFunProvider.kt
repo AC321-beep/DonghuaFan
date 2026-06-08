@@ -6,7 +6,6 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 
-@CloudstreamPlugin
 class DonghuaFunProvider : MainAPI() {
     override var mainUrl = "https://donghuafun.com"
     override var name = "DonghuaFun"
