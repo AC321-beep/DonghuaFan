@@ -95,9 +95,7 @@ class DonghuaFunProvider : MainAPI() {
                     val epHref = fixUrl(a.attr("href"))
                     val epNum = a.select("span").first()?.text()?.trim() ?: a.text().trim()
                     if (epHref.isNotEmpty() && epNum.isNotEmpty()) {
-                        episodes.add(newEpisode(epHref) {
-                            name = "$epNum [$sourceName]"
-                        })
+                        episodes.add(Episode(epHref, name = "$epNum [$sourceName]"))
                     }
                 }
             }
@@ -108,7 +106,7 @@ class DonghuaFunProvider : MainAPI() {
                 val epNum = a.text().trim().ifEmpty { 
                     Regex("""nid/(\d+)""").find(epHref)?.groupValues?.get(1)?.let { "EP$it" } ?: "Episode"
                 }
-                episodes.add(newEpisode(epHref) { name = epNum })
+                episodes.add(Episode(epHref, name = epNum))
             }
         }
 
@@ -145,39 +143,45 @@ class DonghuaFunProvider : MainAPI() {
 
         // Fetch the play page HTML
         val html = try {
-            app.get(data, headers = headers).text
+            app.get(data, headers = headers).document
         } catch (e: Exception) {
             Log.e(TAG, "Failed to fetch page: ${e.message}")
             return false
         }
 
-        // ─── Strategy 1: Extract player_aaaa JSON (Primary method) ───────────────
-        // This works for ALL sources (1, 2, and 3)
-        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-            .find(html)?.groupValues?.get(1)
+        // ─── Strategy 1: Extract script containing player_aaaa ───────────────────
+        val scriptWithPlayer = html.select("script").firstOrNull { it.data().contains("player_aaaa") }
         
-        if (playerJson != null) {
-            Log.d(TAG, "Found player_aaaa JSON for source $sid")
-            if (extractFromPlayerJson(playerJson, data, headers, callback)) {
-                return true
+        if (scriptWithPlayer != null) {
+            val scriptContent = scriptWithPlayer.data()
+            val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+                .find(scriptContent)?.groupValues?.get(1)
+            
+            if (playerJson != null) {
+                Log.d(TAG, "Found player_aaaa JSON for source $sid")
+                if (extractFromPlayerJson(playerJson, data, headers, subtitleCallback, callback)) {
+                    return true
+                }
             }
         }
 
         // ─── Strategy 2: Look for iframes (Fallback) ────────────────────────────
-        val iframePattern = Regex("""<iframe[^>]+src=["']([^"']+dailymotion\.com[^"']+)["']""", RegexOption.IGNORE_CASE)
-        iframePattern.find(html)?.let { match ->
-            val iframeUrl = match.groupValues[1].replace("&amp;", "&")
+        val iframe = html.select("iframe[src*='dailymotion']").firstOrNull()
+        if (iframe != null) {
+            val iframeUrl = iframe.attr("src")
             Log.d(TAG, "Found iframe: $iframeUrl")
             return extractDailymotion(iframeUrl, callback)
         }
 
-        // ─── Strategy 3: Look for direct video sources (Fallback) ────────────────
-        val videoPattern = Regex("""<video[^>]+src=["']([^"']+\.(?:m3u8|mp4)[^"']*)["']""", RegexOption.IGNORE_CASE)
-        videoPattern.find(html)?.let { match ->
-            val videoUrl = match.groupValues[1].replace("\\/", "/")
-            Log.d(TAG, "Found direct video: $videoUrl")
-            callback(createDirectLink(videoUrl, data, headers))
-            return true
+        // ─── Strategy 3: Look for video sources (Fallback) ──────────────────────
+        val videoSource = html.select("video source, video").firstOrNull()
+        if (videoSource != null) {
+            val videoUrl = videoSource.attr("src").ifEmpty { videoSource.attr("data-src") }
+            if (videoUrl.isNotEmpty()) {
+                Log.d(TAG, "Found video source: $videoUrl")
+                callback(createExtractorLink(videoUrl, data, headers))
+                return true
+            }
         }
 
         Log.w(TAG, "No video source found for sid=$sid, nid=$nid")
@@ -190,6 +194,7 @@ class DonghuaFunProvider : MainAPI() {
         json: String,
         referer: String,
         headers: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         // Extract the URL field
@@ -214,19 +219,16 @@ class DonghuaFunProvider : MainAPI() {
                 extractDailymotion(decodedUrl, callback)
             }
             decodedUrl.contains(".m3u8") -> {
-                callback(createDirectLink(decodedUrl, referer, headers))
+                callback(createExtractorLink(decodedUrl, referer, headers))
                 true
             }
             decodedUrl.contains(".mp4") -> {
-                callback(createDirectLink(decodedUrl, referer, headers, isM3u8 = false))
+                callback(createExtractorLink(decodedUrl, referer, headers))
                 true
             }
             else -> {
-                // Try generic extractor as last resort
-                loadExtractor(decodedUrl, referer) { link ->
-                    callback(link)
-                }
-                true
+                // Try to load using the extractor system
+                loadExtractor(decodedUrl, referer, subtitleCallback, callback)
             }
         }
     }
@@ -246,8 +248,7 @@ class DonghuaFunProvider : MainAPI() {
         val embedUrl = "https://www.dailymotion.com/embed/video/$videoId"
         val headers = mapOf(
             "User-Agent" to USER_AGENT,
-            "Referer" to "https://www.dailymotion.com/",
-            "Origin" to "https://www.dailymotion.com"
+            "Referer" to "https://www.dailymotion.com/"
         )
 
         Log.d(TAG, "Fetching Dailymotion embed: $embedUrl")
@@ -260,35 +261,27 @@ class DonghuaFunProvider : MainAPI() {
         }
 
         // Try to extract all available quality streams
-        val qualityPatterns = mapOf(
-            "1080" to Regex(""""1080":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)"""", RegexOption.DOT_MATCHES_ALL),
-            "720" to Regex(""""720":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)"""", RegexOption.DOT_MATCHES_ALL),
-            "480" to Regex(""""480":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)"""", RegexOption.DOT_MATCHES_ALL),
-            "380" to Regex(""""380":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)"""", RegexOption.DOT_MATCHES_ALL),
-            "240" to Regex(""""240":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)"""", RegexOption.DOT_MATCHES_ALL)
+        val qualityPatterns = listOf(
+            Triple("1080", Regex(""""1080":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)""""), 1080),
+            Triple("720", Regex(""""720":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)""""), 720),
+            Triple("480", Regex(""""480":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)""""), 480),
+            Triple("380", Regex(""""380":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)""""), 380),
+            Triple("240", Regex(""""240":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)""""), 240)
         )
 
         var found = false
-        for ((quality, pattern) in qualityPatterns) {
+        for ((quality, pattern, qualityValue) in qualityPatterns) {
             pattern.find(html)?.let { match ->
                 val m3u8 = match.groupValues[1].replace("\\/", "/")
-                val qualityValue = when (quality) {
-                    "1080" -> Qualities.P1080.value
-                    "720" -> Qualities.P720.value
-                    "480" -> Qualities.P480.value
-                    "380" -> Qualities.P360.value
-                    else -> Qualities.P240.value
-                }
-                
                 callback(newExtractorLink(
                     source = name,
-                    name = "$name ${quality}p",
+                    name = "$name $quality",
                     url = m3u8,
                     type = ExtractorLinkType.M3U8,
-                    quality = qualityValue,
-                    headers = headers
+                    quality = qualityValue
                 ) {
                     this.referer = "https://www.dailymotion.com/"
+                    this.headers = headers
                 })
                 found = true
             }
@@ -298,9 +291,14 @@ class DonghuaFunProvider : MainAPI() {
         if (!found) {
             val anyM3u8 = Regex("""(https?://[^\s"']+\.m3u8[^\s"']*)""").find(html)?.value?.replace("\\/", "/")
             if (anyM3u8 != null) {
-                callback(newExtractorLink(name, name, anyM3u8, ExtractorLinkType.M3U8) {
+                callback(newExtractorLink(
+                    source = name,
+                    name = name,
+                    url = anyM3u8,
+                    type = ExtractorLinkType.M3U8,
+                    quality = 720
+                ) {
                     this.referer = "https://www.dailymotion.com/"
-                    this.quality = Qualities.P720.value
                     this.headers = headers
                 })
                 found = true
@@ -312,21 +310,20 @@ class DonghuaFunProvider : MainAPI() {
 
     // ─── Helper Functions ──────────────────────────────────────────────────────
 
-    private fun createDirectLink(
+    private fun createExtractorLink(
         url: String,
         referer: String,
-        headers: Map<String, String>,
-        isM3u8: Boolean = true
+        headers: Map<String, String>
     ): ExtractorLink {
         return newExtractorLink(
             source = name,
-            name = if (isM3u8) "$name HLS" else name,
+            name = name,
             url = url,
-            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-            quality = Qualities.P1080.value,
-            headers = headers
+            type = if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+            quality = 1080
         ) {
             this.referer = referer
+            this.headers = headers
         }
     }
 
