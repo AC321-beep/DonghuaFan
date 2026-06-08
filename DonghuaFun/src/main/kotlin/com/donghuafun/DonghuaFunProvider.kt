@@ -4,21 +4,24 @@ import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
+import kotlin.math.ceil
 
 class DonghuaFunProvider : MainAPI() {
     override var mainUrl = "https://donghuafun.com"
     override var name = "DonghuaFun"
-    override var lang = "zh"
+    override var lang = "en"
     override val hasMainPage = true
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime)
 
     companion object {
         private const val TAG = "DonghuaFun"
-        private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        private val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
     }
 
-    // ────────────────────────────────────────────────────────────── URL Helpers
+    // -------------------------------------------------------------------
+    //  URL helpers
+    // -------------------------------------------------------------------
     private fun detailUrlToId(url: String): String =
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
@@ -28,7 +31,9 @@ class DonghuaFunProvider : MainAPI() {
         return sid to nid
     }
 
-    // ────────────────────────────────────────────────────────────── Main Page
+    // -------------------------------------------------------------------
+    //  Main page
+    // -------------------------------------------------------------------
     override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/type/id/20.html"         to "Trending Donghua",
         "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
@@ -37,12 +42,14 @@ class DonghuaFunProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val pageUrl = if (page == 1) request.data
-                      else request.data.replace(".html", "/page/$page.html")
+                     else request.data.replace(".html", "/page/$page.html")
         val doc = app.get(pageUrl).document
         return newHomePageResponse(request.name, doc.parseShowCards())
     }
 
-    // ────────────────────────────────────────────────────────────── Search
+    // -------------------------------------------------------------------
+    //  Search
+    // -------------------------------------------------------------------
     override suspend fun search(query: String): List<SearchResponse> {
         val doc = app.get(
             "$mainUrl/index.php/vod/search.html",
@@ -51,64 +58,110 @@ class DonghuaFunProvider : MainAPI() {
         return doc.parseShowCards()
     }
 
-    // ────────────────────────────────────────────────────────────── Detail
+    // -------------------------------------------------------------------
+    //  Detail page (episodes with sorting)
+    // -------------------------------------------------------------------
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
         val showId = detailUrlToId(url)
 
-        val title = doc.selectFirst("h1, .video-title")?.text()?.trim()
+        val title = doc.selectFirst("h1, .video-title, .detail-title")?.text()?.trim()
             ?: doc.title().substringBefore(" Donghua").trim()
 
         val poster = doc.selectFirst("meta[property='og:image']")?.attr("content")
-            ?: doc.selectFirst(".detail-pic img, .video-cover img")?.attr("data-src")
+            ?: doc.selectFirst(".detail-pic img, .video-cover img, .card-top img")?.attr("data-src")
+            ?: doc.selectFirst("img.lazy")?.attr("data-src")
 
-        val description = doc.selectFirst(".video-desc, .detail-desc, p.desc")?.text()?.trim()
+        val description = doc.selectFirst(".video-desc, .detail-desc, .card-text")?.text()?.trim()
             ?: doc.selectFirst("meta[name='description']")?.attr("content")
 
-        val tags = doc.select("a[href*='/class/']").map { it.text().trim() }
+        val tags = doc.select("a[href*='/class/']").mapNotNull { it.text().trim().takeIf(String::isNotEmpty) }
         val year = doc.selectFirst("a[href*='/year/']")?.text()?.toIntOrNull()
 
-        val episodes = mutableListOf<Episode>()
-        val serverBlocks = doc.select("div.module-player-list, ul.anthology-list-play")
+        // Raw episodes before sorting
+        val rawEpisodes = mutableListOf<Pair<Episode, Int>>() // episode + numeric order key
 
-        if (serverBlocks.isEmpty()) {
-            doc.select("a[href*='/vod/play/id/$showId/']").forEach { a ->
-                episodes.add(newEpisode(fixUrl(a.attr("href"))) { name = a.text().trim() })
-            }
-        } else {
-            serverBlocks.forEachIndexed { sIdx, block ->
-                val serverName = block.previousElementSibling()?.text()?.trim()
-                    ?: "Source ${sIdx + 1}"
-                block.select("a").forEach { a ->
-                    episodes.add(newEpisode(fixUrl(a.attr("href"))) {
-                        name = "${a.text().trim()} [$serverName]"
-                    })
+        // 1) Episode list from anthology tabs (multiple servers)
+        val serverTabs = doc.select(".anthology-tab a.vod-playerUrl")
+        val container = doc.selectFirst(".anthology-list")
+        if (container != null && serverTabs.isNotEmpty()) {
+            serverTabs.forEachIndexed { idx, tab ->
+                val serverName = tab.text().trim()
+                val serverId = tab.attr("data-form")
+                val listDiv = doc.selectFirst(".anthology-list-box[data-form='$serverId']")
+                    ?: doc.select(".anthology-list-box")?.getOrNull(idx)
+
+                listDiv?.select("a[href*='/vod/play/id/$showId/']")?.forEach { a ->
+                    val epUrl = fixUrl(a.attr("href"))
+                    val epName = a.selectFirst("span")?.text()?.trim() ?: a.text().trim()
+                    val episodeNumber = parseEpisodeNumber(epName)
+                    val episode = newEpisode(epUrl) {
+                        name = "$epName [$serverName]"
+                    }
+                    rawEpisodes.add(episode to episodeNumber)
                 }
             }
         }
 
-        // Fallback: generate episodes if none found
-        if (episodes.isEmpty() && showId.isNotEmpty()) {
+        // 2) Fallback: any play link
+        if (rawEpisodes.isEmpty()) {
+            doc.select("a[href*='/vod/play/id/$showId/']").forEach { a ->
+                val epUrl = fixUrl(a.attr("href"))
+                val epName = a.text().trim()
+                val episodeNumber = parseEpisodeNumber(epName)
+                val episode = newEpisode(epUrl) {
+                    name = epName
+                }
+                rawEpisodes.add(episode to episodeNumber)
+            }
+        }
+
+        // 3) Last resort: generate numeric episodes
+        if (rawEpisodes.isEmpty() && showId.isNotEmpty()) {
             val epCountText = doc.selectFirst(".video-info-main em, .detail-status")?.text() ?: ""
             val epCount = Regex("""EP(\d+)""").find(epCountText)
                 ?.groupValues?.get(1)?.toIntOrNull() ?: 1
             for (n in 1..epCount) {
-                episodes.add(newEpisode("$mainUrl/index.php/vod/play/id/$showId/sid/1/nid/$n.html") {
+                val epUrl = "$mainUrl/index.php/vod/play/id/$showId/sid/1/nid/$n.html"
+                val episode = newEpisode(epUrl) {
                     name = "EP$n"
-                })
+                }
+                rawEpisodes.add(episode to n)
             }
         }
 
-        return newAnimeLoadResponse(title ?: name, url, TvType.Anime) {
-            posterUrl = poster
+        // Sort episodes: regular numeric episodes ascending, then specials (e.g., Movie) at the end
+        val sortedEpisodes = rawEpisodes.sortedWith(compareBy({ it.second }, { it.first.name }))
+            .map { it.first }
+
+        return newAnimeLoadResponse(title, url, TvType.Anime) {
+            posterUrl = poster?.fixUrl()
             plot = description
             tags?.let { this.tags = it }
             year?.let { this.year = it }
-            addEpisodes(DubStatus.None, episodes)
+            addEpisodes(DubStatus.None, sortedEpisodes)
         }
     }
 
-    // ────────────────────────────────────────────────────────────── Link Extraction
+    // Helper: extract numeric episode number from name like "EP227", "EP226", "Movie P1" -> high number, etc.
+    private fun parseEpisodeNumber(name: String): Int {
+        // Try to find "EP" followed by digits
+        val match = Regex("""EP(\d+)""", RegexOption.IGNORE_CASE).find(name)
+        if (match != null) {
+            return match.groupValues[1].toInt()
+        }
+        // Handle specials like "Movie P1", "Movie P2" -> assign a high number (e.g., 10000 + index)
+        if (name.contains("movie", ignoreCase = true) || name.contains("special", ignoreCase = true)) {
+            // Use a hash to keep order but push to end
+            return 10000 + name.hashCode().coerceIn(0, 9999)
+        }
+        // If no number found, push to end
+        return Int.MAX_VALUE
+    }
+
+    // -------------------------------------------------------------------
+    //  Link extraction (same as before)
+    // -------------------------------------------------------------------
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -117,7 +170,7 @@ class DonghuaFunProvider : MainAPI() {
     ): Boolean {
         val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to data)
 
-        // 1. Try MacCMS Ajax API (for some sources)
+        // ----- 1) Try MacCMS Ajax API
         val showId = detailUrlToId(data)
         if (showId.isNotEmpty()) {
             try {
@@ -133,7 +186,6 @@ class DonghuaFunProvider : MainAPI() {
                     ),
                     headers = headers + ("X-Requested-With" to "XMLHttpRequest")
                 ).text
-
                 if (apiJson.isNotEmpty() && apiJson != "false" && !apiJson.startsWith("<")) {
                     if (extractFromPlayerJson(apiJson, data, subtitleCallback, callback)) return true
                 }
@@ -142,7 +194,7 @@ class DonghuaFunProvider : MainAPI() {
             }
         }
 
-        // 2. Scan HTML for player_aaaa, player_bbbb, etc.
+        // ----- 2) Scan HTML for player_aaaa / player_bbbb
         val html = try { app.get(data, headers = headers).text } catch (e: Exception) { "" }
         val playerVars = listOf("player_aaaa", "player_bbbb", "player_cccc", "playinfo", "videoInfo")
         for (varName in playerVars) {
@@ -154,12 +206,25 @@ class DonghuaFunProvider : MainAPI() {
             }
         }
 
-        // 3. Fallback: any iframe
+        // ----- 3) Iframe fallback
         val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
-        doc?.select("iframe[src], iframe[data-src]")?.forEach { iframe ->
+        val iframes = doc?.select("iframe[src], iframe[data-src]") ?: emptyList()
+        for (iframe in iframes) {
             val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
             if (src.isNotEmpty()) {
                 Log.d(TAG, "Iframe fallback: $src")
+                if (src.contains("/m3u8/") && src.contains("?url=")) {
+                    val m3u8Url = Regex("""[?&]url=([^&]+)""").find(src)?.groupValues?.get(1)
+                        ?.let { java.net.URLDecoder.decode(it, "UTF-8") }
+                    if (m3u8Url?.contains(".m3u8") == true) {
+                        callback(newExtractorLink(name, name, m3u8Url, ExtractorLinkType.M3U8) {
+                            this.referer = data
+                            this.quality = Qualities.P1080.value
+                            this.headers = headers
+                        })
+                        return true
+                    }
+                }
                 loadExtractor(fixUrl(src), data, subtitleCallback, callback)
                 return true
             }
@@ -168,17 +233,19 @@ class DonghuaFunProvider : MainAPI() {
         return false
     }
 
-    // ────────────────────────────────────────────────────────────── JSON Extractor
+    // -------------------------------------------------------------------
+    //  JSON extractor (unchanged)
+    // -------------------------------------------------------------------
     private suspend fun extractFromPlayerJson(
         json: String,
         referer: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Extract basic fields
         val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1)
             ?: Regex(""""link"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1)
             ?: return false
+
         val encryptType = Regex(""""encrypt"\s*:\s*(\d+)""").find(json)
             ?.groupValues?.get(1)?.toIntOrNull() ?: 0
         val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1) ?: ""
@@ -186,27 +253,21 @@ class DonghuaFunProvider : MainAPI() {
         val decodedUrl = decodeUrl(rawUrl, encryptType)
             .let { if (it.startsWith("//")) "https:$it" else it }
 
-        Log.d(TAG, "from=$from, decodedUrl=$decodedUrl")
-
-        // ────────────────────────────────────────────────── Dailymotion (4K source)
-        if (from.equals("dailymotion", ignoreCase = true) ||
-            decodedUrl.contains("dailymotion.com") ||
-            decodedUrl.matches(Regex("^[a-zA-Z0-9]{20,}$"))) {   // likely a Dailymotion ID
+        // Dailymotion
+        if (from.equals("dailymotion", ignoreCase = true) || decodedUrl.contains("dailymotion.com") ||
+            decodedUrl.matches(Regex("^[a-zA-Z0-9]{20,}$"))) {
             val dmId = if (decodedUrl.contains("dailymotion")) {
                 Regex("""dailymotion\.com/(?:video/|embed/video/)([a-zA-Z0-9]+)""")
                     .find(decodedUrl)?.groupValues?.get(1) ?: decodedUrl
             } else {
-                decodedUrl   // already just the ID
+                decodedUrl
             }
-            val dmEmbedUrl = "https://www.dailymotion.com/embed/video/$dmId"
-            Log.d(TAG, "Dailymotion embed: $dmEmbedUrl")
-            // Let CloudStream's built-in extractors handle Dailymotion
-            return loadExtractor(dmEmbedUrl, referer, subtitleCallback, callback)
+            val dmEmbed = "https://www.dailymotion.com/embed/video/$dmId"
+            return loadExtractor(dmEmbed, referer, subtitleCallback, callback)
         }
 
-        // ────────────────────────────────────────────────── Direct m3u8 (1080P ENG source)
+        // Direct m3u8
         if (decodedUrl.contains(".m3u8")) {
-            Log.d(TAG, "Direct m3u8: $decodedUrl")
             callback(newExtractorLink(name, name, decodedUrl, ExtractorLinkType.M3U8) {
                 this.referer = referer
                 this.quality = Qualities.P1080.value
@@ -215,7 +276,7 @@ class DonghuaFunProvider : MainAPI() {
             return true
         }
 
-        // ────────────────────────────────────────────────── Direct mp4
+        // Direct mp4
         if (decodedUrl.contains(".mp4")) {
             callback(newExtractorLink(name, name, decodedUrl, ExtractorLinkType.VIDEO) {
                 this.referer = referer
@@ -225,12 +286,13 @@ class DonghuaFunProvider : MainAPI() {
             return true
         }
 
-        // ────────────────────────────────────────────────── Generic embed (e.g., 1080P Indo)
-        Log.d(TAG, "Generic embed fallback: $decodedUrl")
+        // Generic embed fallback
         return loadExtractor(decodedUrl, referer, subtitleCallback, callback)
     }
 
-    // ────────────────────────────────────────────────────────────── URL Decoding
+    // -------------------------------------------------------------------
+    //  URL decoder
+    // -------------------------------------------------------------------
     private fun decodeUrl(raw: String, encryptType: Int): String {
         return try {
             when (encryptType) {
@@ -245,20 +307,21 @@ class DonghuaFunProvider : MainAPI() {
         }
     }
 
-    // ────────────────────────────────────────────────────────────── Card Parser
+    // -------------------------------------------------------------------
+    //  Card parser
+    // -------------------------------------------------------------------
     private fun Document.parseShowCards(): List<SearchResponse> {
         return select("a[href*='/vod/detail/id/']")
             .distinctBy { it.attr("href") }
             .mapNotNull { a ->
                 val href = fixUrl(a.attr("href"))
-                if (href.isEmpty()) return@mapNotNull null
                 val title = a.attr("title").ifEmpty {
                     a.selectFirst("img")?.attr("alt") ?: a.text()
                 }.trim()
                 if (title.isEmpty()) return@mapNotNull null
                 val poster = a.selectFirst("img")?.let {
                     it.attr("data-src").ifEmpty { it.attr("src") }
-                }?.let { if (it.startsWith("data:")) null else fixUrl(it) }
+                }?.takeUnless { it.startsWith("data:") }?.let { fixUrl(it) }
                 newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
             }
     }
