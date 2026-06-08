@@ -5,16 +5,16 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 
-class DonghuaFun4KProvider : MainAPI() {
+class DonghuaFunProvider : MainAPI() {
     override var mainUrl = "https://donghuafun.com"
-    override var name = "DonghuaFun (4K)"
+    override var name = "DonghuaFun (4K only)"
     override var lang = "en"
     override val hasMainPage = true
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime)
 
     companion object {
-        private const val TAG = "DonghuaFun4K"
+        private const val TAG = "DonghuaFun"
         private val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
     }
 
@@ -25,7 +25,7 @@ class DonghuaFun4KProvider : MainAPI() {
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
     // -------------------------------------------------------------------
-    //  Main page (same as before)
+    //  Main page
     // -------------------------------------------------------------------
     override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/type/id/20.html"         to "Trending Donghua",
@@ -52,7 +52,7 @@ class DonghuaFun4KProvider : MainAPI() {
     }
 
     // -------------------------------------------------------------------
-    //  Detail – only 4K source (Dailymotion)
+    //  Detail – only 4K (Dailymotion) source, deduplicated
     // -------------------------------------------------------------------
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
@@ -71,10 +71,10 @@ class DonghuaFun4KProvider : MainAPI() {
         val tags = doc.select("a[href*='/class/']").mapNotNull { it.text().trim().takeIf(String::isNotEmpty) }
         val year = doc.selectFirst("a[href*='/year/']")?.text()?.toIntOrNull()
 
-        // --- Extract ONLY the 4K (Dailymotion) source episodes ---
+        // --- Extract only the 4K (Dailymotion) source episodes ---
         val episodes = mutableListOf<Episode>()
 
-        // Find the 4K source tab (usually first one with "4K" text or data-form="dailymotion")
+        // Find the 4K tab (usually "4K" or data-form="dailymotion")
         val fourKTab = doc.select(".anthology-tab a.vod-playerUrl").firstOrNull { tab ->
             tab.text().contains("4K", ignoreCase = true) ||
             tab.attr("data-form").equals("dailymotion", ignoreCase = true)
@@ -86,7 +86,7 @@ class DonghuaFun4KProvider : MainAPI() {
                 ?: doc.select(".anthology-list-box").firstOrNull()
 
             val episodeLinks = listDiv?.select("a[href*='/vod/play/id/$showId/']") ?: emptyList()
-            val episodeMap = mutableMapOf<Int, Episode>() // episode number -> episode
+            val episodeMap = mutableMapOf<Int, Episode>()
 
             for (a in episodeLinks) {
                 val epUrl = fixUrl(a.attr("href"))
@@ -98,27 +98,10 @@ class DonghuaFun4KProvider : MainAPI() {
                 }
             }
 
-            // Sort ascending and add to list
             episodes.addAll(episodeMap.toSortedMap().values)
         }
 
-        // Fallback: if no 4K source found, try to generate episodes from any source but avoid duplicates
-        if (episodes.isEmpty()) {
-            val allLinks = doc.select("a[href*='/vod/play/id/$showId/']")
-            val uniqueEpisodes = mutableMapOf<Int, Episode>()
-            for (a in allLinks) {
-                val epUrl = fixUrl(a.attr("href"))
-                val epName = a.selectFirst("span")?.text()?.trim() ?: a.text().trim()
-                val epNumber = parseEpisodeNumber(epName)
-                if (epNumber > 0 && !uniqueEpisodes.containsKey(epNumber)) {
-                    val episode = newEpisode(epUrl) { name = "EP$epNumber" }
-                    uniqueEpisodes[epNumber] = episode
-                }
-            }
-            episodes.addAll(uniqueEpisodes.toSortedMap().values)
-        }
-
-        // Last resort: generate numeric episodes
+        // Fallback: if no 4K source found, generate numeric episodes using sid=1 (assumed 4K)
         if (episodes.isEmpty() && showId.isNotEmpty()) {
             val epCountText = doc.selectFirst(".video-info-main em, .detail-status")?.text() ?: ""
             val epCount = Regex("""EP(\d+)""").find(epCountText)
@@ -138,14 +121,13 @@ class DonghuaFun4KProvider : MainAPI() {
         }
     }
 
-    // Extract numeric episode number from strings like "EP227", "EP31", "Movie"
     private fun parseEpisodeNumber(name: String): Int {
         val match = Regex("""EP(\d+)""", RegexOption.IGNORE_CASE).find(name)
         return match?.groupValues?.get(1)?.toIntOrNull() ?: -1
     }
 
     // -------------------------------------------------------------------
-    //  Link extraction – only Dailymotion (4K)
+    //  Link extraction – Dailymotion only
     // -------------------------------------------------------------------
     override suspend fun loadLinks(
         data: String,
@@ -155,14 +137,11 @@ class DonghuaFun4KProvider : MainAPI() {
     ): Boolean {
         val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to data)
 
-        // 1) First try to get Dailymotion ID from the page
-        val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
-        
-        // Look for Dailymotion embed or player_aaaa JSON
-        val html = doc?.html() ?: ""
+        // 1) Try to get Dailymotion ID from player_aaaa JSON
+        val html = try { app.get(data, headers = headers).text } catch (e: Exception) { "" }
         val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
             .find(html)?.groupValues?.get(1)
-        
+
         if (playerJson != null) {
             val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)
             val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
@@ -177,6 +156,7 @@ class DonghuaFun4KProvider : MainAPI() {
         }
 
         // 2) Search for any Dailymotion iframe
+        val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
         doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
             val src = iframe.attr("src")
             val dmId = extractDailymotionId(src)
@@ -186,7 +166,7 @@ class DonghuaFun4KProvider : MainAPI() {
             }
         }
 
-        // 3) Fallback: try to get Dailymotion ID from any link or script
+        // 3) Fallback: regex on entire HTML
         val dmIdMatch = Regex("""dailymotion\.com/(?:embed/)?video/([a-zA-Z0-9]+)""").find(html)
         if (dmIdMatch != null) {
             val dmId = dmIdMatch.groupValues[1]
@@ -199,15 +179,13 @@ class DonghuaFun4KProvider : MainAPI() {
     }
 
     private fun extractDailymotionId(urlOrId: String): String? {
-        // If it's already just an ID (20+ alphanumeric)
         if (urlOrId.matches(Regex("^[a-zA-Z0-9]{15,}$"))) return urlOrId
-        // Extract from URL
         val pattern = Regex("""dailymotion\.com/(?:embed/)?video/([a-zA-Z0-9]+)""")
         return pattern.find(urlOrId)?.groupValues?.get(1)
     }
 
     // -------------------------------------------------------------------
-    //  Card parser (no changes)
+    //  Card parser
     // -------------------------------------------------------------------
     private fun parseShowCards(doc: Document): List<SearchResponse> {
         return doc.select("a[href*='/vod/detail/id/']")
