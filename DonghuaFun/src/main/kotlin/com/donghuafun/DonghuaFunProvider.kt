@@ -85,7 +85,6 @@ class DonghuaFunProvider : MainAPI() {
         
         if (sourceTabs.isNotEmpty() && episodeContainers.isNotEmpty()) {
             sourceTabs.forEachIndexed { idx, tab ->
-                // Get source name (e.g., "4K", "1080P ENG", "1080P Indo")
                 val sourceName = tab.ownText().trim().ifEmpty { 
                     tab.text().trim()
                 }.replace(Regex("""\d+"""), "").trim().ifEmpty { "Source ${idx + 1}" }
@@ -102,7 +101,6 @@ class DonghuaFunProvider : MainAPI() {
                 }
             }
         } else {
-            // Fallback: parse all episode links
             doc.select("a[href*='/vod/play/id/$showId/']").forEach { a ->
                 val epHref = fixUrl(a.attr("href"))
                 val epNum = a.text().trim().ifEmpty { 
@@ -114,7 +112,6 @@ class DonghuaFunProvider : MainAPI() {
             }
         }
 
-        // Sort episodes by episode number (ascending)
         episodes.sortBy { episode ->
             val name = episode.name ?: ""
             Regex("""EP(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull() ?: Int.MAX_VALUE
@@ -146,7 +143,6 @@ class DonghuaFunProvider : MainAPI() {
 
         Log.d(TAG, "Loading: showId=$showId, sid=$sid, nid=$nid")
 
-        // Fetch the play page HTML
         val html = try {
             app.get(data, headers = headers).document
         } catch (e: Exception) {
@@ -154,46 +150,37 @@ class DonghuaFunProvider : MainAPI() {
             return false
         }
 
-        // ─── Strategy 1: Extract script containing player_aaaa ───────────────────
+        // Strategy 1: Extract player_aaaa JSON
         val scriptWithPlayer = html.select("script").firstOrNull { it.data().contains("player_aaaa") }
-        
         if (scriptWithPlayer != null) {
             val scriptContent = scriptWithPlayer.data()
             val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
                 .find(scriptContent)?.groupValues?.get(1)
-            
             if (playerJson != null) {
-                Log.d(TAG, "Found player_aaaa JSON for source $sid")
                 if (extractFromPlayerJson(playerJson, data, headers, subtitleCallback, callback)) {
                     return true
                 }
             }
         }
 
-        // ─── Strategy 2: Look for iframes (Fallback) ────────────────────────────
+        // Strategy 2: iframe
         val iframe = html.select("iframe[src*='dailymotion']").firstOrNull()
         if (iframe != null) {
-            val iframeUrl = iframe.attr("src")
-            Log.d(TAG, "Found iframe: $iframeUrl")
-            return extractDailymotion(iframeUrl, callback)
+            return extractDailymotion(iframe.attr("src"), callback)
         }
 
-        // ─── Strategy 3: Look for video sources (Fallback) ──────────────────────
+        // Strategy 3: video source
         val videoSource = html.select("video source, video").firstOrNull()
         if (videoSource != null) {
             val videoUrl = videoSource.attr("src").ifEmpty { videoSource.attr("data-src") }
             if (videoUrl.isNotEmpty()) {
-                Log.d(TAG, "Found video source: $videoUrl")
                 callback(createExtractorLink(videoUrl, data, headers))
                 return true
             }
         }
 
-        Log.w(TAG, "No video source found for sid=$sid, nid=$nid")
         return false
     }
-
-    // ─── Extract from player_aaaa JSON ─────────────────────────────────────────
 
     private suspend fun extractFromPlayerJson(
         json: String,
@@ -202,23 +189,15 @@ class DonghuaFunProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Extract the URL field
         val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1)
             ?.replace("\\/", "/") ?: return false
-        
-        // Extract encryption type (if any)
         val encryptType = Regex(""""encrypt"\s*:\s*(\d+)""").find(json)
             ?.groupValues?.get(1)?.toIntOrNull() ?: 0
-        
-        // Extract the source type (dailymotion, etc.)
         val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1) ?: ""
 
-        // Decode the URL if encrypted
         val decodedUrl = decodeUrl(rawUrl, encryptType)
-        
         Log.d(TAG, "Decoded URL: from=$from, url=$decodedUrl")
 
-        // Route to appropriate extractor
         return when {
             decodedUrl.contains("dailymotion") || from.contains("dailymotion", ignoreCase = true) -> {
                 extractDailymotion(decodedUrl, callback)
@@ -232,23 +211,16 @@ class DonghuaFunProvider : MainAPI() {
                 true
             }
             else -> {
-                // Try to load using the extractor system
                 loadExtractor(decodedUrl, referer, subtitleCallback, callback)
             }
         }
     }
 
-    // ─── Dailymotion Extractor ─────────────────────────────────────────────────
-
     private suspend fun extractDailymotion(url: String, callback: (ExtractorLink) -> Unit): Boolean {
-        // Extract video ID from various Dailymotion URL formats
         val videoId = Regex("""dailymotion\.com/(?:video/|embed/video/|embed/)([a-zA-Z0-9]+)""")
             .find(url)?.groupValues?.get(1)
             ?: Regex("""^([a-zA-Z0-9]+)$""").find(url)?.groupValues?.get(1)
-            ?: run {
-                Log.e(TAG, "Could not extract Dailymotion video ID from: $url")
-                return false
-            }
+            ?: return false
 
         val embedUrl = "https://www.dailymotion.com/embed/video/$videoId"
         val headers = mapOf(
@@ -256,82 +228,61 @@ class DonghuaFunProvider : MainAPI() {
             "Referer" to "https://www.dailymotion.com/"
         )
 
-        Log.d(TAG, "Fetching Dailymotion embed: $embedUrl")
-
         val html = try {
             app.get(embedUrl, headers = headers).text
         } catch (e: Exception) {
-            Log.e(TAG, "Dailymotion fetch failed: ${e.message}")
             return false
         }
 
-        // Try to extract all available quality streams
         val qualities = listOf("1080", "720", "480", "380", "240")
         var found = false
-        
         for (quality in qualities) {
             val pattern = Regex(""""$quality":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)"""")
-            val match = pattern.find(html)
-            if (match != null) {
+            pattern.find(html)?.let { match ->
                 val m3u8 = match.groupValues[1].replace("\\/", "/")
-                val qualityValue = when (quality) {
-                    "1080" -> 1080
-                    "720" -> 720
-                    "480" -> 480
-                    "380" -> 380
-                    else -> 240
-                }
-                
-                newExtractorLink(
-                    source = name,
-                    name = "$name $quality",
-                    url = m3u8,
-                    type = ExtractorLinkType.M3U8,
-                    quality = qualityValue
-                ) {
+                val link = newExtractorLink(
+                    name,
+                    "$name $quality",
+                    m3u8,
+                    ExtractorLinkType.M3U8,
+                    when (quality) {
+                        "1080" -> 1080
+                        "720" -> 720
+                        "480" -> 480
+                        "380" -> 380
+                        else -> 240
+                    }
+                ).apply {
                     this.referer = "https://www.dailymotion.com/"
                     this.headers = headers
-                }.let { callback(it) }
-                
+                }
+                callback(link)
                 found = true
             }
         }
 
-        // Fallback: try to find any m3u8 URL in the page
         if (!found) {
             val anyM3u8 = Regex("""(https?://[^\s"']+\.m3u8[^\s"']*)""").find(html)?.value?.replace("\\/", "/")
             if (anyM3u8 != null) {
-                newExtractorLink(
-                    source = name,
-                    name = name,
-                    url = anyM3u8,
-                    type = ExtractorLinkType.M3U8,
-                    quality = 720
-                ) {
+                val link = newExtractorLink(name, name, anyM3u8, ExtractorLinkType.M3U8, 720).apply {
                     this.referer = "https://www.dailymotion.com/"
                     this.headers = headers
-                }.let { callback(it) }
+                }
+                callback(link)
                 found = true
             }
         }
-
         return found
     }
 
-    // ─── Helper Functions ──────────────────────────────────────────────────────
-
-    private fun createExtractorLink(
-        url: String,
-        referer: String,
-        headers: Map<String, String>
-    ): ExtractorLink {
+    private fun createExtractorLink(url: String, referer: String, headers: Map<String, String>): ExtractorLink {
         return newExtractorLink(
-            source = name,
-            name = name,
-            url = url,
-            type = if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-            quality = 1080
-        ) {
+            name,
+            name,
+            url,
+            if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+            1080
+        ).apply {
             this.referer = referer
             this.headers = headers
         }
@@ -347,12 +298,9 @@ class DonghuaFunProvider : MainAPI() {
             }
             decoded.replace("\\/", "/")
         } catch (e: Exception) {
-            Log.e(TAG, "URL decode failed: ${e.message}")
             raw.replace("\\/", "/")
         }
     }
-
-    // ─── Document Helper ───────────────────────────────────────────────────────
 
     private fun Document.parseShowCards(): List<SearchResponse> {
         return select("a[href*='/vod/detail/id/']")
@@ -360,20 +308,14 @@ class DonghuaFunProvider : MainAPI() {
             .mapNotNull { a ->
                 val href = fixUrl(a.attr("href"))
                 if (href.isEmpty()) return@mapNotNull null
-                
                 val title = a.attr("title").ifEmpty {
                     a.selectFirst("img")?.attr("alt") ?: a.text()
                 }.trim()
-                
                 if (title.isEmpty()) return@mapNotNull null
-                
                 val poster = a.selectFirst("img")?.let {
                     it.attr("data-src").ifEmpty { it.attr("src") }
                 }?.let { if (it.startsWith("data:")) null else fixUrl(it) }
-                
-                newAnimeSearchResponse(title, href, TvType.Anime) { 
-                    this.posterUrl = poster 
-                }
+                newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
             }
     }
 }
