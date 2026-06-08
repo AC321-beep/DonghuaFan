@@ -157,7 +157,14 @@ class DonghuaFunProvider : MainAPI() {
         if (videoSource != null) {
             val videoUrl = videoSource.attr("src").ifEmpty { videoSource.attr("data-src") }
             if (videoUrl.isNotEmpty()) {
-                callback(createExtractorLink(videoUrl, data, headers))
+                val link = newExtractorLink(name, name, videoUrl, 
+                    if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                ) {
+                    this.quality = 1080
+                    this.referer = data
+                    this.headers = headers
+                }
+                callback(link)
                 return true
             }
         }
@@ -186,11 +193,21 @@ class DonghuaFunProvider : MainAPI() {
                 extractDailymotion(decodedUrl, callback)
             }
             decodedUrl.contains(".m3u8") -> {
-                callback(createExtractorLink(decodedUrl, referer, headers))
+                val link = newExtractorLink(name, name, decodedUrl, ExtractorLinkType.M3U8) {
+                    this.quality = 1080
+                    this.referer = referer
+                    this.headers = headers
+                }
+                callback(link)
                 true
             }
             decodedUrl.contains(".mp4") -> {
-                callback(createExtractorLink(decodedUrl, referer, headers))
+                val link = newExtractorLink(name, name, decodedUrl, ExtractorLinkType.VIDEO) {
+                    this.quality = 1080
+                    this.referer = referer
+                    this.headers = headers
+                }
+                callback(link)
                 true
             }
             else -> {
@@ -252,19 +269,6 @@ class DonghuaFunProvider : MainAPI() {
             }
         }
         return found
-    }
-
-    private fun createExtractorLink(url: String, referer: String, headers: Map<String, String>): ExtractorLink {
-        return newExtractorLink(
-            name,
-            name,
-            url,
-            if (url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-        ) {
-            this.quality = 1080
-            this.referer = referer
-            this.headers = headers
-        }
     }
 
     private fun decodeUrl(raw: String, encryptType: Int): String {
