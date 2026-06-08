@@ -7,5 +7,4 @@ cloudstream {
     tvTypes = listOf("Anime")
     language = "zh"
     iconUrl = "https://donghuafun.com/template/shoutu45/assets/images/logo-1.png"
-    pluginClassName = "com.donghuafun.DonghuaFunPlugin"
 }
