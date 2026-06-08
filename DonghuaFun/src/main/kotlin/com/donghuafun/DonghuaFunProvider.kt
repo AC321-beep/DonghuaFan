@@ -4,7 +4,6 @@ import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
-import kotlin.math.ceil
 
 class DonghuaFunProvider : MainAPI() {
     override var mainUrl = "https://donghuafun.com"
@@ -44,7 +43,7 @@ class DonghuaFunProvider : MainAPI() {
         val pageUrl = if (page == 1) request.data
                      else request.data.replace(".html", "/page/$page.html")
         val doc = app.get(pageUrl).document
-        return newHomePageResponse(request.name, doc.parseShowCards())
+        return newHomePageResponse(request.name, parseShowCards(doc))
     }
 
     // -------------------------------------------------------------------
@@ -55,7 +54,7 @@ class DonghuaFunProvider : MainAPI() {
             "$mainUrl/index.php/vod/search.html",
             params = mapOf("wd" to query)
         ).document
-        return doc.parseShowCards()
+        return parseShowCards(doc)
     }
 
     // -------------------------------------------------------------------
@@ -79,12 +78,11 @@ class DonghuaFunProvider : MainAPI() {
         val year = doc.selectFirst("a[href*='/year/']")?.text()?.toIntOrNull()
 
         // Raw episodes before sorting
-        val rawEpisodes = mutableListOf<Pair<Episode, Int>>() // episode + numeric order key
+        val rawEpisodes = mutableListOf<Pair<Episode, Int>>()
 
         // 1) Episode list from anthology tabs (multiple servers)
         val serverTabs = doc.select(".anthology-tab a.vod-playerUrl")
-        val container = doc.selectFirst(".anthology-list")
-        if (container != null && serverTabs.isNotEmpty()) {
+        if (serverTabs.isNotEmpty()) {
             serverTabs.forEachIndexed { idx, tab ->
                 val serverName = tab.text().trim()
                 val serverId = tab.attr("data-form")
@@ -109,9 +107,7 @@ class DonghuaFunProvider : MainAPI() {
                 val epUrl = fixUrl(a.attr("href"))
                 val epName = a.text().trim()
                 val episodeNumber = parseEpisodeNumber(epName)
-                val episode = newEpisode(epUrl) {
-                    name = epName
-                }
+                val episode = newEpisode(epUrl) { name = epName }
                 rawEpisodes.add(episode to episodeNumber)
             }
         }
@@ -123,19 +119,17 @@ class DonghuaFunProvider : MainAPI() {
                 ?.groupValues?.get(1)?.toIntOrNull() ?: 1
             for (n in 1..epCount) {
                 val epUrl = "$mainUrl/index.php/vod/play/id/$showId/sid/1/nid/$n.html"
-                val episode = newEpisode(epUrl) {
-                    name = "EP$n"
-                }
+                val episode = newEpisode(epUrl) { name = "EP$n" }
                 rawEpisodes.add(episode to n)
             }
         }
 
-        // Sort episodes: regular numeric episodes ascending, then specials (e.g., Movie) at the end
+        // Sort episodes: numeric ascending, then specials at the end
         val sortedEpisodes = rawEpisodes.sortedWith(compareBy({ it.second }, { it.first.name }))
             .map { it.first }
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
-            posterUrl = poster?.fixUrl()
+            posterUrl = poster?.let { fixUrl(it) }
             plot = description
             tags?.let { this.tags = it }
             year?.let { this.year = it }
@@ -143,24 +137,18 @@ class DonghuaFunProvider : MainAPI() {
         }
     }
 
-    // Helper: extract numeric episode number from name like "EP227", "EP226", "Movie P1" -> high number, etc.
+    // Helper: extract numeric episode number
     private fun parseEpisodeNumber(name: String): Int {
-        // Try to find "EP" followed by digits
         val match = Regex("""EP(\d+)""", RegexOption.IGNORE_CASE).find(name)
-        if (match != null) {
-            return match.groupValues[1].toInt()
-        }
-        // Handle specials like "Movie P1", "Movie P2" -> assign a high number (e.g., 10000 + index)
+        if (match != null) return match.groupValues[1].toInt()
         if (name.contains("movie", ignoreCase = true) || name.contains("special", ignoreCase = true)) {
-            // Use a hash to keep order but push to end
             return 10000 + name.hashCode().coerceIn(0, 9999)
         }
-        // If no number found, push to end
         return Int.MAX_VALUE
     }
 
     // -------------------------------------------------------------------
-    //  Link extraction (same as before)
+    //  Link extraction (unchanged)
     // -------------------------------------------------------------------
     override suspend fun loadLinks(
         data: String,
@@ -234,7 +222,7 @@ class DonghuaFunProvider : MainAPI() {
     }
 
     // -------------------------------------------------------------------
-    //  JSON extractor (unchanged)
+    //  JSON extractor
     // -------------------------------------------------------------------
     private suspend fun extractFromPlayerJson(
         json: String,
@@ -286,7 +274,6 @@ class DonghuaFunProvider : MainAPI() {
             return true
         }
 
-        // Generic embed fallback
         return loadExtractor(decodedUrl, referer, subtitleCallback, callback)
     }
 
@@ -308,10 +295,10 @@ class DonghuaFunProvider : MainAPI() {
     }
 
     // -------------------------------------------------------------------
-    //  Card parser
+    //  Card parser (now a regular private method, not an extension)
     // -------------------------------------------------------------------
-    private fun Document.parseShowCards(): List<SearchResponse> {
-        return select("a[href*='/vod/detail/id/']")
+    private fun parseShowCards(doc: Document): List<SearchResponse> {
+        return doc.select("a[href*='/vod/detail/id/']")
             .distinctBy { it.attr("href") }
             .mapNotNull { a ->
                 val href = fixUrl(a.attr("href"))
