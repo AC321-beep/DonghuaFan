@@ -95,7 +95,9 @@ class DonghuaFunProvider : MainAPI() {
                     val epHref = fixUrl(a.attr("href"))
                     val epNum = a.select("span").first()?.text()?.trim() ?: a.text().trim()
                     if (epHref.isNotEmpty() && epNum.isNotEmpty()) {
-                        episodes.add(Episode(epHref, name = "$epNum [$sourceName]"))
+                        episodes.add(newEpisode(epHref) {
+                            name = "$epNum [$sourceName]"
+                        })
                     }
                 }
             }
@@ -106,20 +108,23 @@ class DonghuaFunProvider : MainAPI() {
                 val epNum = a.text().trim().ifEmpty { 
                     Regex("""nid/(\d+)""").find(epHref)?.groupValues?.get(1)?.let { "EP$it" } ?: "Episode"
                 }
-                episodes.add(Episode(epHref, name = epNum))
+                episodes.add(newEpisode(epHref) {
+                    name = epNum
+                })
             }
         }
 
         // Sort episodes by episode number (ascending)
-        episodes.sortBy { ep ->
-            Regex("""EP(\d+)""").find(ep.name)?.groupValues?.get(1)?.toIntOrNull() ?: Int.MAX_VALUE
+        episodes.sortBy { episode ->
+            val name = episode.name ?: ""
+            Regex("""EP(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull() ?: Int.MAX_VALUE
         }
 
         return newAnimeLoadResponse(title ?: name, url, TvType.Anime) {
             posterUrl = poster?.let { fixUrl(it) }
             plot = description
-            tags?.let { this.tags = it }
-            year?.let { this.year = it }
+            this.tags = tags
+            this.year = year
             addEpisodes(DubStatus.None, episodes)
         }
     }
@@ -261,19 +266,23 @@ class DonghuaFunProvider : MainAPI() {
         }
 
         // Try to extract all available quality streams
-        val qualityPatterns = listOf(
-            Triple("1080", Regex(""""1080":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)""""), 1080),
-            Triple("720", Regex(""""720":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)""""), 720),
-            Triple("480", Regex(""""480":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)""""), 480),
-            Triple("380", Regex(""""380":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)""""), 380),
-            Triple("240", Regex(""""240":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)""""), 240)
-        )
-
+        val qualities = listOf("1080", "720", "480", "380", "240")
         var found = false
-        for ((quality, pattern, qualityValue) in qualityPatterns) {
-            pattern.find(html)?.let { match ->
+        
+        for (quality in qualities) {
+            val pattern = Regex(""""$quality":\s*\{\s*"(?:auto|en|fr)":\s*"([^"]+\.m3u8[^"]*)"""")
+            val match = pattern.find(html)
+            if (match != null) {
                 val m3u8 = match.groupValues[1].replace("\\/", "/")
-                callback(newExtractorLink(
+                val qualityValue = when (quality) {
+                    "1080" -> 1080
+                    "720" -> 720
+                    "480" -> 480
+                    "380" -> 380
+                    else -> 240
+                }
+                
+                newExtractorLink(
                     source = name,
                     name = "$name $quality",
                     url = m3u8,
@@ -282,7 +291,8 @@ class DonghuaFunProvider : MainAPI() {
                 ) {
                     this.referer = "https://www.dailymotion.com/"
                     this.headers = headers
-                })
+                }.let { callback(it) }
+                
                 found = true
             }
         }
@@ -291,7 +301,7 @@ class DonghuaFunProvider : MainAPI() {
         if (!found) {
             val anyM3u8 = Regex("""(https?://[^\s"']+\.m3u8[^\s"']*)""").find(html)?.value?.replace("\\/", "/")
             if (anyM3u8 != null) {
-                callback(newExtractorLink(
+                newExtractorLink(
                     source = name,
                     name = name,
                     url = anyM3u8,
@@ -300,7 +310,7 @@ class DonghuaFunProvider : MainAPI() {
                 ) {
                     this.referer = "https://www.dailymotion.com/"
                     this.headers = headers
-                })
+                }.let { callback(it) }
                 found = true
             }
         }
