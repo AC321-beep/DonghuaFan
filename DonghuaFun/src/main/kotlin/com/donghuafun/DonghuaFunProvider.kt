@@ -2,9 +2,11 @@ package com.donghuafun
 
 import android.util.Log
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 
+@CloudstreamPlugin
 class DonghuaFunProvider : MainAPI() {
     override var mainUrl = "https://donghuafun.com"
     override var name = "DonghuaFun"
@@ -15,11 +17,7 @@ class DonghuaFunProvider : MainAPI() {
 
     companion object {
         private const val TAG = "DonghuaFun"
-
-        // MacCMS v10 JSON API — returns real player_aaaa data that the
-        // play page HTML deliberately omits for SEO bots.
-        // Parameters: mid=1 (module), id=showId, sid=source, nid=episode index
-        private const val PLAYER_API = "/index.php/ajax/suggest"
+        private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
     }
 
     // ── URL Helpers ────────────────────────────────────────────────────────────
@@ -101,7 +99,7 @@ class DonghuaFunProvider : MainAPI() {
                 ?.groupValues?.get(1)?.toIntOrNull() ?: 1
             for (n in 1..epCount) {
                 episodes.add(newEpisode("$mainUrl/index.php/vod/play/id/$showId/sid/1/nid/$n.html") {
-                    name = "EP${epCount - n + 1}"
+                    name = "EP$n"
                 })
             }
         }
@@ -125,16 +123,18 @@ class DonghuaFunProvider : MainAPI() {
     ): Boolean {
         val showId = detailUrlToId(data)
         val (sid, nid) = sidNidFromPlayUrl(data)
+        val headers = mapOf(
+            "User-Agent" to USER_AGENT,
+            "Referer"    to data
+        )
 
-        Log.d(TAG, "loadLinks: showId=$showId sid=$sid nid=$nid  url=$data")
+        Log.d(TAG, "loadLinks: showId=$showId sid=$sid nid=$nid")
 
-        // ── Strategy 1: MacCMS JSON API (the real player data source) ─────────
-        // The play page HTML is an SEO shell — player_aaaa is only in the API response.
+        // ── Strategy 1: MacCMS JSON API ───────────────────────────────────────
         if (showId.isNotEmpty()) {
             try {
-                val apiUrl = "$mainUrl$PLAYER_API"
-                val apiResponse = app.get(
-                    apiUrl,
+                val apiJson = app.get(
+                    "$mainUrl/index.php/ajax/suggest",
                     params = mapOf(
                         "mid"  to "1",
                         "id"   to showId,
@@ -143,41 +143,35 @@ class DonghuaFunProvider : MainAPI() {
                         "type" to "1",
                     ),
                     headers = mapOf(
+                        "User-Agent"       to USER_AGENT,
                         "Referer"          to data,
                         "X-Requested-With" to "XMLHttpRequest",
-                        "Accept"           to "application/json, text/javascript, */*; q=0.01",
                     ),
-                    referer = data,
-                )
-                val apiJson = apiResponse.text
+                ).text
+
                 Log.d(TAG, "API response: $apiJson")
 
                 if (apiJson.isNotEmpty() && apiJson != "false" && !apiJson.startsWith("<")) {
-                    if (handlePlayerJson(apiJson, data, subtitleCallback, callback)) return true
+                    if (extractVideoFromJson(apiJson, data, headers, subtitleCallback, callback)) return true
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "API call failed: ${e.message}")
             }
         }
 
-        // ── Strategy 2: Parse raw play page HTML as fallback ──────────────────
-        // Some MacCMS setups still inline player_aaaa in the HTML for logged-in users.
-        val html = try { app.get(data).text } catch (e: Exception) { "" }
-        Log.d(TAG, "HTML fallback snippet: ${html.take(1000)}")
+        // ── Strategy 2: Inline player_aaaa in HTML ────────────────────────────
+        val html = try { app.get(data, headers = headers).text } catch (e: Exception) { "" }
 
-        val playerJsonRaw = listOf("player_aaaa", "player_aaab", "player_data")
-            .firstNotNullOfOrNull { varName ->
-                Regex("""$varName\s*=\s*(\{.+?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-                    .find(html)?.groupValues?.get(1)
-            }
+        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+            .find(html)?.groupValues?.get(1)
 
-        if (playerJsonRaw != null) {
-            Log.d(TAG, "Found inline playerJson: $playerJsonRaw")
-            if (handlePlayerJson(playerJsonRaw, data, subtitleCallback, callback)) return true
+        if (playerJson != null) {
+            Log.d(TAG, "Found inline player_aaaa")
+            if (extractVideoFromJson(playerJson, data, headers, subtitleCallback, callback)) return true
         }
 
         // ── Strategy 3: iframe scan ───────────────────────────────────────────
-        val doc = try { app.get(data).document } catch (e: Exception) { null }
+        val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
         doc?.select("iframe[src], iframe[data-src]")?.forEach { iframe ->
             val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
             if (src.isNotEmpty()) {
@@ -189,61 +183,122 @@ class DonghuaFunProvider : MainAPI() {
         return false
     }
 
-    // ── Player JSON Handler ────────────────────────────────────────────────────
+    // ── Video Extractor ────────────────────────────────────────────────────────
 
-    private suspend fun handlePlayerJson(
+    private suspend fun extractVideoFromJson(
         json: String,
         referer: String,
+        headers: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1)
-            ?: return false
+            ?.replace("\\/", "/") ?: return false
         val encryptType = Regex(""""encrypt"\s*:\s*(\d+)""").find(json)
             ?.groupValues?.get(1)?.toIntOrNull() ?: 0
         val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1) ?: ""
 
-        Log.d(TAG, "from=$from  rawUrl=$rawUrl  encrypt=$encryptType")
-
-        val videoUrl = decodeVideoUrl(rawUrl, encryptType)
+        val decodedUrl = decodeVideoUrl(rawUrl, encryptType)
             .let { if (it.startsWith("//")) "https:$it" else it }
 
-        Log.d(TAG, "decoded videoUrl=$videoUrl")
+        Log.d(TAG, "from=$from  decodedUrl=$decodedUrl")
 
-        // Dailymotion (sid/1 = 4K source in the working screenshots)
-        if (videoUrl.contains("dailymotion.com") ||
-            from.contains("dm", ignoreCase = true) ||
-            from.contains("dailymotion", ignoreCase = true)) {
+        // ── Dailymotion ───────────────────────────────────────────────────────
+        val isDailymotion = from.contains("dailymotion", ignoreCase = true) ||
+                            from.contains("dm", ignoreCase = true) ||
+                            decodedUrl.contains("dailymotion.com")
+
+        if (isDailymotion) {
             val dmId = Regex("""dailymotion\.com/(?:video/|embed/video/)([a-zA-Z0-9]+)""")
-                .find(videoUrl)?.groupValues?.get(1)
-            val dmUrl = if (dmId != null) "https://www.dailymotion.com/video/$dmId" else videoUrl
-            Log.d(TAG, "Dailymotion: $dmUrl")
-            loadExtractor(dmUrl, referer, subtitleCallback, callback)
+                .find(decodedUrl)?.groupValues?.get(1) ?: decodedUrl
+
+            val dmEmbedUrl = "https://www.dailymotion.com/embed/video/$dmId"
+            val dmHeaders = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Referer"    to "https://www.dailymotion.com/"
+            )
+
+            Log.d(TAG, "Fetching Dailymotion embed: $dmEmbedUrl")
+
+            val dmHtml = try {
+                app.get(dmEmbedUrl, headers = dmHeaders).text
+            } catch (e: Exception) {
+                Log.e(TAG, "Dailymotion fetch failed: ${e.message}")
+                return false
+            }
+
+            val qualityMap = mapOf(
+                "1080" to Qualities.P1080.value,
+                "720"  to Qualities.P720.value,
+                "480"  to Qualities.P480.value,
+                "380"  to Qualities.P360.value,
+                "240"  to Qualities.P240.value,
+            )
+
+            var found = false
+            qualityMap.forEach { (label, quality) ->
+                val m3u8 = Regex(""""${label}":\s*\{"(?:auto|en)":\s*"([^"]+\.m3u8[^"]*)"""")
+                    .find(dmHtml)?.groupValues?.get(1)?.replace("\\/", "/")
+                if (m3u8 != null) {
+                    Log.d(TAG, "Dailymotion ${label}p: $m3u8")
+                    callback(newExtractorLink(name, "$name ${label}p", m3u8, ExtractorLinkType.M3U8) {
+                        this.referer  = "https://www.dailymotion.com/"
+                        this.quality  = quality
+                        this.headers  = dmHeaders
+                    })
+                    found = true
+                }
+            }
+
+            // Fallback: any m3u8 in the Dailymotion page
+            if (!found) {
+                Regex("""(https://[^\s"']+\.m3u8[^\s"']*)""").findAll(dmHtml).forEach { match ->
+                    val m3u8 = match.value.replace("\\/", "/")
+                    Log.d(TAG, "Dailymotion fallback m3u8: $m3u8")
+                    callback(newExtractorLink(name, name, m3u8, ExtractorLinkType.M3U8) {
+                        this.referer = "https://www.dailymotion.com/"
+                        this.quality = Qualities.P720.value
+                        this.headers = dmHeaders
+                    })
+                    found = true
+                }
+            }
+
+            return found
+        }
+
+        // ── OkRu ──────────────────────────────────────────────────────────────
+        if (decodedUrl.contains("ok.ru") || from.contains("okru", ignoreCase = true)) {
+            Log.d(TAG, "OkRu: $decodedUrl")
+            loadExtractor(decodedUrl, referer, subtitleCallback, callback)
             return true
         }
 
-        // OkRu (sid/3 in the working screenshots)
-        if (videoUrl.contains("ok.ru") || from.contains("okru", ignoreCase = true)) {
-            Log.d(TAG, "OkRu: $videoUrl")
-            loadExtractor(videoUrl, referer, subtitleCallback, callback)
-            return true
-        }
-
-        // Direct .m3u8 / .mp4 stream
-        if (videoUrl.contains(".m3u8") || videoUrl.contains(".mp4")) {
-            callback(newExtractorLink(name, name, videoUrl,
-                if (videoUrl.contains(".mp4")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
-            ) {
+        // ── Direct .m3u8 ──────────────────────────────────────────────────────
+        if (decodedUrl.contains(".m3u8")) {
+            Log.d(TAG, "Direct m3u8: $decodedUrl")
+            callback(newExtractorLink(name, name, decodedUrl, ExtractorLinkType.M3U8) {
                 this.referer = referer
                 this.quality = Qualities.P1080.value
+                this.headers = headers
             })
             return true
         }
 
-        // Any other embed URL — let CloudStream's built-in extractors handle it
-        if (loadExtractor(videoUrl, referer, subtitleCallback, callback)) return true
+        // ── Direct .mp4 ───────────────────────────────────────────────────────
+        if (decodedUrl.contains(".mp4")) {
+            Log.d(TAG, "Direct mp4: $decodedUrl")
+            callback(newExtractorLink(name, name, decodedUrl, ExtractorLinkType.VIDEO) {
+                this.referer = referer
+                this.quality = Qualities.P1080.value
+                this.headers = headers
+            })
+            return true
+        }
 
-        return false
+        // ── Generic embed — let CloudStream's built-in extractors handle it ───
+        Log.d(TAG, "Generic fallback: $decodedUrl")
+        return loadExtractor(decodedUrl, referer, subtitleCallback, callback)
     }
 
     // ── Decode Helper ──────────────────────────────────────────────────────────
