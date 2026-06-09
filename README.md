@@ -1,4 +1,4 @@
-**** Important Note****
+** Important Note**
 
 This extension was created with no prior programming experience and was developed primarily with the assistance of AI tools. The code, configuration, and documentation were generated and refined through AI-assisted development.
 As this project is still under active development, it may contain bugs, errors, incomplete features, or other inconsistencies. Contributions, feedback, and issue reports are welcome.
