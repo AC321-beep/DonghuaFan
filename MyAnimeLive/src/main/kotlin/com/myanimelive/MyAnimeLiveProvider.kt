@@ -25,32 +25,36 @@ class MyAnimeLiveProvider : MainAPI() {
         val doc = app.get(request.data).document
         val seriesMap = mutableMapOf<String, SearchResponse>()
 
-        // Select each article/post on the homepage
         doc.select("article").forEach { article ->
             val titleElem = article.selectFirst("h2.entry-title a")
             val title = titleElem?.text()?.trim() ?: return@forEach
-            // Extract series name: remove episode info, e.g., "Zhe Tian - Shrouding the Heavens episode 166" -> "Zhe Tian"
-            val seriesName = title
-                .substringBefore(" episode")
-                .substringBefore(" Episode")
-                .substringBefore("- episode")
-                .substringBefore("- Episode")
-                .replace(Regex("""\s+episode\s+\d+.*$"""), "", ignoreCase = true)
-                .replace(Regex("""\s+EP\s+\d+.*$"""), "", ignoreCase = true)
-                .trim()
-                .let { if (it.contains("-")) it.substringBefore("-").trim() else it }
+
+            // Extract series name: remove episode info
+            var seriesName = title
+                .substringBefore(" episode", missingDelimiterValue = title)
+                .substringBefore(" Episode", missingDelimiterValue = title)
+                .substringBefore("- episode", missingDelimiterValue = title)
+                .substringBefore("- Episode", missingDelimiterValue = title)
+
+            // Remove any remaining "episode 123" or "EP 123" using regex
+            val episodePattern = Regex("""\s+[Ee]p(?:isode)?\s+\d+.*$""")
+            seriesName = episodePattern.replace(seriesName, "").trim()
+
+            // If title contains " - ", take the part before it
+            if (seriesName.contains(" - ")) {
+                seriesName = seriesName.substringBefore(" - ").trim()
+            }
 
             if (seriesName.isBlank()) return@forEach
 
             val slug = seriesName.lowercase().replace(" ", "-")
-            val seriesUrl = "$mainUrl/tag/$slug/"  // try tag page first
+            val seriesUrl = "$mainUrl/tag/$slug/"
 
             if (!seriesMap.containsKey(seriesUrl)) {
                 seriesMap[seriesUrl] = newAnimeSearchResponse(seriesName, seriesUrl, TvType.Anime)
             }
         }
 
-        // If for some reason we got nothing, fallback to scanning first page of posts
         if (seriesMap.isEmpty()) {
             Log.d(TAG, "No series extracted from homepage, falling back to archive scan")
             return fallbackToArchiveScan()
@@ -75,7 +79,6 @@ class MyAnimeLiveProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
 
-        // If it's a tag page (contains /tag/)
         if (url.contains("/tag/")) {
             val seriesName = doc.selectFirst("h1.page-title")?.text()
                 ?.replace("Tag: ", "")?.trim() ?: "Unknown Series"
@@ -95,7 +98,6 @@ class MyAnimeLiveProvider : MainAPI() {
                 addEpisodes(DubStatus.None, episodes)
             }
         } else {
-            // Single episode page – treat as series with one episode (fallback)
             val title = doc.selectFirst("h1.entry-title")?.text()?.trim() ?: "Episode"
             val seriesName = title.substringBefore(" episode").substringBefore(" Episode").trim()
             val epNum = extractEpisodeNumber(title)
@@ -128,19 +130,16 @@ class MyAnimeLiveProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data).document
 
-        // Direct Dailymotion link
         val dmLink = doc.selectFirst("a[href*='dailymotion.com/video/']")?.attr("href")
         if (dmLink != null) {
             return loadExtractor(dmLink, data, subtitleCallback, callback)
         }
 
-        // Iframe
         val iframeSrc = doc.selectFirst("iframe[src*='dailymotion.com']")?.attr("src")
         if (iframeSrc != null) {
             return loadExtractor(iframeSrc, data, subtitleCallback, callback)
         }
 
-        // Regex fallback
         val html = doc.html()
         val dmId = Regex("""dailymotion\.com/video/([a-zA-Z0-9]+)""").find(html)?.groupValues?.get(1)
         if (dmId != null) {
