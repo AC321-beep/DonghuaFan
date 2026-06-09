@@ -3,6 +3,7 @@ package com.myanimelive
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import org.jsoup.nodes.Document
 
 class MyAnimeLiveProvider : MainAPI() {
     override var mainUrl = "https://myanime.live"
@@ -16,39 +17,62 @@ class MyAnimeLiveProvider : MainAPI() {
         private const val TAG = "MyAnimeLive"
     }
 
+    // Use the /tags/ page which lists all series (tags)
     override val mainPage = mainPageOf(
-        "$mainUrl/post-sitemap.xml" to "All Series"
+        "$mainUrl/tags/" to "All Series"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val doc = app.get(request.data).document
-        val seriesMap = mutableMapOf<String, SearchResponse>()
+        val seriesList = doc.select("a[rel='tag']").mapNotNull { a ->
+            val name = a.text().trim()
+            val url = fixUrl(a.attr("href"))
+            if (name.isNotBlank() && url.isNotBlank()) {
+                newAnimeSearchResponse(name, url, TvType.Anime)
+            } else null
+        }.distinctBy { it.url }
 
-        doc.select("loc").forEach { loc ->
-            val url = loc.text()
-            // Match series slug from URL like https://myanime.live/series-name/episode-123/
-            val match = Regex("""$mainUrl/([^/]+)/episode-\d+/?""").find(url)
-            if (match != null) {
-                val slug = match.groupValues[1]
-                val seriesName = slug.replace("-", " ")
-                    .split(" ")
-                    .joinToString(" ") { it.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() } }
-                if (!seriesMap.containsKey(slug)) {
-                    // Use the tag page URL if it exists, otherwise first episode
-                    val seriesUrl = "$mainUrl/tag/$slug/"
-                    seriesMap[slug] = newAnimeSearchResponse(seriesName, seriesUrl, TvType.Anime)
-                }
-            }
+        // If tags page fails (empty), fallback to scanning recent posts
+        val finalList = if (seriesList.isEmpty()) {
+            Log.d(TAG, "Tags page empty, falling back to archive scan")
+            scanArchiveForSeries()
+        } else {
+            seriesList
         }
 
-        return newHomePageResponse(request.name, seriesMap.values.toList())
+        return newHomePageResponse(request.name, finalList)
+    }
+
+    private suspend fun scanArchiveForSeries(): List<SearchResponse> {
+        val seriesMap = mutableMapOf<String, SearchResponse>()
+        // Check first 3 pages of the blog archive
+        for (i in 1..3) {
+            val url = if (i == 1) mainUrl else "$mainUrl/page/$i/"
+            val doc = app.get(url).document
+            doc.select("article h2.entry-title a").forEach { link ->
+                val postUrl = link.attr("href")
+                // Extract series slug from post URL: e.g., /zhe-tian/episode-123/ -> zhe-tian
+                val slug = postUrl.substringAfter(mainUrl).substringAfter("/").substringBefore("/")
+                if (slug.isNotBlank() && !slug.contains("episode")) {
+                    val seriesName = slug.replace("-", " ")
+                        .split(" ")
+                        .joinToString(" ") { it.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() } }
+                    val seriesUrl = "$mainUrl/tag/$slug/"
+                    if (!seriesMap.containsKey(slug)) {
+                        seriesMap[slug] = newAnimeSearchResponse(seriesName, seriesUrl, TvType.Anime)
+                    }
+                }
+            }
+            if (seriesMap.size >= 30) break
+        }
+        return seriesMap.values.toList()
     }
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
 
         if (url.contains("/tag/")) {
-            // Tag page: list all episodes from this tag
+            // Tag page: list episodes
             val seriesName = doc.selectFirst("h1.page-title")?.text()
                 ?.replace("Tag: ", "")?.trim() ?: "Unknown Series"
 
@@ -67,7 +91,7 @@ class MyAnimeLiveProvider : MainAPI() {
                 addEpisodes(DubStatus.None, episodes)
             }
         } else {
-            // Single episode page – treat as series with one episode
+            // Single episode fallback
             val title = doc.selectFirst("h1.entry-title")?.text()?.trim() ?: "Episode"
             val seriesName = title.substringBefore(" Episode").trim()
             val epNum = extractEpisodeNumber(title)
@@ -100,19 +124,19 @@ class MyAnimeLiveProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data).document
 
-        // 1. Direct Dailymotion link
+        // Direct Dailymotion link
         val dmLink = doc.selectFirst("a[href*='dailymotion.com/video/']")?.attr("href")
         if (dmLink != null) {
             return loadExtractor(dmLink, data, subtitleCallback, callback)
         }
 
-        // 2. Dailymotion iframe
+        // Iframe
         val iframeSrc = doc.selectFirst("iframe[src*='dailymotion.com']")?.attr("src")
         if (iframeSrc != null) {
             return loadExtractor(iframeSrc, data, subtitleCallback, callback)
         }
 
-        // 3. Regex fallback
+        // Regex fallback
         val html = doc.html()
         val dmId = Regex("""dailymotion\.com/video/([a-zA-Z0-9]+)""").find(html)?.groupValues?.get(1)
         if (dmId != null) {
