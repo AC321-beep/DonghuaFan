@@ -1,5 +1,3 @@
-package com.donghuafun
-
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -22,9 +20,9 @@ class DonghuaFunProvider : MainAPI() {
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
     override val mainPage = mainPageOf(
-        "$mainUrl/index.php/vod/type/id/20.html"         to "Trending Donghua",
-        "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
-        "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
+        "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",  // 1st
+        "$mainUrl/index.php/vod/type/id/20.html"         to "Trending Donghua",   // 2nd
+        "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",       // 3rd
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
