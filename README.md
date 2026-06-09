@@ -1,24 +1,24 @@
 ** Important Note**
 
-This extension was created with no prior programming experience and was developed primarily with the assistance of AI tools. The code, configuration, and documentation were generated and refined through AI-assisted development.
-As this project is still under active development, it may contain bugs, errors, incomplete features, or other inconsistencies. Contributions, feedback, and issue reports are welcome.
+This project was created with no prior programming experience and was developed primarily with the assistance of AI tools. The code, configuration, and documentation were generated and refined through AI-assisted development.
+As the project is still under active development, it may contain bugs, errors, incomplete features, or other inconsistencies. Contributions, feedback, and issue reports are welcome.
 
 **Acknowledgements**
 
-Special thanks to phisher98 for the reference repositories and examples that helped guide the development of this extension.
+Special thanks to phisher98 for the reference repositories and examples that guided the development of this extension.
 
-Thanks also to the CloudStream community for providing TestPlugin, along with the documentation, examples, and open-source resources that were instrumental in the development of this project.
+Thanks to the CloudStream community for TestPlugin, documentation, examples, and open-source resources that made this project possible.
 
 **📜 License**
 
-This project is released into the public domain. You are free to use, modify, and distribute it without restriction.
+This project is free and open-source software licensed under the GNU General Public License (GPL).
 
-**⚖️ DMCA & Legal Disclaimer**
+⚖️ DMCA & Legal Disclaimer
 
-This extension does not host, store, or distribute any content. It only acts as a tool for accessing third-party sources.
-The developer is not responsible for any content accessed through this extension or for any legal consequences resulting from its use.
-Users are responsible for:
-Complying with all applicable laws in their jurisdiction.
-Respecting copyright and intellectual property rights.
-Accessing only content they are legally permitted to view.
-Any copyrighted content remains the property of its respective owners. Use of this extension is entirely at the user's own risk and responsibility.
+This project is intended for educational and research purposes only. It functions as a tool for accessing content from third-party sources and does not host, store, or distribute any media.
+
+- All content is hosted by independent third-party providers.
+- Users are solely responsible for their use of this project and for complying with applicable laws and copyright regulations.
+- All copyrights, trademarks, and other intellectual property rights belong to their respective owners.
+
+If you believe any content infringes your rights, please contact the relevant content host or provider directly, as this project has no control over third-party content.
