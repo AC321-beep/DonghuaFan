@@ -22,9 +22,9 @@ class DonghuaFunProvider : MainAPI() {
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
     override val mainPage = mainPageOf(
-        "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",  // 1st
-        "$mainUrl/index.php/vod/type/id/20.html"         to "Trending Donghua",   // 2nd
-        "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",       // 3rd
+        "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
+        "$mainUrl/index.php/vod/type/id/20.html"         to "Trending Donghua",
+        "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -120,44 +120,53 @@ class DonghuaFunProvider : MainAPI() {
         val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to data)
 
         val html = try { app.get(data, headers = headers).text } catch (e: Exception) { "" }
-        
-        // Look for player_aaaa JSON (contains Dailymotion URL)
+
+        // 1. Look for player_aaaa JSON (contains Dailymotion URL)
         val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
             .find(html)?.groupValues?.get(1)
 
         if (playerJson != null) {
             val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)
             val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
-            
+
             if (from.equals("dailymotion", ignoreCase = true) || rawUrl?.contains("dailymotion") == true) {
                 val dmId = extractDailymotionId(rawUrl ?: "")
                 if (dmId != null) {
-                    val embedUrl = "https://www.dailymotion.com/embed/video/$dmId"
-                    return loadExtractor(embedUrl, data, subtitleCallback, callback)
+                    // ✅ Use VIDEO page, not embed (fixes 1080p audio)
+                    val videoUrl = "https://www.dailymotion.com/video/$dmId"
+                    return loadExtractor(videoUrl, data, subtitleCallback, callback)
                 }
             }
         }
 
-        // Fallback: find any Dailymotion iframe
+        // 2. Fallback: find any Dailymotion iframe
         val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
         doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
             val src = iframe.attr("src")
             val dmId = extractDailymotionId(src)
             if (dmId != null) {
-                val embedUrl = "https://www.dailymotion.com/embed/video/$dmId"
-                return loadExtractor(embedUrl, data, subtitleCallback, callback)
+                val videoUrl = "https://www.dailymotion.com/video/$dmId"
+                return loadExtractor(videoUrl, data, subtitleCallback, callback)
             }
         }
 
-        // Last resort: regex on HTML
+        // 3. Last resort: regex on HTML
         val dmIdMatch = Regex("""dailymotion\.com/(?:embed/)?video/([a-zA-Z0-9]+)""").find(html)
         if (dmIdMatch != null) {
             val dmId = dmIdMatch.groupValues[1]
-            val embedUrl = "https://www.dailymotion.com/embed/video/$dmId"
-            return loadExtractor(embedUrl, data, subtitleCallback, callback)
+            val videoUrl = "https://www.dailymotion.com/video/$dmId"
+            return loadExtractor(videoUrl, data, subtitleCallback, callback)
         }
 
-        Log.d(TAG, "No Dailymotion source found for $data")
+        // 4. If no Dailymotion, try any other iframe source
+        doc?.select("iframe[src]")?.forEach { iframe ->
+            val src = fixUrl(iframe.attr("src"))
+            if (src.isNotBlank() && !src.contains("dailymotion")) {
+                if (loadExtractor(src, data, subtitleCallback, callback)) return true
+            }
+        }
+
+        Log.d(TAG, "No playable source found for $data")
         return false
     }
 
