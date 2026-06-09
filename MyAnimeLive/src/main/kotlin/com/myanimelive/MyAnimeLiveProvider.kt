@@ -3,7 +3,6 @@ package com.myanimelive
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.nodes.Document
 
 class MyAnimeLiveProvider : MainAPI() {
     override var mainUrl = "https://myanime.live"
@@ -17,62 +16,67 @@ class MyAnimeLiveProvider : MainAPI() {
         private const val TAG = "MyAnimeLive"
     }
 
-    // Use the /tags/ page which lists all series (tags)
+    // Use the homepage (recent posts) to extract unique series
     override val mainPage = mainPageOf(
-        "$mainUrl/tags/" to "All Series"
+        mainUrl to "Latest Series"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val doc = app.get(request.data).document
-        val seriesList = doc.select("a[rel='tag']").mapNotNull { a ->
-            val name = a.text().trim()
-            val url = fixUrl(a.attr("href"))
-            if (name.isNotBlank() && url.isNotBlank()) {
-                newAnimeSearchResponse(name, url, TvType.Anime)
-            } else null
-        }.distinctBy { it.url }
+        val seriesMap = mutableMapOf<String, SearchResponse>()
 
-        // If tags page fails (empty), fallback to scanning recent posts
-        val finalList = if (seriesList.isEmpty()) {
-            Log.d(TAG, "Tags page empty, falling back to archive scan")
-            scanArchiveForSeries()
-        } else {
-            seriesList
+        // Select each article/post on the homepage
+        doc.select("article").forEach { article ->
+            val titleElem = article.selectFirst("h2.entry-title a")
+            val title = titleElem?.text()?.trim() ?: return@forEach
+            // Extract series name: remove episode info, e.g., "Zhe Tian - Shrouding the Heavens episode 166" -> "Zhe Tian"
+            val seriesName = title
+                .substringBefore(" episode")
+                .substringBefore(" Episode")
+                .substringBefore("- episode")
+                .substringBefore("- Episode")
+                .replace(Regex("""\s+episode\s+\d+.*$"""), "", ignoreCase = true)
+                .replace(Regex("""\s+EP\s+\d+.*$"""), "", ignoreCase = true)
+                .trim()
+                .let { if (it.contains("-")) it.substringBefore("-").trim() else it }
+
+            if (seriesName.isBlank()) return@forEach
+
+            val slug = seriesName.lowercase().replace(" ", "-")
+            val seriesUrl = "$mainUrl/tag/$slug/"  // try tag page first
+
+            if (!seriesMap.containsKey(seriesUrl)) {
+                seriesMap[seriesUrl] = newAnimeSearchResponse(seriesName, seriesUrl, TvType.Anime)
+            }
         }
 
-        return newHomePageResponse(request.name, finalList)
+        // If for some reason we got nothing, fallback to scanning first page of posts
+        if (seriesMap.isEmpty()) {
+            Log.d(TAG, "No series extracted from homepage, falling back to archive scan")
+            return fallbackToArchiveScan()
+        }
+
+        return newHomePageResponse(request.name, seriesMap.values.toList())
     }
 
-    private suspend fun scanArchiveForSeries(): List<SearchResponse> {
-        val seriesMap = mutableMapOf<String, SearchResponse>()
-        // Check first 3 pages of the blog archive
-        for (i in 1..3) {
-            val url = if (i == 1) mainUrl else "$mainUrl/page/$i/"
-            val doc = app.get(url).document
-            doc.select("article h2.entry-title a").forEach { link ->
-                val postUrl = link.attr("href")
-                // Extract series slug from post URL: e.g., /zhe-tian/episode-123/ -> zhe-tian
-                val slug = postUrl.substringAfter(mainUrl).substringAfter("/").substringBefore("/")
-                if (slug.isNotBlank() && !slug.contains("episode")) {
-                    val seriesName = slug.replace("-", " ")
-                        .split(" ")
-                        .joinToString(" ") { it.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() } }
-                    val seriesUrl = "$mainUrl/tag/$slug/"
-                    if (!seriesMap.containsKey(slug)) {
-                        seriesMap[slug] = newAnimeSearchResponse(seriesName, seriesUrl, TvType.Anime)
-                    }
-                }
-            }
-            if (seriesMap.size >= 30) break
-        }
-        return seriesMap.values.toList()
+    private suspend fun fallbackToArchiveScan(): HomePageResponse {
+        val doc = app.get(mainUrl).document
+        val fallbackList = doc.select("article h2.entry-title a").mapNotNull { link ->
+            val url = fixUrl(link.attr("href"))
+            val title = link.text().trim()
+            val seriesName = title.substringBefore(" episode").substringBefore(" Episode").trim()
+            if (seriesName.isNotBlank()) {
+                newAnimeSearchResponse(seriesName, url, TvType.Anime)
+            } else null
+        }.distinctBy { it.url }
+        return newHomePageResponse("Latest Series (fallback)", fallbackList)
     }
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
 
+        // If it's a tag page (contains /tag/)
         if (url.contains("/tag/")) {
-            // Tag page: list episodes
             val seriesName = doc.selectFirst("h1.page-title")?.text()
                 ?.replace("Tag: ", "")?.trim() ?: "Unknown Series"
 
@@ -91,9 +95,9 @@ class MyAnimeLiveProvider : MainAPI() {
                 addEpisodes(DubStatus.None, episodes)
             }
         } else {
-            // Single episode fallback
+            // Single episode page – treat as series with one episode (fallback)
             val title = doc.selectFirst("h1.entry-title")?.text()?.trim() ?: "Episode"
-            val seriesName = title.substringBefore(" Episode").trim()
+            val seriesName = title.substringBefore(" episode").substringBefore(" Episode").trim()
             val epNum = extractEpisodeNumber(title)
             val episode = newEpisode(url) {
                 name = if (epNum != null) "Episode $epNum" else title
