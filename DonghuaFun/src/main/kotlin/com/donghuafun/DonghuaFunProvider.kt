@@ -8,7 +8,7 @@ import org.jsoup.nodes.Document
 class DonghuaFunProvider : MainAPI() {
     override var mainUrl = "https://donghuafun.com"
     override var name = "DonghuaFun (4K)"
-    override var lang = "en"
+    override var lang = "zh"
     override val hasMainPage = true
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime)
@@ -59,17 +59,13 @@ class DonghuaFunProvider : MainAPI() {
         val tags = doc.select("a[href*='/class/']").mapNotNull { it.text().trim().takeIf(String::isNotEmpty) }
         val year = doc.selectFirst("a[href*='/year/']")?.text()?.toIntOrNull()
 
-        // --- Extract episodes from the 4K tab (first tab, usually labelled "4K") ---
-        val episodes = mutableListOf<Episode>()
-
-        // Get all server tabs
-        val tabs = doc.select(".anthology-tab a.vod-playerUrl")
-        // Find index of the 4K tab (text contains "4K" or first tab)
+            val episodes = mutableListOf<Episode>()
+         val tabs = doc.select(".anthology-tab a.vod-playerUrl")
+      
         val fourKTabIndex = tabs.indexOfFirst { it.text().contains("4K", ignoreCase = true) }
         val targetIndex = if (fourKTabIndex != -1) fourKTabIndex else 0 // fallback to first tab
 
-        // Get all episode list containers
-        val listContainers = doc.select(".anthology-list-box")
+            val listContainers = doc.select(".anthology-list-box")
         if (targetIndex < listContainers.size) {
             val container = listContainers[targetIndex]
             val episodeLinks = container.select("a[href*='/vod/play/id/$showId/']")
@@ -88,8 +84,7 @@ class DonghuaFunProvider : MainAPI() {
             Log.d(TAG, "Found ${episodes.size} episodes from 4K tab")
         }
 
-        // Fallback: if still no episodes, generate numeric up to a reasonable max (e.g., 300)
-        if (episodes.isEmpty() && showId.isNotEmpty()) {
+              if (episodes.isEmpty() && showId.isNotEmpty()) {
             Log.d(TAG, "No episodes found from tabs, generating numeric range 1..300")
             for (n in 1..300) {
                 val epUrl = "$mainUrl/index.php/vod/play/id/$showId/sid/1/nid/$n.html"
@@ -121,7 +116,7 @@ class DonghuaFunProvider : MainAPI() {
 
         val html = try { app.get(data, headers = headers).text } catch (e: Exception) { "" }
 
-        // 1. Look for player_aaaa JSON (contains Dailymotion URL)
+       
         val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
             .find(html)?.groupValues?.get(1)
 
@@ -132,14 +127,14 @@ class DonghuaFunProvider : MainAPI() {
             if (from.equals("dailymotion", ignoreCase = true) || rawUrl?.contains("dailymotion") == true) {
                 val dmId = extractDailymotionId(rawUrl ?: "")
                 if (dmId != null) {
-                    // ✅ Use VIDEO page, not embed (fixes 1080p audio)
+                  
                     val videoUrl = "https://www.dailymotion.com/video/$dmId"
                     return loadExtractor(videoUrl, data, subtitleCallback, callback)
                 }
             }
         }
 
-        // 2. Fallback: find any Dailymotion iframe
+      
         val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
         doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
             val src = iframe.attr("src")
@@ -150,7 +145,7 @@ class DonghuaFunProvider : MainAPI() {
             }
         }
 
-        // 3. Last resort: regex on HTML
+   
         val dmIdMatch = Regex("""dailymotion\.com/(?:embed/)?video/([a-zA-Z0-9]+)""").find(html)
         if (dmIdMatch != null) {
             val dmId = dmIdMatch.groupValues[1]
@@ -158,7 +153,7 @@ class DonghuaFunProvider : MainAPI() {
             return loadExtractor(videoUrl, data, subtitleCallback, callback)
         }
 
-        // 4. If no Dailymotion, try any other iframe source
+    
         doc?.select("iframe[src]")?.forEach { iframe ->
             val src = fixUrl(iframe.attr("src"))
             if (src.isNotBlank() && !src.contains("dailymotion")) {
