@@ -1,7 +1,7 @@
 version = 1
 
 cloudstream {
-    description = "Watch Donghua (Chinese Animation) from donghuafun.com"
+    description = "Donghua (Chinese Animation)"
     authors = listOf("AC321-beep")
     status = 1
     tvTypes = listOf("Anime")
