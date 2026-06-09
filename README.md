@@ -7,7 +7,7 @@ As this project is still under active development, it may contain bugs, errors, 
 
 Special thanks to phisher98 for the reference repositories and examples that helped guide the development of this extension.
 
-Thanks also to the CloudStream community and the builders of TestPlugin for their documentation, examples, and open-source contributions, which were instrumental in understanding the plugin architecture and developing this project.
+Thanks also to the CloudStream community for providing TestPlugin, along with the documentation, examples, and open-source resources that were instrumental in the development of this project.
 
 **📜 License**
 
