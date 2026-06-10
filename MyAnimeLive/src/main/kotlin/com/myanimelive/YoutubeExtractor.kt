@@ -8,10 +8,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.services.youtube.linkHandler.YoutubeStreamLinkHandlerFactory
 
-/**
- * Custom YouTube extractor using NewPipe.
- * Works even when CloudStream's built‑in extractor is broken.
- */
 class YoutubeExtractor : ExtractorApi() {
     override val name = "YouTube (Custom)"
     override val mainUrl = "https://www.youtube.com"
@@ -28,7 +24,7 @@ class YoutubeExtractor : ExtractorApi() {
             val extractor = ServiceList.YouTube.getStreamExtractor(linkHandler)
             extractor.fetchPage()
 
-            // Video streams (muxed + video‑only)
+            // Video streams
             for (stream in extractor.videoStreams + extractor.videoOnlyStreams) {
                 val videoUrl = stream.content ?: continue
                 val height = stream.height ?: 0
@@ -45,7 +41,7 @@ class YoutubeExtractor : ExtractorApi() {
                 )
             }
 
-            // Audio streams (optional, for DASH)
+            // Audio streams (optional)
             for (audio in extractor.audioStreams) {
                 val audioUrl = audio.content ?: continue
                 callback(
