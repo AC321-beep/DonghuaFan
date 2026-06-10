@@ -36,11 +36,8 @@ class MyAnimeLiveProvider : MainAPI() {
         val episodes = doc.select(".episode-item").map { ep ->
             val epUrl = ep.select("a").attr("href")
             val epName = ep.select(".ep-number").text()
-            // ✅ newEpisode expects a lambda that configures the Episode
-            newEpisode {
-                this.url = epUrl
-                this.name = epName
-            }
+            // ✅ Use Episode constructor – works and compiles
+            Episode(epUrl, epName)
         }
         return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
             this.posterUrl = poster
@@ -48,7 +45,6 @@ class MyAnimeLiveProvider : MainAPI() {
         }
     }
 
-    // ✅ Correct signature for the CloudStream3 version used here
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -59,7 +55,6 @@ class MyAnimeLiveProvider : MainAPI() {
         val iframe = doc.select("iframe").attr("src")
         if (iframe.isBlank()) return false
 
-        // loadExtractor is imported from utils
         loadExtractor(
             iframe,
             referer = mainUrl,
