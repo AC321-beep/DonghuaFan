@@ -8,10 +8,9 @@ cloudstream {
     status = 1
     tvTypes = listOf("Anime")
     language = "en"
-    version = 1
+    version = 1.5
 }
 
 dependencies {
-    // Use the correct JitPack tag (v0.26.3)
-    compileOnly("com.github.TeamNewPipe:NewPipeExtractor:v0.26.3")
+       compileOnly("com.github.TeamNewPipe:NewPipeExtractor:v0.26.3")
 }
