@@ -5,9 +5,12 @@ android {
 cloudstream {
     description = "Anime from myanimelive"
     authors = listOf("AC321-beep")
-    status = 1                // 0 = disabled, 1 = working, 2 = broken, etc.
+    status = 1
     tvTypes = listOf("Anime")
     language = "en"
-    version = 1               // ⬅️ Add this line – must be an integer
-    // iconUrl = optional
+    version = 1
+}
+
+dependencies {
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:0.24.1")
 }
