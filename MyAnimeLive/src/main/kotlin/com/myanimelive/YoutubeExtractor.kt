@@ -18,8 +18,8 @@ class YoutubeExtractor : ExtractorApi() {
         referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        return try {
+    ) {
+        try {
             val linkHandler = YoutubeStreamLinkHandlerFactory.getInstance().fromUrl(url)
             val extractor = ServiceList.YouTube.getStreamExtractor(linkHandler)
             extractor.fetchPage()
@@ -63,9 +63,8 @@ class YoutubeExtractor : ExtractorApi() {
                     subtitleCallback(SubtitleFile(lang, subUrl))
                 }
             }
-            true
         } catch (e: Exception) {
-            false
+            // Extraction failed – do nothing
         }
     }
 }
