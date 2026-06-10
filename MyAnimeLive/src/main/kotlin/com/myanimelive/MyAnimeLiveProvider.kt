@@ -164,12 +164,22 @@ class MyAnimeLiveProvider : MainAPI() {
         return patterns.firstNotNullOfOrNull { it.find(text)?.groupValues?.get(1)?.toIntOrNull() }
     }
 
+    // --------------------------------------------------------------
+    // loadLinks: direct call to custom YouTube extractor (Option A)
+    // --------------------------------------------------------------
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // 1) Direct handling of YouTube URLs using our custom extractor
+        if (data.contains("youtube.com/watch") || data.contains("youtu.be/") || data.contains("/shorts/")) {
+            val ytExtractor = YoutubeExtractor()
+            return ytExtractor.getUrl(data, null, subtitleCallback, callback)
+        }
+
+        // 2) For other sources (Dailymotion, ok.ru, etc.) use the normal extractor chain
         val doc = app.get(data).document
         val html = doc.html()
 
@@ -177,7 +187,7 @@ class MyAnimeLiveProvider : MainAPI() {
             return loadExtractor(url, data, subtitleCallback, callback)
         }
 
-        // Check all iframes for video sources
+        // Check iframes
         for (iframe in doc.select("iframe")) {
             val src = iframe.attr("src")
             when {
@@ -186,9 +196,9 @@ class MyAnimeLiveProvider : MainAPI() {
                     if (videoId != null) return tryLoad("https://www.dailymotion.com/video/$videoId")
                     return tryLoad(src)
                 }
-                src.contains("youtube.com/embed/") || src.contains("youtu.be") -> return tryLoad(src)
                 src.contains("ok.ru") -> return tryLoad(src)
                 src.contains("streamtape") || src.contains("mp4upload") -> return tryLoad(src)
+                // YouTube iframes are already handled above – skip them here
             }
         }
 
@@ -199,10 +209,6 @@ class MyAnimeLiveProvider : MainAPI() {
         // Dailymotion ID via regex
         val dmId = Regex("""dailymotion\.com/video/([a-zA-Z0-9]+)""").find(html)?.groupValues?.get(1)
         if (dmId != null) return tryLoad("https://www.dailymotion.com/video/$dmId")
-
-        // YouTube direct links
-        val ytLink = doc.selectFirst("a[href*='youtube.com/watch?v=']")?.attr("href")
-        if (ytLink != null) return tryLoad(ytLink)
 
         // ok.ru direct links
         val okLink = doc.selectFirst("a[href*='ok.ru/video/']")?.attr("href")
