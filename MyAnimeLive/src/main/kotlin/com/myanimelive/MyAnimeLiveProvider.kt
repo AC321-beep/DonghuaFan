@@ -17,9 +17,7 @@ class MyAnimeLiveProvider : MainAPI() {
         private const val TAG = "MyAnimeLive"
     }
 
-    override val mainPage = mainPageOf(
-        mainUrl to "Latest Series"
-    )
+    override val mainPage = mainPageOf(mainUrl to "Latest Series")
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val doc = app.get(request.data).document
@@ -35,27 +33,27 @@ class MyAnimeLiveProvider : MainAPI() {
                 .substringBefore(" Episode", missingDelimiterValue = title)
                 .replace(Regex("""\s+[Ee]p(?:isode)?\.?\s*\d+.*$"""), "")
                 .trim()
-
-            // Remove "english sub" suffix
             seriesName = Regex("""\s+english\s+sub$""", RegexOption.IGNORE_CASE).replace(seriesName, "")
-
             if (seriesName.isBlank() || seriesName.length < 3) {
                 seriesName = title.split(Regex("[-–:]"))[0].trim()
             }
-
             if (seriesName.isBlank()) return@forEach
+
+            // Extract poster from the article's thumbnail
+            val poster = article.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
 
             val encodedName = URLEncoder.encode(seriesName, "UTF-8")
             val seriesUrl = "$mainUrl/?s=$encodedName"
 
             if (!seriesMap.containsKey(seriesUrl)) {
-                seriesMap[seriesUrl] = newAnimeSearchResponse(seriesName, seriesUrl, TvType.Anime)
+                val response = newAnimeSearchResponse(seriesName, seriesUrl, TvType.Anime)
+                response.posterUrl = poster
+                seriesMap[seriesUrl] = response
             }
         }
 
         if (seriesMap.isEmpty()) {
             Log.e(TAG, "No series extracted from homepage")
-            // Use the new helper for empty response
             return newHomePageResponse("", emptyList())
         }
 
@@ -67,24 +65,42 @@ class MyAnimeLiveProvider : MainAPI() {
         Log.d(TAG, "Loading URL: $url")
 
         if (url.contains("?s=")) {
+            // This is a search results page (series episode list) – fetch all pages
             val seriesName = doc.selectFirst("h1.page-header-title span")?.text()?.trim()
                 ?: doc.selectFirst("title")?.text()?.substringBefore(" - ") ?: "Unknown Series"
 
-            val episodes = doc.select("article").mapNotNull { article ->
-                val link = article.selectFirst("h2.entry-header-title a")
-                val epUrl = link?.attr("href")?.let { fixUrl(it) } ?: return@mapNotNull null
-                val epTitle = link.text().trim()
-                val epNum = extractEpisodeNumber(epTitle)
-                newEpisode(epUrl) {
-                    name = if (epNum != null) "Episode $epNum" else epTitle
-                    episode = epNum
-                }
-            }.sortedBy { it.episode ?: Int.MAX_VALUE }
+            // Get poster from first article's thumbnail
+            val poster = doc.selectFirst("article img")?.attr("src")?.let { fixUrl(it) }
 
+            val allEpisodes = mutableListOf<Episode>()
+            var currentUrl = url
+            while (currentUrl.isNotBlank()) {
+                val pageDoc = app.get(currentUrl).document
+                val episodes = pageDoc.select("article").mapNotNull { article ->
+                    val link = article.selectFirst("h2.entry-header-title a")
+                    val epUrl = link?.attr("href")?.let { fixUrl(it) } ?: return@mapNotNull null
+                    val epTitle = link.text().trim()
+                    val epNum = extractEpisodeNumber(epTitle)
+                    newEpisode(epUrl) {
+                        name = if (epNum != null) "Episode $epNum" else epTitle
+                        episode = epNum
+                        posterUrl = article.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
+                    }
+                }
+                allEpisodes.addAll(episodes)
+
+                // Find "Next" pagination link
+                val nextLink = pageDoc.selectFirst("a.next.page-numbers")?.attr("href")
+                currentUrl = if (nextLink != null && nextLink != currentUrl) fixUrl(nextLink) else ""
+            }
+
+            val sortedEpisodes = allEpisodes.sortedBy { it.episode ?: Int.MAX_VALUE }
             return newAnimeLoadResponse(seriesName, url, TvType.Anime) {
-                addEpisodes(DubStatus.None, episodes)
+                addEpisodes(DubStatus.None, sortedEpisodes)
+                posterUrl = poster
             }
         } else {
+            // Direct episode page – treat as single episode series
             val title = doc.selectFirst("h1.entry-header-title")?.text()?.trim() ?: "Episode"
             var seriesName = title
                 .substringBefore(" episode", missingDelimiterValue = title)
@@ -93,13 +109,18 @@ class MyAnimeLiveProvider : MainAPI() {
                 .trim()
             seriesName = Regex("""\s+english\s+sub$""", RegexOption.IGNORE_CASE).replace(seriesName, "")
             if (seriesName.isBlank()) seriesName = "Unknown Series"
+
             val epNum = extractEpisodeNumber(title)
+            val poster = doc.selectFirst("article img")?.attr("src")?.let { fixUrl(it) }
+
             val episode = newEpisode(url) {
                 name = if (epNum != null) "Episode $epNum" else title
                 episode = epNum
+                posterUrl = poster
             }
             return newAnimeLoadResponse(seriesName, url, TvType.Anime) {
                 addEpisodes(DubStatus.None, listOf(episode))
+                posterUrl = poster
             }
         }
     }
