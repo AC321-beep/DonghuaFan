@@ -17,7 +17,6 @@ class MyAnimeLiveProvider : MainAPI() {
         private const val TAG = "MyAnimeLive"
     }
 
-    // Homepage -> list of latest episodes grouped by series (using search)
     override val mainPage = mainPageOf(
         mainUrl to "Latest Series"
     )
@@ -26,28 +25,26 @@ class MyAnimeLiveProvider : MainAPI() {
         val doc = app.get(request.data).document
         val seriesMap = mutableMapOf<String, SearchResponse>()
 
-        // Select each article (post) on homepage
         doc.select("article").forEach { article ->
             val titleLink = article.selectFirst("h2.entry-header-title a")
             val title = titleLink?.text()?.trim() ?: return@forEach
             val episodeUrl = titleLink.attr("href").let { fixUrl(it) }
 
-            // Extract series name by removing episode and subtitle info
             var seriesName = title
                 .substringBefore(" episode", missingDelimiterValue = title)
                 .substringBefore(" Episode", missingDelimiterValue = title)
                 .replace(Regex("""\s+[Ee]p(?:isode)?\.?\s*\d+.*$"""), "")
-                .replace(Regex("""\s+english\s+sub$"""), "", ignoreCase = true)
                 .trim()
 
-            // Fallback: take part before a hyphen or colon
+            // Remove "english sub" suffix
+            seriesName = Regex("""\s+english\s+sub$""", RegexOption.IGNORE_CASE).replace(seriesName, "")
+
             if (seriesName.isBlank() || seriesName.length < 3) {
                 seriesName = title.split(Regex("[-–:]"))[0].trim()
             }
 
             if (seriesName.isBlank()) return@forEach
 
-            // Use search URL to get all episodes of this series
             val encodedName = URLEncoder.encode(seriesName, "UTF-8")
             val seriesUrl = "$mainUrl/?s=$encodedName"
 
@@ -58,7 +55,8 @@ class MyAnimeLiveProvider : MainAPI() {
 
         if (seriesMap.isEmpty()) {
             Log.e(TAG, "No series extracted from homepage")
-            return HomePageResponse(emptyList())
+            // Use the new helper for empty response
+            return newHomePageResponse("", emptyList())
         }
 
         return newHomePageResponse(request.name, seriesMap.values.toList())
@@ -68,10 +66,9 @@ class MyAnimeLiveProvider : MainAPI() {
         val doc = app.get(url).document
         Log.d(TAG, "Loading URL: $url")
 
-        // Case 1: Search results page (series episode list)
         if (url.contains("?s=")) {
             val seriesName = doc.selectFirst("h1.page-header-title span")?.text()?.trim()
-                ?: doc.selectFirst("title")?.text()?.substringBefore(" - ")?: "Unknown Series"
+                ?: doc.selectFirst("title")?.text()?.substringBefore(" - ") ?: "Unknown Series"
 
             val episodes = doc.select("article").mapNotNull { article ->
                 val link = article.selectFirst("h2.entry-header-title a")
@@ -87,17 +84,15 @@ class MyAnimeLiveProvider : MainAPI() {
             return newAnimeLoadResponse(seriesName, url, TvType.Anime) {
                 addEpisodes(DubStatus.None, episodes)
             }
-        }
-        // Case 2: Direct episode page
-        else {
+        } else {
             val title = doc.selectFirst("h1.entry-header-title")?.text()?.trim() ?: "Episode"
-            val seriesName = title
+            var seriesName = title
                 .substringBefore(" episode", missingDelimiterValue = title)
                 .substringBefore(" Episode", missingDelimiterValue = title)
                 .replace(Regex("""\s+[Ee]p(?:isode)?\.?\s*\d+.*$"""), "")
-                .replace(Regex("""\s+english\s+sub$"""), "", ignoreCase = true)
                 .trim()
-                .ifBlank { "Unknown Series" }
+            seriesName = Regex("""\s+english\s+sub$""", RegexOption.IGNORE_CASE).replace(seriesName, "")
+            if (seriesName.isBlank()) seriesName = "Unknown Series"
             val epNum = extractEpisodeNumber(title)
             val episode = newEpisode(url) {
                 name = if (epNum != null) "Episode $epNum" else title
@@ -127,10 +122,8 @@ class MyAnimeLiveProvider : MainAPI() {
         val doc = app.get(data).document
         val html = doc.html()
 
-        // Find Dailymotion iframe (geo.dailymotion.com)
         val iframe = doc.selectFirst("iframe[src*='dailymotion.com']")?.attr("src")
         if (iframe != null) {
-            // Extract video ID from src like: https://geo.dailymotion.com/player.html?video=k2boTOGdBIYYDjGxEMm
             val videoId = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(iframe)?.groupValues?.get(1)
             if (videoId != null) {
                 val videoUrl = "https://www.dailymotion.com/video/$videoId"
@@ -138,13 +131,11 @@ class MyAnimeLiveProvider : MainAPI() {
             }
         }
 
-        // Fallback: search for any Dailymotion link
         val dmLink = doc.selectFirst("a[href*='dailymotion.com/video/']")?.attr("href")
         if (dmLink != null) {
             return loadExtractor(dmLink, data, subtitleCallback, callback)
         }
 
-        // Try regex on whole HTML
         val dmId = Regex("""dailymotion\.com/video/([a-zA-Z0-9]+)""").find(html)?.groupValues?.get(1)
         if (dmId != null) {
             return loadExtractor("https://www.dailymotion.com/video/$dmId", data, subtitleCallback, callback)
