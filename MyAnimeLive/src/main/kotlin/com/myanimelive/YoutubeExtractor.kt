@@ -23,10 +23,19 @@ class YoutubeExtractor : ExtractorApi() {
             val extractor = ServiceList.YouTube.getStreamExtractor(linkHandler)
             extractor.fetchPage()
 
-            for (stream in extractor.videoStreams + extractor.videoOnlyStreams) {
+            // Collect ALL video streams (muxed + video‑only)
+            val allVideoStreams = extractor.videoStreams + extractor.videoOnlyStreams
+            
+            // Use a set to avoid duplicate heights (some streams may have same resolution)
+            val seenHeights = mutableSetOf<Int>()
+            for (stream in allVideoStreams) {
                 val videoUrl = stream.content ?: continue
                 val height = stream.height ?: 0
-                val label = if (height > 0) "${height}p" else "Video"
+                if (height <= 0) continue
+                // If we already have this height, skip (keep first occurrence)
+                if (!seenHeights.add(height)) continue
+                
+                val label = "${height}p"
                 callback(
                     newExtractorLink(
                         name,
@@ -39,6 +48,7 @@ class YoutubeExtractor : ExtractorApi() {
                 )
             }
 
+            // Also add audio‑only streams (optional – can be used if video fails)
             for (audio in extractor.audioStreams) {
                 val audioUrl = audio.content ?: continue
                 callback(
@@ -50,8 +60,11 @@ class YoutubeExtractor : ExtractorApi() {
                         this.referer = mainUrl
                     }
                 )
+                // Only add one audio stream (best quality) to avoid clutter
+                break
             }
 
+            // Subtitles
             extractor.subtitlesDefault?.forEach { sub ->
                 val lang = sub.locale?.language ?: "en"
                 val subUrl = sub.content ?: sub.getUrl()
@@ -60,7 +73,7 @@ class YoutubeExtractor : ExtractorApi() {
                 }
             }
         } catch (e: Exception) {
-            // silently fail – extractor chain continues
+            // Silent fail – CloudStream will fall back to built‑in extractor
         }
     }
 }
