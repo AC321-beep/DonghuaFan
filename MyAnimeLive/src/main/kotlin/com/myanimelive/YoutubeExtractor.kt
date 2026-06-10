@@ -3,7 +3,6 @@ package com.myanimelive
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.services.youtube.linkHandler.YoutubeStreamLinkHandlerFactory
@@ -36,7 +35,6 @@ class YoutubeExtractor : ExtractorApi() {
                         videoUrl
                     ).apply {
                         this.referer = mainUrl
-                        this.type = INFER_TYPE
                         this.quality = height
                     }
                 )
@@ -52,7 +50,6 @@ class YoutubeExtractor : ExtractorApi() {
                         audioUrl
                     ).apply {
                         this.referer = mainUrl
-                        this.type = INFER_TYPE
                     }
                 )
             }
