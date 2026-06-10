@@ -3,16 +3,15 @@ package com.myanimelive
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.SubtitleFile
+import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.Jsoup
 import java.net.URLEncoder
 
 class MyAnimeLiveProvider : MainAPI() {
-    override var mainUrl = "https://myanimelive.com"   // ⬅️ change to actual domain
+    override var mainUrl = "https://myanimelive.com"   // ⬅️ replace with actual domain
     override var name = "MyAnimeLive"
-    override var lang = "en"                           // ⬅️ var, not val
-    override val hasMainPage = true                    // OK (not overridden? but keep if no error)
-    // hasSearch is NOT used in this API version – remove it
-    // override val hasSearch = true                   // ❌ remove (does not override anything)
+    override var lang = "en"
+    override val hasMainPage = true
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl/page/$page/"
@@ -22,7 +21,6 @@ class MyAnimeLiveProvider : MainAPI() {
             val href = element.select("a").attr("href")
             val link = if (href.startsWith("http")) href else mainUrl + href
             val poster = element.select("img").attr("src")
-            // ✅ Correct: newTvSeriesSearchResponse(name, url, type, ...)
             newTvSeriesSearchResponse(title, link, TvType.Anime) {
                 this.posterUrl = poster
             }
@@ -38,8 +36,11 @@ class MyAnimeLiveProvider : MainAPI() {
         val episodes = doc.select(".episode-item").map { ep ->
             val epUrl = ep.select("a").attr("href")
             val epName = ep.select(".ep-number").text()
-            // ✅ Use newEpisode (deprecated constructor replaced)
-            newEpisode(epUrl, epName)
+            // ✅ newEpisode expects a lambda that configures the Episode
+            newEpisode {
+                this.url = epUrl
+                this.name = epName
+            }
         }
         return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
             this.posterUrl = poster
@@ -47,19 +48,18 @@ class MyAnimeLiveProvider : MainAPI() {
         }
     }
 
-    // ✅ Override the correct loadLinks signature expected by this build
+    // ✅ Correct signature for the CloudStream3 version used here
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // data is the episode URL
         val doc = Jsoup.connect(data).get()
         val iframe = doc.select("iframe").attr("src")
         if (iframe.isBlank()) return false
 
-        // Use loadExtractor with callbacks
+        // loadExtractor is imported from utils
         loadExtractor(
             iframe,
             referer = mainUrl,
