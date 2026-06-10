@@ -53,9 +53,6 @@ class YoutubeExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val videoId = extractVideoId(url)
-        // Use a cache to avoid re‑fetching the same video multiple times
-        // (simplified: we don't cache here, but we could)
-
         try {
             val linkHandler = YoutubeStreamLinkHandlerFactory.getInstance().fromUrl("https://www.youtube.com/watch?v=$videoId")
             val extractor = ServiceList.YouTube.getStreamExtractor(linkHandler)
@@ -64,7 +61,7 @@ class YoutubeExtractor : ExtractorApi() {
             val durationSec = if (extractor.length > 0) extractor.length else 3600L
             val seenUrls = mutableSetOf<String>()
 
-            // Collect video‑only streams (high quality)
+            // Collect video‑only streams
             val videoOnlyList = (extractor.videoOnlyStreams ?: emptyList()).mapNotNull { vs ->
                 val streamUrl = vs.content ?: return@mapNotNull null
                 if (!seenUrls.add(streamUrl)) return@mapNotNull null
@@ -91,10 +88,10 @@ class YoutubeExtractor : ExtractorApi() {
 
             val audiosByLanguage = audioList.groupBy { it.language }
 
-            // Start local DASH server if needed
+            // Start local DASH server
             startServerIfNeeded()
 
-            // For each video‑only stream, combine with best matching audio and serve via DASH
+            // Create DASH links for each video resolution with matching audio
             for (video in videoOnlyList) {
                 if (audiosByLanguage.isNotEmpty()) {
                     for ((lang, audios) in audiosByLanguage) {
@@ -110,7 +107,7 @@ class YoutubeExtractor : ExtractorApi() {
                                 callback(
                                     newExtractorLink(
                                         name,
-                                        "${video.label} (${lang})",
+                                        "${video.label} ($lang)",
                                         localUrl,
                                         type = ExtractorLinkType.DASH
                                     ).apply {
@@ -124,7 +121,7 @@ class YoutubeExtractor : ExtractorApi() {
                 }
             }
 
-            // Also add muxed streams (already have audio+video) as a fallback
+            // Fallback: muxed streams
             for (vs in extractor.videoStreams ?: emptyList()) {
                 val streamUrl = vs.content ?: continue
                 if (!seenUrls.add(streamUrl)) continue
@@ -146,32 +143,26 @@ class YoutubeExtractor : ExtractorApi() {
                     subtitleCallback(newSubtitleFile(lang, subUrl))
                 }
             }
-
         } catch (e: Exception) {
-            // Silently fail – CloudStream will try the built‑in extractor
+            // Silent fail
         }
     }
 
-    private fun extractVideoId(url: String): String {
-        return when {
-            url.contains("youtu.be/") -> url.substringAfter("youtu.be/").substringBefore("?")
-            url.contains("watch?v=") -> url.substringAfter("watch?v=").substringBefore("&")
-            url.contains("/shorts/") -> url.substringAfter("/shorts/").substringBefore("?")
-            else -> url
-        }
+    private fun extractVideoId(url: String): String = when {
+        url.contains("youtu.be/") -> url.substringAfter("youtu.be/").substringBefore("?")
+        url.contains("watch?v=") -> url.substringAfter("watch?v=").substringBefore("&")
+        url.contains("/shorts/") -> url.substringAfter("/shorts/").substringBefore("?")
+        else -> url
     }
 
-    private fun getMimeFromUrl(url: String, isAudio: Boolean): String {
-        return try {
-            val decoded = URLDecoder.decode(url, "UTF-8")
-            if (decoded.contains("video/webm") || decoded.contains("audio/webm")) {
-                if (isAudio) "audio/webm" else "video/webm"
-            } else {
-                if (isAudio) "audio/mp4" else "video/mp4"
-            }
-        } catch (e: Exception) {
-            if (isAudio) "audio/mp4" else "video/mp4"
+    private fun getMimeFromUrl(url: String, isAudio: Boolean): String = try {
+        val decoded = URLDecoder.decode(url, "UTF-8")
+        when {
+            decoded.contains("video/webm") || decoded.contains("audio/webm") -> if (isAudio) "audio/webm" else "video/webm"
+            else -> if (isAudio) "audio/mp4" else "video/mp4"
         }
+    } catch (e: Exception) {
+        if (isAudio) "audio/mp4" else "video/mp4"
     }
 
     @Synchronized
@@ -186,9 +177,7 @@ class YoutubeExtractor : ExtractorApi() {
                     thread { handleClient(client) }
                 }
             }
-        } catch (e: Exception) {
-            // ignore
-        }
+        } catch (e: Exception) { /* ignore */ }
     }
 
     private fun registerManifest(xml: String): String? {
@@ -211,22 +200,22 @@ class YoutubeExtractor : ExtractorApi() {
                         if (path.endsWith(".mpd")) path = path.substringBeforeLast(".mpd")
                         val manifest = manifestMap[path]
                         if (manifest != null) {
-                            writer.println("HTTP/1.1 200 OK")
-                            writer.println("Content-Type: application/dash+xml")
-                            writer.println("Connection: close")
-                            writer.println("Access-Control-Allow-Origin: *")
-                            writer.println("")
-                            writer.println(manifest)
+                            writer.write("HTTP/1.1 200 OK\r\n")
+                            writer.write("Content-Type: application/dash+xml\r\n")
+                            writer.write("Connection: close\r\n")
+                            writer.write("Access-Control-Allow-Origin: *\r\n")
+                            writer.write("\r\n")
+                            writer.write(manifest)
+                            writer.flush()
                         } else {
-                            writer.println("HTTP/1.1 404 Not Found")
-                            writer.println("")
+                            writer.write("HTTP/1.1 404 Not Found\r\n")
+                            writer.write("\r\n")
+                            writer.flush()
                         }
                     }
                 }
             }
-        } catch (e: Exception) {
-            // ignore
-        }
+        } catch (e: Exception) { /* ignore */ }
     }
 
     private fun buildDashManifest(video: StreamInfo, audioList: List<AudioInfo>, durationSec: Long): String {
@@ -236,7 +225,6 @@ class YoutubeExtractor : ExtractorApi() {
         sb.append("""<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" mediaPresentationDuration="$duration" minBufferTime="PT5.0S">""")
         sb.append("<Period>")
 
-        // Video adaptation set
         val vCodecs = if (video.mimeType.contains("webm")) "vp9" else "avc1.4d401f"
         val vSegmentBase = if (video.initRange != null && video.indexRange != null) {
             """<SegmentBase indexRange="${video.indexRange}"><Initialization range="${video.initRange}" /></SegmentBase>"""
@@ -250,7 +238,6 @@ class YoutubeExtractor : ExtractorApi() {
             </AdaptationSet>
         """.trimIndent())
 
-        // Audio adaptation sets
         audioList.forEachIndexed { idx, audio ->
             val aCodecs = if (audio.mimeType.contains("webm")) "opus" else "mp4a.40.2"
             val aSegmentBase = if (audio.initRange != null && audio.indexRange != null) {
@@ -270,7 +257,5 @@ class YoutubeExtractor : ExtractorApi() {
         return sb.toString()
     }
 
-    private fun escapeXml(s: String): String {
-        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    }
+    private fun escapeXml(s: String): String = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 }
