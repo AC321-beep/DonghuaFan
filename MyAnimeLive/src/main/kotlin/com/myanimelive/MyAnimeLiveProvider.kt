@@ -164,9 +164,6 @@ class MyAnimeLiveProvider : MainAPI() {
         return patterns.firstNotNullOfOrNull { it.find(text)?.groupValues?.get(1)?.toIntOrNull() }
     }
 
-    // --------------------------------------------------------------
-    // loadLinks: direct call to custom YouTube extractor (Option A)
-    // --------------------------------------------------------------
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -176,7 +173,8 @@ class MyAnimeLiveProvider : MainAPI() {
         // 1) Direct handling of YouTube URLs using our custom extractor
         if (data.contains("youtube.com/watch") || data.contains("youtu.be/") || data.contains("/shorts/")) {
             val ytExtractor = YoutubeExtractor()
-            return ytExtractor.getUrl(data, null, subtitleCallback, callback)
+            ytExtractor.getUrl(data, null, subtitleCallback, callback)
+            return true
         }
 
         // 2) For other sources (Dailymotion, ok.ru, etc.) use the normal extractor chain
@@ -198,7 +196,6 @@ class MyAnimeLiveProvider : MainAPI() {
                 }
                 src.contains("ok.ru") -> return tryLoad(src)
                 src.contains("streamtape") || src.contains("mp4upload") -> return tryLoad(src)
-                // YouTube iframes are already handled above – skip them here
             }
         }
 
