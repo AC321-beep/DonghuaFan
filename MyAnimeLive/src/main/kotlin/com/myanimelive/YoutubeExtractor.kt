@@ -1,10 +1,10 @@
 package com.myanimelive
 
 import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.newExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.services.youtube.linkHandler.YoutubeStreamLinkHandlerFactory
 
@@ -24,7 +24,7 @@ class YoutubeExtractor : ExtractorApi() {
             val extractor = ServiceList.YouTube.getStreamExtractor(linkHandler)
             extractor.fetchPage()
 
-            // Video streams
+            // Video streams (muxed + video‑only)
             for (stream in extractor.videoStreams + extractor.videoOnlyStreams) {
                 val videoUrl = stream.content ?: continue
                 val height = stream.height ?: 0
