@@ -19,12 +19,13 @@ class MyAnimeLiveProvider : MainAPI() {
 
     override val mainPage = mainPageOf(mainUrl to "Latest Series")
 
+    // ---------------------------------------------------------------------------------------------
+    // HOMEPAGE (infinite scrolling)
+    // ---------------------------------------------------------------------------------------------
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Construct paginated URL: page 1 -> mainUrl, page 2 -> mainUrl/page/2/
         val pageUrl = if (page == 1) mainUrl else "$mainUrl/page/$page/"
         val doc = app.get(pageUrl).document
         
-        // If no articles found, we've reached the end
         val articles = doc.select("article")
         if (articles.isEmpty()) {
             return newHomePageResponse(request.name, emptyList(), false)
@@ -35,24 +36,10 @@ class MyAnimeLiveProvider : MainAPI() {
         articles.forEach { article ->
             val titleLink = article.selectFirst("h2.entry-header-title a")
             val title = titleLink?.text()?.trim() ?: return@forEach
-            
-            // Extract series name by removing episode info
-            var seriesName = title
-                .substringBefore(" episode", missingDelimiterValue = title)
-                .substringBefore(" Episode", missingDelimiterValue = title)
-                .replace(Regex("""\s+[Ee]p(?:isode)?\.?\s*\d+.*$"""), "")
-                .trim()
-            seriesName = Regex("""\s+english\s+sub$""", RegexOption.IGNORE_CASE).replace(seriesName, "")
-            
-            if (seriesName.isBlank() || seriesName.length < 3) {
-                seriesName = title.split(Regex("[-–:]"))[0].trim()
-            }
+            val seriesName = extractSeriesName(title)
             if (seriesName.isBlank()) return@forEach
             
-            // Extract poster from thumbnail
             val poster = article.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
-            
-            // Use search URL to list all episodes of this series
             val encodedName = URLEncoder.encode(seriesName, "UTF-8")
             val seriesUrl = "$mainUrl/?s=$encodedName"
             
@@ -63,18 +50,82 @@ class MyAnimeLiveProvider : MainAPI() {
             }
         }
         
-        // Check if there is a next page (pagination)
         val hasNext = doc.selectFirst("a.next.page-numbers") != null
-        
         return newHomePageResponse(request.name, seriesMap.values.toList(), hasNext)
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // SEARCH (global and homepage search)
+    // ---------------------------------------------------------------------------------------------
+    override suspend fun search(query: String): List<SearchResponse> {
+        val encodedQuery = URLEncoder.encode(query, "UTF-8")
+        val searchUrl = "$mainUrl/?s=$encodedQuery"
+        Log.d(TAG, "Search URL: $searchUrl")
+        
+        val doc = app.get(searchUrl).document
+        
+        // Check if the page says "no results"
+        val noResults = doc.selectFirst(".no-results, .nothing-found, .search-no-results, .no-posts")
+        if (noResults != null) {
+            Log.d(TAG, "No results message found for query: $query")
+            return emptyList()
+        }
+        
+        // Try multiple selectors for result items
+        var articles = doc.select("article")
+        if (articles.isEmpty()) {
+            articles = doc.select(".post, .entry, li.type-post, div[class*='post']")
+        }
+        
+        if (articles.isEmpty()) {
+            Log.d(TAG, "No standard articles, falling back to link extraction")
+            // Fallback: find any internal links that look like episodes
+            val links = doc.select("a[href*='/20']") // WordPress date-based URLs
+            return links.mapNotNull { link ->
+                val url = fixUrl(link.attr("href"))
+                val title = link.text().trim()
+                if (title.isNotBlank() && url.contains("/20")) {
+                    val seriesName = extractSeriesName(title)
+                    newAnimeSearchResponse(seriesName, url, TvType.Anime)
+                } else null
+            }.distinctBy { it.url }
+        }
+        
+        val seriesMap = mutableMapOf<String, SearchResponse>()
+        
+        articles.forEach { article ->
+            // Try to find title link
+            var titleLink = article.selectFirst("h2.entry-header-title a")
+            if (titleLink == null) titleLink = article.selectFirst("h2 a, .entry-title a, a[rel='bookmark']")
+            val title = titleLink?.text()?.trim() ?: return@forEach
+            
+            val seriesName = extractSeriesName(title)
+            if (seriesName.isBlank()) return@forEach
+            
+            val poster = article.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
+            val encodedName = URLEncoder.encode(seriesName, "UTF-8")
+            val seriesUrl = "$mainUrl/?s=$encodedName"
+            
+            if (!seriesMap.containsKey(seriesUrl)) {
+                val response = newAnimeSearchResponse(seriesName, seriesUrl, TvType.Anime)
+                response.posterUrl = poster
+                seriesMap[seriesUrl] = response
+            }
+        }
+        
+        Log.d(TAG, "Search found ${seriesMap.size} unique series")
+        return seriesMap.values.toList()
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // LOAD EPISODES (series page = search results with pagination)
+    // ---------------------------------------------------------------------------------------------
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
         Log.d(TAG, "Loading URL: $url")
 
         if (url.contains("?s=")) {
-            // Search results page – fetch all pages for episodes
+            // This is a series episode list (search results)
             val seriesName = doc.selectFirst("h1.page-header-title span")?.text()?.trim()
                 ?: doc.selectFirst("title")?.text()?.substringBefore(" - ") ?: "Unknown Series"
             
@@ -97,7 +148,6 @@ class MyAnimeLiveProvider : MainAPI() {
                 }
                 allEpisodes.addAll(episodes)
                 
-                // Find next page link
                 val nextLink = pageDoc.selectFirst("a.next.page-numbers")?.attr("href")
                 currentUrl = if (nextLink != null && nextLink != currentUrl) fixUrl(nextLink) else ""
             }
@@ -110,14 +160,7 @@ class MyAnimeLiveProvider : MainAPI() {
         } else {
             // Single episode page
             val title = doc.selectFirst("h1.entry-header-title")?.text()?.trim() ?: "Episode"
-            var seriesName = title
-                .substringBefore(" episode", missingDelimiterValue = title)
-                .substringBefore(" Episode", missingDelimiterValue = title)
-                .replace(Regex("""\s+[Ee]p(?:isode)?\.?\s*\d+.*$"""), "")
-                .trim()
-            seriesName = Regex("""\s+english\s+sub$""", RegexOption.IGNORE_CASE).replace(seriesName, "")
-            if (seriesName.isBlank()) seriesName = "Unknown Series"
-            
+            val seriesName = extractSeriesName(title).ifBlank { "Unknown Series" }
             val epNum = extractEpisodeNumber(title)
             val poster = doc.selectFirst("article img")?.attr("src")?.let { fixUrl(it) }
             
@@ -133,6 +176,24 @@ class MyAnimeLiveProvider : MainAPI() {
         }
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // HELPERS
+    // ---------------------------------------------------------------------------------------------
+    private fun extractSeriesName(title: String): String {
+        var name = title
+            .substringBefore(" episode", missingDelimiterValue = title)
+            .substringBefore(" Episode", missingDelimiterValue = title)
+            .replace(Regex("""\s+[Ee]p(?:isode)?\.?\s*\d+.*$"""), "")
+            .trim()
+        name = Regex("""\s+english\s+sub$""", RegexOption.IGNORE_CASE).replace(name, "")
+        if (name.isBlank() || name.length < 3) {
+            name = title.split(Regex("[-–:]"))[0].trim()
+        }
+        // Remove trailing "english sub" if still present
+        name = Regex("english sub$", RegexOption.IGNORE_CASE).replace(name, "").trim()
+        return name
+    }
+
     private fun extractEpisodeNumber(text: String): Int? {
         val patterns = listOf(
             Regex("""(?:episode|ep|ep\.)\s*(\d+)""", RegexOption.IGNORE_CASE),
@@ -142,6 +203,9 @@ class MyAnimeLiveProvider : MainAPI() {
         return patterns.firstNotNullOfOrNull { it.find(text)?.groupValues?.get(1)?.toIntOrNull() }
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // LOAD LINKS (extract Dailymotion video)
+    // ---------------------------------------------------------------------------------------------
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -151,7 +215,7 @@ class MyAnimeLiveProvider : MainAPI() {
         val doc = app.get(data).document
         val html = doc.html()
 
-        // Try to find Dailymotion iframe
+        // Try to find Dailymotion iframe (geo.dailymotion.com)
         val iframe = doc.selectFirst("iframe[src*='dailymotion.com']")?.attr("src")
         if (iframe != null) {
             val videoId = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(iframe)?.groupValues?.get(1)
@@ -166,7 +230,7 @@ class MyAnimeLiveProvider : MainAPI() {
             return loadExtractor(dmLink, data, subtitleCallback, callback)
         }
 
-        // Regex fallback
+        // Regex fallback on full HTML
         val dmId = Regex("""dailymotion\.com/video/([a-zA-Z0-9]+)""").find(html)?.groupValues?.get(1)
         if (dmId != null) {
             return loadExtractor("https://www.dailymotion.com/video/$dmId", data, subtitleCallback, callback)
