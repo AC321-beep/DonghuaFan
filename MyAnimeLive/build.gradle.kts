@@ -12,6 +12,6 @@ cloudstream {
 }
 
 dependencies {
-    // Use the correct JitPack tag (v0.27.1)
-    compileOnly("com.github.TeamNewPipe:NewPipeExtractor:v0.27.1")
+    // Use the correct JitPack tag (v0.27.6)
+    compileOnly("com.github.TeamNewPipe:NewPipeExtractor:v0.27.6")
 }
