@@ -8,7 +8,7 @@ import org.jsoup.Jsoup
 import java.net.URLEncoder
 
 class MyAnimeLiveProvider : MainAPI() {
-    override var mainUrl = "https://myanimelive.com"   // ⬅️ replace with actual domain
+    override var mainUrl = "https://myanimelive.com"
     override var name = "MyAnimeLive"
     override var lang = "en"
     override val hasMainPage = true
@@ -36,8 +36,8 @@ class MyAnimeLiveProvider : MainAPI() {
         val episodes = doc.select(".episode-item").map { ep ->
             val epUrl = ep.select("a").attr("href")
             val epName = ep.select(".ep-number").text()
-            // ✅ Use Episode constructor – works and compiles
-            Episode(epUrl, epName)
+            // ✅ Use newEpisode instead of deprecated Episode constructor
+            newEpisode(epUrl, epName)
         }
         return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
             this.posterUrl = poster
