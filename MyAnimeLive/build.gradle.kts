@@ -3,7 +3,7 @@ android {
 }
 
 cloudstream {
-    description = "Watch anime from myanime.live (Dailymotion)"
+    description = "Anime from myanimelive"
     authors = listOf("AC321-beep")
     status = 1
     tvTypes = listOf("Anime")
