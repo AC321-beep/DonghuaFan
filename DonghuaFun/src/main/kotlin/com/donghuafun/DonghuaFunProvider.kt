@@ -16,8 +16,6 @@ class DonghuaFunProvider : MainAPI() {
     companion object {
         private const val TAG = "DonghuaFun"
         private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (Chrome/124.0.0.0 Mobile Safari/537.36"
-        // Regex to detect episode indicators in badges
-        private val EPISODE_REGEX = Regex("""EP|Part|第|集|\d+""", RegexOption.IGNORE_CASE)
     }
 
     private val headers get() = mapOf(
@@ -32,69 +30,66 @@ class DonghuaFunProvider : MainAPI() {
     override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
         "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
-        "coming_soon_filter" to "Coming Soon"
+        "$mainUrl/index.php/vod/show/id/20/by/time.html?filter=comingsoon" to "Coming Soon"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        if (request.data == "coming_soon_filter") {
-            // Collect all upcoming shows by iterating through all pages of "Recently Updated"
-            val allCards = mutableListOf<SearchResponse>()
-            var currentPage = 1
-            while (true) {
-                val pageUrl = "$mainUrl/index.php/vod/show/id/20/by/time.html/page/$currentPage.html"
-                val doc = try {
-                    app.get(pageUrl).document
-                } catch (e: Exception) {
-                    break
-                }
-                val cards = parseShowCardsWithFilter(doc, onlyComingSoon = true)
-                if (cards.isEmpty()) break
-                allCards.addAll(cards)
-                // If less than a full page (e.g., 20 items), assume it's the last page
-                if (cards.size < 20) break
-                currentPage++
-                if (currentPage > 20) break // safety limit
-            }
-            // Remove duplicates
-            val distinctCards = allCards.distinctBy { it.url }
-            return newHomePageResponse(request.name, distinctCards)
+        // For normal pages, pagination is handled by CloudStream (page parameter)
+        if (request.data.contains("filter=comingsoon")) {
+            // Extract base URL without filter param
+            val baseUrl = "$mainUrl/index.php/vod/show/id/20/by/time.html"
+            val pageUrl = if (page == 1) baseUrl else "$baseUrl/page/$page.html"
+            val doc = app.get(pageUrl).document
+            // Filter cards that are "Coming Soon" (only trailer, no episode numbers)
+            val cards = parseComingSoonCards(doc)
+            return newHomePageResponse(request.name, cards)
         }
 
-        // Normal pagination for regular groups
         val pageUrl = if (page == 1) request.data
                       else request.data.replace(".html", "/page/$page.html")
         val doc = app.get(pageUrl).document
-        val cards = parseShowCardsWithFilter(doc, onlyComingSoon = false)
+        val cards = parseShowCards(doc)
         return newHomePageResponse(request.name, cards)
     }
 
-    private fun parseShowCardsWithFilter(doc: Document, onlyComingSoon: Boolean): List<SearchResponse> {
+    private fun parseShowCards(doc: Document): List<SearchResponse> {
         return doc.select("a[href*='/vod/detail/id/']")
             .distinctBy { it.attr("href") }
             .mapNotNull { a ->
-                if (onlyComingSoon) {
-                    // Get the episode badge text (e.g., "Trailer", "EP01", "Part 01", "Coming Soon")
-                    val badge = a.selectFirst(".public-list-prb, .status, .badge, .episode-badge")
-                    val badgeText = badge?.text()?.trim() ?: ""
-                    
-                    // Determine if this is a regular episode (contains episode numbers)
-                    val hasEpisodeNumber = EPISODE_REGEX.containsMatchIn(badgeText) &&
-                            !badgeText.contains("Coming Soon", ignoreCase = true) &&
-                            !badgeText.contains("Trailer", ignoreCase = true)
-                    
-                    // If the badge contains any episode indicator (EP, Part, numbers), it's NOT coming soon
-                    if (hasEpisodeNumber) return@mapNotNull null
-                    
-                    // Additional checks: card text containing "Coming Soon" or badge being exactly "Trailer"
-                    val cardText = a.text()
-                    val isComingSoon = cardText.contains("Coming Soon", ignoreCase = true) ||
-                                       cardText.contains("Not yet aired", ignoreCase = true) ||
-                                       badgeText.contains("Coming Soon", ignoreCase = true) ||
-                                       badgeText.equals("Trailer", ignoreCase = true)
-                    
-                    if (!isComingSoon) return@mapNotNull null
-                }
+                val href = fixUrl(a.attr("href"))
+                val title = a.attr("title").ifEmpty {
+                    a.selectFirst("img")?.attr("alt") ?: a.text()
+                }.trim()
+                if (title.isEmpty()) return@mapNotNull null
+                val poster = a.selectFirst("img")?.let {
+                    it.attr("data-src").ifEmpty { it.attr("src") }
+                }?.takeUnless { it.startsWith("data:") }?.let { fixUrl(it) }
+                newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
+            }
+    }
 
+    private fun parseComingSoonCards(doc: Document): List<SearchResponse> {
+        return doc.select("a[href*='/vod/detail/id/']")
+            .distinctBy { it.attr("href") }
+            .mapNotNull { a ->
+                // Check the badge that shows episode info
+                val badge = a.selectFirst(".public-list-prb, .status, .badge, .episode-badge")
+                val badgeText = badge?.text()?.trim() ?: ""
+                
+                // A show is "Coming Soon" if:
+                // 1. Badge contains "Trailer" (case insensitive)
+                // 2. Badge contains "Coming Soon"
+                // 3. Badge is not empty and does NOT contain "EP" (episode number) AND does NOT contain "Part" (like "Part 01")
+                //    and also not just numeric (like "01")
+                val isComingSoon = badgeText.contains("Trailer", ignoreCase = true) ||
+                                   badgeText.contains("Coming Soon", ignoreCase = true) ||
+                                   (badgeText.isNotBlank() && 
+                                    !badgeText.contains("EP", ignoreCase = true) &&
+                                    !badgeText.contains("Part", ignoreCase = true) &&
+                                    !badgeText.matches(Regex("\\d+")))
+                
+                if (!isComingSoon) return@mapNotNull null
+                
                 val href = fixUrl(a.attr("href"))
                 val title = a.attr("title").ifEmpty {
                     a.selectFirst("img")?.attr("alt") ?: a.text()
@@ -112,7 +107,7 @@ class DonghuaFunProvider : MainAPI() {
             "$mainUrl/index.php/vod/search.html",
             params = mapOf("wd" to query)
         ).document
-        return parseShowCardsWithFilter(doc, onlyComingSoon = false)
+        return parseShowCards(doc)
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -134,7 +129,7 @@ class DonghuaFunProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
 
-        // Try to get episodes from 4K tab
+        // Extract episodes from the 4K tab or any play link
         val tabs = doc.select(".anthology-tab a.vod-playerUrl")
         val fourKTabIndex = tabs.indexOfFirst { it.text().contains("4K", ignoreCase = true) }
         val targetIndex = if (fourKTabIndex != -1) fourKTabIndex else 0
@@ -150,7 +145,6 @@ class DonghuaFunProvider : MainAPI() {
             Log.d(TAG, "Found ${episodes.size} episodes from 4K tab")
         }
 
-        // If none, look anywhere on the page
         if (episodes.isEmpty()) {
             val allPlayLinks = doc.select("a[href*='/vod/play/id/$showId/']")
             for (a in allPlayLinks) {
@@ -161,23 +155,19 @@ class DonghuaFunProvider : MainAPI() {
             Log.d(TAG, "Found ${episodes.size} episodes from global links")
         }
 
-        // Determine if the show is "Coming Soon" based on detail page
-        val isComingSoon = doc.select(".right p:contains(Coming Soon), .card-top .right p:contains(Coming Soon)").any()
+        // If no episodes and the page has "Coming Soon" text, add a trailer link
+        val isComingSoonDetail = doc.select(".right p:contains(Coming Soon), .card-top .right p:contains(Coming Soon)").any()
                 || doc.text().contains("Coming Soon", ignoreCase = true)
 
-        // For true Coming Soon shows (with no episodes or only a trailer), add a trailer
-        if (episodes.isEmpty() && isComingSoon) {
-            Log.d(TAG, "Series is Coming Soon, looking for trailer")
-            val trailerUrl = extractTrailerPlayUrl(doc, showId)
-            if (trailerUrl != null) {
-                episodes.add(newEpisode(trailerUrl) { name = "Trailer" })
-                Log.d(TAG, "Added trailer episode")
-            }
+        if (episodes.isEmpty() && isComingSoonDetail) {
+            Log.d(TAG, "Series is Coming Soon, adding trailer episode")
+            val trailerUrl = "$mainUrl/index.php/vod/play/id/$showId/sid/1/nid/1.html"
+            episodes.add(newEpisode(trailerUrl) { name = "Trailer" })
         }
 
-        // If the show has actual episodes (even if coming soon badge was wrong), we should not generate fake episodes
-        if (episodes.isEmpty() && !isComingSoon) {
-            Log.d(TAG, "No episodes found and not Coming Soon – generating numeric range 1..300")
+        // Only generate fake episodes for regular series (not Coming Soon) with no episodes
+        if (episodes.isEmpty() && !isComingSoonDetail) {
+            Log.d(TAG, "No episodes found and not Coming Soon – generating range 1..300")
             for (n in 1..300) {
                 val epUrl = "$mainUrl/index.php/vod/play/id/$showId/sid/1/nid/$n.html"
                 episodes.add(newEpisode(epUrl) { name = "EP$n" })
@@ -193,70 +183,93 @@ class DonghuaFunProvider : MainAPI() {
         }
     }
 
-    private fun extractTrailerPlayUrl(doc: Document, showId: String): String? {
-        val html = doc.html()
-        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-            .find(html)?.groupValues?.get(1)
-        if (playerJson != null) {
-            val epUrl = Regex(""""link"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)
-            if (!epUrl.isNullOrBlank()) {
-                return fixUrl(epUrl)
-            }
-        }
-        return "$mainUrl/index.php/vod/play/id/$showId/sid/1/nid/1.html"
-    }
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // Fetch the play page
         val doc = try {
             app.get(data, headers = headers).document
         } catch (e: Exception) {
             null
         }
 
-        if (doc != null) {
-            // Look for player_aaaa JSON
-            val scripts = doc.select("script").map { it.html() }.joinToString("\n")
-            val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-                .find(scripts)?.groupValues?.get(1)
-            if (playerJson != null) {
-                val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)
-                if (!rawUrl.isNullOrBlank() && rawUrl.startsWith("http")) {
-                    val extLink = ExtractorLink(
-                        source = name,
-                        name = "CloudOKyo",
-                        url = rawUrl,
-                        referer = mainUrl,
-                        quality = Qualities.P1080.value,
-                        type = ExtractorLinkType.M3U8,
-                        headers = headers
-                    )
-                    callback(extLink)
-                    return true
+        if (doc == null) return false
+
+        // 1. Look for player_aaaa JSON (contains direct .m3u8 or Dailymotion info)
+        val scripts = doc.select("script").map { it.html() }.joinToString("\n")
+        val playerJsonMatch = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+            .find(scripts)
+        
+        if (playerJsonMatch != null) {
+            val playerJson = playerJsonMatch.groupValues[1]
+            val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)
+            val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
+            
+            // If it's Dailymotion
+            if (from.equals("dailymotion", ignoreCase = true) || rawUrl?.contains("dailymotion") == true) {
+                val dmId = extractDailymotionId(rawUrl ?: "")
+                if (dmId != null) {
+                    val videoUrl = "https://www.dailymotion.com/video/$dmId"
+                    return loadExtractor(videoUrl, data, subtitleCallback, callback)
                 }
             }
-
-            // Try iframe wrapper
-            val iframe = doc.selectFirst("iframe[src*='play.donghuafun.com'], iframe[src*='m3u8']")
-            if (iframe != null) {
-                val iframeSrc = fixUrl(iframe.attr("src"))
-                if (loadExtractor(iframeSrc, data, subtitleCallback, callback)) return true
+            // If it's a direct .m3u8 URL
+            else if (!rawUrl.isNullOrBlank() && rawUrl.startsWith("http")) {
+                val extLink = ExtractorLink(
+                    source = name,
+                    name = "CloudOKyo",
+                    url = rawUrl,
+                    referer = mainUrl,
+                    quality = Qualities.P1080.value,
+                    type = ExtractorLinkType.M3U8,
+                    headers = headers
+                )
+                callback(extLink)
+                return true
             }
+        }
 
-            // Any other iframe
-            for (iframe in doc.select("iframe[src]")) {
-                val src = fixUrl(iframe.attr("src"))
-                if (src.isNotBlank() && loadExtractor(src, data, subtitleCallback, callback)) {
-                    return true
+        // 2. Look for Dailymotion iframes
+        val iframes = doc.select("iframe[src]")
+        for (iframe in iframes) {
+            val src = fixUrl(iframe.attr("src"))
+            if (src.contains("dailymotion")) {
+                val dmId = extractDailymotionId(src)
+                if (dmId != null) {
+                    val videoUrl = "https://www.dailymotion.com/video/$dmId"
+                    if (loadExtractor(videoUrl, data, subtitleCallback, callback)) return true
                 }
+            }
+        }
+
+        // 3. Try any iframe that might be a player (fallback)
+        for (iframe in iframes) {
+            val src = fixUrl(iframe.attr("src"))
+            if (src.isNotBlank() && loadExtractor(src, data, subtitleCallback, callback)) {
+                return true
             }
         }
 
         Log.d(TAG, "No playable source found for $data")
         return false
+    }
+
+    private fun extractDailymotionId(urlOrId: String): String? {
+        // If it's already just an ID (alphanumeric, length > 10)
+        if (urlOrId.matches(Regex("^[a-zA-Z0-9]{10,}$"))) return urlOrId
+        // Extract from URL
+        val patterns = listOf(
+            Regex("""dailymotion\.com/(?:embed/)?video/([a-zA-Z0-9]+)"""),
+            Regex("""dailymotion\.com/video/([a-zA-Z0-9]+)""")
+        )
+        for (pattern in patterns) {
+            pattern.find(urlOrId)?.let {
+                return it.groupValues[1]
+            }
+        }
+        return null
     }
 }
