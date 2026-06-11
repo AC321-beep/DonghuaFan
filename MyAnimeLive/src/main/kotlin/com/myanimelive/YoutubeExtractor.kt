@@ -23,15 +23,17 @@ class YoutubeExtractor : ExtractorApi() {
             val service = NewPipe.getService(0)
             val streamInfo = StreamInfo.getInfo(service, url)
 
+            // Only muxed streams (video + audio combined) — skip videoOnlyStreams
+            // videoStreams are muxed (max ~720p), videoOnlyStreams are DASH (need separate audio)
             val seenHeights = mutableSetOf<Int>()
-            for (video in streamInfo.videoStreams + streamInfo.videoOnlyStreams) {
+            for (video in streamInfo.videoStreams) {
                 val videoUrl = video.content?.takeIf { it.isNotBlank() } ?: continue
                 val height = video.height.takeIf { it > 0 } ?: continue
                 if (seenHeights.add(height)) {
                     callback(
                         newExtractorLink(
                             source = name,
-                            name = "${height}p",
+                            name = name,  // Don't include height — quality field handles display
                             url = videoUrl,
                             type = ExtractorLinkType.VIDEO
                         ) {
@@ -42,26 +44,13 @@ class YoutubeExtractor : ExtractorApi() {
                 }
             }
 
-            for (audio in streamInfo.audioStreams) {
-                val audioUrl = audio.content?.takeIf { it.isNotBlank() } ?: continue
-                val lang = audio.audioLocale?.language ?: "audio"
-                callback(
-                    newExtractorLink(
-                        source = name,
-                        name = "Audio ($lang)",
-                        url = audioUrl,
-                        type = ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = mainUrl
-                    }
-                )
-            }
-
+            // Subtitles only
             for (sub in streamInfo.subtitles) {
                 val subUrl = sub.content?.takeIf { it.isNotBlank() } ?: continue
                 val lang = sub.locale?.language ?: "en"
                 subtitleCallback(SubtitleFile(lang = lang, url = subUrl))
             }
+
         } catch (e: Exception) {
             e.printStackTrace()
         }
