@@ -12,7 +12,6 @@ cloudstream {
 }
 
 dependencies {
-    // NewPipe extractor - must be implementation not compileOnly
-    // so the classes are available at runtime
     implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }
