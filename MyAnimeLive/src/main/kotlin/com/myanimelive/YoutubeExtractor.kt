@@ -26,15 +26,15 @@ class YoutubeExtractor : ExtractorApi() {
 
             val seenHeights = mutableSetOf<Int>()
 
-            // Video-only streams (highest quality)
+            // Video-only streams
             for (stream in extractor.videoOnlyStreams ?: emptyList()) {
                 val videoUrl = stream.content ?: continue
                 val height = stream.height ?: 0
                 if (height > 0 && seenHeights.add(height)) {
                     callback(
                         newExtractorLink(
-                            name = this.name,
-                            label = "${height}p",
+                            source = this.name,           // provider name
+                            name = this.name,             // display name
                             url = videoUrl,
                             referer = mainUrl,
                             quality = height
@@ -43,7 +43,7 @@ class YoutubeExtractor : ExtractorApi() {
                 }
             }
 
-            // Audio streams (one per language/bitrate)
+            // Audio streams
             val audioUrls = mutableSetOf<String>()
             for (audio in extractor.audioStreams ?: emptyList()) {
                 val audioUrl = audio.content ?: continue
@@ -52,10 +52,11 @@ class YoutubeExtractor : ExtractorApi() {
                     val lang = audio.audioTrackId?.substringBefore(".")?.uppercase() ?: "Audio"
                     callback(
                         newExtractorLink(
-                            name = this.name,
-                            label = "$lang (${bitrate}kbps)",
+                            source = this.name,
+                            name = "$lang (${bitrate}kbps)",   // show description as name
                             url = audioUrl,
                             referer = mainUrl
+                            // quality is not used for audio
                         )
                     )
                 }
@@ -70,7 +71,7 @@ class YoutubeExtractor : ExtractorApi() {
                 }
             }
         } catch (e: Exception) {
-            // Silent fail – CloudStream will fall back to built-in extractor
+            // Silent fail – fallback to built-in extractor
         }
     }
 }
