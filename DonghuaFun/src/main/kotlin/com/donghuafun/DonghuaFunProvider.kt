@@ -18,7 +18,6 @@ class DonghuaFunProvider : MainAPI() {
         private const val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (Chrome/124.0.0.0 Mobile Safari/537.36"
     }
 
-    // Instance-level headers – can use mainUrl safely here
     private val headers get() = mapOf(
         "User-Agent" to USER_AGENT,
         "Referer" to mainUrl,
@@ -36,9 +35,22 @@ class DonghuaFunProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (request.data == "coming_soon_filter") {
-            val doc = app.get("$mainUrl/index.php/vod/show/id/20/by/time.html").document
-            val cards = parseShowCardsWithFilter(doc, onlyComingSoon = true)
-            return newHomePageResponse(request.name, cards)
+            // Collect upcoming shows from the first 3 pages of "Recently Updated"
+            val allCards = mutableListOf<SearchResponse>()
+            for (p in 1..3) {
+                val pageUrl = "$mainUrl/index.php/vod/show/id/20/by/time.html/page/$p.html"
+                val doc = try {
+                    app.get(pageUrl).document
+                } catch (e: Exception) {
+                    break
+                }
+                val cards = parseShowCardsWithFilter(doc, onlyComingSoon = true)
+                allCards.addAll(cards)
+                if (cards.size < 20) break // last page
+            }
+            // Remove duplicates by href
+            val distinctCards = allCards.distinctBy { it.url }
+            return newHomePageResponse(request.name, distinctCards)
         }
 
         val pageUrl = if (page == 1) request.data
@@ -53,10 +65,17 @@ class DonghuaFunProvider : MainAPI() {
             .distinctBy { it.attr("href") }
             .mapNotNull { a ->
                 if (onlyComingSoon) {
-                    val hasComingSoon = a.select(".public-list-prb, .status, .badge, p")
-                        .any { it.text().contains("Coming Soon", ignoreCase = true) }
-                            || a.text().contains("Coming Soon", ignoreCase = true)
-                    if (!hasComingSoon) return@mapNotNull null
+                    val cardText = a.text()
+                    val badge = a.selectFirst(".public-list-prb, .status, .badge, .episode-badge")
+                    val badgeText = badge?.text() ?: ""
+                    
+                    val isComingSoon = cardText.contains("Coming Soon", ignoreCase = true) ||
+                                       cardText.contains("Not yet aired", ignoreCase = true) ||
+                                       badgeText.contains("Coming Soon", ignoreCase = true) ||
+                                       badgeText.contains("Trailer", ignoreCase = true) ||
+                                       (badgeText.isNotBlank() && !badgeText.contains("EP", ignoreCase = true))
+                    
+                    if (!isComingSoon) return@mapNotNull null
                 }
                 val href = fixUrl(a.attr("href"))
                 val title = a.attr("title").ifEmpty {
@@ -97,7 +116,6 @@ class DonghuaFunProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
 
-        // Try to get episodes from 4K tab first
         val tabs = doc.select(".anthology-tab a.vod-playerUrl")
         val fourKTabIndex = tabs.indexOfFirst { it.text().contains("4K", ignoreCase = true) }
         val targetIndex = if (fourKTabIndex != -1) fourKTabIndex else 0
@@ -113,7 +131,6 @@ class DonghuaFunProvider : MainAPI() {
             Log.d(TAG, "Found ${episodes.size} episodes from 4K tab")
         }
 
-        // If none, look anywhere on the page
         if (episodes.isEmpty()) {
             val allPlayLinks = doc.select("a[href*='/vod/play/id/$showId/']")
             for (a in allPlayLinks) {
@@ -121,13 +138,12 @@ class DonghuaFunProvider : MainAPI() {
                 val epName = a.selectFirst("span")?.text()?.trim() ?: a.text().trim()
                 episodes.add(newEpisode(epUrl) { name = if (epName.isNotEmpty()) epName else "Episode" })
             }
-            Log.d(TAG, "Found ${episodes.size} episodes from global play links")
+            Log.d(TAG, "Found ${episodes.size} episodes from global links")
         }
 
         val isComingSoon = doc.select(".right p:contains(Coming Soon), .card-top .right p:contains(Coming Soon)").any()
                 || doc.text().contains("Coming Soon", ignoreCase = true)
 
-        // For Coming Soon shows with no episodes, try to add a trailer
         if (episodes.isEmpty() && isComingSoon) {
             Log.d(TAG, "Series is Coming Soon, looking for trailer")
             val trailerUrl = extractTrailerPlayUrl(doc, showId)
@@ -137,7 +153,6 @@ class DonghuaFunProvider : MainAPI() {
             }
         }
 
-        // Final fallback only for regular series (not Coming Soon)
         if (episodes.isEmpty() && !isComingSoon) {
             Log.d(TAG, "No episodes found and not Coming Soon – generating numeric range 1..300")
             for (n in 1..300) {
@@ -174,7 +189,6 @@ class DonghuaFunProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Fetch the play page
         val doc = try {
             app.get(data, headers = headers).document
         } catch (e: Exception) {
@@ -182,7 +196,6 @@ class DonghuaFunProvider : MainAPI() {
         }
 
         if (doc != null) {
-            // Look for player_aaaa JSON in script tags
             val scripts = doc.select("script").map { it.html() }.joinToString("\n")
             val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
                 .find(scripts)?.groupValues?.get(1)
@@ -203,14 +216,12 @@ class DonghuaFunProvider : MainAPI() {
                 }
             }
 
-            // Try iframe that wraps the m3u8
             val iframe = doc.selectFirst("iframe[src*='play.donghuafun.com'], iframe[src*='m3u8']")
             if (iframe != null) {
                 val iframeSrc = fixUrl(iframe.attr("src"))
                 if (loadExtractor(iframeSrc, data, subtitleCallback, callback)) return true
             }
 
-            // Fallback: any iframe on the page
             for (iframe in doc.select("iframe[src]")) {
                 val src = fixUrl(iframe.attr("src"))
                 if (src.isNotBlank() && loadExtractor(src, data, subtitleCallback, callback)) {
