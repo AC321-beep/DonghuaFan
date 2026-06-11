@@ -3,12 +3,12 @@ android {
 }
 
 cloudstream {
-    description = "Chinese Anime(English Sub"
+    description = "Chinese Anime(English Sub)"
     authors = listOf("AC321-beep")
     status = 1
     tvTypes = listOf("Anime")
     language = "en"
-    version = 1.5
+    version = 2
 }
 
 dependencies {
