@@ -1,10 +1,13 @@
 package com.myanimelive
 
 import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.utils.get
+import com.lagradost.cloudstream3.utils.post
 import org.json.JSONObject
 
 class YoutubeExtractor : ExtractorApi() {
@@ -113,10 +116,11 @@ class YoutubeExtractor : ExtractorApi() {
                         newExtractorLink(
                             source = this.name,
                             name = "$qualityLabel$nameSuffix",
-                            url = urlLine,
-                            referer = mainUrl,
-                            quality = height
-                        )
+                            url = urlLine
+                        ).apply {
+                            this.referer = mainUrl
+                            this.quality = height
+                        }
                     )
                 }
                 i += 2
@@ -136,7 +140,7 @@ class YoutubeExtractor : ExtractorApi() {
         }
     }
 
-    private fun extractSubtitlesFromApi(root: JSONObject, subtitleCallback: (SubtitleFile) -> Unit) {
+    private suspend fun extractSubtitlesFromApi(root: JSONObject, subtitleCallback: (SubtitleFile) -> Unit) {
         try {
             val captions = root.optJSONObject("captions")
             val tracklist = captions?.optJSONObject("playerCaptionsTracklistRenderer")
