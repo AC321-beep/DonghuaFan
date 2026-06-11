@@ -3,7 +3,7 @@ android {
 }
 
 cloudstream {
-    description = "Anime from myanimelive"
+    description = "Chinese Anime(English Sub"
     authors = listOf("AC321-beep")
     status = 1
     tvTypes = listOf("Anime")
