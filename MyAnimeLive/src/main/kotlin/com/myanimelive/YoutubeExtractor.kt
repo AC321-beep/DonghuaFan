@@ -1,23 +1,19 @@
-package com.youtube
+package com.myanimelive
 
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.lagradost.cloudstream3.utils.Qualities
-import kotlinx.coroutines.delay
 import org.json.JSONObject
-import java.net.URLEncoder
 
 class YoutubeExtractor : ExtractorApi() {
     override val name = "YouTube"
     override val mainUrl = "https://www.youtube.com"
     override val requiresReferer = false
 
-    // Default visitor cookie – works without login
+    private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     private val defaultVisitorData = "CgtsTzVVMk92M3pRcyi76Y2iBg%3D%3D"
-    private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
 
     override suspend fun getUrl(
         url: String,
@@ -26,20 +22,19 @@ class YoutubeExtractor : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val videoId = extractYoutubeId(url) ?: return
-        val watchUrl = "$mainUrl/watch?v=$videoId&hl=en"
 
-        // 1. Fetch watch page to get API key and visitor data (optional, we can use defaults)
+        // 1. Fetch watch page to get fresh API data (optional, fallback to defaults)
         val watchHtml = try {
-            app.get(watchUrl, headers = mapOf("User-Agent" to userAgent)).text
-        } catch (e: Exception) {
-            null
-        }
+            app.get("$mainUrl/watch?v=$videoId&hl=en", headers = mapOf("User-Agent" to userAgent)).text
+        } catch (e: Exception) { null }
 
-        val apiKey = watchHtml?.let { findConfig(it, "INNERTUBE_API_KEY") } ?: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
-        val clientVersion = watchHtml?.let { findConfig(it, "INNERTUBE_CLIENT_VERSION") } ?: "2.20240725.01.00"
+        val apiKey = watchHtml?.let { findConfig(it, "INNERTUBE_API_KEY") }
+            ?: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+        val clientVersion = watchHtml?.let { findConfig(it, "INNERTUBE_CLIENT_VERSION") }
+            ?: "2.20240725.01.00"
         val visitorData = watchHtml?.let { findConfig(it, "VISITOR_DATA") } ?: defaultVisitorData
 
-        // 2. Call player API
+        // 2. Call YouTube player API
         val apiUrl = "$mainUrl/youtubei/v1/player?key=$apiKey"
         val payload = mapOf(
             "context" to mapOf(
@@ -63,28 +58,24 @@ class YoutubeExtractor : ExtractorApi() {
 
         val responseText = try {
             app.post(apiUrl, headers = headers, json = payload).text
-        } catch (e: Exception) {
-            return
-        }
+        } catch (e: Exception) { return }
 
-        // 3. Parse HLS manifest URL
         val root = JSONObject(responseText)
+
+        // 3. Extract HLS manifest URL
         val streamingData = root.optJSONObject("streamingData")
         val hlsManifestUrl = streamingData?.optString("hlsManifestUrl")
-
         if (hlsManifestUrl.isNullOrEmpty()) return
 
-        // 4. Fetch and parse M3U8 manifest
+        // 4. Parse M3U8 master playlist
         val masterM3u8 = try {
             app.get(hlsManifestUrl, referer = mainUrl).text
-        } catch (e: Exception) {
-            return
-        }
+        } catch (e: Exception) { return }
 
         val lines = masterM3u8.lines()
         val subtitleMap = mutableMapOf<String, String>()
 
-        // First pass: collect subtitles from EXT-X-MEDIA tags
+        // Collect subtitles from EXT-X-MEDIA tags
         lines.forEach { line ->
             if (line.startsWith("#EXT-X-MEDIA") && line.contains("TYPE=SUBTITLES")) {
                 val uri = parseM3u8Tag(line, "URI")
@@ -97,7 +88,7 @@ class YoutubeExtractor : ExtractorApi() {
             }
         }
 
-        // Second pass: extract video streams
+        // Extract video streams
         var i = 0
         while (i < lines.size) {
             val line = lines[i]
@@ -108,7 +99,6 @@ class YoutubeExtractor : ExtractorApi() {
                     val height = resolution?.substringAfter("x")?.toIntOrNull() ?: 0
                     val qualityLabel = if (height > 0) "${height}p" else "Auto"
 
-                    // Check for audio language and type
                     val audioId = parseM3u8Tag(line, "YT-EXT-AUDIO-CONTENT-ID")
                     val lang = audioId?.substringBefore('.')?.uppercase()
                     val ytTags = parseM3u8Tag(line, "YT-EXT-XTAGS")
@@ -140,7 +130,7 @@ class YoutubeExtractor : ExtractorApi() {
             subtitleCallback(newSubtitleFile(name, uri))
         }
 
-        // Optional: if no subtitles found via HLS, try the captions API
+        // Fallback: try captions API if no HLS subtitles found
         if (subtitleMap.isEmpty()) {
             extractSubtitlesFromApi(root, subtitleCallback)
         }
@@ -151,20 +141,16 @@ class YoutubeExtractor : ExtractorApi() {
             val captions = root.optJSONObject("captions")
             val tracklist = captions?.optJSONObject("playerCaptionsTracklistRenderer")
             val captionTracks = tracklist?.optJSONArray("captionTracks") ?: return
-
             for (i in 0 until captionTracks.length()) {
                 val track = captionTracks.getJSONObject(i)
                 val baseUrl = track.optString("baseUrl")
                 val lang = track.optString("languageCode")
                 val name = track.optJSONObject("name")?.optString("simpleText") ?: lang
                 if (baseUrl.isNotEmpty()) {
-                    val vttUrl = "$baseUrl&fmt=vtt"
-                    subtitleCallback(newSubtitleFile("$name ($lang)", vttUrl))
+                    subtitleCallback(newSubtitleFile("$name ($lang)", "$baseUrl&fmt=vtt"))
                 }
             }
-        } catch (e: Exception) {
-            // Ignore
-        }
+        } catch (e: Exception) { }
     }
 
     private fun extractYoutubeId(url: String): String? {
@@ -173,16 +159,13 @@ class YoutubeExtractor : ExtractorApi() {
             Regex("youtube\\.com/watch\\?.*v=([A-Za-z0-9_-]{11})")
         )
         for (pattern in patterns) {
-            pattern.find(url)?.let {
-                return it.groupValues[1]
-            }
+            pattern.find(url)?.let { return it.groupValues[1] }
         }
         return null
     }
 
     private fun findConfig(html: String, key: String): String? {
-        val regex = Regex("\"$key\"\\s*:\\s*\"([^\"]+)\"")
-        return regex.find(html)?.groupValues?.get(1)
+        return Regex("\"$key\"\\s*:\\s*\"([^\"]+)\"").find(html)?.groupValues?.get(1)
     }
 
     private fun parseM3u8Tag(tag: String, key: String): String? {
