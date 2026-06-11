@@ -24,45 +24,42 @@ class YoutubeExtractor : ExtractorApi() {
             val extractor = ServiceList.YouTube.getStreamExtractor(linkHandler)
             extractor.fetchPage()
 
-            val seenHeights = mutableSetOf<Int>()
+            // Add all video streams (muxed + video‑only)
+            for (stream in extractor.videoStreams + extractor.videoOnlyStreams) {
+                val videoUrl = stream.content
+                if (videoUrl != null) {
+                    val height = stream.height ?: 0
+                    if (height > 0) {
+                        callback(
+                            newExtractorLink(
+                                name,
+                                "${height}p",
+                                videoUrl
+                            ).apply {
+                                this.referer = mainUrl
+                                this.quality = height
+                            }
+                        )
+                    }
+                }
+            }
 
-            // Video-only streams
-            for (stream in extractor.videoOnlyStreams ?: emptyList()) {
-                val videoUrl = stream.content ?: continue
-                val height = stream.height ?: 0
-                if (height > 0 && seenHeights.add(height)) {
+            // Add one audio stream as fallback (optional)
+            extractor.audioStreams.firstOrNull()?.let { audio ->
+                audio.content?.let { audioUrl ->
                     callback(
                         newExtractorLink(
-                            source = this.name,           // provider name
-                            name = this.name,             // display name
-                            url = videoUrl,
-                            referer = mainUrl,
-                            quality = height
-                        )
+                            name,
+                            "Audio",
+                            audioUrl
+                        ).apply {
+                            this.referer = mainUrl
+                        }
                     )
                 }
             }
 
-            // Audio streams
-            val audioUrls = mutableSetOf<String>()
-            for (audio in extractor.audioStreams ?: emptyList()) {
-                val audioUrl = audio.content ?: continue
-                if (audioUrls.add(audioUrl)) {
-                    val bitrate = audio.bitrate ?: 128
-                    val lang = audio.audioTrackId?.substringBefore(".")?.uppercase() ?: "Audio"
-                    callback(
-                        newExtractorLink(
-                            source = this.name,
-                            name = "$lang (${bitrate}kbps)",   // show description as name
-                            url = audioUrl,
-                            referer = mainUrl
-                            // quality is not used for audio
-                        )
-                    )
-                }
-            }
-
-            // Subtitles
+            // Subtitles – using non‑deprecated API
             extractor.subtitlesDefault?.forEach { sub ->
                 val lang = sub.locale?.language ?: "en"
                 val subUrl = sub.content ?: sub.getUrl()
@@ -71,7 +68,7 @@ class YoutubeExtractor : ExtractorApi() {
                 }
             }
         } catch (e: Exception) {
-            // Silent fail – fallback to built-in extractor
+            // Silent fail – CloudStream will try the built‑in extractor
         }
     }
 }
