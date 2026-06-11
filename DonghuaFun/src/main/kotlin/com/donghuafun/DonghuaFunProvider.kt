@@ -3,6 +3,7 @@ package com.donghuafun
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.delay
 import org.jsoup.nodes.Document
 
 class DonghuaFunProvider : MainAPI() {
@@ -120,7 +121,7 @@ class DonghuaFunProvider : MainAPI() {
             val nextPage = doc.selectFirst("a:contains(下一页), .page-next, .next")
             if (nextPage == null || nextPage.attr("href").isBlank()) break
             page++
-            delay(500)
+            delay(500) // now works because we imported delay
         }
         return results
     }
@@ -159,7 +160,7 @@ class DonghuaFunProvider : MainAPI() {
             }
         }
 
-        // Fallback to all play links (if 4K tab gave nothing)
+        // Fallback to all play links
         if (episodes.isEmpty()) {
             val allPlayLinks = doc.select("a[href*='/vod/play/id/$showId/']")
             for (a in allPlayLinks) {
@@ -169,8 +170,8 @@ class DonghuaFunProvider : MainAPI() {
             }
         }
 
-        // Deduplicate episodes by URL
-        val uniqueEpisodes = episodes.distinctBy { it.url }
+        // Deduplicate episodes by their "data" field (the URL)
+        val uniqueEpisodes = episodes.distinctBy { it.data }
 
         val isComingSoonDetail = doc.select(".right p:contains(Coming Soon), .card-top .right p:contains(Coming Soon)").any()
                 || doc.text().contains("Coming Soon", ignoreCase = true)
@@ -186,8 +187,6 @@ class DonghuaFunProvider : MainAPI() {
         } else {
             uniqueEpisodes
         }
-
-        // No fake episode generation – if still empty, user sees nothing
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = poster?.let { fixUrl(it) }
