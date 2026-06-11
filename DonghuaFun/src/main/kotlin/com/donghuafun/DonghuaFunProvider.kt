@@ -15,7 +15,12 @@ class DonghuaFunProvider : MainAPI() {
 
     companion object {
         private const val TAG = "DonghuaFun"
-        private val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        private val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (Chrome/124.0.0.0 Mobile Safari/537.36"
+        private val HEADERS = mapOf(
+            "User-Agent" to USER_AGENT,
+            "Referer" to mainUrl,
+            "Origin" to mainUrl
+        )
     }
 
     private fun detailUrlToId(url: String): String =
@@ -45,12 +50,14 @@ class DonghuaFunProvider : MainAPI() {
         return doc.select("a[href*='/vod/detail/id/']")
             .distinctBy { it.attr("href") }
             .mapNotNull { a ->
-                if (onlyComingSoon && !a.text().contains("Coming Soon", ignoreCase = true)) {
-                    val badge = a.selectFirst(".public-list-prb, .status, .badge")
-                    if (badge == null || !badge.text().contains("Coming Soon", ignoreCase = true)) {
-                        return@mapNotNull null
-                    }
+                if (onlyComingSoon) {
+                    // Check if this card contains "Coming Soon" in any of its child elements
+                    val hasComingSoon = a.select(".public-list-prb, .status, .badge, p")
+                        .any { it.text().contains("Coming Soon", ignoreCase = true) }
+                            || a.text().contains("Coming Soon", ignoreCase = true)
+                    if (!hasComingSoon) return@mapNotNull null
                 }
+
                 val href = fixUrl(a.attr("href"))
                 val title = a.attr("title").ifEmpty {
                     a.selectFirst("img")?.attr("alt") ?: a.text()
@@ -72,7 +79,7 @@ class DonghuaFunProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url).document
+        val doc = app.get(url, headers = HEADERS).document
         val showId = detailUrlToId(url)
 
         val title = doc.selectFirst("h1, .video-title, .detail-title")?.text()?.trim()
@@ -90,7 +97,7 @@ class DonghuaFunProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
 
-        // Episode extraction from tabs
+        // Episode extraction – same as before
         val tabs = doc.select(".anthology-tab a.vod-playerUrl")
         val fourKTabIndex = tabs.indexOfFirst { it.text().contains("4K", ignoreCase = true) }
         val targetIndex = if (fourKTabIndex != -1) fourKTabIndex else 0
@@ -106,7 +113,6 @@ class DonghuaFunProvider : MainAPI() {
             Log.d(TAG, "Found ${episodes.size} episodes from 4K tab")
         }
 
-        // Fallback: any play link on the page
         if (episodes.isEmpty()) {
             val allPlayLinks = doc.select("a[href*='/vod/play/id/$showId/']")
             for (a in allPlayLinks) {
@@ -120,19 +126,15 @@ class DonghuaFunProvider : MainAPI() {
         val isComingSoon = doc.select(".right p:contains(Coming Soon), .card-top .right p:contains(Coming Soon)").any()
                 || doc.text().contains("Coming Soon", ignoreCase = true)
 
-        // For Coming Soon shows with no episodes, add a trailer
         if (episodes.isEmpty() && isComingSoon) {
             Log.d(TAG, "Series is Coming Soon, looking for trailer")
             val trailerUrl = extractTrailerPlayUrl(doc, showId)
             if (trailerUrl != null) {
                 episodes.add(newEpisode(trailerUrl) { name = "Trailer" })
                 Log.d(TAG, "Added trailer episode")
-            } else {
-                Log.d(TAG, "No trailer found – leaving episode list empty")
             }
         }
 
-        // Only generate fake episodes if not Coming Soon and still no episodes
         if (episodes.isEmpty() && !isComingSoon) {
             Log.d(TAG, "No episodes found and not Coming Soon – generating numeric range 1..300")
             for (n in 1..300) {
@@ -169,35 +171,57 @@ class DonghuaFunProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to data)
+        // First, try to get the HTML of the play page (the episode URL)
+        val doc = try {
+            app.get(data, headers = HEADERS).document
+        } catch (e: Exception) {
+            null
+        }
 
-        val html = try { app.get(data, headers = headers).text } catch (e: Exception) { "" }
+        if (doc != null) {
+            // Look for the player_aaaa JSON inside the page (might be in script tags)
+            val scripts = doc.select("script").map { it.html() }.joinToString("\n")
+            val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+                .find(scripts)?.groupValues?.get(1)
+            if (playerJson != null) {
+                val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)
+                if (!rawUrl.isNullOrBlank() && rawUrl.startsWith("http")) {
+                    // Direct .m3u8 link
+                    val headers = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Referer" to mainUrl,
+                        "Origin" to mainUrl
+                    )
+                    val extLink = ExtractorLink(
+                        source = name,
+                        name = "CloudOKyo",
+                        url = rawUrl,
+                        referer = mainUrl,
+                        quality = Qualities.P1080.value,
+                        type = ExtractorLinkType.M3U8,
+                        headers = headers
+                    )
+                    callback(extLink)
+                    return true
+                }
+            }
 
-        // Extract direct .m3u8 link from player_aaaa JSON
-        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-            .find(html)?.groupValues?.get(1)
-        if (playerJson != null) {
-            val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)
-            if (!rawUrl.isNullOrBlank() && rawUrl.startsWith("http")) {
-                val extLink = ExtractorLink(
-                    source = name,
-                    name = "CloudOKyo",
-                    url = rawUrl,
-                    referer = mainUrl,
-                    quality = Qualities.P1080.value,
-                    type = ExtractorLinkType.M3U8
-                )
-                callback(extLink)
-                return true
+            // If direct m3u8 not found, look for iframe (e.g., play.donghuafun.com/m3u8/?url=...)
+            val iframe = doc.selectFirst("iframe[src*='play.donghuafun.com'], iframe[src*='m3u8']")
+            if (iframe != null) {
+                val iframeSrc = fixUrl(iframe.attr("src"))
+                // The iframe might need to be loaded directly – we can try to load it as an extractor
+                if (loadExtractor(iframeSrc, data, subtitleCallback, callback)) return true
             }
         }
 
-        // Fallback: look for any iframe that might embed the video (Dailymotion, etc.)
-        val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
-        doc?.select("iframe[src]")?.forEach { iframe ->
-            val src = fixUrl(iframe.attr("src"))
-            if (src.isNotBlank()) {
-                if (loadExtractor(src, data, subtitleCallback, callback)) return true
+        // Last resort: try any iframe on the page
+        if (doc != null) {
+            for (iframe in doc.select("iframe[src]")) {
+                val src = fixUrl(iframe.attr("src"))
+                if (src.isNotBlank() && loadExtractor(src, data, subtitleCallback, callback)) {
+                    return true
+                }
             }
         }
 
