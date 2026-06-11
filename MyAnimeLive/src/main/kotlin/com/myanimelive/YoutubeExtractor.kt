@@ -1,13 +1,10 @@
 package com.myanimelive
 
 import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.lagradost.cloudstream3.utils.get
-import com.lagradost.cloudstream3.utils.post
 import org.json.JSONObject
 
 class YoutubeExtractor : ExtractorApi() {
@@ -26,7 +23,7 @@ class YoutubeExtractor : ExtractorApi() {
     ) {
         val videoId = extractYoutubeId(url) ?: return
 
-        // 1. Fetch watch page to get fresh API data (optional, fallback to defaults)
+        // 1. Fetch watch page (optional – fallback to defaults)
         val watchHtml = try {
             app.get("$mainUrl/watch?v=$videoId&hl=en", headers = mapOf("User-Agent" to userAgent)).text
         } catch (e: Exception) { null }
