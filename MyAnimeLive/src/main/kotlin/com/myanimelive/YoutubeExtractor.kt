@@ -26,7 +26,7 @@ class YoutubeExtractor : ExtractorApi() {
 
             val seenHeights = mutableSetOf<Int>()
 
-            // 1. Video-only streams (up to 4K, no audio)
+            // Video-only streams (up to 4K, no audio) – highest quality
             for (stream in extractor.videoOnlyStreams ?: emptyList()) {
                 val videoUrl = stream.content ?: continue
                 val height = stream.height ?: 0
@@ -34,7 +34,7 @@ class YoutubeExtractor : ExtractorApi() {
                     callback(
                         newExtractorLink(
                             name,
-                            "${height}p (video only)",
+                            "${height}p",
                             videoUrl
                         ).apply {
                             this.referer = mainUrl
@@ -44,25 +44,7 @@ class YoutubeExtractor : ExtractorApi() {
                 }
             }
 
-            // 2. Muxed streams (audio+video together, often lower resolutions)
-            for (stream in extractor.videoStreams ?: emptyList()) {
-                val videoUrl = stream.content ?: continue
-                val height = stream.height ?: 0
-                if (height > 0 && seenHeights.add(height)) {
-                    callback(
-                        newExtractorLink(
-                            name,
-                            "${height}p (muxed)",
-                            videoUrl
-                        ).apply {
-                            this.referer = mainUrl
-                            this.quality = height
-                        }
-                    )
-                }
-            }
-
-            // 3. Audio streams (one per language/bitrate)
+            // Audio streams (one per language/bitrate)
             val audioUrls = mutableSetOf<String>()
             for (audio in extractor.audioStreams ?: emptyList()) {
                 val audioUrl = audio.content ?: continue
@@ -81,7 +63,7 @@ class YoutubeExtractor : ExtractorApi() {
                 }
             }
 
-            // 4. Subtitles
+            // Subtitles
             extractor.subtitlesDefault?.forEach { sub ->
                 val lang = sub.locale?.language ?: "en"
                 val subUrl = sub.content ?: sub.getUrl()
