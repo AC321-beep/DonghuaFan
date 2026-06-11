@@ -4,31 +4,45 @@ import android.content.Context
 import com.lagradost.cloudstream3.extractors.Dailymotion
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.schabi.newpipe.extractor.NewPipe
 import org.schabi.newpipe.extractor.downloader.Downloader
-import org.schabi.newpipe.extractor.downloader.Request
 import org.schabi.newpipe.extractor.downloader.Response
-import com.lagradost.cloudstream3.app
 
 @CloudstreamPlugin
 class MyAnimeLivePlugin : Plugin() {
     override fun load(context: Context) {
-        // Initialize NewPipe with a downloader that uses CloudStream's http client
-        NewPipe.init(object : Downloader() {
-            override fun execute(request: Request): Response {
-                val response = app.get(
-                    request.url(),
-                    headers = request.headers().toMap()
-                        .mapValues { it.value.firstOrNull() ?: "" }
-                ).also { it }
+        val okClient = OkHttpClient()
 
-                return Response.Builder()
-                    .responseCode(response.code)
-                    .responseMessage(response.message)
-                    .responseBody(response.text)
-                    .responseHeaders(response.headers.toMultimap())
-                    .latestUrl(response.url)
-                    .build()
+        NewPipe.init(object : Downloader() {
+            override fun execute(
+                request: org.schabi.newpipe.extractor.downloader.Request
+            ): Response {
+                val reqBuilder = Request.Builder().url(request.url())
+                request.headers().forEach { (key, values) ->
+                    values.forEach { value -> reqBuilder.addHeader(key, value) }
+                }
+                if (request.httpMethod() == "POST") {
+                    val body = request.dataToSend()
+                        ?.let { okhttp3.RequestBody.create(null, it) }
+                        ?: okhttp3.RequestBody.create(null, ByteArray(0))
+                    reqBuilder.post(body)
+                }
+
+                val resp = okClient.newCall(reqBuilder.build()).execute()
+                val responseHeaders = mutableMapOf<String, MutableList<String>>()
+                resp.headers().names().forEach { name ->
+                    responseHeaders[name] = resp.headers(name).toMutableList()
+                }
+
+                return Response(
+                    resp.code(),
+                    resp.message(),
+                    responseHeaders,
+                    resp.body()?.string(),
+                    resp.request().url().toString()
+                )
             }
         })
 
