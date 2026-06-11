@@ -1,17 +1,17 @@
 package com.myanimelive
 
 import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.schabi.newpipe.extractor.NewPipe
-import org.schabi.newpipe.extractor.StreamingService
-import org.schabi.newpipe.extractor.services.youtube.YoutubeService
-import org.schabi.newpipe.extractor.services.youtube.linkHandler.YoutubeStreamLinkHandlerFactory
 import org.schabi.newpipe.extractor.stream.StreamInfo
+import org.schabi.newpipe.extractor.stream.VideoStream
+import org.schabi.newpipe.extractor.stream.AudioStream
+import org.schabi.newpipe.extractor.stream.SubtitlesStream
 
 class YoutubeExtractor : ExtractorApi() {
     override val name = "YouTube"
@@ -24,26 +24,25 @@ class YoutubeExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Run NewPipe blocking calls on IO dispatcher
         withContext(Dispatchers.IO) {
             try {
-                // Use existing NewPipe initializer (assumed already initialized by host app)
-                val service: StreamingService = YoutubeService()
-                val linkHandler = YoutubeStreamLinkHandlerFactory.getInstance().fromUrl(url)
-                val streamInfo = StreamInfo.getInfo(service, linkHandler)
+                // NewPipe requires a DownloaderImpl — must be initialized by the host app
+                val service = NewPipe.getService(0) // 0 = YouTube
+                val streamInfo = StreamInfo.getInfo(service, url)
 
-                // Add video streams (muxed + video‑only)
+                // Muxed + video-only streams
                 val seenHeights = mutableSetOf<Int>()
-                for (video in streamInfo.videoStreams + streamInfo.videoOnlyStreams) {
-                    val videoUrl = video.content ?: continue
-                    val height = video.height ?: 0
-                    if (height > 0 && seenHeights.add(height)) {
+                for (video in (streamInfo.videoStreams + streamInfo.videoOnlyStreams)) {
+                    val videoUrl = video.content?.takeIf { it.isNotBlank() } ?: continue
+                    val height = video.height.takeIf { it > 0 } ?: continue
+                    if (seenHeights.add(height)) {
                         callback(
                             newExtractorLink(
-                                source = this@YoutubeExtractor.name,
+                                source = name,
                                 name = "${height}p",
-                                url = videoUrl
-                            ).apply {
+                                url = videoUrl,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
                                 this.referer = mainUrl
                                 this.quality = height
                             }
@@ -51,33 +50,35 @@ class YoutubeExtractor : ExtractorApi() {
                     }
                 }
 
-                // Add audio streams (optional, for DASH)
+                // Audio streams
                 for (audio in streamInfo.audioStreams) {
-                    val audioUrl = audio.content ?: continue
-                    val bitrate = audio.bitrate ?: 128
-                    val lang = audio.language?.firstOrNull()?.code ?: "audio"
+                    val audioUrl = audio.content?.takeIf { it.isNotBlank() } ?: continue
+                    // locale is a java.util.Locale, use toLanguageTag() or language property
+                    val lang = audio.audioLocale?.language ?: "audio"
+                    val bitrate = audio.averageBitrate.takeIf { it > 0 } ?: 128
                     callback(
                         newExtractorLink(
-                            source = this@YoutubeExtractor.name,
-                            name = "Audio ($lang, ${bitrate}kbps)",
-                            url = audioUrl
-                        ).apply {
+                            source = name,
+                            name = "Audio ($lang ${bitrate}kbps)",
+                            url = audioUrl,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
                             this.referer = mainUrl
                         }
                     )
                 }
 
-                // Add subtitles
+                // Subtitles
                 for (sub in streamInfo.subtitles) {
-                    val lang = sub.language?.firstOrNull()?.code ?: "en"
-                    val subUrl = sub.content ?: sub.getUrl()
-                    if (subUrl != null) {
-                        subtitleCallback(newSubtitleFile(lang, subUrl))
-                    }
+                    val subUrl = sub.content?.takeIf { it.isNotBlank() } ?: continue
+                    // locale is java.util.Locale
+                    val lang = sub.locale?.language ?: "en"
+                    subtitleCallback(
+                        SubtitleFile(lang = lang, url = subUrl)
+                    )
                 }
 
             } catch (e: Exception) {
-                // Silent fallback – CloudStream will try other extractors
                 e.printStackTrace()
             }
         }
