@@ -170,7 +170,7 @@ override suspend fun loadLinks(
     val html = try { app.get(detailPageUrl, headers = headers).text } catch (e: Exception) { "" }
     val doc = try { app.get(detailPageUrl, headers = headers).document } catch (e: Exception) { null }
 
-    // ----- 1) Dailymotion (unchanged, works) -----
+    // ----- Dailymotion (unchanged, works) -----
     var dailymotionToken: String? = null
     doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
         val src = iframe.attr("src")
@@ -185,97 +185,83 @@ override suspend fun loadLinks(
         if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
     }
 
-    // ----- 2) Parse player_aaaa -----
-    val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-        .find(html)?.groupValues?.get(1)
-
-    if (playerJson == null) {
-        Log.d(TAG, "No player_aaaa found")
-        return false
-    }
-
-    var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
-    val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
-    val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-
-    if (encrypt == 1) {
-        rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-    } else if (encrypt == 2) {
-        rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
-        rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-    }
-    Log.d(TAG, "Raw URL: $rawUrl, from: $from")
-
-    // Dailymotion fallback
-    if (from.equals("dailymotion", ignoreCase = true)) {
-        val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
-        if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
-    }
-
-    // ----- 3) Non-Dailymotion: get the .m3u8 URL from the iframe proxy -----
-    var videoUrl: String? = null
+    // ----- Non-Dailymotion: get the proxy iframe URL -----
     var proxyIframeUrl: String? = null
-
     doc?.select("iframe[src*='play.donghuafun.com/m3u8/']")?.forEach { iframe ->
         proxyIframeUrl = iframe.attr("src")
-        val match = Regex("""[?&]url=([^&]+)""").find(proxyIframeUrl!!)
+        Log.d(TAG, "Found proxy iframe: $proxyIframeUrl")
+        return@forEach
+    }
+
+    // If we have a proxy iframe, try to load it directly (the iframe page may contain the video)
+    if (proxyIframeUrl != null) {
+        // First, try using CloudStream's extractor on the proxy page
+        if (loadExtractor(proxyIframeUrl, detailPageUrl, subtitleCallback, callback)) {
+            return true
+        }
+        
+        // If that fails, extract the .m3u8 from the proxy iframe's 'url' parameter and play with proper referer
+        val match = Regex("""[?&]url=([^&]+)""").find(proxyIframeUrl)
         if (match != null) {
-            videoUrl = URLDecoder.decode(match.groupValues[1], "UTF-8")
+            val videoUrl = URLDecoder.decode(match.groupValues[1], "UTF-8")
             Log.d(TAG, "Extracted video URL: $videoUrl")
-            return@forEach
+            // Use the proxy iframe URL as referer (critical for CDN)
+            val videoHeaders = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Referer" to proxyIframeUrl,
+                "Origin" to "https://play.donghuafun.com"
+            )
+            callback.invoke(
+                ExtractorLink(
+                    source = this.name,
+                    name = this.name,
+                    url = videoUrl,
+                    referer = proxyIframeUrl,
+                    quality = Qualities.Unknown.value,
+                    type = ExtractorLinkType.M3U8,
+                    headers = videoHeaders
+                )
+            )
+            return true
         }
     }
 
-    // If we have the proxy iframe URL, use its URL as referer
-    if (videoUrl != null && proxyIframeUrl != null) {
-        // Important: set Referer to the proxy iframe URL, not the detail page
-        val videoHeaders = mapOf(
-            "User-Agent" to USER_AGENT,
-            "Referer" to proxyIframeUrl,
-            "Origin" to "https://play.donghuafun.com"
-        )
-        callback.invoke(
-            ExtractorLink(
-                source = this.name,
-                name = this.name,
-                url = videoUrl,
-                referer = proxyIframeUrl,
-                quality = Qualities.Unknown.value,
-                type = ExtractorLinkType.M3U8,
-                headers = videoHeaders
-            )
-        )
-        return true
-    }
+    // Fallback: parse player_aaaa
+    val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+        .find(html)?.groupValues?.get(1)
+    if (playerJson != null) {
+        var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+        val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
+        val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
-    // Fallback: use rawUrl if it's a direct .m3u8
-    if (rawUrl.contains(".m3u8") || rawUrl.contains(".mp4")) {
-        callback.invoke(
-            ExtractorLink(
-                source = this.name,
-                name = this.name,
-                url = rawUrl,
-                referer = detailPageUrl,
-                quality = Qualities.Unknown.value,
-                type = if (rawUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                headers = headers
+        if (encrypt == 1) rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+        else if (encrypt == 2) {
+            rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
+            rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+        }
+        if (from.equals("dailymotion", ignoreCase = true)) {
+            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
+            if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
+        }
+        if (rawUrl.contains(".m3u8") || rawUrl.contains(".mp4")) {
+            callback.invoke(
+                ExtractorLink(
+                    source = this.name,
+                    name = this.name,
+                    url = rawUrl,
+                    referer = detailPageUrl,
+                    quality = Qualities.Unknown.value,
+                    type = if (rawUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                    headers = headers
+                )
             )
-        )
-        return true
-    }
-
-    // Last resort: try any iframe
-    doc?.select("iframe[src]")?.forEach { iframe ->
-        val src = fixUrl(iframe.attr("src"))
-        if (src.isNotBlank() && !src.contains("dailymotion")) {
-            if (loadExtractor(src, detailPageUrl, subtitleCallback, callback)) return true
+            return true
         }
     }
 
     Log.d(TAG, "No playable source found for $detailPageUrl")
     return false
 }
-
     private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
         return doc.select("a[href*='/vod/detail/id/']")
             .distinctBy { it.attr("href") }
