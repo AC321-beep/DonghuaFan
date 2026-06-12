@@ -26,21 +26,65 @@ class DonghuaFunProvider : MainAPI() {
     override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
         "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
+        "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Coming Soon" 
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val pageUrl = if (page == 1) request.data
-                     else request.data.replace(".html", "/page/$page.html")
-        val doc = app.get(pageUrl).document
-        return newHomePageResponse(request.name, parseShowCards(doc))
+        val isComingSoon = request.name == "Coming Soon"
+        var currentPage = page
+        val items = mutableListOf<SearchResponse>()
+        var hasNextPage = true
+        
+        val maxPagesToSearch = if (isComingSoon) 5 else 1 
+        var pagesSearched = 0
+
+        while (items.isEmpty() && hasNextPage && pagesSearched < maxPagesToSearch) {
+            val pageUrl = if (currentPage == 1) request.data 
+                          else request.data.replace(".html", "/page/$currentPage.html")
+            
+            val doc = app.get(pageUrl).document
+            
+            val elements = doc.select("a[href*='/vod/detail/id/']")
+            if (elements.isEmpty()) {
+                hasNextPage = false
+                break
+            }
+
+            items.addAll(parseShowCards(doc, isComingSoon))
+            
+            pagesSearched++
+            
+            if (items.isEmpty()) {
+                currentPage++ 
+            }
+        }
+
+        return newHomePageResponse(request.name, items, hasNextPage)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val doc = app.get(
-            "$mainUrl/index.php/vod/search.html",
-            params = mapOf("wd" to query)
-        ).document
-        return parseShowCards(doc)
+        val results = mutableListOf<SearchResponse>()
+        
+        for (page in 1..3) {
+            val doc = try {
+                app.get(
+                    "$mainUrl/index.php/vod/search.html",
+                    params = mapOf("wd" to query, "page" to page.toString())
+                ).document
+            } catch (e: Exception) {
+                null
+            } ?: break
+
+            val pageResults = parseShowCards(doc)
+            if (pageResults.isEmpty()) break
+            
+            results.addAll(pageResults)
+            
+            val hasNext = doc.select("a.page-next:not(.disabled), a:contains(Next), a:contains(下一页)").isNotEmpty()
+            if (!hasNext) break
+        }
+        
+        return results.distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -76,8 +120,14 @@ class DonghuaFunProvider : MainAPI() {
                 val epUrl = fixUrl(a.attr("href"))
                 val epName = a.selectFirst("span")?.text()?.trim() ?: a.text().trim()
                 val epNumber = parseEpisodeNumber(epName)
-                if (epNumber > 0 && !episodeMap.containsKey(epNumber)) {
-                    episodeMap[epNumber] = newEpisode(epUrl) { name = "EP$epNumber" }
+                
+                val finalNumber = if (epNumber > 0) epNumber else episodeMap.size + 1
+                
+                if (!episodeMap.containsKey(finalNumber)) {
+                    episodeMap[finalNumber] = newEpisode(epUrl) { 
+                        name = epName.ifEmpty { "Episode $finalNumber" }
+                        episode = finalNumber
+                    }
                 }
             }
 
@@ -103,7 +153,7 @@ class DonghuaFunProvider : MainAPI() {
     }
 
     private fun parseEpisodeNumber(name: String): Int {
-        val match = Regex("""EP(\d+)""", RegexOption.IGNORE_CASE).find(name)
+        val match = Regex("""(\d+)""").find(name)
         return match?.groupValues?.get(1)?.toIntOrNull() ?: -1
     }
 
@@ -135,7 +185,7 @@ class DonghuaFunProvider : MainAPI() {
                 }
             }
 
-            // 2. FALLBACK IMPROVEMENT: MacCMS Decryption for normal episodes (solves "no link")
+            // 2. FALLBACK IMPROVEMENT: MacCMS Decryption for normal episodes
             try {
                 if (encrypt == 1) {
                     rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
@@ -147,7 +197,7 @@ class DonghuaFunProvider : MainAPI() {
                 Log.e(TAG, "Failed to decrypt MacCMS url", e)
             }
 
-            // 3. Check Dailymotion again POST-decryption, just in case the Dailymotion link was encrypted
+            // 3. Check Dailymotion again POST-decryption, just in case the link was encoded
             if (from.equals("dailymotion", ignoreCase = true) || rawUrl.contains("dailymotion", ignoreCase = true)) {
                 val dmId = extractDailymotionId(rawUrl)
                 if (dmId != null) {
@@ -219,18 +269,44 @@ class DonghuaFunProvider : MainAPI() {
         return null
     }
 
-    private fun parseShowCards(doc: Document): List<SearchResponse> {
+    private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
         return doc.select("a[href*='/vod/detail/id/']")
             .distinctBy { it.attr("href") }
+            .filter { a -> 
+                if (!isComingSoon) {
+                    true
+                } else {
+                    val parent1 = a.parent()
+                    val parent2 = a.parent()?.parent()
+                    val parent3 = a.parent()?.parent()?.parent()
+
+                    val container = when {
+                        parent3 != null && parent3.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent3
+                        parent2 != null && parent2.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent2
+                        parent1 != null && parent1.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent1
+                        else -> a
+                    }
+                    
+                    val cardText = container.text()
+                    
+                    val keywords = listOf(
+                        "trailer", "coming soon", "not yet aired", 
+                        "upcoming", "releasing soon", "0 episode"
+                    )
+                    keywords.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
+                }
+            }
             .mapNotNull { a ->
                 val href = fixUrl(a.attr("href"))
                 val title = a.attr("title").ifEmpty {
                     a.selectFirst("img")?.attr("alt") ?: a.text()
                 }.trim()
                 if (title.isEmpty()) return@mapNotNull null
+                
                 val poster = a.selectFirst("img")?.let {
                     it.attr("data-src").ifEmpty { it.attr("src") }
                 }?.takeUnless { it.startsWith("data:") }?.let { fixUrl(it) }
+                
                 newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
             }
     }
