@@ -40,6 +40,15 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v5
+        
+        - name: Create local.properties from secrets
+  env:
+    KissKh: ${{ secrets.KissKh }}
+    KisskhSub: ${{ secrets.KisskhSub }}
+  run: |
+    cd $GITHUB_WORKSPACE/src
+    echo "KissKh=$KissKh" >> local.properties
+    echo "KisskhSub=$KisskhSub" >> local.properties
 
       - name: Build Plugins
         run: |
