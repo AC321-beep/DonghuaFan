@@ -119,12 +119,10 @@ class DonghuaFunProvider : MainAPI() {
                 val epName = a.selectFirst("span")?.text()?.trim() ?: a.text().trim()
                 val epNumber = parseEpisodeNumber(epName)
                 
-                // Fallback: If no number is found (e.g., "HD Movie"), just use the next available index
                 val finalNumber = if (epNumber > 0) epNumber else episodeMap.size + 1
                 
                 if (!episodeMap.containsKey(finalNumber)) {
                     episodeMap[finalNumber] = newEpisode(epUrl) { 
-                        // Preserve the original name (e.g., "part01", "HD") instead of forcing "EP1"
                         name = epName.ifEmpty { "Episode $finalNumber" }
                         episode = finalNumber
                     }
@@ -145,7 +143,6 @@ class DonghuaFunProvider : MainAPI() {
     }
 
     private fun parseEpisodeNumber(name: String): Int {
-        // Broadened to catch ANY number in the string (e.g., "part01" -> 1, "02" -> 2, "第12集" -> 12)
         val match = Regex("""(\d+)""").find(name)
         return match?.groupValues?.get(1)?.toIntOrNull() ?: -1
     }
@@ -164,7 +161,7 @@ class DonghuaFunProvider : MainAPI() {
             .find(html)?.groupValues?.get(1)
 
         if (playerJson != null) {
-            val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)
+            val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/")
             val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
 
             if (from.equals("dailymotion", ignoreCase = true) || rawUrl?.contains("dailymotion") == true) {
@@ -173,6 +170,19 @@ class DonghuaFunProvider : MainAPI() {
                     val videoUrl = "https://www.dailymotion.com/video/$dmId"
                     return loadExtractor(videoUrl, data, subtitleCallback, callback)
                 }
+            } 
+            else if (rawUrl != null && (rawUrl.contains(".m3u8", ignoreCase = true) || rawUrl.contains(".mp4", ignoreCase = true))) {
+                callback.invoke(
+                    ExtractorLink(
+                        source = this.name,
+                        name = this.name,
+                        url = rawUrl,
+                        referer = data,
+                        quality = Qualities.Unknown.value,
+                        isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
+                    )
+                )
+                return true
             }
         }
 
@@ -205,9 +215,20 @@ class DonghuaFunProvider : MainAPI() {
     }
 
     private fun extractDailymotionId(urlOrId: String): String? {
-        if (urlOrId.matches(Regex("^[a-zA-Z0-9]{15,}$"))) return urlOrId
-        val pattern = Regex("""dailymotion\.com/(?:embed/)?video/([a-zA-Z0-9]+)""")
-        return pattern.find(urlOrId)?.groupValues?.get(1)
+        // Direct IDs are typically ~7 characters (e.g., "x9fuxk2")
+        if (urlOrId.matches(Regex("^[a-zA-Z0-9_-]{6,15}$"))) return urlOrId
+        
+        // Matches standard URL: dailymotion.com/video/x9fuxk2
+        val standardPattern = Regex("""dailymotion\.com/(?:embed/)?video/([a-zA-Z0-9]+)""")
+        val standardMatch = standardPattern.find(urlOrId)
+        if (standardMatch != null) return standardMatch.groupValues[1]
+        
+        // Matches geo player URL: geo.dailymotion.com/player/xkyen.html?video=x9fuxk2
+        val geoPattern = Regex("""[?&]video=([a-zA-Z0-9]+)""")
+        val geoMatch = geoPattern.find(urlOrId)
+        if (geoMatch != null) return geoMatch.groupValues[1]
+
+        return null
     }
 
     private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
