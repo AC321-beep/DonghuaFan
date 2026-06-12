@@ -167,8 +167,29 @@ class DonghuaFunProvider : MainAPI() {
     ): Boolean {
         val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to data)
         val html = try { app.get(data, headers = headers).text } catch (e: Exception) { "" }
+        val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
 
-        // ----- Parse player_aaaa JSON (if present) -----
+        // ----- Step 1: Find the Dailymotion iframe and extract the video token -----
+        var dailymotionToken: String? = null
+        doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
+            val src = iframe.attr("src")
+            val match = Regex("""[?&]video=([^&]+)""").find(src)
+            if (match != null) {
+                dailymotionToken = match.groupValues[1]
+                Log.d(TAG, "Found Dailymotion token from iframe: $dailymotionToken")
+                return@forEach
+            }
+        }
+
+        // If we found a token, build the embed URL and try to load it
+        if (dailymotionToken != null) {
+            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
+            if (loadExtractor(embedUrl, data, subtitleCallback, callback)) {
+                return true
+            }
+        }
+
+        // ----- Step 2: Fallback to player_aaaa JSON (if iframe not found or load failed) -----
         val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
             .find(html)?.groupValues?.get(1)
 
@@ -177,7 +198,7 @@ class DonghuaFunProvider : MainAPI() {
             val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
             val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
-            // MacCMS decryption
+            // Decrypt if needed
             if (encrypt == 1) {
                 rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
             } else if (encrypt == 2) {
@@ -185,16 +206,14 @@ class DonghuaFunProvider : MainAPI() {
                 rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
             }
 
-            // --- Handle Dailymotion (from="dailymotion" or rawUrl contains dailymotion) ---
-            if (from.equals("dailymotion", ignoreCase = true) || rawUrl.contains("dailymotion", ignoreCase = true)) {
-                val dmId = extractDailymotionId(rawUrl)
-                if (dmId != null) {
-                    val videoUrl = "https://www.dailymotion.com/video/$dmId"
-                    if (loadExtractor(videoUrl, data, subtitleCallback, callback)) return true
-                }
+            // --- Dailymotion (if from field indicates dailymotion) ---
+            if (from.equals("dailymotion", ignoreCase = true)) {
+                // The rawUrl might be a token (episodes) or a short ID (trailers)
+                val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
+                if (loadExtractor(embedUrl, data, subtitleCallback, callback)) return true
             }
 
-            // --- Direct .m3u8 or .mp4 ---
+            // --- Direct .m3u8 / .mp4 (non-Dailymotion trailers) ---
             if (rawUrl.contains(".m3u8", ignoreCase = true) || rawUrl.contains(".mp4", ignoreCase = true)) {
                 callback.invoke(
                     ExtractorLink(
@@ -203,38 +222,19 @@ class DonghuaFunProvider : MainAPI() {
                         url = rawUrl,
                         referer = data,
                         quality = Qualities.Unknown.value,
-                        type = if (rawUrl.contains(".m3u8", ignoreCase = true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        type = if (rawUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     )
                 )
                 return true
             }
 
-            // --- Generic extractor for any other HTTP URL ---
+            // --- Generic HTTP extractor ---
             if (rawUrl.startsWith("http") && loadExtractor(rawUrl, data, subtitleCallback, callback)) {
                 return true
             }
         }
 
-        // ----- Fallback: scan iframes and raw HTML for Dailymotion (when player_aaaa missing or not Dailymotion) -----
-        val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
-
-        doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
-            val src = iframe.attr("src")
-            val dmId = extractDailymotionId(src)
-            if (dmId != null) {
-                val videoUrl = "https://www.dailymotion.com/video/$dmId"
-                if (loadExtractor(videoUrl, data, subtitleCallback, callback)) return true
-            }
-        }
-
-        val dmIdMatch = Regex("""dailymotion\.com/(?:embed/)?video/([a-zA-Z0-9]+)""").find(html)
-        if (dmIdMatch != null) {
-            val dmId = dmIdMatch.groupValues[1]
-            val videoUrl = "https://www.dailymotion.com/video/$dmId"
-            if (loadExtractor(videoUrl, data, subtitleCallback, callback)) return true
-        }
-
-        // ----- Generic iframe scanning for other embed sources (non-Dailymotion) -----
+        // ----- Step 3: Generic iframe scanning for other sources (non-Dailymotion) -----
         doc?.select("iframe[src]")?.forEach { iframe ->
             val src = fixUrl(iframe.attr("src"))
             if (src.isNotBlank() && !src.contains("dailymotion")) {
@@ -244,30 +244,6 @@ class DonghuaFunProvider : MainAPI() {
 
         Log.d(TAG, "No playable source found for $data")
         return false
-    }
-
-    /**
-     * Extracts Dailymotion video ID from various formats:
-     * - Short ID only: "x9fuxk2" (common in player_aaaa.url for trailers)
-     * - Full URL: https://www.dailymotion.com/video/x9fuxk2
-     * - Embed URL: https://geo.dailymotion.com/player/xkyen.html?video=x9fuxk2
-     * - Any alphanumeric ID typically starting with 'x' and length 5-20
-     */
-    private fun extractDailymotionId(urlOrId: String): String? {
-        // If it's already a plain ID (no http, no slash, alphanumeric, typical length 5-20)
-        if (urlOrId.matches(Regex("^[a-zA-Z0-9]{5,20}$"))) {
-            return urlOrId
-        }
-        // Standard dailymotion.com video URLs
-        val pattern1 = Regex("""dailymotion\.com/(?:embed/)?video/([a-zA-Z0-9]+)""")
-        pattern1.find(urlOrId)?.let { return it.groupValues[1] }
-        // Geo.dailymotion.com iframe with video parameter
-        val pattern2 = Regex("""[?&]video=([a-zA-Z0-9]+)""")
-        pattern2.find(urlOrId)?.let { return it.groupValues[1] }
-        // Fallback: any alphanumeric sequence after the last slash (for generic Dailymotion links)
-        val pattern3 = Regex("""/([a-zA-Z0-9]{5,20})(?:[?#/]|$)""")
-        pattern3.find(urlOrId)?.let { return it.groupValues[1] }
-        return null
     }
 
     private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
