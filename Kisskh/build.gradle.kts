@@ -1,10 +1,11 @@
-android {
-    namespace = "com.kisskh"
-}
+version = 1
 
-dependencies {
-    // Force the correct dependency for this module only
-    implementation("com.github.recloudstream:cloudstream:master-SNAPSHOT") {
-        isTransitive = false
-    }
+cloudstream {
+    description = "Korean, Chinese, Philippine dramas and anime from Kisskh"
+    authors = listOf("YourUsername")  // change to your GitHub username
+    status = 1
+    tvTypes = listOf("AsianDrama", "Anime")
+    language = "en"
+    version = 1
+    iconUrl = "https://kisskh.nl/favicon.ico"
 }
