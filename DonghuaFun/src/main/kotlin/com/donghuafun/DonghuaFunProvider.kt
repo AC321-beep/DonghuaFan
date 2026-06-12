@@ -1,4 +1,5 @@
 package com.donghuafun
+
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -20,7 +21,6 @@ class DonghuaFunProvider : MainAPI() {
     private fun detailUrlToId(url: String): String =
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
-    // Added "Coming Soon" pointing to the updated list, which we will filter client-side
     override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
         "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
@@ -28,25 +28,68 @@ class DonghuaFunProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val pageUrl = if (page == 1) request.data
-                      else request.data.replace(".html", "/page/$page.html")
-        val doc = app.get(pageUrl).document
-        
         val isComingSoon = request.name == "Coming Soon"
+        var currentPage = page
+        val items = mutableListOf<SearchResponse>()
+        var hasNextPage = true
         
-        // We must check if the unfiltered page has items to prevent Cloudstream from breaking pagination 
-        // when our keyword filter results in an empty list for a specific page.
-        val hasNextPage = doc.select("a[href*='/vod/detail/id/']").isNotEmpty()
-        
-        return newHomePageResponse(request.name, parseShowCards(doc, isComingSoon), hasNextPage)
+        // If filtering for "Coming Soon", allow digging through up to 5 pages to find items
+        val maxPagesToSearch = if (isComingSoon) 5 else 1 
+        var pagesSearched = 0
+
+        while (items.isEmpty() && hasNextPage && pagesSearched < maxPagesToSearch) {
+            val pageUrl = if (currentPage == 1) request.data 
+                          else request.data.replace(".html", "/page/$currentPage.html")
+            
+            val doc = app.get(pageUrl).document
+            
+            // Check if the unfiltered HTML actually has items
+            val elements = doc.select("a[href*='/vod/detail/id/']")
+            if (elements.isEmpty()) {
+                hasNextPage = false
+                break
+            }
+
+            // Apply our case-insensitive filter
+            items.addAll(parseShowCards(doc, isComingSoon))
+            
+            pagesSearched++
+            
+            // If our filter removed everything, increment the page number and loop again
+            if (items.isEmpty()) {
+                currentPage++ 
+            }
+        }
+
+        return newHomePageResponse(request.name, items, hasNextPage)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val doc = app.get(
-            "$mainUrl/index.php/vod/search.html",
-            params = mapOf("wd" to query)
-        ).document
-        return parseShowCards(doc)
+        val results = mutableListOf<SearchResponse>()
+        
+        // Multi-page search: Scrape up to 3 pages of search results to return more shows
+        for (page in 1..3) {
+            val doc = try {
+                app.get(
+                    "$mainUrl/index.php/vod/search.html",
+                    // Adding page param to fetch subsequent search pages
+                    params = mapOf("wd" to query, "page" to page.toString())
+                ).document
+            } catch (e: Exception) {
+                null
+            } ?: break
+
+            val pageResults = parseShowCards(doc)
+            if (pageResults.isEmpty()) break
+            
+            results.addAll(pageResults)
+            
+            // If there's no "Next" page button in the HTML, we've reached the end
+            val hasNext = doc.select("a.page-next:not(.disabled), a:contains(Next), a:contains(下一页)").isNotEmpty()
+            if (!hasNext) break
+        }
+        
+        return results.distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -91,13 +134,7 @@ class DonghuaFunProvider : MainAPI() {
             Log.d(TAG, "Found ${episodes.size} episodes from 4K tab")
         }
 
-        if (episodes.isEmpty() && showId.isNotEmpty()) {
-            Log.d(TAG, "No episodes found from tabs, generating numeric range 1..300")
-            for (n in 1..300) {
-                val epUrl = "$mainUrl/index.php/vod/play/id/$showId/sid/1/nid/$n.html"
-                episodes.add(newEpisode(epUrl) { name = "EP$n" })
-            }
-        }
+        // The fake 1..300 episode generation block has been permanently removed here
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = poster?.let { fixUrl(it) }
@@ -112,6 +149,8 @@ class DonghuaFunProvider : MainAPI() {
         val match = Regex("""EP(\d+)""", RegexOption.IGNORE_CASE).find(name)
         return match?.groupValues?.get(1)?.toIntOrNull() ?: -1
     }
+
+    // ---- LOADLINKS REMAINS COMPLETELY UNCHANGED BELOW THIS LINE ---- //
 
     override suspend fun loadLinks(
         data: String,
@@ -173,32 +212,47 @@ class DonghuaFunProvider : MainAPI() {
         return pattern.find(urlOrId)?.groupValues?.get(1)
     }
 
-    // Updated parameter with isComingSoon flag
-   private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
-    return doc.select("a[href*='/vod/detail/id/']")
-        .distinctBy { it.attr("href") }
-        .filter { a -> 
-            if (!isComingSoon) {
-                true
-            } else {
-                val text = a.text()
-                // Cleaned up list: strictly English keywords, case-insensitive
-                val keywords = listOf("trailer", "coming soon", "not yet aired", "upcoming", "0 episode")
-                keywords.any { keyword -> text.contains(keyword, ignoreCase = true) }
+    private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
+        return doc.select("a[href*='/vod/detail/id/']")
+            .distinctBy { it.attr("href") }
+            .filter { a -> 
+                if (!isComingSoon) {
+                    true
+                } else {
+                    // Look up to 3 levels higher to capture descriptions and badges.
+                    val parent1 = a.parent()
+                    val parent2 = a.parent()?.parent()
+                    val parent3 = a.parent()?.parent()?.parent()
+
+                    // Find the highest parent container that ONLY contains links for this specific show.
+                    val container = when {
+                        parent3 != null && parent3.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent3
+                        parent2 != null && parent2.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent2
+                        parent1 != null && parent1.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent1
+                        else -> a
+                    }
+                    
+                    val cardText = container.text()
+                    
+                    val keywords = listOf(
+                        "trailer", "coming soon", "not yet aired", 
+                        "upcoming", "releasing soon", "0 episode"
+                    )
+                    keywords.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
+                }
             }
-        }
-        .mapNotNull { a ->
-            val href = fixUrl(a.attr("href"))
-            val title = a.attr("title").ifEmpty {
-                a.selectFirst("img")?.attr("alt") ?: a.text()
-            }.trim()
-            if (title.isEmpty()) return@mapNotNull null
-            
-            val poster = a.selectFirst("img")?.let {
-                it.attr("data-src").ifEmpty { it.attr("src") }
-            }?.takeUnless { it.startsWith("data:") }?.let { fixUrl(it) }
-            
-            newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
-        }
-}
+            .mapNotNull { a ->
+                val href = fixUrl(a.attr("href"))
+                val title = a.attr("title").ifEmpty {
+                    a.selectFirst("img")?.attr("alt") ?: a.text()
+                }.trim()
+                if (title.isEmpty()) return@mapNotNull null
+                
+                val poster = a.selectFirst("img")?.let {
+                    it.attr("data-src").ifEmpty { it.attr("src") }
+                }?.takeUnless { it.startsWith("data:") }?.let { fixUrl(it) }
+                
+                newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
+            }
+    }
 }
