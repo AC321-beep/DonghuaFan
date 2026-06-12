@@ -24,7 +24,7 @@ fun decrypt(encryptedB64: String): String {
         try {
             return decryptWithKeyIv(keyBytes, ivBytes, encryptedBytes)
         } catch (ex: Exception) {
-            // Continue to next key
+            // continue to next key
         }
     }
     return "Decryption failed: All keys/IVs failed"
