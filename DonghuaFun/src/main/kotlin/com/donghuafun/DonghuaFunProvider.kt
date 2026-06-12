@@ -167,7 +167,11 @@ class DonghuaFunProvider : MainAPI() {
     ): Boolean {
         val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to data)
 
-        val html = try { app.get(data, headers = headers).text } catch (e: Exception) { "" }
+        val html = try { 
+            app.get(data, headers = headers).text 
+        } catch (e: Exception) { 
+            "" 
+        }
 
         val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
             .find(html)?.groupValues?.get(1)
@@ -177,13 +181,7 @@ class DonghuaFunProvider : MainAPI() {
             val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
             val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
-            // 1. PRIMARY: Check Dailymotion first before doing any decryption manipulation
+            // 1. PRIMARY: Check Dailymotion first
             if (from.equals("dailymotion", ignoreCase = true) || rawUrl.contains("dailymotion", ignoreCase = true)) {
                 val dmId = extractDailymotionId(rawUrl)
-                if (dmId != null) {
-                    val videoUrl = "https://www.dailymotion.com/video/$dmId"
-                    if (loadExtractor(videoUrl, data, subtitleCallback, callback)) return true
-                }
-            }
-
-            // 2. FALLBACK IMPROVEMENT: MacCMS Decryption for normal video
+                if (dmId !=
