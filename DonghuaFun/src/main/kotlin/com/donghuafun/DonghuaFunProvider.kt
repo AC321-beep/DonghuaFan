@@ -201,3 +201,4 @@ class DonghuaFunProvider : MainAPI() {
             newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
         }
 }
+}
