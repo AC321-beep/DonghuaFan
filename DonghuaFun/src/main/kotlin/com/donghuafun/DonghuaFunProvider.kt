@@ -172,17 +172,18 @@ class DonghuaFunProvider : MainAPI() {
                 }
             } 
             else if (rawUrl != null && (rawUrl.contains(".m3u8", ignoreCase = true) || rawUrl.contains(".mp4", ignoreCase = true))) {
-                callback.invoke(
-                    newExtractorLink(
-                        source = this.name,
-                        name = this.name,
-                        url = rawUrl
-                    ) {
-                        this.referer = data
-                        this.quality = Qualities.Unknown.value
-                        this.isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
-                    }
+                
+                @Suppress("DEPRECATION") // Forces the compiler to allow the old constructor
+                val link = ExtractorLink(
+                    source = this.name,
+                    name = this.name,
+                    url = rawUrl,
+                    referer = data,
+                    quality = Qualities.Unknown.value,
+                    isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
                 )
+                
+                callback.invoke(link)
                 return true
             }
         }
