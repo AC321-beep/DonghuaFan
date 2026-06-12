@@ -159,92 +159,106 @@ class DonghuaFunProvider : MainAPI() {
     }
 
     @Suppress("DEPRECATION", "DEPRECATION_ERROR")
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to data)
-        val html = try { app.get(data, headers = headers).text } catch (e: Exception) { "" }
-        val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
+override suspend fun loadLinks(
+    data: String,
+    isCasting: Boolean,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit
+): Boolean {
+    val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to data)
+    val html = try { app.get(data, headers = headers).text } catch (e: Exception) { "" }
+    val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
 
-        // ----- Step 1: Find the Dailymotion iframe and extract the video token -----
-        var dailymotionToken: String? = null
-        doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
-            val src = iframe.attr("src")
-            val match = Regex("""[?&]video=([^&]+)""").find(src)
-            if (match != null) {
-                dailymotionToken = match.groupValues[1]
-                Log.d(TAG, "Found Dailymotion token from iframe: $dailymotionToken")
-                return@forEach
-            }
+    // ----- 1) Handle Dailymotion via iframe token (works for trailers & episodes) -----
+    var dailymotionToken: String? = null
+    doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
+        val src = iframe.attr("src")
+        val match = Regex("""[?&]video=([^&]+)""").find(src)
+        if (match != null) {
+            dailymotionToken = match.groupValues[1]
+            Log.d(TAG, "Dailymotion token: $dailymotionToken")
+            return@forEach
         }
-
-        // If we found a token, build the embed URL and try to load it
-        if (dailymotionToken != null) {
-            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
-            if (loadExtractor(embedUrl, data, subtitleCallback, callback)) {
-                return true
-            }
-        }
-
-        // ----- Step 2: Fallback to player_aaaa JSON (if iframe not found or load failed) -----
-        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-            .find(html)?.groupValues?.get(1)
-
-        if (playerJson != null) {
-            var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
-            val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
-            val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-
-            // Decrypt if needed
-            if (encrypt == 1) {
-                rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-            } else if (encrypt == 2) {
-                rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
-                rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-            }
-
-            // --- Dailymotion (if from field indicates dailymotion) ---
-            if (from.equals("dailymotion", ignoreCase = true)) {
-                // The rawUrl might be a token (episodes) or a short ID (trailers)
-                val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
-                if (loadExtractor(embedUrl, data, subtitleCallback, callback)) return true
-            }
-
-            // --- Direct .m3u8 / .mp4 (non-Dailymotion trailers) ---
-            if (rawUrl.contains(".m3u8", ignoreCase = true) || rawUrl.contains(".mp4", ignoreCase = true)) {
-                callback.invoke(
-                    ExtractorLink(
-                        source = this.name,
-                        name = this.name,
-                        url = rawUrl,
-                        referer = data,
-                        quality = Qualities.Unknown.value,
-                        type = if (rawUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    )
-                )
-                return true
-            }
-
-            // --- Generic HTTP extractor ---
-            if (rawUrl.startsWith("http") && loadExtractor(rawUrl, data, subtitleCallback, callback)) {
-                return true
-            }
-        }
-
-        // ----- Step 3: Generic iframe scanning for other sources (non-Dailymotion) -----
-        doc?.select("iframe[src]")?.forEach { iframe ->
-            val src = fixUrl(iframe.attr("src"))
-            if (src.isNotBlank() && !src.contains("dailymotion")) {
-                if (loadExtractor(src, data, subtitleCallback, callback)) return true
-            }
-        }
-
-        Log.d(TAG, "No playable source found for $data")
-        return false
     }
+    if (dailymotionToken != null) {
+        val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
+        if (loadExtractor(embedUrl, data, subtitleCallback, callback)) return true
+    }
+
+    // ----- 2) Parse player_aaaa JSON (non-Dailymotion sources) -----
+    val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+        .find(html)?.groupValues?.get(1)
+
+    if (playerJson != null) {
+        var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+        val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
+        val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+
+        if (encrypt == 1) {
+            rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+        } else if (encrypt == 2) {
+            rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
+            rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+        }
+        Log.d(TAG, "player_aaaa url: $rawUrl, from: $from")
+
+        // Dailymotion fallback (if iframe method missed)
+        if (from.equals("dailymotion", ignoreCase = true) && dailymotionToken == null) {
+            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
+            if (loadExtractor(embedUrl, data, subtitleCallback, callback)) return true
+        }
+
+        // Direct .m3u8 or .mp4 (like the Seven-Star Palace trailer)
+        if (rawUrl.contains(".m3u8", ignoreCase = true) || rawUrl.contains(".mp4", ignoreCase = true)) {
+            callback.invoke(
+                ExtractorLink(
+                    source = this.name,
+                    name = this.name,
+                    url = rawUrl,
+                    referer = data,
+                    quality = Qualities.Unknown.value,
+                    type = if (rawUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                )
+            )
+            return true
+        }
+
+        // Generic HTTP extractor for other URLs
+        if (rawUrl.startsWith("http") && loadExtractor(rawUrl, data, subtitleCallback, callback)) {
+            return true
+        }
+    }
+
+    // ----- 3) Scan ALL iframes (non-Dailymotion) – this catches the proxy iframe for direct .m3u8 -----
+    doc?.select("iframe[src]")?.forEach { iframe ->
+        val src = fixUrl(iframe.attr("src"))
+        if (src.isNotBlank() && !src.contains("dailymotion")) {
+            Log.d(TAG, "Trying iframe: $src")
+            if (loadExtractor(src, data, subtitleCallback, callback)) return true
+        }
+    }
+
+    // ----- 4) Last resort: extract any .m3u8 or .mp4 URL from the entire HTML -----
+    val anyUrl = Regex("""(https?://[^\s"'<>]+\.(?:m3u8|mp4)(?:\?[^\s"'<>]*)?)""", RegexOption.IGNORE_CASE).find(html)
+    if (anyUrl != null) {
+        val videoUrl = anyUrl.groupValues[1]
+        Log.d(TAG, "Found raw video URL: $videoUrl")
+        callback.invoke(
+            ExtractorLink(
+                source = this.name,
+                name = this.name,
+                url = videoUrl,
+                referer = data,
+                quality = Qualities.Unknown.value,
+                type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            )
+        )
+        return true
+    }
+
+    Log.d(TAG, "No playable source found for $data")
+    return false
+}
 
     private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
         return doc.select("a[href*='/vod/detail/id/']")
