@@ -33,7 +33,6 @@ class DonghuaFunProvider : MainAPI() {
         val items = mutableListOf<SearchResponse>()
         var hasNextPage = true
         
-        // If filtering for "Coming Soon", allow digging through up to 5 pages to find items
         val maxPagesToSearch = if (isComingSoon) 5 else 1 
         var pagesSearched = 0
 
@@ -43,19 +42,16 @@ class DonghuaFunProvider : MainAPI() {
             
             val doc = app.get(pageUrl).document
             
-            // Check if the unfiltered HTML actually has items
             val elements = doc.select("a[href*='/vod/detail/id/']")
             if (elements.isEmpty()) {
                 hasNextPage = false
                 break
             }
 
-            // Apply our case-insensitive filter
             items.addAll(parseShowCards(doc, isComingSoon))
             
             pagesSearched++
             
-            // If our filter removed everything, increment the page number and loop again
             if (items.isEmpty()) {
                 currentPage++ 
             }
@@ -67,12 +63,10 @@ class DonghuaFunProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
         
-        // Multi-page search: Scrape up to 3 pages of search results to return more shows
         for (page in 1..3) {
             val doc = try {
                 app.get(
                     "$mainUrl/index.php/vod/search.html",
-                    // Adding page param to fetch subsequent search pages
                     params = mapOf("wd" to query, "page" to page.toString())
                 ).document
             } catch (e: Exception) {
@@ -84,7 +78,6 @@ class DonghuaFunProvider : MainAPI() {
             
             results.addAll(pageResults)
             
-            // If there's no "Next" page button in the HTML, we've reached the end
             val hasNext = doc.select("a.page-next:not(.disabled), a:contains(Next), a:contains(下一页)").isNotEmpty()
             if (!hasNext) break
         }
@@ -125,16 +118,22 @@ class DonghuaFunProvider : MainAPI() {
                 val epUrl = fixUrl(a.attr("href"))
                 val epName = a.selectFirst("span")?.text()?.trim() ?: a.text().trim()
                 val epNumber = parseEpisodeNumber(epName)
-                if (epNumber > 0 && !episodeMap.containsKey(epNumber)) {
-                    episodeMap[epNumber] = newEpisode(epUrl) { name = "EP$epNumber" }
+                
+                // Fallback: If no number is found (e.g., "HD Movie"), just use the next available index
+                val finalNumber = if (epNumber > 0) epNumber else episodeMap.size + 1
+                
+                if (!episodeMap.containsKey(finalNumber)) {
+                    episodeMap[finalNumber] = newEpisode(epUrl) { 
+                        // Preserve the original name (e.g., "part01", "HD") instead of forcing "EP1"
+                        name = epName.ifEmpty { "Episode $finalNumber" }
+                        episode = finalNumber
+                    }
                 }
             }
 
             episodes.addAll(episodeMap.toSortedMap().values)
             Log.d(TAG, "Found ${episodes.size} episodes from 4K tab")
         }
-
-        // The fake 1..300 episode generation block has been permanently removed here
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = poster?.let { fixUrl(it) }
@@ -146,11 +145,10 @@ class DonghuaFunProvider : MainAPI() {
     }
 
     private fun parseEpisodeNumber(name: String): Int {
-        val match = Regex("""EP(\d+)""", RegexOption.IGNORE_CASE).find(name)
+        // Broadened to catch ANY number in the string (e.g., "part01" -> 1, "02" -> 2, "第12集" -> 12)
+        val match = Regex("""(\d+)""").find(name)
         return match?.groupValues?.get(1)?.toIntOrNull() ?: -1
     }
-
-    // ---- LOADLINKS REMAINS COMPLETELY UNCHANGED BELOW THIS LINE ---- //
 
     override suspend fun loadLinks(
         data: String,
@@ -219,12 +217,10 @@ class DonghuaFunProvider : MainAPI() {
                 if (!isComingSoon) {
                     true
                 } else {
-                    // Look up to 3 levels higher to capture descriptions and badges.
                     val parent1 = a.parent()
                     val parent2 = a.parent()?.parent()
                     val parent3 = a.parent()?.parent()?.parent()
 
-                    // Find the highest parent container that ONLY contains links for this specific show.
                     val container = when {
                         parent3 != null && parent3.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent3
                         parent2 != null && parent2.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent2
