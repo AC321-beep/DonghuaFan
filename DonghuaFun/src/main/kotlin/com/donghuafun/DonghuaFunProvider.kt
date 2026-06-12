@@ -173,14 +173,15 @@ class DonghuaFunProvider : MainAPI() {
             } 
             else if (rawUrl != null && (rawUrl.contains(".m3u8", ignoreCase = true) || rawUrl.contains(".mp4", ignoreCase = true))) {
                 callback.invoke(
-                    newExtractorLink( // <--- UPDATED HERE
+                    newExtractorLink(
                         source = this.name,
                         name = this.name,
-                        url = rawUrl,
-                        referer = data,
-                        quality = Qualities.Unknown.value,
-                        isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
-                    )
+                        url = rawUrl
+                    ) {
+                        this.referer = data
+                        this.quality = Qualities.Unknown.value
+                        this.isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
+                    }
                 )
                 return true
             }
