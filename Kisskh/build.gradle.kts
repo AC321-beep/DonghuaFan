@@ -1,42 +1,25 @@
-
-import org.jetbrains.kotlin.konan.properties.Properties
-// use an integer for version numbers
 version = 1
 
 android {
     defaultConfig {
-        val properties = Properties()
-        properties.load(project.rootProject.file("local.properties").inputStream())
-        android.buildFeatures.buildConfig=true
-        buildConfigField("String", "KissKh", "\"${properties.getProperty("KissKh")}\"")
-        buildConfigField("String", "KisskhSub", "\"${properties.getProperty("KisskhSub")}\"")
+        val localProperties = java.util.Properties()
+        val localFile = rootProject.file("local.properties")
+        if (localFile.exists()) {
+            localProperties.load(localFile.inputStream())
+        }
+        val kissKhApi = localProperties.getProperty("KissKh") ?: System.getenv("KissKh") ?: ""
+        val kisskhSubApi = localProperties.getProperty("KisskhSub") ?: System.getenv("KisskhSub") ?: ""
 
+        buildConfigField("String", "KissKh", "\"$kissKhApi\"")
+        buildConfigField("String", "KisskhSub", "\"$kisskhSubApi\"")
     }
 }
 
-
 cloudstream {
+    description = "Korean, Chinese, Philippine dramas and anime from Kisskh"
+    authors = listOf(providers.gradleProperty("cs_author").orNull ?: "AC321-beep")
+    status = 1
+    tvTypes = listOf("AsianDrama", "Anime")
     language = "en"
-    // All of these properties are optional, you can safely remove them
-
-    // description = "Lorem Ipsum"
-     authors = listOf("AC321-beep")
-
-    /**
-     * Status int as the following:
-     * 0: Down
-     * 1: Ok
-     * 2: Slow
-     * 3: Beta only
-     * */
-    status = 1 // will be 3 if unspecified
-    tvTypes = listOf(
-        "AsianDrama",
-        "TvSeries",
-        "Anime",
-        "Movie",
-    )
-
-    iconUrl = "https://www.google.com/s2/favicons?domain=kisskh.co&sz=%size%"
-
+    iconUrl = "https://kisskh.nl/favicon.ico"
 }
