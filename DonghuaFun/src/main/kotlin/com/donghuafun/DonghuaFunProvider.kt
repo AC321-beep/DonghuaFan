@@ -174,32 +174,30 @@ class DonghuaFunProvider : MainAPI() {
     }
 
     // Updated parameter with isComingSoon flag
-    private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
-        return doc.select("a[href*='/vod/detail/id/']")
-            .distinctBy { it.attr("href") }
-            .filter { a -> 
-                if (!isComingSoon) {
-                    true
-                } else {
-                    // Look for common unreleased indicators in the item's inner text (including overlay badges)
-                    val text = a.text().lowercase()
-                    text.contains("trailer") || 
-                    text.contains("coming soon") || 
-                    text.contains("not yet aired") || 
-                    text.contains("upcoming") ||
-                    text.contains("0 episode")
-                }
+   private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
+    return doc.select("a[href*='/vod/detail/id/']")
+        .distinctBy { it.attr("href") }
+        .filter { a -> 
+            if (!isComingSoon) {
+                true
+            } else {
+                val text = a.text()
+                // Cleaned up list: strictly English keywords, case-insensitive
+                val keywords = listOf("trailer", "coming soon", "not yet aired", "upcoming", "0 episode")
+                keywords.any { keyword -> text.contains(keyword, ignoreCase = true) }
             }
-            .mapNotNull { a ->
-                val href = fixUrl(a.attr("href"))
-                val title = a.attr("title").ifEmpty {
-                    a.selectFirst("img")?.attr("alt") ?: a.text()
-                }.trim()
-                if (title.isEmpty()) return@mapNotNull null
-                val poster = a.selectFirst("img")?.let {
-                    it.attr("data-src").ifEmpty { it.attr("src") }
-                }?.takeUnless { it.startsWith("data:") }?.let { fixUrl(it) }
-                newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
-            }
-    }
+        }
+        .mapNotNull { a ->
+            val href = fixUrl(a.attr("href"))
+            val title = a.attr("title").ifEmpty {
+                a.selectFirst("img")?.attr("alt") ?: a.text()
+            }.trim()
+            if (title.isEmpty()) return@mapNotNull null
+            
+            val poster = a.selectFirst("img")?.let {
+                it.attr("data-src").ifEmpty { it.attr("src") }
+            }?.takeUnless { it.startsWith("data:") }?.let { fixUrl(it) }
+            
+            newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
+        }
 }
