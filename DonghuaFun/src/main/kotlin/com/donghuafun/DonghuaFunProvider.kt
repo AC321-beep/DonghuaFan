@@ -165,18 +165,21 @@ override suspend fun loadLinks(
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit
 ): Boolean {
-    val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to data, "Origin" to mainUrl)
+    val headers = mapOf(
+        "User-Agent" to USER_AGENT,
+        "Referer" to data,
+        "Origin" to mainUrl
+    )
     val html = try { app.get(data, headers = headers).text } catch (e: Exception) { "" }
     val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
 
-    // ----- 1) Dailymotion via iframe token (works for all Dailymotion) -----
+    // ----- 1) Dailymotion (unchanged, works for trailers & episodes) -----
     var dailymotionToken: String? = null
     doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
         val src = iframe.attr("src")
         val match = Regex("""[?&]video=([^&]+)""").find(src)
         if (match != null) {
             dailymotionToken = match.groupValues[1]
-            Log.d(TAG, "Dailymotion token: $dailymotionToken")
             return@forEach
         }
     }
@@ -185,84 +188,87 @@ override suspend fun loadLinks(
         if (loadExtractor(embedUrl, data, subtitleCallback, callback)) return true
     }
 
-    // ----- 2) Parse player_aaaa JSON (for non-Dailymotion) -----
+    // ----- 2) Parse player_aaaa to get the real video URL -----
     val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
         .find(html)?.groupValues?.get(1)
 
-    if (playerJson != null) {
-        var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
-        val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
-        val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+    if (playerJson == null) {
+        Log.d(TAG, "No player_aaaa found")
+        return false
+    }
 
-        if (encrypt == 1) {
-            rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-        } else if (encrypt == 2) {
-            rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
-            rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-        }
-        Log.d(TAG, "player_aaaa url: $rawUrl, from: $from")
+    var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+    val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
+    val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
-        // Dailymotion fallback (if iframe method missed)
-        if (from.equals("dailymotion", ignoreCase = true) && dailymotionToken == null) {
-            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
-            if (loadExtractor(embedUrl, data, subtitleCallback, callback)) return true
-        }
+    // Decrypt if needed
+    if (encrypt == 1) {
+        rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+    } else if (encrypt == 2) {
+        rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
+        rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+    }
+    Log.d(TAG, "Raw URL from player_aaaa: $rawUrl, from: $from")
 
-        // ----- Non-Dailymotion: try to get the real .m3u8 from the iframe's 'url' parameter -----
-        var m3u8Url: String? = null
-        doc?.select("iframe[src*='play.donghuafun.com/m3u8/']")?.forEach { iframe ->
-            val src = iframe.attr("src")
-            val match = Regex("""[?&]url=([^&]+)""").find(src)
-            if (match != null) {
-                m3u8Url = URLDecoder.decode(match.groupValues[1], "UTF-8")
-                Log.d(TAG, "Extracted m3u8 from iframe: $m3u8Url")
-                return@forEach
-            }
-        }
+    // Handle Dailymotion fallback
+    if (from.equals("dailymotion", ignoreCase = true)) {
+        val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
+        if (loadExtractor(embedUrl, data, subtitleCallback, callback)) return true
+    }
 
-        // If we found an m3u8 from the iframe, play it directly with headers
-        if (m3u8Url != null && (m3u8Url.contains(".m3u8") || m3u8Url.contains(".mp4"))) {
-            callback.invoke(
-                ExtractorLink(
-                    source = this.name,
-                    name = this.name,
-                    url = m3u8Url,
-                    referer = data,
-                    quality = Qualities.Unknown.value,
-                    type = if (m3u8Url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                    headers = headers
-                )
-            )
-            return true
-        }
+    // ----- 3) For non-Dailymotion: get the best available video URL -----
+    var videoUrl: String? = null
 
-        // Fallback: use the rawUrl from player_aaaa if it's a direct .m3u8/.mp4
-        if (rawUrl.contains(".m3u8", ignoreCase = true) || rawUrl.contains(".mp4", ignoreCase = true)) {
-            callback.invoke(
-                ExtractorLink(
-                    source = this.name,
-                    name = this.name,
-                    url = rawUrl,
-                    referer = data,
-                    quality = Qualities.Unknown.value,
-                    type = if (rawUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                    headers = headers
-                )
-            )
-            return true
-        }
-
-        // Generic HTTP extractor for other URLs
-        if (rawUrl.startsWith("http") && loadExtractor(rawUrl, data, subtitleCallback, callback)) {
-            return true
+    // Try to extract from iframe's 'url' parameter (most reliable for .m3u8 trailers)
+    doc?.select("iframe[src*='play.donghuafun.com/m3u8/']")?.forEach { iframe ->
+        val src = iframe.attr("src")
+        val match = Regex("""[?&]url=([^&]+)""").find(src)
+        if (match != null) {
+            videoUrl = URLDecoder.decode(match.groupValues[1], "UTF-8")
+            Log.d(TAG, "Extracted video URL from iframe: $videoUrl")
+            return@forEach
         }
     }
 
-    // ----- 3) Scan all other iframes (non-Dailymotion) as a last resort -----
+    // If not found, use the rawUrl itself (may be .m3u8 or .mp4)
+    if (videoUrl == null && (rawUrl.contains(".m3u8") || rawUrl.contains(".mp4"))) {
+        videoUrl = rawUrl
+        Log.d(TAG, "Using rawUrl as video URL: $videoUrl")
+    }
+
+    // If still no video URL, try any iframe src that might be a player
+    if (videoUrl == null) {
+        doc?.select("iframe[src]")?.forEach { iframe ->
+            val src = fixUrl(iframe.attr("src"))
+            if (src.contains(".m3u8") || src.contains(".mp4") || src.contains("player")) {
+                videoUrl = src
+                Log.d(TAG, "Found video URL from iframe src: $videoUrl")
+                return@forEach
+            }
+        }
+    }
+
+    // Finally, if we have a video URL, play it with headers
+    if (videoUrl != null) {
+        val isM3u8 = videoUrl.contains(".m3u8", ignoreCase = true)
+        callback.invoke(
+            ExtractorLink(
+                source = this.name,
+                name = this.name,
+                url = videoUrl,
+                referer = data,
+                quality = Qualities.Unknown.value,
+                type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                headers = headers
+            )
+        )
+        return true
+    }
+
+    // ----- Last resort: try loading the iframe src directly (may be a proxy player) -----
     doc?.select("iframe[src]")?.forEach { iframe ->
         val src = fixUrl(iframe.attr("src"))
-        if (src.isNotBlank() && !src.contains("dailymotion") && !src.contains("play.donghuafun.com")) {
-            Log.d(TAG, "Trying iframe: $src")
+        if (src.isNotBlank() && !src.contains("dailymotion")) {
             if (loadExtractor(src, data, subtitleCallback, callback)) return true
         }
     }
