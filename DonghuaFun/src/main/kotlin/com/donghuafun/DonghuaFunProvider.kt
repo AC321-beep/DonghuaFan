@@ -158,18 +158,18 @@ class DonghuaFunProvider : MainAPI() {
         return match?.groupValues?.get(1)?.toIntOrNull() ?: -1
     }
 
-    @Suppress("DEPRECATION", "DEPRECATION_ERROR")
+   @Suppress("DEPRECATION", "DEPRECATION_ERROR")
 override suspend fun loadLinks(
     data: String,
     isCasting: Boolean,
     subtitleCallback: (SubtitleFile) -> Unit,
     callback: (ExtractorLink) -> Unit
 ): Boolean {
-    val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to data)
+    val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to data, "Origin" to mainUrl)
     val html = try { app.get(data, headers = headers).text } catch (e: Exception) { "" }
     val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
 
-    // ----- 1) Handle Dailymotion via iframe token (works for trailers & episodes) -----
+    // ----- 1) Dailymotion via iframe token (works for all Dailymotion) -----
     var dailymotionToken: String? = null
     doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
         val src = iframe.attr("src")
@@ -185,7 +185,7 @@ override suspend fun loadLinks(
         if (loadExtractor(embedUrl, data, subtitleCallback, callback)) return true
     }
 
-    // ----- 2) Parse player_aaaa JSON (non-Dailymotion sources) -----
+    // ----- 2) Parse player_aaaa JSON (non-Dailymotion) -----
     val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
         .find(html)?.groupValues?.get(1)
 
@@ -208,7 +208,22 @@ override suspend fun loadLinks(
             if (loadExtractor(embedUrl, data, subtitleCallback, callback)) return true
         }
 
-        // Direct .m3u8 or .mp4 (like the Seven-Star Palace trailer)
+        // For non-Dailymotion: FIRST, look for a proxy iframe (play.donghuafun.com/m3u8/?url=...)
+        var iframeProxyUrl: String? = null
+        doc?.select("iframe[src*='play.donghuafun.com']")?.forEach { iframe ->
+            val src = iframe.attr("src")
+            if (src.contains("/m3u8/") && src.contains("url=")) {
+                iframeProxyUrl = src
+                Log.d(TAG, "Found proxy iframe: $iframeProxyUrl")
+                return@forEach
+            }
+        }
+        // Try the proxy iframe first (most reliable for direct .m3u8 trailers)
+        if (iframeProxyUrl != null && loadExtractor(iframeProxyUrl, data, subtitleCallback, callback)) {
+            return true
+        }
+
+        // Direct .m3u8 or .mp4 (fallback if iframe fails or not present)
         if (rawUrl.contains(".m3u8", ignoreCase = true) || rawUrl.contains(".mp4", ignoreCase = true)) {
             callback.invoke(
                 ExtractorLink(
@@ -217,7 +232,8 @@ override suspend fun loadLinks(
                     url = rawUrl,
                     referer = data,
                     quality = Qualities.Unknown.value,
-                    type = if (rawUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    type = if (rawUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                    headers = headers
                 )
             )
             return true
@@ -229,16 +245,16 @@ override suspend fun loadLinks(
         }
     }
 
-    // ----- 3) Scan ALL iframes (non-Dailymotion) – this catches the proxy iframe for direct .m3u8 -----
+    // ----- 3) Scan all other iframes (non-Dailymotion, non-proxy) -----
     doc?.select("iframe[src]")?.forEach { iframe ->
         val src = fixUrl(iframe.attr("src"))
-        if (src.isNotBlank() && !src.contains("dailymotion")) {
+        if (src.isNotBlank() && !src.contains("dailymotion") && !src.contains("play.donghuafun.com")) {
             Log.d(TAG, "Trying iframe: $src")
             if (loadExtractor(src, data, subtitleCallback, callback)) return true
         }
     }
 
-    // ----- 4) Last resort: extract any .m3u8 or .mp4 URL from the entire HTML -----
+    // ----- 4) Last resort: extract any .m3u8 or .mp4 URL from raw HTML -----
     val anyUrl = Regex("""(https?://[^\s"'<>]+\.(?:m3u8|mp4)(?:\?[^\s"'<>]*)?)""", RegexOption.IGNORE_CASE).find(html)
     if (anyUrl != null) {
         val videoUrl = anyUrl.groupValues[1]
@@ -250,7 +266,8 @@ override suspend fun loadLinks(
                 url = videoUrl,
                 referer = data,
                 quality = Qualities.Unknown.value,
-                type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                headers = headers
             )
         )
         return true
