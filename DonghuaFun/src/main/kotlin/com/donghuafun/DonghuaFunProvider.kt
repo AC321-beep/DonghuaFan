@@ -1,5 +1,3 @@
-package com.donghuafun
-
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -21,16 +19,25 @@ class DonghuaFunProvider : MainAPI() {
     private fun detailUrlToId(url: String): String =
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
+    // Added "Coming Soon" pointing to the updated list, which we will filter client-side
     override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
         "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
+        "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Coming Soon" 
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val pageUrl = if (page == 1) request.data
-                     else request.data.replace(".html", "/page/$page.html")
+                      else request.data.replace(".html", "/page/$page.html")
         val doc = app.get(pageUrl).document
-        return newHomePageResponse(request.name, parseShowCards(doc))
+        
+        val isComingSoon = request.name == "Coming Soon"
+        
+        // We must check if the unfiltered page has items to prevent Cloudstream from breaking pagination 
+        // when our keyword filter results in an empty list for a specific page.
+        val hasNextPage = doc.select("a[href*='/vod/detail/id/']").isNotEmpty()
+        
+        return newHomePageResponse(request.name, parseShowCards(doc, isComingSoon), hasNextPage)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -60,7 +67,7 @@ class DonghuaFunProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
         val tabs = doc.select(".anthology-tab a.vod-playerUrl")
-      
+        
         val fourKTabIndex = tabs.indexOfFirst { it.text().contains("4K", ignoreCase = true) }
         val targetIndex = if (fourKTabIndex != -1) fourKTabIndex else 0
 
@@ -165,9 +172,23 @@ class DonghuaFunProvider : MainAPI() {
         return pattern.find(urlOrId)?.groupValues?.get(1)
     }
 
-    private fun parseShowCards(doc: Document): List<SearchResponse> {
+    // Updated parameter with isComingSoon flag
+    private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
         return doc.select("a[href*='/vod/detail/id/']")
             .distinctBy { it.attr("href") }
+            .filter { a -> 
+                if (!isComingSoon) {
+                    true
+                } else {
+                    // Look for common unreleased indicators in the item's inner text (including overlay badges)
+                    val text = a.text().lowercase()
+                    text.contains("trailer") || 
+                    text.contains("coming soon") || 
+                    text.contains("not yet aired") || 
+                    text.contains("upcoming") ||
+                    text.contains("0 episode")
+                }
+            }
             .mapNotNull { a ->
                 val href = fixUrl(a.attr("href"))
                 val title = a.attr("title").ifEmpty {
