@@ -158,7 +158,7 @@ class DonghuaFunProvider : MainAPI() {
         return match?.groupValues?.get(1)?.toIntOrNull() ?: -1
     }
 
-   @Suppress("DEPRECATION", "DEPRECATION_ERROR")
+  @Suppress("DEPRECATION", "DEPRECATION_ERROR")
 override suspend fun loadLinks(
     data: String,
     isCasting: Boolean,
@@ -185,7 +185,7 @@ override suspend fun loadLinks(
         if (loadExtractor(embedUrl, data, subtitleCallback, callback)) return true
     }
 
-    // ----- 2) Parse player_aaaa JSON (non-Dailymotion) -----
+    // ----- 2) Parse player_aaaa JSON (for non-Dailymotion) -----
     val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
         .find(html)?.groupValues?.get(1)
 
@@ -208,22 +208,35 @@ override suspend fun loadLinks(
             if (loadExtractor(embedUrl, data, subtitleCallback, callback)) return true
         }
 
-        // For non-Dailymotion: FIRST, look for a proxy iframe (play.donghuafun.com/m3u8/?url=...)
-        var iframeProxyUrl: String? = null
-        doc?.select("iframe[src*='play.donghuafun.com']")?.forEach { iframe ->
+        // ----- Non-Dailymotion: try to get the real .m3u8 from the iframe's 'url' parameter -----
+        var m3u8Url: String? = null
+        doc?.select("iframe[src*='play.donghuafun.com/m3u8/']")?.forEach { iframe ->
             val src = iframe.attr("src")
-            if (src.contains("/m3u8/") && src.contains("url=")) {
-                iframeProxyUrl = src
-                Log.d(TAG, "Found proxy iframe: $iframeProxyUrl")
+            val match = Regex("""[?&]url=([^&]+)""").find(src)
+            if (match != null) {
+                m3u8Url = URLDecoder.decode(match.groupValues[1], "UTF-8")
+                Log.d(TAG, "Extracted m3u8 from iframe: $m3u8Url")
                 return@forEach
             }
         }
-        // Try the proxy iframe first (most reliable for direct .m3u8 trailers)
-        if (iframeProxyUrl != null && loadExtractor(iframeProxyUrl, data, subtitleCallback, callback)) {
+
+        // If we found an m3u8 from the iframe, play it directly with headers
+        if (m3u8Url != null && (m3u8Url.contains(".m3u8") || m3u8Url.contains(".mp4"))) {
+            callback.invoke(
+                ExtractorLink(
+                    source = this.name,
+                    name = this.name,
+                    url = m3u8Url,
+                    referer = data,
+                    quality = Qualities.Unknown.value,
+                    type = if (m3u8Url.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                    headers = headers
+                )
+            )
             return true
         }
 
-        // Direct .m3u8 or .mp4 (fallback if iframe fails or not present)
+        // Fallback: use the rawUrl from player_aaaa if it's a direct .m3u8/.mp4
         if (rawUrl.contains(".m3u8", ignoreCase = true) || rawUrl.contains(".mp4", ignoreCase = true)) {
             callback.invoke(
                 ExtractorLink(
@@ -245,32 +258,13 @@ override suspend fun loadLinks(
         }
     }
 
-    // ----- 3) Scan all other iframes (non-Dailymotion, non-proxy) -----
+    // ----- 3) Scan all other iframes (non-Dailymotion) as a last resort -----
     doc?.select("iframe[src]")?.forEach { iframe ->
         val src = fixUrl(iframe.attr("src"))
         if (src.isNotBlank() && !src.contains("dailymotion") && !src.contains("play.donghuafun.com")) {
             Log.d(TAG, "Trying iframe: $src")
             if (loadExtractor(src, data, subtitleCallback, callback)) return true
         }
-    }
-
-    // ----- 4) Last resort: extract any .m3u8 or .mp4 URL from raw HTML -----
-    val anyUrl = Regex("""(https?://[^\s"'<>]+\.(?:m3u8|mp4)(?:\?[^\s"'<>]*)?)""", RegexOption.IGNORE_CASE).find(html)
-    if (anyUrl != null) {
-        val videoUrl = anyUrl.groupValues[1]
-        Log.d(TAG, "Found raw video URL: $videoUrl")
-        callback.invoke(
-            ExtractorLink(
-                source = this.name,
-                name = this.name,
-                url = videoUrl,
-                referer = data,
-                quality = Qualities.Unknown.value,
-                type = if (videoUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                headers = headers
-            )
-        )
-        return true
     }
 
     Log.d(TAG, "No playable source found for $data")
