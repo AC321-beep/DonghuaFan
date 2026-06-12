@@ -1,9 +1,11 @@
 package com.donghuafun
 
+import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
+import java.net.URLDecoder
 
 class DonghuaFunProvider : MainAPI() {
     override var mainUrl = "https://donghuafun.com"
@@ -133,6 +135,15 @@ class DonghuaFunProvider : MainAPI() {
             Log.d(TAG, "Found ${episodes.size} episodes from 4K tab")
         }
 
+        // Fallback generator for shows returning no episodes in UI
+        if (episodes.isEmpty() && showId.isNotEmpty()) {
+            Log.d(TAG, "No episodes found from tabs, generating numeric range 1..300")
+            for (n in 1..300) {
+                val epUrl = "$mainUrl/index.php/vod/play/id/$showId/sid/1/nid/$n.html"
+                episodes.add(newEpisode(epUrl) { name = "EP$n" })
+            }
+        }
+
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             posterUrl = poster?.let { fixUrl(it) }
             plot = description
@@ -162,17 +173,27 @@ class DonghuaFunProvider : MainAPI() {
             .find(html)?.groupValues?.get(1)
 
         if (playerJson != null) {
-            val rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/")
+            var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
             val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
+            val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
-            if (from.equals("dailymotion", ignoreCase = true) || rawUrl?.contains("dailymotion") == true) {
-                val dmId = extractDailymotionId(rawUrl ?: "")
+            // MacCMS Decryption logic
+            if (encrypt == 1) {
+                rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+            } else if (encrypt == 2) {
+                rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
+                rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+            }
+
+            if (from.equals("dailymotion", ignoreCase = true) || rawUrl.contains("dailymotion", ignoreCase = true)) {
+                val dmId = extractDailymotionId(rawUrl)
                 if (dmId != null) {
                     val videoUrl = "https://www.dailymotion.com/video/$dmId"
-                    return loadExtractor(videoUrl, data, subtitleCallback, callback)
+                    if (loadExtractor(videoUrl, data, subtitleCallback, callback)) return true
                 }
             } 
-            else if (rawUrl != null && (rawUrl.contains(".m3u8", ignoreCase = true) || rawUrl.contains(".mp4", ignoreCase = true))) {
+            
+            if (rawUrl.contains(".m3u8", ignoreCase = true) || rawUrl.contains(".mp4", ignoreCase = true)) {
                 callback.invoke(
                     ExtractorLink(
                         source = this.name,
@@ -185,6 +206,11 @@ class DonghuaFunProvider : MainAPI() {
                 )
                 return true
             }
+            
+            // Allow other direct link extractors found in the raw URL
+            if (rawUrl.startsWith("http") && loadExtractor(rawUrl, data, subtitleCallback, callback)) {
+                return true
+            }
         }
 
         val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
@@ -193,7 +219,7 @@ class DonghuaFunProvider : MainAPI() {
             val dmId = extractDailymotionId(src)
             if (dmId != null) {
                 val videoUrl = "https://www.dailymotion.com/video/$dmId"
-                return loadExtractor(videoUrl, data, subtitleCallback, callback)
+                if (loadExtractor(videoUrl, data, subtitleCallback, callback)) return true
             }
         }
 
@@ -201,7 +227,7 @@ class DonghuaFunProvider : MainAPI() {
         if (dmIdMatch != null) {
             val dmId = dmIdMatch.groupValues[1]
             val videoUrl = "https://www.dailymotion.com/video/$dmId"
-            return loadExtractor(videoUrl, data, subtitleCallback, callback)
+            if (loadExtractor(videoUrl, data, subtitleCallback, callback)) return true
         }
 
         doc?.select("iframe[src]")?.forEach { iframe ->
@@ -216,14 +242,20 @@ class DonghuaFunProvider : MainAPI() {
     }
 
     private fun extractDailymotionId(urlOrId: String): String? {
-        if (urlOrId.matches(Regex("^[a-zA-Z0-9_-]{6,15}$"))) return urlOrId
-        val standardPattern = Regex("""dailymotion\.com/(?:embed/)?video/([a-zA-Z0-9]+)""")
-        val standardMatch = standardPattern.find(urlOrId)
-        if (standardMatch != null) return standardMatch.groupValues[1]
+        // Direct ID check (Often Dailymotion IDs start with 'x' and are alphanumeric)
+        if (urlOrId.matches(Regex("^[xX][a-zA-Z0-9]{5,15}$")) || urlOrId.matches(Regex("^[a-zA-Z0-9]{6,15}$"))) return urlOrId
         
-        val geoPattern = Regex("""[?&]video=([a-zA-Z0-9]+)""")
-        val geoMatch = geoPattern.find(urlOrId)
-        if (geoMatch != null) return geoMatch.groupValues[1]
+        // Match standard and embed links
+        val standardPattern = Regex("""dailymotion\.com/(?:embed/)?video/([a-zA-Z0-9]+)""")
+        standardPattern.find(urlOrId)?.let { return it.groupValues[1] }
+        
+        // Match geo.dailymotion links
+        val geoVideoParamPattern = Regex("""[?&]video=([a-zA-Z0-9]+)""")
+        geoVideoParamPattern.find(urlOrId)?.let { return it.groupValues[1] }
+
+        // Generic catch-all for IDs following a slash if the domain is Dailymotion
+        val genericPattern = Regex("""dailymotion\.com.*?/([xX][a-zA-Z0-9]+)""")
+        genericPattern.find(urlOrId)?.let { return it.groupValues[1] }
 
         return null
     }
