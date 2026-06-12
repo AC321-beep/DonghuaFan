@@ -135,6 +135,7 @@ class DonghuaFunProvider : MainAPI() {
             Log.d(TAG, "Found ${episodes.size} episodes from 4K tab")
         }
 
+        // Fallback generator for shows returning no episodes in UI
         if (episodes.isEmpty() && showId.isNotEmpty()) {
             Log.d(TAG, "No episodes found from tabs, generating numeric range 1..300")
             for (n in 1..300) {
@@ -176,7 +177,7 @@ class DonghuaFunProvider : MainAPI() {
             val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
             val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
-            // 1. PRIMARY: Your original logic first (Handles unencrypted Dailymotion links)
+            // 1. PRIMARY: Check Dailymotion first before doing any decryption manipulation
             if (from.equals("dailymotion", ignoreCase = true) || rawUrl.contains("dailymotion", ignoreCase = true)) {
                 val dmId = extractDailymotionId(rawUrl)
                 if (dmId != null) {
@@ -185,129 +186,4 @@ class DonghuaFunProvider : MainAPI() {
                 }
             }
 
-            // 2. FALLBACK IMPROVEMENT: MacCMS Decryption for normal episodes
-            try {
-                if (encrypt == 1) {
-                    rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-                } else if (encrypt == 2) {
-                    rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
-                    rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to decrypt MacCMS url", e)
-            }
-
-            // 3. Check Dailymotion again POST-decryption, just in case the link was encoded
-            if (from.equals("dailymotion", ignoreCase = true) || rawUrl.contains("dailymotion", ignoreCase = true)) {
-                val dmId = extractDailymotionId(rawUrl)
-                if (dmId != null) {
-                    val videoUrl = "https://www.dailymotion.com/video/$dmId"
-                    if (loadExtractor(videoUrl, data, subtitleCallback, callback)) return true
-                }
-            }
-
-            // 4. Return regular decrypted video files (.m3u8/.mp4)
-            if (rawUrl.contains(".m3u8", ignoreCase = true) || rawUrl.contains(".mp4", ignoreCase = true)) {
-                callback.invoke(
-                    ExtractorLink(
-                        source = this.name,
-                        name = this.name,
-                        url = rawUrl,
-                        referer = data,
-                        quality = Qualities.Unknown.value,
-                        type = if (rawUrl.contains(".m3u8", ignoreCase = true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    )
-                )
-                return true
-            }
-        }
-
-        val doc = try { app.get(data, headers = headers).document } catch (e: Exception) { null }
-        doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
-            val src = iframe.attr("src")
-            val dmId = extractDailymotionId(src)
-            if (dmId != null) {
-                val videoUrl = "https://www.dailymotion.com/video/$dmId"
-                if (loadExtractor(videoUrl, data, subtitleCallback, callback)) return true
-            }
-        }
-
-        val dmIdMatch = Regex("""dailymotion\.com/(?:embed/)?video/([a-zA-Z0-9]+)""").find(html)
-        if (dmIdMatch != null) {
-            val dmId = dmIdMatch.groupValues[1]
-            val videoUrl = "https://www.dailymotion.com/video/$dmId"
-            if (loadExtractor(videoUrl, data, subtitleCallback, callback)) return true
-        }
-
-        doc?.select("iframe[src]")?.forEach { iframe ->
-            val src = fixUrl(iframe.attr("src"))
-            if (src.isNotBlank() && !src.contains("dailymotion")) {
-                if (loadExtractor(src, data, subtitleCallback, callback)) return true
-            }
-        }
-
-        Log.d(TAG, "No playable source found for $data")
-        return false
-    }
-
-    private fun extractDailymotionId(urlOrId: String): String? {
-        // 1. PRIMARY: Your original working check
-        if (urlOrId.matches(Regex("^[a-zA-Z0-9]{15,}$"))) return urlOrId
-        val pattern = Regex("""dailymotion\.com/(?:embed/)?video/([a-zA-Z0-9]+)""")
-        val match = pattern.find(urlOrId)?.groupValues?.get(1)
-        if (match != null) return match
-
-        // 2. FALLBACK: Catch extra Dailymotion formats (like geo parameters or generic 'x' IDs)
-        if (urlOrId.matches(Regex("^[xX][a-zA-Z0-9]{5,15}$"))) return urlOrId
-        if (urlOrId.matches(Regex("^[a-zA-Z0-9]{6,15}$"))) return urlOrId
-        val geoVideoParamPattern = Regex("""[?&]video=([a-zA-Z0-9]+)""")
-        geoVideoParamPattern.find(urlOrId)?.let { return it.groupValues[1] }
-
-        val genericPattern = Regex("""dailymotion\.com.*?/([xX][a-zA-Z0-9]+)""")
-        genericPattern.find(urlOrId)?.let { return it.groupValues[1] }
-
-        return null
-    }
-
-    private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
-        return doc.select("a[href*='/vod/detail/id/']")
-            .distinctBy { it.attr("href") }
-            .filter { a -> 
-                if (!isComingSoon) {
-                    true
-                } else {
-                    val parent1 = a.parent()
-                    val parent2 = a.parent()?.parent()
-                    val parent3 = a.parent()?.parent()?.parent()
-
-                    val container = when {
-                        parent3 != null && parent3.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent3
-                        parent2 != null && parent2.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent2
-                        parent1 != null && parent1.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent1
-                        else -> a
-                    }
-                    
-                    val cardText = container.text()
-                    
-                    val keywords = listOf(
-                        "trailer", "coming soon", "not yet aired", 
-                        "upcoming", "releasing soon", "0 episode"
-                    )
-                    keywords.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
-                }
-            }
-            .mapNotNull { a ->
-                val href = fixUrl(a.attr("href"))
-                val title = a.attr("title").ifEmpty {
-                    a.selectFirst("img")?.attr("alt") ?: a.text()
-                }.trim()
-                if (title.isEmpty()) return@mapNotNull null
-                
-                val poster = a.selectFirst("img")?.let {
-                    it.attr("data-src").ifEmpty { it.attr("src") }
-                }?.takeUnless { it.startsWith("data:") }?.let { fixUrl(it) }
-                
-                newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
-            }
-    }
-}
+            // 2. FALLBACK IMPROVEMENT: MacCMS Decryption for normal video
