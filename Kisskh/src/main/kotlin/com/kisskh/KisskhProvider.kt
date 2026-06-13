@@ -1,9 +1,19 @@
 package com.kisskh
 
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.mvvm.safeApiCall
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.INFER_TYPE
+import com.lagradost.cloudstream3.utils.M3u8Helper
+import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.base64DecodeArray
+import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import okhttp3.Interceptor
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
@@ -18,13 +28,14 @@ class KisskhProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.AsianDrama, TvType.Anime)
 
-    // Google Script URLs (same as working provider)
+    // Google Script URLs (as used in the working Turkish provider)
     private val kisskhApiBase = "https://script.google.com/macros/s/AKfycbzn8B31PuDxzaMa9_CQ0VGEDasFqfzI5bXvjaIZH4DM8DNq9q6xj1ALvZNz_JT3jF0suA/exec?id="
     private val kisskhSubBase = "https://script.google.com/macros/s/AKfycbyq6hTj0ZhlinYC6xbggtgo166tp6XaDKBCGtnYk8uOfYBUFwwxBui0sGXiu_zIFmA/exec?id="
 
     companion object {
         var philippineCountryCode = 8
-        // Decryption keys for subtitles
+
+        // Decryption keys for subtitles (same as Turkish provider)
         internal const val KEY = "AmSmZVcH93UQUezi"
         internal const val KEY2 = "8056483646328763"
         internal const val KEY3 = "sWODXX04QRTkHdlZ"
@@ -176,13 +187,12 @@ class KisskhProvider : MainAPI() {
             val subApiUrl = "$mainUrl/api/Sub/${loadData.epsId}?kkey=$subtitleKkey"
             val subtitleResponse = app.get(subApiUrl).text
             val subtitleList = tryParseJson<List<Subtitle>>(subtitleResponse) ?: emptyList()
-            subtitleList.forEach { sub ->
-                val lang = getLanguage(sub.label ?: return@forEach)
-                val srcUrl = sub.src ?: return@forEach
+            // Use a regular for loop to allow suspend calls inside
+            for (sub in subtitleList) {
+                val lang = getLanguage(sub.label ?: continue)
+                val srcUrl = sub.src ?: continue
                 try {
-                    // Fetch encrypted subtitle content
                     val encryptedContent = app.get(srcUrl).text
-                    // Decrypt the whole content using the same chunk logic
                     val decryptedContent = decryptSubtitleContent(encryptedContent)
                     subtitleCallback.invoke(newSubtitleFile(lang, decryptedContent))
                 } catch (e: Exception) {
@@ -252,7 +262,7 @@ class KisskhProvider : MainAPI() {
         }
     }
 
-    // ---------- Data classes (unchanged) ----------
+    // ---------- Data classes ----------
     data class Data(val title: String?, val eps: Int?, val id: Int?, val epsId: Int?)
     data class Sources(@JsonProperty("Video") val video: String?, @JsonProperty("ThirdParty") val thirdParty: String?)
     data class Subtitle(@JsonProperty("src") val src: String?, @JsonProperty("label") val label: String?)
