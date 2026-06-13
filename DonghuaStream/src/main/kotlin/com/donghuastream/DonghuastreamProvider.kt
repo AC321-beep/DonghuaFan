@@ -1,120 +1,133 @@
-package com.donghuastream
+package com.Donghuastream
 
-import android.util.Log
-import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.api.Log
+import com.lagradost.cloudstream3.HomePageList
+import com.lagradost.cloudstream3.HomePageResponse
+import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.MainPageRequest
+import com.lagradost.cloudstream3.SearchResponse
+import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.base64Decode
+import com.lagradost.cloudstream3.fixUrl
+import com.lagradost.cloudstream3.fixUrlNull
+import com.lagradost.cloudstream3.mainPageOf
+import com.lagradost.cloudstream3.newEpisode
+import com.lagradost.cloudstream3.newHomePageResponse
+import com.lagradost.cloudstream3.newMovieLoadResponse
+import com.lagradost.cloudstream3.newMovieSearchResponse
+import com.lagradost.cloudstream3.newTvSeriesLoadResponse
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.INFER_TYPE
+import com.lagradost.cloudstream3.utils.getQualityFromName
+import com.lagradost.cloudstream3.utils.httpsify
+import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.utils.newExtractorLink
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 
-class DonghuastreamProvider : MainAPI() {
+open class Donghuastream : MainAPI() {
     override var mainUrl = "https://donghuastream.org"
-    override var name = "DonghuaStream"
-    override var lang = "en" // Site primarily provides English hardsubs/softsubs
+    override var name = "Donghuastream"
     override val hasMainPage = true
+    override var lang = "zh"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime)
 
-    // Using standard WP pagination endpoints
+    // Only "Recently Updated" remains
     override val mainPage = mainPageOf(
-        "$mainUrl/page/" to "Latest Updates"
+        "anime/?status=&type=&order=update&page=" to "Recently Updated"
     )
 
-    override suspend fun getMainPage(
-        page: Int,
-        request: MainPageRequest
-    ): HomePageResponse {
-        val url = if (page == 1) {
-            request.data.substringBefore("page/")
-        } else {
-            "${request.data}$page/"
-        }
-        
-        val doc = app.get(url).document
-        
-        // Standard WordPress/Dooplay/AnimeStream selectors
-        val items = doc.select("article, .post-item, .bsx, .update-info, .l-post").mapNotNull { element ->
-            element.toSearchResponse()
-        }
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val document = app.get("$mainUrl/${request.data}$page").document
+        val home = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
 
-        return newHomePageResponse(request.name, items)
+        return newHomePageResponse(
+            list = HomePageList(
+                name = request.name,
+                list = home,
+                isHorizontalImages = false
+            ),
+            hasNext = true
+        )
     }
 
-    private fun Element.toSearchResponse(): SearchResponse? {
-        val titleElement = this.selectFirst("h2, h3, .tt, .entry-title, .post-title") ?: return null
-        val title = titleElement.text().trim()
-        
-        val a = this.selectFirst("a") ?: return null
-        val url = fixUrl(a.attr("href"))
-        
-        val img = this.selectFirst("img")
-        var poster = img?.attr("data-src")?.takeIf { it.isNotBlank() }
-            ?: img?.attr("src")
-            
-        // Filter out blank or placeholder Base64 images
-        if (poster?.contains("data:image") == true) poster = null
+    fun Element.toSearchResult(): SearchResponse {
+        val title = this.select("div.bsx > a").attr("title")
+        val href = fixUrl(this.select("div.bsx > a").attr("href"))
+        val posterUrl = fixUrlNull(this.selectFirst("div.bsx a img")?.getImageAttr())
+        return newMovieSearchResponse(title, href, TvType.Movie) {
+            this.posterUrl = posterUrl
+        }
+    }
 
-        return newAnimeSearchResponse(title, url, TvType.Anime) {
-            this.posterUrl = poster?.let { fixUrl(it) }
+    private fun Element.getImageAttr(): String {
+        return when {
+            this.hasAttr("data-src") -> this.attr("data-src")
+            this.hasAttr("src") -> this.attr("src")
+            else -> this.attr("src")
         }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        // Standard WP search query parameter
-        val url = "$mainUrl/?s=${query.replace(" ", "+")}"
-        val doc = app.get(url).document
-        
-        return doc.select("article, .post-item, .bsx, .result-item, .l-post").mapNotNull {
-            it.toSearchResponse()
+        val searchResponse = mutableListOf<SearchResponse>()
+
+        for (i in 1..3) {
+            val document = app.get("${mainUrl}/pagg/$i/?s=$query").document
+            val results = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
+
+            if (!searchResponse.containsAll(results)) {
+                searchResponse.addAll(results)
+            } else {
+                break
+            }
+
+            if (results.isEmpty()) break
         }
+
+        return searchResponse
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url).document
-        
-        val title = doc.selectFirst("h1.entry-title, .infox h1, h1[itemprop=name]")?.text()?.trim() 
-            ?: doc.title().substringBefore("-").trim()
-            
-        val poster = doc.selectFirst(".thumb img, .post-thumbnail img, .poster img")?.let {
-            it.attr("data-src").ifEmpty { it.attr("src") }
-        }
-        
-        val description = doc.selectFirst(".entry-content, .description, [itemprop=description]")?.text()?.trim()
+        val document = app.get(url).document
+        val title = document.selectFirst("h1.entry-title")?.text()?.trim().toString()
+        val href = document.selectFirst(".eplister li > a")?.attr("href") ?: ""
+        var poster = document.select("div.ime > img").attr("data-src")
+        val description = document.selectFirst("div.entry-content")?.text()?.trim()
+        val type = document.selectFirst(".spe")?.text().toString()
+        val tvtag = if (type.contains("Movie")) TvType.Movie else TvType.TvSeries
 
-        val episodes = mutableListOf<Episode>()
-        
-        // Looks for traditional episode lists in WP series pages
-        val epElements = doc.select(".eplister ul li a, .episodes li a, .eplist li a")
-        
-        if (epElements.isNotEmpty()) {
-            epElements.forEach { ep ->
-                val epUrl = fixUrl(ep.attr("href"))
-                val epTitle = ep.selectFirst(".epl-title, .ep-title")?.text() ?: ep.text()
-                val epNum = ep.selectFirst(".epl-num, .ep-num")?.text()?.filter { it.isDigit() }?.toIntOrNull()
-                    ?: Regex("""(?i)episode\s*(\d+)""").find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
-                
-                episodes.add(
-                    newEpisode(epUrl) {
-                        this.name = epTitle.trim()
-                        this.episode = epNum
-                    }
-                )
+        return if (tvtag == TvType.TvSeries) {
+            val epPage = document.selectFirst(".eplister li > a")?.attr("href") ?: ""
+            val doc = app.get(epPage).document
+            val episodes = doc.select("div.episodelist > ul > li").map { info ->
+                val href1 = info.select("a").attr("href")
+                val episode = info.select("a span").text().substringAfter("-").substringBeforeLast("-")
+                val posterr = info.selectFirst("a img")?.attr("data-src") ?: ""
+                newEpisode(href1) {
+                    this.name = episode.replace(title, "", ignoreCase = true)
+                    this.episode = episode.toIntOrNull()
+                    this.posterUrl = posterr
+                }
+            }
+            if (poster.isEmpty()) {
+                poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim().toString()
+            }
+            newTvSeriesLoadResponse(title, url, TvType.Anime, episodes.reversed()) {
+                this.posterUrl = poster
+                this.plot = description
             }
         } else {
-            // Fallback: If donghuastream.org links directly to the episode post rather than a series page
-            val epNum = Regex("""(?i)episode\s*[-]?\s*(\d+)""").find(title)?.groupValues?.get(1)?.toIntOrNull()
-            
-            episodes.add(
-                newEpisode(url) {
-                    this.name = title
-                    this.episode = epNum
-                }
-            )
-        }
-
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
-            this.posterUrl = poster?.let { fixUrl(it) }
-            this.plot = description
-            // Reversing is standard since WP lists newest episodes first
-            addEpisodes(DubStatus.Subbed, episodes.reversed()) 
+            if (poster.isEmpty()) {
+                poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim().toString()
+            }
+            newMovieLoadResponse(title, url, TvType.Movie, href) {
+                this.posterUrl = poster
+                this.plot = description
+            }
         }
     }
 
@@ -124,35 +137,47 @@ class DonghuastreamProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val doc = app.get(data).document
-        var found = false
-        
-        // 1. Scrape standard iframes for video players
-        val iframes = doc.select("iframe, .player-video iframe")
-        
-        for (iframe in iframes) {
-            val src = iframe.attr("src").takeIf { it.isNotBlank() } ?: iframe.attr("data-src")
-            if (src.isNotBlank() && !src.contains("youtube.com", ignoreCase = true)) {
-                found = loadExtractor(fixUrl(src), data, subtitleCallback, callback) || found
+        val html = app.get(data).document
+
+        val options = html.select("option[data-index]")
+
+        for (option in options) {
+            val base64 = option.attr("value")
+            if (base64.isBlank()) continue
+            val label = option.text().trim()
+            val decodedHtml = try {
+                base64Decode(base64)
+            } catch (_: Exception) {
+                Log.w("Error", "Base64 decode failed: $base64")
+                continue
+            }
+
+            val iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
+            if (iframeUrl.isNullOrEmpty()) continue
+            when {
+                "vidmoly" in iframeUrl -> {
+                    val cleanedUrl = "http:" + iframeUrl.substringAfter("=\"").substringBefore("\"")
+                    loadExtractor(cleanedUrl, referer = iframeUrl, subtitleCallback, callback)
+                }
+                iframeUrl.endsWith(".mp4") -> {
+                    callback(
+                        newExtractorLink(
+                            label,
+                            label,
+                            url = iframeUrl,
+                            INFER_TYPE
+                        ) {
+                            this.referer = ""
+                            this.quality = getQualityFromName(label)
+                        }
+                    )
+                }
+                else -> {
+                    loadExtractor(iframeUrl, referer = iframeUrl, subtitleCallback, callback)
+                }
             }
         }
-        
-        // 2. If no iframe is immediately visible, look for script-based player embeds
-        if (!found) {
-            val scripts = doc.select("script").map { it.data() }.joinToString("")
-            val regex = Regex("""['"](https?://[^'"]*(?:dailymotion\.com|filemoon|streamwish|vidhide)[^'"]*)['"]""")
-            val match = regex.find(scripts)
-            
-            if (match != null) {
-                val extractedUrl = match.groupValues[1]
-                found = loadExtractor(fixUrl(extractedUrl), data, subtitleCallback, callback) || found
-            }
-        }
-        
-        if (!found) {
-            Log.d("DonghuaStream", "No playable source found for $data")
-        }
-        
-        return found
+
+        return true
     }
 }
