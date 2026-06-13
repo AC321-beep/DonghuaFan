@@ -16,12 +16,12 @@ class UltrahdExtractor : ExtractorApi() {
         referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    ): Unit {
         val doc = app.get(url, referer = mainUrl).document
         val jsonUrl = Regex("""\$\s*\.\s*ajax\s*\(\s*\{\s*url:\s*"([^"]+)"""").find(doc.toString())?.groupValues?.get(1)
-            ?: return false
+            ?: return
 
-        val data = app.get(jsonUrl).parsedSafe<UltrahdResponse>() ?: return false
+        val data = app.get(jsonUrl).parsedSafe<UltrahdResponse>() ?: return
 
         data.sources?.forEach { source ->
             val videoUrl = httpsify(source.file)
@@ -44,13 +44,13 @@ class UltrahdExtractor : ExtractorApi() {
 
         data.tracks?.forEach { track ->
             subtitleCallback.invoke(
-                newSubtitleFile(
+                SubtitleFile(
                     lang = track.label,
                     url = track.file
                 )
             )
         }
-        return true
+        return
     }
 
     data class UltrahdResponse(
