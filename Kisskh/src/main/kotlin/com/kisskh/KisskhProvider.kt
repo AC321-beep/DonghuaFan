@@ -11,12 +11,12 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.base64DecodeArray
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import okhttp3.Interceptor
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import java.util.Base64
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -35,7 +35,7 @@ class KisskhProvider : MainAPI() {
     companion object {
         var philippineCountryCode = 8
 
-        // Decryption keys for subtitles (same as Turkish provider)
+        // Decryption keys for subtitles
         internal const val KEY = "AmSmZVcH93UQUezi"
         internal const val KEY2 = "8056483646328763"
         internal const val KEY3 = "sWODXX04QRTkHdlZ"
@@ -187,7 +187,6 @@ class KisskhProvider : MainAPI() {
             val subApiUrl = "$mainUrl/api/Sub/${loadData.epsId}?kkey=$subtitleKkey"
             val subtitleResponse = app.get(subApiUrl).text
             val subtitleList = tryParseJson<List<Subtitle>>(subtitleResponse) ?: emptyList()
-            // Use a regular for loop to allow suspend calls inside
             for (sub in subtitleList) {
                 val lang = getLanguage(sub.label ?: continue)
                 val srcUrl = sub.src ?: continue
@@ -205,7 +204,7 @@ class KisskhProvider : MainAPI() {
     }
 
     // ----------------------------------------------------------------------
-    // Subtitle decryption (copied from working provider)
+    // Subtitle decryption (using Java Base64)
     // ----------------------------------------------------------------------
     private val CHUNK_REGEX1 by lazy { Regex("^\\d+$", RegexOption.MULTILINE) }
 
@@ -236,7 +235,7 @@ class KisskhProvider : MainAPI() {
             Pair(KEY2.toByteArray(Charsets.UTF_8), IV2.toByteArray()),
             Pair(KEY3.toByteArray(Charsets.UTF_8), IV3.toByteArray())
         )
-        val encryptedBytes = base64DecodeArray(encryptedB64)
+        val encryptedBytes = Base64.getDecoder().decode(encryptedB64)
         for ((keyBytes, ivBytes) in keyIvPairs) {
             try {
                 return decryptWithKeyIv(keyBytes, ivBytes, encryptedBytes)
