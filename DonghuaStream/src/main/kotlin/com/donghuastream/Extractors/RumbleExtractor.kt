@@ -2,7 +2,6 @@ package com.donghuastream.Extractors
 
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.ExtractorApi
 
@@ -16,9 +15,9 @@ class RumbleExtractor : ExtractorApi() {
         referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    ): Unit {
         val doc = app.get(url, referer = referer ?: mainUrl).document
-        val script = doc.selectFirst("script:containsData(jwplayer)")?.data() ?: return false
+        val script = doc.selectFirst("script:containsData(jwplayer)")?.data() ?: return
 
         val sourceRegex = """"file"\s*:\s*"(https?:[^"]+\.(?:mp4|m3u8)[^"]*)"""".toRegex()
         sourceRegex.findAll(script).forEachIndexed { idx, match ->
@@ -43,12 +42,12 @@ class RumbleExtractor : ExtractorApi() {
         val trackRegex = """"file"\s*:\s*"(https?:[^"]+\.vtt[^"]*)"\s*,\s*"label"\s*:\s*"([^"]+)"""".toRegex()
         trackRegex.findAll(script).forEach { match ->
             subtitleCallback.invoke(
-                newSubtitleFile(
+                SubtitleFile(
                     lang = match.groupValues[2],
                     url = match.groupValues[1].replace("\\/", "/")
                 )
             )
         }
-        return true
+        return
     }
 }
