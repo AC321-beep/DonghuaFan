@@ -44,7 +44,7 @@ class KisskhProvider : MainAPI() {
         internal val IV3 = intArrayOf(946894696, 1634749029, 1127508082, 1396271183)
     }
 
-    override val mainPage = mainPageOfoverride val mainPage = mainPageOf(
+    override val mainPage = mainPageOf(
     "&type=0&sub=0&country=0&status=0&order=2" to "Trending",
     "&type=0&sub=0&country=2&status=0&order=2" to "Latest K-Drama",
     "&type=0&sub=0&country=1&status=0&order=2" to "Latest C-Drama",
