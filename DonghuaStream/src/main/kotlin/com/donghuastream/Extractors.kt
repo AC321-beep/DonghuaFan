@@ -1,4 +1,4 @@
-package com.donghuastream.Extractors
+package com.donghuastream
 
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.SubtitleFile
@@ -50,7 +50,6 @@ class PlayStreamplayExtractor : ExtractorApi() {
             val apiUrl = "$mainUrl/api/?$token"
             val response = app.get(apiUrl, timeout = 10000).parsedSafe<PlayStreamplayResponse>() ?: return
 
-            // Video sources
             val m3u8Url = response.sources.find { it.file.isNotBlank() }?.file
             if (!m3u8Url.isNullOrEmpty()) {
                 val headers = mapOf(
@@ -69,7 +68,6 @@ class PlayStreamplayExtractor : ExtractorApi() {
                 M3u8Helper.generateM3u8(name, m3u8Url, mainUrl, headers = headers).forEach(callback)
             }
 
-            // Subtitles
             response.tracks.forEach { track ->
                 subtitleCallback(SubtitleFile(track.label, track.file))
             }
@@ -113,14 +111,12 @@ class RumbleExtractor : ExtractorApi() {
         runCatching {
             val doc = app.get(url, referer = referer ?: mainUrl).document
 
-            // Try the jwplayer script first
             val jwScript = doc.selectFirst("script:containsData(jwplayer)")?.data()
             if (jwScript != null) {
                 extractFromJwScript(jwScript, callback, subtitleCallback)
                 return
             }
 
-            // Fallback: look for video element or source tags
             val videoElement = doc.selectFirst("video")
             val mp4Url = videoElement?.select("source[src$=.mp4]")?.attr("src")
                 ?: videoElement?.attr("src")
@@ -132,7 +128,6 @@ class RumbleExtractor : ExtractorApi() {
                 return
             }
 
-            // Another fallback: search for any .mp4 or .m3u8 in script data
             val allScripts = doc.select("script").joinToString("\n") { it.data() }
             val fallbackUrl = Regex("""https?://[^\s"']+\.(?:mp4|m3u8)[^\s"']*""")
                 .find(allScripts)?.value
@@ -241,7 +236,6 @@ class VtbeExtractor : ExtractorApi() {
             val script = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return
             val unpacked = JsUnpacker(script).unpack() ?: return
 
-            // Try to find m3u8 source
             val m3u8 = Regex("""sources:\s*\[\s*\{\s*file:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""")
                 .find(unpacked)?.groupValues?.get(1)
                 ?: Regex("""file:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""")
@@ -257,7 +251,6 @@ class VtbeExtractor : ExtractorApi() {
                 return
             }
 
-            // Fallback: look for .mp4 direct links
             val mp4 = Regex("""file:\s*["'](https?://[^"']+\.mp4[^"']*)["']""")
                 .find(unpacked)?.groupValues?.get(1)
             if (!mp4.isNullOrEmpty()) {
