@@ -34,27 +34,20 @@ class KisskhProvider : MainAPI() {
 
     companion object {
         var philippineCountryCode = 8
-
-        // Decryption keys for subtitles
-        internal const val KEY = "AmSmZVcH93UQUezi"
-        internal const val KEY2 = "8056483646328763"
-        internal const val KEY3 = "sWODXX04QRTkHdlZ"
-        internal val IV = intArrayOf(1382367819, 1465333859, 1902406224, 1164854838)
-        internal val IV2 = intArrayOf(909653298, 909193779, 925905208, 892483379)
-        internal val IV3 = intArrayOf(946894696, 1634749029, 1127508082, 1396271183)
+        // Decryption keys have been moved to SubDecryptor
     }
 
     override val mainPage = mainPageOf(
-    "&type=0&sub=0&country=0&status=0&order=2" to "Trending",
-    "&type=0&sub=0&country=2&status=0&order=2" to "Latest K-Drama",
-    "&type=0&sub=0&country=1&status=0&order=2" to "Latest C-Drama",
-    "&type=2&sub=0&country=$philippineCountryCode&status=0&order=2" to "Latest Philippine Movie",
-    "&type=2&sub=0&country=2&status=0&order=2" to "Movie Last Update",
-    "&type=1&sub=0&country=2&status=0&order=1" to "TVSeries Popular",
-    "&type=3&sub=0&country=0&status=0&order=2" to "Anime Latest Update",
-    "&type=4&sub=0&country=0&status=0&order=2" to "Hollywood Last Update",
-    "&type=0&sub=0&country=0&status=3&order=2" to "Upcoming"
-)
+        "&type=0&sub=0&country=0&status=0&order=2" to "Trending",
+        "&type=0&sub=0&country=2&status=0&order=2" to "Latest K-Drama",
+        "&type=0&sub=0&country=1&status=0&order=2" to "Latest C-Drama",
+        "&type=2&sub=0&country=$philippineCountryCode&status=0&order=2" to "Latest Philippine Movie",
+        "&type=2&sub=0&country=2&status=0&order=2" to "Movie Last Update",
+        "&type=1&sub=0&country=2&status=0&order=1" to "TVSeries Popular",
+        "&type=3&sub=0&country=0&status=0&order=2" to "Anime Latest Update",
+        "&type=4&sub=0&country=0&status=0&order=2" to "Hollywood Last Update",
+        "&type=0&sub=0&country=0&status=3&order=2" to "Upcoming"
+    )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val home = app.get("$mainUrl/api/DramaList/List?page=$page${request.data}")
@@ -177,7 +170,7 @@ class KisskhProvider : MainAPI() {
             }
         } ?: Log.e("Kisskh", "No video sources found")
 
-        // ---- Subtitles (using Google Script key + decryption) ----
+        // ---- Subtitles (using Google Script key + SubDecryptor) ----
         val subKeyUrl = "$kisskhSubBase${loadData.epsId}&version=2.8.10"
         val subtitleKkey = app.get(subKeyUrl, timeout = 10000).parsedSafe<Key>()?.key ?: ""
         if (subtitleKkey.isNotBlank()) {
@@ -189,7 +182,7 @@ class KisskhProvider : MainAPI() {
                 val srcUrl = sub.src ?: continue
                 try {
                     val encryptedContent = app.get(srcUrl).text
-                    val decryptedContent = decryptSubtitleContent(encryptedContent)
+                    val decryptedContent = SubDecryptor.decryptFullContent(encryptedContent)
                     subtitleCallback.invoke(newSubtitleFile(lang, decryptedContent))
                 } catch (e: Exception) {
                     Log.e("Kisskh", "Failed to decrypt subtitle: ${e.message}")
@@ -198,64 +191,6 @@ class KisskhProvider : MainAPI() {
         }
 
         return true
-    }
-
-    // ----------------------------------------------------------------------
-    // Subtitle decryption (using Java Base64)
-    // ----------------------------------------------------------------------
-    private val CHUNK_REGEX1 by lazy { Regex("^\\d+$", RegexOption.MULTILINE) }
-
-    private fun decryptSubtitleContent(encryptedContent: String): String {
-        val chunks = encryptedContent.split(CHUNK_REGEX1)
-            .filter { it.isNotBlank() }
-            .map { it.trim() }
-        return chunks.mapIndexed { index, chunk ->
-            if (chunk.isBlank()) return@mapIndexed ""
-            val parts = chunk.split("\n")
-            if (parts.isEmpty()) return@mapIndexed ""
-            val header = parts.first()
-            val text = parts.drop(1)
-            val decryptedLines = text.joinToString("\n") { line ->
-                try {
-                    decrypt(line)
-                } catch (e: Exception) {
-                    "DECRYPT_ERROR:${e.message}"
-                }
-            }
-            listOf(index + 1, header, decryptedLines).joinToString("\n")
-        }.filter { it.isNotEmpty() }.joinToString("\n\n")
-    }
-
-    private fun decrypt(encryptedB64: String): String {
-        val keyIvPairs = listOf(
-            Pair(KEY.toByteArray(Charsets.UTF_8), IV.toByteArray()),
-            Pair(KEY2.toByteArray(Charsets.UTF_8), IV2.toByteArray()),
-            Pair(KEY3.toByteArray(Charsets.UTF_8), IV3.toByteArray())
-        )
-        val encryptedBytes = Base64.getDecoder().decode(encryptedB64)
-        for ((keyBytes, ivBytes) in keyIvPairs) {
-            try {
-                return decryptWithKeyIv(keyBytes, ivBytes, encryptedBytes)
-            } catch (ex: Exception) { }
-        }
-        return "Decryption failed: All keys/IVs failed"
-    }
-
-    private fun decryptWithKeyIv(keyBytes: ByteArray, ivBytes: ByteArray, encryptedBytes: ByteArray): String {
-        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(ivBytes))
-        return String(cipher.doFinal(encryptedBytes), Charsets.UTF_8)
-    }
-
-    private fun IntArray.toByteArray(): ByteArray {
-        return ByteArray(size * 4).also { bytes ->
-            forEachIndexed { index, value ->
-                bytes[index * 4] = (value shr 24).toByte()
-                bytes[index * 4 + 1] = (value shr 16).toByte()
-                bytes[index * 4 + 2] = (value shr 8).toByte()
-                bytes[index * 4 + 3] = value.toByte()
-            }
-        }
     }
 
     // ---------- Data classes ----------
