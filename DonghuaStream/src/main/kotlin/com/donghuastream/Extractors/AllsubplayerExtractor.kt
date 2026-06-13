@@ -3,7 +3,6 @@ package com.donghuastream.Extractors
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.ExtractorApi
 
@@ -17,15 +16,15 @@ class PlayStreamplayExtractor : ExtractorApi() {
         referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    ): Unit {
         val doc = app.get(url, timeout = 10000).document
-        val packedScript = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return false
-        val packedCode = Regex("""eval\(.*?\)\)\)""", RegexOption.DOT_MATCHES_ALL).find(packedScript)?.value ?: return false
-        val unpackedJs = JsUnpacker(packedCode).unpack() ?: return false
-        val token = Regex("""kaken="(.*?)"""").find(unpackedJs)?.groupValues?.get(1) ?: return false
+        val packedScript = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return
+        val packedCode = Regex("""eval\(.*?\)\)\)""", RegexOption.DOT_MATCHES_ALL).find(packedScript)?.value ?: return
+        val unpackedJs = JsUnpacker(packedCode).unpack() ?: return
+        val token = Regex("""kaken="(.*?)"""").find(unpackedJs)?.groupValues?.get(1) ?: return
 
         val apiUrl = "$mainUrl/api/?$token"
-        val response = app.get(apiUrl, timeout = 10000).parsedSafe<PlayStreamplayResponse>() ?: return false
+        val response = app.get(apiUrl, timeout = 10000).parsedSafe<PlayStreamplayResponse>() ?: return
 
         val m3u8Url = response.sources.find { it.file.isNotBlank() }?.file
         if (!m3u8Url.isNullOrEmpty()) {
@@ -47,13 +46,13 @@ class PlayStreamplayExtractor : ExtractorApi() {
 
         response.tracks.forEach { subtitle ->
             subtitleCallback.invoke(
-                newSubtitleFile(
+                SubtitleFile(
                     lang = subtitle.label,
                     url = subtitle.file
                 )
             )
         }
-        return true
+        return
     }
 
     data class PlayStreamplayResponse(
