@@ -13,8 +13,8 @@ fun generateVideoKkey(episodeId: String): String {
         var hash = 0
         for (ch in str) {
             val charCode = ch.code
-            val shifted = (hash shl 5) and 0xFFFFFFFF
-            hash = (shifted - hash + charCode).toInt()   // <-- ADD .toInt()
+            val shifted = (hash shl 5) and 0xFFFFFFFFL   // use Long literal
+            hash = ((shifted - hash + charCode) and 0xFFFFFFFFL).toInt() // safe conversion
         }
         return hash
     }
