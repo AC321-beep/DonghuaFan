@@ -1,5 +1,3 @@
-version = 1
-
 cloudstream {
     description = "Donghua (Chinese Animation)"
     authors = listOf("AC321-beep")
