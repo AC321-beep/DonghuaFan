@@ -21,7 +21,7 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-// Import the SubDecryptor from the same package
+// Import the decryption utility
 import com.kisskh.SubDecryptor
 
 class KisskhProvider : MainAPI() {
@@ -31,13 +31,13 @@ class KisskhProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.AsianDrama, TvType.Anime)
 
-    // Google Script URLs (as used in the working Turkish provider)
+    // Google Script URLs (video and subtitle key generation)
     private val kisskhApiBase = "https://script.google.com/macros/s/AKfycbzn8B31PuDxzaMa9_CQ0VGEDasFqfzI5bXvjaIZH4DM8DNq9q6xj1ALvZNz_JT3jF0suA/exec?id="
     private val kisskhSubBase = "https://script.google.com/macros/s/AKfycbyq6hTj0ZhlinYC6xbggtgo166tp6XaDKBCGtnYk8uOfYBUFwwxBui0sGXiu_zIFmA/exec?id="
 
     companion object {
         var philippineCountryCode = 8
-        // Decryption keys have been moved to SubDecryptor
+        // Decryption keys are in SubDecryptor
     }
 
     override val mainPage = mainPageOf(
@@ -173,53 +173,73 @@ class KisskhProvider : MainAPI() {
             }
         } ?: Log.e("Kisskh", "No video sources found")
 
-        // ---- Subtitles (using Google Script key + SubDecryptor) ----
+        // ---- Subtitles (using Google Script key, passed as URL, decrypted in interceptor) ----
         val subKeyUrl = "$kisskhSubBase${loadData.epsId}&version=2.8.10"
-        Log.d("Kisskh", "Subtitle key URL: $subKeyUrl")
         val subtitleKkey = app.get(subKeyUrl, timeout = 10000).parsedSafe<Key>()?.key ?: ""
-        Log.d("Kisskh", "Subtitle kkey: '$subtitleKkey'")
-
         if (subtitleKkey.isBlank()) {
             Log.e("Kisskh", "subtitleKkey is blank - cannot fetch subtitles")
-            return true // Not a fatal error, video may still play
+            return true // Not fatal
         }
 
         val subApiUrl = "$mainUrl/api/Sub/${loadData.epsId}?kkey=$subtitleKkey"
-        Log.d("Kisskh", "Subtitle API URL: $subApiUrl")
         val subtitleResponse = app.get(subApiUrl).text
-        Log.d("Kisskh", "Subtitle API response: $subtitleResponse")
         val subtitleList = tryParseJson<List<Subtitle>>(subtitleResponse) ?: emptyList()
-        Log.d("Kisskh", "Parsed subtitle list size: ${subtitleList.size}")
-
         for (sub in subtitleList) {
             val lang = getLanguage(sub.label ?: continue)
             val srcUrl = sub.src ?: continue
-            Log.d("Kisskh", "Fetching subtitle from: $srcUrl")
-            try {
-                val content = app.get(srcUrl).text
-                Log.d("Kisskh", "Content length: ${content.length}, first 100 chars: ${content.take(100)}")
-                
-                // Check if the content looks like plain text (e.g., starts with "WEBVTT" or "1\n00:00:00")
-                val isPlainText = content.startsWith("WEBVTT") || 
-                                  content.contains(Regex("""^\d+\n\d{2}:\d{2}:\d{2}""", RegexOption.MULTILINE))
-                
-                val finalContent = if (isPlainText) {
-                    Log.d("Kisskh", "Subtitle appears to be plain text, using as-is")
-                    content
-                } else {
-                    Log.d("Kisskh", "Subtitle appears encrypted, decrypting...")
-                    SubDecryptor.decryptFullContent(content)
-                }
-                subtitleCallback.invoke(newSubtitleFile(lang, finalContent))
-            } catch (e: Exception) {
-                Log.e("Kisskh", "Failed to process subtitle: ${e.message}")
-            }
+            // Pass the URL – decryption happens inside getVideoInterceptor
+            subtitleCallback.invoke(newSubtitleFile(lang, srcUrl))
         }
 
         return true
     }
 
-    // ---------- Data classes ----------
+    // ----------------------------------------------------------------------
+    // Interceptor to decrypt subtitle .txt files on the fly (same as Turkish provider)
+    // ----------------------------------------------------------------------
+    private val CHUNK_REGEX1 by lazy { Regex("^\\d+$", RegexOption.MULTILINE) }
+
+    override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor {
+        return object : Interceptor {
+            override fun intercept(chain: Interceptor.Chain): Response {
+                val request = chain.request().newBuilder().build()
+                val response = chain.proceed(request)
+                val url = response.request.url.toString()
+
+                if (url.contains(".txt")) {
+                    val responseBody = response.body.string()
+                    val chunks = responseBody.split(CHUNK_REGEX1)
+                        .filter { it.isNotBlank() }
+                        .map { it.trim() }
+
+                    val decrypted = chunks.mapIndexed { index, chunk ->
+                        if (chunk.isBlank()) return@mapIndexed ""
+                        val parts = chunk.split("\n")
+                        if (parts.isEmpty()) return@mapIndexed ""
+
+                        val header = parts.first()
+                        val text = parts.drop(1)
+                        val decryptedLines = text.joinToString("\n") { line ->
+                            try {
+                                SubDecryptor.decrypt(line)
+                            } catch (e: Exception) {
+                                "DECRYPT_ERROR:${e.message}"
+                            }
+                        }
+                        listOf(index + 1, header, decryptedLines).joinToString("\n")
+                    }.filter { it.isNotEmpty() }.joinToString("\n\n")
+
+                    val newBody = decrypted.toResponseBody(response.body.contentType())
+                    return response.newBuilder()
+                        .body(newBody)
+                        .build()
+                }
+                return response
+            }
+        }
+    }
+
+    // ---------- Data classes (unchanged) ----------
     data class Data(val title: String?, val eps: Int?, val id: Int?, val epsId: Int?)
     data class Sources(@JsonProperty("Video") val video: String?, @JsonProperty("ThirdParty") val thirdParty: String?)
     data class Subtitle(@JsonProperty("src") val src: String?, @JsonProperty("label") val label: String?)
