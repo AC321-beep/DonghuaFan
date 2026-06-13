@@ -44,20 +44,17 @@ class KisskhProvider : MainAPI() {
         internal val IV3 = intArrayOf(946894696, 1634749029, 1127508082, 1396271183)
     }
 
-    override val mainPage = mainPageOf(
-        "&type=0&sub=0&country=0&status=0&order=2" to "Trending",
-        "&type=0&sub=0&country=2&status=0&order=2" to "Latest K-Drama",
-        "&type=0&sub=0&country=1&status=0&order=2" to "Latest C-Drama",
-        "&type=2&sub=0&country=2&status=0&order=1" to "Movie Popular",
-        "&type=2&sub=0&country=2&status=0&order=2" to "Movie Last Update",
-        "&type=1&sub=0&country=2&status=0&order=1" to "TVSeries Popular",
-        "&type=1&sub=0&country=2&status=0&order=2" to "TVSeries Last Update",
-        "&type=3&sub=0&country=0&status=0&order=2" to "Anime Latest Update",
-        "&type=4&sub=0&country=0&status=0&order=1" to "Hollywood Popular",
-        "&type=4&sub=0&country=0&status=0&order=2" to "Hollywood Last Update",
-        "&type=0&sub=0&country=0&status=3&order=2" to "Upcoming",
-        "&type=2&sub=0&country=$philippineCountryCode&status=0&order=2" to "Latest Philippine Movie"
-    )
+    override val mainPage = mainPageOfoverride val mainPage = mainPageOf(
+    "&type=0&sub=0&country=0&status=0&order=2" to "Trending",
+    "&type=0&sub=0&country=2&status=0&order=2" to "Latest K-Drama",
+    "&type=0&sub=0&country=1&status=0&order=2" to "Latest C-Drama",
+    "&type=2&sub=0&country=$philippineCountryCode&status=0&order=2" to "Latest Philippine Movie",
+    "&type=2&sub=0&country=2&status=0&order=2" to "Movie Last Update",
+    "&type=1&sub=0&country=2&status=0&order=1" to "TVSeries Popular",
+    "&type=3&sub=0&country=0&status=0&order=2" to "Anime Latest Update",
+    "&type=4&sub=0&country=0&status=0&order=2" to "Hollywood Last Update",
+    "&type=0&sub=0&country=0&status=3&order=2" to "Upcoming"
+)
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val home = app.get("$mainUrl/api/DramaList/List?page=$page${request.data}")
