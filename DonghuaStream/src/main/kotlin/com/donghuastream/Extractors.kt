@@ -122,7 +122,12 @@ class RumbleExtractor : ExtractorApi() {
             val mp4Url = videoElement?.select("source[src$=.mp4]")?.attr("src")
                 ?: videoElement?.attr("src")
             if (!mp4Url.isNullOrBlank()) {
-                callback(newExtractorLink(name, name, mp4Url, INFER_TYPE, referer = mainUrl, quality = Qualities.Unknown.value))
+                callback(
+                    newExtractorLink(name, name, mp4Url, INFER_TYPE) {
+                        this.referer = mainUrl
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
                 return
             }
 
@@ -147,14 +152,10 @@ class RumbleExtractor : ExtractorApi() {
             val fileUrl = match.groupValues[1].replace("\\/", "/")
             if (fileUrl.contains(".mp4")) {
                 callback(
-                    newExtractorLink(
-                        source = name,
-                        name = "${name} Server ${idx + 1}",
-                        url = fileUrl,
-                        type = INFER_TYPE,
-                        referer = "",
-                        quality = getQualityFromName("") ?: Qualities.Unknown.value
-                    )
+                    newExtractorLink(name, "${name} Server ${idx + 1}", fileUrl, INFER_TYPE) {
+                        this.referer = ""
+                        this.quality = getQualityFromName("") ?: Qualities.Unknown.value
+                    }
                 )
             } else {
                 M3u8Helper.generateM3u8(name, fileUrl, mainUrl).forEach(callback)
@@ -193,14 +194,10 @@ class UltrahdExtractor : ExtractorApi() {
                 val videoUrl = httpsify(source.file)
                 if (videoUrl.contains(".mp4")) {
                     callback(
-                        newExtractorLink(
-                            source = name,
-                            name = name,
-                            url = videoUrl,
-                            type = INFER_TYPE,
-                            referer = "",
-                            quality = getQualityFromName(source.label) ?: Qualities.Unknown.value
-                        )
+                        newExtractorLink(name, name, videoUrl, INFER_TYPE) {
+                            this.referer = ""
+                            this.quality = getQualityFromName(source.label) ?: Qualities.Unknown.value
+                        }
                     )
                 } else {
                     M3u8Helper.generateM3u8(name, videoUrl, "$mainUrl/").forEach(callback)
@@ -249,14 +246,10 @@ class VtbeExtractor : ExtractorApi() {
 
             if (!m3u8.isNullOrEmpty()) {
                 callback(
-                    newExtractorLink(
-                        source = name,
-                        name = name,
-                        url = m3u8,
-                        type = ExtractorLinkType.M3U8,
-                        referer = referer ?: mainUrl,
-                        quality = Qualities.Unknown.value
-                    )
+                    newExtractorLink(name, name, m3u8, ExtractorLinkType.M3U8) {
+                        this.referer = referer ?: mainUrl
+                        this.quality = Qualities.Unknown.value
+                    }
                 )
                 return
             }
@@ -265,14 +258,10 @@ class VtbeExtractor : ExtractorApi() {
                 .find(unpacked)?.groupValues?.get(1)
             if (!mp4.isNullOrEmpty()) {
                 callback(
-                    newExtractorLink(
-                        source = name,
-                        name = name,
-                        url = mp4,
-                        type = INFER_TYPE,
-                        referer = referer ?: mainUrl,
-                        quality = Qualities.Unknown.value
-                    )
+                    newExtractorLink(name, name, mp4, INFER_TYPE) {
+                        this.referer = referer ?: mainUrl
+                        this.quality = Qualities.Unknown.value
+                    }
                 )
             }
         }.onFailure { e ->
