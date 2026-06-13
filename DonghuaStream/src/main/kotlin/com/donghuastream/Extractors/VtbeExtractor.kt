@@ -1,4 +1,4 @@
-package com.donghuastream.extractors
+package com.donghuastream.Extractors
 
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
