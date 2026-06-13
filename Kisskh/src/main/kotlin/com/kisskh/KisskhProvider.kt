@@ -3,16 +3,7 @@ package com.kisskh
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.mvvm.safeApiCall
-import com.lagradost.cloudstream3.utils.AppUtils.parseJson
-import com.lagradost.cloudstream3.utils.AppUtils.toJson
-import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.INFER_TYPE
-import com.lagradost.cloudstream3.utils.M3u8Helper
-import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.loadExtractor
-import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.lagradost.cloudstream3.base64DecodeArray
+import com.lagradost.cloudstream3.utils.*
 import okhttp3.Interceptor
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
@@ -27,14 +18,13 @@ class KisskhProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.AsianDrama, TvType.Anime)
 
-    private val kisskhApiBase = "https://kisskh.nl/api/drama/episode/"
-    private val kisskhSubBase = "https://kisskh.nl/api/subtitle/"
+    // Google Script URLs (same as working provider)
+    private val kisskhApiBase = "https://script.google.com/macros/s/AKfycbzn8B31PuDxzaMa9_CQ0VGEDasFqfzI5bXvjaIZH4DM8DNq9q6xj1ALvZNz_JT3jF0suA/exec?id="
+    private val kisskhSubBase = "https://script.google.com/macros/s/AKfycbyq6hTj0ZhlinYC6xbggtgo166tp6XaDKBCGtnYk8uOfYBUFwwxBui0sGXiu_zIFmA/exec?id="
 
-    // ---------- Single companion object ----------
     companion object {
-        var philippineCountryCode = 8  // Updated from 5 to 8
-
-        // Decryption keys (internal so accessible from inside the class)
+        var philippineCountryCode = 8
+        // Decryption keys for subtitles
         internal const val KEY = "AmSmZVcH93UQUezi"
         internal const val KEY2 = "8056483646328763"
         internal const val KEY3 = "sWODXX04QRTkHdlZ"
@@ -43,7 +33,6 @@ class KisskhProvider : MainAPI() {
         internal val IV3 = intArrayOf(946894696, 1634749029, 1127508082, 1396271183)
     }
 
-    // ---------- Main page ----------
     override val mainPage = mainPageOf(
         "&type=0&sub=0&country=0&status=0&order=2" to "Trending",
         "&type=0&sub=0&country=2&status=0&order=2" to "Latest K-Drama",
@@ -131,57 +120,74 @@ class KisskhProvider : MainAPI() {
     ): Boolean {
         val loadData = parseJson<Data>(data)
 
-        // ---- Video links ----
-        val videoKkey = app.get("${kisskhApiBase}${loadData.epsId}&version=2.8.10", timeout = 10000)
-            .parsedSafe<Key>()?.key ?: ""
-        app.get(
-            "$mainUrl/api/DramaList/Episode/${loadData.epsId}.png?err=false&ts=&time=&kkey=$videoKkey",
-            referer = "$mainUrl/Drama/${getTitle("${loadData.title}")}/Episode-${loadData.eps}?id=${loadData.id}&ep=${loadData.epsId}&page=0&pageSize=100"
-        ).parsedSafe<Sources>()?.let { source ->
+        // ---- Video links (using Google Script key) ----
+        val videoKeyUrl = "$kisskhApiBase${loadData.epsId}&version=2.8.10"
+        val kkey = app.get(videoKeyUrl, timeout = 10000).parsedSafe<Key>()?.key ?: ""
+        if (kkey.isBlank()) {
+            Log.e("Kisskh", "Failed to obtain video kkey")
+            return false
+        }
+
+        val videoApiUrl = "$mainUrl/api/DramaList/Episode/${loadData.epsId}.png?err=false&ts=&time=&kkey=$kkey"
+        val videoReferer = "$mainUrl/Drama/${getTitle("${loadData.title}")}/Episode-${loadData.eps}?id=${loadData.id}&ep=${loadData.epsId}&page=0&pageSize=100"
+
+        app.get(videoApiUrl, referer = videoReferer).parsedSafe<Sources>()?.let { source ->
             listOf(source.video, source.thirdParty).amap { link ->
                 safeApiCall {
-                    if (link?.contains(".m3u8") == true) {
-                        M3u8Helper.generateM3u8(
-                            this.name,
-                            fixUrl(link),
-                            referer = "$mainUrl/",
-                            headers = mapOf("Origin" to mainUrl)
-                        ).forEach(callback)
-                    } else if (link?.contains("mp4") == true) {
-                        callback.invoke(
-                            newExtractorLink(
+                    when {
+                        link?.contains(".m3u8") == true -> {
+                            M3u8Helper.generateM3u8(
                                 this.name,
-                                this.name,
-                                url = fixUrl(link),
-                                INFER_TYPE
-                            ) {
-                                this.referer = mainUrl
-                                this.quality = Qualities.P720.value
-                            }
-                        )
-                    } else {
-                        loadExtractor(
-                            link?.substringBefore("=http") ?: return@safeApiCall,
-                            "$mainUrl/",
-                            subtitleCallback,
-                            callback
-                        )
+                                fixUrl(link),
+                                referer = "$mainUrl/",
+                                headers = mapOf("Origin" to mainUrl)
+                            ).forEach(callback)
+                        }
+                        link?.contains("mp4") == true -> {
+                            callback.invoke(
+                                newExtractorLink(
+                                    this.name,
+                                    this.name,
+                                    url = fixUrl(link),
+                                    INFER_TYPE
+                                ) {
+                                    this.referer = mainUrl
+                                    this.quality = Qualities.P720.value
+                                }
+                            )
+                        }
+                        link != null -> {
+                            loadExtractor(
+                                link.substringBefore("=http"),
+                                "$mainUrl/",
+                                subtitleCallback,
+                                callback
+                            )
+                        }
                     }
                 }
             }
-        }
+        } ?: Log.e("Kisskh", "No video sources found")
 
-        // ---- Subtitles ----
-        val subtitleKkey = app.get("${kisskhSubBase}${loadData.epsId}&version=2.8.10", timeout = 10000)
-            .parsedSafe<Key>()?.key ?: ""
-        app.get("$mainUrl/api/Sub/${loadData.epsId}?kkey=$subtitleKkey").text.let { res ->
-            tryParseJson<List<Subtitle>>(res)?.map { sub ->
-                subtitleCallback.invoke(
-                    newSubtitleFile(
-                        getLanguage(sub.label ?: return@map),
-                        sub.src ?: return@map
-                    )
-                )
+        // ---- Subtitles (using Google Script key + decryption) ----
+        val subKeyUrl = "$kisskhSubBase${loadData.epsId}&version=2.8.10"
+        val subtitleKkey = app.get(subKeyUrl, timeout = 10000).parsedSafe<Key>()?.key ?: ""
+        if (subtitleKkey.isNotBlank()) {
+            val subApiUrl = "$mainUrl/api/Sub/${loadData.epsId}?kkey=$subtitleKkey"
+            val subtitleResponse = app.get(subApiUrl).text
+            val subtitleList = tryParseJson<List<Subtitle>>(subtitleResponse) ?: emptyList()
+            subtitleList.forEach { sub ->
+                val lang = getLanguage(sub.label ?: return@forEach)
+                val srcUrl = sub.src ?: return@forEach
+                try {
+                    // Fetch encrypted subtitle content
+                    val encryptedContent = app.get(srcUrl).text
+                    // Decrypt the whole content using the same chunk logic
+                    val decryptedContent = decryptSubtitleContent(encryptedContent)
+                    subtitleCallback.invoke(newSubtitleFile(lang, decryptedContent))
+                } catch (e: Exception) {
+                    Log.e("Kisskh", "Failed to decrypt subtitle: ${e.message}")
+                }
             }
         }
 
@@ -189,50 +195,31 @@ class KisskhProvider : MainAPI() {
     }
 
     // ----------------------------------------------------------------------
-    // Subtitle decryption interceptor
+    // Subtitle decryption (copied from working provider)
     // ----------------------------------------------------------------------
     private val CHUNK_REGEX1 by lazy { Regex("^\\d+$", RegexOption.MULTILINE) }
 
-    override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor {
-        return object : Interceptor {
-            override fun intercept(chain: Interceptor.Chain): Response {
-                val request = chain.request()
-                    .newBuilder()
-                    .build()
-                val response = chain.proceed(request)
-                if (response.request.url.toString().contains(".txt")) {
-                    val responseBody = response.body.toString()
-                    val chunks = responseBody.split(CHUNK_REGEX1)
-                        .filter(String::isNotBlank)
-                        .map(String::trim)
-                    val decrypted = chunks.mapIndexed { index, chunk ->
-                        if (chunk.isBlank()) return@mapIndexed ""
-                        val parts = chunk.split("\n")
-                        if (parts.isEmpty()) return@mapIndexed ""
-
-                        val header = parts.first()
-                        val text = parts.drop(1)
-                        val d = text.joinToString("\n") { line ->
-                            try {
-                                decrypt(line)
-                            } catch (e: Exception) {
-                                "DECRYPT_ERROR:${e.message}"
-                            }
-                        }
-                        listOf(index + 1, header, d).joinToString("\n")
-                    }.filter { it.isNotEmpty() }
-                        .joinToString("\n\n")
-                    val newBody = decrypted.toResponseBody(response.body.contentType())
-                    return response.newBuilder()
-                        .body(newBody)
-                        .build()
+    private fun decryptSubtitleContent(encryptedContent: String): String {
+        val chunks = encryptedContent.split(CHUNK_REGEX1)
+            .filter { it.isNotBlank() }
+            .map { it.trim() }
+        return chunks.mapIndexed { index, chunk ->
+            if (chunk.isBlank()) return@mapIndexed ""
+            val parts = chunk.split("\n")
+            if (parts.isEmpty()) return@mapIndexed ""
+            val header = parts.first()
+            val text = parts.drop(1)
+            val decryptedLines = text.joinToString("\n") { line ->
+                try {
+                    decrypt(line)
+                } catch (e: Exception) {
+                    "DECRYPT_ERROR:${e.message}"
                 }
-                return response
             }
-        }
+            listOf(index + 1, header, decryptedLines).joinToString("\n")
+        }.filter { it.isNotEmpty() }.joinToString("\n\n")
     }
 
-    // ---------- Decryption functions ----------
     private fun decrypt(encryptedB64: String): String {
         val keyIvPairs = listOf(
             Pair(KEY.toByteArray(Charsets.UTF_8), IV.toByteArray()),
@@ -243,9 +230,7 @@ class KisskhProvider : MainAPI() {
         for ((keyBytes, ivBytes) in keyIvPairs) {
             try {
                 return decryptWithKeyIv(keyBytes, ivBytes, encryptedBytes)
-            } catch (ex: Exception) {
-                // continue to next key
-            }
+            } catch (ex: Exception) { }
         }
         return "Decryption failed: All keys/IVs failed"
     }
@@ -267,57 +252,17 @@ class KisskhProvider : MainAPI() {
         }
     }
 
-    // ---------- Data classes ----------
-    data class Data(
-        val title: String?,
-        val eps: Int?,
-        val id: Int?,
-        val epsId: Int?,
-    )
-
-    data class Sources(
-        @param:JsonProperty("Video") val video: String?,
-        @param:JsonProperty("ThirdParty") val thirdParty: String?,
-    )
-
-    data class Subtitle(
-        @param:JsonProperty("src") val src: String?,
-        @param:JsonProperty("label") val label: String?,
-    )
-
-    data class Responses(
-        @param:JsonProperty("data") val data: ArrayList<Media>? = arrayListOf(),
-    )
-
-    data class Media(
-        @param:JsonProperty("episodesCount") val episodesCount: Int?,
-        @param:JsonProperty("thumbnail") val thumbnail: String?,
-        @param:JsonProperty("label") val label: String?,
-        @param:JsonProperty("id") val id: Int?,
-        @param:JsonProperty("title") val title: String?,
-    )
-
-    data class Episodes(
-        @param:JsonProperty("id") val id: Int?,
-        @param:JsonProperty("number") val number: Double?,
-        @param:JsonProperty("sub") val sub: Int?,
-    )
-
+    // ---------- Data classes (unchanged) ----------
+    data class Data(val title: String?, val eps: Int?, val id: Int?, val epsId: Int?)
+    data class Sources(@JsonProperty("Video") val video: String?, @JsonProperty("ThirdParty") val thirdParty: String?)
+    data class Subtitle(@JsonProperty("src") val src: String?, @JsonProperty("label") val label: String?)
+    data class Responses(@JsonProperty("data") val data: ArrayList<Media>? = arrayListOf())
+    data class Media(val episodesCount: Int?, val thumbnail: String?, val label: String?, val id: Int?, val title: String?)
+    data class Episodes(val id: Int?, val number: Double?, val sub: Int?)
     data class MediaDetail(
-        @param:JsonProperty("description") val description: String?,
-        @param:JsonProperty("releaseDate") val releaseDate: String?,
-        @param:JsonProperty("status") val status: String?,
-        @param:JsonProperty("type") val type: String?,
-        @param:JsonProperty("country") val country: String?,
-        @param:JsonProperty("episodes") val episodes: ArrayList<Episodes>? = arrayListOf(),
-        @param:JsonProperty("thumbnail") val thumbnail: String?,
-        @param:JsonProperty("id") val id: Int?,
-        @param:JsonProperty("title") val title: String?,
+        val description: String?, val releaseDate: String?, val status: String?, val type: String?,
+        val country: String?, val episodes: ArrayList<Episodes>? = arrayListOf(), val thumbnail: String?,
+        val id: Int?, val title: String?
     )
-
-    data class Key(
-        val id: String,
-        val version: String,
-        val key: String,
-    )
+    data class Key(val id: String, val version: String, val key: String)
 }
