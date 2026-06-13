@@ -9,14 +9,14 @@ import java.net.URLDecoder
 
 class DonghuaFunProvider : MainAPI() {
     override var mainUrl = "https://donghuafun.com"
-    override var name = "DonghuaFun (4K)"
+    override var name = "Donghuafun (4K)"
     override var lang = "zh"
     override val hasMainPage = true
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime)
 
     companion object {
-        private const val TAG = "DonghuaFun"
+        private const val TAG = "Donghuafun"
         private val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
     }
 
