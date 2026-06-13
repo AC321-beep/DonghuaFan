@@ -27,13 +27,20 @@ class KisskhProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.AsianDrama, TvType.Anime)
 
-    // ---------- API endpoints ----------
-    private val kisskhApiBase = "https://kisskh.nl/api/drama/episode/"   // used to fetch video kkey
-    private val kisskhSubBase = "https://kisskh.nl/api/subtitle/"        // used to fetch subtitle key
+    private val kisskhApiBase = "https://kisskh.nl/api/drama/episode/"
+    private val kisskhSubBase = "https://kisskh.nl/api/subtitle/"
 
-    // Philippine country code – change if 5 doesn't work (try 6,7,0)
+    // ---------- Single companion object ----------
     companion object {
-        var philippineCountryCode = 5
+        var philippineCountryCode = 8  // Updated from 5 to 8
+
+        // Decryption keys (internal so accessible from inside the class)
+        internal const val KEY = "AmSmZVcH93UQUezi"
+        internal const val KEY2 = "8056483646328763"
+        internal const val KEY3 = "sWODXX04QRTkHdlZ"
+        internal val IV = intArrayOf(1382367819, 1465333859, 1902406224, 1164854838)
+        internal val IV2 = intArrayOf(909653298, 909193779, 925905208, 892483379)
+        internal val IV3 = intArrayOf(946894696, 1634749029, 1127508082, 1396271183)
     }
 
     // ---------- Main page ----------
@@ -122,7 +129,6 @@ class KisskhProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // BuildConfig references removed – using the declared API bases
         val loadData = parseJson<Data>(data)
 
         // ---- Video links ----
@@ -183,7 +189,7 @@ class KisskhProvider : MainAPI() {
     }
 
     // ----------------------------------------------------------------------
-    // Subtitle decryption (from the Kisskh extension)
+    // Subtitle decryption interceptor
     // ----------------------------------------------------------------------
     private val CHUNK_REGEX1 by lazy { Regex("^\\d+$", RegexOption.MULTILINE) }
 
@@ -226,7 +232,7 @@ class KisskhProvider : MainAPI() {
         }
     }
 
-    // ---------- Decryption functions (keys from original Kisskh extension) ----------
+    // ---------- Decryption functions ----------
     private fun decrypt(encryptedB64: String): String {
         val keyIvPairs = listOf(
             Pair(KEY.toByteArray(Charsets.UTF_8), IV.toByteArray()),
@@ -259,15 +265,6 @@ class KisskhProvider : MainAPI() {
                 bytes[index * 4 + 3] = value.toByte()
             }
         }
-    }
-
-    companion object Keys {
-        private const val KEY = "AmSmZVcH93UQUezi"
-        private const val KEY2 = "8056483646328763"
-        private const val KEY3 = "sWODXX04QRTkHdlZ"
-        private val IV = intArrayOf(1382367819, 1465333859, 1902406224, 1164854838)
-        private val IV2 = intArrayOf(909653298, 909193779, 925905208, 892483379)
-        private val IV3 = intArrayOf(946894696, 1634749029, 1127508082, 1396271183)
     }
 
     // ---------- Data classes ----------
