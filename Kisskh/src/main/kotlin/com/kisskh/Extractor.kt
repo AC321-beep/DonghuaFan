@@ -4,9 +4,6 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-// ----------------------------------------------------------------------
-// Video token generation (from the Python script)
-// ----------------------------------------------------------------------
 private const val VID_TOKEN = "62f176f3bb1b5b8e70e39932ad34a0c7"
 private const val VIDEO_KEY_HEX = "4F6BDAA39E2F8CB07F5E722D9EDEF314"
 private const val VIDEO_IV_HEX = "01504AF356E619CF2E42BBA68C3F70F9"
@@ -17,7 +14,7 @@ fun generateVideoKkey(episodeId: String): String {
         for (ch in str) {
             val charCode = ch.code
             val shifted = (hash shl 5) and 0xFFFFFFFF
-            hash = (shifted - hash + charCode).toInt()
+            hash = (shifted - hash + charCode).toInt()   // <-- FIX: added .toInt()
         }
         return hash
     }
@@ -36,7 +33,6 @@ fun generateVideoKkey(episodeId: String): String {
     return encrypted.joinToString("") { "%02X".format(it) }
 }
 
-// Helper function to convert a hex string to ByteArray
 private fun hexStringToByteArray(hex: String): ByteArray {
     require(hex.length % 2 == 0) { "Hex string must have even length" }
     return hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
