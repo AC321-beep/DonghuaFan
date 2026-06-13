@@ -12,9 +12,13 @@ import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.base64DecodeArray
 import okhttp3.Interceptor
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 class KisskhProvider : MainAPI() {
     override var mainUrl = "https://kisskh.nl"
@@ -23,8 +27,8 @@ class KisskhProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.AsianDrama, TvType.Anime)
 
-    // ---------- API endpoints (adjust if needed) ----------
-    private val kisskhApiBase = "https://kisskh.nl/api/drama/episode/"   // used to fetch kkey
+    // ---------- API endpoints ----------
+    private val kisskhApiBase = "https://kisskh.nl/api/drama/episode/"   // used to fetch video kkey
     private val kisskhSubBase = "https://kisskh.nl/api/subtitle/"        // used to fetch subtitle key
 
     // Philippine country code – change if 5 doesn't work (try 6,7,0)
@@ -32,7 +36,7 @@ class KisskhProvider : MainAPI() {
         var philippineCountryCode = 5
     }
 
-    // ---------- Main page (modified as requested) ----------
+    // ---------- Main page ----------
     override val mainPage = mainPageOf(
         "&type=0&sub=0&country=0&status=0&order=2" to "Trending",
         "&type=0&sub=0&country=2&status=0&order=2" to "Latest K-Drama",
@@ -41,7 +45,6 @@ class KisskhProvider : MainAPI() {
         "&type=2&sub=0&country=2&status=0&order=2" to "Movie Last Update",
         "&type=1&sub=0&country=2&status=0&order=1" to "TVSeries Popular",
         "&type=1&sub=0&country=2&status=0&order=2" to "TVSeries Last Update",
-        // Anime Popular removed
         "&type=3&sub=0&country=0&status=0&order=2" to "Anime Latest Update",
         "&type=4&sub=0&country=0&status=0&order=1" to "Hollywood Popular",
         "&type=4&sub=0&country=0&status=0&order=2" to "Hollywood Last Update",
@@ -119,12 +122,14 @@ class KisskhProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-         val KisskhAPI = BuildConfig.KissKh
-        val KisskhSub = BuildConfig.KisskhSub
+        // BuildConfig references removed – using the declared API bases
         val loadData = parseJson<Data>(data)
-        val kkey = app.get("$KisskhAPI${loadData.epsId}&version=2.8.10", timeout = 10000).parsedSafe<Key>()?.key ?:""
+
+        // ---- Video links ----
+        val videoKkey = app.get("${kisskhApiBase}${loadData.epsId}&version=2.8.10", timeout = 10000)
+            .parsedSafe<Key>()?.key ?: ""
         app.get(
-            "$mainUrl/api/DramaList/Episode/${loadData.epsId}.png?err=false&ts=&time=&kkey=$kkey",
+            "$mainUrl/api/DramaList/Episode/${loadData.epsId}.png?err=false&ts=&time=&kkey=$videoKkey",
             referer = "$mainUrl/Drama/${getTitle("${loadData.title}")}/Episode-${loadData.eps}?id=${loadData.id}&ep=${loadData.epsId}&page=0&pageSize=100"
         ).parsedSafe<Sources>()?.let { source ->
             listOf(source.video, source.thirdParty).amap { link ->
@@ -148,7 +153,6 @@ class KisskhProvider : MainAPI() {
                                 this.quality = Qualities.P720.value
                             }
                         )
-
                     } else {
                         loadExtractor(
                             link?.substringBefore("=http") ?: return@safeApiCall,
@@ -161,45 +165,28 @@ class KisskhProvider : MainAPI() {
             }
         }
 
-        val kkey1=app.get("$KisskhSub${loadData.epsId}&version=2.8.10", timeout = 10000).parsedSafe<Key>()?.key ?:""
-        app.get("$mainUrl/api/Sub/${loadData.epsId}?kkey=$kkey1").text.let { res ->
+        // ---- Subtitles ----
+        val subtitleKkey = app.get("${kisskhSubBase}${loadData.epsId}&version=2.8.10", timeout = 10000)
+            .parsedSafe<Key>()?.key ?: ""
+        app.get("$mainUrl/api/Sub/${loadData.epsId}?kkey=$subtitleKkey").text.let { res ->
             tryParseJson<List<Subtitle>>(res)?.map { sub ->
-                if (sub.src!!.contains(".txt")) {
-                    subtitleCallback.invoke(
-                        newSubtitleFile(
-                            getLanguage(sub.label ?: return@map),
-                            sub.src
-                        )
-                    )
-                }
-                else
                 subtitleCallback.invoke(
                     newSubtitleFile(
                         getLanguage(sub.label ?: return@map),
-                        sub.src
+                        sub.src ?: return@map
                     )
                 )
             }
         }
 
         return true
-
     }
-    // SubDecryptor Code from Thanks to https://github.com/Kohi-den/extensions-source/blob/515590ecfec6af2b915d23508266536f7f5a3ab8/src/en/kisskh/src/eu/kanade/tachiyomi/animeextension/en/kisskh/SubDecryptor.kt
 
-
-    //OLD Method
-    /*
-    val decrypted = chunks.mapIndexed { index, chunk ->
-    val parts = chunk.split("\n")
-    val text = parts.slice(1 until parts.size)
-    val d = text.map { decrypt(it) }.joinToString("\n")
-    arrayOf(index + 1, parts.first(), d).joinToString("\n")
-    }.joinToString("\n\n")
-     */
-
-
+    // ----------------------------------------------------------------------
+    // Subtitle decryption (from the Kisskh extension)
+    // ----------------------------------------------------------------------
     private val CHUNK_REGEX1 by lazy { Regex("^\\d+$", RegexOption.MULTILINE) }
+
     override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor {
         return object : Interceptor {
             override fun intercept(chain: Interceptor.Chain): Response {
@@ -239,7 +226,51 @@ class KisskhProvider : MainAPI() {
         }
     }
 
+    // ---------- Decryption functions (keys from original Kisskh extension) ----------
+    private fun decrypt(encryptedB64: String): String {
+        val keyIvPairs = listOf(
+            Pair(KEY.toByteArray(Charsets.UTF_8), IV.toByteArray()),
+            Pair(KEY2.toByteArray(Charsets.UTF_8), IV2.toByteArray()),
+            Pair(KEY3.toByteArray(Charsets.UTF_8), IV3.toByteArray())
+        )
+        val encryptedBytes = base64DecodeArray(encryptedB64)
+        for ((keyBytes, ivBytes) in keyIvPairs) {
+            try {
+                return decryptWithKeyIv(keyBytes, ivBytes, encryptedBytes)
+            } catch (ex: Exception) {
+                // continue to next key
+            }
+        }
+        return "Decryption failed: All keys/IVs failed"
+    }
 
+    private fun decryptWithKeyIv(keyBytes: ByteArray, ivBytes: ByteArray, encryptedBytes: ByteArray): String {
+        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(ivBytes))
+        return String(cipher.doFinal(encryptedBytes), Charsets.UTF_8)
+    }
+
+    private fun IntArray.toByteArray(): ByteArray {
+        return ByteArray(size * 4).also { bytes ->
+            forEachIndexed { index, value ->
+                bytes[index * 4] = (value shr 24).toByte()
+                bytes[index * 4 + 1] = (value shr 16).toByte()
+                bytes[index * 4 + 2] = (value shr 8).toByte()
+                bytes[index * 4 + 3] = value.toByte()
+            }
+        }
+    }
+
+    companion object Keys {
+        private const val KEY = "AmSmZVcH93UQUezi"
+        private const val KEY2 = "8056483646328763"
+        private const val KEY3 = "sWODXX04QRTkHdlZ"
+        private val IV = intArrayOf(1382367819, 1465333859, 1902406224, 1164854838)
+        private val IV2 = intArrayOf(909653298, 909193779, 925905208, 892483379)
+        private val IV3 = intArrayOf(946894696, 1634749029, 1127508082, 1396271183)
+    }
+
+    // ---------- Data classes ----------
     data class Data(
         val title: String?,
         val eps: Int?,
