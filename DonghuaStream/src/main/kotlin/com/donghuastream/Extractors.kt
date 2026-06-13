@@ -45,10 +45,10 @@ class PlayStreamplayExtractor : ExtractorApi() {
                     M3u8Helper.generateM3u8(name, directLink, mainUrl).forEach(callback)
                 } else {
                     callback(
-                        ExtractorLink(
-                            name, name, directLink, referer ?: mainUrl, 
-                            Qualities.Unknown.value, INFER_TYPE
-                        )
+                        newExtractorLink(name, name, directLink, INFER_TYPE) {
+                            this.referer = referer ?: mainUrl
+                            this.quality = Qualities.Unknown.value
+                        }
                     )
                 }
             }
@@ -85,10 +85,10 @@ class RumbleExtractor : ExtractorApi() {
                     // Remove escape characters from JSON URLs
                     val vidUrl = matchResult.groupValues[1].replace("\\/", "/")
                     callback(
-                        ExtractorLink(
-                            name, "$name Server ${index + 1}", vidUrl, url, 
-                            Qualities.Unknown.value, INFER_TYPE
-                        )
+                        newExtractorLink(name, "$name Server ${index + 1}", vidUrl, INFER_TYPE) {
+                            this.referer = url
+                            this.quality = Qualities.Unknown.value
+                        }
                     )
                 }
                 return
@@ -98,10 +98,10 @@ class RumbleExtractor : ExtractorApi() {
             val rawMp4 = Regex("""(https?://[^"'\s]+\.mp4[^"'\s]*)""").find(response)?.groupValues?.get(1)
             if (rawMp4 != null) {
                 callback(
-                    ExtractorLink(
-                        name, name, rawMp4, url, 
-                        Qualities.Unknown.value, INFER_TYPE
-                    )
+                    newExtractorLink(name, name, rawMp4, INFER_TYPE) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
+                    }
                 )
             }
         }.onFailure { e ->
