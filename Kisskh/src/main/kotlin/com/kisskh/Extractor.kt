@@ -35,19 +35,3 @@ fun generateVideoKkey(episodeId: String): String {
     val encrypted = cipher.doFinal(final.toByteArray(Charsets.UTF_8))
     return encrypted.joinToString("") { "%02X".format(it) }
 }
-
-// ----------------------------------------------------------------------
-// Subtitle token generation (using subs_token from the Python script)
-// ----------------------------------------------------------------------
-private const val SUBS_TOKEN = "VgV52sWhwvBSf8BsM3BRY9weWiiCbtGp"
-private const val SUBS_KEY_HEX = "8F791C23F5BE50AFC7A342A2E212D9CF"   // Example – you must verify
-private const val SUBS_IV_HEX = "4A9F2B3C8D7E1F6A5B4C3D2E1F0A9B8C"   // Example – you must verify
-
-fun generateSubtitleKkey(episodeId: String): String {
-    // Same algorithm as video, but with different static values.
-    // The Python script did not include the subtitle key/iv, only the token.
-    // You may need to extract them from the original Phisher98 extension or intercept a subtitle request.
-    // For now, we return a placeholder – you must replace with the correct implementation.
-    // TODO: Implement subtitle token generation using the subs_token and correct AES parameters.
-    return ""
-}
