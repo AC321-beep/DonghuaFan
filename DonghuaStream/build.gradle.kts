@@ -1,5 +1,4 @@
 cloudstream {
-    name = "DonghuaStream"
     description = "Donghua"
     authors = listOf("AC321-beep")
     status = 1
