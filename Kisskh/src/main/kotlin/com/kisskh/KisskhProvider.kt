@@ -21,6 +21,9 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
+// Import the SubDecryptor from the same package
+import com.kisskh.SubDecryptor
+
 class KisskhProvider : MainAPI() {
     override var mainUrl = "https://kisskh.nl"
     override var name = "Kisskh"
@@ -170,48 +173,47 @@ class KisskhProvider : MainAPI() {
             }
         } ?: Log.e("Kisskh", "No video sources found")
 
-       // ---- Subtitles (using Google Script key + SubDecryptor) ----
-val subKeyUrl = "$kisskhSubBase${loadData.epsId}&version=2.8.10"
-Log.d("Kisskh", "Subtitle key URL: $subKeyUrl")
-val subtitleKkey = app.get(subKeyUrl, timeout = 10000).parsedSafe<Key>()?.key ?: ""
-Log.d("Kisskh", "Subtitle kkey: '$subtitleKkey'")
+        // ---- Subtitles (using Google Script key + SubDecryptor) ----
+        val subKeyUrl = "$kisskhSubBase${loadData.epsId}&version=2.8.10"
+        Log.d("Kisskh", "Subtitle key URL: $subKeyUrl")
+        val subtitleKkey = app.get(subKeyUrl, timeout = 10000).parsedSafe<Key>()?.key ?: ""
+        Log.d("Kisskh", "Subtitle kkey: '$subtitleKkey'")
 
-if (subtitleKkey.isBlank()) {
-    Log.e("Kisskh", "subtitleKkey is blank - cannot fetch subtitles")
-    return true // Not a fatal error, video may still play
-}
-
-val subApiUrl = "$mainUrl/api/Sub/${loadData.epsId}?kkey=$subtitleKkey"
-Log.d("Kisskh", "Subtitle API URL: $subApiUrl")
-val subtitleResponse = app.get(subApiUrl).text
-Log.d("Kisskh", "Subtitle API response: $subtitleResponse")
-val subtitleList = tryParseJson<List<Subtitle>>(subtitleResponse) ?: emptyList()
-Log.d("Kisskh", "Parsed subtitle list size: ${subtitleList.size}")
-
-for (sub in subtitleList) {
-    val lang = getLanguage(sub.label ?: continue)
-    val srcUrl = sub.src ?: continue
-    Log.d("Kisskh", "Fetching subtitle from: $srcUrl")
-    try {
-        val content = app.get(srcUrl).text
-        Log.d("Kisskh", "Content length: ${content.length}, first 100 chars: ${content.take(100)}")
-        
-        // Check if the content looks like plain text (e.g., starts with "WEBVTT" or "1\n00:00:00")
-        val isPlainText = content.startsWith("WEBVTT") || 
-                          content.contains(Regex("""^\d+\n\d{2}:\d{2}:\d{2}""", RegexOption.MULTILINE))
-        
-        val finalContent = if (isPlainText) {
-            Log.d("Kisskh", "Subtitle appears to be plain text, using as-is")
-            content
-        } else {
-            Log.d("Kisskh", "Subtitle appears encrypted, decrypting...")
-            SubDecryptor.decryptFullContent(content)
+        if (subtitleKkey.isBlank()) {
+            Log.e("Kisskh", "subtitleKkey is blank - cannot fetch subtitles")
+            return true // Not a fatal error, video may still play
         }
-        subtitleCallback.invoke(newSubtitleFile(lang, finalContent))
-    } catch (e: Exception) {
-        Log.e("Kisskh", "Failed to process subtitle: ${e.message}")
-    }
-}
+
+        val subApiUrl = "$mainUrl/api/Sub/${loadData.epsId}?kkey=$subtitleKkey"
+        Log.d("Kisskh", "Subtitle API URL: $subApiUrl")
+        val subtitleResponse = app.get(subApiUrl).text
+        Log.d("Kisskh", "Subtitle API response: $subtitleResponse")
+        val subtitleList = tryParseJson<List<Subtitle>>(subtitleResponse) ?: emptyList()
+        Log.d("Kisskh", "Parsed subtitle list size: ${subtitleList.size}")
+
+        for (sub in subtitleList) {
+            val lang = getLanguage(sub.label ?: continue)
+            val srcUrl = sub.src ?: continue
+            Log.d("Kisskh", "Fetching subtitle from: $srcUrl")
+            try {
+                val content = app.get(srcUrl).text
+                Log.d("Kisskh", "Content length: ${content.length}, first 100 chars: ${content.take(100)}")
+                
+                // Check if the content looks like plain text (e.g., starts with "WEBVTT" or "1\n00:00:00")
+                val isPlainText = content.startsWith("WEBVTT") || 
+                                  content.contains(Regex("""^\d+\n\d{2}:\d{2}:\d{2}""", RegexOption.MULTILINE))
+                
+                val finalContent = if (isPlainText) {
+                    Log.d("Kisskh", "Subtitle appears to be plain text, using as-is")
+                    content
+                } else {
+                    Log.d("Kisskh", "Subtitle appears encrypted, decrypting...")
+                    SubDecryptor.decryptFullContent(content)
+                }
+                subtitleCallback.invoke(newSubtitleFile(lang, finalContent))
+            } catch (e: Exception) {
+                Log.e("Kisskh", "Failed to process subtitle: ${e.message}")
+            }
         }
 
         return true
