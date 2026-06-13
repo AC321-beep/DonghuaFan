@@ -15,10 +15,10 @@ class VtbeExtractor : ExtractorApi() {
         referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    ): Unit {
         val doc = app.get(url, referer = mainUrl).document
-        val script = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return false
-        val unpacked = JsUnpacker(script).unpack() ?: return false
+        val script = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return
+        val unpacked = JsUnpacker(script).unpack() ?: return
 
         val m3u8 = Regex("""sources:\[\{file:"(https?:[^"]+\.m3u8[^"]*)"\?""").find(unpacked)?.groupValues?.get(1)
         if (!m3u8.isNullOrEmpty()) {
@@ -33,8 +33,8 @@ class VtbeExtractor : ExtractorApi() {
                     this.quality = Qualities.Unknown.value
                 }
             )
-            return true
+            return
         }
-        return false
+        return
     }
 }
