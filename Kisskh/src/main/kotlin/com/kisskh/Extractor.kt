@@ -35,3 +35,9 @@ fun generateVideoKkey(episodeId: String): String {
     val encrypted = cipher.doFinal(final.toByteArray(Charsets.UTF_8))
     return encrypted.joinToString("") { "%02X".format(it) }
 }
+
+// Helper function to convert a hex string to ByteArray
+private fun hexStringToByteArray(hex: String): ByteArray {
+    require(hex.length % 2 == 0) { "Hex string must have even length" }
+    return hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+}
