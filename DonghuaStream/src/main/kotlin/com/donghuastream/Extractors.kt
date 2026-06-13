@@ -1,6 +1,7 @@
 package com.donghuastream
 
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.Filesim
@@ -11,8 +12,8 @@ import com.lagradost.cloudstream3.utils.*
 // 1. Built‑in extractor extensions (simple)
 // ------------------------------------------------------------------
 class FileMoonExtractor : Filesim() {
-    override val mainUrl = "https://filemoon.sx"
-    override val name = "FileMoonSx"
+    override var mainUrl = "https://filemoon.sx"
+    override var name = "FileMoonSx"
 }
 
 class StreamSBExtractor : StreamSB() {
@@ -139,7 +140,7 @@ class RumbleExtractor : ExtractorApi() {
         }
     }
 
-    private fun extractFromJwScript(
+    private suspend fun extractFromJwScript(
         script: String,
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit
