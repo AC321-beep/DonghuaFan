@@ -1,4 +1,4 @@
-package com.Donghuastream
+package com.donghuastream
 
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.HomePageList
@@ -28,7 +28,7 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 
-open class Donghuastream : MainAPI() {
+open class DonghuastreamProvider : MainAPI() {
     override var mainUrl = "https://donghuastream.org"
     override var name = "Donghuastream"
     override val hasMainPage = true
