@@ -10,13 +10,13 @@ private const val VIDEO_IV_HEX = "01504AF356E619CF2E42BBA68C3F70F9"
 
 fun generateVideoKkey(episodeId: String): String {
     fun hashFunc(str: String): Int {
-        var hash = 0
+        var hash = 0u
         for (ch in str) {
-            val charCode = ch.code
-            val shifted = (hash shl 5) and 0xFFFFFFFFL   // use Long literal
-            hash = ((shifted - hash + charCode) and 0xFFFFFFFFL).toInt() // safe conversion
+            val charCode = ch.code.toUInt()
+            // Perform the same operation as the Python script, but with UInt (wraps on overflow)
+            hash = (hash shl 5) - hash + charCode
         }
-        return hash
+        return hash.toInt()
     }
 
     val payload = mutableListOf("", episodeId, "", "mg3c3b04ba", "2.8.10", VID_TOKEN, "4830201", "kisskh", "kisskh", "kisskh", "kisskh", "kisskh", "kisskh", "00", "")
