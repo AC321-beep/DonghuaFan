@@ -4,29 +4,10 @@ import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.extractors.Filesim
-import com.lagradost.cloudstream3.extractors.StreamSB
 import com.lagradost.cloudstream3.utils.*
 
 // ------------------------------------------------------------------
-// 1. Built‑in extractor extensions (simple)
-// ------------------------------------------------------------------
-class FileMoonExtractor : Filesim() {
-    override var mainUrl = "https://filemoon.sx"
-    override var name = "FileMoonSx"
-}
-
-class StreamSBExtractor : StreamSB() {
-    override var mainUrl = "https://waaw.to"
-}
-
-class StreamWishExtractor : com.lagradost.cloudstream3.extractors.StreamWishExtractor() {
-    override var mainUrl = "https://wishfast.top"
-    override var name = "StreamWish"
-}
-
-// ------------------------------------------------------------------
-// 2. PlayStreamplayExtractor (All sub player)
+// 1. PlayStreamplayExtractor (All sub player)
 // ------------------------------------------------------------------
 class PlayStreamplayExtractor : ExtractorApi() {
     override var name = "All sub player"
@@ -38,7 +19,7 @@ class PlayStreamplayExtractor : ExtractorApi() {
         referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ): Unit {
+    ) {
         runCatching {
             val doc = app.get(url, timeout = 10000).document
             val packedScript = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data()
@@ -96,7 +77,7 @@ class PlayStreamplayExtractor : ExtractorApi() {
 }
 
 // ------------------------------------------------------------------
-// 3. RumbleExtractor – improved with fallbacks
+// 2. RumbleExtractor
 // ------------------------------------------------------------------
 class RumbleExtractor : ExtractorApi() {
     override var name = "Rumble"
@@ -108,7 +89,7 @@ class RumbleExtractor : ExtractorApi() {
         referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ): Unit {
+    ) {
         runCatching {
             val doc = app.get(url, referer = referer ?: mainUrl).document
 
@@ -165,107 +146,6 @@ class RumbleExtractor : ExtractorApi() {
         val trackRegex = """"file"\s*:\s*"(https?:[^"]+\.vtt[^"]*)"\s*,\s*"label"\s*:\s*"([^"]+)"""".toRegex()
         trackRegex.findAll(script).forEach { match ->
             subtitleCallback(SubtitleFile(match.groupValues[2], match.groupValues[1].replace("\\/", "/")))
-        }
-    }
-}
-
-// ------------------------------------------------------------------
-// 4. UltrahdExtractor
-// ------------------------------------------------------------------
-class UltrahdExtractor : ExtractorApi() {
-    override var name = "Ultrahd Streamplay"
-    override var mainUrl = "https://ultrahd.streamplay.co.in"
-    override val requiresReferer = false
-
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Unit {
-        runCatching {
-            val doc = app.get(url, referer = mainUrl).document
-            val jsonUrl = Regex("""\$\s*\.\s*ajax\s*\(\s*\{\s*url:\s*"([^"]+)""")
-                .find(doc.toString())?.groupValues?.get(1) ?: return
-
-            val data = app.get(jsonUrl).parsedSafe<UltrahdResponse>() ?: return
-
-            data.sources?.forEach { source ->
-                val videoUrl = httpsify(source.file)
-                if (videoUrl.contains(".mp4")) {
-                    callback(
-                        newExtractorLink(name, name, videoUrl, INFER_TYPE) {
-                            this.referer = ""
-                            this.quality = getQualityFromName(source.label) ?: Qualities.Unknown.value
-                        }
-                    )
-                } else {
-                    M3u8Helper.generateM3u8(name, videoUrl, "$mainUrl/").forEach(callback)
-                }
-            }
-
-            data.tracks?.forEach { track ->
-                subtitleCallback(SubtitleFile(track.label, track.file))
-            }
-        }.onFailure { e ->
-            Log.w("Ultrahd", "Extraction failed: ${e.message}")
-        }
-    }
-
-    data class UltrahdResponse(
-        val sources: List<UltrahdSource>?,
-        val tracks: List<UltrahdTrack>?
-    )
-    data class UltrahdSource(val file: String, val label: String? = null)
-    data class UltrahdTrack(val file: String, val label: String, val default: Boolean? = null)
-}
-
-// ------------------------------------------------------------------
-// 5. VtbeExtractor – improved regex and fallback
-// ------------------------------------------------------------------
-class VtbeExtractor : ExtractorApi() {
-    override var name = "Vtbe"
-    override var mainUrl = "https://vtbe.to"
-    override val requiresReferer = true
-
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Unit {
-        runCatching {
-            val doc = app.get(url, referer = mainUrl).document
-            val script = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return
-            val unpacked = JsUnpacker(script).unpack() ?: return
-
-            val m3u8 = Regex("""sources:\s*\[\s*\{\s*file:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""")
-                .find(unpacked)?.groupValues?.get(1)
-                ?: Regex("""file:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""")
-                    .find(unpacked)?.groupValues?.get(1)
-
-            if (!m3u8.isNullOrEmpty()) {
-                callback(
-                    newExtractorLink(name, name, m3u8, ExtractorLinkType.M3U8) {
-                        this.referer = referer ?: mainUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-                return
-            }
-
-            val mp4 = Regex("""file:\s*["'](https?://[^"']+\.mp4[^"']*)["']""")
-                .find(unpacked)?.groupValues?.get(1)
-            if (!mp4.isNullOrEmpty()) {
-                callback(
-                    newExtractorLink(name, name, mp4, INFER_TYPE) {
-                        this.referer = referer ?: mainUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-            }
-        }.onFailure { e ->
-            Log.w("Vtbe", "Extraction failed: ${e.message}")
         }
     }
 }
