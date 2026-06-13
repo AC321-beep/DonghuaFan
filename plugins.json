@@ -1,0 +1,352 @@
+[
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/Adfree.cs3",
+        "status": 1,
+        "version": 11,
+        "name": "Adfree",
+        "internalName": "Adfree",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Blocks pop-up.",
+        "fileSize": 11819,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "en",
+        "iconUrl": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/refs/heads/master/Adfree/Icon.png",
+        "apiVersion": 1,
+        "fileHash": "sha256-5ede6d87f06da848177fd58b7bea2d690ce4723d9b27c6a75ad2cf32c85457f3"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/Anichi.cs3",
+        "status": 3,
+        "version": 2,
+        "name": "Anichi",
+        "internalName": "Anichi",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Watch Anime streams from Anichi",
+        "fileSize": 57905,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "en",
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie"
+        ],
+        "iconUrl": "https://www.google.com/s2/favicons?domain=allanimenews.com&sz=256",
+        "apiVersion": 1,
+        "fileHash": "sha256-2e426de2451e088e64d2a0fc0503ca0ebdbe6dcdea3dc6bdb2dabcf3721310dc"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/Anim4i.cs3",
+        "status": 1,
+        "version": 1,
+        "name": "Anim4i",
+        "internalName": "Anim4i",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Watch Donghua & Anime streams from Anime4i",
+        "fileSize": 29621,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "en",
+        "tvTypes": [
+            "Anime",
+            "AsianDrama",
+            "Movie"
+        ],
+        "iconUrl": "https://www.google.com/s2/favicons?domain=anime4i.com&sz=256",
+        "apiVersion": 1,
+        "fileHash": "sha256-0a0df46449650a8577f070fb2461b9b72722c90d83707c12d5832f8e5c663d70"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/Animekhor.cs3",
+        "status": 1,
+        "version": 9,
+        "name": "Animekhor",
+        "internalName": "Animekhor",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Watch Donghua & Anime streams from Animekhor",
+        "fileSize": 44902,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "zh",
+        "tvTypes": [
+            "Anime",
+            "Movie"
+        ],
+        "iconUrl": "https://www.google.com/s2/favicons?domain=animekhor.org&sz=256",
+        "apiVersion": 1,
+        "fileHash": "sha256-1457f08d53a692edeb55fda0686c3b0d952f51311c1deb6d342f003d9b08125e"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/Animexin.cs3",
+        "status": 1,
+        "version": 7,
+        "name": "Animexin",
+        "internalName": "Animexin",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Watch Donghua & Anime streams from Animexin",
+        "fileSize": 38482,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "zh",
+        "tvTypes": [
+            "Anime",
+            "Movie"
+        ],
+        "iconUrl": "https://icon.horse/icon/animexin.dev",
+        "apiVersion": 1,
+        "fileHash": "sha256-bc3f86b193d63171c849e4bf0385c693ce53af38b92aee5f1797f390d6192227"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/ChikiAnimation.cs3",
+        "status": 1,
+        "version": 7,
+        "name": "ChikiAnimation",
+        "internalName": "ChikiAnimation",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Watch Donghua, Comic & AI Anime streams from ChikiAnimation (2D + 3D)",
+        "fileSize": 67351,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "zh",
+        "tvTypes": [
+            "Anime",
+            "Movie"
+        ],
+        "iconUrl": "https://www.google.com/s2/favicons?domain=chikianimation.com&sz=256",
+        "apiVersion": 1,
+        "fileHash": "sha256-01fc26ba0ab3c77030e874bde9a75bad6b3a4a35182cb4b2d23bae0e18253531"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/Comix.cs3",
+        "status": 1,
+        "version": 5,
+        "name": "Comix",
+        "internalName": "Comix",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Read Comics, Manga, Manhwa & Manhua from Comix.Custom reader with Auto-Resume, a quick chapter jump menu, and smart tap zones (tap screen edges to scroll, or tap the bottom centre/righ edge when at the end of a chapter to load the next).",
+        "fileSize": 56872,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "en",
+        "tvTypes": [
+            "Anime",
+            "Others"
+        ],
+        "iconUrl": "https://www.google.com/s2/favicons?domain=comix.to&sz=256",
+        "apiVersion": 1,
+        "fileHash": "sha256-b7fb09f6c9780ee6ea23f5b240e6b6c5a9a219a359622b786da130db42a184d0"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/Donghuafun.cs3",
+        "status": 1,
+        "version": 11,
+        "name": "Donghuafun",
+        "internalName": "Donghuafun",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Donghua (Chinese Animation)",
+        "fileSize": 49628,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "zh",
+        "tvTypes": [
+            "Anime"
+        ],
+        "iconUrl": "https://donghuafun.com/template/shoutu45/assets/images/logo-1.png",
+        "apiVersion": 1,
+        "fileHash": "sha256-62eeb2e9b2758e1575a266f97a0a323d5e5e16f8e84c7ccee34975c2f9e2341a"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/DonghuaStream.cs3",
+        "status": 1,
+        "version": 12,
+        "name": "DonghuaStream",
+        "internalName": "DonghuaStream",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Donghua (Multi-Source)",
+        "fileSize": 53407,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "zh",
+        "tvTypes": [
+            "Anime"
+        ],
+        "iconUrl": "https://donghuastream.org/wp-content/uploads/2023/05/Donghua-Stream--1024x1024.jpeg",
+        "apiVersion": 1,
+        "fileHash": "sha256-f43fb4f4e208437df29114059067a167027e18b856a281edc41aacb7721e9e93"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/DonghuaWorld.cs3",
+        "status": 1,
+        "version": 4,
+        "name": "DonghuaWorld",
+        "internalName": "DonghuaWorld",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Watch Donghua & Anime streams from DonghuaWorld",
+        "fileSize": 26720,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "zh",
+        "tvTypes": [
+            "Anime",
+            "Movie",
+            "Comic"
+        ],
+        "iconUrl": "https://www.google.com/s2/favicons?domain=donghuaworld.com&sz=256",
+        "apiVersion": 1,
+        "fileHash": "sha256-3058808b6208d6c0b26a906b264f8568de6a0d367569783212d41147e34ef24c"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/DongSub.cs3",
+        "status": 1,
+        "version": 2,
+        "name": "DongSub",
+        "internalName": "DongSub",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Watch Donghua & Anime streams from Dongsub",
+        "fileSize": 31351,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "zh",
+        "tvTypes": [
+            "Anime",
+            "Donghua",
+            "Movie"
+        ],
+        "iconUrl": "https://www.google.com/s2/favicons?domain=dongsub.net&sz=256",
+        "apiVersion": 1,
+        "fileHash": "sha256-344ec5c98a2d2e108680bb3e84dcf16a598ddb02689b8d97e644e1a74891bf9c"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/FootballReplays.cs3",
+        "status": 1,
+        "version": 3,
+        "name": "FootballReplays",
+        "internalName": "FootballReplays",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Watch Football Match Replays & Highlights",
+        "fileSize": 35848,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "en",
+        "tvTypes": [
+            "Sports"
+        ],
+        "iconUrl": "https://t2.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=https://www.footreplays.com/&size=128",
+        "apiVersion": 1,
+        "fileHash": "sha256-a12f74416f4220f9964abe1bae4edffd2a569cec75bb55bef22b2e934b70283f"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/Kisskh.cs3",
+        "status": 1,
+        "version": 2,
+        "name": "Kisskh",
+        "internalName": "Kisskh",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Mostly Asian Content ",
+        "fileSize": 32977,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "en",
+        "tvTypes": [
+            "AsianDrama",
+            "Anime"
+        ],
+        "iconUrl": "https://www.google.com/s2/favicons?domain=kisskh.nl&sz=256",
+        "apiVersion": 1,
+        "fileHash": "sha256-c28261cb07fa45e0d391d5ca93e555bc7bf981246533385d1d9c10c2c1ebdcdb"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/LiveSports.cs3",
+        "status": 1,
+        "version": 11,
+        "name": "LiveSports",
+        "internalName": "LiveSports",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Premium Live Sports Events (Livesports + SportsZone)",
+        "fileSize": 82839,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "en",
+        "tvTypes": [
+            "Live"
+        ],
+        "iconUrl": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/refs/heads/master/LiveSports/Icon.png",
+        "apiVersion": 1,
+        "fileHash": "sha256-34d92606870968ab6a41eb9fd9ebca610b8184642583e104760a73ca676cd560"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/LuciferDonghua.cs3",
+        "status": 3,
+        "version": 4,
+        "name": "LuciferDonghua",
+        "internalName": "LuciferDonghua",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Watch Donghua from Multi-Source",
+        "fileSize": 43516,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "zh",
+        "tvTypes": [
+            "Anime"
+        ],
+        "iconUrl": "https://i0.wp.com/luciferdonghua.in/wp-content/uploads/2022/12/cropped-lucifer-donghua-DP-192x192.webp",
+        "apiVersion": 1,
+        "fileHash": "sha256-380f625351a7b95ecbf95cc9aaacd82613b3e5f242037d94c65ab802d363b66b"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/MangaManhwa.cs3",
+        "status": 1,
+        "version": 1,
+        "name": "MangaManhwa",
+        "internalName": "MangaManhwa",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Read Manga, Manhwa & Manhua from 20+ sources",
+        "fileSize": 102114,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "en",
+        "tvTypes": [
+            "Manga",
+            "Manhwa"
+        ],
+        "iconUrl": "https://www.google.com/s2/favicons?domain=asurascans.com&sz=256",
+        "apiVersion": 1,
+        "fileHash": "sha256-ac7ca701395bcad88f0b32b1bf0e8e3b91b22922e4de11fac97efce609dc27f2"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/MyAnimeLive.cs3",
+        "status": 1,
+        "version": 5,
+        "name": "MyAnimeLive",
+        "internalName": "MyAnimeLive",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Chinese Anime (English Sub)",
+        "fileSize": 18507,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "en",
+        "tvTypes": [
+            "Anime"
+        ],
+        "iconUrl": "https://static.everythingmoe.com/icons/myanimelive.png",
+        "apiVersion": 1,
+        "fileHash": "sha256-1de1f1e78277135a20f3e122a69161f81b9cda879d43f207f31f2af62630db29"
+    }
+]
