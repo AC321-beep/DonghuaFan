@@ -1,0 +1,83 @@
+[
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/Donghuafun.cs3",
+        "status": 1,
+        "version": 6,
+        "name": "Donghuafun",
+        "internalName": "Donghuafun",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Donghua (Chinese Animation)",
+        "fileSize": 19235,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "zh",
+        "tvTypes": [
+            "Anime"
+        ],
+        "iconUrl": "https://donghuafun.com/template/shoutu45/assets/images/logo-1.png",
+        "apiVersion": 1,
+        "fileHash": "sha256-ab04111e17b61b2e8157a5293ea6e5b5d78900e782a42811eb98058401c77a0a"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/DonghuaStream.cs3",
+        "status": 1,
+        "version": 10,
+        "name": "DonghuaStream",
+        "internalName": "DonghuaStream",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Donghua (Multi-Source)",
+        "fileSize": 23807,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "zh",
+        "tvTypes": [
+            "Anime"
+        ],
+        "iconUrl": "https://donghuastream.org/wp-content/uploads/2023/05/Donghua-Stream--1024x1024.jpeg",
+        "apiVersion": 1,
+        "fileHash": "sha256-981ef0a109ada2301560015883b08bc15222a970338d75e5ba585a68fb7f2d79"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/Kisskh.cs3",
+        "status": 1,
+        "version": 2,
+        "name": "Kisskh",
+        "internalName": "Kisskh",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Mostly Asian Content ",
+        "fileSize": 30558,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "en",
+        "tvTypes": [
+            "AsianDrama",
+            "Anime"
+        ],
+        "iconUrl": "https://kisskh.nl/favicon.ico",
+        "apiVersion": 1,
+        "fileHash": "sha256-0adcc44550622e11b666a7672453c63c8bfb6437904e8147f4b85a8522bc2201"
+    },
+    {
+        "url": "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/builds/MyAnimeLive.cs3",
+        "status": 1,
+        "version": 4,
+        "name": "MyAnimeLive",
+        "internalName": "MyAnimeLive",
+        "authors": [
+            "AC321-beep"
+        ],
+        "description": "Chinese Anime (English Sub)",
+        "fileSize": 21238,
+        "repositoryUrl": "https://github.com/AC321-beep/DonghuaFan",
+        "language": "en",
+        "tvTypes": [
+            "Anime"
+        ],
+        "iconUrl": "https://myanime.live/favicon.ico",
+        "apiVersion": 1,
+        "fileHash": "sha256-457c2ae9c7e8def3252fa411796ded4567d30e10bab3aa42326cac77722f9017"
+    }
+]
