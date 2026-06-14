@@ -27,74 +27,75 @@ class Rumble : ExtractorApi() {
             return
         }
 
+        val scrapedUrls = mutableSetOf<String>()
+
         // Target the Rumble media layout block initialized via JS: r.setup({ ... })
+        // Switched to findAll to iterate through multiple unlabeled active players on a single DOM landscape
         val scriptRegex = Regex("""r\.setup\(\s*(\{.*?\})\s*\)""", RegexOption.DOT_MATCHES_ALL)
-        val match = scriptRegex.find(html)
+        val matches = scriptRegex.findAll(html)
 
-        if (match == null) {
-            Log.w(name, "r.setup data block not found. Utilizing smart fallback.")
-            fallbackExtract(html, url, callback)
-            return
-        }
+        matches.forEach { match ->
+            val jsonString = match.groupValues[1]
+            try {
+                // Jackson automatically converts escaped paths (like https:\/\/...) to valid URLs
+                val json = mapper.readValue<Map<String, Any>>(jsonString)
 
-        val jsonString = match.groupValues[1]
-        try {
-            // Jackson automatically converts escaped paths (like https:\/\/...) to valid URLs
-            val json = mapper.readValue<Map<String, Any>>(jsonString)
+                // Rumble moves streams depending on layout. Inspect 'ua', 'u', or root level
+                val videoNode = json["ua"] as? Map<String, Any> 
+                    ?: json["u"] as? Map<String, Any> 
+                    ?: json
 
-            // Rumble moves streams depending on layout. Inspect 'ua', 'u', or root level
-            val videoNode = json["ua"] as? Map<String, Any> 
-                ?: json["u"] as? Map<String, Any> 
-                ?: json
-
-            // 1. Look for HLS (.m3u8 adaptive streams)
-            val hlsNode = videoNode["hls"] as? Map<String, Any>
-            val hlsUrl = hlsNode?.get("url") as? String ?: json["hlsUrl"] as? String
-            if (!hlsUrl.isNullOrBlank()) {
-                Log.d(name, "Extracted HLS Playlist: $hlsUrl")
-                M3u8Helper.generateM3u8(name, hlsUrl, url).forEach(callback)
-            }
-
-            // 2. Look for explicit multi-resolution MP4 video nodes
-            val mp4Map = videoNode["mp4"] as? Map<String, Any>
-            mp4Map?.forEach { (qualityKey, qualityData) ->
-                val dataMap = qualityData as? Map<String, Any>
-                val videoUrl = dataMap?.get("url") as? String
-
-                if (!videoUrl.isNullOrBlank()) {
-                    val qualityInt = when (qualityKey) {
-                        "1080" -> Qualities.P1080.value
-                        "720"  -> Qualities.P720.value
-                        "480"  -> Qualities.P480.value
-                        "360"  -> Qualities.P360.value
-                        "240"  -> Qualities.P240.value
-                        else   -> Qualities.Unknown.value
-                    }
-
-                    // FIX: Passed variables inside the builder lambda block context
-                    callback(
-                        newExtractorLink(
-                            name,
-                            "$name ${qualityKey}p",
-                            videoUrl,
-                            INFER_TYPE
-                        ) {
-                            this.referer = url
-                            this.quality = qualityInt
-                        }
-                    )
+                // 1. Look for HLS (.m3u8 adaptive streams) -> Handles Multi Quality Selection Link
+                val hlsNode = videoNode["hls"] as? Map<String, Any>
+                val hlsUrl = hlsNode?.get("url") as? String ?: json["hlsUrl"] as? String
+                if (!hlsUrl.isNullOrBlank() && scrapedUrls.add(hlsUrl)) {
+                    Log.d(name, "Extracted HLS Playlist: $hlsUrl")
+                    M3u8Helper.generateM3u8(name, hlsUrl, url).forEach(callback)
                 }
-            }
 
-        } catch (e: Exception) {
-            Log.e(name, "Error parsing configuration object: ${e.message}")
-            fallbackExtract(html, url, callback)
+                // 2. Look for explicit multi-resolution MP4 video nodes -> Handles fixed resolutions (like 360p)
+                val mp4Map = videoNode["mp4"] as? Map<String, Any>
+                mp4Map?.forEach { (qualityKey, qualityData) ->
+                    val dataMap = qualityData as? Map<String, Any>
+                    val videoUrl = dataMap?.get("url") as? String
+
+                    if (!videoUrl.isNullOrBlank() && scrapedUrls.add(videoUrl)) {
+                        val qualityInt = when (qualityKey) {
+                            "1080" -> Qualities.P1080.value
+                            "720"  -> Qualities.P720.value
+                            "480"  -> Qualities.P480.value
+                            "360"  -> Qualities.P360.value
+                            "240"  -> Qualities.P240.value
+                            else   -> Qualities.Unknown.value
+                        }
+
+                        callback(
+                            newExtractorLink(
+                                name,
+                                "$name ${qualityKey}p",
+                                videoUrl,
+                                INFER_TYPE
+                            ) {
+                                this.referer = url
+                                this.quality = qualityInt
+                            }
+                        )
+                    }
+                }
+
+            } catch (e: Exception) {
+                Log.e(name, "Error parsing configuration object: ${e.message}")
+            }
         }
+
+        // Always process the fallback extraction layout at the end to catch links not handled by the configuration blocks
+        fallbackExtract(html, url, scrapedUrls, callback)
     }
 
     private suspend fun fallbackExtract(
         html: String,
         embedUrl: String,
+        scrapedUrls: MutableSet<String>,
         callback: (ExtractorLink) -> Unit
     ) {
         // Fixes the slash extraction loop bug by accounting for both standard and backslash-escaped targets
@@ -112,21 +113,22 @@ class Rumble : ExtractorApi() {
         }
 
         matches.forEach { fileUrl ->
-            if (fileUrl.contains(".m3u8")) {
-                M3u8Helper.generateM3u8(name, fileUrl, embedUrl).forEach(callback)
-            } else {
-                // FIX: Passed variables inside the builder lambda block context
-                callback(
-                    newExtractorLink(
-                        name,
-                        "$name Fallback Play",
-                        fileUrl,
-                        INFER_TYPE
-                    ) {
-                        this.referer = embedUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
+            if (scrapedUrls.add(fileUrl)) {
+                if (fileUrl.contains(".m3u8")) {
+                    M3u8Helper.generateM3u8(name, fileUrl, embedUrl).forEach(callback)
+                } else {
+                    callback(
+                        newExtractorLink(
+                            name,
+                            "$name Fallback Play",
+                            fileUrl,
+                            INFER_TYPE
+                        ) {
+                            this.referer = embedUrl
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                }
             }
         }
     }
