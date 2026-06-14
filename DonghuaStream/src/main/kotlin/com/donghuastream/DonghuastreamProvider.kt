@@ -10,7 +10,7 @@ import java.net.URLDecoder
 
 open class DonghuastreamProvider : MainAPI() {
     override var mainUrl = "https://donghuastream.org"
-    override var name = "Donghuastream"
+    override var name = "DonghuaStream"
     override val hasMainPage = true
     override var lang = "zh"
     override val hasDownloadSupport = true
