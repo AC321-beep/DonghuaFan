@@ -16,51 +16,54 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Extract the video ID from the embed URL
-        // e.g. https://rumble.com/embed/v78r4i2/?pub=... -> v78r4i2
+        // Extract video ID from embed URL (e.g., https://rumble.com/embed/v78r4i2/?pub=...)
         val videoId = Regex("""embed/([^/?]+)""").find(url)?.groupValues?.get(1)
             ?: run {
                 Log.w(name, "Could not extract video ID from $url")
                 return
             }
 
-        // Try the API endpoint (returns JSON with video URLs)
+        // Try Rumble's JSON API first
         val apiUrl = "https://rumble.com/api/media/video/$videoId/?embed=1"
         Log.d(name, "Fetching API: $apiUrl")
 
         val response = try {
             app.get(apiUrl, referer = "https://rumble.com/")
         } catch (e: Exception) {
-            Log.w(name, "API request failed: ${e.message}")
+            Log.w(name, "API request failed: ${e.message}. Falling back to embed page.")
+            fallbackExtract(url, referer, subtitleCallback, callback)
             return
         }
 
         val json = response.text
-        // Look for mp4Url or hlsUrl in the JSON
         val mp4 = Regex(""""mp4Url"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1)
         val hls = Regex(""""hlsUrl"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1)
 
         if (mp4 != null) {
-            callback(newExtractorLink(name, name, mp4, INFER_TYPE) { this.referer = "" })
+            callback(newExtractorLink(name, name, mp4, INFER_TYPE) { this.referer = mainUrl })
         } else if (hls != null) {
             M3u8Helper.generateM3u8(name, hls, mainUrl).forEach(callback)
         } else {
-            // Fallback: try to extract from the embed page as before
+            // No video URLs found in API – fallback to embed page
             fallbackExtract(url, referer, subtitleCallback, callback)
         }
     }
 
-    /** Old extraction method (kept as fallback) */
+    /** Fallback extraction using regex on the embed page */
     private suspend fun fallbackExtract(
         url: String,
         referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val response = app.get(url, referer = referer ?: mainUrl)
-        val html = response.text
+        val html = try {
+            app.get(url, referer = referer ?: mainUrl).text
+        } catch (e: Exception) {
+            Log.w(name, "Failed to fetch embed page: ${e.message}")
+            return
+        }
 
-        // Regex for any .mp4 or .m3u8 URL in the page
+        // Look for direct .mp4 or .m3u8 URLs
         val regex = Regex("""https?://[^"'\s<>]+\.(mp4|m3u8)[^"'\s<>]*""")
         val matches = regex.findAll(html).toList()
         if (matches.isNotEmpty()) {
@@ -101,7 +104,7 @@ class PlayStreamplay : ExtractorApi() {
             return
         }
 
-        // Unpacked script
+        // Unpacked script (packed with eval)
         val packed = Regex("""eval\(function\(p,a,c,k,e,d\).*?\)\)\)""", RegexOption.DOT_MATCHES_ALL)
             .find(html)?.value ?: return
         val unpacked = JsUnpacker(packed).unpack() ?: return
