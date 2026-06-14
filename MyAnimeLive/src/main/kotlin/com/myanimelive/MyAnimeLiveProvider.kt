@@ -213,7 +213,6 @@ class MyAnimeLiveProvider : MainAPI() {
                 }
             }
         }
-
         // Direct Dailymotion links
         val dmLink = doc.selectFirst("a[href*='dailymotion.com/video/']")?.attr("href")?.let { fixUrlIfRelative(it) }
         if (dmLink != null) return handleGeneric(dmLink)
