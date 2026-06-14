@@ -173,15 +173,14 @@ class MyAnimeLiveProvider : MainAPI() {
         val doc = app.get(data).document
         val html = doc.html()
 
-        // Helper to fix protocol-relative URLs
         fun fixUrlIfRelative(url: String): String {
             return if (url.startsWith("//")) "https:$url" else url
         }
 
-        // Helper to use custom YouTube extractor
+        // ARCHIVED BACKUP ENGINE: Will run if explicitly called by YouTube routes below
         suspend fun handleYoutube(rawUrl: String): Boolean {
             val fullUrl = fixUrlIfRelative(rawUrl)
-            Log.d(TAG, "Handling YouTube URL: $fullUrl")
+            Log.d(TAG, "Invoking Archived Custom YouTube Extractor: $fullUrl")
             val ytExtractor = YoutubeExtractor()
             ytExtractor.getUrl(fullUrl, null, subtitleCallback, callback)
             return true
@@ -203,23 +202,25 @@ class MyAnimeLiveProvider : MainAPI() {
                     return handleGeneric(fixedSrc)
                 }
                 fixedSrc.contains("youtube.com/embed/") || fixedSrc.contains("youtu.be") -> {
-                    return handleYoutube(fixedSrc)
-                }
-                fixedSrc.contains("ok.ru") -> {
+                    // ARCHIVE MODIFICATION: Routes to built-in handler. Change to handleYoutube(fixedSrc) to reactivate archive.
                     return handleGeneric(fixedSrc)
                 }
-                fixedSrc.contains("streamtape") || fixedSrc.contains("mp4upload") -> {
+                fixedSrc.contains("ok.ru") || fixedSrc.contains("streamtape") || fixedSrc.contains("mp4upload") -> {
                     return handleGeneric(fixedSrc)
                 }
             }
         }
+        
         // Direct Dailymotion links
         val dmLink = doc.selectFirst("a[href*='dailymotion.com/video/']")?.attr("href")?.let { fixUrlIfRelative(it) }
         if (dmLink != null) return handleGeneric(dmLink)
 
         // Direct YouTube links
         val ytLink = doc.selectFirst("a[href*='youtube.com/watch?v=']")?.attr("href")?.let { fixUrlIfRelative(it) }
-        if (ytLink != null) return handleYoutube(ytLink)
+        if (ytLink != null) {
+            // ARCHIVE MODIFICATION: Routes to built-in handler. Change to handleYoutube(ytLink) to reactivate archive.
+            return handleGeneric(ytLink)
+        }
 
         // Dailymotion ID via regex
         val dmId = Regex("""dailymotion\.com/video/([a-zA-Z0-9]+)""").find(html)?.groupValues?.get(1)
