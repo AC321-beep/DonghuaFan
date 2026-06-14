@@ -16,6 +16,9 @@ class MyAnimeLivePlugin : Plugin() {
     override fun load(context: Context) {
         val okClient = OkHttpClient()
 
+        // ARCHIVED: Custom NewPipe Downloader Initialization
+        // Remove the block comments /* and */ below to reactivate if built-in extraction breaks.
+        /*
         NewPipe.init(object : Downloader() {
             override fun execute(
                 request: org.schabi.newpipe.extractor.downloader.Request
@@ -46,14 +49,17 @@ class MyAnimeLivePlugin : Plugin() {
                     resp.code,
                     resp.message,
                     responseHeaders,
-                    resp.body?.string(),
+                    resp.body.string(),
                     resp.request.url.toString()
                 )
             }
         })
+        */
 
         registerMainAPI(MyAnimeLiveProvider())
         registerExtractorAPI(Dailymotion())
-        registerExtractorAPI(YoutubeExtractor())
+        
+        // ARCHIVED: Uncomment the line below to reactivate the custom YouTube extractor
+        // registerExtractorAPI(YoutubeExtractor())
     }
 }
