@@ -8,7 +8,7 @@ cloudstream {
     status = 1
     tvTypes = listOf("Anime")
     language = "en"
-    version = 3
+    version = 4
     iconUrl = "https://myanime.live/favicon.ico"
 }
 
