@@ -151,9 +151,9 @@ open class DonghuastreamProvider : MainAPI() {
             // Directly call the appropriate extractor based on the domain
             when {
                 "rumble.com" in iframeUrl -> {
-    val rumble = Rumble()
-    rumble.getUrl(iframeUrl, iframeUrl, subtitleCallback, callback)
-}
+                 val rumble = Rumble()
+                 rumble.getUrl(iframeUrl, iframeUrl, subtitleCallback, callback)
+                }
                 "play.streamplay.co.in" in iframeUrl -> {
                     val play = PlayStreamplay()
                     play.getUrl(iframeUrl, iframeUrl, subtitleCallback, callback)
