@@ -3,12 +3,8 @@ package com.donghuastream
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.*
 
-// ------------------------------------------------------------------
-// Rumble Extractor
-// ------------------------------------------------------------------
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
     override var mainUrl = "https://rumble.com"
@@ -23,7 +19,6 @@ class Rumble : ExtractorApi() {
         Log.d("Rumble", "Loading: $url")
         val html = app.get(url, referer = referer ?: mainUrl).text
 
-        // Find any mp4 or m3u8 URL in the page
         val regex = Regex("""https?://[^"'\s<>]+\.(mp4|m3u8)[^"'\s<>]*""")
         val matches = regex.findAll(html).toList()
 
@@ -45,9 +40,6 @@ class Rumble : ExtractorApi() {
     }
 }
 
-// ------------------------------------------------------------------
-// PlayStreamplay (All sub player) Extractor
-// ------------------------------------------------------------------
 class PlayStreamplay : ExtractorApi() {
     override var name = "All sub player"
     override var mainUrl = "https://play.streamplay.co.in"
@@ -62,7 +54,7 @@ class PlayStreamplay : ExtractorApi() {
         Log.d("PlayStreamplay", "Loading: $url")
         val html = app.get(url).text
 
-        // Look for direct m3u8 URL first
+        // Direct m3u8
         var m3u8 = Regex("""(https?://[^"'\s]+\.m3u8[^"'\s]*)""").find(html)?.value
         if (m3u8 != null) {
             Log.d("PlayStreamplay", "Found direct m3u8: $m3u8")
@@ -70,22 +62,19 @@ class PlayStreamplay : ExtractorApi() {
             return
         }
 
-        // No direct m3u8, try to find packed script and extract API endpoint
-        val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?\)\)\)""", RegexOption.DOT_MATCHES_ALL)
+        // Unpacked script
+        val packed = Regex("""eval\(function\(p,a,c,k,e,d\).*?\)\)\)""", RegexOption.DOT_MATCHES_ALL)
             .find(html)?.value ?: return
+        val unpacked = JsUnpacker(packed).unpack() ?: return
 
-        val unpacked = JsUnpacker(packedScript).unpack() ?: return
-
-        // Look for "file":"..." in unpacked JS (common pattern)
-        val fileRegex = Regex(""""file"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""")
-        m3u8 = fileRegex.find(unpacked)?.groupValues?.get(1)
+        m3u8 = Regex(""""file"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""").find(unpacked)?.groupValues?.get(1)
         if (m3u8 != null) {
-            Log.d("PlayStreamplay", "Found m3u8 in unpacked JS: $m3u8")
+            Log.d("PlayStreamplay", "Found m3u8 in unpacked: $m3u8")
             M3u8Helper.generateM3u8(name, m3u8, mainUrl).forEach(callback)
             return
         }
 
-        // Last resort: look for token and call API
+        // Token API fallback
         val token = Regex("""kaken\s*=\s*"([^"]+)"""").find(unpacked)?.groupValues?.get(1)
         if (token != null) {
             val apiUrl = "$mainUrl/api/?$token"
