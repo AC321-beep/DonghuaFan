@@ -1,9 +1,11 @@
 package com.donghuastream
 
 import android.util.Base64
+import com.fasterxml.jackson.module.kotlin.readValue
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.mapper
 import com.lagradost.cloudstream3.utils.*
 import java.net.URLDecoder
 
@@ -18,63 +20,110 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val videoId = Regex("""embed/([^/?]+)""").find(url)?.groupValues?.get(1)
-            ?: run {
-                Log.w(name, "Could not extract video ID from $url")
-                return
-            }
-
-        val apiUrl = "https://rumble.com/api/media/video/$videoId/?embed=1"
-        Log.d(name, "Fetching API: $apiUrl")
-
-        val response = try {
-            app.get(apiUrl, referer = "https://rumble.com/")
+        val html = try {
+            app.get(url, referer = referer ?: mainUrl).text
         } catch (e: Exception) {
-            Log.w(name, "API request failed: ${e.message}. Falling back to embed page.")
-            fallbackExtract(url, referer, subtitleCallback, callback)
+            Log.e(name, "Failed to fetch Rumble embed page: ${e.message}")
             return
         }
 
-        val json = response.text
-        val mp4 = Regex(""""mp4Url"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1)
-        val hls = Regex(""""hlsUrl"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1)
+        // Target the Rumble media layout block initialized via JS: r.setup({ ... })
+        val scriptRegex = Regex("""r\.setup\(\s*(\{.*?\})\s*\)""", RegexOption.DOT_MATCHES_ALL)
+        val match = scriptRegex.find(html)
 
-        if (mp4 != null) {
-            callback(newExtractorLink(name, name, mp4, INFER_TYPE) { this.referer = mainUrl })
-        } else if (hls != null) {
-            M3u8Helper.generateM3u8(name, hls, mainUrl).forEach(callback)
-        } else {
-            fallbackExtract(url, referer, subtitleCallback, callback)
+        if (match == null) {
+            Log.w(name, "r.setup data block not found. Utilizing smart fallback.")
+            fallbackExtract(html, url, callback)
+            return
+        }
+
+        val jsonString = match.groupValues[1]
+        try {
+            // Jackson automatically converts escaped paths (like https:\/\/...) to valid URLs
+            val json = mapper.readValue<Map<String, Any>>(jsonString)
+
+            // Rumble moves streams depending on layout. Inspect 'ua', 'u', or root level
+            val videoNode = json["ua"] as? Map<String, Any> 
+                ?: json["u"] as? Map<String, Any> 
+                ?: json
+
+            // 1. Look for HLS (.m3u8 adaptive streams)
+            val hlsNode = videoNode["hls"] as? Map<String, Any>
+            val hlsUrl = hlsNode?.get("url") as? String ?: json["hlsUrl"] as? String
+            if (!hlsUrl.isNullOrBlank()) {
+                Log.d(name, "Extracted HLS Playlist: $hlsUrl")
+                M3u8Helper.generateM3u8(name, hlsUrl, url).forEach(callback)
+            }
+
+            // 2. Look for explicit multi-resolution MP4 video nodes
+            val mp4Map = videoNode["mp4"] as? Map<String, Any>
+            mp4Map?.forEach { (qualityKey, qualityData) ->
+                val dataMap = qualityData as? Map<String, Any>
+                val videoUrl = dataMap?.get("url") as? String
+
+                if (!videoUrl.isNullOrBlank()) {
+                    val qualityInt = when (qualityKey) {
+                        "1080" -> Qualities.P1080.value
+                        "720"  -> Qualities.P720.value
+                        "480"  -> Qualities.P480.value
+                        "360"  -> Qualities.P360.value
+                        "240"  -> Qualities.P240.value
+                        else   -> Qualities.Unknown.value
+                    }
+
+                    callback(
+                        ExtractorLink(
+                            source = name,
+                            name = "$name ${qualityKey}p",
+                            url = videoUrl,
+                            referer = url,
+                            quality = qualityInt,
+                            isM3u8 = videoUrl.contains(".m3u8")
+                        )
+                    )
+                }
+            }
+
+        } catch (e: Exception) {
+            Log.e(name, "Error parsing configuration object: ${e.message}")
+            fallbackExtract(html, url, callback)
         }
     }
 
     private suspend fun fallbackExtract(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
+        html: String,
+        embedUrl: String,
         callback: (ExtractorLink) -> Unit
     ) {
-        val html = try {
-            app.get(url, referer = referer ?: mainUrl).text
-        } catch (e: Exception) {
-            Log.w(name, "Failed to fetch embed page: ${e.message}")
+        // Fixes the slash extraction loop bug by accounting for both standard and backslash-escaped targets
+        val escapedUrlRegex = Regex("""https?:\\\/\\\/[^"'\s<>‘’“”]+\.(mp4|m3u8)[^"'\s<>‘’“”]*""")
+        val cleanUrlRegex = Regex("""https?://[^"'\s<>‘’“”]+\.(mp4|m3u8)[^"'\s<>‘’“”]*""")
+
+        val matches = (escapedUrlRegex.findAll(html) + cleanUrlRegex.findAll(html))
+            .map { it.value.replace("\\/", "/") }
+            .distinct()
+            .toList()
+
+        if (matches.isEmpty()) {
+            Log.w(name, "Fallback engine found zero links.")
             return
         }
 
-        val regex = Regex("""https?://[^"'\s<>]+\.(mp4|m3u8)[^"'\s<>]*""")
-        val matches = regex.findAll(html).toList()
-        if (matches.isNotEmpty()) {
-            matches.forEach { match ->
-                val fileUrl = match.value
-                if (fileUrl.contains(".m3u8")) {
-                    M3u8Helper.generateM3u8(name, fileUrl, mainUrl).forEach(callback)
-                } else {
-                    callback(newExtractorLink(name, name, fileUrl, INFER_TYPE) { this.referer = "" })
-                }
+        matches.forEach { fileUrl ->
+            if (fileUrl.contains(".m3u8")) {
+                M3u8Helper.generateM3u8(name, fileUrl, embedUrl).forEach(callback)
+            } else {
+                callback(
+                    ExtractorLink(
+                        source = name,
+                        name = "$name Fallback Play",
+                        url = fileUrl,
+                        referer = embedUrl,
+                        quality = Qualities.Unknown.value
+                    )
+                )
             }
-            return
         }
-        Log.w(name, "Could not extract video URL from $url")
     }
 }
 
