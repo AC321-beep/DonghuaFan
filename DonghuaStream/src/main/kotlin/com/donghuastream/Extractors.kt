@@ -71,8 +71,9 @@ class Rumble : ExtractorApi() {
                         else   -> Qualities.Unknown.value
                     }
 
+                    // FIX: Replaced ExtractorLink(...) with newExtractorLink(...)
                     callback(
-                        ExtractorLink(
+                        newExtractorLink(
                             source = name,
                             name = "$name ${qualityKey}p",
                             url = videoUrl,
@@ -113,13 +114,15 @@ class Rumble : ExtractorApi() {
             if (fileUrl.contains(".m3u8")) {
                 M3u8Helper.generateM3u8(name, fileUrl, embedUrl).forEach(callback)
             } else {
+                // FIX: Replaced ExtractorLink(...) with newExtractorLink(...)
                 callback(
-                    ExtractorLink(
+                    newExtractorLink(
                         source = name,
                         name = "$name Fallback Play",
                         url = fileUrl,
                         referer = embedUrl,
-                        quality = Qualities.Unknown.value
+                        quality = Qualities.Unknown.value,
+                        isM3u8 = fileUrl.contains(".m3u8")
                     )
                 )
             }
