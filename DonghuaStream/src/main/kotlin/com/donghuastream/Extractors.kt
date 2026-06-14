@@ -1,13 +1,10 @@
 package com.donghuastream
 
 import android.util.Base64
-import com.fasterxml.jackson.module.kotlin.readValue
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.mapper
 import com.lagradost.cloudstream3.utils.*
-import java.net.URLDecoder
 
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
@@ -20,6 +17,7 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        Log.d(name, "Starting extraction for: $url")
         val html = try {
             app.get(url, referer = referer ?: mainUrl).text
         } catch (e: Exception) {
@@ -29,64 +27,61 @@ class Rumble : ExtractorApi() {
 
         val scrapedUrls = mutableSetOf<String>()
 
-        // Target the Rumble media layout block initialized via JS: r.setup({ ... })
-        val scriptRegex = Regex("""r\.setup\(\s*(\{.*?\})\s*\)""", RegexOption.DOT_MATCHES_ALL)
-        val matches = scriptRegex.findAll(html)
+        // 1. Unified Regex: Captures both standard (https://) and JSON-escaped (https:\/\/) URLs in one pass
+        val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
+        
+        val matches = urlRegex.findAll(html)
+            .map { it.value.replace("\\/", "/") }
+            .distinct()
+            .toList()
 
-        matches.forEach { match ->
-            val jsonString = match.groupValues[1]
-            try {
-                val json = mapper.readValue<Map<String, Any>>(jsonString)
+        // 2. The Quarantine Filter: Destroys the garbage trackers that caused the ExoPlayer to crash
+        val validVideoUrls = matches.filter { link ->
+            !link.contains("/assets/", ignoreCase = true) &&
+            !link.contains("loop", ignoreCase = true) &&
+            !link.contains("preview", ignoreCase = true) &&
+            !link.contains("tracker", ignoreCase = true) &&
+            !link.contains("thumb", ignoreCase = true)
+        }
 
-                val videoNode = json["ua"] as? Map<String, Any> 
-                    ?: json["u"] as? Map<String, Any> 
-                    ?: json
+        if (validVideoUrls.isEmpty()) {
+            Log.w(name, "No valid video links found in Rumble source.")
+            return
+        }
 
-                // 1. Look for HLS (.m3u8 adaptive streams) -> The working Multi-Quality selector
-                val hlsNode = videoNode["hls"] as? Map<String, Any>
-                val hlsUrl = hlsNode?.get("url") as? String ?: json["hlsUrl"] as? String
-                if (!hlsUrl.isNullOrBlank() && scrapedUrls.add(hlsUrl)) {
-                    Log.d(name, "Extracted HLS Playlist: $hlsUrl")
-                    M3u8Helper.generateM3u8(name, hlsUrl, url).forEach(callback)
-                }
+        // 3. Process the Cleaned Links
+        validVideoUrls.forEach { fileUrl ->
+            if (scrapedUrls.add(fileUrl)) {
+                
+                if (fileUrl.contains(".m3u8")) {
+                    // This generates the flawless HLS stream with the Multi-Quality Selector (Tick mark)
+                    Log.d(name, "Found HLS Stream: $fileUrl")
+                    M3u8Helper.generateM3u8(name, fileUrl, url).forEach(callback)
+                    
+                } else if (fileUrl.contains(".mp4")) {
+                    // This generates the backup MP4 streams
+                    Log.d(name, "Found MP4 Stream: $fileUrl")
+                    
+                    // Attempt to read the quality natively from the Rumble URL (e.g., ...-360p.mp4)
+                    val qualityMatch = Regex("""(?:-|_)(\d{3,4})p?\.mp4""").find(fileUrl)
+                    val qualityStr = qualityMatch?.groupValues?.get(1)
+                    val qualityInt = qualityStr?.toIntOrNull() ?: Qualities.Unknown.value
+                    val displayLabel = if (qualityStr != null) "$name ${qualityStr}p" else name
 
-                // 2. Look for explicit multi-resolution MP4 -> The working 360p/720p static links
-                val mp4Map = videoNode["mp4"] as? Map<String, Any>
-                mp4Map?.forEach { (qualityKey, qualityData) ->
-                    val dataMap = qualityData as? Map<String, Any>
-                    val videoUrl = dataMap?.get("url") as? String
-
-                    if (!videoUrl.isNullOrBlank() && scrapedUrls.add(videoUrl)) {
-                        val qualityInt = when (qualityKey) {
-                            "1080" -> Qualities.P1080.value
-                            "720"  -> Qualities.P720.value
-                            "480"  -> Qualities.P480.value
-                            "360"  -> Qualities.P360.value
-                            "240"  -> Qualities.P240.value
-                            else   -> Qualities.Unknown.value
+                    callback(
+                        newExtractorLink(
+                            name,
+                            displayLabel,
+                            fileUrl,
+                            INFER_TYPE
+                        ) {
+                            this.referer = url
+                            this.quality = qualityInt
                         }
-
-                        callback(
-                            newExtractorLink(
-                                name,
-                                "$name ${qualityKey}p",
-                                videoUrl,
-                                INFER_TYPE
-                            ) {
-                                this.referer = url
-                                this.quality = qualityInt
-                            }
-                        )
-                    }
+                    )
                 }
-
-            } catch (e: Exception) {
-                Log.e(name, "Error parsing configuration object: ${e.message}")
             }
         }
-        
-        // Note: The broken Regex fallback has been intentionally deleted. 
-        // It only extracted unplayable background loops and caused the ExoPlayer to crash.
     }
 }
 
