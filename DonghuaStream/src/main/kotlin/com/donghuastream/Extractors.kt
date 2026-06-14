@@ -16,27 +16,41 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        Log.d("Rumble", "Loading: $url")
-        val html = app.get(url, referer = referer ?: mainUrl).text
+        val response = app.get(url, referer = referer ?: mainUrl)
+        val doc = response.document
+        val html = response.text
 
-        val regex = Regex("""https?://[^"'\s<>]+\.(mp4|m3u8)[^"'\s<>]*""")
-        val matches = regex.findAll(html).toList()
-
-        if (matches.isEmpty()) {
-            Log.d("Rumble", "No video URLs found")
+        // Method 1: Direct <video src="...">
+        var videoUrl = doc.selectFirst("video[src]")?.attr("src")
+        if (videoUrl != null) {
+            callback(newExtractorLink(name, name, videoUrl, INFER_TYPE) { this.referer = "" })
             return
         }
 
-        matches.forEachIndexed { index, match ->
-            val videoUrl = match.value
-            if (videoUrl.contains(".m3u8")) {
-                M3u8Helper.generateM3u8(name, videoUrl, mainUrl).forEach(callback)
-            } else {
-                callback(newExtractorLink(name, "$name ${index+1}", videoUrl, INFER_TYPE) {
-                    this.referer = ""
-                })
-            }
+        // Method 2: <video><source src="..."></video>
+        videoUrl = doc.selectFirst("video source[src]")?.attr("src")
+        if (videoUrl != null) {
+            callback(newExtractorLink(name, name, videoUrl, INFER_TYPE) { this.referer = "" })
+            return
         }
+
+        // Method 3: Regex fallback for any .mp4 or .m3u8 URL
+        val regex = Regex("""https?://[^"'\s<>]+\.(mp4|m3u8)[^"'\s<>]*""")
+        val matches = regex.findAll(html).toList()
+        if (matches.isNotEmpty()) {
+            matches.forEach { match ->
+                val fileUrl = match.value
+                if (fileUrl.contains(".m3u8")) {
+                    M3u8Helper.generateM3u8(name, fileUrl, mainUrl).forEach(callback)
+                } else {
+                    callback(newExtractorLink(name, name, fileUrl, INFER_TYPE) { this.referer = "" })
+                }
+            }
+            return
+        }
+
+        // If all fail, log a warning
+        Log.w("Rumble", "Could not extract video URL from: $url")
     }
 }
 
