@@ -1,18 +1,21 @@
 package com.donghuastream
 
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.*
 
 // ------------------------------------------------------------------
-// Rumble Extractor
+// Rumble Extractor (using Jackson, no extra dependencies)
 // ------------------------------------------------------------------
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
     override var mainUrl = "https://rumble.com"
     override val requiresReferer = true
+
+    private val mapper = ObjectMapper()
 
     override suspend fun getUrl(
         url: String,
@@ -20,47 +23,57 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val response = app.get(url, referer = referer ?: "$mainUrl/")
-        val document = response.document
+        val response = app.get(url, referer = referer ?: mainUrl)
+        val html = response.text
 
-        val playerScript = document.selectFirst("script:containsData(jwplayer)")?.data()
-            ?: return
-
-        val sourceRegex = """"file"\s*:\s*"(https:[^"]+\.(?:mp4|m3u8)[^"]*)"""".toRegex()
-        val sources = sourceRegex.findAll(playerScript)
-
-        for ((index, source) in sources.withIndex()) {
-            val fileUrl = source.groupValues[1].replace("\\/", "/")
-            if (fileUrl.contains(".mp4")) {
-                callback(
-                    newExtractorLink(
-                        name,
-                        "$name Server ${index + 1}",
-                        fileUrl,
-                        INFER_TYPE
-                    ) {
-                        this.referer = ""
-                        this.quality = getQualityFromName("")
+        // Method 1: Look for window.videoPlayerConfig JSON
+        val jsonRegex = Regex("""window\.videoPlayerConfig\s*=\s*({.*?});""", RegexOption.DOT_MATCHES_ALL)
+        jsonRegex.find(html)?.groupValues?.get(1)?.let { jsonStr ->
+            try {
+                val json = mapper.readTree(jsonStr)
+                val sources = json.get("sources")
+                for (i in 0 until sources.size()) {
+                    val source = sources.get(i)
+                    val fileUrl = source.get("file").asText()
+                    if (fileUrl.contains(".m3u8")) {
+                        M3u8Helper.generateM3u8(name, fileUrl, mainUrl).forEach(callback)
+                    } else if (fileUrl.contains(".mp4")) {
+                        callback(newExtractorLink(name, "$name ${i+1}", fileUrl, INFER_TYPE) {
+                            this.referer = ""
+                        })
                     }
-                )
-            } else {
-                M3u8Helper.generateM3u8(name, fileUrl, mainUrl).forEach(callback)
-            }
+                }
+                return
+            } catch (_: Exception) { }
         }
 
-        val trackRegex = """"file"\s*:\s*"(https:[^"]+\.vtt[^"]*)"\s*,\s*"label"\s*:\s*"([^"]+)"""".toRegex()
-        val tracks = trackRegex.findAll(playerScript)
+        // Method 2: Extract from <video> source tags
+        val doc = response.document
+        val videoSrc = doc.selectFirst("video source")?.attr("src")
+        if (!videoSrc.isNullOrEmpty()) {
+            callback(newExtractorLink(name, name, videoSrc, INFER_TYPE) {
+                this.referer = ""
+            })
+            return
+        }
 
-        for (track in tracks) {
-            val fileUrl = track.groupValues[1].replace("\\/", "/")
-            val label = track.groupValues[2]
-            subtitleCallback(newSubtitleFile(label, fileUrl))
+        // Method 3: Regex fallback for direct mp4/m3u8 URLs
+        val directRegex = Regex("""https?://[^"'\s]+\.(?:mp4|m3u8)[^"'\s]*""")
+        directRegex.findAll(html).forEach { match ->
+            val fileUrl = match.value
+            if (fileUrl.contains(".m3u8")) {
+                M3u8Helper.generateM3u8(name, fileUrl, mainUrl).forEach(callback)
+            } else {
+                callback(newExtractorLink(name, name, fileUrl, INFER_TYPE) {
+                    this.referer = ""
+                })
+            }
         }
     }
 }
 
 // ------------------------------------------------------------------
-// PlayStreamplay (All sub player) Extractor
+// PlayStreamplay (All sub player) Extractor – improved API detection
 // ------------------------------------------------------------------
 class PlayStreamplay : ExtractorApi() {
     override var name = "All sub player"
@@ -74,72 +87,53 @@ class PlayStreamplay : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val doc = app.get(url, timeout = 10000).document
-        val packedScript = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return
+        val html = doc.html()
 
-        val evalRegex = Regex("""eval\(.*?\)\)\)""", RegexOption.DOT_MATCHES_ALL)
-        val packedCode = evalRegex.find(packedScript)?.value ?: return
+        // Find the packed eval script
+        val packedRegex = Regex("""eval\(function\(p,a,c,k,e,d\).*?\)\)\)""", RegexOption.DOT_MATCHES_ALL)
+        val packedCode = packedRegex.find(html)?.value ?: return
 
         val unpackedJs = JsUnpacker(packedCode).unpack() ?: return
 
-        val token = Regex("""kaken="(.*?)"""").find(unpackedJs)?.groupValues?.getOrNull(1) ?: return
+        // Try to get the API path from "url":"..."
+        var apiPath = Regex("""url["']?\s*:\s*["']([^"']+api/?\?[^"']+)["']""").find(unpackedJs)?.groupValues?.get(1)
 
-        val apiUrl = "$mainUrl/api/?$token"
-        val response = app.get(apiUrl, timeout = 10000).parsedSafe<PlayStreamplayResponse>() ?: return
-
-        val m3u8Url = response.sources.find { it.file.isNotBlank() }?.file
-        if (!m3u8Url.isNullOrEmpty()) {
-            val headers = mapOf(
-                "pragma" to "no-cache",
-                "priority" to "u=0, i",
-                "sec-ch-ua" to "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
-                "sec-ch-ua-mobile" to "?0",
-                "sec-ch-ua-platform" to "\"Windows\"",
-                "sec-fetch-dest" to "document",
-                "sec-fetch-mode" to "navigate",
-                "sec-fetch-site" to "none",
-                "sec-fetch-user" to "?1",
-                "upgrade-insecure-requests" to "1",
-                "user-agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-            )
-            M3u8Helper.generateM3u8(name, m3u8Url, mainUrl, headers = headers).forEach(callback)
+        // Fallback: look for a token and build the API URL
+        if (apiPath.isNullOrEmpty()) {
+            val token = Regex("""token["']?\s*:\s*["']([^"']+)["']""").find(unpackedJs)?.groupValues?.get(1)
+            if (!token.isNullOrEmpty()) {
+                apiPath = "/api/?$token"
+            }
         }
 
+        if (apiPath.isNullOrEmpty()) return
+
+        val apiUrl = if (apiPath.startsWith("http")) apiPath else "$mainUrl$apiPath"
+        val response = app.get(apiUrl, timeout = 10000).parsedSafe<PlayStreamplayResponse>() ?: return
+
+        // Process video sources
+        response.sources.forEach { source ->
+            val fileUrl = source.file
+            if (fileUrl.contains(".m3u8")) {
+                M3u8Helper.generateM3u8(name, fileUrl, mainUrl).forEach(callback)
+            } else if (fileUrl.contains(".mp4")) {
+                callback(newExtractorLink(name, name, fileUrl, INFER_TYPE) {
+                    this.referer = ""
+                })
+            }
+        }
+
+        // Process subtitles
         response.tracks.forEach { track ->
             subtitleCallback(newSubtitleFile(track.label, track.file))
         }
     }
 
+    // Minimal response data classes – adjust fields if the API returns more
     data class PlayStreamplayResponse(
-        val query: Query,
-        val status: String,
-        val message: String,
-        @param:JsonProperty("embed_url")
-        val embedUrl: String,
-        @param:JsonProperty("download_url")
-        val downloadUrl: String,
-        val title: String,
-        val poster: String,
-        val filmstrip: String,
         val sources: List<Source>,
-        val tracks: List<Track>,
+        val tracks: List<Track>
     )
-
-    data class Query(
-        val source: String,
-        val id: String,
-        val download: String,
-    )
-
-    data class Source(
-        val file: String,
-        val type: String,
-        val label: String,
-        val default: Boolean,
-    )
-
-    data class Track(
-        val file: String,
-        val label: String,
-        val default: Boolean?,
-    )
+    data class Source(val file: String, val type: String, val label: String, val default: Boolean)
+    data class Track(val file: String, val label: String, val default: Boolean?)
 }
