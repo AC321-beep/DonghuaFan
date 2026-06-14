@@ -8,7 +8,7 @@ import com.lagradost.cloudstream3.utils.*
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
     override var mainUrl = "https://rumble.com"
-    override val requiresReferer = true
+    override val requiresReferer = false
 
     override suspend fun getUrl(
         url: String,
@@ -16,25 +16,51 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        // Extract the video ID from the embed URL
+        // e.g. https://rumble.com/embed/v78r4i2/?pub=... -> v78r4i2
+        val videoId = Regex("""embed/([^/?]+)""").find(url)?.groupValues?.get(1)
+            ?: run {
+                Log.w(name, "Could not extract video ID from $url")
+                return
+            }
+
+        // Try the API endpoint (returns JSON with video URLs)
+        val apiUrl = "https://rumble.com/api/media/video/$videoId/?embed=1"
+        Log.d(name, "Fetching API: $apiUrl")
+
+        val response = try {
+            app.get(apiUrl, referer = "https://rumble.com/")
+        } catch (e: Exception) {
+            Log.w(name, "API request failed: ${e.message}")
+            return
+        }
+
+        val json = response.text
+        // Look for mp4Url or hlsUrl in the JSON
+        val mp4 = Regex(""""mp4Url"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1)
+        val hls = Regex(""""hlsUrl"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1)
+
+        if (mp4 != null) {
+            callback(newExtractorLink(name, name, mp4, INFER_TYPE) { this.referer = "" })
+        } else if (hls != null) {
+            M3u8Helper.generateM3u8(name, hls, mainUrl).forEach(callback)
+        } else {
+            // Fallback: try to extract from the embed page as before
+            fallbackExtract(url, referer, subtitleCallback, callback)
+        }
+    }
+
+    /** Old extraction method (kept as fallback) */
+    private suspend fun fallbackExtract(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
         val response = app.get(url, referer = referer ?: mainUrl)
-        val doc = response.document
         val html = response.text
 
-        // Method 1: Direct <video src="...">
-        var videoUrl = doc.selectFirst("video[src]")?.attr("src")
-        if (videoUrl != null) {
-            callback(newExtractorLink(name, name, videoUrl, INFER_TYPE) { this.referer = "" })
-            return
-        }
-
-        // Method 2: <video><source src="..."></video>
-        videoUrl = doc.selectFirst("video source[src]")?.attr("src")
-        if (videoUrl != null) {
-            callback(newExtractorLink(name, name, videoUrl, INFER_TYPE) { this.referer = "" })
-            return
-        }
-
-        // Method 3: Regex fallback for any .mp4 or .m3u8 URL
+        // Regex for any .mp4 or .m3u8 URL in the page
         val regex = Regex("""https?://[^"'\s<>]+\.(mp4|m3u8)[^"'\s<>]*""")
         val matches = regex.findAll(html).toList()
         if (matches.isNotEmpty()) {
@@ -49,8 +75,7 @@ class Rumble : ExtractorApi() {
             return
         }
 
-        // If all fail, log a warning
-        Log.w("Rumble", "Could not extract video URL from: $url")
+        Log.w(name, "Could not extract video URL from $url")
     }
 }
 
