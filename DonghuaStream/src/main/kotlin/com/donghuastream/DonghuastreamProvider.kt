@@ -36,7 +36,6 @@ open class DonghuastreamProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime)
 
-    // Only "Recently Updated" remains
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update&page=" to "Recently Updated"
     )
@@ -44,7 +43,6 @@ open class DonghuastreamProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val document = app.get("$mainUrl/${request.data}$page").document
         val home = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
-
         return newHomePageResponse(
             list = HomePageList(
                 name = request.name,
@@ -74,20 +72,16 @@ open class DonghuastreamProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val searchResponse = mutableListOf<SearchResponse>()
-
         for (i in 1..3) {
             val document = app.get("${mainUrl}/pagg/$i/?s=$query").document
             val results = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
-
             if (!searchResponse.containsAll(results)) {
                 searchResponse.addAll(results)
             } else {
                 break
             }
-
             if (results.isEmpty()) break
         }
-
         return searchResponse
     }
 
@@ -138,7 +132,6 @@ open class DonghuastreamProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val html = app.get(data).document
-
         val options = html.select("option[data-index]")
 
         for (option in options) {
@@ -154,7 +147,17 @@ open class DonghuastreamProvider : MainAPI() {
 
             val iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
             if (iframeUrl.isNullOrEmpty()) continue
+
+            // Directly call the appropriate extractor based on the domain
             when {
+                "rumble.com" in iframeUrl -> {
+                    val rumble = Rumble()
+                    rumble.getUrl(iframeUrl, iframeUrl, subtitleCallback, callback)
+                }
+                "play.streamplay.co.in" in iframeUrl -> {
+                    val play = PlayStreamplay()
+                    play.getUrl(iframeUrl, iframeUrl, subtitleCallback, callback)
+                }
                 "vidmoly" in iframeUrl -> {
                     val cleanedUrl = "http:" + iframeUrl.substringAfter("=\"").substringBefore("\"")
                     loadExtractor(cleanedUrl, referer = iframeUrl, subtitleCallback, callback)
@@ -173,11 +176,11 @@ open class DonghuastreamProvider : MainAPI() {
                     )
                 }
                 else -> {
+                    // Fallback to generic extractor for any other domain
                     loadExtractor(iframeUrl, referer = iframeUrl, subtitleCallback, callback)
                 }
             }
         }
-
         return true
     }
 }
