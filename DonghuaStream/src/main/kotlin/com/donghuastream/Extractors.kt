@@ -27,52 +27,52 @@ class Rumble : ExtractorApi() {
 
         val scrapedUrls = mutableSetOf<String>()
 
-        // 1. Unified Regex: Captures both standard (https://) and JSON-escaped (https:\/\/) URLs in one pass
+        // 1. Unified Regex: Captures both standard (https://) and JSON-escaped (https:\/\/) URLs
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
-        
         val matches = urlRegex.findAll(html)
-            .map { it.value.replace("\\/", "/") }
-            .distinct()
-            .toList()
 
-        // 2. The Quarantine Filter: Destroys the garbage trackers that caused the ExoPlayer to crash
-        val validVideoUrls = matches.filter { link ->
-            !link.contains("/assets/", ignoreCase = true) &&
-            !link.contains("loop", ignoreCase = true) &&
-            !link.contains("preview", ignoreCase = true) &&
-            !link.contains("tracker", ignoreCase = true) &&
-            !link.contains("thumb", ignoreCase = true)
-        }
+        matches.forEach { match ->
+            val rawUrl = match.value
+            val cleanUrl = rawUrl.replace("\\/", "/")
 
-        if (validVideoUrls.isEmpty()) {
-            Log.w(name, "No valid video links found in Rumble source.")
-            return
-        }
+            // 2. The Quarantine Filter: Destroys the garbage links that caused the ExoPlayer to crash
+            if (cleanUrl.contains("/assets/", ignoreCase = true) ||
+                cleanUrl.contains("loop", ignoreCase = true) ||
+                cleanUrl.contains("preview", ignoreCase = true) ||
+                cleanUrl.contains("tracker", ignoreCase = true) ||
+                cleanUrl.contains("thumb", ignoreCase = true)) {
+                return@forEach
+            }
 
-        // 3. Process the Cleaned Links
-        validVideoUrls.forEach { fileUrl ->
-            if (scrapedUrls.add(fileUrl)) {
-                
-                if (fileUrl.contains(".m3u8")) {
-                    // This generates the flawless HLS stream with the Multi-Quality Selector (Tick mark)
-                    Log.d(name, "Found HLS Stream: $fileUrl")
-                    M3u8Helper.generateM3u8(name, fileUrl, url).forEach(callback)
+            if (scrapedUrls.add(cleanUrl)) {
+                if (cleanUrl.contains(".m3u8")) {
+                    // Flawless HLS stream with the Multi-Quality Selector (Tick mark)
+                    M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
                     
-                } else if (fileUrl.contains(".mp4")) {
-                    // This generates the backup MP4 streams
-                    Log.d(name, "Found MP4 Stream: $fileUrl")
-                    
-                    // Attempt to read the quality natively from the Rumble URL (e.g., ...-360p.mp4)
-                    val qualityMatch = Regex("""(?:-|_)(\d{3,4})p?\.mp4""").find(fileUrl)
-                    val qualityStr = qualityMatch?.groupValues?.get(1)
-                    val qualityInt = qualityStr?.toIntOrNull() ?: Qualities.Unknown.value
-                    val displayLabel = if (qualityStr != null) "$name ${qualityStr}p" else name
+                } else if (cleanUrl.contains(".mp4")) {
+                    // 3. Smart Quality Locator: Reads the raw HTML immediately preceding the URL to find the resolution tag
+                    val startIndex = Math.max(0, match.range.first - 150)
+                    val precedingText = html.substring(startIndex, match.range.first)
+
+                    // Scans the preceding text for "h":720 or "720":{
+                    val qMatch = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""").findAll(precedingText).lastOrNull()
+                        ?: Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""").findAll(precedingText).lastOrNull()
+
+                    var displayLabel = name
+                    var qualityInt = Qualities.Unknown.value
+
+                    // If it finds the resolution tag, apply it to the label
+                    if (qMatch != null) {
+                        val qStr = qMatch.groupValues[1]
+                        displayLabel = "$name ${qStr}p"
+                        qualityInt = qStr.toIntOrNull() ?: Qualities.Unknown.value
+                    }
 
                     callback(
                         newExtractorLink(
                             name,
                             displayLabel,
-                            fileUrl,
+                            cleanUrl,
                             INFER_TYPE
                         ) {
                             this.referer = url
