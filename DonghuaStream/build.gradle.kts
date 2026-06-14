@@ -4,6 +4,6 @@ cloudstream {
     status = 1
     tvTypes = listOf("Anime")
     language = "zh"
-    version = 3
-    iconUrl = "https://donghuastream.org/template/shoutu45/assets/images/logo-1.png"
+    version = 4
+    iconUrl = "https://donghuastream.org/wp-content/uploads/2023/05/Donghua-Stream--1024x1024.jpeg"
 }
