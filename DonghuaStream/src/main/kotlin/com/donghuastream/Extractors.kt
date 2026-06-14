@@ -71,16 +71,17 @@ class Rumble : ExtractorApi() {
                         else   -> Qualities.Unknown.value
                     }
 
-                    // FIX: Replaced ExtractorLink(...) with newExtractorLink(...)
+                    // FIX: Passed variables inside the builder lambda block context
                     callback(
                         newExtractorLink(
-                            source = name,
-                            name = "$name ${qualityKey}p",
-                            url = videoUrl,
-                            referer = url,
-                            quality = qualityInt,
-                            isM3u8 = videoUrl.contains(".m3u8")
-                        )
+                            name,
+                            "$name ${qualityKey}p",
+                            videoUrl,
+                            INFER_TYPE
+                        ) {
+                            this.referer = url
+                            this.quality = qualityInt
+                        }
                     )
                 }
             }
@@ -114,16 +115,17 @@ class Rumble : ExtractorApi() {
             if (fileUrl.contains(".m3u8")) {
                 M3u8Helper.generateM3u8(name, fileUrl, embedUrl).forEach(callback)
             } else {
-                // FIX: Replaced ExtractorLink(...) with newExtractorLink(...)
+                // FIX: Passed variables inside the builder lambda block context
                 callback(
                     newExtractorLink(
-                        source = name,
-                        name = "$name Fallback Play",
-                        url = fileUrl,
-                        referer = embedUrl,
-                        quality = Qualities.Unknown.value,
-                        isM3u8 = fileUrl.contains(".m3u8")
-                    )
+                        name,
+                        "$name Fallback Play",
+                        fileUrl,
+                        INFER_TYPE
+                    ) {
+                        this.referer = embedUrl
+                        this.quality = Qualities.Unknown.value
+                    }
                 )
             }
         }
