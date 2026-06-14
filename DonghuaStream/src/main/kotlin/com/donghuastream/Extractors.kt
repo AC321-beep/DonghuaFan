@@ -30,22 +30,19 @@ class Rumble : ExtractorApi() {
         val scrapedUrls = mutableSetOf<String>()
 
         // Target the Rumble media layout block initialized via JS: r.setup({ ... })
-        // Switched to findAll to iterate through multiple unlabeled active players on a single DOM landscape
         val scriptRegex = Regex("""r\.setup\(\s*(\{.*?\})\s*\)""", RegexOption.DOT_MATCHES_ALL)
         val matches = scriptRegex.findAll(html)
 
         matches.forEach { match ->
             val jsonString = match.groupValues[1]
             try {
-                // Jackson automatically converts escaped paths (like https:\/\/...) to valid URLs
                 val json = mapper.readValue<Map<String, Any>>(jsonString)
 
-                // Rumble moves streams depending on layout. Inspect 'ua', 'u', or root level
                 val videoNode = json["ua"] as? Map<String, Any> 
                     ?: json["u"] as? Map<String, Any> 
                     ?: json
 
-                // 1. Look for HLS (.m3u8 adaptive streams) -> Handles Multi Quality Selection Link
+                // 1. Look for HLS (.m3u8 adaptive streams) -> The working Multi-Quality selector
                 val hlsNode = videoNode["hls"] as? Map<String, Any>
                 val hlsUrl = hlsNode?.get("url") as? String ?: json["hlsUrl"] as? String
                 if (!hlsUrl.isNullOrBlank() && scrapedUrls.add(hlsUrl)) {
@@ -53,7 +50,7 @@ class Rumble : ExtractorApi() {
                     M3u8Helper.generateM3u8(name, hlsUrl, url).forEach(callback)
                 }
 
-                // 2. Look for explicit multi-resolution MP4 video nodes -> Handles fixed resolutions (like 360p)
+                // 2. Look for explicit multi-resolution MP4 -> The working 360p/720p static links
                 val mp4Map = videoNode["mp4"] as? Map<String, Any>
                 mp4Map?.forEach { (qualityKey, qualityData) ->
                     val dataMap = qualityData as? Map<String, Any>
@@ -87,50 +84,9 @@ class Rumble : ExtractorApi() {
                 Log.e(name, "Error parsing configuration object: ${e.message}")
             }
         }
-
-        // Always process the fallback extraction layout at the end to catch links not handled by the configuration blocks
-        fallbackExtract(html, url, scrapedUrls, callback)
-    }
-
-    private suspend fun fallbackExtract(
-        html: String,
-        embedUrl: String,
-        scrapedUrls: MutableSet<String>,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        // Fixes the slash extraction loop bug by accounting for both standard and backslash-escaped targets
-        val escapedUrlRegex = Regex("""https?:\\\/\\\/[^"'\s<>‘’“”]+\.(mp4|m3u8)[^"'\s<>‘’“”]*""")
-        val cleanUrlRegex = Regex("""https?://[^"'\s<>‘’“”]+\.(mp4|m3u8)[^"'\s<>‘’“”]*""")
-
-        val matches = (escapedUrlRegex.findAll(html) + cleanUrlRegex.findAll(html))
-            .map { it.value.replace("\\/", "/") }
-            .distinct()
-            .toList()
-
-        if (matches.isEmpty()) {
-            Log.w(name, "Fallback engine found zero links.")
-            return
-        }
-
-        matches.forEach { fileUrl ->
-            if (scrapedUrls.add(fileUrl)) {
-                if (fileUrl.contains(".m3u8")) {
-                    M3u8Helper.generateM3u8(name, fileUrl, embedUrl).forEach(callback)
-                } else {
-                    callback(
-                        newExtractorLink(
-                            name,
-                            "$name Fallback Play",
-                            fileUrl,
-                            INFER_TYPE
-                        ) {
-                            this.referer = embedUrl
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                }
-            }
-        }
+        
+        // Note: The broken Regex fallback has been intentionally deleted. 
+        // It only extracted unplayable background loops and caused the ExoPlayer to crash.
     }
 }
 
