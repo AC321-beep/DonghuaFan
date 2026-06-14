@@ -8,15 +8,15 @@ cloudstream {
     status = 1
     tvTypes = listOf("Anime")
     language = "en"
-    version = 4
+    version = 3
     iconUrl = "https://myanime.live/favicon.ico"
 }
 
 dependencies {
-    // ARCHIVED: Custom NewPipe Extractor Dependency
-    // Uncomment the line below if the built-in Cloudstream extractor breaks 
-    // and you need to bundle a specific standalone NewPipe version again.
-    // implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.3")
-
+    // ACTIVE FOR COMPILATION: 
+    // We keep this active so YoutubeExtractor.kt compiles without errors, 
+    // even though the extractor itself is currently dormant in the provider.
+    implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.3")
+    
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
 }
