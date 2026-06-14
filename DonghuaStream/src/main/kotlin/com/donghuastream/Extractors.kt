@@ -32,14 +32,12 @@ class Rumble : ExtractorApi() {
         val match = scriptRegex.find(html)
 
         if (match == null) {
-            Log.w(name, "r.setup data block not found. Utilizing smart fallback.")
-            fallbackExtract(html, url, callback)
+            Log.w(name, "r.setup data block not found.")
             return
         }
 
         val jsonString = match.groupValues[1]
         try {
-            // Jackson automatically converts escaped paths (like https:\/\/...) to valid URLs
             val json = mapper.readValue<Map<String, Any>>(jsonString)
 
             // Rumble moves streams depending on layout. Inspect 'ua', 'u', or root level
@@ -47,87 +45,55 @@ class Rumble : ExtractorApi() {
                 ?: json["u"] as? Map<String, Any> 
                 ?: json
 
-            // 1. Look for HLS (.m3u8 adaptive streams)
+            // Counter to track if the high-quality adaptive HLS playlist loaded successfully
+            var adaptiveLinksLoaded = 0
+            val trackingCallback: (ExtractorLink) -> Unit = { link ->
+                adaptiveLinksLoaded++
+                callback(link)
+            }
+
+            // 1. Extract HLS (.m3u8 adaptive stream with multiple selection qualities built-in)
             val hlsNode = videoNode["hls"] as? Map<String, Any>
             val hlsUrl = hlsNode?.get("url") as? String ?: json["hlsUrl"] as? String
             if (!hlsUrl.isNullOrBlank()) {
                 Log.d(name, "Extracted HLS Playlist: $hlsUrl")
-                M3u8Helper.generateM3u8(name, hlsUrl, url).forEach(callback)
+                M3u8Helper.generateM3u8(name, hlsUrl, url).forEach(trackingCallback)
             }
 
-            // 2. Look for explicit multi-resolution MP4 video nodes
-            val mp4Map = videoNode["mp4"] as? Map<String, Any>
-            mp4Map?.forEach { (qualityKey, qualityData) ->
-                val dataMap = qualityData as? Map<String, Any>
-                val videoUrl = dataMap?.get("url") as? String
+            // 2. Only extract single MP4 nodes if the adaptive HLS engine found absolutely nothing
+            if (adaptiveLinksLoaded == 0) {
+                val mp4Map = videoNode["mp4"] as? Map<String, Any>
+                mp4Map?.forEach { (qualityKey, qualityData) ->
+                    val dataMap = qualityData as? Map<String, Any>
+                    val videoUrl = dataMap?.get("url") as? String
 
-                if (!videoUrl.isNullOrBlank()) {
-                    val qualityInt = when (qualityKey) {
-                        "1080" -> Qualities.P1080.value
-                        "720"  -> Qualities.P720.value
-                        "480"  -> Qualities.P480.value
-                        "360"  -> Qualities.P360.value
-                        "240"  -> Qualities.P240.value
-                        else   -> Qualities.Unknown.value
-                    }
-
-                    // FIX: Passed variables inside the builder lambda block context
-                    callback(
-                        newExtractorLink(
-                            name,
-                            "$name ${qualityKey}p",
-                            videoUrl,
-                            INFER_TYPE
-                        ) {
-                            this.referer = url
-                            this.quality = qualityInt
+                    if (!videoUrl.isNullOrBlank()) {
+                        val qualityInt = when (qualityKey) {
+                            "1080" -> Qualities.P1080.value
+                            "720"  -> Qualities.P720.value
+                            "480"  -> Qualities.P480.value
+                            "360"  -> Qualities.P360.value
+                            "240"  -> Qualities.P240.value
+                            else   -> Qualities.Unknown.value
                         }
-                    )
+
+                        callback(
+                            newExtractorLink(
+                                source = name,
+                                name = "$name ${qualityKey}p Backup",
+                                url = videoUrl,
+                                type = INFER_TYPE
+                            ) {
+                                this.referer = url
+                                this.quality = qualityInt
+                            }
+                        )
+                    }
                 }
             }
 
         } catch (e: Exception) {
             Log.e(name, "Error parsing configuration object: ${e.message}")
-            fallbackExtract(html, url, callback)
-        }
-    }
-
-    private suspend fun fallbackExtract(
-        html: String,
-        embedUrl: String,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        // Fixes the slash extraction loop bug by accounting for both standard and backslash-escaped targets
-        val escapedUrlRegex = Regex("""https?:\\\/\\\/[^"'\s<>‘’“”]+\.(mp4|m3u8)[^"'\s<>‘’“”]*""")
-        val cleanUrlRegex = Regex("""https?://[^"'\s<>‘’“”]+\.(mp4|m3u8)[^"'\s<>‘’“”]*""")
-
-        val matches = (escapedUrlRegex.findAll(html) + cleanUrlRegex.findAll(html))
-            .map { it.value.replace("\\/", "/") }
-            .distinct()
-            .toList()
-
-        if (matches.isEmpty()) {
-            Log.w(name, "Fallback engine found zero links.")
-            return
-        }
-
-        matches.forEach { fileUrl ->
-            if (fileUrl.contains(".m3u8")) {
-                M3u8Helper.generateM3u8(name, fileUrl, embedUrl).forEach(callback)
-            } else {
-                // FIX: Passed variables inside the builder lambda block context
-                callback(
-                    newExtractorLink(
-                        name,
-                        "$name Fallback Play",
-                        fileUrl,
-                        INFER_TYPE
-                    ) {
-                        this.referer = embedUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-            }
         }
     }
 }
