@@ -172,6 +172,9 @@ class MyAnimeLiveProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data).document
         val html = doc.html()
+        
+        // Tracking variable to prevent early exit
+        var linksLoaded = false
 
         // Helper to fix protocol-relative URLs
         fun fixUrlIfRelative(url: String): String {
@@ -179,59 +182,76 @@ class MyAnimeLiveProvider : MainAPI() {
         }
 
         // Helper to use custom YouTube extractor (ARCHIVED FOR NOW)
-        suspend fun handleYoutube(rawUrl: String): Boolean {
+        suspend fun handleYoutube(rawUrl: String) {
             val fullUrl = fixUrlIfRelative(rawUrl)
             Log.d(TAG, "Handling YouTube URL: $fullUrl")
             val ytExtractor = YoutubeExtractor()
             ytExtractor.getUrl(fullUrl, null, subtitleCallback, callback)
-            return true
+            linksLoaded = true // Mark as success without exiting the method
         }
 
-        suspend fun handleGeneric(rawUrl: String): Boolean {
+        suspend fun handleGeneric(rawUrl: String) {
             val fullUrl = fixUrlIfRelative(rawUrl)
-            return loadExtractor(fullUrl, data, subtitleCallback, callback)
+            val success = loadExtractor(fullUrl, data, subtitleCallback, callback)
+            if (success) {
+                linksLoaded = true // Accumulate success without breaking the loop
+            }
         }
 
-        // Process iframes
+        // 1. Process iframes (No more 'return' keywords here)
         for (iframe in doc.select("iframe")) {
             val src = iframe.attr("src")
+            if (src.isBlank()) continue
+            
             val fixedSrc = fixUrlIfRelative(src)
             when {
                 fixedSrc.contains("dailymotion.com") -> {
                     val videoId = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(fixedSrc)?.groupValues?.get(1)
-                    if (videoId != null) return handleGeneric("https://www.dailymotion.com/video/$videoId")
-                    return handleGeneric(fixedSrc)
+                    if (videoId != null) {
+                        handleGeneric("https://www.dailymotion.com/video/$videoId")
+                    } else {
+                        handleGeneric(fixedSrc)
+                    }
                 }
                 fixedSrc.contains("youtube.com/embed/") || fixedSrc.contains("youtu.be") -> {
-                    // ARCHIVED: Route to built-in generic extractor instead of handleYoutube
-                    return handleGeneric(fixedSrc)
+                    // ARCHIVED: Using built-in generic extractor instead of handleYoutube
+                    handleGeneric(fixedSrc)
                 }
                 fixedSrc.contains("ok.ru") -> {
-                    return handleGeneric(fixedSrc)
+                    handleGeneric(fixedSrc)
                 }
                 fixedSrc.contains("streamtape") || fixedSrc.contains("mp4upload") -> {
-                    return handleGeneric(fixedSrc)
+                    handleGeneric(fixedSrc)
                 }
             }
         }
-        // Direct Dailymotion links
-        val dmLink = doc.selectFirst("a[href*='dailymotion.com/video/']")?.attr("href")?.let { fixUrlIfRelative(it) }
-        if (dmLink != null) return handleGeneric(dmLink)
 
-        // Direct YouTube links
-        val ytLink = doc.selectFirst("a[href*='youtube.com/watch?v=']")?.attr("href")?.let { fixUrlIfRelative(it) }
-        // ARCHIVED: Route to built-in generic extractor instead of handleYoutube
-        if (ytLink != null) return handleGeneric(ytLink)
+        // 2. Direct Dailymotion links
+        doc.selectFirst("a[href*='dailymotion.com/video/']")?.attr("href")?.let { 
+            handleGeneric(fixUrlIfRelative(it)) 
+        }
 
-        // Dailymotion ID via regex
+        // 3. Direct YouTube links
+        doc.selectFirst("a[href*='youtube.com/watch?v=']")?.attr("href")?.let { 
+            handleGeneric(fixUrlIfRelative(it)) 
+        }
+
+        // 4. Dailymotion ID via regex
         val dmId = Regex("""dailymotion\.com/video/([a-zA-Z0-9]+)""").find(html)?.groupValues?.get(1)
-        if (dmId != null) return handleGeneric("https://www.dailymotion.com/video/$dmId")
+        if (dmId != null) {
+            handleGeneric("https://www.dailymotion.com/video/$dmId")
+        }
 
-        // ok.ru direct links
-        val okLink = doc.selectFirst("a[href*='ok.ru/video/']")?.attr("href")?.let { fixUrlIfRelative(it) }
-        if (okLink != null) return handleGeneric(okLink)
+        // 5. ok.ru direct links
+        doc.selectFirst("a[href*='ok.ru/video/']")?.attr("href")?.let { 
+            handleGeneric(fixUrlIfRelative(it)) 
+        }
 
-        Log.d(TAG, "No supported video source found for $data")
-        return false
+        if (!linksLoaded) {
+            Log.d(TAG, "No supported video source found for $data")
+        }
+        
+        // Finally, return whether any sources were successfully loaded
+        return linksLoaded
     }
 }
