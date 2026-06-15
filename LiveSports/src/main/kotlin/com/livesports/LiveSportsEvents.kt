@@ -2,7 +2,6 @@ package com.livesports
 
 import android.os.Handler
 import android.os.Looper
-import android.util.Base64
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -16,9 +15,11 @@ import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newDrmExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.lagradost.cloudstream3.app
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import java.text.SimpleDateFormat
 import java.util.*
+import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -34,29 +35,10 @@ class LiveSportsEvents : MainAPI() {
     override val hasChromecastSupport = true
     override val supportedTypes = setOf(TvType.Live)
 
-    // Data classes
-    data class LiveEventData(
-        val id: Int, val title: String, val slug: String, val cat: String?,
-        val formats: List<LiveEventFormat>?, val eventInfo: LiveEventInfo?
-    )
-    data class LiveEventFormat(val name: String?, val link: String?, val api: String?, val type: String?)
-    data class LiveEventInfo(
-        val teamA: String?, val teamB: String?, val teamAFlag: String?, val teamBFlag: String?,
-        val eventName: String?, val eventType: String?, val eventCat: String?, val eventLogo: String?,
-        val startTime: String?, val endTime: String?
-    )
-    data class ChannelStreamResponse(
-        val streamUrls: List<StreamUrl>?, val related: List<LiveEventData>?,
-        val prevChannel: String?, val nextChannel: String?
-    )
-    data class StreamUrl(
-        val api: String?, val id: Int?, val link: String?, val title: String?,
-        val type: String?, val webLink: String?
-    )
-    data class LiveEventLoadData(
-        val eventId: Int, val title: String, val poster: String, val slug: String,
-        val formats: List<LiveEventFormat>, val eventInfo: LiveEventInfo?
-    )
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .build()
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val events = LiveSportsProviderManager.fetchLiveEvents()
@@ -143,8 +125,8 @@ class LiveSportsEvents : MainAPI() {
                 "7" -> {
                     val drmParts = stream.api?.split(":") ?: return@forEach
                     if (drmParts.size == 2) {
-                        val kid = drmParts[0].replace("-", "").hexToBase64UrlOrNull() ?: drmParts[0]
-                        val key = drmParts[1].replace("-", "").hexToBase64UrlOrNull() ?: drmParts[1]
+                        val kid = drmParts[0].hexToBase64UrlOrNull() ?: drmParts[0]
+                        val key = drmParts[1].hexToBase64UrlOrNull() ?: drmParts[1]
                         
                         val drmHeaders = headers.toMutableMap()
                         drmHeaders["drm_scheme"] = "clearkey"
@@ -173,22 +155,20 @@ class LiveSportsEvents : MainAPI() {
         return true
     }
 
-    private suspend fun createExtractor(url: String, type: ExtractorLinkType?, headers: Map<String, String>, name: String): ExtractorLink {
+    private fun createExtractor(url: String, type: ExtractorLinkType?, headers: Map<String, String>, name: String): ExtractorLink {
         return newExtractorLink(this.name, name, url, type) {
             quality = Qualities.Unknown.value
             if (headers.isNotEmpty()) this.headers = headers
         }
     }
 
-    // Safely runs using Cloudstream's native networking to avoid ANR crashes
-    private suspend fun fetchChannelStreams(slug: String): ChannelStreamResponse? {
+    private fun fetchChannelStreams(slug: String): ChannelStreamResponse? {
         try {
-            val base = LiveSportsProviderManager.getBaseUrl() ?: return null
-            val url = "$base/channels/${slug.lowercase()}.txt"
-            
-            val response = app.get(url, headers = mapOf("User-Agent" to "Mozilla/5.0")).text
-            if (response.isNotBlank()) {
-                val decrypted = CryptoUtils.decryptData(response.trim())
+            val url = "${LiveSportsProviderManager.getBaseUrl()}/channels/${slug.lowercase()}.txt"
+            val request = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
+            val response = client.newCall(request).execute()
+            if (response.isSuccessful) {
+                val decrypted = CryptoUtils.decryptData(response.body?.string()?.trim() ?: "")
                 if (!decrypted.isNullOrBlank()) return parseJson(decrypted)
             }
         } catch (e: Exception) { e.printStackTrace() }
@@ -218,11 +198,6 @@ class LiveSportsEvents : MainAPI() {
 
     private suspend fun resolveEmbedUrlIfNeeded(url: String): String? {
         if (url.contains(".m3u8") || url.contains(".mpd") || url.contains(".mp4") || url.contains(".ts")) return url
-        return loadEmbedInWebView(url)
-    }
-
-    // Safely uses Handlers instead of kotlinx.coroutines to avoid build errors
-    private suspend fun loadEmbedInWebView(embedUrl: String): String? {
         return suspendCoroutine { cont ->
             Handler(Looper.getMainLooper()).post {
                 val ctx = context
@@ -238,7 +213,6 @@ class LiveSportsEvents : MainAPI() {
                         mediaPlaybackRequiresUserGesture = false
                     }
                     var urlCaptured = false
-                    
                     webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
                             val reqUrl = request.url.toString()
@@ -268,11 +242,10 @@ class LiveSportsEvents : MainAPI() {
                             }
                         }
                     }
-                    loadUrl(embedUrl)
+                    loadUrl(url) 
                 }
-                // Failsafe timeout
                 Handler(Looper.getMainLooper()).postDelayed({
-                    if (!webView.url.isNullOrEmpty() && !webView.title.isNullOrEmpty()) { // check if not destroyed
+                    if (!webView.url.isNullOrEmpty() && !webView.title.isNullOrEmpty()) {
                         try {
                             cont.resume(null)
                             webView.destroy()
@@ -285,9 +258,7 @@ class LiveSportsEvents : MainAPI() {
 
     private fun createDisplayTitle(event: LiveEventData): String {
         val info = event.eventInfo
-        return if (info?.teamA != null && info.teamB != null && info.teamA != info.teamB) {
-            "${info.teamA} vs ${info.teamB}"
-        } else event.title
+        return if (info?.teamA != null && info.teamB != null && info.teamA != info.teamB) "${info.teamA} vs ${info.teamB}" else event.title
     }
 
     private fun getEventStatus(event: LiveEventData): String {
@@ -330,15 +301,5 @@ class LiveSportsEvents : MainAPI() {
             append("&isLive=${isEventLive(event)}")
             append("&isEnded=${getEventStatus(event) == "✅"}")
         }
-    }
-
-    // Missing function required for DRM Key Parsing
-    private fun String.hexToBase64UrlOrNull(): String? {
-        val normalizedHex = trim().replace("-", "")
-        if (normalizedHex.isEmpty() || normalizedHex.length % 2 != 0 || !normalizedHex.matches(Regex("^[0-9a-fA-F]+$"))) return null
-        return try {
-            val bytes = normalizedHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-            Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
-        } catch (_: Exception) { null }
     }
 }
