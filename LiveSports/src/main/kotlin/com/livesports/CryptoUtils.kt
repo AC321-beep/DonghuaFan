@@ -6,8 +6,13 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 object CryptoUtils {
-    private val KEY1 = try { BuildConfig.LIVESPORTS_PROVIDER_SECRET1 } catch (e: Exception) { "" }
-    private val KEY2 = try { BuildConfig.LIVESPORTS_PROVIDER_SECRET2 } catch (e: Exception) { "" }
+    // Fallback – will be overridden by BuildConfig if available
+    private val KEY1: String by lazy {
+        try { BuildConfig.LIVESPORTS_PROVIDER_SECRET1 } catch (e: Exception) { "" }
+    }
+    private val KEY2: String by lazy {
+        try { BuildConfig.LIVESPORTS_PROVIDER_SECRET2 } catch (e: Exception) { "" }
+    }
 
     private val keys = listOf(KEY1, KEY2).mapNotNull { parseKeyInfo(it) }
 
