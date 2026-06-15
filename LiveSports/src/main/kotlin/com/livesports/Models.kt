@@ -2,30 +2,32 @@ package com.livesports
 
 import com.fasterxml.jackson.annotation.JsonProperty
 
-data class FirebaseConfig(
-    @JsonProperty("api_url") val apiUrl: String,
-    @JsonProperty("encryption_key") val encryptionKey: String,
-    @JsonProperty("encryption_iv") val encryptionIv: String
-)
-
-data class LiveEventResponse(
-    @JsonProperty("events") val events: List<LiveEvent>
-)
-
-data class LiveEvent(
-    @JsonProperty("id") val id: String,
+data class LiveEventData(
+    @JsonProperty("id") val id: Int? = null,
     @JsonProperty("title") val title: String,
-    @JsonProperty("category") val category: String,
-    @JsonProperty("thumbnail") val thumbnail: String?,
-    @JsonProperty("streams") val streams: List<LiveStreamConfig>
+    @JsonProperty("image") val image: String? = null,
+    @JsonProperty("slug") val slug: String,
+    @JsonProperty("cat") val cat: String? = null,
+    @JsonProperty("eventInfo") val eventInfo: LiveEventInfo? = null,
+    @JsonProperty("publish") val publish: Int? = 1,
+    @JsonProperty("formats") val formats: List<LiveEventFormat>? = null
 )
 
-data class LiveStreamConfig(
-    @JsonProperty("name") val name: String,
-    @JsonProperty("url") val url: String,
-    @JsonProperty("is_drm") val isDrm: Boolean = false,
-    @JsonProperty("clear_key_id") val clearKeyId: String? = null,
-    @JsonProperty("clear_key_value") val clearKeyValue: String? = null,
-    @JsonProperty("use_webview") val useWebView: Boolean = false,
-    @JsonProperty("headers") val headers: Map<String, String>? = null
+data class LiveEventInfo(
+    @JsonProperty("teamA") val teamA: String? = null,
+    @JsonProperty("teamB") val teamB: String? = null,
+    @JsonProperty("teamAFlag") val teamAFlag: String? = null,
+    @JsonProperty("teamBFlag") val teamBFlag: String? = null,
+    @JsonProperty("eventCat") val eventCat: String? = null,
+    @JsonProperty("eventName") val eventName: String? = null,
+    @JsonProperty("eventLogo") val eventLogo: String? = null,
+    @JsonProperty("isHot") val isHot: String? = null,
+    @JsonProperty("eventType") val eventType: String? = null,
+    @JsonProperty("startTime") val startTime: String? = null,
+    @JsonProperty("endTime") val endTime: String? = null
+)
+
+data class LiveEventFormat(
+    @JsonProperty("title") val title: String? = null,
+    @JsonProperty("webLink") val webLink: String? = null
 )
