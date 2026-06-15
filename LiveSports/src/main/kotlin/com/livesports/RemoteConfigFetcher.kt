@@ -12,9 +12,17 @@ import java.util.concurrent.TimeUnit
 
 object RemoteConfigFetcher {
     private const val PACKAGE_NAME = "com.livesports"
-    private val API_KEY: String get() = try { BuildConfig.LIVESPORTS_FIREBASE_API_KEY } catch (e: Exception) { "" }
-    private val APP_ID: String get() = try { BuildConfig.LIVESPORTS_FIREBASE_APP_ID } catch (e: Exception) { "" }
-    private val PROJECT_NUMBER: String get() = try { BuildConfig.LIVESPORTS_FIREBASE_PROJECT_NUMBER } catch (e: Exception) { "" }
+    
+    // Fallback – will be overridden by BuildConfig if available
+    private val API_KEY: String by lazy {
+        try { BuildConfig.LIVESPORTS_FIREBASE_API_KEY } catch (e: Exception) { "" }
+    }
+    private val APP_ID: String by lazy {
+        try { BuildConfig.LIVESPORTS_FIREBASE_APP_ID } catch (e: Exception) { "" }
+    }
+    private val PROJECT_NUMBER: String by lazy {
+        try { BuildConfig.LIVESPORTS_FIREBASE_PROJECT_NUMBER } catch (e: Exception) { "" }
+    }
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
