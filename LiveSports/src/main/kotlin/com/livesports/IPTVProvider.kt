@@ -3,9 +3,9 @@ package com.livesports
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -18,7 +18,6 @@ class IPTVProvider(
         var context: android.content.Context? = null
         const val EXT_M3U = "#EXTM3U"
         const val EXT_INF = "#EXTINF"
-        const val EXT_VLC_OPT = "#EXTVLCOPT"
     }
 
     override var lang = "en"
@@ -152,7 +151,7 @@ class IPTVProvider(
         return true
     }
 
-    private fun handleMpd(loadData: LoadData, headers: Map<String, String>, callback: (ExtractorLink) -> Unit) {
+    private suspend fun handleMpd(loadData: LoadData, headers: Map<String, String>, callback: (ExtractorLink) -> Unit) {
         val hasValidKeys = loadData.key.isNotBlank() && loadData.keyid.isNotBlank()
         val hasLicenseUrl = loadData.licenseUrl.isNotBlank()
 
@@ -162,7 +161,7 @@ class IPTVProvider(
 
             if (loadData.drmKeys.isNotEmpty()) {
                 val mpdXml = getMpdStream(loadData.url, headers)
-                val mpdKid = Regex("""cenc:default_KID=["']([0-9a-fA-F\-]{36})["']")
+                val mpdKid = Regex("""cenc:default_KID=["']([0-9a-fA-F\-]{36})["']""")
                     .find(mpdXml)?.groupValues?.get(1)?.replace("-", "")?.lowercase()
                 if (!mpdKid.isNullOrEmpty()) {
                     val mapped = loadData.drmKeys[mpdKid]
@@ -180,7 +179,7 @@ class IPTVProvider(
             })
         } else if (hasLicenseUrl) {
             val mpdXml = getMpdStream(loadData.url, headers)
-            val kidHex = Regex("""cenc:default_KID=["']([0-9a-fA-F\-]{36})['"]")
+            val kidHex = Regex("""cenc:default_KID=["']([0-9a-fA-F\-]{36})["']""")
                 .find(mpdXml)?.groupValues?.get(1) ?: UUID.randomUUID().toString()
             val kidBase64 = kidHex.replace("-", "").hexToBase64UrlOrNull() ?: kidHex
             val keyBase64 = fetchKeyFromLicenseServer(loadData.licenseUrl, kidBase64)
