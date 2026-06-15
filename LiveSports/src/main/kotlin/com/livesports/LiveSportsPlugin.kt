@@ -14,10 +14,8 @@ class LiveSportsPlugin : Plugin() {
         IPTVProvider.context = context
         LiveSportsEvents.context = context
 
-        // Always register live events provider
         registerMainAPI(LiveSportsEvents())
 
-        // Fetch available IPTV playlists from remote config
         val providers = runBlocking { LiveSportsProviderManager.fetchProviders() }
 
         val enabledProviders = providers.filter { provider ->
