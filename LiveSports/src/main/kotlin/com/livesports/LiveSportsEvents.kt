@@ -2,23 +2,25 @@ package com.livesports
 
 import android.os.Handler
 import android.os.Looper
-import android.webkit.WebChromeClient
+import android.util.Base64
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import okhttp3.Request
+import com.lagradost.cloudstream3.utils.CLEARKEY_UUID
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.INFER_TYPE
+import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.newDrmExtractorLink
+import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.app
 import java.text.SimpleDateFormat
 import java.util.*
-import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
 class LiveSportsEvents : MainAPI() {
     companion object {
@@ -31,11 +33,6 @@ class LiveSportsEvents : MainAPI() {
     override val hasMainPage = true
     override val hasChromecastSupport = true
     override val supportedTypes = setOf(TvType.Live)
-
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .build()
 
     // Data classes
     data class LiveEventData(
@@ -116,7 +113,7 @@ class LiveSportsEvents : MainAPI() {
                 it.startTime?.let { time ->
                     try {
                         val parsed = SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US).parse(time)
-                        append("🕐 ${SimpleDateFormat("MMM dd, yyyy HH:mm", Locale.US).format(parsed)}\n")
+                        parsed?.let { d -> append("🕐 ${SimpleDateFormat("MMM dd, yyyy HH:mm", Locale.US).format(d)}\n") }
                     } catch (e: Exception) { append("🕐 $time\n") }
                 }
             }
@@ -148,9 +145,14 @@ class LiveSportsEvents : MainAPI() {
                     if (drmParts.size == 2) {
                         val kid = drmParts[0].replace("-", "").hexToBase64UrlOrNull() ?: drmParts[0]
                         val key = drmParts[1].replace("-", "").hexToBase64UrlOrNull() ?: drmParts[1]
+                        
+                        val drmHeaders = headers.toMutableMap()
+                        drmHeaders["drm_scheme"] = "clearkey"
+                        drmHeaders["drm_license_key"] = "{\"keys\":[{\"kty\":\"oct\",\"k\":\"${key}\",\"kid\":\"${kid}\"}]}"
+                        
                         callback.invoke(newDrmExtractorLink(name, serverName, resolved, INFER_TYPE, CLEARKEY_UUID) {
                             quality = Qualities.Unknown.value
-                            if (headers.isNotEmpty()) this.headers = headers
+                            if (drmHeaders.isNotEmpty()) this.headers = drmHeaders
                             this.kid = kid
                             this.key = key
                         })
@@ -160,7 +162,11 @@ class LiveSportsEvents : MainAPI() {
                 }
                 else -> {
                     val type = if (resolved.contains(".mpd")) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
-                    callback.invoke(createExtractor(resolved, type, headers, serverName))
+                    val finalHeaders = headers.toMutableMap()
+                    if (type == ExtractorLinkType.M3U8 && !finalHeaders.containsKey("User-Agent")) {
+                        finalHeaders["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    }
+                    callback.invoke(createExtractor(resolved, type, finalHeaders, serverName))
                 }
             }
         }
@@ -174,23 +180,19 @@ class LiveSportsEvents : MainAPI() {
         }
     }
 
+    // Safely runs using Cloudstream's native networking to avoid ANR crashes
     private suspend fun fetchChannelStreams(slug: String): ChannelStreamResponse? {
-        return withContext(Dispatchers.IO) {
-            try {
-                val base = LiveSportsProviderManager.getBaseUrl() ?: return@withContext null
-                val url = "$base/channels/${slug.lowercase()}.txt"
-                val request = Request.Builder().url(url)
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                    .build()
-                val resp = client.newCall(request).execute()
-                if (resp.isSuccessful) {
-                    val encrypted = resp.body.string()
-                    val decrypted = CryptoUtils.decryptData(encrypted.trim())
-                    if (!decrypted.isNullOrBlank()) return@withContext parseJson(decrypted)
-                }
-            } catch (e: Exception) { e.printStackTrace() }
-            null
-        }
+        try {
+            val base = LiveSportsProviderManager.getBaseUrl() ?: return null
+            val url = "$base/channels/${slug.lowercase()}.txt"
+            
+            val response = app.get(url, headers = mapOf("User-Agent" to "Mozilla/5.0")).text
+            if (response.isNotBlank()) {
+                val decrypted = CryptoUtils.decryptData(response.trim())
+                if (!decrypted.isNullOrBlank()) return parseJson(decrypted)
+            }
+        } catch (e: Exception) { e.printStackTrace() }
+        return null
     }
 
     private fun parseStreamLink(link: String): Pair<String, Map<String, String>> {
@@ -215,57 +217,69 @@ class LiveSportsEvents : MainAPI() {
     }
 
     private suspend fun resolveEmbedUrlIfNeeded(url: String): String? {
-        if (url.contains(".m3u8") || url.contains(".mpd") || url.contains(".mp4")) return url
+        if (url.contains(".m3u8") || url.contains(".mpd") || url.contains(".mp4") || url.contains(".ts")) return url
         return loadEmbedInWebView(url)
     }
 
+    // Safely uses Handlers instead of kotlinx.coroutines to avoid build errors
     private suspend fun loadEmbedInWebView(embedUrl: String): String? {
-        return suspendCancellableCoroutine { cont ->
-            val ctx = context
-            if (ctx == null) {
-                cont.resume(null)
-                return@suspendCancellableCoroutine
-            }
-            val webView = WebView(ctx).apply {
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    mediaPlaybackRequiresUserGesture = false
-                }
-                webViewClient = object : WebViewClient() {
-                    override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
-                        val reqUrl = request.url.toString()
-                        if (reqUrl.contains(".m3u8") || reqUrl.contains(".mpd")) {
-                            if (cont.isActive) cont.resume(reqUrl)
-                            destroy()
-                        }
-                        return super.shouldInterceptRequest(view, request)
-                    }
-                    override fun onPageFinished(view: WebView, url: String) {
-                        Handler(Looper.getMainLooper()).postDelayed({
-                            if (cont.isActive) {
-                                view.evaluateJavascript("(function(){ return typeof playbackURL !== 'undefined' ? playbackURL : null; })();") { result ->
-                                    if (cont.isActive) {
-                                        if (result != "null" && result.isNotBlank()) cont.resume(result.trim('"'))
-                                        else cont.resume(null)
-                                        view.destroy()
-                                    }
-                                }
-                            } else {
-                                view.destroy()
-                            }
-                        }, 1500)
-                    }
-                }
-                loadUrl(embedUrl)
-            }
-            Handler(Looper.getMainLooper()).postDelayed({
-                if (cont.isActive) {
+        return suspendCoroutine { cont ->
+            Handler(Looper.getMainLooper()).post {
+                val ctx = context
+                if (ctx == null) {
                     cont.resume(null)
-                    webView.destroy()
+                    return@post
                 }
-            }, 30000)
+                val webView = WebView(ctx).apply {
+                    settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                        mediaPlaybackRequiresUserGesture = false
+                    }
+                    var urlCaptured = false
+                    
+                    webViewClient = object : WebViewClient() {
+                        override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
+                            val reqUrl = request.url.toString()
+                            if ((reqUrl.contains(".m3u8") || reqUrl.contains(".mpd")) && !urlCaptured) {
+                                urlCaptured = true
+                                Handler(Looper.getMainLooper()).post {
+                                    cont.resume(reqUrl)
+                                    destroy()
+                                }
+                            }
+                            return super.shouldInterceptRequest(view, request)
+                        }
+                        override fun onPageFinished(view: WebView, url: String) {
+                            if (!urlCaptured) {
+                                Handler(Looper.getMainLooper()).postDelayed({
+                                    if (!urlCaptured) {
+                                        view.evaluateJavascript("(function(){ return typeof playbackURL !== 'undefined' ? playbackURL : null; })();") { result ->
+                                            if (!urlCaptured) {
+                                                urlCaptured = true
+                                                if (result != null && result != "null" && result.isNotBlank()) cont.resume(result.trim('"'))
+                                                else cont.resume(null)
+                                                view.destroy()
+                                            }
+                                        }
+                                    }
+                                }, 1500)
+                            }
+                        }
+                    }
+                    loadUrl(embedUrl)
+                }
+                // Failsafe timeout
+                Handler(Looper.getMainLooper()).postDelayed({
+                    if (!webView.url.isNullOrEmpty() && !webView.title.isNullOrEmpty()) { // check if not destroyed
+                        try {
+                            cont.resume(null)
+                            webView.destroy()
+                        } catch (e: Exception) {}
+                    }
+                }, 15000)
+            }
         }
     }
 
@@ -316,5 +330,15 @@ class LiveSportsEvents : MainAPI() {
             append("&isLive=${isEventLive(event)}")
             append("&isEnded=${getEventStatus(event) == "✅"}")
         }
+    }
+
+    // Missing function required for DRM Key Parsing
+    private fun String.hexToBase64UrlOrNull(): String? {
+        val normalizedHex = trim().replace("-", "")
+        if (normalizedHex.isEmpty() || normalizedHex.length % 2 != 0 || !normalizedHex.matches(Regex("^[0-9a-fA-F]+$"))) return null
+        return try {
+            val bytes = normalizedHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+            Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+        } catch (_: Exception) { null }
     }
 }
