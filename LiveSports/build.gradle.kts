@@ -1,5 +1,19 @@
+plugins {
+    id("com.android.library")
+    id("kotlin-android")
+}
+
 android {
     namespace = "com.livesports"
+    compileSdk = 34
+
+    defaultConfig {
+        minSdk = 21
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
 }
 
 cloudstream {
@@ -9,10 +23,4 @@ cloudstream {
     tvTypes = listOf("Live")
     language = "en"
     version = 1
-    // Optional: Add a valid icon URL here
-    iconUrl = "" 
-}
-
-dependencies {
-    // Cloudstream handles most dependencies, but add any specific ones you need here
 }
