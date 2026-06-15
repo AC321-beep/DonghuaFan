@@ -10,9 +10,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.UUID
-import javax.crypto.Cipher
-import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
 class IPTVProvider(
     private val customName: String = "LiveSports IPTV",
@@ -31,7 +28,7 @@ class IPTVProvider(
     override val hasChromecastSupport = true
     override val supportedTypes = setOf(TvType.Live)
 
-    private val headers = mapOf(
+    private val defaultHeaders = mapOf(
         "Accept" to "*/*",
         "Cache-Control" to "no-cache, no-store",
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -39,33 +36,20 @@ class IPTVProvider(
 
     private val customHttpClient by lazy {
         OkHttpClient.Builder()
-            .addInterceptor(HeaderReplacementInterceptor(headers))
+            .addInterceptor(HeaderReplacementInterceptor(defaultHeaders))
             .build()
     }
 
-    private suspend fun getWithCustomHeaders(url: String): String {
+    private fun getWithCustomHeaders(url: String): String {
         val request = Request.Builder().url(url).build()
-        return customHttpClient.newCall(request).execute().use { it.body.string() }
+        return customHttpClient.newCall(request).execute().use { it.body?.string() ?: "" }
     }
 
     private fun decryptContent(content: String): String {
         if (content.startsWith(EXT_M3U) || content.startsWith(EXT_INF)) return content
         val trimmed = content.trim()
         if (trimmed.length < 79) return trimmed
-
-        return try {
-            val part1 = trimmed.substring(0, 10)
-            val part2 = trimmed.substring(34, trimmed.length - 54)
-            val part3 = trimmed.substring(trimmed.length - 10)
-            val encryptedData = part1 + part2 + part3
-            val iv = Base64.decode(trimmed.substring(10, 34), Base64.DEFAULT)
-            val key = Base64.decode(trimmed.substring(trimmed.length - 54, trimmed.length - 10), Base64.DEFAULT)
-            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            String(cipher.doFinal(Base64.decode(encryptedData, Base64.DEFAULT)), Charsets.UTF_8)
-        } catch (e: Exception) {
-            content
-        }
+        return CryptoUtils.decryptData(trimmed) ?: content
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -76,7 +60,7 @@ class IPTVProvider(
         val homeLists = data.items.groupBy { it.attributes["group-title"] ?: "Uncategorized" }
             .map { (group, channels) ->
                 val items = channels.map { channel ->
-                    val loadData = LoadData(
+                    val loadData = LiveEventLoadData(
                         url = channel.url ?: "",
                         title = channel.title ?: "Unknown",
                         poster = channel.attributes["tvg-logo"] ?: "",
@@ -103,19 +87,16 @@ class IPTVProvider(
         val raw = getWithCustomHeaders(mainUrl)
         val decrypted = decryptContent(raw)
         val data = IptvPlaylistParser().parseM3U(decrypted)
+        
         return data.items.filter { it.title?.contains(query, ignoreCase = true) == true }
             .map { channel ->
-                val loadData = LoadData(
-                    url = channel.url ?: "",
-                    title = channel.title ?: "",
+                val loadData = LiveEventLoadData(
+                    url = channel.url ?: "", title = channel.title ?: "",
                     poster = channel.attributes["tvg-logo"] ?: "",
                     nation = channel.attributes["group-title"] ?: "",
-                    key = channel.key ?: "",
-                    keyid = channel.keyid ?: "",
-                    userAgent = channel.userAgent ?: "",
-                    cookie = channel.cookie ?: "",
-                    licenseUrl = channel.licenseUrl ?: "",
-                    drmKeys = channel.drmKeys,
+                    key = channel.key ?: "", keyid = channel.keyid ?: "",
+                    userAgent = channel.userAgent ?: "", cookie = channel.cookie ?: "",
+                    licenseUrl = channel.licenseUrl ?: "", drmKeys = channel.drmKeys,
                     headers = channel.headers
                 )
                 newLiveSearchResponse(channel.title ?: "", loadData.toJson(), TvType.Live) {
@@ -126,7 +107,7 @@ class IPTVProvider(
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val data = parseJson<LoadData>(url)
+        val data = parseJson<LiveEventLoadData>(url)
         return newLiveStreamLoadResponse(data.title, url, url) {
             this.posterUrl = data.poster
             this.plot = data.nation
@@ -139,7 +120,7 @@ class IPTVProvider(
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val loadData = parseJson<LoadData>(data)
+        val loadData = parseJson<LiveEventLoadData>(data)
         val headers = buildMap {
             putAll(loadData.headers)
             if (loadData.userAgent.isNotBlank()) put("User-Agent", loadData.userAgent)
@@ -155,7 +136,7 @@ class IPTVProvider(
         return true
     }
 
-    private suspend fun handleMpd(loadData: LoadData, headers: Map<String, String>, callback: (ExtractorLink) -> Unit) {
+    private fun handleMpd(loadData: LiveEventLoadData, headers: Map<String, String>, callback: (ExtractorLink) -> Unit) {
         val hasValidKeys = loadData.key.isNotBlank() && loadData.keyid.isNotBlank()
         val hasLicenseUrl = loadData.licenseUrl.isNotBlank()
 
@@ -185,8 +166,10 @@ class IPTVProvider(
             val mpdXml = getMpdStream(loadData.url, headers)
             val kidHex = Regex("""cenc:default_KID=["']([0-9a-fA-F\-]{36})["']""")
                 .find(mpdXml)?.groupValues?.get(1) ?: UUID.randomUUID().toString()
+                
             val kidBase64 = kidHex.replace("-", "").hexToBase64UrlOrNull() ?: kidHex
             val keyBase64 = fetchKeyFromLicenseServer(loadData.licenseUrl, kidBase64)
+            
             if (keyBase64.isNotBlank()) {
                 callback.invoke(newDrmExtractorLink(name, name, loadData.url, INFER_TYPE, CLEARKEY_UUID) {
                     quality = Qualities.Unknown.value
@@ -206,41 +189,38 @@ class IPTVProvider(
         }
     }
 
-    private suspend fun getMpdStream(url: String, headers: Map<String, String>): String {
+    private fun getMpdStream(url: String, headers: Map<String, String>): String {
         val client = OkHttpClient.Builder()
             .addInterceptor(HeaderReplacementInterceptor(headers))
             .build()
         val request = Request.Builder().url(url).build()
-        return client.newCall(request).execute().use { it.body.string() }
+        return client.newCall(request).execute().use { it.body?.string() ?: "" }
     }
 
-    private suspend fun fetchKeyFromLicenseServer(licenseUrl: String, kid: String): String {
-        val client = OkHttpClient.Builder()
-            .addInterceptor(HeaderReplacementInterceptor(mapOf(
-                "User-Agent" to "Dalvik/2.1.0 (Linux; U; Android)",
-                "Content-Type" to "application/json;charset=UTF-8"
-            )))
-            .build()
-        val body = "{\"kids\":[\"$kid\"],\"type\":\"temporary\"}"
-            .toRequestBody("application/json".toMediaType())
-        val request = Request.Builder().url(licenseUrl).post(body).build()
-        return client.newCall(request).execute().use { resp ->
-            val json = parseJson<Map<String, Any>>(resp.body.string())
-            ((json["keys"] as? List<Map<String, String>>)?.firstOrNull()?.get("k") ?: "").trim()
-        }
+    private fun fetchKeyFromLicenseServer(licenseUrl: String, kid: String): String {
+        return try {
+            val client = OkHttpClient.Builder()
+                .addInterceptor(HeaderReplacementInterceptor(mapOf(
+                    "User-Agent" to "Dalvik/2.1.0 (Linux; U; Android)",
+                    "Content-Type" to "application/json;charset=UTF-8"
+                )))
+                .build()
+                
+            val body = "{\"kids\":[\"$kid\"],\"type\":\"temporary\"}".toRequestBody("application/json".toMediaType())
+            val request = Request.Builder().url(licenseUrl).post(body).build()
+            
+            client.newCall(request).execute().use { resp ->
+                val json = parseJson<Map<String, Any>>(resp.body?.string() ?: "")
+                ((json["keys"] as? List<Map<String, String>>)?.firstOrNull()?.get("k") ?: "").trim()
+            }
+        } catch (e: Exception) { "" }
     }
 
-    private suspend fun createExtractor(url: String, type: ExtractorLinkType?, headers: Map<String, String>, customName: String = name): ExtractorLink {
+    private fun createExtractor(url: String, type: ExtractorLinkType?, headers: Map<String, String>, customName: String = name): ExtractorLink {
         return newExtractorLink(customName, customName, url, type) {
             referer = ""
             quality = Qualities.Unknown.value
             if (headers.isNotEmpty()) this.headers = headers
         }
     }
-
-    data class LoadData(
-        val url: String, val title: String, val poster: String, val nation: String,
-        val key: String, val keyid: String, val userAgent: String, val cookie: String,
-        val licenseUrl: String, val drmKeys: Map<String, String>, val headers: Map<String, String>
-    )
 }
