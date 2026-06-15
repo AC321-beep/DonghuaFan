@@ -8,8 +8,6 @@ import kotlinx.coroutines.runBlocking
 
 @CloudstreamPlugin
 class LiveSportsPlugin : Plugin() {
-    private val sharedPref = activity?.getSharedPreferences("LiveSports", Context.MODE_PRIVATE)
-
     override fun load(context: Context) {
         IPTVProvider.context = context
         LiveSportsEvents.context = context
@@ -18,9 +16,11 @@ class LiveSportsPlugin : Plugin() {
 
         val providers = runBlocking { LiveSportsProviderManager.fetchProviders() }
 
+        val sharedPref = context.getSharedPreferences("LiveSports", Context.MODE_PRIVATE)
+
         val enabledProviders = providers.filter { provider ->
             val title = provider["title"] as? String
-            title != null && (sharedPref?.getBoolean(title, false) == true)
+            title != null && (sharedPref.getBoolean(title, false))
         }
 
         enabledProviders.forEach { provider ->
