@@ -9,7 +9,7 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 object LiveSportsProviderManager {
-    private const val FALLBACK_BASE_URL = "https://cfyhljddgbkkufh82.top"
+    private const val FALLBACK_BASE_URL = "https://tv.noobon.top"
     private const val PACKAGE_NAME = "com.cricfy.tv"
     private var cachedBaseUrl: String? = null
 
