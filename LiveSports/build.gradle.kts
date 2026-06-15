@@ -64,7 +64,7 @@ cloudstream {
     status = 1
     tvTypes = listOf("Live")
     language = "en"
-    version = 1
+    version = 3
 }
 
 // Dependencies – no need to add cloudstream3 here, it's overridden from root
