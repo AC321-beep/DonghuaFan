@@ -19,16 +19,13 @@ class LiveSportsProvider : MainAPI() {
     override val hasMainPage = true
     override var lang = "en"
 
-    // --- CONFIGURATION ---
     private val defaultCricifyBaseUrl = "https://cfymarkscanjiostar80.top"
     
-    // Companion object fixes the "Const val is only allowed on top level" compiler error
     companion object {
         private const val TYPE_CNC = "cnc"
         private const val TYPE_CRICIFY = "cricify"
     }
 
-    // --- DATA MODELS ---
     data class TargetPayload(val type: String, val jsonPayload: String)
     data class CncPayload(val title: String, val poster: String?, val streamUrl: String)
     
@@ -48,7 +45,6 @@ class LiveSportsProvider : MainAPI() {
         val webLink: String?
     )
 
-    // CNC's active, unencrypted gateway list
     private val cncWorkingEndpoints = listOf(
         mapOf("title" to "TATA PLAY", "image" to "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQz_qYe3Y4S5bXXVlPtXQnqtAkLw1-no57QHhPyMgWE0SQmxujzHxZKiDs&s=10", "catLink" to "https://hotstarlive.delta-cloud.workers.dev/?token=240bb9-374e2e-3c13f0-4a7xz5"),
         mapOf("title" to "HOTSTAR", "image" to "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRWwYjMvB58DMLsL9Ii2fhvw6NBYvD1iVCjOMU8TXBLJt0eibLGOjoRkLJP&s=10", "catLink" to "https://hotstar-live-event.alpha-circuit.workers.dev/?token=a13d9c-4b782a-6c90fd-9a1b84"),
@@ -62,31 +58,23 @@ class LiveSportsProvider : MainAPI() {
         mapOf("title" to "T SPORTS", "image" to "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRJ0QvfKyjAqcCOumIXjcuYg505GnaBeVk2lQ&usqp=CAU", "catLink" to "https://fifabangladesh2-xyz-ekkj.spidy.online/AYN/tsports.m3u")
     )
 
-    // 1. BUILDS THE HOMEPAGE (Merging CNC + Cricify with Premium UI)
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val homePages = mutableListOf<HomePageList>()
 
-        // PART A: Always load CNC networks instantly
         val cncCards = cncWorkingEndpoints.mapNotNull { endpoint ->
             val title = endpoint["title"] ?: return@mapNotNull null
             val image = endpoint["image"]
             val link = endpoint["catLink"] ?: return@mapNotNull null
 
             val payload = TargetPayload(TYPE_CNC, CncPayload(title, image, link).toJson())
-
             newLiveSearchResponse(title, payload.toJson(), TvType.Live) { this.posterUrl = image }
         }
         homePages.add(HomePageList("📺 Live Networks (CNC Sync)", cncCards, isHorizontalImages = true))
 
-        // PART B: Attempt to load Cricify safely and format Match Cards perfectly
         try {
             val baseUrl = try {
                 FirebaseRemoteConfigFetcher.getProviderApiUrl() ?: defaultCricifyBaseUrl
-            } catch (e: Exception) {
-                defaultCricifyBaseUrl
-            } catch (e: LinkageError) {
-                defaultCricifyBaseUrl
-            }
+            } catch (e: Exception) { defaultCricifyBaseUrl } catch (e: LinkageError) { defaultCricifyBaseUrl }
             
             val apiUrl = "$baseUrl/categories/live-events.txt"
 
@@ -99,7 +87,6 @@ class LiveSportsProvider : MainAPI() {
                     val cricifyGroups = events.groupBy { it.cat ?: it.eventInfo?.eventCat ?: "Live Events" }.map { (category, categoryEvents) ->
                         val searchResponses = categoryEvents.map { event ->
                             val payload = TargetPayload(TYPE_CRICIFY, event.toJson())
-                            
                             val info = event.eventInfo
                             val displayTitle = if (!info?.teamA.isNullOrBlank() && !info?.teamB.isNullOrBlank()) {
                                 val isLive = event.title.contains("live", ignoreCase = true) || info?.isHot == "1"
@@ -118,18 +105,13 @@ class LiveSportsProvider : MainAPI() {
                     homePages.addAll(cricifyGroups)
                 }
             }
-        } catch (e: Exception) {
-            // Silently catch SERVFAIL or offline domain errors to safeguard home screen loading
-        }
+        } catch (e: Exception) {}
 
         return newHomePageResponse(homePages, hasNext = false)
     }
 
-    override suspend fun search(query: String): List<SearchResponse> {
-        return emptyList()
-    }
+    override suspend fun search(query: String): List<SearchResponse> { return emptyList() }
 
-    // 2. LOADS THE MATCH DETAILS
     override suspend fun load(url: String): LoadResponse? {
         val target = parseJson<TargetPayload>(url)
 
@@ -145,7 +127,6 @@ class LiveSportsProvider : MainAPI() {
         }
     }
 
-    // 3. EXTRACTS THE VIDEO STREAMS
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -155,31 +136,39 @@ class LiveSportsProvider : MainAPI() {
         val target = parseJson<TargetPayload>(data)
 
         if (target.type == TYPE_CNC) {
-            // --- CNC EXTRACTION ---
             val payload = parseJson<CncPayload>(target.jsonPayload)
             val streamUrl = payload.streamUrl
 
-            if (streamUrl.endsWith(".m3u", ignoreCase = true) && streamUrl.contains("githubusercontent")) {
+            // Parse M3U text files to extract the real video URLs
+            if (streamUrl.endsWith(".m3u", ignoreCase = true) || streamUrl.endsWith(".txt", ignoreCase = true)) {
                 try {
                     val m3uText = app.get(streamUrl).text
-                    m3uText.lines().filter { it.startsWith("http") }.forEachIndexed { index, link ->
-                        callback.invoke(
-                            newExtractorLink(
-                                source = this.name,
-                                name = "${payload.title} - Server ${index + 1}",
-                                url = link.trim(),
-                                type = if (link.contains(".m3u8")) ExtractorLinkType.M3U8 else INFER_TYPE
+                    val links = m3uText.lines().filter { it.trim().startsWith("http") }
+                    
+                    if (links.isNotEmpty()) {
+                        links.forEachIndexed { index, link ->
+                            callback.invoke(
+                                newExtractorLink(
+                                    source = this.name,
+                                    name = "${payload.title} - Server ${index + 1}",
+                                    url = link.trim(),
+                                    type = ExtractorLinkType.M3U8 // Force M3U8
+                                )
                             )
-                        )
+                        }
+                    } else {
+                        // Fallback if the file didn't contain raw HTTP lines
+                        callback.invoke(newExtractorLink(this.name, payload.title, streamUrl, ExtractorLinkType.M3U8))
                     }
                 } catch (e: Exception) { e.printStackTrace() }
             } else {
+                // Cloudflare Workers - Bypass inference and force M3U8 for ExoPlayer
                 callback.invoke(
                     newExtractorLink(
                         source = this.name,
                         name = payload.title,
                         url = streamUrl,
-                        type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else INFER_TYPE
+                        type = ExtractorLinkType.M3U8
                     ) {
                         this.headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
                     }
@@ -190,11 +179,7 @@ class LiveSportsProvider : MainAPI() {
         } else {
             // --- CRICIFY EXTRACTION ---
             val event = parseJson<LiveEventData>(target.jsonPayload)
-            val baseUrl = try {
-                FirebaseRemoteConfigFetcher.getProviderApiUrl() ?: defaultCricifyBaseUrl
-            } catch (e: Exception) {
-                defaultCricifyBaseUrl
-            }
+            val baseUrl = try { FirebaseRemoteConfigFetcher.getProviderApiUrl() ?: defaultCricifyBaseUrl } catch (e: Exception) { defaultCricifyBaseUrl }
             val streamUrl = "$baseUrl/channels/${event.slug.lowercase()}.txt"
 
             val encryptedStreamPayload = app.get(streamUrl).text
@@ -220,7 +205,7 @@ class LiveSportsProvider : MainAPI() {
                         drmHeaders["drm_scheme"] = "clearkey"
                         drmHeaders["drm_license_key"] = "{\"keys\":[{\"kty\":\"oct\",\"k\":\"${drmKeyBase64}\",\"kid\":\"${drmKidBase64}\"}]}"
 
-                        callback.invoke(newDrmExtractorLink(this.name, "$serverName (DRM)", cleanUrl, if (cleanUrl.contains(".m3u8") || cleanUrl.contains(".mpd")) ExtractorLinkType.DASH else INFER_TYPE, CLEARKEY_UUID) {
+                        callback.invoke(newDrmExtractorLink(this.name, "$serverName (DRM)", cleanUrl, ExtractorLinkType.DASH, CLEARKEY_UUID) {
                             this.referer = ""
                             this.quality = Qualities.Unknown.value
                             this.headers = drmHeaders
@@ -231,9 +216,9 @@ class LiveSportsProvider : MainAPI() {
                 } else {
                     val finalHeaders = headers.toMutableMap()
                     if (cleanUrl.contains(".m3u8") && !finalHeaders.containsKey("User-Agent")) {
-                        finalHeaders["User-Agent"] = "Mozilla/5.0 (Linux; Android 10; Pixel 3 XL) AppleWebKit/537.36"
+                        finalHeaders["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
                     }
-                    callback.invoke(newExtractorLink(this.name, serverName, cleanUrl, if (cleanUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else INFER_TYPE) {
+                    callback.invoke(newExtractorLink(this.name, serverName, cleanUrl, ExtractorLinkType.M3U8) {
                         this.referer = ""
                         this.quality = Qualities.Unknown.value
                         if (finalHeaders.isNotEmpty()) this.headers = finalHeaders
@@ -247,7 +232,6 @@ class LiveSportsProvider : MainAPI() {
     private fun parseStreamLink(link: String): Pair<String, Map<String, String>> {
         val headers = mutableMapOf<String, String>()
         if (!link.contains("|")) return Pair(link, headers)
-        
         val parts = link.split("|", limit = 2)
         val url = parts[0]
         if (parts.size > 1) {
