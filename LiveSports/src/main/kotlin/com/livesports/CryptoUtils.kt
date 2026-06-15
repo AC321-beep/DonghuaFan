@@ -6,11 +6,13 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 object CryptoUtils {
-    // No secrets – decryption will fail (return null)
-    private fun getSecret1() = ""
-    private fun getSecret2() = ""
-
-    private val keys = listOf(getSecret1(), getSecret2()).mapNotNull { parseKeyInfo(it) }
+    // Safely pulls keys injected by GitHub Actions
+    private val keys by lazy {
+        listOf(
+            try { BuildConfig.LIVESPORTS_PROVIDER_SECRET1 } catch (e: Exception) { "" },
+            try { BuildConfig.LIVESPORTS_PROVIDER_SECRET2 } catch (e: Exception) { "" }
+        ).filter { it.isNotBlank() }.mapNotNull { parseKeyInfo(it) }
+    }
 
     private data class KeyInfo(val key: ByteArray, val iv: ByteArray)
 
