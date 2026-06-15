@@ -1,13 +1,24 @@
 import com.android.build.gradle.BaseExtension
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
-// Apply the CloudStream plugin (if not already applied by root)
-plugins {
-    id("com.android.library")
-    id("kotlin-android")
-    id("com.lagradost.cloudstream3.gradle")
+// Override the incorrect CloudStream dependency from the root
+configurations.all {
+    resolutionStrategy {
+        eachDependency {
+            if (requested.group == "com.lagradost" && requested.name == "cloudstream3") {
+                useTarget("com.github.recloudstream:cloudstream:pre-release")
+                because("Official CloudStream API on JitPack")
+            }
+        }
+    }
 }
 
+// Apply required plugins (root already applies them, but re-applying is safe)
+apply(plugin = "com.android.library")
+apply(plugin = "kotlin-android")
+apply(plugin = "com.lagradost.cloudstream3.gradle")
+
+// Override the root's namespace
 android {
     namespace = "com.livesports"
     compileSdk = 35
@@ -15,13 +26,6 @@ android {
     defaultConfig {
         minSdk = 21
         targetSdk = 35
-
-        // Optional: BuildConfig fields for secrets (add later when you have them)
-        // buildConfigField("String", "LIVESPORTS_FIREBASE_API_KEY", "\"\"")
-        // buildConfigField("String", "LIVESPORTS_FIREBASE_APP_ID", "\"\"")
-        // buildConfigField("String", "LIVESPORTS_FIREBASE_PROJECT_NUMBER", "\"\"")
-        // buildConfigField("String", "LIVESPORTS_PROVIDER_SECRET1", "\"\"")
-        // buildConfigField("String", "LIVESPORTS_PROVIDER_SECRET2", "\"\"")
     }
 
     compileOptions {
@@ -41,35 +45,23 @@ android {
     }
 }
 
-// ✅ CRITICAL: CloudStream extension metadata
+// CloudStream metadata (must be after android block)
 cloudstream {
     description = "Live Sports (IPTV + Live Events)"
     authors = listOf("AC321-beep")
-    status = 1                          // 1 = Working
-    tvTypes = listOf("Live")            // Live TV channels + events
-    language = "en"                     // English
-    version = 1                         // Integer version code (increment on updates)
-    iconUrl = "https://your-icon-url.png"  // Replace with actual icon if you have one
+    status = 1
+    tvTypes = listOf("Live")
+    language = "en"
+    version = 1
 }
 
+// Dependencies – no need to add cloudstream3 here, it's overridden from root
 dependencies {
-    // CloudStream3 core (provided at runtime)
-    compileOnly("com.lagradost:cloudstream3:pre-release")
-
-    // Kotlin coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
-
-    // Networking
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-
-    // AndroidX (for SettingsDialog)
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
-
-    // JSON parsing
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.13.1")
-
-    // HTML parsing (if needed)
     implementation("org.jsoup:jsoup:1.18.3")
 }
