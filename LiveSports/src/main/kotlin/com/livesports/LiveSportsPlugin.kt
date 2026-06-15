@@ -11,10 +11,10 @@ class LiveSportsPlugin : Plugin() {
     private val sharedPref = activity?.getSharedPreferences("LiveSports", Context.MODE_PRIVATE)
 
     override fun load(context: Context) {
-        LiveSports.context = context
+        IPTVProvider.context = context
         LiveSportsEvents.context = context
 
-        // Always register live events provider (unremovable)
+        // Always register live events provider
         registerMainAPI(LiveSportsEvents())
 
         // Fetch available IPTV playlists from remote config
@@ -28,7 +28,7 @@ class LiveSportsPlugin : Plugin() {
         enabledProviders.forEach { provider ->
             val title = provider["title"] as String
             val playlistUrl = provider["catLink"] as String
-            registerMainAPI(LiveSports(title, playlistUrl))
+            registerMainAPI(IPTVProvider(title, playlistUrl))
         }
 
         val activity = context as AppCompatActivity
