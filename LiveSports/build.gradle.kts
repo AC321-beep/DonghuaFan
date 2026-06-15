@@ -22,5 +22,5 @@ cloudstream {
     status = 1
     tvTypes = listOf("Live")
     language = "en"
-    version = 1
+    version = 2
 }
