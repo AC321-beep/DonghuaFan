@@ -1,27 +1,17 @@
 package com.livesports
 
+import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import java.util.UUID
-import java.util.concurrent.TimeUnit
 
 object RemoteConfigFetcher {
-    private const val PACKAGE_NAME = "com.livesports"
+    // This MUST match the package name registered in the Firebase console
+    private const val PACKAGE_NAME = "com.cricfy.tv"
     
-    // No BuildConfig – always return null (secrets can be added later)
-    private fun getApiKey() = ""
-    private fun getAppId() = ""
-    private fun getProjectNumber() = ""
-
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .build()
+    // Pulls the keys injected by GitHub Actions Secrets during the build
+    private fun getApiKey() = try { BuildConfig.LIVESPORTS_FIREBASE_API_KEY } catch (e: Exception) { "" }
+    private fun getAppId() = try { BuildConfig.LIVESPORTS_FIREBASE_APP_ID } catch (e: Exception) { "" }
+    private fun getProjectNumber() = try { BuildConfig.LIVESPORTS_FIREBASE_PROJECT_NUMBER } catch (e: Exception) { "" }
 
     data class RemoteConfigResponse(val entries: Map<String, String>? = null)
 
@@ -29,30 +19,39 @@ object RemoteConfigFetcher {
         val apiKey = getApiKey()
         val appId = getAppId()
         val projNum = getProjectNumber()
+        
         if (apiKey.isBlank() || appId.isBlank() || projNum.isBlank()) return null
-        return withContext(Dispatchers.IO) {
-            try {
-                val url = "https://firebaseremoteconfig.googleapis.com/v1/projects/$projNum/namespaces/firebase:fetch"
-                val payload = """
-                    {
-                        "appInstanceId": "${UUID.randomUUID().toString().replace("-", "")}",
-                        "appId": "$appId",
-                        "packageName": "$PACKAGE_NAME",
-                        "appVersion": "5.0",
-                        "sdkVersion": "22.1.0"
-                    }
-                """.trimIndent()
-                val request = Request.Builder().url(url)
-                    .post(payload.toRequestBody("application/json".toMediaType()))
-                    .header("X-Goog-Api-Key", apiKey)
-                    .header("X-Android-Package", PACKAGE_NAME)
-                    .build()
-                val response = client.newCall(request).execute()
-                if (response.isSuccessful) {
-                    val resp = parseJson<RemoteConfigResponse>(response.body.string())
-                    return@withContext resp.entries
-                }
-            } catch (e: Exception) { e.printStackTrace() }
+        
+        return try {
+            val url = "https://firebaseremoteconfig.googleapis.com/v1/projects/$projNum/namespaces/firebase:fetch"
+            
+            // Map the JSON payload cleanly
+            val payload = mapOf(
+                "appInstanceId" to UUID.randomUUID().toString().replace("-", ""),
+                "appId" to appId,
+                "packageName" to PACKAGE_NAME,
+                "appVersion" to "5.0",
+                "sdkVersion" to "22.1.0"
+            )
+            
+            val headers = mapOf(
+                "X-Goog-Api-Key" to apiKey,
+                "X-Android-Package" to PACKAGE_NAME,
+                "Content-Type" to "application/json",
+                "Accept" to "application/json"
+            )
+            
+            // Cloudstream's native app.post() runs asynchronously automatically (No OkHttp/Coroutines needed!)
+            val responseText = app.post(url, headers = headers, json = payload).text
+            
+            if (responseText.isNotBlank()) {
+                val resp = parseJson<RemoteConfigResponse>(responseText)
+                resp.entries
+            } else {
+                null
+            }
+        } catch (e: Exception) { 
+            e.printStackTrace()
             null
         }
     }
