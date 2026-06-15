@@ -3,10 +3,13 @@ package com.livesports
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
+import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.utils.newDrmExtractorLink
+import com.lagradost.cloudstream3.utils.CLEARKEY_UUID
 import com.lagradost.cloudstream3.app
 
 class LiveSportsProvider : MainAPI() {
@@ -56,9 +59,10 @@ class LiveSportsProvider : MainAPI() {
         }
     }
 
+    // FIXED: isCasting parameter is now correct, allowing the override to succeed
     override suspend fun loadLinks(
         data: String,
-        isCdn: Boolean,
+        isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
@@ -69,15 +73,16 @@ class LiveSportsProvider : MainAPI() {
             // Option A: WebView Interception
             if (stream.useWebView) {
                 val interceptedUrl = interceptWebViewStream(stream.url) ?: stream.url
-                callback(
+                callback.invoke(
                     newExtractorLink(
-                        source = this.name,
-                        name = "${stream.name} (WebView Source)",
-                        url = interceptedUrl,
-                        referer = "",
-                        quality = Qualities.Unknown.value,
-                        type = if (interceptedUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else INFER_TYPE
+                        this.name,
+                        "${stream.name} (WebView Source)",
+                        interceptedUrl,
+                        if (interceptedUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else INFER_TYPE
                     ) {
+                        // FIXED: Referer and Quality must be set inside the builder block
+                        this.referer = ""
+                        this.quality = Qualities.Unknown.value
                         stream.headers?.let { this.headers = it }
                     }
                 )
@@ -90,30 +95,33 @@ class LiveSportsProvider : MainAPI() {
                 drmHeaders["drm_scheme"] = "clearkey"
                 drmHeaders["drm_license_key"] = "{\"keys\":[{\"kty\":\"oct\",\"k\":\"${stream.clearKeyValue}\",\"kid\":\"${stream.clearKeyId}\"}]}"
                 
-                callback(
-                    newExtractorLink(
-                        source = this.name,
-                        name = "${stream.name} (DRM Protected)",
-                        url = stream.url,
-                        referer = "",
-                        quality = Qualities.Unknown.value,
-                        type = if (stream.url.contains(".m3u8") || stream.url.contains(".mpd")) ExtractorLinkType.DASH else INFER_TYPE
+                callback.invoke(
+                    newDrmExtractorLink(
+                        this.name,
+                        "${stream.name} (DRM Protected)",
+                        stream.url,
+                        if (stream.url.contains(".m3u8") || stream.url.contains(".mpd")) ExtractorLinkType.DASH else INFER_TYPE,
+                        CLEARKEY_UUID
                     ) {
+                        this.referer = ""
+                        this.quality = Qualities.Unknown.value
                         this.headers = drmHeaders
+                        this.kid = stream.clearKeyId
+                        this.key = stream.clearKeyValue
                     }
                 )
             } else {
                 
                 // Option C: Standard Dynamic Direct Link Processing
-                callback(
+                callback.invoke(
                     newExtractorLink(
-                        source = this.name,
-                        name = stream.name,
-                        url = stream.url,
-                        referer = "",
-                        quality = Qualities.Unknown.value,
-                        type = if (stream.url.contains(".m3u8")) ExtractorLinkType.M3U8 else INFER_TYPE
+                        this.name,
+                        stream.name,
+                        stream.url,
+                        if (stream.url.contains(".m3u8")) ExtractorLinkType.M3U8 else INFER_TYPE
                     ) {
+                        this.referer = ""
+                        this.quality = Qualities.Unknown.value
                         stream.headers?.let { this.headers = it }
                     }
                 )
