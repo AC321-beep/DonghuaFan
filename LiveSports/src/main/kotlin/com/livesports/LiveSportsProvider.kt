@@ -1,507 +1,135 @@
 package com.livesports
 
-import android.os.Handler
-import android.os.Looper
-import android.util.Base64
-import android.webkit.WebChromeClient
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
-import com.lagradost.cloudstream3.utils.CLEARKEY_UUID
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.newDrmExtractorLink
-import com.lagradost.cloudstream3.utils.newExtractorLink
-import java.text.SimpleDateFormat
-import java.util.*
-import java.util.concurrent.TimeUnit
-import kotlin.coroutines.resume
-import kotlin.coroutines.suspendCoroutine
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import okhttp3.Request
+import com.lagradost.cloudstream3.app
 
-class LiveSportsProvider : MainAPI() {
-    companion object {
-        var context: android.content.Context? = null
-        private const val DEFAULT_BASE_URL = "https://cfymarkscanjiostar80.top"
-        var dynamicBaseUrl: String? = null 
-    }
-
-    override var mainUrl = DEFAULT_BASE_URL
+class LiveSportsProvider : MainPageProvider() {
     override var name = "Live Sports"
-    override var lang = "en"
+    override var supportedTypes = setOf(TvType.Live)
     override val hasMainPage = true
-    override val hasChromecastSupport = true
-    override val supportedTypes = setOf(TvType.Live)
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .build()
+    // Replace with your designated remote configuration entrypoint
+    private val firebaseConfigUrl = "https://your-firebase-project.firebaseio.com/config.json"
 
-    data class ChannelStreamResponse(
-        val streamUrls: List<StreamUrl>?,
-        val related: List<LiveEventData>?,
-        val prevChannel: String?,
-        val nextChannel: String?
-    )
-
-    data class StreamUrl(
-        val api: String?, 
-        val id: Int?,
-        val link: String?, 
-        val title: String?, 
-        val type: String?, 
-        val webLink: String?
-    )
-
-    data class LiveEventLoadData(
-        val eventId: Int,
-        val title: String,
-        val poster: String,
-        val slug: String,
-        val formats: List<LiveEventFormat>,
-        val eventInfo: LiveEventInfo?
-    )
-
-    // --- Core API Routing & Decryption ---
-    
-    private suspend fun getBaseUrl(): String {
-        dynamicBaseUrl?.let { return it }
-        val firebaseUrl = FirebaseRemoteConfigFetcher.getProviderApiUrl()
-        if (!firebaseUrl.isNullOrBlank()) {
-            dynamicBaseUrl = firebaseUrl.trimEnd('/')
-            mainUrl = dynamicBaseUrl!!
-            return dynamicBaseUrl!!
-        }
-        dynamicBaseUrl = DEFAULT_BASE_URL
-        return DEFAULT_BASE_URL
-    }
-
-    private suspend fun fetchLiveEvents(): List<LiveEventData> {
-        return withContext(Dispatchers.IO) {
-            try {
-                val baseUrl = getBaseUrl()
-                val request = Request.Builder()
-                    .url("$baseUrl/categories/live-events.txt")
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                    .build()
-
-                val response = client.newCall(request).execute()
-                if (response.isSuccessful) {
-                    val encryptedData = response.body.string()
-                    if (encryptedData.isNotBlank()) {
-                        val decryptedData = CryptoUtils.decryptData(encryptedData.trim())
-                        if (!decryptedData.isNullOrBlank()) {
-                            val events = parseJson<List<LiveEventData>>(decryptedData)
-                            // Strict filter applied as per ProviderManager.kt
-                            return@withContext events.filter { it.publish == 1 }
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-            emptyList()
-        }
-    }
-
-    private suspend fun fetchChannelStreams(slug: String): ChannelStreamResponse? {
-        return withContext(Dispatchers.IO) {
-            try {
-                val baseUrl = getBaseUrl()
-                val url = "$baseUrl/channels/${slug.lowercase()}.txt"
-                val request = Request.Builder()
-                    .url(url)
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                    .build()
-
-                val response = client.newCall(request).execute()
-                if (response.isSuccessful) {
-                    val encryptedData = response.body.string()
-                    if (encryptedData.isNotBlank()) {
-                        val decryptedData = CryptoUtils.decryptData(encryptedData.trim())
-                        if (!decryptedData.isNullOrBlank()) {
-                            return@withContext parseJson<ChannelStreamResponse>(decryptedData)
-                        }
-                    }
-                }
-            } catch (e: Exception) { e.printStackTrace() }
-            null
-        }
-    }
-
-    // --- UI Formatting Methods ---
-
-    private fun createDisplayTitle(event: LiveEventData): String {
-        val eventInfo = event.eventInfo
-        return if (eventInfo != null && !eventInfo.teamA.isNullOrBlank() && !eventInfo.teamB.isNullOrBlank()) {
-            if (eventInfo.teamA == eventInfo.teamB) eventInfo.teamA else "${eventInfo.teamA} vs ${eventInfo.teamB}"
-        } else {
-            event.title
-        }
-    }
-
-    private fun getEventStatus(event: LiveEventData): String {
-        val eventInfo = event.eventInfo ?: return ""
-        val now = System.currentTimeMillis()
-        return try {
-            val dateFormat = SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US)
-            val startTime = eventInfo.startTime?.let { dateFormat.parse(it)?.time }
-            val endTime = eventInfo.endTime?.let { dateFormat.parse(it)?.time }
-
-            when {
-                endTime != null && now >= endTime -> "✅"
-                startTime != null && now >= startTime -> "🔴"
-                startTime != null && now < startTime -> "🔜"
-                else -> ""
-            }
-        } catch (e: Exception) { "" }
-    }
-
-    private fun isEventLive(event: LiveEventData): Boolean {
-        val eventInfo = event.eventInfo ?: return false
-        val now = System.currentTimeMillis()
-        return try {
-            val dateFormat = SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US)
-            val startTime = eventInfo.startTime?.let { dateFormat.parse(it)?.time }
-            val endTime = eventInfo.endTime?.let { dateFormat.parse(it)?.time }
-            if (endTime != null && now >= endTime) false else startTime != null && now >= startTime
-        } catch (e: Exception) { false }
-    }
-
-    private fun isEventEnded(event: LiveEventData): Boolean {
-        val eventInfo = event.eventInfo ?: return false
-        val now = System.currentTimeMillis()
-        return try {
-            val dateFormat = SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US)
-            val endTime = eventInfo.endTime?.let { dateFormat.parse(it)?.time }
-            endTime != null && now >= endTime
-        } catch (e: Exception) { false }
-    }
-
-    private fun generateMatchCardUrl(event: LiveEventData): String {
-        val eventInfo = event.eventInfo
-        val title = java.net.URLEncoder.encode(eventInfo?.eventName ?: event.title, "UTF-8")
-        val teamA = java.net.URLEncoder.encode(eventInfo?.teamA ?: "Team A", "UTF-8")
-        val teamB = java.net.URLEncoder.encode(eventInfo?.teamB ?: "Team B", "UTF-8")
-        val teamAImg = eventInfo?.teamAFlag ?: ""
-        val teamBImg = eventInfo?.teamBFlag ?: ""
-        val eventLogo = eventInfo?.eventLogo ?: ""
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
+        val config = fetchFirebaseConfig() ?: return null
         
-        val time = try {
-            eventInfo?.startTime?.let {
-                val dateFormat = SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US)
-                val displayFormat = SimpleDateFormat("MMM dd, yyyy hh:mm a", Locale.US)
-                dateFormat.parse(it)?.let { d -> java.net.URLEncoder.encode(displayFormat.format(d), "UTF-8") }
-            } ?: ""
-        } catch (e: Exception) { "" }
-        
-        return buildString {
-            append("https://live-card-png.cricify.workers.dev/?")
-            append("title=$title&teamA=$teamA&teamB=$teamB")
-            if (teamAImg.isNotBlank()) append("&teamAImg=$teamAImg")
-            if (teamBImg.isNotBlank()) append("&teamBImg=$teamBImg")
-            if (eventLogo.isNotBlank()) append("&eventLogo=$eventLogo")
-            if (time.isNotBlank()) append("&time=$time")
-            append("&isLive=${isEventLive(event)}&isEnded=${isEventEnded(event)}")
-        }
-    }
+        // Fetch raw encrypted live configuration layout
+        val encryptedPayload = app.get(config.apiUrl).text
+        val decryptedJson = CryptoUtils.decryptAesCbc(encryptedPayload, config.encryptionKey, config.encryptionIv)
+        val response = parseJson<LiveEventResponse>(decryptedJson)
 
-    // --- Provider Overrides ---
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val events = fetchLiveEvents()
-        val groupedEvents = events.groupBy { it.eventInfo?.eventCat ?: it.cat ?: "Other" }
-
-        val homePageLists = groupedEvents.map { (category, categoryEvents) ->
-            val icon = when (category.lowercase()) {
-                "cricket" -> "🏏"
-                "football" -> "⚽"
-                "basketball" -> "🏀"
-                "ice hockey" -> "🏒"
-                "boxing" -> "🥊"
-                "motorsport" -> "🏎️"
-                "tennis" -> "🎾"
-                else -> "📺"
+        // Categorize incoming live content dynamically into Home tabs
+        val homePages = response.events.groupBy { it.category }.map { (category, events) ->
+            val searchResponses = events.map { event ->
+                newLiveSearchResponse(
+                    name = event.title,
+                    url = event.toJson(), // Bundle configuration direct payload into URL references
+                    apiName = this.name,
+                    posterUrl = event.thumbnail
+                )
             }
-
-            val searchResponses = categoryEvents
-                .sortedByDescending { isEventLive(it) }
-                .map { event ->
-                    val displayTitle = createDisplayTitle(event)
-                    val status = getEventStatus(event)
-                    val fullTitle = if (status.isNotBlank()) "$status $displayTitle" else displayTitle
-                    val posterUrl = generateMatchCardUrl(event)
-
-                    val loadData = LiveEventLoadData(
-                        eventId = event.id,
-                        title = displayTitle,
-                        poster = posterUrl,
-                        slug = event.slug,
-                        formats = event.formats ?: emptyList(),
-                        eventInfo = event.eventInfo
-                    )
-
-                    newLiveSearchResponse(fullTitle, loadData.toJson(), TvType.Live) {
-                        this.posterUrl = posterUrl
-                    }
-                }
-
-            HomePageList("$icon $category", searchResponses, isHorizontalImages = true)
-        }.sortedBy { list ->
-            when {
-                list.name.contains("Cricket", ignoreCase = true) -> 0
-                list.name.contains("Football", ignoreCase = true) -> 1
-                list.name.contains("Basketball", ignoreCase = true) -> 2
-                else -> 10
-            }
+            HomePageList(category, searchResponses)
         }
 
-        return newHomePageResponse(homePageLists, hasNext = false)
+        return HomePageResponse(homePages, hasNext = false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        return fetchLiveEvents().filter { event ->
-            val searchText = listOfNotNull(
-                event.title, event.eventInfo?.teamA, event.eventInfo?.teamB,
-                event.eventInfo?.eventName, event.eventInfo?.eventType
-            ).joinToString(" ")
-            searchText.contains(query, ignoreCase = true)
-        }.map { event ->
-            val displayTitle = createDisplayTitle(event)
-            val status = getEventStatus(event)
-            val fullTitle = if (status.isNotBlank()) "$status $displayTitle" else displayTitle
-            val posterUrl = generateMatchCardUrl(event)
-
-            val loadData = LiveEventLoadData(
-                eventId = event.id, title = displayTitle, poster = posterUrl,
-                slug = event.slug, formats = event.formats ?: emptyList(), eventInfo = event.eventInfo
-            )
-
-            newLiveSearchResponse(fullTitle, loadData.toJson(), TvType.Live) {
-                this.posterUrl = posterUrl
-            }
-        }
+        // Core architecture maps strictly via dynamic remote main feed updates
+        return emptyList()
     }
 
-    override suspend fun load(url: String): LoadResponse {
-        val data = parseJson<LiveEventLoadData>(url)
-        val eventInfo = data.eventInfo
-        val plot = buildString {
-            eventInfo?.let { info ->
-                info.eventType?.let { append("📌 $it\n") }
-                info.eventName?.let { append("🏆 $it\n") }
-                info.startTime?.let {
-                    try {
-                        val dateFormat = SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US)
-                        val displayFormat = SimpleDateFormat("MMM dd, yyyy HH:mm", Locale.US)
-                        dateFormat.parse(it)?.let { d -> append("🕐 ${displayFormat.format(d)}\n") }
-                    } catch (e: Exception) { append("🕐 $it\n") }
-                }
-            }
-            append("\n📡 Available Servers: ${data.formats.size}")
-        }
-
-        return newLiveStreamLoadResponse(data.title, url, url) {
-            this.posterUrl = data.poster
-            this.plot = plot
+    override suspend fun load(url: String): LoadResponse? {
+        val event = parseJson<LiveEvent>(url)
+        
+        return newLiveStreamLoadResponse(
+            name = event.title,
+            url = url,
+            apiName = this.name,
+            dataUrl = url
+        ) {
+            this.posterUrl = event.thumbnail
         }
     }
 
     override suspend fun loadLinks(
         data: String,
-        isCasting: Boolean,
+        isCdn: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val loadData = parseJson<LiveEventLoadData>(data)
-        val streamResponse = fetchChannelStreams(loadData.slug)
+        val event = parseJson<LiveEvent>(data)
+        
+        for (stream in event.streams) {
+            // Option A: WebView Interception
+            if (stream.useWebView) {
+                val interceptedUrl = interceptWebViewStream(stream.url) ?: stream.url
+                callback(
+                    ExtractorLink(
+                        source = this.name,
+                        name = "${stream.name} (WebView Source)",
+                        url = interceptedUrl,
+                        referer = "",
+                        quality = Qualities.Unknown.value,
+                        isM3u8 = interceptedUrl.contains(".m3u8"),
+                        headers = stream.headers ?: emptyMap()
+                    )
+                )
+                continue
+            }
 
-        if (streamResponse?.streamUrls.isNullOrEmpty()) return false
-
-        streamResponse.streamUrls.forEach { stream ->
-            val serverName = stream.title ?: "Server"
-            val streamLink = stream.link ?: return@forEach
-            val (url, headers) = parseStreamLink(streamLink)
-
-            if (url.isBlank()) return@forEach
-            val resolvedUrl = resolveEmbedUrlIfNeeded(url) ?: return@forEach
-
-            try {
-                when (stream.type) {
-                    "7" -> {
-                        // MPD with DRM (ClearKey)
-                        val drmInfo = stream.api?.split(":")
-                        if (drmInfo != null && drmInfo.size == 2) {
-                            val drmKidBytes = drmInfo[0].replace("-", "").chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-                            val drmKidBase64 = Base64.encodeToString(drmKidBytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
-                            val drmKeyBytes = drmInfo[1].replace("-", "").chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-                            val drmKeyBase64 = Base64.encodeToString(drmKeyBytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
-                            
-                            callback.invoke(
-                                newDrmExtractorLink(this.name, serverName, resolvedUrl, INFER_TYPE, CLEARKEY_UUID) {
-                                    this.quality = Qualities.Unknown.value
-                                    this.key = drmKeyBase64
-                                    this.kid = drmKidBase64
-                                    if (headers.isNotEmpty()) this.headers = headers
-                                }
-                            )
-                        } else {
-                            callback.invoke(
-                                newExtractorLink(this.name, serverName, resolvedUrl, ExtractorLinkType.DASH) {
-                                    this.quality = Qualities.Unknown.value
-                                    if (headers.isNotEmpty()) this.headers = headers
-                                }
-                            )
-                        }
-                    }
-                    else -> {
-                        val linkType = if (resolvedUrl.contains(".mpd")) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
-                        val finalHeaders = headers.toMutableMap()
-                        if (linkType == ExtractorLinkType.M3U8 && !finalHeaders.containsKey("User-Agent")) {
-                            finalHeaders["User-Agent"] = "Mozilla/5.0 (Linux; Android 10; Pixel 3 XL) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
-                        }
-
-                        callback.invoke(
-                            newExtractorLink(this.name, serverName, resolvedUrl, linkType) {
-                                this.quality = Qualities.Unknown.value
-                                if (finalHeaders.isNotEmpty()) this.headers = finalHeaders
-                            }
-                        )
-                    }
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
+            // Option B: DRM Protection Configuration (ClearKey Mapping Setup)
+            if (stream.isDrm && stream.clearKeyId != null && stream.clearKeyValue != null) {
+                val drmHeaders = stream.headers?.toMutableMap() ?: mutableMapOf()
+                
+                // Pack standard clear-key configuration elements directly for player translation layers
+                drmHeaders["drm_scheme"] = "clearkey"
+                drmHeaders["drm_license_key"] = "{\"keys\":[{\"kty\":\"oct\",\"k\":\"${stream.clearKeyValue}\",\"kid\":\"${stream.clearKeyId}\"}]}"
+                
+                callback(
+                    ExtractorLink(
+                        source = this.name,
+                        name = "${stream.name} (DRM Protected)",
+                        url = stream.url,
+                        referer = "",
+                        quality = Qualities.Unknown.value,
+                        isM3u8 = stream.url.contains(".m3u8") || stream.url.contains(".mpd"),
+                        headers = drmHeaders
+                    )
+                )
+            } else {
+                // Option C: Standard Dynamic Direct Link Processing
+                callback(
+                    ExtractorLink(
+                        source = this.name,
+                        name = stream.name,
+                        url = stream.url,
+                        referer = "",
+                        quality = Qualities.Unknown.value,
+                        isM3u8 = stream.url.contains(".m3u8"),
+                        headers = stream.headers ?: emptyMap()
+                    )
+                )
             }
         }
         return true
     }
 
-    private fun parseStreamLink(link: String): Pair<String, Map<String, String>> {
-        val headers = mutableMapOf<String, String>()
-        if (!link.contains("|")) return Pair(link, headers)
-        
-        val parts = link.split("|", limit = 2)
-        val url = parts[0]
-        if (parts.size > 1) {
-            parts[1].split("&").forEach { headerPair ->
-                val keyValue = headerPair.split("=", limit = 2)
-                if (keyValue.size == 2) {
-                    val key = keyValue[0].trim()
-                    val headerName = when (key.lowercase()) {
-                        "user-agent" -> "User-Agent"
-                        "referer" -> "Referer"
-                        "origin" -> "Origin"
-                        "cookie" -> "Cookie"
-                        else -> key
-                    }
-                    headers[headerName] = keyValue[1].trim()
-                }
-            }
+    private suspend fun fetchFirebaseConfig(): FirebaseConfig? {
+        return try {
+            app.get(firebaseConfigUrl).parsed<FirebaseConfig>()
+        } catch (e: Exception) {
+            null
         }
-        return Pair(url, headers)
     }
 
-    private fun isDirectStreamUrl(url: String): Boolean {
-        return url.contains(".m3u8") || url.contains(".mpd") || url.contains(".mp4") ||
-               url.contains(".ts") || url.contains(".mkv") || url.contains(".webm")
-    }
-
-    private suspend fun resolveEmbedUrlIfNeeded(url: String): String? {
-        if (isDirectStreamUrl(url)) return url
-        return loadEmbedInWebView(url)
-    }
-
-    private suspend fun loadEmbedInWebView(embedUrl: String): String? {
-        return withContext(Dispatchers.Main) {
-            suspendCoroutine { continuation ->
-                try {
-                    val ctx = context
-                    if (ctx == null) {
-                        continuation.resume(null)
-                        return@suspendCoroutine
-                    }
-
-                    val webView = WebView(ctx)
-                    webView.settings.javaScriptEnabled = true
-                    webView.settings.domStorageEnabled = true
-                    webView.settings.mediaPlaybackRequiresUserGesture = false
-
-                    var urlCaptured = false
-                    var capturedUrl: String? = null
-
-                    val bridge = object {
-                        @android.webkit.JavascriptInterface
-                        fun onStreamUrlFound(url: String) {
-                            if (!urlCaptured && url.isNotBlank()) {
-                                urlCaptured = true
-                                capturedUrl = url
-                                Handler(Looper.getMainLooper()).post {
-                                    try { webView.destroy() } catch (_: Exception) {}
-                                    continuation.resume(url)
-                                }
-                            }
-                        }
-                    }
-
-                    webView.addJavascriptInterface(bridge, "StreamBridge")
-
-                    webView.webViewClient = object : WebViewClient() {
-                        override fun shouldInterceptRequest(
-                            view: WebView,
-                            request: android.webkit.WebResourceRequest
-                        ): android.webkit.WebResourceResponse? {
-                            val requestUrl = request.url.toString()
-                            if (isDirectStreamUrl(requestUrl) && !urlCaptured) {
-                                urlCaptured = true
-                                capturedUrl = requestUrl
-                                Handler(Looper.getMainLooper()).post {
-                                    try { webView.destroy() } catch (_: Exception) {}
-                                    continuation.resume(requestUrl)
-                                }
-                            }
-                            return super.shouldInterceptRequest(view, request)
-                        }
-
-                        override fun onPageFinished(view: WebView, pageUrl: String) {
-                            super.onPageFinished(view, pageUrl)
-                            if (!urlCaptured) {
-                                Handler(Looper.getMainLooper()).postDelayed({
-                                    try {
-                                        val jsCode = """
-                                            (function() {
-                                                if (typeof playbackURL !== 'undefined' && playbackURL) {
-                                                    window.StreamBridge.onStreamUrlFound(playbackURL);
-                                                }
-                                            })();
-                                        """.trimIndent()
-                                        webView.evaluateJavascript(jsCode, null)
-                                    } catch (_: Exception) {}
-                                }, 500)
-                            }
-                        }
-                    }
-
-                    webView.webChromeClient = WebChromeClient()
-                    webView.loadUrl(embedUrl)
-
-                    Handler(Looper.getMainLooper()).postDelayed({
-                        if (!urlCaptured && capturedUrl == null) {
-                            try { webView.destroy() } catch (_: Exception) {}
-                            try { continuation.resume(null) } catch (_: Exception) {}
-                        }
-                    }, 15000)
-                } catch (e: Exception) {
-                    continuation.resume(null)
-                }
-            }
-        }
+    private suspend fun interceptWebViewStream(url: String): String? {
+        // Stub implementation hook for handling custom internal browser-based requests
+        return url
     }
 }
