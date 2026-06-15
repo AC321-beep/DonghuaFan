@@ -155,7 +155,7 @@ class LiveSportsEvents : MainAPI() {
         return true
     }
 
-    private fun createExtractor(url: String, type: ExtractorLinkType?, headers: Map<String, String>, name: String): ExtractorLink {
+    private suspend fun createExtractor(url: String, type: ExtractorLinkType?, headers: Map<String, String>, name: String): ExtractorLink {
         return newExtractorLink(this.name, name, url, type) {
             quality = Qualities.Unknown.value
             if (headers.isNotEmpty()) this.headers = headers
