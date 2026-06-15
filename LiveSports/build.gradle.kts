@@ -49,7 +49,6 @@ cloudstream {
     tvTypes = listOf("Live")            // Live TV channels + events
     language = "en"                     // English
     version = 1                         // Integer version code (increment on updates)
-    versionName = "1.0.0"               // Optional semantic version
     iconUrl = "https://your-icon-url.png"  // Replace with actual icon if you have one
 }
 
