@@ -1,14 +1,16 @@
 package com.livesports
 
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 object LiveSportsProviderManager {
     private const val FALLBACK_BASE_URL = "https://cfyhljddgbkkufh82.top"
+    private const val PACKAGE_NAME = "com.cricfy.tv"
     private var cachedBaseUrl: String? = null
 
     private val client = OkHttpClient.Builder()
@@ -16,52 +18,71 @@ object LiveSportsProviderManager {
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    suspend fun getBaseUrl(): String? {
-        if (cachedBaseUrl != null) return cachedBaseUrl
-        val apiUrl = RemoteConfigFetcher.getProviderApiUrl()
-        cachedBaseUrl = apiUrl ?: FALLBACK_BASE_URL
-        return cachedBaseUrl
-    }
+    data class RemoteConfigResponse(val entries: Map<String, String>? = null)
 
-    suspend fun fetchProviders(): List<Map<String, Any>> {
-        return withContext(Dispatchers.IO) {
+    fun getBaseUrl(): String {
+        if (cachedBaseUrl != null) return cachedBaseUrl!!
+        
+        val apiKey = try { BuildConfig.LIVESPORTS_FIREBASE_API_KEY } catch (e: Exception) { "" }
+        val appId = try { BuildConfig.LIVESPORTS_FIREBASE_APP_ID } catch (e: Exception) { "" }
+        val projNum = try { BuildConfig.LIVESPORTS_FIREBASE_PROJECT_NUMBER } catch (e: Exception) { "" }
+
+        if (apiKey.isNotBlank() && appId.isNotBlank() && projNum.isNotBlank()) {
             try {
-                val base = getBaseUrl() ?: return@withContext emptyList()
-                val url = "$base/cats.txt"
+                val url = "https://firebaseremoteconfig.googleapis.com/v1/projects/$projNum/namespaces/firebase:fetch"
+                val payload = """
+                    {
+                        "appInstanceId": "${UUID.randomUUID().toString().replace("-", "")}",
+                        "appId": "$appId",
+                        "packageName": "$PACKAGE_NAME",
+                        "appVersion": "5.0",
+                        "sdkVersion": "22.1.0"
+                    }
+                """.trimIndent()
+
                 val request = Request.Builder().url(url)
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                    .post(payload.toRequestBody("application/json".toMediaType()))
+                    .header("X-Goog-Api-Key", apiKey)
+                    .header("X-Android-Package", PACKAGE_NAME)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json")
                     .build()
+
                 val response = client.newCall(request).execute()
                 if (response.isSuccessful) {
-                    val encrypted = response.body.string()
-                    val decrypted = CryptoUtils.decryptData(encrypted.trim())
-                    if (!decrypted.isNullOrBlank()) {
-                        return@withContext parseJson(decrypted)
-                    }
+                    val resp = parseJson<RemoteConfigResponse>(response.body?.string() ?: "")
+                    cachedBaseUrl = resp.entries?.get("cric_api2") ?: resp.entries?.get("cric_api1")
                 }
             } catch (e: Exception) { e.printStackTrace() }
-            emptyList()
         }
+        
+        if (cachedBaseUrl == null) cachedBaseUrl = FALLBACK_BASE_URL
+        return cachedBaseUrl!!
     }
 
-    suspend fun fetchLiveEvents(): List<LiveSportsEvents.LiveEventData> {
-        return withContext(Dispatchers.IO) {
-            try {
-                val base = getBaseUrl() ?: return@withContext emptyList()
-                val url = "$base/live-events.txt"
-                val request = Request.Builder().url(url)
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-                    .build()
-                val response = client.newCall(request).execute()
-                if (response.isSuccessful) {
-                    val encrypted = response.body.string()
-                    val decrypted = CryptoUtils.decryptData(encrypted.trim())
-                    if (!decrypted.isNullOrBlank()) {
-                        return@withContext parseJson(decrypted)
-                    }
-                }
-            } catch (e: Exception) { e.printStackTrace() }
-            emptyList()
-        }
+    fun fetchProviders(): List<Map<String, Any>> {
+        try {
+            val url = "${getBaseUrl()}/cats.txt"
+            val request = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
+            val response = client.newCall(request).execute()
+            if (response.isSuccessful) {
+                val decrypted = CryptoUtils.decryptData(response.body?.string() ?: "")
+                if (!decrypted.isNullOrBlank()) return parseJson(decrypted)
+            }
+        } catch (e: Exception) { e.printStackTrace() }
+        return emptyList()
+    }
+
+    fun fetchLiveEvents(): List<LiveEventData> {
+        try {
+            val url = "${getBaseUrl()}/live-events.txt"
+            val request = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
+            val response = client.newCall(request).execute()
+            if (response.isSuccessful) {
+                val decrypted = CryptoUtils.decryptData(response.body?.string() ?: "")
+                if (!decrypted.isNullOrBlank()) return parseJson(decrypted)
+            }
+        } catch (e: Exception) { e.printStackTrace() }
+        return emptyList()
     }
 }
