@@ -13,7 +13,7 @@ import java.util.UUID
 
 class IPTVProvider(
     private val customName: String = "LiveSports IPTV",
-    private val customMainUrl: String = "https://fifabd.site/OPLLX7/LIVE2.m3u"
+    private val customMainUrl: String = "https://tv.noobon.top/playlist/movies.php"
 ) : MainAPI() {
     companion object {
         var context: android.content.Context? = null
