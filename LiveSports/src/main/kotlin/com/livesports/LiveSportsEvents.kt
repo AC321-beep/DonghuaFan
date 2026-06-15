@@ -9,6 +9,7 @@ import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -16,7 +17,7 @@ import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
-import kotlin.coroutines.suspendCoroutine
+import kotlin.coroutines.resumeWithException
 
 class LiveSportsEvents : MainAPI() {
     companion object {
@@ -165,7 +166,7 @@ class LiveSportsEvents : MainAPI() {
         return true
     }
 
-    private fun createExtractor(url: String, type: Any, headers: Map<String, String>, name: String): ExtractorLink {
+    private suspend fun createExtractor(url: String, type: ExtractorLinkType?, headers: Map<String, String>, name: String): ExtractorLink {
         return newExtractorLink(this.name, name, url, type) {
             quality = Qualities.Unknown.value
             if (headers.isNotEmpty()) this.headers = headers
@@ -218,41 +219,52 @@ class LiveSportsEvents : MainAPI() {
     }
 
     private suspend fun loadEmbedInWebView(embedUrl: String): String? {
-        return withContext(Dispatchers.Main) {
-            suspendCoroutine { cont ->
-                val ctx = context ?: return@suspendCoroutine cont.resume(null)
-                val webView = WebView(ctx).apply {
-                    settings.apply {
-                        javaScriptEnabled = true
-                        domStorageEnabled = true
-                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                        mediaPlaybackRequiresUserGesture = false
-                    }
-                    webViewClient = object : WebViewClient() {
-                        override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
-                            request.url.toString().takeIf { it.contains(".m3u8") || it.contains(".mpd") }?.let {
-                                cont.resume(it)
-                                destroy()
-                            }
-                            return super.shouldInterceptRequest(view, request)
-                        }
-                        override fun onPageFinished(view: WebView, url: String) {
-                            Handler(Looper.getMainLooper()).postDelayed({
-                                if (!cont.isActive) return@postDelayed
-                                view.evaluateJavascript("(function(){ return typeof playbackURL !== 'undefined' ? playbackURL : null; })();") { result ->
-                                    if (result != "null" && result.isNotBlank()) cont.resume(result.trim('"'))
-                                    else cont.resume(null)
-                                    view.destroy()
-                                }
-                            }, 1500)
-                        }
-                    }
-                    loadUrl(embedUrl)
-                }
-                Handler(Looper.getMainLooper()).postDelayed({
-                    if (cont.isActive) { cont.resume(null); webView.destroy() }
-                }, 30000)
+        return suspendCancellableCoroutine { cont ->
+            val ctx = context
+            if (ctx == null) {
+                cont.resume(null)
+                return@suspendCancellableCoroutine
             }
+            val webView = WebView(ctx).apply {
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    mediaPlaybackRequiresUserGesture = false
+                }
+                webViewClient = object : WebViewClient() {
+                    override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
+                        val reqUrl = request.url.toString()
+                        if (reqUrl.contains(".m3u8") || reqUrl.contains(".mpd")) {
+                            if (cont.isActive) cont.resume(reqUrl)
+                            destroy()
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
+                    override fun onPageFinished(view: WebView, url: String) {
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            if (cont.isActive) {
+                                view.evaluateJavascript("(function(){ return typeof playbackURL !== 'undefined' ? playbackURL : null; })();") { result ->
+                                    if (cont.isActive) {
+                                        if (result != "null" && result.isNotBlank()) cont.resume(result.trim('"'))
+                                        else cont.resume(null)
+                                        view.destroy()
+                                    }
+                                }
+                            } else {
+                                view.destroy()
+                            }
+                        }, 1500)
+                    }
+                }
+                loadUrl(embedUrl)
+            }
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (cont.isActive) {
+                    cont.resume(null)
+                    webView.destroy()
+                }
+            }, 30000)
         }
     }
 
