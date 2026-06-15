@@ -22,9 +22,11 @@ class LiveSportsProvider : MainAPI() {
     // --- CONFIGURATION ---
     private val defaultCricifyBaseUrl = "https://cfymarkscanjiostar80.top"
     
-    // Routing Constants
-    private const val TYPE_CNC = "cnc"
-    private const val TYPE_CRICIFY = "cricify"
+    // Companion object fixes the "Const val is only allowed on top level" compiler error
+    companion object {
+        private const val TYPE_CNC = "cnc"
+        private const val TYPE_CRICIFY = "cricify"
+    }
 
     // --- DATA MODELS ---
     data class TargetPayload(val type: String, val jsonPayload: String)
@@ -161,13 +163,27 @@ class LiveSportsProvider : MainAPI() {
                 try {
                     val m3uText = app.get(streamUrl).text
                     m3uText.lines().filter { it.startsWith("http") }.forEachIndexed { index, link ->
-                        callback.invoke(newExtractorLink(this.name, "${payload.title} - Server ${index + 1}", link.trim(), "", Qualities.Unknown.value, link.contains(".m3u8")))
+                        callback.invoke(
+                            newExtractorLink(
+                                source = this.name,
+                                name = "${payload.title} - Server ${index + 1}",
+                                url = link.trim(),
+                                type = if (link.contains(".m3u8")) ExtractorLinkType.M3U8 else INFER_TYPE
+                            )
+                        )
                     }
                 } catch (e: Exception) { e.printStackTrace() }
             } else {
-                callback.invoke(newExtractorLink(this.name, payload.title, streamUrl, "", Qualities.Unknown.value, streamUrl.contains(".m3u8")) {
-                    this.headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-                })
+                callback.invoke(
+                    newExtractorLink(
+                        source = this.name,
+                        name = payload.title,
+                        url = streamUrl,
+                        type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else INFER_TYPE
+                    ) {
+                        this.headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                    }
+                )
             }
             return true
 
