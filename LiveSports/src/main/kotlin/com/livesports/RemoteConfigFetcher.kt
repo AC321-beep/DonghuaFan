@@ -13,16 +13,10 @@ import java.util.concurrent.TimeUnit
 object RemoteConfigFetcher {
     private const val PACKAGE_NAME = "com.livesports"
     
-    // Fallback – will be overridden by BuildConfig if available
-    private val API_KEY: String by lazy {
-        try { BuildConfig.LIVESPORTS_FIREBASE_API_KEY } catch (e: Exception) { "" }
-    }
-    private val APP_ID: String by lazy {
-        try { BuildConfig.LIVESPORTS_FIREBASE_APP_ID } catch (e: Exception) { "" }
-    }
-    private val PROJECT_NUMBER: String by lazy {
-        try { BuildConfig.LIVESPORTS_FIREBASE_PROJECT_NUMBER } catch (e: Exception) { "" }
-    }
+    // No BuildConfig – always return null (secrets can be added later)
+    private fun getApiKey() = ""
+    private fun getAppId() = ""
+    private fun getProjectNumber() = ""
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -32,14 +26,17 @@ object RemoteConfigFetcher {
     data class RemoteConfigResponse(val entries: Map<String, String>? = null)
 
     suspend fun fetchRemoteConfig(): Map<String, String>? {
-        if (API_KEY.isBlank() || APP_ID.isBlank() || PROJECT_NUMBER.isBlank()) return null
+        val apiKey = getApiKey()
+        val appId = getAppId()
+        val projNum = getProjectNumber()
+        if (apiKey.isBlank() || appId.isBlank() || projNum.isBlank()) return null
         return withContext(Dispatchers.IO) {
             try {
-                val url = "https://firebaseremoteconfig.googleapis.com/v1/projects/$PROJECT_NUMBER/namespaces/firebase:fetch"
+                val url = "https://firebaseremoteconfig.googleapis.com/v1/projects/$projNum/namespaces/firebase:fetch"
                 val payload = """
                     {
                         "appInstanceId": "${UUID.randomUUID().toString().replace("-", "")}",
-                        "appId": "$APP_ID",
+                        "appId": "$appId",
                         "packageName": "$PACKAGE_NAME",
                         "appVersion": "5.0",
                         "sdkVersion": "22.1.0"
@@ -47,7 +44,7 @@ object RemoteConfigFetcher {
                 """.trimIndent()
                 val request = Request.Builder().url(url)
                     .post(payload.toRequestBody("application/json".toMediaType()))
-                    .header("X-Goog-Api-Key", API_KEY)
+                    .header("X-Goog-Api-Key", apiKey)
                     .header("X-Android-Package", PACKAGE_NAME)
                     .build()
                 val response = client.newCall(request).execute()
