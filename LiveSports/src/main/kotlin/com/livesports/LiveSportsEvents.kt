@@ -35,7 +35,7 @@ class LiveSportsEvents : MainAPI() {
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    // Data classes (same as original)
+    // Data classes
     data class LiveEventData(
         val id: Int, val title: String, val slug: String, val cat: String?,
         val formats: List<LiveEventFormat>?, val eventInfo: LiveEventInfo?
