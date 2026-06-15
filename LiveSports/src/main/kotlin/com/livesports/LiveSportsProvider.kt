@@ -26,8 +26,6 @@ import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 class LiveSportsProvider : MainAPI() {
     companion object {
@@ -350,13 +348,14 @@ class LiveSportsProvider : MainAPI() {
     }
 
     private suspend fun loadEmbedInWebView(embedUrl: String): String? {
-        return withContext(Dispatchers.Main) {
-            suspendCoroutine { continuation ->
+        // Native Android Handler eliminates the need for kotlinx.coroutines
+        return suspendCoroutine { continuation ->
+            Handler(Looper.getMainLooper()).post {
                 try {
                     val ctx = context
                     if (ctx == null) {
                         continuation.resume(null)
-                        return@suspendCoroutine
+                        return@post
                     }
 
                     val webView = WebView(ctx)
@@ -409,7 +408,7 @@ class LiveSportsProvider : MainAPI() {
                                 Handler(Looper.getMainLooper()).postDelayed({
                                     if (!urlCaptured) {
                                         try { webView.destroy() } catch (e: Exception) {}
-                                        continuation.resume(null)
+                                        try { continuation.resume(null) } catch (e: Exception) {}
                                     }
                                 }, 3000)
                             }
@@ -428,7 +427,7 @@ class LiveSportsProvider : MainAPI() {
                     }, 15000)
 
                 } catch (e: Exception) {
-                    continuation.resume(null)
+                    try { continuation.resume(null) } catch (ex: Exception) {}
                 }
             }
         }
