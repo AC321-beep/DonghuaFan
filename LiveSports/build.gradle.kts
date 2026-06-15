@@ -23,9 +23,21 @@ android {
     namespace = "com.livesports"
     compileSdk = 35
 
+    // ENABLE BUILD CONFIG GENERATION
+    buildFeatures {
+        buildConfig = true
+    }
+
     defaultConfig {
         minSdk = 21
         targetSdk = 35
+        
+        // BRIDGE TO GITHUB ACTIONS SECRETS
+        buildConfigField("String", "LIVESPORTS_FIREBASE_API_KEY", "\"${System.getenv("LIVESPORTS_FIREBASE_API_KEY") ?: ""}\"")
+        buildConfigField("String", "LIVESPORTS_FIREBASE_APP_ID", "\"${System.getenv("LIVESPORTS_FIREBASE_APP_ID") ?: ""}\"")
+        buildConfigField("String", "LIVESPORTS_FIREBASE_PROJECT_NUMBER", "\"${System.getenv("LIVESPORTS_FIREBASE_PROJECT_NUMBER") ?: ""}\"")
+        buildConfigField("String", "LIVESPORTS_PROVIDER_SECRET1", "\"${System.getenv("LIVESPORTS_PROVIDER_SECRET1") ?: ""}\"")
+        buildConfigField("String", "LIVESPORTS_PROVIDER_SECRET2", "\"${System.getenv("LIVESPORTS_PROVIDER_SECRET2") ?: ""}\"")
     }
 
     compileOptions {
