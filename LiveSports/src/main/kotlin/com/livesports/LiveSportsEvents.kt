@@ -8,6 +8,8 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -17,7 +19,6 @@ import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 class LiveSportsEvents : MainAPI() {
     companion object {
