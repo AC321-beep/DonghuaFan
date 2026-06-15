@@ -3,8 +3,10 @@ package com.livesports
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
@@ -226,7 +228,7 @@ class IPTVProvider(
         }
     }
 
-    private fun createExtractor(url: String, type: Any, headers: Map<String, String>, customName: String = name): ExtractorLink {
+    private suspend fun createExtractor(url: String, type: ExtractorLinkType?, headers: Map<String, String>, customName: String = name): ExtractorLink {
         return newExtractorLink(customName, customName, url, type) {
             referer = ""
             quality = Qualities.Unknown.value
