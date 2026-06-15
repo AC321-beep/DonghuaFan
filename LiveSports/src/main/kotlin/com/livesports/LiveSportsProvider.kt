@@ -139,40 +139,51 @@ class LiveSportsProvider : MainAPI() {
             val payload = parseJson<CncPayload>(target.jsonPayload)
             val streamUrl = payload.streamUrl
 
-            // Parse M3U text files to extract the real video URLs
-            if (streamUrl.endsWith(".m3u", ignoreCase = true) || streamUrl.endsWith(".txt", ignoreCase = true)) {
-                try {
-                    val m3uText = app.get(streamUrl).text
-                    val links = m3uText.lines().filter { it.trim().startsWith("http") }
-                    
-                    if (links.isNotEmpty()) {
-                        links.forEachIndexed { index, link ->
+            try {
+                // Fetch the response content dynamically to safely inspect format structure
+                val response = app.get(streamUrl, headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"))
+                val bodyText = response.text
+
+                // Sniffer checking if the payload is actually an internal multi-channel list file
+                if (bodyText.contains("#EXTM3U") || bodyText.contains("#EXTINF")) {
+                    var currentName = ""
+                    bodyText.lines().forEach { line ->
+                        val trimmed = line.trim()
+                        if (trimmed.startsWith("#EXTINF")) {
+                            currentName = trimmed.substringAfterLast(",").trim()
+                        } else if (trimmed.startsWith("http")) {
+                            val label = if (currentName.isNotEmpty() && !currentName.startsWith("#")) currentName else "Channel Stream"
+                            val type = when {
+                                trimmed.contains(".mpd") -> ExtractorLinkType.DASH
+                                trimmed.contains(".m3u8") -> ExtractorLinkType.M3U8
+                                else -> ExtractorLinkType.M3U8
+                            }
                             callback.invoke(
                                 newExtractorLink(
                                     source = this.name,
-                                    name = "${payload.title} - Server ${index + 1}",
-                                    url = link.trim(),
-                                    type = ExtractorLinkType.M3U8 // Force M3U8
-                                )
+                                    name = "${payload.title} - $label",
+                                    url = trimmed,
+                                    type = type
+                                ) {
+                                    this.headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                                }
                             )
+                            currentName = ""
                         }
-                    } else {
-                        // Fallback if the file didn't contain raw HTTP lines
-                        callback.invoke(newExtractorLink(this.name, payload.title, streamUrl, ExtractorLinkType.M3U8))
                     }
-                } catch (e: Exception) { e.printStackTrace() }
-            } else {
-                // Cloudflare Workers - Bypass inference and force M3U8 for ExoPlayer
-                callback.invoke(
-                    newExtractorLink(
-                        source = this.name,
-                        name = payload.title,
-                        url = streamUrl,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-                    }
-                )
+                } else {
+                    // Direct target media link fallback
+                    val type = if (streamUrl.contains(".mpd")) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
+                    callback.invoke(
+                        newExtractorLink(this.name, payload.title, streamUrl, type) {
+                            this.headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                        }
+                    )
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                // Fail-safe default connection configuration
+                callback.invoke(newExtractorLink(this.name, payload.title, streamUrl, INFER_TYPE))
             }
             return true
 
@@ -215,10 +226,16 @@ class LiveSportsProvider : MainAPI() {
                     }
                 } else {
                     val finalHeaders = headers.toMutableMap()
-                    if (cleanUrl.contains(".m3u8") && !finalHeaders.containsKey("User-Agent")) {
+                    if (!finalHeaders.containsKey("User-Agent")) {
                         finalHeaders["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
                     }
-                    callback.invoke(newExtractorLink(this.name, serverName, cleanUrl, ExtractorLinkType.M3U8) {
+                    // Prevent 3002 mismatch on normal links by adapting format inference dynamically
+                    val linkType = when {
+                        cleanUrl.contains(".m3u8") -> ExtractorLinkType.M3U8
+                        cleanUrl.contains(".mpd") -> ExtractorLinkType.DASH
+                        else -> INFER_TYPE
+                    }
+                    callback.invoke(newExtractorLink(this.name, serverName, cleanUrl, linkType) {
                         this.referer = ""
                         this.quality = Qualities.Unknown.value
                         if (finalHeaders.isNotEmpty()) this.headers = finalHeaders
