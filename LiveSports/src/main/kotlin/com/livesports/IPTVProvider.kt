@@ -60,7 +60,7 @@ class IPTVProvider(
         val homeLists = data.items.groupBy { it.attributes["group-title"] ?: "Uncategorized" }
             .map { (group, channels) ->
                 val items = channels.map { channel ->
-                    val loadData = LiveEventLoadData(
+                    val loadData = LoadData(
                         url = channel.url ?: "",
                         title = channel.title ?: "Unknown",
                         poster = channel.attributes["tvg-logo"] ?: "",
@@ -90,7 +90,7 @@ class IPTVProvider(
         
         return data.items.filter { it.title?.contains(query, ignoreCase = true) == true }
             .map { channel ->
-                val loadData = LiveEventLoadData(
+                val loadData = LoadData(
                     url = channel.url ?: "", title = channel.title ?: "",
                     poster = channel.attributes["tvg-logo"] ?: "",
                     nation = channel.attributes["group-title"] ?: "",
@@ -107,7 +107,7 @@ class IPTVProvider(
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val data = parseJson<LiveEventLoadData>(url)
+        val data = parseJson<LoadData>(url)
         return newLiveStreamLoadResponse(data.title, url, url) {
             this.posterUrl = data.poster
             this.plot = data.nation
@@ -120,7 +120,7 @@ class IPTVProvider(
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val loadData = parseJson<LiveEventLoadData>(data)
+        val loadData = parseJson<LoadData>(data)
         val headers = buildMap {
             putAll(loadData.headers)
             if (loadData.userAgent.isNotBlank()) put("User-Agent", loadData.userAgent)
@@ -136,7 +136,7 @@ class IPTVProvider(
         return true
     }
 
-    private fun handleMpd(loadData: LiveEventLoadData, headers: Map<String, String>, callback: (ExtractorLink) -> Unit) {
+    private suspend fun handleMpd(loadData: LoadData, headers: Map<String, String>, callback: (ExtractorLink) -> Unit) {
         val hasValidKeys = loadData.key.isNotBlank() && loadData.keyid.isNotBlank()
         val hasLicenseUrl = loadData.licenseUrl.isNotBlank()
 
@@ -147,7 +147,7 @@ class IPTVProvider(
             if (loadData.drmKeys.isNotEmpty()) {
                 val mpdXml = getMpdStream(loadData.url, headers)
                 val mpdKid = Regex("""cenc:default_KID=["']([0-9a-fA-F\-]{36})["']""")
-                    .find(mpdXml)?.groupValues?.get(1)?.replace("-", "")?.lowercase()
+                    .find(mpdXml)?.groups?.get(1)?.value?.replace("-", "")?.lowercase()
                 if (!mpdKid.isNullOrEmpty()) {
                     val mapped = loadData.drmKeys[mpdKid]
                     if (!mapped.isNullOrEmpty()) {
@@ -165,7 +165,7 @@ class IPTVProvider(
         } else if (hasLicenseUrl) {
             val mpdXml = getMpdStream(loadData.url, headers)
             val kidHex = Regex("""cenc:default_KID=["']([0-9a-fA-F\-]{36})["']""")
-                .find(mpdXml)?.groupValues?.get(1) ?: UUID.randomUUID().toString()
+                .find(mpdXml)?.groups?.get(1)?.value ?: UUID.randomUUID().toString()
                 
             val kidBase64 = kidHex.replace("-", "").hexToBase64UrlOrNull() ?: kidHex
             val keyBase64 = fetchKeyFromLicenseServer(loadData.licenseUrl, kidBase64)
@@ -216,11 +216,17 @@ class IPTVProvider(
         } catch (e: Exception) { "" }
     }
 
-    private fun createExtractor(url: String, type: ExtractorLinkType?, headers: Map<String, String>, customName: String = name): ExtractorLink {
+    private suspend fun createExtractor(url: String, type: ExtractorLinkType?, headers: Map<String, String>, customName: String = name): ExtractorLink {
         return newExtractorLink(customName, customName, url, type) {
             referer = ""
             quality = Qualities.Unknown.value
             if (headers.isNotEmpty()) this.headers = headers
         }
     }
+
+    data class LoadData(
+        val url: String, val title: String, val poster: String, val nation: String,
+        val key: String, val keyid: String, val userAgent: String, val cookie: String,
+        val licenseUrl: String, val drmKeys: Map<String, String>, val headers: Map<String, String>
+    )
 }
