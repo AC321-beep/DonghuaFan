@@ -2,12 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.livesports">
 
-    <uses-permission android:name="android.permission.INTERNET" />
-
-    <application>
-        <meta-data
-            android:name="CloudstreamPlugin"
-            android:value="com.livesports.LiveSportsPlugin" />
-    </application>
+    <!-- Allows the extension to read website HTML data -->
+    <uses-permission android:name="android.permission.INTERNET"/>
 
 </manifest>
