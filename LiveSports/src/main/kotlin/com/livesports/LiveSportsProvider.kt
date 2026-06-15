@@ -1,5 +1,6 @@
 package com.livesports
 
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
@@ -8,6 +9,8 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.utils.newDrmExtractorLink
+import com.lagradost.cloudstream3.utils.CLEARKEY_UUID
 import com.lagradost.cloudstream3.app
 
 class LiveSportsProvider : MainAPI() {
@@ -16,15 +19,34 @@ class LiveSportsProvider : MainAPI() {
     override val hasMainPage = true
     override var lang = "en"
 
-    // Data class to cleanly pass the direct CNC stream links between the UI and the Video Player
-    data class StreamPayload(
-        val title: String,
-        val poster: String?,
-        val streamUrl: String
+    // --- CONFIGURATION ---
+    private val defaultCricifyBaseUrl = "https://cfymarkscanjiostar80.top"
+    
+    // Routing Constants
+    private const val TYPE_CNC = "cnc"
+    private const val TYPE_CRICIFY = "cricify"
+
+    // --- DATA MODELS ---
+    data class TargetPayload(val type: String, val jsonPayload: String)
+    data class CncPayload(val title: String, val poster: String?, val streamUrl: String)
+    
+    data class ChannelStreamResponse(
+        val streamUrls: List<StreamUrl>?,
+        val related: List<LiveEventData>?,
+        val prevChannel: String?,
+        val nextChannel: String?
+    )
+
+    data class StreamUrl(
+        val api: String?, 
+        val id: Int?,
+        val link: String?, 
+        val title: String?, 
+        val type: String?, 
+        val webLink: String?
     )
 
     // CNC's active, unencrypted gateway list
-    // You can seamlessly add or update links here whenever CNC updates their repository!
     private val cncWorkingEndpoints = listOf(
         mapOf("title" to "TATA PLAY", "image" to "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQz_qYe3Y4S5bXXVlPtXQnqtAkLw1-no57QHhPyMgWE0SQmxujzHxZKiDs&s=10", "catLink" to "https://hotstarlive.delta-cloud.workers.dev/?token=240bb9-374e2e-3c13f0-4a7xz5"),
         mapOf("title" to "HOTSTAR", "image" to "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRWwYjMvB58DMLsL9Ii2fhvw6NBYvD1iVCjOMU8TXBLJt0eibLGOjoRkLJP&s=10", "catLink" to "https://hotstar-live-event.alpha-circuit.workers.dev/?token=a13d9c-4b782a-6c90fd-9a1b84"),
@@ -38,100 +60,196 @@ class LiveSportsProvider : MainAPI() {
         mapOf("title" to "T SPORTS", "image" to "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRJ0QvfKyjAqcCOumIXjcuYg505GnaBeVk2lQ&usqp=CAU", "catLink" to "https://fifabangladesh2-xyz-ekkj.spidy.online/AYN/tsports.m3u")
     )
 
-    // 1. BUILDS THE HOMEPAGE INSTANTLY (No API Decryption Delay)
+    // 1. BUILDS THE HOMEPAGE (Merging CNC + Cricify with Premium UI)
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val channelCards = cncWorkingEndpoints.mapNotNull { endpoint ->
+        val homePages = mutableListOf<HomePageList>()
+
+        // PART A: Always load CNC networks instantly
+        val cncCards = cncWorkingEndpoints.mapNotNull { endpoint ->
             val title = endpoint["title"] ?: return@mapNotNull null
             val image = endpoint["image"]
             val link = endpoint["catLink"] ?: return@mapNotNull null
 
-            // We bundle the exact stream URL into the click payload
-            val payload = StreamPayload(title, image, link)
+            val payload = TargetPayload(TYPE_CNC, CncPayload(title, image, link).toJson())
 
-            newLiveSearchResponse(
-                name = title,
-                url = payload.toJson(),
-                type = TvType.Live
-            ) {
-                this.posterUrl = image
-            }
+            newLiveSearchResponse(title, payload.toJson(), TvType.Live) { this.posterUrl = image }
         }
+        homePages.add(HomePageList("📺 Live Networks (CNC Sync)", cncCards, isHorizontalImages = true))
 
-        val homePages = listOf(
-            HomePageList("Live Networks (CNC Sync)", channelCards)
-        )
+        // PART B: Attempt to load Cricify safely and format Match Cards perfectly
+        try {
+            val baseUrl = try {
+                FirebaseRemoteConfigFetcher.getProviderApiUrl() ?: defaultCricifyBaseUrl
+            } catch (e: Exception) {
+                defaultCricifyBaseUrl
+            } catch (e: LinkageError) {
+                defaultCricifyBaseUrl
+            }
+            
+            val apiUrl = "$baseUrl/categories/live-events.txt"
+
+            val encryptedPayload = app.get(apiUrl).text
+            if (encryptedPayload.isNotBlank()) {
+                val decryptedJson = CryptoUtils.decryptData(encryptedPayload)
+                if (!decryptedJson.isNullOrBlank()) {
+                    val events = parseJson<List<LiveEventData>>(decryptedJson).filter { it.publish == 1 }
+
+                    val cricifyGroups = events.groupBy { it.cat ?: it.eventInfo?.eventCat ?: "Live Events" }.map { (category, categoryEvents) ->
+                        val searchResponses = categoryEvents.map { event ->
+                            val payload = TargetPayload(TYPE_CRICIFY, event.toJson())
+                            
+                            val info = event.eventInfo
+                            val displayTitle = if (!info?.teamA.isNullOrBlank() && !info?.teamB.isNullOrBlank()) {
+                                val isLive = event.title.contains("live", ignoreCase = true) || info?.isHot == "1"
+                                val prefix = if (isLive) "🔴 " else "➡️ "
+                                "$prefix${info.teamA} vs ${info.teamB}"
+                            } else {
+                                event.title
+                            }
+
+                            newLiveSearchResponse(displayTitle, payload.toJson(), TvType.Live) {
+                                this.posterUrl = event.image ?: info?.eventLogo
+                            }
+                        }
+                        HomePageList(category, searchResponses, isHorizontalImages = true)
+                    }
+                    homePages.addAll(cricifyGroups)
+                }
+            }
+        } catch (e: Exception) {
+            // Silently catch SERVFAIL or offline domain errors to safeguard home screen loading
+        }
 
         return newHomePageResponse(homePages, hasNext = false)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        return emptyList() // Disabled for direct list routing
+        return emptyList()
     }
 
     // 2. LOADS THE MATCH DETAILS
     override suspend fun load(url: String): LoadResponse? {
-        val payload = parseJson<StreamPayload>(url)
-        
-        return newLiveStreamLoadResponse(
-            name = payload.title,
-            url = url,
-            dataUrl = url
-        ) {
-            this.posterUrl = payload.poster
+        val target = parseJson<TargetPayload>(url)
+
+        return if (target.type == TYPE_CNC) {
+            val payload = parseJson<CncPayload>(target.jsonPayload)
+            newLiveStreamLoadResponse(payload.title, url, url) { this.posterUrl = payload.poster }
+        } else {
+            val event = parseJson<LiveEventData>(target.jsonPayload)
+            newLiveStreamLoadResponse(event.title, url, url) {
+                this.posterUrl = event.image ?: event.eventInfo?.eventLogo
+                this.plot = event.eventInfo?.startTime?.let { "Starts: $it" }
+            }
         }
     }
 
-    // 3. EXTRACTS THE VIDEO STREAMS DIRECTLY
+    // 3. EXTRACTS THE VIDEO STREAMS
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val payload = parseJson<StreamPayload>(data)
-        val streamUrl = payload.streamUrl
+        val target = parseJson<TargetPayload>(data)
 
-        // Some CNC endpoints point to a raw M3U text file on GitHub instead of an M3U8 video feed.
-        // If it's a playlist file, we fetch it and pass the internal streams.
-        if (streamUrl.endsWith(".m3u", ignoreCase = true) && streamUrl.contains("githubusercontent")) {
-            try {
-                val m3uText = app.get(streamUrl).text
-                // Find all lines that look like a URL in the playlist
-                val links = m3uText.lines().filter { it.startsWith("http") }
-                
-                links.forEachIndexed { index, link ->
-                    callback.invoke(
-                        newExtractorLink(
-                            source = this.name,
-                            name = "${payload.title} - Server ${index + 1}",
-                            url = link.trim(),
-                            referer = "",
-                            quality = Qualities.Unknown.value,
-                            type = if (link.contains(".m3u8")) ExtractorLinkType.M3U8 else INFER_TYPE
-                        )
-                    )
-                }
-                return true
+        if (target.type == TYPE_CNC) {
+            // --- CNC EXTRACTION ---
+            val payload = parseJson<CncPayload>(target.jsonPayload)
+            val streamUrl = payload.streamUrl
+
+            if (streamUrl.endsWith(".m3u", ignoreCase = true) && streamUrl.contains("githubusercontent")) {
+                try {
+                    val m3uText = app.get(streamUrl).text
+                    m3uText.lines().filter { it.startsWith("http") }.forEachIndexed { index, link ->
+                        callback.invoke(newExtractorLink(this.name, "${payload.title} - Server ${index + 1}", link.trim(), "", Qualities.Unknown.value, link.contains(".m3u8")))
+                    }
+                } catch (e: Exception) { e.printStackTrace() }
+            } else {
+                callback.invoke(newExtractorLink(this.name, payload.title, streamUrl, "", Qualities.Unknown.value, streamUrl.contains(".m3u8")) {
+                    this.headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                })
+            }
+            return true
+
+        } else {
+            // --- CRICIFY EXTRACTION ---
+            val event = parseJson<LiveEventData>(target.jsonPayload)
+            val baseUrl = try {
+                FirebaseRemoteConfigFetcher.getProviderApiUrl() ?: defaultCricifyBaseUrl
             } catch (e: Exception) {
-                e.printStackTrace()
+                defaultCricifyBaseUrl
+            }
+            val streamUrl = "$baseUrl/channels/${event.slug.lowercase()}.txt"
+
+            val encryptedStreamPayload = app.get(streamUrl).text
+            if (encryptedStreamPayload.isBlank()) return false
+
+            val decryptedStreamJson = CryptoUtils.decryptData(encryptedStreamPayload) ?: return false
+            val streamResponse = parseJson<ChannelStreamResponse>(decryptedStreamJson)
+
+            streamResponse.streamUrls?.forEach { stream ->
+                val serverName = stream.title ?: "Server"
+                val rawLink = stream.link ?: return@forEach
+                val (cleanUrl, headers) = parseStreamLink(rawLink)
+
+                if (stream.type == "7" && stream.api != null) {
+                    val drmInfo = stream.api.split(":")
+                    if (drmInfo.size == 2) {
+                        val drmKidBytes = drmInfo[0].replace("-", "").chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+                        val drmKidBase64 = Base64.encodeToString(drmKidBytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+                        val drmKeyBytes = drmInfo[1].replace("-", "").chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+                        val drmKeyBase64 = Base64.encodeToString(drmKeyBytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+                        
+                        val drmHeaders = headers.toMutableMap()
+                        drmHeaders["drm_scheme"] = "clearkey"
+                        drmHeaders["drm_license_key"] = "{\"keys\":[{\"kty\":\"oct\",\"k\":\"${drmKeyBase64}\",\"kid\":\"${drmKidBase64}\"}]}"
+
+                        callback.invoke(newDrmExtractorLink(this.name, "$serverName (DRM)", cleanUrl, if (cleanUrl.contains(".m3u8") || cleanUrl.contains(".mpd")) ExtractorLinkType.DASH else INFER_TYPE, CLEARKEY_UUID) {
+                            this.referer = ""
+                            this.quality = Qualities.Unknown.value
+                            this.headers = drmHeaders
+                            this.kid = drmKidBase64
+                            this.key = drmKeyBase64
+                        })
+                    }
+                } else {
+                    val finalHeaders = headers.toMutableMap()
+                    if (cleanUrl.contains(".m3u8") && !finalHeaders.containsKey("User-Agent")) {
+                        finalHeaders["User-Agent"] = "Mozilla/5.0 (Linux; Android 10; Pixel 3 XL) AppleWebKit/537.36"
+                    }
+                    callback.invoke(newExtractorLink(this.name, serverName, cleanUrl, if (cleanUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else INFER_TYPE) {
+                        this.referer = ""
+                        this.quality = Qualities.Unknown.value
+                        if (finalHeaders.isNotEmpty()) this.headers = finalHeaders
+                    })
+                }
+            }
+            return true
+        }
+    }
+
+    private fun parseStreamLink(link: String): Pair<String, Map<String, String>> {
+        val headers = mutableMapOf<String, String>()
+        if (!link.contains("|")) return Pair(link, headers)
+        
+        val parts = link.split("|", limit = 2)
+        val url = parts[0]
+        if (parts.size > 1) {
+            parts[1].split("&").forEach { headerPair ->
+                val keyValue = headerPair.split("=", limit = 2)
+                if (keyValue.size == 2) {
+                    val key = keyValue[0].trim()
+                    val headerName = when (key.lowercase()) {
+                        "user-agent" -> "User-Agent"
+                        "referer" -> "Referer"
+                        "origin" -> "Origin"
+                        "cookie" -> "Cookie"
+                        else -> key
+                    }
+                    headers[headerName] = keyValue[1].trim()
+                }
             }
         }
-
-        // For Cloudflare Workers and direct M3U8 feeds, pass them straight to ExoPlayer
-        callback.invoke(
-            newExtractorLink(
-                source = this.name,
-                name = payload.title,
-                url = streamUrl,
-                referer = "",
-                quality = Qualities.Unknown.value,
-                type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else INFER_TYPE
-            ) {
-                // Attach a standard User-Agent just in case the worker checks for one
-                this.headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-            }
-        )
-
-        return true
+        return Pair(url, headers)
     }
 }
