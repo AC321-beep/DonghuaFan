@@ -99,9 +99,10 @@ class FifaLive : MainAPI() {
         try {
             val subStreams = parseJson<List<CloudPlayStream>>(resText)
             if (subStreams.isNotEmpty()) {
-                val allShows = subStreams.amap { subStream ->
+                // Using flatMap instead of amap.flatten for optimal synchronous parsing
+                val allShows = subStreams.flatMap { subStream ->
                     fetchChannels(subStream.url, subStream.logo ?: fallbackLogo)
-                }.flatten()
+                }
                 shows.addAll(allShows)
             }
         } catch (_: Exception) {}
@@ -172,9 +173,8 @@ class FifaLive : MainAPI() {
         val decryptedJson = decryptPayload(res.payload, res.iv)
         val streams = parseJson<CloudPlayStreams>(decryptedJson).streams
 
-        val allChannels = streams.amap { stream -> fetchChannels(stream.url, stream.logo) }.flatten()
+        val allChannels = streams.flatMap { stream -> fetchChannels(stream.url, stream.logo) }
         
-        // Removed the invalid `.plot` reference. This is perfectly safe now!
         return allChannels.filter { 
             isFifaRelated(it.name) && it.name.contains(query, ignoreCase = true) 
         }
@@ -235,13 +235,27 @@ class FifaLive : MainAPI() {
                 keyStr = getDRMKeysFromLicenseServer(licenseUrl, kidStr)
             }
 
+            // [MAINTAINED] Our custom fix for DRM 6003 crash
+            val isClearKey = kidStr.isNotEmpty() && keyStr.isNotEmpty()
+            val finalHeaders = channel.headers?.toMutableMap() ?: mutableMapOf()
+            
+            if (isClearKey) {
+                finalHeaders["drm_scheme"] = "clearkey"
+                finalHeaders["drm_license_key"] = "{\"keys\":[{\"kty\":\"oct\",\"k\":\"$keyStr\",\"kid\":\"$kidStr\"}]}"
+            }
+
             callback.invoke(
-                newDrmExtractorLink(this.name, channel.name ?: "FIFA DASH", channel.mpd_url, INFER_TYPE,
-                    if (kidStr.isNotEmpty() && keyStr.isNotEmpty()) CLEARKEY_UUID else UUID.fromString("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")
+                newDrmExtractorLink(
+                    this.name, 
+                    channel.name ?: "FIFA DASH", 
+                    channel.mpd_url, 
+                    INFER_TYPE,
+                    if (isClearKey) CLEARKEY_UUID else UUID.fromString("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")
                 ) {
-                    channel.headers?.let { this.headers = it }
-                    if (kidStr.isNotEmpty() && keyStr.isNotEmpty()) {
-                        this.kid = kidStr; this.key = keyStr
+                    this.headers = finalHeaders
+                    if (isClearKey) {
+                        this.kid = kidStr
+                        this.key = keyStr
                     } else if (licenseUrl.isNotEmpty()) {
                         this.licenseUrl = licenseUrl
                     }
@@ -250,12 +264,21 @@ class FifaLive : MainAPI() {
         } else if (channel.m3u8_url != null) {
             val isTs = channel.m3u8_url.contains(".ts", ignoreCase = true)
             callback.invoke(
-                newExtractorLink(this.name, channel.name ?: "FIFA HLS", channel.m3u8_url,
+                newExtractorLink(
+                    this.name, 
+                    channel.name ?: "FIFA HLS", 
+                    channel.m3u8_url,
                     if (isTs) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
                 ) {
-                    channel.headers?.let { this.headers = it }
-                    channel.headers?.amap { (key, value) ->
-                        if (key.equals("referer", ignoreCase = true)) this.referer = value
+                    if (channel.headers != null) {
+                        this.headers = channel.headers
+                    }
+                    
+                    // [MERGED] The developer's newly committed Referer optimization
+                    channel.headers?.forEach { (key, value) ->
+                        if (key.equals("referer", ignoreCase = true)) {
+                            this.referer = value
+                        }
                     }
                 }
             )
