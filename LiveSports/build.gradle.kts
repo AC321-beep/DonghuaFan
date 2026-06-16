@@ -56,7 +56,8 @@ cloudstream {
     status = 1
     tvTypes = listOf("Live")
     language = "en"
-    version = 7 
+    version = 8 
+    iconUrl = "https://iconscout.com/icon/live-sport-icon_2713697"
 }
 
 dependencies {
