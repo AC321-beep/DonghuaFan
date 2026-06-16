@@ -1,6 +1,5 @@
 package com.livesports
 
-import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
@@ -35,9 +34,7 @@ class IPTVProvider(
     )
 
     private val customHttpClient by lazy {
-        OkHttpClient.Builder()
-            .addInterceptor(HeaderReplacementInterceptor(defaultHeaders))
-            .build()
+        OkHttpClient.Builder().addInterceptor(HeaderReplacementInterceptor(defaultHeaders)).build()
     }
 
     private fun getWithCustomHeaders(url: String): String {
@@ -60,18 +57,12 @@ class IPTVProvider(
         val homeLists = data.items.groupBy { it.attributes["group-title"] ?: "Uncategorized" }
             .map { (group, channels) ->
                 val items = channels.map { channel ->
-                    val loadData = LoadData(
-                        url = channel.url ?: "",
-                        title = channel.title ?: "Unknown",
-                        poster = channel.attributes["tvg-logo"] ?: "",
-                        nation = group,
-                        key = channel.key ?: "",
-                        keyid = channel.keyid ?: "",
-                        userAgent = channel.userAgent ?: "",
-                        cookie = channel.cookie ?: "",
-                        licenseUrl = channel.licenseUrl ?: "",
-                        drmKeys = channel.drmKeys,
-                        headers = channel.headers
+                    val loadData = IptvLoadData(
+                        url = channel.url ?: "", title = channel.title ?: "Unknown",
+                        poster = channel.attributes["tvg-logo"] ?: "", nation = group,
+                        key = channel.key ?: "", keyid = channel.keyid ?: "",
+                        userAgent = channel.userAgent ?: "", cookie = channel.cookie ?: "",
+                        licenseUrl = channel.licenseUrl ?: "", drmKeys = channel.drmKeys, headers = channel.headers
                     )
                     newLiveSearchResponse(channel.title ?: "Channel", loadData.toJson(), TvType.Live) {
                         this.posterUrl = channel.attributes["tvg-logo"]
@@ -83,44 +74,15 @@ class IPTVProvider(
         return newHomePageResponse(homeLists, false)
     }
 
-    override suspend fun search(query: String): List<SearchResponse> {
-        val raw = getWithCustomHeaders(mainUrl)
-        val decrypted = decryptContent(raw)
-        val data = IptvPlaylistParser().parseM3U(decrypted)
-        
-        return data.items.filter { it.title?.contains(query, ignoreCase = true) == true }
-            .map { channel ->
-                val loadData = LoadData(
-                    url = channel.url ?: "", title = channel.title ?: "",
-                    poster = channel.attributes["tvg-logo"] ?: "",
-                    nation = channel.attributes["group-title"] ?: "",
-                    key = channel.key ?: "", keyid = channel.keyid ?: "",
-                    userAgent = channel.userAgent ?: "", cookie = channel.cookie ?: "",
-                    licenseUrl = channel.licenseUrl ?: "", drmKeys = channel.drmKeys,
-                    headers = channel.headers
-                )
-                newLiveSearchResponse(channel.title ?: "", loadData.toJson(), TvType.Live) {
-                    this.posterUrl = channel.attributes["tvg-logo"]
-                    this.lang = channel.attributes["group-title"]
-                }
-            }
-    }
+    override suspend fun search(query: String): List<SearchResponse> { return emptyList() }
 
     override suspend fun load(url: String): LoadResponse {
-        val data = parseJson<LoadData>(url)
-        return newLiveStreamLoadResponse(data.title, url, url) {
-            this.posterUrl = data.poster
-            this.plot = data.nation
-        }
+        val data = parseJson<IptvLoadData>(url)
+        return newLiveStreamLoadResponse(data.title, url, url) { this.posterUrl = data.poster; this.plot = data.nation }
     }
 
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val loadData = parseJson<LoadData>(data)
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        val loadData = parseJson<IptvLoadData>(data)
         val headers = buildMap {
             putAll(loadData.headers)
             if (loadData.userAgent.isNotBlank()) put("User-Agent", loadData.userAgent)
@@ -136,7 +98,7 @@ class IPTVProvider(
         return true
     }
 
-    private suspend fun handleMpd(loadData: LoadData, headers: Map<String, String>, callback: (ExtractorLink) -> Unit) {
+    private suspend fun handleMpd(loadData: IptvLoadData, headers: Map<String, String>, callback: (ExtractorLink) -> Unit) {
         val hasValidKeys = loadData.key.isNotBlank() && loadData.keyid.isNotBlank()
         val hasLicenseUrl = loadData.licenseUrl.isNotBlank()
 
@@ -146,42 +108,29 @@ class IPTVProvider(
 
             if (loadData.drmKeys.isNotEmpty()) {
                 val mpdXml = getMpdStream(loadData.url, headers)
-                val mpdKid = Regex("""cenc:default_KID=["']([0-9a-fA-F\-]{36})["']""")
-                    .find(mpdXml)?.groups?.get(1)?.value?.replace("-", "")?.lowercase()
-                if (!mpdKid.isNullOrEmpty()) {
-                    val mapped = loadData.drmKeys[mpdKid]
-                    if (!mapped.isNullOrEmpty()) {
-                        kid = mpdKid
-                        key = mapped
-                    }
+                val mpdKid = Regex("""cenc:default_KID=["']([0-9a-fA-F\-]{36})["']""").find(mpdXml)?.groups?.get(1)?.value?.replace("-", "")?.lowercase()
+                if (!mpdKid.isNullOrEmpty() && !loadData.drmKeys[mpdKid].isNullOrEmpty()) {
+                    kid = mpdKid; key = loadData.drmKeys[mpdKid]!!
                 }
             }
             callback.invoke(newDrmExtractorLink(name, name, loadData.url, INFER_TYPE, CLEARKEY_UUID) {
-                quality = Qualities.Unknown.value
-                if (headers.isNotEmpty()) this.headers = headers
-                this.key = key.hexToBase64UrlOrNull() ?: key
-                this.kid = kid.hexToBase64UrlOrNull() ?: kid
+                quality = Qualities.Unknown.value; if (headers.isNotEmpty()) this.headers = headers
+                this.key = key.hexToBase64UrlOrNull() ?: key; this.kid = kid.hexToBase64UrlOrNull() ?: kid
             })
         } else if (hasLicenseUrl) {
             val mpdXml = getMpdStream(loadData.url, headers)
-            val kidHex = Regex("""cenc:default_KID=["']([0-9a-fA-F\-]{36})["']""")
-                .find(mpdXml)?.groups?.get(1)?.value ?: UUID.randomUUID().toString()
-                
+            val kidHex = Regex("""cenc:default_KID=["']([0-9a-fA-F\-]{36})["']""").find(mpdXml)?.groups?.get(1)?.value ?: UUID.randomUUID().toString()
             val kidBase64 = kidHex.replace("-", "").hexToBase64UrlOrNull() ?: kidHex
             val keyBase64 = fetchKeyFromLicenseServer(loadData.licenseUrl, kidBase64)
             
             if (keyBase64.isNotBlank()) {
                 callback.invoke(newDrmExtractorLink(name, name, loadData.url, INFER_TYPE, CLEARKEY_UUID) {
-                    quality = Qualities.Unknown.value
-                    if (headers.isNotEmpty()) this.headers = headers
-                    this.key = keyBase64
-                    this.kid = kidBase64
+                    quality = Qualities.Unknown.value; if (headers.isNotEmpty()) this.headers = headers
+                    this.key = keyBase64; this.kid = kidBase64
                 })
             } else {
                 callback.invoke(newDrmExtractorLink(name, name, loadData.url, INFER_TYPE, CLEARKEY_UUID) {
-                    quality = Qualities.Unknown.value
-                    if (headers.isNotEmpty()) this.headers = headers
-                    this.licenseUrl = loadData.licenseUrl
+                    quality = Qualities.Unknown.value; if (headers.isNotEmpty()) this.headers = headers; this.licenseUrl = loadData.licenseUrl
                 })
             }
         } else {
@@ -190,43 +139,23 @@ class IPTVProvider(
     }
 
     private fun getMpdStream(url: String, headers: Map<String, String>): String {
-        val client = OkHttpClient.Builder()
-            .addInterceptor(HeaderReplacementInterceptor(headers))
-            .build()
         val request = Request.Builder().url(url).build()
-        return client.newCall(request).execute().use { it.body?.string() ?: "" }
+        return OkHttpClient.Builder().addInterceptor(HeaderReplacementInterceptor(headers)).build().newCall(request).execute().use { it.body?.string() ?: "" }
     }
 
     private fun fetchKeyFromLicenseServer(licenseUrl: String, kid: String): String {
         return try {
-            val client = OkHttpClient.Builder()
-                .addInterceptor(HeaderReplacementInterceptor(mapOf(
-                    "User-Agent" to "Dalvik/2.1.0 (Linux; U; Android)",
-                    "Content-Type" to "application/json;charset=UTF-8"
-                )))
-                .build()
-                
-            val body = "{\"kids\":[\"$kid\"],\"type\":\"temporary\"}".toRequestBody("application/json".toMediaType())
-            val request = Request.Builder().url(licenseUrl).post(body).build()
-            
+            val client = OkHttpClient.Builder().addInterceptor(HeaderReplacementInterceptor(mapOf("User-Agent" to "Dalvik/2.1.0", "Content-Type" to "application/json"))).build()
+            val request = Request.Builder().url(licenseUrl).post("{\"kids\":[\"$kid\"],\"type\":\"temporary\"}".toRequestBody("application/json".toMediaType())).build()
             client.newCall(request).execute().use { resp ->
-                val json = parseJson<Map<String, Any>>(resp.body?.string() ?: "")
-                ((json["keys"] as? List<Map<String, String>>)?.firstOrNull()?.get("k") ?: "").trim()
+                ((parseJson<Map<String, Any>>(resp.body?.string() ?: "")["keys"] as? List<Map<String, String>>)?.firstOrNull()?.get("k") ?: "").trim()
             }
         } catch (e: Exception) { "" }
     }
 
     private suspend fun createExtractor(url: String, type: ExtractorLinkType?, headers: Map<String, String>, customName: String = name): ExtractorLink {
         return newExtractorLink(customName, customName, url, type) {
-            referer = ""
-            quality = Qualities.Unknown.value
-            if (headers.isNotEmpty()) this.headers = headers
+            referer = ""; quality = Qualities.Unknown.value; if (headers.isNotEmpty()) this.headers = headers
         }
     }
-
-    data class LoadData(
-        val url: String, val title: String, val poster: String, val nation: String,
-        val key: String, val keyid: String, val userAgent: String, val cookie: String,
-        val licenseUrl: String, val drmKeys: Map<String, String>, val headers: Map<String, String>
-    )
 }
