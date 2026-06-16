@@ -121,7 +121,9 @@ class DonghuaFunProvider : MainAPI() {
         return Regex("""(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull() ?: -1
     }
 
-    @Suppress("DEPRECATION", "DEPRECATION_ERROR")
+    
+        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1)
+         @Suppress("DEPRECATION", "DEPRECATION_ERROR")
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -129,7 +131,7 @@ class DonghuaFunProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val detailPageUrl = data
-        val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to mainUrl, "Origin" to mainUrl)
+        val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to detailPageUrl, "Origin" to mainUrl)
         val html = try { app.get(detailPageUrl, headers = headers).text } catch (e: Exception) { "" }
         val doc = try { app.get(detailPageUrl, headers = headers).document } catch (e: Exception) { null }
 
@@ -137,14 +139,18 @@ class DonghuaFunProvider : MainAPI() {
         doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
             val src = iframe.attr("src")
             val match = Regex("""[?&]video=([^&]+)""").find(src)
-            if (match != null) { dailymotionToken = match.groupValues[1]; return@forEach }
+            if (match != null) {
+                dailymotionToken = match.groupValues[1]
+                return@forEach
+            }
         }
         if (dailymotionToken != null) {
             val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
             if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
         }
 
-        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1)
+        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+            .find(html)?.groupValues?.get(1)
             
         if (playerJson != null) {
             var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
@@ -162,54 +168,52 @@ class DonghuaFunProvider : MainAPI() {
             } 
             else if (rawUrl.isNotEmpty()) {
                 var finalUrl = rawUrl
-                
-                // Clean any query strings from the URL (like ?url=) without forging a domain
                 if (finalUrl.contains("url=")) {
                     finalUrl = finalUrl.substringAfter("url=")
                     finalUrl = URLDecoder.decode(finalUrl, "UTF-8")
                 }
 
                 val isM3u8 = finalUrl.contains(".m3u8", ignoreCase = true)
-                
-                // THE CRITICAL FIX: The exact, real domains. No hallucinated play.donghuafun
                 val streamHeaders = mapOf(
                     "User-Agent" to USER_AGENT,
-                    "Accept" to "*/*",
-                    "Origin" to "https://donghuafun.com",
-                    "Referer" to "https://donghuafun.com/"
+                    "Referer" to "https://donghuafun.com/",
+                    "Origin" to mainUrl,
+                    "Accept" to "*/*"
                 )
 
-                var helperSucceeded = false
+                var m3u8HelperSucceeded = false
 
                 if (isM3u8) {
                     try {
                         val qualities = M3u8Helper.generateM3u8(
-                            name = this.name,
-                            streamUrl = finalUrl,
-                            referer = "https://donghuafun.com/",
+                            this.name,
+                            finalUrl,
+                            "https://donghuafun.com/",
                             headers = streamHeaders
                         )
                         if (qualities.isNotEmpty()) {
                             qualities.forEach(callback)
-                            helperSucceeded = true
+                            m3u8HelperSucceeded = true
                         }
                     } catch (e: Exception) {
                         Log.e(TAG, "M3u8Helper failed: ${e.message}")
                     }
                 }
 
-                // Fail-safe block: Safely passes to ExoPlayer with correct headers
-                if (!helperSucceeded) {
+                if (!m3u8HelperSucceeded) {
+                    // Correct Builder Pattern: 
+                    // Positional args: source, name, url, type
+                    // Optional builder block for referer and quality
                     callback.invoke(
                         newExtractorLink(
-                            source = this.name,
-                            name = from.ifEmpty { "Server 1" },
-                            url = finalUrl,
-                            referer = "https://donghuafun.com/",
-                            quality = Qualities.Unknown.value,
-                            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            this.name,
+                            from.ifEmpty { "Server 1" },
+                            finalUrl,
+                            if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                         ) {
                             this.headers = streamHeaders
+                            this.referer = "https://donghuafun.com/"
+                            this.quality = Qualities.Unknown.value
                         }
                     )
                 }
