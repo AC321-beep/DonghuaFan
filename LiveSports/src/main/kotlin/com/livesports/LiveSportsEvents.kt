@@ -37,9 +37,26 @@ class LiveSportsEvents : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val events = LiveSportsProviderManager.fetchLiveEvents()
+        
+        // Group events by category
         val grouped = events.groupBy { it.eventInfo?.eventCat ?: it.cat ?: "Other" }
-        val lists = grouped.map { (category, list) ->
-            val icon = when (category.lowercase()) { "cricket" -> "🏏"; "football" -> "⚽"; "motorsport" -> "🏎️"; else -> "📺" }
+        
+        // Define your strict custom homepage order here
+        val categoryOrder = listOf("football", "cricket", "boxing", "motorsport", "motorsports")
+        
+        // Sort the categories based on your list. Unlisted sports go to the bottom.
+        val sortedCategories = grouped.keys.sortedBy { category ->
+            val index = categoryOrder.indexOf(category.lowercase())
+            if (index == -1) Int.MAX_VALUE else index // Int.MAX_VALUE pushes it to the bottom
+        }
+
+        val lists = sortedCategories.mapNotNull { category ->
+            val list = grouped[category] ?: return@mapNotNull null
+            
+            val icon = when (category.lowercase()) { 
+                "cricket" -> "🏏"; "football" -> "⚽"; "motorsport", "motorsports" -> "🏎️"; "boxing" -> "🥊"; "basketball" -> "🏀"; "tennis" -> "🎾"; else -> "📺" 
+            }
+            
             val items = list.sortedByDescending { isEventLive(it) }.map { event ->
                 val status = getEventStatus(event)
                 val title = if (status.isNotBlank()) "$status ${createDisplayTitle(event)}" else createDisplayTitle(event)
@@ -116,6 +133,7 @@ class LiveSportsEvents : MainAPI() {
 
     private suspend fun createExtractor(url: String, type: ExtractorLinkType?, headers: Map<String, String>, name: String): ExtractorLink {
         return newExtractorLink(this.name, name, url, type) {
+            this.isM3u8 = type == ExtractorLinkType.M3U8 
             quality = Qualities.Unknown.value
             if (headers.isNotEmpty()) this.headers = headers
         }
