@@ -254,15 +254,14 @@ class DonghuaFunProvider : MainAPI() {
                         Log.e(TAG, "Fallback also failed: ${fallbackError.message}", fallbackError)
                     }
                 }
-            } else {
+           } else {
                 Log.d(TAG, "Adding as direct video link")
                 callback.invoke(
                     newExtractorLink(
                         this.name,
                         from.ifEmpty { "Server 1" },
                         rawUrl,
-                        detailPageUrl,
-                        ExtractorLinkType.VIDEO
+                        ExtractorLinkType.VIDEO // Moved up to the 4th position
                     ) {
                         this.headers = streamHeaders
                         this.referer = detailPageUrl
