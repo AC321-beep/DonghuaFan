@@ -18,6 +18,7 @@ class DonghuaFunProvider : MainAPI() {
 
     companion object {
         private const val TAG = "Donghuafun"
+        // Desktop User-Agent to bypass mobile scraper blocks
         private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
 
@@ -40,50 +41,27 @@ class DonghuaFunProvider : MainAPI() {
         var pagesSearched = 0
 
         while (items.isEmpty() && hasNextPage && pagesSearched < maxPagesToSearch) {
-            val pageUrl = if (currentPage == 1) request.data 
-                          else request.data.replace(".html", "/page/$currentPage.html")
-            
+            val pageUrl = if (currentPage == 1) request.data else request.data.replace(".html", "/page/$currentPage.html")
             val doc = app.get(pageUrl).document
-            
             val elements = doc.select("a[href*='/vod/detail/id/']")
-            if (elements.isEmpty()) {
-                hasNextPage = false
-                break
-            }
-
+            if (elements.isEmpty()) { hasNextPage = false; break }
             items.addAll(parseShowCards(doc, isComingSoon))
             pagesSearched++
-            
-            if (items.isEmpty()) {
-                currentPage++ 
-            }
+            if (items.isEmpty()) currentPage++ 
         }
-
         return newHomePageResponse(request.name, items, hasNextPage)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
-        
         for (page in 1..3) {
-            val doc = try {
-                app.get(
-                    "$mainUrl/index.php/vod/search.html",
-                    params = mapOf("wd" to query, "page" to page.toString())
-                ).document
-            } catch (e: Exception) {
-                null
-            } ?: break
-
+            val doc = try { app.get("$mainUrl/index.php/vod/search.html", params = mapOf("wd" to query, "page" to page.toString())).document } catch (e: Exception) { null } ?: break
             val pageResults = parseShowCards(doc)
             if (pageResults.isEmpty()) break
-            
             results.addAll(pageResults)
-            
             val hasNext = doc.select("a.page-next:not(.disabled), a:contains(Next), a:contains(下一页)").isNotEmpty()
             if (!hasNext) break
         }
-        
         return results.distinctBy { it.url }
     }
 
@@ -91,22 +69,14 @@ class DonghuaFunProvider : MainAPI() {
         val doc = app.get(url).document
         val showId = detailUrlToId(url)
 
-        val title = doc.selectFirst("h1, .video-title, .detail-title")?.text()?.trim()
-            ?: doc.title().substringBefore(" Donghua").trim()
-
-        val poster = doc.selectFirst("meta[property='og:image']")?.attr("content")
-            ?: doc.selectFirst(".detail-pic img, .video-cover img, .card-top img")?.attr("data-src")
-            ?: doc.selectFirst("img.lazy")?.attr("data-src")
-
-        val description = doc.selectFirst(".video-desc, .detail-desc, .card-text")?.text()?.trim()
-            ?: doc.selectFirst("meta[name='description']")?.attr("content")
-
+        val title = doc.selectFirst("h1, .video-title, .detail-title")?.text()?.trim() ?: doc.title().substringBefore(" Donghua").trim()
+        val poster = doc.selectFirst("meta[property='og:image']")?.attr("content") ?: doc.selectFirst(".detail-pic img, .video-cover img, .card-top img")?.attr("data-src") ?: doc.selectFirst("img.lazy")?.attr("data-src")
+        val description = doc.selectFirst(".video-desc, .detail-desc, .card-text")?.text()?.trim() ?: doc.selectFirst("meta[name='description']")?.attr("content")
         val tags = doc.select("a[href*='/class/']").mapNotNull { it.text().trim().takeIf(String::isNotEmpty) }
         val year = doc.selectFirst("a[href*='/year/']")?.text()?.toIntOrNull()
 
         val episodes = mutableListOf<Episode>()
         val tabs = doc.select(".anthology-tab a.vod-playerUrl")
-        
         val fourKTabIndex = tabs.indexOfFirst { it.text().contains("4K", ignoreCase = true) }
         val targetIndex = if (fourKTabIndex != -1) fourKTabIndex else 0
 
@@ -120,17 +90,14 @@ class DonghuaFunProvider : MainAPI() {
                 val epUrl = fixUrl(a.attr("href"))
                 val epName = a.selectFirst("span")?.text()?.trim() ?: a.text().trim()
                 val epNumber = parseEpisodeNumber(epName)
-                
                 val finalNumber = if (epNumber > 0) epNumber else episodeMap.size + 1
                 
                 if (!episodeMap.containsKey(finalNumber)) {
                     episodeMap[finalNumber] = newEpisode(epUrl) { 
-                        name = epName.ifEmpty { "Episode $finalNumber" }
-                        episode = finalNumber
+                        name = epName.ifEmpty { "Episode $finalNumber" }; episode = finalNumber
                     }
                 }
             }
-
             episodes.addAll(episodeMap.toSortedMap().values)
         }
 
@@ -151,8 +118,7 @@ class DonghuaFunProvider : MainAPI() {
     }
 
     private fun parseEpisodeNumber(name: String): Int {
-        val match = Regex("""(\d+)""").find(name)
-        return match?.groupValues?.get(1)?.toIntOrNull() ?: -1
+        return Regex("""(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull() ?: -1
     }
 
     @Suppress("DEPRECATION", "DEPRECATION_ERROR")
@@ -163,7 +129,7 @@ class DonghuaFunProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val detailPageUrl = data
-        val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to detailPageUrl, "Origin" to mainUrl)
+        val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to mainUrl, "Origin" to mainUrl)
         val html = try { app.get(detailPageUrl, headers = headers).text } catch (e: Exception) { "" }
         val doc = try { app.get(detailPageUrl, headers = headers).document } catch (e: Exception) { null }
 
@@ -171,18 +137,14 @@ class DonghuaFunProvider : MainAPI() {
         doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
             val src = iframe.attr("src")
             val match = Regex("""[?&]video=([^&]+)""").find(src)
-            if (match != null) {
-                dailymotionToken = match.groupValues[1]
-                return@forEach
-            }
+            if (match != null) { dailymotionToken = match.groupValues[1]; return@forEach }
         }
         if (dailymotionToken != null) {
             val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
             if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
         }
 
-        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-            .find(html)?.groupValues?.get(1)
+        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1)
             
         if (playerJson != null) {
             var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
@@ -196,12 +158,12 @@ class DonghuaFunProvider : MainAPI() {
             }
 
             if (from.equals("dailymotion", ignoreCase = true)) {
-                val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
-                if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
+                return loadExtractor("https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl", detailPageUrl, subtitleCallback, callback)
             } 
             else if (rawUrl.isNotEmpty()) {
                 var finalUrl = rawUrl
                 
+                // Clean any query strings from the URL (like ?url=) without forging a domain
                 if (finalUrl.contains("url=")) {
                     finalUrl = finalUrl.substringAfter("url=")
                     finalUrl = URLDecoder.decode(finalUrl, "UTF-8")
@@ -209,51 +171,51 @@ class DonghuaFunProvider : MainAPI() {
 
                 val isM3u8 = finalUrl.contains(".m3u8", ignoreCase = true)
                 
+                // THE CRITICAL FIX: The exact, real domains. No hallucinated play.donghuafun
                 val streamHeaders = mapOf(
                     "User-Agent" to USER_AGENT,
-                    "Referer" to detailPageUrl,  
-                    "Origin" to mainUrl,         
-                    "Accept" to "*/*"
+                    "Accept" to "*/*",
+                    "Origin" to "https://donghuafun.com",
+                    "Referer" to "https://donghuafun.com/"
                 )
 
-                var m3u8HelperSucceeded = false
+                var helperSucceeded = false
 
                 if (isM3u8) {
                     try {
                         val qualities = M3u8Helper.generateM3u8(
-                            this.name,
-                            finalUrl,
-                            detailPageUrl,
+                            name = this.name,
+                            streamUrl = finalUrl,
+                            referer = "https://donghuafun.com/",
                             headers = streamHeaders
                         )
                         if (qualities.isNotEmpty()) {
                             qualities.forEach(callback)
-                            m3u8HelperSucceeded = true
+                            helperSucceeded = true
                         }
                     } catch (e: Exception) {
                         Log.e(TAG, "M3u8Helper failed: ${e.message}")
                     }
                 }
 
-                if (!m3u8HelperSucceeded) {
+                // Fail-safe block: Safely passes to ExoPlayer with correct headers
+                if (!helperSucceeded) {
                     callback.invoke(
-                        // FIX: syntax exactly matches your working Animekhor snippet
                         newExtractorLink(
-                            this.name,
-                            from.ifEmpty { "Server 1" },
+                            source = this.name,
+                            name = from.ifEmpty { "Server 1" },
                             url = finalUrl,
+                            referer = "https://donghuafun.com/",
+                            quality = Qualities.Unknown.value,
                             type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                         ) {
                             this.headers = streamHeaders
-                            this.referer = detailPageUrl
-                            this.quality = Qualities.Unknown.value
                         }
                     )
                 }
                 return true
             }
         }
-
         return false
     }
 
@@ -261,9 +223,7 @@ class DonghuaFunProvider : MainAPI() {
         return doc.select("a[href*='/vod/detail/id/']")
             .distinctBy { it.attr("href") }
             .filter { a -> 
-                if (!isComingSoon) {
-                    true
-                } else {
+                if (!isComingSoon) { true } else {
                     val parent1 = a.parent()
                     val parent2 = a.parent()?.parent()
                     val parent3 = a.parent()?.parent()?.parent()
@@ -274,27 +234,16 @@ class DonghuaFunProvider : MainAPI() {
                         parent1 != null && parent1.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent1
                         else -> a
                     }
-                    
                     val cardText = container.text()
-                    
-                    val keywords = listOf(
-                        "trailer", "coming soon", "not yet aired", 
-                        "upcoming", "releasing soon", "0 episode"
-                    )
+                    val keywords = listOf("trailer", "coming soon", "not yet aired", "upcoming", "releasing soon", "0 episode")
                     keywords.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
                 }
             }
             .mapNotNull { a ->
                 val href = fixUrl(a.attr("href"))
-                val title = a.attr("title").ifEmpty {
-                    a.selectFirst("img")?.attr("alt") ?: a.text()
-                }.trim()
+                val title = a.attr("title").ifEmpty { a.selectFirst("img")?.attr("alt") ?: a.text() }.trim()
                 if (title.isEmpty()) return@mapNotNull null
-                
-                val poster = a.selectFirst("img")?.let {
-                    it.attr("data-src").ifEmpty { it.attr("src") }
-                }?.takeUnless { it.startsWith("data:") }?.let { fixUrl(it) }
-                
+                val poster = a.selectFirst("img")?.let { it.attr("data-src").ifEmpty { it.attr("src") } }?.takeUnless { it.startsWith("data:") }?.let { fixUrl(it) }
                 newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
             }
     }
