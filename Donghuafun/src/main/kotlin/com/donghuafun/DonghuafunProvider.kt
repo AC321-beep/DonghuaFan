@@ -18,7 +18,6 @@ class DonghuaFunProvider : MainAPI() {
 
     companion object {
         private const val TAG = "Donghuafun"
-        // Standard Desktop UA to bypass basic anti-bot scripts
         private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
 
@@ -203,7 +202,6 @@ class DonghuaFunProvider : MainAPI() {
             else if (rawUrl.isNotEmpty()) {
                 var finalUrl = rawUrl
                 
-                // Clean any stray url queries without forging a fake domain
                 if (finalUrl.contains("url=")) {
                     finalUrl = finalUrl.substringAfter("url=")
                     finalUrl = URLDecoder.decode(finalUrl, "UTF-8")
@@ -211,11 +209,10 @@ class DonghuaFunProvider : MainAPI() {
 
                 val isM3u8 = finalUrl.contains(".m3u8", ignoreCase = true)
                 
-                // CRITICAL FIX: Sending the EXACT Origin and Referer of the real site
                 val streamHeaders = mapOf(
                     "User-Agent" to USER_AGENT,
-                    "Referer" to detailPageUrl,  // e.g. https://donghuafun.com/index.php/vod/play/id/20606/sid/1/nid/1.html
-                    "Origin" to mainUrl,         // e.g. https://donghuafun.com
+                    "Referer" to detailPageUrl,  
+                    "Origin" to mainUrl,         
                     "Accept" to "*/*"
                 )
 
@@ -224,9 +221,9 @@ class DonghuaFunProvider : MainAPI() {
                 if (isM3u8) {
                     try {
                         val qualities = M3u8Helper.generateM3u8(
-                            source = this.name,
-                            streamUrl = finalUrl,
-                            referer = detailPageUrl,
+                            this.name,
+                            finalUrl,
+                            detailPageUrl,
                             headers = streamHeaders
                         )
                         if (qualities.isNotEmpty()) {
@@ -238,18 +235,18 @@ class DonghuaFunProvider : MainAPI() {
                     }
                 }
 
-                // If M3u8Helper fails (or isn't an M3u8), we fall back safely
                 if (!m3u8HelperSucceeded) {
                     callback.invoke(
+                        // FIX: syntax exactly matches your working Animekhor snippet
                         newExtractorLink(
-                            source = this.name,
-                            name = from.ifEmpty { "Server 1" },
+                            this.name,
+                            from.ifEmpty { "Server 1" },
                             url = finalUrl,
-                            referer = detailPageUrl,
-                            quality = Qualities.Unknown.value,
                             type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                         ) {
                             this.headers = streamHeaders
+                            this.referer = detailPageUrl
+                            this.quality = Qualities.Unknown.value
                         }
                     )
                 }
