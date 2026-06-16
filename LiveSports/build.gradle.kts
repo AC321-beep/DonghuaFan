@@ -54,7 +54,7 @@ cloudstream {
     status = 1
     tvTypes = listOf("Live")
     language = "en"
-    version = 4
+    version = 5
 }
 
 dependencies {
