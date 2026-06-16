@@ -4,7 +4,7 @@ import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.M3u8Helper // <-- Explicitly imported here!
+import com.lagradost.cloudstream3.utils.M3u8Helper
 import org.jsoup.nodes.Document
 import java.net.URLDecoder
 
@@ -18,6 +18,7 @@ class DonghuaFunProvider : MainAPI() {
 
     companion object {
         private const val TAG = "Donghuafun"
+        // Standard Desktop UA to bypass basic anti-bot scripts
         private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
 
@@ -52,7 +53,6 @@ class DonghuaFunProvider : MainAPI() {
             }
 
             items.addAll(parseShowCards(doc, isComingSoon))
-            
             pagesSearched++
             
             if (items.isEmpty()) {
@@ -133,11 +133,9 @@ class DonghuaFunProvider : MainAPI() {
             }
 
             episodes.addAll(episodeMap.toSortedMap().values)
-            Log.d(TAG, "Found ${episodes.size} episodes from 4K tab")
         }
 
         if (episodes.isEmpty() && showId.isNotEmpty()) {
-            Log.d(TAG, "No episodes found from tabs, generating numeric range 1..300")
             for (n in 1..300) {
                 val epUrl = "$mainUrl/index.php/vod/play/id/$showId/sid/1/nid/$n.html"
                 episodes.add(newEpisode(epUrl) { name = "EP$n" })
@@ -205,18 +203,19 @@ class DonghuaFunProvider : MainAPI() {
             else if (rawUrl.isNotEmpty()) {
                 var finalUrl = rawUrl
                 
+                // Clean any stray url queries without forging a fake domain
                 if (finalUrl.contains("url=")) {
                     finalUrl = finalUrl.substringAfter("url=")
                     finalUrl = URLDecoder.decode(finalUrl, "UTF-8")
                 }
 
-                val playerIframeUrl = "https://play.donghuafun.com/"
                 val isM3u8 = finalUrl.contains(".m3u8", ignoreCase = true)
                 
+                // CRITICAL FIX: Sending the EXACT Origin and Referer of the real site
                 val streamHeaders = mapOf(
                     "User-Agent" to USER_AGENT,
-                    "Referer" to playerIframeUrl, 
-                    "Origin" to "https://play.donghuafun.com",
+                    "Referer" to detailPageUrl,  // e.g. https://donghuafun.com/index.php/vod/play/id/20606/sid/1/nid/1.html
+                    "Origin" to mainUrl,         // e.g. https://donghuafun.com
                     "Accept" to "*/*"
                 )
 
@@ -225,9 +224,9 @@ class DonghuaFunProvider : MainAPI() {
                 if (isM3u8) {
                     try {
                         val qualities = M3u8Helper.generateM3u8(
-                            this.name,
-                            finalUrl,
-                            playerIframeUrl,
+                            source = this.name,
+                            streamUrl = finalUrl,
+                            referer = detailPageUrl,
                             headers = streamHeaders
                         )
                         if (qualities.isNotEmpty()) {
@@ -235,21 +234,22 @@ class DonghuaFunProvider : MainAPI() {
                             m3u8HelperSucceeded = true
                         }
                     } catch (e: Exception) {
-                        Log.d(TAG, "M3u8Helper failed to parse playlist: ${e.message}")
+                        Log.e(TAG, "M3u8Helper failed: ${e.message}")
                     }
                 }
 
+                // If M3u8Helper fails (or isn't an M3u8), we fall back safely
                 if (!m3u8HelperSucceeded) {
                     callback.invoke(
                         newExtractorLink(
-                            this.name,
-                            from.ifEmpty { "1080p ENG" },
+                            source = this.name,
+                            name = from.ifEmpty { "Server 1" },
                             url = finalUrl,
+                            referer = detailPageUrl,
+                            quality = Qualities.Unknown.value,
                             type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                         ) {
                             this.headers = streamHeaders
-                            this.referer = playerIframeUrl
-                            this.quality = Qualities.Unknown.value 
                         }
                     )
                 }
@@ -257,7 +257,6 @@ class DonghuaFunProvider : MainAPI() {
             }
         }
 
-        Log.d(TAG, "No Dailymotion or Raw source found for $detailPageUrl")
         return false
     }
 
