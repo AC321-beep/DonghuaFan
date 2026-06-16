@@ -236,17 +236,17 @@ class DonghuaFunProvider : MainAPI() {
                     // Fallback: Add as direct M3U8 link
                     try {
                         callback.invoke(
-                            newExtractorLink(
-                                this.name,
-                                from.ifEmpty { "M3U8 Stream" },
-                                rawUrl,
-                                detailPageUrl,
-                                ExtractorLinkType.M3U8
-                            ) {
-                                this.headers = streamHeaders
-                                this.referer = detailPageUrl
-                                this.quality = Qualities.Unknown.value
-                            }
+                           
+                     newExtractorLink(
+                     this.name,
+                     from.ifEmpty { "M3U8 Stream" },
+                     rawUrl,
+                     ExtractorLinkType.M3U8
+                ) {
+                    this.referer = detailPageUrl  // Set inside lambda instead
+                    this.headers = streamHeaders
+                    this.quality = Qualities.Unknown.value
+                   }
                         )
                         Log.d(TAG, "Added as fallback M3U8 link")
                         return true
