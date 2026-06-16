@@ -174,10 +174,9 @@ class FifaLive : MainAPI() {
 
         val allChannels = streams.amap { stream -> fetchChannels(stream.url, stream.logo) }.flatten()
         
-        // Filter search results to only show FIFA channels matching the search query
+        // Removed the invalid `.plot` reference. This is perfectly safe now!
         return allChannels.filter { 
-            (isFifaRelated(it.name) || isFifaRelated((it as? LiveSearchResponse)?.plot)) && 
-            it.name.contains(query, ignoreCase = true) 
+            isFifaRelated(it.name) && it.name.contains(query, ignoreCase = true) 
         }
     }
 
