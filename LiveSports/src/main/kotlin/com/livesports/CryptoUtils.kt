@@ -25,17 +25,37 @@ object CryptoUtils {
         return hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
     }
 
+    // 100% exact match to the Smali logic you extracted
     fun decryptData(encryptedBase64: String): String? {
-        val clean = encryptedBase64.trim().replace(Regex("[\\n\\r\\s]"), "")
-        val ciphertext = base64DecodeArray(clean) ?: return null
+        // Explicitly replace newlines, carriage returns, spaces, and tabs just like the Smali
+        val cleanBase64 = encryptedBase64.trim()
+            .replace("\n", "")
+            .replace("\r", "")
+            .replace(" ", "")
+            .replace("\t", "")
+
+        val ciphertext = base64DecodeArray(cleanBase64) ?: return null
+
         for (keyInfo in keys) {
             try {
                 val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyInfo.key, "AES"), IvParameterSpec(keyInfo.iv))
-                val decrypted = String(cipher.doFinal(ciphertext), Charsets.UTF_8)
-                if (decrypted.startsWith("{") || decrypted.startsWith("[") || decrypted.contains("http"))
-                    return decrypted
-            } catch (_: Exception) { }
+                val secretKeySpec = SecretKeySpec(keyInfo.key, "AES")
+                val ivParameterSpec = IvParameterSpec(keyInfo.iv)
+                
+                cipher.init(Cipher.DECRYPT_MODE, secretKeySpec, ivParameterSpec)
+                
+                val decryptedBytes = cipher.doFinal(ciphertext)
+                val text = String(decryptedBytes, Charsets.UTF_8)
+                
+                // Matches the Smali validation exactly, including ignoreCase = true for "http"
+                if (text.startsWith("{") || 
+                    text.startsWith("[") || 
+                    text.contains("http", ignoreCase = true)) {
+                    return text
+                }
+            } catch (_: Exception) { 
+                // Silently loop to the next key on failure, just like the Smali
+            }
         }
         return null
     }
