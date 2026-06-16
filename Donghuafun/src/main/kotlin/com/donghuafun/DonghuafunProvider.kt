@@ -135,6 +135,7 @@ class DonghuaFunProvider : MainAPI() {
         val html = try { app.get(detailPageUrl, headers = headers).text } catch (e: Exception) { "" }
         val doc = try { app.get(detailPageUrl, headers = headers).document } catch (e: Exception) { null }
 
+        // --- Dailymotion Logic Restored ---
         var dailymotionToken: String? = null
         doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
             val src = iframe.attr("src")
@@ -146,79 +147,69 @@ class DonghuaFunProvider : MainAPI() {
         }
         if (dailymotionToken != null) {
             val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
+            // Using loadExtractor directly for Dailymotion
             if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
         }
 
+        // --- Main Player Logic ---
         val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-            .find(html)?.groupValues?.get(1)
-            
-        if (playerJson != null) {
-            var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
-            val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
-            val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            .find(html)?.groupValues?.get(1) ?: return false
 
-            if (encrypt == 1) rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-            else if (encrypt == 2) {
-                rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
+        var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+        val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
+        val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+
+        if (encrypt == 1) rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+        else if (encrypt == 2) {
+            rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
+            rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+        }
+
+        if (from.equals("dailymotion", ignoreCase = true)) {
+            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
+            if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
+        } 
+        else if (rawUrl.isNotEmpty()) {
+            if (rawUrl.contains("url=")) {
+                rawUrl = rawUrl.substringAfter("url=")
                 rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
             }
 
-            if (from.equals("dailymotion", ignoreCase = true)) {
-                return loadExtractor("https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl", detailPageUrl, subtitleCallback, callback)
-            } 
-            else if (rawUrl.isNotEmpty()) {
-                var finalUrl = rawUrl
-                if (finalUrl.contains("url=")) {
-                    finalUrl = finalUrl.substringAfter("url=")
-                    finalUrl = URLDecoder.decode(finalUrl, "UTF-8")
-                }
+            val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
+            val streamHeaders = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Referer" to "https://donghuafun.com/",
+                "Origin" to "https://donghuafun.com"
+            )
 
-                val isM3u8 = finalUrl.contains(".m3u8", ignoreCase = true)
-                val streamHeaders = mapOf(
-                    "User-Agent" to USER_AGENT,
-                    "Referer" to "https://donghuafun.com/",
-                    "Origin" to mainUrl,
-                    "Accept" to "*/*"
-                )
-
-                var m3u8HelperSucceeded = false
-
-                if (isM3u8) {
-                    try {
-                        val qualities = M3u8Helper.generateM3u8(
-                            this.name,
-                            finalUrl,
-                            "https://donghuafun.com/",
-                            headers = streamHeaders
-                        )
-                        if (qualities.isNotEmpty()) {
-                            qualities.forEach(callback)
-                            m3u8HelperSucceeded = true
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "M3u8Helper failed: ${e.message}")
-                    }
-                }
-
-                if (!m3u8HelperSucceeded) {
-                    // Correct Builder Pattern: 
-                    // Positional args: source, name, url, type
-                    // Optional builder block for referer and quality
+            if (isM3u8) {
+                try {
+                    M3u8Helper.generateM3u8(
+                        this.name,
+                        rawUrl,
+                        "https://donghuafun.com/",
+                        headers = streamHeaders
+                    ).forEach(callback)
+                } catch (e: Exception) {
+                    Log.e(TAG, "M3u8Helper failed, using fallback: ${e.message}")
                     callback.invoke(
-                        newExtractorLink(
-                            this.name,
-                            from.ifEmpty { "Server 1" },
-                            finalUrl,
-                            if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        ) {
+                        newExtractorLink(this.name, from.ifEmpty { "Server 1" }, rawUrl, ExtractorLinkType.M3U8) {
                             this.headers = streamHeaders
                             this.referer = "https://donghuafun.com/"
                             this.quality = Qualities.Unknown.value
                         }
                     )
                 }
-                return true
+            } else {
+                callback.invoke(
+                    newExtractorLink(this.name, from.ifEmpty { "Server 1" }, rawUrl, ExtractorLinkType.VIDEO) {
+                        this.headers = streamHeaders
+                        this.referer = "https://donghuafun.com/"
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
             }
+            return true
         }
         return false
     }
