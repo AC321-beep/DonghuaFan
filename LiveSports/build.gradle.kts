@@ -28,6 +28,7 @@ android {
         minSdk = 21
         targetSdk = 35
         
+        // These MUST stay here for the main LiveSportsEvents scraper!
         buildConfigField("String", "LIVESPORTS_FIREBASE_API_KEY", "\"${System.getenv("LIVESPORTS_FIREBASE_API_KEY") ?: ""}\"")
         buildConfigField("String", "LIVESPORTS_FIREBASE_APP_ID", "\"${System.getenv("LIVESPORTS_FIREBASE_APP_ID") ?: ""}\"")
         buildConfigField("String", "LIVESPORTS_FIREBASE_PROJECT_NUMBER", "\"${System.getenv("LIVESPORTS_FIREBASE_PROJECT_NUMBER") ?: ""}\"")
@@ -49,12 +50,13 @@ android {
 }
 
 cloudstream {
-    description = "Live Sports (IPTV + Live Events)"
+    // Updated to reflect the massive changes we made!
+    description = "Premium Live Sports Events & FIFA Streams"
     authors = listOf("AC321-beep")
     status = 1
     tvTypes = listOf("Live")
     language = "en"
-    version = 6
+    version = 7 
 }
 
 dependencies {
