@@ -9,6 +9,7 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 object LiveSportsProviderManager {
+    // New updated fallback domain from CNC smali
     private const val FALLBACK_BASE_URL = "https://cfymarkscanjiostar80.top"
     private const val PACKAGE_NAME = "com.cricfy.tv"
     private var cachedBaseUrl: String? = null
@@ -20,7 +21,7 @@ object LiveSportsProviderManager {
 
     data class RemoteConfigResponse(val entries: Map<String, String>? = null)
 
-    fun getBaseUrl(): String {
+    suspend fun getBaseUrl(): String {
         if (cachedBaseUrl != null) return cachedBaseUrl!!
         
         val apiKey = try { BuildConfig.LIVESPORTS_FIREBASE_API_KEY } catch (e: Exception) { "" }
@@ -60,20 +61,7 @@ object LiveSportsProviderManager {
         return cachedBaseUrl!!
     }
 
-    fun fetchProviders(): List<Map<String, Any>> {
-        try {
-            val url = "${getBaseUrl()}/cats.txt"
-            val request = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
-            val response = client.newCall(request).execute()
-            if (response.isSuccessful) {
-                val decrypted = CryptoUtils.decryptData(response.body?.string() ?: "")
-                if (!decrypted.isNullOrBlank()) return parseJson(decrypted)
-            }
-        } catch (e: Exception) { e.printStackTrace() }
-        return emptyList()
-    }
-
-    fun fetchLiveEvents(): List<LiveEventData> {
+    suspend fun fetchLiveEvents(): List<LiveEventData> {
         try {
             val url = "${getBaseUrl()}/live-events.txt"
             val request = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
