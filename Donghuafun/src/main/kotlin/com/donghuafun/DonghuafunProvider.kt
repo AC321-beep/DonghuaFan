@@ -4,6 +4,7 @@ import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.M3u8Helper // Explicitly imported now!
 import org.jsoup.nodes.Document
 import java.net.URLDecoder
 
@@ -17,7 +18,7 @@ class DonghuaFunProvider : MainAPI() {
 
     companion object {
         private const val TAG = "Donghuafun"
-        private val USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
 
     private fun detailUrlToId(url: String): String =
@@ -187,6 +188,7 @@ class DonghuaFunProvider : MainAPI() {
         // ----- 2) Raw URL Extractor (Cloudokyo) -----
         val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
             .find(html)?.groupValues?.get(1)
+            
         if (playerJson != null) {
             var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
             val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
@@ -205,47 +207,52 @@ class DonghuaFunProvider : MainAPI() {
             else if (rawUrl.isNotEmpty()) {
                 var finalUrl = rawUrl
                 
-                // Strip the iframe wrapper
-                if (finalUrl.contains("play.donghuafun.com/m3u8/?url=")) {
-                    finalUrl = finalUrl.substringAfter("?url=")
+                if (finalUrl.contains("url=")) {
+                    finalUrl = finalUrl.substringAfter("url=")
                     finalUrl = URLDecoder.decode(finalUrl, "UTF-8")
                 }
 
-                val playerIframeUrl = "https://play.donghuafun.com/m3u8/?url=$finalUrl"
+                val playerIframeUrl = "https://play.donghuafun.com/"
                 val isM3u8 = finalUrl.contains(".m3u8", ignoreCase = true)
                 
-                // Strictly mimic the desktop browser to bypass WAF Connection Resets
                 val streamHeaders = mapOf(
-                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "User-Agent" to USER_AGENT,
                     "Referer" to playerIframeUrl, 
                     "Origin" to "https://play.donghuafun.com",
                     "Accept" to "*/*"
                 )
 
+                var m3u8HelperSucceeded = false
+
                 if (isM3u8) {
-                    // --- THE FIX: Using Cloudstream's native M3u8Helper ---
-                    // This fetches the master playlist through Cloudstream's robust OkHttp client,
-                    // parses the resolutions, and generates individual selectable qualities!
-                    M3u8Helper.generateM3u8(
-                        source = this.name,
-                        streamUrl = finalUrl,
-                        referer = playerIframeUrl,
-                        headers = streamHeaders
-                    ).forEach { link ->
-                        callback.invoke(link)
+                    try {
+                        // Correctly instantiated the M3u8Helper class with ()
+                        val qualities = M3u8Helper().generateM3u8(
+                            source = this.name,
+                            streamUrl = finalUrl,
+                            referer = playerIframeUrl,
+                            headers = streamHeaders
+                        )
+                        if (qualities.isNotEmpty()) {
+                            qualities.forEach { callback.invoke(it) }
+                            m3u8HelperSucceeded = true
+                        }
+                    } catch (e: Exception) {
+                        Log.d(TAG, "M3u8Helper failed to parse playlist: ${e.message}")
                     }
-                } else {
-                    // Fallback just in case they upload raw MP4s instead of M3U8
+                }
+
+                if (!m3u8HelperSucceeded) {
                     callback.invoke(
                         newExtractorLink(
                             source = this.name,
-                            name = from.ifEmpty { "Server 1" },
+                            name = from.ifEmpty { "1080p ENG" },
                             url = finalUrl,
-                            type = ExtractorLinkType.VIDEO
+                            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                         ) {
                             this.headers = streamHeaders
                             this.referer = playerIframeUrl
-                            this.quality = Qualities.Unknown.value
+                            this.quality = Qualities.Unknown.value 
                         }
                     )
                 }
