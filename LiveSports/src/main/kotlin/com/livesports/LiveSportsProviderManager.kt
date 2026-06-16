@@ -63,7 +63,9 @@ object LiveSportsProviderManager {
 
     suspend fun fetchLiveEvents(): List<LiveEventData> {
         try {
-            val url = "${getBaseUrl()}/live-events.txt"
+            // FIXED: Added the /categories/ path you extracted from the Smali!
+            val url = "${getBaseUrl()}/categories/live-events.txt"
+            
             val request = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
             val response = client.newCall(request).execute()
             if (response.isSuccessful) {
