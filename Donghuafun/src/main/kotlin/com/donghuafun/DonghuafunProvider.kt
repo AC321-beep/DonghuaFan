@@ -4,7 +4,7 @@ import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.M3u8Helper // Explicit import
+import com.lagradost.cloudstream3.utils.M3u8Helper // <-- Explicitly imported here!
 import org.jsoup.nodes.Document
 import java.net.URLDecoder
 
@@ -224,7 +224,6 @@ class DonghuaFunProvider : MainAPI() {
 
                 if (isM3u8) {
                     try {
-                        // FIX: Calling generateM3u8 exactly like your working Animekhor snippet
                         val qualities = M3u8Helper.generateM3u8(
                             this.name,
                             finalUrl,
@@ -242,7 +241,6 @@ class DonghuaFunProvider : MainAPI() {
 
                 if (!m3u8HelperSucceeded) {
                     callback.invoke(
-                        // FIX: Safely formatting the fallback extractor exactly like your working code
                         newExtractorLink(
                             this.name,
                             from.ifEmpty { "1080p ENG" },
