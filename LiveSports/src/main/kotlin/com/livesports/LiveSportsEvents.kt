@@ -26,7 +26,7 @@ class LiveSportsEvents : MainAPI() {
     companion object { var context: android.content.Context? = null }
 
     override var mainUrl = "https://tv.noobon.top"
-    override var name = "LiveSports"
+    override var name = "🏏 LiveSports Events"
     override var lang = "en"
     override val hasMainPage = true
     override val hasChromecastSupport = true
@@ -61,12 +61,24 @@ class LiveSportsEvents : MainAPI() {
             
             val items = list.sortedByDescending { isEventLive(it) }.map { event ->
                 val status = getEventStatus(event)
-                val title = if (status.isNotBlank()) "$status ${createDisplayTitle(event)}" else createDisplayTitle(event)
+                val time = getFormattedTime(event)
+                val baseTitle = createDisplayTitle(event)
+                
+                // Add the time to the text title if the event is upcoming
+                val title = buildString {
+                    if (status.isNotBlank()) append("$status ")
+                    append(baseTitle)
+                    if (time.isNotBlank() && !isEventLive(event)) {
+                        append(" • $time")
+                    }
+                }
+                
                 val loadData = LiveEventLoadData(
-                    eventId = event.id, title = createDisplayTitle(event),
+                    eventId = event.id, title = baseTitle, // Keep load title clean
                     poster = generateMatchCardUrl(event), slug = event.slug,
                     formats = event.formats ?: emptyList(), eventInfo = event.eventInfo
                 )
+                
                 newLiveSearchResponse(title, loadData.toJson(), TvType.Live) { this.posterUrl = generateMatchCardUrl(event) }
             }
             HomePageList("$icon $category", items, isHorizontalImages = true)
@@ -196,6 +208,17 @@ class LiveSportsEvents : MainAPI() {
         return if (info?.teamA != null && info.teamB != null && info.teamA != info.teamB) "${info.teamA} vs ${info.teamB}" else event.title
     }
 
+    // New helper function to format the date beautifully
+    private fun getFormattedTime(event: LiveEventData): String {
+        val timeStr = event.eventInfo?.startTime ?: return ""
+        return try {
+            val parsed = SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US).parse(timeStr)
+            parsed?.let { SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()).format(it) } ?: ""
+        } catch (e: Exception) {
+            "" // Fallback to empty if parsing fails
+        }
+    }
+
     private fun getEventStatus(event: LiveEventData): String {
         val info = event.eventInfo ?: return ""
         val now = System.currentTimeMillis()
@@ -220,6 +243,7 @@ class LiveSportsEvents : MainAPI() {
 
     private fun generateMatchCardUrl(event: LiveEventData): String {
         val info = event.eventInfo
+        val time = getFormattedTime(event)
         return buildString {
             append("https://live-card-png.cricify.workers.dev/?")
             append("title=${java.net.URLEncoder.encode(info?.eventName ?: event.title, "UTF-8")}")
@@ -229,6 +253,11 @@ class LiveSportsEvents : MainAPI() {
             info?.teamBFlag?.let { append("&teamBImg=$it") }
             info?.eventLogo?.let { append("&eventLogo=$it") }
             append("&isLive=${isEventLive(event)}")
+            
+            // Pass the time parameter to the image generator if it's an upcoming match
+            if (time.isNotBlank() && !isEventLive(event)) {
+                append("&time=${java.net.URLEncoder.encode(time, "UTF-8")}")
+            }
         }
     }
 }
