@@ -185,7 +185,7 @@ class DonghuaFunProvider : MainAPI() {
             if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
         }
 
-        // ----- 2) Fallback: parse player_aaaa for Dailymotion (if iframe missing) -----
+        // ----- 2) Fallback: parse player_aaaa for Dailymotion & Raw Links -----
         val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
             .find(html)?.groupValues?.get(1)
         if (playerJson != null) {
@@ -202,10 +202,27 @@ class DonghuaFunProvider : MainAPI() {
             if (from.equals("dailymotion", ignoreCase = true)) {
                 val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
                 if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
+            } 
+            // --- FIXED COMPILABLE ADDITION FOR TRAILER / RAW LINKS ---
+            else if (rawUrl.isNotEmpty()) {
+                val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
+                callback.invoke(
+                    newExtractorLink(
+                        source = this.name,
+                        name = from.ifEmpty { "Server 1" },
+                        url = rawUrl,
+                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = detailPageUrl
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+                return true
             }
+            // --- END FIXED COMPILABLE ADDITION ---
         }
 
-        Log.d(TAG, "No Dailymotion source found for $detailPageUrl")
+        Log.d(TAG, "No Dailymotion or Raw source found for $detailPageUrl")
         return false
     }
 
