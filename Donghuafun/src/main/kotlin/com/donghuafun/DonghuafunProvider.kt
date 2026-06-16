@@ -135,7 +135,6 @@ class DonghuaFunProvider : MainAPI() {
             Log.d(TAG, "Found ${episodes.size} episodes from 4K tab")
         }
 
-        // Fallback generator for shows returning no episodes in UI
         if (episodes.isEmpty() && showId.isNotEmpty()) {
             Log.d(TAG, "No episodes found from tabs, generating numeric range 1..300")
             for (n in 1..300) {
@@ -170,7 +169,7 @@ class DonghuaFunProvider : MainAPI() {
         val html = try { app.get(detailPageUrl, headers = headers).text } catch (e: Exception) { "" }
         val doc = try { app.get(detailPageUrl, headers = headers).document } catch (e: Exception) { null }
 
-        // ----- 1) Dailymotion via iframe token -----
+        // ----- 1) Dailymotion Check -----
         var dailymotionToken: String? = null
         doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
             val src = iframe.attr("src")
@@ -185,7 +184,7 @@ class DonghuaFunProvider : MainAPI() {
             if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
         }
 
-        // ----- 2) Fallback: parse player_aaaa -----
+        // ----- 2) Raw URL Extractor (Cloudokyo) -----
         val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
             .find(html)?.groupValues?.get(1)
         if (playerJson != null) {
@@ -204,23 +203,31 @@ class DonghuaFunProvider : MainAPI() {
                 if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
             } 
             else if (rawUrl.isNotEmpty()) {
-                // --- DETECT AND STRIP WEB EMBED WRAPPERS ---
+                
                 var finalUrl = rawUrl
                 if (finalUrl.contains("play.donghuafun.com/m3u8/?url=")) {
                     finalUrl = finalUrl.substringAfter("?url=")
                     finalUrl = URLDecoder.decode(finalUrl, "UTF-8")
                 }
-                // -------------------------------------------
 
                 val isM3u8 = finalUrl.contains(".m3u8", ignoreCase = true)
+                
                 callback.invoke(
                     newExtractorLink(
                         source = this.name,
-                        name = from.ifEmpty { "ENG No Ads" },
+                        name = from.ifEmpty { "Server 1" },
                         url = finalUrl,
                         type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     ) {
-                        this.referer = detailPageUrl
+                        // CRITICAL: Aggressive Header Injection to bypass Cloudokyo 403 Forbidden Error
+                        this.headers = mapOf(
+                            "User-Agent" to USER_AGENT,
+                            "Referer" to "$mainUrl/",
+                            "Origin" to mainUrl,
+                            "Accept" to "*/*"
+                        )
+                        // Explicit referer bind for ExoPlayer fallback
+                        this.referer = "$mainUrl/"
                         this.quality = Qualities.Unknown.value
                     }
                 )
@@ -231,6 +238,7 @@ class DonghuaFunProvider : MainAPI() {
         Log.d(TAG, "No Dailymotion or Raw source found for $detailPageUrl")
         return false
     }
+
     private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
         return doc.select("a[href*='/vod/detail/id/']")
             .distinctBy { it.attr("href") }
