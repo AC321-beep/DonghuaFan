@@ -150,139 +150,66 @@ class DonghuaFunProvider : MainAPI() {
         }
 
         // --- Main Player Logic ---
-        Log.d(TAG, "Attempting to extract player_aaaa from HTML (${html.length} chars)")
-        
-        val playerJsonRaw = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-            .find(html)?.groupValues?.get(1) ?: run {
-            Log.e(TAG, "Failed to extract player_aaaa from HTML")
-            return false
-        }
-        
-        Log.d(TAG, "Raw player_aaaa: ${playerJsonRaw.take(200)}...")
+        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+            .find(html)?.groupValues?.get(1) ?: return false
 
-        // Better URL extraction with multiple fallback patterns
-        var rawUrl = extractJsonValue(playerJsonRaw, "url")
-        Log.d(TAG, "Extracted URL: $rawUrl")
-        
-        if (rawUrl.isEmpty()) {
-            Log.e(TAG, "Failed to extract URL from player JSON")
-            return false
-        }
+        var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+        val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
+        val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
-        // Unescape JSON escaped slashes
-        rawUrl = rawUrl.replace("\\/", "/")
-        Log.d(TAG, "Unescaped URL: $rawUrl")
-
-        val from = extractJsonValue(playerJsonRaw, "from")
-        val encryptStr = extractJsonValue(playerJsonRaw, "encrypt")
-        val encrypt = encryptStr.toIntOrNull() ?: 0
-        
-        Log.d(TAG, "Source: $from, Encryption: $encrypt")
-
-        // Handle encryption
-        if (encrypt == 1) {
-            rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-            Log.d(TAG, "URL decoded from UTF-8")
-        } else if (encrypt == 2) {
+        if (encrypt == 1) rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+        else if (encrypt == 2) {
             rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
             rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-            Log.d(TAG, "URL decoded from Base64 + UTF-8")
         }
 
-        // Handle dailymotion source
         if (from.equals("dailymotion", ignoreCase = true)) {
             val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
-            Log.d(TAG, "Processing as Dailymotion: $embedUrl")
             if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
         } 
         else if (rawUrl.isNotEmpty()) {
-            // Handle URL parameter wrapping
             if (rawUrl.contains("url=")) {
                 rawUrl = rawUrl.substringAfter("url=")
                 rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-                Log.d(TAG, "Extracted from URL parameter: $rawUrl")
             }
 
             val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
-            Log.d(TAG, "Is M3U8: $isM3u8, URL: $rawUrl")
-
-            // Stream headers - More permissive for CloudOkyo CDN
             val streamHeaders = mapOf(
                 "User-Agent" to USER_AGENT,
-                "Referer" to detailPageUrl,  // IMPORTANT: Use the actual detail page, not just domain
-                "Origin" to "https://donghuafun.com",
-                "Accept" to "*/*",
-                "Accept-Language" to "en-US,en;q=0.9",
-                "Connection" to "keep-alive",
-                "Sec-Fetch-Dest" to "video",
-                "Sec-Fetch-Mode" to "cors",
-                "Sec-Fetch-Site" to "cross-site"
+                "Referer" to "https://donghuafun.com/",
+                "Origin" to "https://donghuafun.com"
             )
 
             if (isM3u8) {
                 try {
-                    Log.d(TAG, "Generating M3U8 with headers: ${streamHeaders.keys}")
-                    val m3u8Links = M3u8Helper.generateM3u8(
+                    M3u8Helper.generateM3u8(
                         this.name,
                         rawUrl,
-                        detailPageUrl,  // Use detail page as base URL
+                        "https://donghuafun.com/",
                         headers = streamHeaders
-                    )
-                    Log.d(TAG, "M3U8 generated successfully, ${m3u8Links.size} links found")
-                    m3u8Links.forEach(callback)
-                    return true
+                    ).forEach(callback)
                 } catch (e: Exception) {
-                    Log.e(TAG, "M3u8Helper failed: ${e.message}", e)
-                    // Fallback: Add as direct M3U8 link
-                    try {
-                        callback.invoke(
-                           
-                     newExtractorLink(
-                     this.name,
-                     from.ifEmpty { "M3U8 Stream" },
-                     rawUrl,
-                     ExtractorLinkType.M3U8
-                ) {
-                    this.referer = detailPageUrl  // Set inside lambda instead
-                    this.headers = streamHeaders
-                    this.quality = Qualities.Unknown.value
-                   }
-                        )
-                        Log.d(TAG, "Added as fallback M3U8 link")
-                        return true
-                    } catch (fallbackError: Exception) {
-                        Log.e(TAG, "Fallback also failed: ${fallbackError.message}", fallbackError)
-                    }
+                    Log.e(TAG, "M3u8Helper failed, using fallback: ${e.message}")
+                    callback.invoke(
+                        newExtractorLink(this.name, from.ifEmpty { "Server 1" }, rawUrl, ExtractorLinkType.M3U8) {
+                            this.headers = streamHeaders
+                            this.referer = "https://donghuafun.com/"
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
                 }
-           } else {
-                Log.d(TAG, "Adding as direct video link")
+            } else {
                 callback.invoke(
-                    newExtractorLink(
-                        this.name,
-                        from.ifEmpty { "Server 1" },
-                        rawUrl,
-                        ExtractorLinkType.VIDEO // Moved up to the 4th position
-                    ) {
+                    newExtractorLink(this.name, from.ifEmpty { "Server 1" }, rawUrl, ExtractorLinkType.VIDEO) {
                         this.headers = streamHeaders
-                        this.referer = detailPageUrl
+                        this.referer = "https://donghuafun.com/"
                         this.quality = Qualities.Unknown.value
                     }
                 )
-                return true
             }
+            return true
         }
-        
-        Log.e(TAG, "No valid URL found to process")
         return false
-    }
-
-    /**
-     * Extract a JSON value safely from a JSON string without full parsing
-     */
-    private fun extractJsonValue(json: String, key: String): String {
-        // Pattern: "key":"value" or "key": "value"
-        val pattern = """"$key"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)""""
-        return Regex(pattern).find(json)?.groupValues?.get(1) ?: ""
     }
 
     private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
