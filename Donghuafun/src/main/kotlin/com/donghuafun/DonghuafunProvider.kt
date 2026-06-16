@@ -170,7 +170,7 @@ class DonghuaFunProvider : MainAPI() {
         val html = try { app.get(detailPageUrl, headers = headers).text } catch (e: Exception) { "" }
         val doc = try { app.get(detailPageUrl, headers = headers).document } catch (e: Exception) { null }
 
-        // ----- 1) Dailymotion via iframe token (works for all Dailymotion) -----
+        // ----- 1) Dailymotion via iframe token -----
         var dailymotionToken: String? = null
         doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
             val src = iframe.attr("src")
@@ -185,7 +185,7 @@ class DonghuaFunProvider : MainAPI() {
             if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
         }
 
-        // ----- 2) Fallback: parse player_aaaa for Dailymotion & Raw Links -----
+        // ----- 2) Fallback: parse player_aaaa -----
         val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
             .find(html)?.groupValues?.get(1)
         if (playerJson != null) {
@@ -203,14 +203,21 @@ class DonghuaFunProvider : MainAPI() {
                 val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
                 if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
             } 
-            // --- FIXED COMPILABLE ADDITION FOR TRAILER / RAW LINKS ---
             else if (rawUrl.isNotEmpty()) {
-                val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
+                // --- DETECT AND STRIP WEB EMBED WRAPPERS ---
+                var finalUrl = rawUrl
+                if (finalUrl.contains("play.donghuafun.com/m3u8/?url=")) {
+                    finalUrl = finalUrl.substringAfter("?url=")
+                    finalUrl = URLDecoder.decode(finalUrl, "UTF-8")
+                }
+                // -------------------------------------------
+
+                val isM3u8 = finalUrl.contains(".m3u8", ignoreCase = true)
                 callback.invoke(
                     newExtractorLink(
                         source = this.name,
-                        name = from.ifEmpty { "Server 1" },
-                        url = rawUrl,
+                        name = from.ifEmpty { "ENG No Ads" },
+                        url = finalUrl,
                         type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                     ) {
                         this.referer = detailPageUrl
@@ -219,13 +226,11 @@ class DonghuaFunProvider : MainAPI() {
                 )
                 return true
             }
-            // --- END FIXED COMPILABLE ADDITION ---
         }
 
         Log.d(TAG, "No Dailymotion or Raw source found for $detailPageUrl")
         return false
     }
-
     private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
         return doc.select("a[href*='/vod/detail/id/']")
             .distinctBy { it.attr("href") }
