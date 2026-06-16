@@ -26,7 +26,7 @@ class LiveSportsEvents : MainAPI() {
     companion object { var context: android.content.Context? = null }
 
     override var mainUrl = "https://tv.noobon.top"
-    override var name = "🏏 LiveSports Events"
+    override var name = "LiveSports"
     override var lang = "en"
     override val hasMainPage = true
     override val hasChromecastSupport = true
