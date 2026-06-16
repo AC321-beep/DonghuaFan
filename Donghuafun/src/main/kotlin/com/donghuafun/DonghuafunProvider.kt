@@ -4,7 +4,7 @@ import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.M3u8Helper // Explicitly imported now!
+import com.lagradost.cloudstream3.utils.M3u8Helper // Explicit import
 import org.jsoup.nodes.Document
 import java.net.URLDecoder
 
@@ -170,7 +170,6 @@ class DonghuaFunProvider : MainAPI() {
         val html = try { app.get(detailPageUrl, headers = headers).text } catch (e: Exception) { "" }
         val doc = try { app.get(detailPageUrl, headers = headers).document } catch (e: Exception) { null }
 
-        // ----- 1) Dailymotion Check -----
         var dailymotionToken: String? = null
         doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
             val src = iframe.attr("src")
@@ -185,7 +184,6 @@ class DonghuaFunProvider : MainAPI() {
             if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
         }
 
-        // ----- 2) Raw URL Extractor (Cloudokyo) -----
         val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
             .find(html)?.groupValues?.get(1)
             
@@ -226,15 +224,15 @@ class DonghuaFunProvider : MainAPI() {
 
                 if (isM3u8) {
                     try {
-                        // Correctly instantiated the M3u8Helper class with ()
-                        val qualities = M3u8Helper().generateM3u8(
-                            source = this.name,
-                            streamUrl = finalUrl,
-                            referer = playerIframeUrl,
+                        // FIX: Calling generateM3u8 exactly like your working Animekhor snippet
+                        val qualities = M3u8Helper.generateM3u8(
+                            this.name,
+                            finalUrl,
+                            playerIframeUrl,
                             headers = streamHeaders
                         )
                         if (qualities.isNotEmpty()) {
-                            qualities.forEach { callback.invoke(it) }
+                            qualities.forEach(callback)
                             m3u8HelperSucceeded = true
                         }
                     } catch (e: Exception) {
@@ -244,9 +242,10 @@ class DonghuaFunProvider : MainAPI() {
 
                 if (!m3u8HelperSucceeded) {
                     callback.invoke(
+                        // FIX: Safely formatting the fallback extractor exactly like your working code
                         newExtractorLink(
-                            source = this.name,
-                            name = from.ifEmpty { "1080p ENG" },
+                            this.name,
+                            from.ifEmpty { "1080p ENG" },
                             url = finalUrl,
                             type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                         ) {
