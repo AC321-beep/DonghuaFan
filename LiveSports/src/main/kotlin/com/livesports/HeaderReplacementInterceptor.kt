@@ -8,7 +8,6 @@ class HeaderReplacementInterceptor(private val headers: Map<String, String>) : I
         val originalRequest = chain.request()
         val requestBuilder = originalRequest.newBuilder()
 
-        // Remove existing headers to avoid duplicates, then add our custom ones
         headers.forEach { (name, value) ->
             requestBuilder.removeHeader(name)
             requestBuilder.addHeader(name, value)
