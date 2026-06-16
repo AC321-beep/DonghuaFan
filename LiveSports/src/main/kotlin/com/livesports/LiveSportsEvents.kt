@@ -2,7 +2,6 @@ package com.livesports
 
 import android.os.Handler
 import android.os.Looper
-import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
@@ -33,7 +32,10 @@ class LiveSportsEvents : MainAPI() {
     override val hasChromecastSupport = true
     override val supportedTypes = setOf(TvType.Live)
 
-    private val client = OkHttpClient.Builder().connectTimeout(30, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS).build()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .build()
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val events = LiveSportsProviderManager.fetchLiveEvents()
@@ -41,20 +43,20 @@ class LiveSportsEvents : MainAPI() {
         // Group events by category
         val grouped = events.groupBy { it.eventInfo?.eventCat ?: it.cat ?: "Other" }
         
-        // Define your strict custom homepage order here
+        // STRICT CUSTOM ORDER: Football -> Cricket -> Boxing -> Motorsports
         val categoryOrder = listOf("football", "cricket", "boxing", "motorsport", "motorsports")
         
-        // Sort the categories based on your list. Unlisted sports go to the bottom.
+        // Sort the categories. Anything not in the list gets pushed to the bottom.
         val sortedCategories = grouped.keys.sortedBy { category ->
             val index = categoryOrder.indexOf(category.lowercase())
-            if (index == -1) Int.MAX_VALUE else index // Int.MAX_VALUE pushes it to the bottom
+            if (index == -1) Int.MAX_VALUE else index 
         }
 
         val lists = sortedCategories.mapNotNull { category ->
             val list = grouped[category] ?: return@mapNotNull null
             
             val icon = when (category.lowercase()) { 
-                "cricket" -> "🏏"; "football" -> "⚽"; "motorsport", "motorsports" -> "🏎️"; "boxing" -> "🥊"; "basketball" -> "🏀"; "tennis" -> "🎾"; else -> "📺" 
+                "cricket" -> "🏏"; "football" -> "⚽"; "motorsport", "motorsports" -> "🏎️"; "boxing" -> "🥊"; "basketball" -> "🏀"; "tennis" -> "🎾"; "ice hockey" -> "🏒"; "baseball" -> "⚾"; else -> "📺" 
             }
             
             val items = list.sortedByDescending { isEventLive(it) }.map { event ->
@@ -132,8 +134,7 @@ class LiveSportsEvents : MainAPI() {
     }
 
     private suspend fun createExtractor(url: String, type: ExtractorLinkType?, headers: Map<String, String>, name: String): ExtractorLink {
-        return newExtractorLink(this.name, name, url, type) {
-            this.isM3u8 = type == ExtractorLinkType.M3U8 
+        return newExtractorLink(this.name, name, url, type ?: INFER_TYPE) {
             quality = Qualities.Unknown.value
             if (headers.isNotEmpty()) this.headers = headers
         }
