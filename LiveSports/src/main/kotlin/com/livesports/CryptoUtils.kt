@@ -6,7 +6,6 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 object CryptoUtils {
-    // Safely pulls keys injected by GitHub Actions
     private val keys by lazy {
         listOf(
             try { BuildConfig.LIVESPORTS_PROVIDER_SECRET1 } catch (e: Exception) { "" },
