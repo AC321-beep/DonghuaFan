@@ -203,34 +203,52 @@ class DonghuaFunProvider : MainAPI() {
                 if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
             } 
             else if (rawUrl.isNotEmpty()) {
-                
                 var finalUrl = rawUrl
+                
+                // Strip the iframe wrapper
                 if (finalUrl.contains("play.donghuafun.com/m3u8/?url=")) {
                     finalUrl = finalUrl.substringAfter("?url=")
                     finalUrl = URLDecoder.decode(finalUrl, "UTF-8")
                 }
 
+                val playerIframeUrl = "https://play.donghuafun.com/m3u8/?url=$finalUrl"
                 val isM3u8 = finalUrl.contains(".m3u8", ignoreCase = true)
                 
-                callback.invoke(
-                    newExtractorLink(
-                        source = this.name,
-                        name = from.ifEmpty { "Server 1" },
-                        url = finalUrl,
-                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    ) {
-                        // CRITICAL: Aggressive Header Injection to bypass Cloudokyo 403 Forbidden Error
-                        this.headers = mapOf(
-                            "User-Agent" to USER_AGENT,
-                            "Referer" to "$mainUrl/",
-                            "Origin" to mainUrl,
-                            "Accept" to "*/*"
-                        )
-                        // Explicit referer bind for ExoPlayer fallback
-                        this.referer = "$mainUrl/"
-                        this.quality = Qualities.Unknown.value
-                    }
+                // Strictly mimic the desktop browser to bypass WAF Connection Resets
+                val streamHeaders = mapOf(
+                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Referer" to playerIframeUrl, 
+                    "Origin" to "https://play.donghuafun.com",
+                    "Accept" to "*/*"
                 )
+
+                if (isM3u8) {
+                    // --- THE FIX: Using Cloudstream's native M3u8Helper ---
+                    // This fetches the master playlist through Cloudstream's robust OkHttp client,
+                    // parses the resolutions, and generates individual selectable qualities!
+                    M3u8Helper.generateM3u8(
+                        source = this.name,
+                        streamUrl = finalUrl,
+                        referer = playerIframeUrl,
+                        headers = streamHeaders
+                    ).forEach { link ->
+                        callback.invoke(link)
+                    }
+                } else {
+                    // Fallback just in case they upload raw MP4s instead of M3U8
+                    callback.invoke(
+                        newExtractorLink(
+                            source = this.name,
+                            name = from.ifEmpty { "Server 1" },
+                            url = finalUrl,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.headers = streamHeaders
+                            this.referer = playerIframeUrl
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                }
                 return true
             }
         }
