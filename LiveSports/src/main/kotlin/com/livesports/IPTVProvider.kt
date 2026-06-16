@@ -34,7 +34,9 @@ class IPTVProvider(
     )
 
     private val customHttpClient by lazy {
-        OkHttpClient.Builder().addInterceptor(HeaderReplacementInterceptor(defaultHeaders)).build()
+        OkHttpClient.Builder()
+            .addInterceptor(HeaderReplacementInterceptor(defaultHeaders))
+            .build()
     }
 
     private fun getWithCustomHeaders(url: String): String {
@@ -121,6 +123,8 @@ class IPTVProvider(
             val mpdXml = getMpdStream(loadData.url, headers)
             val kidHex = Regex("""cenc:default_KID=["']([0-9a-fA-F\-]{36})["']""").find(mpdXml)?.groups?.get(1)?.value ?: UUID.randomUUID().toString()
             val kidBase64 = kidHex.replace("-", "").hexToBase64UrlOrNull() ?: kidHex
+            
+            // Calling the exact logic found in the Smali
             val keyBase64 = fetchKeyFromLicenseServer(loadData.licenseUrl, kidBase64)
             
             if (keyBase64.isNotBlank()) {
@@ -140,17 +144,39 @@ class IPTVProvider(
 
     private fun getMpdStream(url: String, headers: Map<String, String>): String {
         val request = Request.Builder().url(url).build()
-        return OkHttpClient.Builder().addInterceptor(HeaderReplacementInterceptor(headers)).build().newCall(request).execute().use { it.body?.string() ?: "" }
+        return OkHttpClient.Builder()
+            .addInterceptor(HeaderReplacementInterceptor(headers))
+            .build()
+            .newCall(request)
+            .execute()
+            .use { it.body?.string() ?: "" }
     }
 
+    // This is the direct translation of the getDRMKeysFromLicenseServer Smali method
     private fun fetchKeyFromLicenseServer(licenseUrl: String, kid: String): String {
         return try {
-            val client = OkHttpClient.Builder().addInterceptor(HeaderReplacementInterceptor(mapOf("User-Agent" to "Dalvik/2.1.0", "Content-Type" to "application/json"))).build()
-            val request = Request.Builder().url(licenseUrl).post("{\"kids\":[\"$kid\"],\"type\":\"temporary\"}".toRequestBody("application/json".toMediaType())).build()
+            val client = OkHttpClient.Builder()
+                .addInterceptor(HeaderReplacementInterceptor(mapOf(
+                    "User-Agent" to "Dalvik/2.1.0 (Linux; U; Android)", // Exact UA from Smali
+                    "Content-Type" to "application/json;charset=UTF-8"
+                )))
+                .build()
+            
+            val payload = "{\"kids\":[\"$kid\"],\"type\":\"temporary\"}"
+            val request = Request.Builder()
+                .url(licenseUrl)
+                .post(payload.toRequestBody("application/json".toMediaType()))
+                .build()
+                
             client.newCall(request).execute().use { resp ->
-                ((parseJson<Map<String, Any>>(resp.body?.string() ?: "")["keys"] as? List<Map<String, String>>)?.firstOrNull()?.get("k") ?: "").trim()
+                val responseString = resp.body?.string() ?: ""
+                val jsonResponse = parseJson<Map<String, Any>>(responseString)
+                val keysList = jsonResponse["keys"] as? List<Map<String, String>>
+                (keysList?.firstOrNull()?.get("k") ?: "").trim()
             }
-        } catch (e: Exception) { "" }
+        } catch (e: Exception) { 
+            "" 
+        }
     }
 
     private suspend fun createExtractor(url: String, type: ExtractorLinkType?, headers: Map<String, String>, customName: String = name): ExtractorLink {
