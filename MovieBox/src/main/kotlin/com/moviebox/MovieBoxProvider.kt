@@ -134,107 +134,170 @@ class MovieBoxProvider : MainAPI() {
     }
 
     // -------------------------------------------------------------------------
-    // 1. MAIN PAGE – tries multiple tabIds
+    // 1. MAIN PAGE – with extensive fallbacks and debug logging
     // -------------------------------------------------------------------------
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val tabIds = listOf(0, 1, 2, 3, 4, 5) // try several
-        var normalSections: List<HomePageList> = emptyList()
+        // Try tab-operating with various tabId and version combinations
+        val tabIds = listOf(0, 1, 2, 3, 4, 5)
+        val versions = listOf("", "3.0.03", "3.0.02", "3.0.01")
 
         for (tabId in tabIds) {
-            try {
-                val url = buildUrl("/wefeed-mobile-bff/tab-operating", mapOf(
-                    "page" to "1",
-                    "tabId" to tabId.toString(),
-                    "version" to ""
-                ))
-                val xClientToken = generateXClientToken()
-                val xTrSignature = generateXTrSignature("GET", "application/json", "application/json", url)
+            for (version in versions) {
+                try {
+                    val url = buildUrl("/wefeed-mobile-bff/tab-operating", mapOf(
+                        "page" to "1",
+                        "tabId" to tabId.toString(),
+                        "version" to version
+                    ))
+                    val xClientToken = generateXClientToken()
+                    val xTrSignature = generateXTrSignature("GET", "application/json", "application/json", url)
 
-                val headers = mapOf(
-                    "user-agent" to "com.community.mbox.in/50020042 (Linux; U; Android 16; en_IN; sdk_gphone64_x86_64; Build/BP22.250325.006; Cronet/133.0.6876.3)",
-                    "accept" to "application/json",
-                    "content-type" to "application/json",
-                    "connection" to "keep-alive",
-                    "x-client-token" to xClientToken,
-                    "x-tr-signature" to xTrSignature,
-                    "x-client-info" to """{"package_name":"com.community.mbox.in","version_name":"3.0.03.0529.03","version_code":50020042,"os":"android","os_version":"16","device_id":"$deviceId","install_store":"ps","gaid":"d7578036d13336cc","brand":"google","model":"${randomBrandModel()}","system_language":"en","net":"NETWORK_WIFI","region":"IN","timezone":"Asia/Calcutta","sp_code":""}""",
-                    "x-client-status" to "0",
-                    "x-play-mode" to "2"
-                )
+                    val headers = mapOf(
+                        "user-agent" to "com.community.mbox.in/50020042 (Linux; U; Android 16; en_IN; sdk_gphone64_x86_64; Build/BP22.250325.006; Cronet/133.0.6876.3)",
+                        "accept" to "application/json",
+                        "content-type" to "application/json",
+                        "connection" to "keep-alive",
+                        "x-client-token" to xClientToken,
+                        "x-tr-signature" to xTrSignature,
+                        "x-client-info" to """{"package_name":"com.community.mbox.in","version_name":"3.0.03.0529.03","version_code":50020042,"os":"android","os_version":"16","device_id":"$deviceId","install_store":"ps","gaid":"d7578036d13336cc","brand":"google","model":"${randomBrandModel()}","system_language":"en","net":"NETWORK_WIFI","region":"IN","timezone":"Asia/Calcutta","sp_code":""}""",
+                        "x-client-status" to "0",
+                        "x-play-mode" to "2"
+                    )
 
-                val response = app.get(url, headers = headers)
-                val responseBody = response.body?.string() ?: ""
+                    val response = app.get(url, headers = headers)
+                    val responseBody = response.body?.string() ?: ""
 
-                if (response.code != 200 || responseBody.isBlank()) continue
+                    // Debug output – you can check Logcat
+                    println("MovieBox: URL = $url")
+                    println("MovieBox: Response code = ${response.code}")
+                    if (response.code != 200 || responseBody.isBlank()) continue
 
-                fun parseSubject(subjectJson: JsonNode?): SearchResponse? {
-                    subjectJson ?: return null
-                    val subjectId = subjectJson["subjectId"]?.asText() ?: return null
-                    val title = subjectJson["title"]?.asText() ?: return null
-                    val coverUrl = subjectJson["cover"]?.get("url")?.asText()
-                    val subjectType = when (subjectJson["subjectType"]?.asInt()) {
-                        1 -> TvType.Movie
-                        2 -> TvType.TvSeries
-                        5 -> TvType.Live
-                        else -> TvType.Movie
-                    }
-                    return newMovieSearchResponse(title, subjectId, subjectType) {
-                        this.posterUrl = coverUrl
-                        this.score = Score.from10(subjectJson["imdbRatingValue"]?.asText())
-                    }
-                }
+                    val mapper = jacksonObjectMapper()
+                    val root = mapper.readTree(responseBody)
+                    val data = root["data"]
+                    if (data == null) continue
 
-                val mapper = jacksonObjectMapper()
-                val root = mapper.readTree(responseBody)
-                val data = root["data"]
-                if (data == null || !data.has("items")) continue
-                val sections = data["items"]
-                if (!sections.isArray || sections.size() == 0) continue
+                    // Try different possible field names for the sections list
+                    val sections = data["items"] ?: data["sections"] ?: data["list"] ?: continue
+                    if (!sections.isArray || sections.size() == 0) continue
 
-                val parsedSections = sections.mapNotNull { section ->
-                    val title = section["title"]?.asText()?.let {
-                        if (it.equals("banner", ignoreCase = true)) "🔥Top Picks" else it
-                    } ?: return@mapNotNull null
-                    val type = section["type"]?.asText()
-
-                    val mediaList = when (type) {
-                        "BANNER" -> section["banner"]?.get("banners")
-                            ?.mapNotNull { bannerItem -> parseSubject(bannerItem["subject"]) }
-                        "SUBJECTS_MOVIE" -> section["subjects"]
-                            ?.mapNotNull { subjectItem -> parseSubject(subjectItem) }
-                        "CUSTOM" -> section["customData"]?.get("items")
-                            ?.mapNotNull { customItem -> parseSubject(customItem["subject"]) }
-                        else -> null
+                    fun parseSubject(subjectJson: JsonNode?): SearchResponse? {
+                        subjectJson ?: return null
+                        val subjectId = subjectJson["subjectId"]?.asText() ?: return null
+                        val title = subjectJson["title"]?.asText() ?: return null
+                        val coverUrl = subjectJson["cover"]?.get("url")?.asText()
+                        val subjectType = when (subjectJson["subjectType"]?.asInt()) {
+                            1 -> TvType.Movie
+                            2 -> TvType.TvSeries
+                            5 -> TvType.Live
+                            else -> TvType.Movie
+                        }
+                        return newMovieSearchResponse(title, subjectId, subjectType) {
+                            this.posterUrl = coverUrl
+                            this.score = Score.from10(subjectJson["imdbRatingValue"]?.asText())
+                        }
                     }
 
-                    if (mediaList.isNullOrEmpty()) null
-                    else HomePageList(title, mediaList)
-                }
+                    val parsedSections = sections.mapNotNull { section ->
+                        val title = section["title"]?.asText()?.let {
+                            if (it.equals("banner", ignoreCase = true)) "🔥Top Picks" else it
+                        } ?: return@mapNotNull null
+                        val type = section["type"]?.asText()
 
-                if (parsedSections.isNotEmpty()) {
-                    normalSections = parsedSections
-                    break
+                        val mediaList = when (type) {
+                            "BANNER" -> section["banner"]?.get("banners")
+                                ?.mapNotNull { bannerItem -> parseSubject(bannerItem["subject"]) }
+                            "SUBJECTS_MOVIE" -> section["subjects"]
+                                ?.mapNotNull { subjectItem -> parseSubject(subjectItem) }
+                            "CUSTOM" -> section["customData"]?.get("items")
+                                ?.mapNotNull { customItem -> parseSubject(customItem["subject"]) }
+                            else -> null
+                        }
+
+                        if (mediaList.isNullOrEmpty()) null
+                        else HomePageList(title, mediaList)
+                    }
+
+                    if (parsedSections.isNotEmpty()) {
+                        return newHomePageResponse(parsedSections)
+                    }
+                } catch (_: Exception) {
+                    // continue
                 }
-            } catch (_: Exception) {
-                // continue to next tabId
             }
         }
 
-        if (normalSections.isNotEmpty()) {
-            return newHomePageResponse(normalSections)
+        // Fallback 1: Trending endpoint (known to work)
+        val trendingList = fetchTrending()
+        if (trendingList.isNotEmpty()) {
+            return newHomePageResponse(listOf(HomePageList("🔥 Trending", trendingList)))
         }
 
-        // Fallback: try live sports
+        // Fallback 2: Live Sports
         val liveList = fetchLiveSports()
         if (liveList.isNotEmpty()) {
             return newHomePageResponse(listOf(HomePageList("⚽ Live Sports", liveList)))
         }
 
+        // Ultimate fallback: empty
         return newHomePageResponse(emptyList())
     }
 
     // -------------------------------------------------------------------------
-    // 2. FETCH LIVE SPORTS
+    // 2. FETCH TRENDING (reliable fallback)
+    // -------------------------------------------------------------------------
+    private suspend fun fetchTrending(): List<SearchResponse> {
+        return try {
+            val url = buildUrl("/wefeed-mobile-bff/subject-api/trending/v2")
+            val jsonBody = "{}"
+            val xClientToken = generateXClientToken()
+            val xTrSignature = generateXTrSignature("POST", "application/json", "application/json; charset=utf-8", url, jsonBody)
+
+            val headers = mapOf(
+                "user-agent" to "com.community.mbox.in/50020042 (Linux; U; Android 16; en_IN; sdk_gphone64_x86_64; Build/BP22.250325.006; Cronet/133.0.6876.3)",
+                "accept" to "application/json",
+                "content-type" to "application/json",
+                "x-client-token" to xClientToken,
+                "x-tr-signature" to xTrSignature,
+                "x-client-info" to """{"package_name":"com.community.mbox.in","version_name":"3.0.03.0529.03","version_code":50020042,"os":"android","os_version":"16","device_id":"$deviceId","install_store":"ps","gaid":"d7578036d13336cc","brand":"google","model":"${randomBrandModel()}","system_language":"en","net":"NETWORK_WIFI","region":"IN","timezone":"Asia/Calcutta","sp_code":""}""",
+                "x-client-status" to "0"
+            )
+
+            val requestBody = jsonBody.toRequestBody("application/json".toMediaType())
+            val response = app.post(url, headers = headers, requestBody = requestBody)
+            if (response.code != 200) return emptyList()
+
+            val body = response.body.string()
+            val mapper = jacksonObjectMapper()
+            val root = mapper.readTree(body)
+            val data = root["data"]
+            if (data == null) return emptyList()
+
+            val subjects = data["subjects"] ?: data["list"] ?: return emptyList()
+            if (!subjects.isArray) return emptyList()
+
+            subjects.mapNotNull { subject ->
+                val subjectId = subject["subjectId"]?.asText() ?: return@mapNotNull null
+                val title = subject["title"]?.asText() ?: return@mapNotNull null
+                val coverUrl = subject["cover"]?.get("url")?.asText()
+                val subjectType = when (subject["subjectType"]?.asInt()) {
+                    1 -> TvType.Movie
+                    2 -> TvType.TvSeries
+                    5 -> TvType.Live
+                    else -> TvType.Movie
+                }
+                newMovieSearchResponse(title, subjectId, subjectType) {
+                    this.posterUrl = coverUrl
+                    this.score = Score.from10(subject["imdbRatingValue"]?.asText())
+                }
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. FETCH LIVE SPORTS
     // -------------------------------------------------------------------------
     private suspend fun fetchLiveSports(): List<SearchResponse> {
         // Try dedicated live endpoint
@@ -332,7 +395,7 @@ class MovieBoxProvider : MainAPI() {
     }
 
     // -------------------------------------------------------------------------
-    // 3. SEARCH
+    // 4. SEARCH
     // -------------------------------------------------------------------------
     override suspend fun search(query: String, page: Int): SearchResponseList {
         val url = buildUrl("/wefeed-mobile-bff/subject-api/search/v2")
@@ -382,7 +445,7 @@ class MovieBoxProvider : MainAPI() {
     }
 
     // -------------------------------------------------------------------------
-    // 4. LOAD
+    // 5. LOAD
     // -------------------------------------------------------------------------
     override suspend fun load(url: String): LoadResponse {
         val id = Regex("""subjectId=([^&]+)""")
@@ -676,7 +739,7 @@ class MovieBoxProvider : MainAPI() {
     }
 
     // -------------------------------------------------------------------------
-    // 5. LOAD LINKS
+    // 6. LOAD LINKS
     // -------------------------------------------------------------------------
     override suspend fun loadLinks(
         data: String,
@@ -974,7 +1037,7 @@ class MovieBoxProvider : MainAPI() {
 }
 
 // -------------------------------------------------------------------------
-// Helper functions
+// Helper functions (unchanged)
 // -------------------------------------------------------------------------
 
 fun getHighestQuality(input: String): Int? {
