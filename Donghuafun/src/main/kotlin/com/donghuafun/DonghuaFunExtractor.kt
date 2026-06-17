@@ -1,15 +1,13 @@
 package com.donghuafun
 
 import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.utils.ExtractorApi
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.newExtractorLink
+import com.lagradost.cloudstream3.utils.*
 
 class DonghuaFunExtractor : ExtractorApi() {
     override val name = "DonghuaFun Player"
     override val mainUrl = "https://play.donghuafun.com"
+    // Restored the missing override that the compiler asked for
+    override val requiresReferer = false 
 
     override suspend fun getUrl(
         url: String,
@@ -22,7 +20,7 @@ class DonghuaFunExtractor : ExtractorApi() {
             url.substringAfter("?url=")
         } else url
 
-        // Strict positional parameters mapping to Cloudstream's builder
+        // Uses positional arguments and the wildcard utils import to ensure no unresolved references
         callback.invoke(
             newExtractorLink(
                 this.name,
