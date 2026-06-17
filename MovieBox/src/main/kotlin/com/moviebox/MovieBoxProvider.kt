@@ -468,6 +468,8 @@ class MovieBoxProvider : MainAPI() {
         val Poster = meta?.get("poster")?.asText() ?: coverUrl
         val Background = meta?.get("background")?.asText() ?: backgroundUrl
         val IMDBRating = meta?.get("imdbRating")?.asText()
+        // ✅ FIX: add this line – define Description
+        val Description = meta?.get("overview")?.asText() ?: description
 
         // --- LIVE TV handling with extra match details ---
         if (type == TvType.Live) {
