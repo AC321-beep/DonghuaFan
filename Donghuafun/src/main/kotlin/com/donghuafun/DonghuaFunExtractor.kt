@@ -3,6 +3,7 @@ package com.donghuafun
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType // <-- Added import
 import com.lagradost.cloudstream3.utils.Qualities
 
 class DonghuaFunExtractor : ExtractorApi() {
@@ -29,7 +30,7 @@ class DonghuaFunExtractor : ExtractorApi() {
                 url = m3u8Url,
                 referer = "https://donghuafun.com/",
                 quality = Qualities.Unknown.value,
-                isM3u8 = true, // Forces ExoPlayer to natively handle the manifest
+                type = ExtractorLinkType.M3U8, // <-- Replaced isM3u8 with the proper Type enum
                 headers = mapOf(
                     "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                     "Origin" to "https://donghuafun.com",
