@@ -134,126 +134,103 @@ class MovieBoxProvider : MainAPI() {
     }
 
     // -------------------------------------------------------------------------
-    // 1. MAIN PAGE
+    // 1. MAIN PAGE – tries multiple tabIds
     // -------------------------------------------------------------------------
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-    // Try several tabIds, starting with 0, then 1, then 2
-    val tabIds = listOf(0, 1, 2)
-    var normalSections: List<HomePageList> = emptyList()
-    var lastException: Exception? = null
+        val tabIds = listOf(0, 1, 2, 3, 4, 5) // try several
+        var normalSections: List<HomePageList> = emptyList()
 
-    for (tabId in tabIds) {
-        try {
-            val url = buildUrl("/wefeed-mobile-bff/tab-operating", mapOf(
-                "page" to "1",
-                "tabId" to tabId.toString(),
-                "version" to "" // try with empty; if fails, maybe add a version like "3.0.03"
-            ))
-            val xClientToken = generateXClientToken()
-            val xTrSignature = generateXTrSignature("GET", "application/json", "application/json", url)
+        for (tabId in tabIds) {
+            try {
+                val url = buildUrl("/wefeed-mobile-bff/tab-operating", mapOf(
+                    "page" to "1",
+                    "tabId" to tabId.toString(),
+                    "version" to ""
+                ))
+                val xClientToken = generateXClientToken()
+                val xTrSignature = generateXTrSignature("GET", "application/json", "application/json", url)
 
-            val headers = mapOf(
-                "user-agent" to "com.community.mbox.in/50020042 (Linux; U; Android 16; en_IN; sdk_gphone64_x86_64; Build/BP22.250325.006; Cronet/133.0.6876.3)",
-                "accept" to "application/json",
-                "content-type" to "application/json",
-                "connection" to "keep-alive",
-                "x-client-token" to xClientToken,
-                "x-tr-signature" to xTrSignature,
-                "x-client-info" to """{"package_name":"com.community.mbox.in","version_name":"3.0.03.0529.03","version_code":50020042,"os":"android","os_version":"16","device_id":"$deviceId","install_store":"ps","gaid":"d7578036d13336cc","brand":"google","model":"${randomBrandModel()}","system_language":"en","net":"NETWORK_WIFI","region":"IN","timezone":"Asia/Calcutta","sp_code":""}""",
-                "x-client-status" to "0",
-                "x-play-mode" to "2"
-            )
+                val headers = mapOf(
+                    "user-agent" to "com.community.mbox.in/50020042 (Linux; U; Android 16; en_IN; sdk_gphone64_x86_64; Build/BP22.250325.006; Cronet/133.0.6876.3)",
+                    "accept" to "application/json",
+                    "content-type" to "application/json",
+                    "connection" to "keep-alive",
+                    "x-client-token" to xClientToken,
+                    "x-tr-signature" to xTrSignature,
+                    "x-client-info" to """{"package_name":"com.community.mbox.in","version_name":"3.0.03.0529.03","version_code":50020042,"os":"android","os_version":"16","device_id":"$deviceId","install_store":"ps","gaid":"d7578036d13336cc","brand":"google","model":"${randomBrandModel()}","system_language":"en","net":"NETWORK_WIFI","region":"IN","timezone":"Asia/Calcutta","sp_code":""}""",
+                    "x-client-status" to "0",
+                    "x-play-mode" to "2"
+                )
 
-            val response = app.get(url, headers = headers)
-            val responseBody = response.body?.string() ?: ""
+                val response = app.get(url, headers = headers)
+                val responseBody = response.body?.string() ?: ""
 
-            // If response is empty or not 200, skip this tabId
-            if (response.code != 200 || responseBody.isBlank()) {
-                continue
-            }
+                if (response.code != 200 || responseBody.isBlank()) continue
 
-            fun parseSubject(subjectJson: JsonNode?): SearchResponse? {
-                subjectJson ?: return null
-                val subjectId = subjectJson["subjectId"]?.asText() ?: return null
-                val title = subjectJson["title"]?.asText() ?: return null
-                val coverUrl = subjectJson["cover"]?.get("url")?.asText()
-                val subjectType = when (subjectJson["subjectType"]?.asInt()) {
-                    1 -> TvType.Movie
-                    2 -> TvType.TvSeries
-                    5 -> TvType.Live
-                    else -> TvType.Movie
-                }
-                return newMovieSearchResponse(title, subjectId, subjectType) {
-                    this.posterUrl = coverUrl
-                    this.score = Score.from10(subjectJson["imdbRatingValue"]?.asText())
-                }
-            }
-
-            val mapper = jacksonObjectMapper()
-            val root = mapper.readTree(responseBody)
-            val data = root["data"]
-            if (data == null || !data.has("items")) {
-                continue // structure not as expected
-            }
-
-            val sections = data["items"]
-            if (!sections.isArray || sections.size() == 0) {
-                continue // empty sections
-            }
-
-            val parsedSections = sections.mapNotNull { section ->
-                val title = section["title"]?.asText()?.let {
-                    if (it.equals("banner", ignoreCase = true)) "🔥Top Picks" else it
-                } ?: return@mapNotNull null
-                val type = section["type"]?.asText()
-
-                val mediaList = when (type) {
-                    "BANNER" -> section["banner"]?.get("banners")
-                        ?.mapNotNull { bannerItem -> parseSubject(bannerItem["subject"]) }
-                    "SUBJECTS_MOVIE" -> section["subjects"]
-                        ?.mapNotNull { subjectItem -> parseSubject(subjectItem) }
-                    "CUSTOM" -> section["customData"]?.get("items")
-                        ?.mapNotNull { customItem -> parseSubject(customItem["subject"]) }
-                    else -> null
+                fun parseSubject(subjectJson: JsonNode?): SearchResponse? {
+                    subjectJson ?: return null
+                    val subjectId = subjectJson["subjectId"]?.asText() ?: return null
+                    val title = subjectJson["title"]?.asText() ?: return null
+                    val coverUrl = subjectJson["cover"]?.get("url")?.asText()
+                    val subjectType = when (subjectJson["subjectType"]?.asInt()) {
+                        1 -> TvType.Movie
+                        2 -> TvType.TvSeries
+                        5 -> TvType.Live
+                        else -> TvType.Movie
+                    }
+                    return newMovieSearchResponse(title, subjectId, subjectType) {
+                        this.posterUrl = coverUrl
+                        this.score = Score.from10(subjectJson["imdbRatingValue"]?.asText())
+                    }
                 }
 
-                if (mediaList.isNullOrEmpty()) null
-                else HomePageList(title, mediaList)
-            }
+                val mapper = jacksonObjectMapper()
+                val root = mapper.readTree(responseBody)
+                val data = root["data"]
+                if (data == null || !data.has("items")) continue
+                val sections = data["items"]
+                if (!sections.isArray || sections.size() == 0) continue
 
-            if (parsedSections.isNotEmpty()) {
-                normalSections = parsedSections
-                break // success, stop trying other tabIds
+                val parsedSections = sections.mapNotNull { section ->
+                    val title = section["title"]?.asText()?.let {
+                        if (it.equals("banner", ignoreCase = true)) "🔥Top Picks" else it
+                    } ?: return@mapNotNull null
+                    val type = section["type"]?.asText()
+
+                    val mediaList = when (type) {
+                        "BANNER" -> section["banner"]?.get("banners")
+                            ?.mapNotNull { bannerItem -> parseSubject(bannerItem["subject"]) }
+                        "SUBJECTS_MOVIE" -> section["subjects"]
+                            ?.mapNotNull { subjectItem -> parseSubject(subjectItem) }
+                        "CUSTOM" -> section["customData"]?.get("items")
+                            ?.mapNotNull { customItem -> parseSubject(customItem["subject"]) }
+                        else -> null
+                    }
+
+                    if (mediaList.isNullOrEmpty()) null
+                    else HomePageList(title, mediaList)
+                }
+
+                if (parsedSections.isNotEmpty()) {
+                    normalSections = parsedSections
+                    break
+                }
+            } catch (_: Exception) {
+                // continue to next tabId
             }
-        } catch (e: Exception) {
-            lastException = e
-            // continue to next tabId
         }
-    }
 
-    // If we got sections, return them
-    if (normalSections.isNotEmpty()) {
-        return newHomePageResponse(normalSections)
-    }
+        if (normalSections.isNotEmpty()) {
+            return newHomePageResponse(normalSections)
+        }
 
-    // Fallback: try live sports
-    val liveList = fetchLiveSports()
-    if (liveList.isNotEmpty()) {
-        return newHomePageResponse(listOf(HomePageList("⚽ Live Sports", liveList)))
-    }
-
-    // Ultimate fallback: return an empty response with a message?
-    // CloudStream doesn't support custom messages, so just return empty.
-    return newHomePageResponse(emptyList())
-}
-
-        // Fallback to live sports
+        // Fallback: try live sports
         val liveList = fetchLiveSports()
-        return if (liveList.isNotEmpty()) {
-            newHomePageResponse(listOf(HomePageList("⚽ Live Sports", liveList)))
-        } else {
-            newHomePageResponse(emptyList())
+        if (liveList.isNotEmpty()) {
+            return newHomePageResponse(listOf(HomePageList("⚽ Live Sports", liveList)))
         }
+
+        return newHomePageResponse(emptyList())
     }
 
     // -------------------------------------------------------------------------
@@ -505,7 +482,6 @@ class MovieBoxProvider : MainAPI() {
         val Poster = meta?.get("poster")?.asText() ?: coverUrl
         val Background = meta?.get("background")?.asText() ?: backgroundUrl
         val IMDBRating = meta?.get("imdbRating")?.asText()
-        // ✅ FIX: add this line – define Description
         val Description = meta?.get("overview")?.asText() ?: description
 
         // --- LIVE TV handling with extra match details ---
