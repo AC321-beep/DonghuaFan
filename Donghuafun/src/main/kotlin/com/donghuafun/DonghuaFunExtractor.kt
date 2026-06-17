@@ -10,7 +10,6 @@ import com.lagradost.cloudstream3.newExtractorLink
 class DonghuaFunExtractor : ExtractorApi() {
     override val name = "DonghuaFun Player"
     override val mainUrl = "https://play.donghuafun.com"
-    override val requiresReferer = false
 
     override suspend fun getUrl(
         url: String,
@@ -23,16 +22,17 @@ class DonghuaFunExtractor : ExtractorApi() {
             url.substringAfter("?url=")
         } else url
 
+        // Strict positional parameters mapping to Cloudstream's builder
         callback.invoke(
             newExtractorLink(
-                name = this.name,
-                source = "DonghuaFun (M3U8)",
-                url = m3u8Url,
-                type = ExtractorLinkType.M3U8
+                this.name,
+                "DonghuaFun (M3U8)",
+                m3u8Url,
+                ExtractorLinkType.M3U8
             ) {
-                // Changed from the main site to the player subdomain to bypass the 403 block
-                this.referer = "https://play.donghuafun.com/" 
                 this.quality = Qualities.Unknown.value
+                // Spoofed headers targeting the subdomain to clear ExoPlayer Error 2004
+                this.referer = "https://play.donghuafun.com/" 
                 this.headers = mapOf(
                     "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
                     "Origin" to "https://play.donghuafun.com",
