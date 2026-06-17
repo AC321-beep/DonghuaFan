@@ -2,9 +2,15 @@ package com.donghuafun
 
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.newExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorApi
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.M3u8Helper // Explicitly imported here
+import com.lagradost.cloudstream3.utils.Qualities
 
 class DonghuaFunExtractor : ExtractorApi() {
+    // ... rest of the code remains exactly the same ...
     override val name = "DonghuaFun Player"
     override val mainUrl = "https://play.donghuafun.com"
     override val requiresReferer = false
