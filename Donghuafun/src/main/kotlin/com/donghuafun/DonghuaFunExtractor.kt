@@ -1,16 +1,9 @@
 package com.donghuafun
 
-import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.newExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorApi
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.M3u8Helper // Explicitly imported here
-import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.*
 
 class DonghuaFunExtractor : ExtractorApi() {
-    // ... rest of the code remains exactly the same ...
     override val name = "DonghuaFun Player"
     override val mainUrl = "https://play.donghuafun.com"
     override val requiresReferer = false
@@ -54,8 +47,7 @@ class DonghuaFunExtractor : ExtractorApi() {
             m3u8Headers["Cookie"] = cookieString
         }
 
-        // 3. Extract the M3U8 links. 
-        // We use M3u8Helper first because it unpacks nested playlists, preventing ExoPlayer relative path errors.
+        // 3. Extract the M3U8 links safely
         try {
             M3u8Helper.generateM3u8(
                 this.name,
@@ -64,7 +56,7 @@ class DonghuaFunExtractor : ExtractorApi() {
                 headers = m3u8Headers
             ).forEach(callback)
         } catch (e: Exception) {
-            // 4. If the helper fails, fallback to passing the raw URL and cookies natively to ExoPlayer
+            // 4. Fallback directly to ExoPlayer with cookies attached
             callback.invoke(
                 newExtractorLink(
                     this.name,
