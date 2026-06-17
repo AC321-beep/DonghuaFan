@@ -121,7 +121,7 @@ class DonghuaFunProvider : MainAPI() {
         return Regex("""(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull() ?: -1
     }
 
-    @Suppress("DEPRECATION", "DEPRECATION_ERROR")
+   @Suppress("DEPRECATION", "DEPRECATION_ERROR")
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -145,7 +145,6 @@ class DonghuaFunProvider : MainAPI() {
         }
         if (dailymotionToken != null) {
             val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
-            // Using loadExtractor directly for Dailymotion
             if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
         }
 
@@ -174,37 +173,31 @@ class DonghuaFunProvider : MainAPI() {
             }
 
             val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
-            val streamHeaders = mapOf(
-                "User-Agent" to USER_AGENT,
-                "Referer" to "https://donghuafun.com/",
-                "Origin" to "https://donghuafun.com"
-            )
-
+            
             if (isM3u8) {
-                try {
-                    M3u8Helper.generateM3u8(
-                        this.name,
-                        rawUrl,
-                        "https://donghuafun.com/",
-                        headers = streamHeaders
-                    ).forEach(callback)
-                } catch (e: Exception) {
-                    Log.e(TAG, "M3u8Helper failed, using fallback: ${e.message}")
-                    callback.invoke(
-                        newExtractorLink(this.name, from.ifEmpty { "Server 1" }, rawUrl, ExtractorLinkType.M3U8) {
-                            this.headers = streamHeaders
-                            this.referer = "https://donghuafun.com/"
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
+                // Route to our newly created DonghuaFunExtractor by prepending the domain
+                val extractorUrl = if (rawUrl.startsWith("http")) {
+                    "https://play.donghuafun.com/m3u8/?url=$rawUrl"
+                } else rawUrl
+
+                if (loadExtractor(extractorUrl, "https://donghuafun.com/", subtitleCallback, callback)) {
+                    return true
                 }
             } else {
                 callback.invoke(
-                    newExtractorLink(this.name, from.ifEmpty { "Server 1" }, rawUrl, ExtractorLinkType.VIDEO) {
-                        this.headers = streamHeaders
-                        this.referer = "https://donghuafun.com/"
-                        this.quality = Qualities.Unknown.value
-                    }
+                    ExtractorLink(
+                        source = this.name,
+                        name = from.ifEmpty { "Server 1" },
+                        url = rawUrl,
+                        referer = "https://donghuafun.com/",
+                        quality = Qualities.Unknown.value,
+                        isM3u8 = false,
+                        headers = mapOf(
+                            "User-Agent" to USER_AGENT,
+                            "Referer" to "https://donghuafun.com/",
+                            "Origin" to "https://donghuafun.com"
+                        )
+                    )
                 )
             }
             return true
