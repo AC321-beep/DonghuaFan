@@ -24,7 +24,7 @@ class DonghuaFunProvider : MainAPI() {
     private fun detailUrlToId(url: String): String =
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
-    // Reverted EXACTLY to your original working order
+    // Original working homepage order
     override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
         "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
@@ -133,7 +133,7 @@ class DonghuaFunProvider : MainAPI() {
         val html = try { app.get(detailPageUrl, headers = headers).text } catch (e: Exception) { "" }
         val doc = try { app.get(detailPageUrl, headers = headers).document } catch (e: Exception) { null }
 
-        // --- Dailymotion Logic Restored ---
+        // --- Dailymotion Logic Intact ---
         var dailymotionToken: String? = null
         doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
             val src = iframe.attr("src")
@@ -180,6 +180,7 @@ class DonghuaFunProvider : MainAPI() {
             )
 
             if (isM3u8) {
+                // Route to our newly created DonghuaFunExtractor by prepending the domain
                 val extractorUrl = if (rawUrl.startsWith("http")) {
                     "https://play.donghuafun.com/m3u8/?url=$rawUrl"
                 } else rawUrl
