@@ -4,7 +4,6 @@ import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.M3u8Helper
 import org.jsoup.nodes.Document
 import java.net.URLDecoder
 
@@ -25,6 +24,7 @@ class DonghuaFunProvider : MainAPI() {
     private fun detailUrlToId(url: String): String =
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
+    // Reverted EXACTLY to your original working order
     override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
         "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
@@ -121,7 +121,7 @@ class DonghuaFunProvider : MainAPI() {
         return Regex("""(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull() ?: -1
     }
 
-   @Suppress("DEPRECATION", "DEPRECATION_ERROR")
+    @Suppress("DEPRECATION", "DEPRECATION_ERROR")
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -173,9 +173,13 @@ class DonghuaFunProvider : MainAPI() {
             }
 
             val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
-            
+            val streamHeaders = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Referer" to "https://donghuafun.com/",
+                "Origin" to "https://donghuafun.com"
+            )
+
             if (isM3u8) {
-                // Route to our newly created DonghuaFunExtractor by prepending the domain
                 val extractorUrl = if (rawUrl.startsWith("http")) {
                     "https://play.donghuafun.com/m3u8/?url=$rawUrl"
                 } else rawUrl
@@ -185,19 +189,16 @@ class DonghuaFunProvider : MainAPI() {
                 }
             } else {
                 callback.invoke(
-                    ExtractorLink(
-                        source = this.name,
-                        name = from.ifEmpty { "Server 1" },
+                    newExtractorLink(
+                        name = this.name,
+                        source = from.ifEmpty { "Server 1" },
                         url = rawUrl,
-                        referer = "https://donghuafun.com/",
-                        quality = Qualities.Unknown.value,
-                        isM3u8 = false,
-                        headers = mapOf(
-                            "User-Agent" to USER_AGENT,
-                            "Referer" to "https://donghuafun.com/",
-                            "Origin" to "https://donghuafun.com"
-                        )
-                    )
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.headers = streamHeaders
+                        this.referer = "https://donghuafun.com/"
+                        this.quality = Qualities.Unknown.value
+                    }
                 )
             }
             return true
