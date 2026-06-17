@@ -24,7 +24,7 @@ class DonghuaFunProvider : MainAPI() {
     private fun detailUrlToId(url: String): String =
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
-    // Original working homepage order
+    // EXACT original working homepage order
     override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
         "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
@@ -189,12 +189,13 @@ class DonghuaFunProvider : MainAPI() {
                     return true
                 }
             } else {
+                // Strict positional mapping fallback
                 callback.invoke(
                     newExtractorLink(
-                        name = this.name,
-                        source = from.ifEmpty { "Server 1" },
-                        url = rawUrl,
-                        type = ExtractorLinkType.VIDEO
+                        this.name,
+                        from.ifEmpty { "Server 1" },
+                        rawUrl,
+                        ExtractorLinkType.VIDEO
                     ) {
                         this.headers = streamHeaders
                         this.referer = "https://donghuafun.com/"
