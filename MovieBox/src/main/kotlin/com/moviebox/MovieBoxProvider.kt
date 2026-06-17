@@ -137,11 +137,17 @@ class MovieBoxProvider : MainAPI() {
     // 1. MAIN PAGE
     // -------------------------------------------------------------------------
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val normalSections = try {
+    // Try several tabIds, starting with 0, then 1, then 2
+    val tabIds = listOf(0, 1, 2)
+    var normalSections: List<HomePageList> = emptyList()
+    var lastException: Exception? = null
+
+    for (tabId in tabIds) {
+        try {
             val url = buildUrl("/wefeed-mobile-bff/tab-operating", mapOf(
                 "page" to "1",
-                "tabId" to "0",
-                "version" to ""
+                "tabId" to tabId.toString(),
+                "version" to "" // try with empty; if fails, maybe add a version like "3.0.03"
             ))
             val xClientToken = generateXClientToken()
             val xTrSignature = generateXTrSignature("GET", "application/json", "application/json", url)
@@ -160,6 +166,11 @@ class MovieBoxProvider : MainAPI() {
 
             val response = app.get(url, headers = headers)
             val responseBody = response.body?.string() ?: ""
+
+            // If response is empty or not 200, skip this tabId
+            if (response.code != 200 || responseBody.isBlank()) {
+                continue
+            }
 
             fun parseSubject(subjectJson: JsonNode?): SearchResponse? {
                 subjectJson ?: return null
@@ -180,9 +191,17 @@ class MovieBoxProvider : MainAPI() {
 
             val mapper = jacksonObjectMapper()
             val root = mapper.readTree(responseBody)
-            val sections = root["data"]?.get("items") ?: return newHomePageResponse(emptyList())
+            val data = root["data"]
+            if (data == null || !data.has("items")) {
+                continue // structure not as expected
+            }
 
-            sections.mapNotNull { section ->
+            val sections = data["items"]
+            if (!sections.isArray || sections.size() == 0) {
+                continue // empty sections
+            }
+
+            val parsedSections = sections.mapNotNull { section ->
                 val title = section["title"]?.asText()?.let {
                     if (it.equals("banner", ignoreCase = true)) "🔥Top Picks" else it
                 } ?: return@mapNotNull null
@@ -201,14 +220,32 @@ class MovieBoxProvider : MainAPI() {
                 if (mediaList.isNullOrEmpty()) null
                 else HomePageList(title, mediaList)
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            emptyList()
-        }
 
-        if (normalSections.isNotEmpty()) {
-            return newHomePageResponse(normalSections)
+            if (parsedSections.isNotEmpty()) {
+                normalSections = parsedSections
+                break // success, stop trying other tabIds
+            }
+        } catch (e: Exception) {
+            lastException = e
+            // continue to next tabId
         }
+    }
+
+    // If we got sections, return them
+    if (normalSections.isNotEmpty()) {
+        return newHomePageResponse(normalSections)
+    }
+
+    // Fallback: try live sports
+    val liveList = fetchLiveSports()
+    if (liveList.isNotEmpty()) {
+        return newHomePageResponse(listOf(HomePageList("⚽ Live Sports", liveList)))
+    }
+
+    // Ultimate fallback: return an empty response with a message?
+    // CloudStream doesn't support custom messages, so just return empty.
+    return newHomePageResponse(emptyList())
+}
 
         // Fallback to live sports
         val liveList = fetchLiveSports()
