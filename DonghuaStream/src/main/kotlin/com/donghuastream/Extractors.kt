@@ -71,7 +71,7 @@ class Extractor : ExtractorApi() {
     }
 }
 
-// ----- 2. Rumble Extractor (improved) -----
+// ----- 2. Rumble Extractor (improved for trailers) -----
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
     override var mainUrl = "https://rumble.com"
@@ -106,7 +106,7 @@ class Rumble : ExtractorApi() {
 
         val scrapedUrls = mutableSetOf<String>()
 
-        // ----- 1. Find all mp4/m3u8 URLs in the page -----
+        // ----- 1. Direct URLs (.mp4 / .m3u8) with standard pattern -----
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
 
@@ -114,7 +114,7 @@ class Rumble : ExtractorApi() {
             val rawUrl = match.value
             val cleanUrl = rawUrl.replace("\\/", "/")
 
-            // Skip known non-video assets
+            // Skip obvious non-video assets
             if (cleanUrl.contains("/assets/", ignoreCase = true) ||
                 cleanUrl.contains("loop", ignoreCase = true) ||
                 cleanUrl.contains("preview", ignoreCase = true) ||
@@ -125,54 +125,21 @@ class Rumble : ExtractorApi() {
             }
 
             if (scrapedUrls.add(cleanUrl)) {
-                if (cleanUrl.contains(".m3u8")) {
-                    M3u8Helper.generateM3u8(name, cleanUrl, effectiveReferer).forEach(callback)
-                } else if (cleanUrl.contains(".mp4")) {
-                    val startIndex = maxOf(0, match.range.first - 250)
-                    val precedingText = html.substring(startIndex, match.range.first)
-
-                    val qMatch = Regex("""(?:\\"h\\"|"h"|height)\s*:\s*(\d{3,4})""")
-                        .findAll(precedingText).lastOrNull()
-                        ?: Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
-                            .findAll(precedingText).lastOrNull()
-
-                    var displayLabel = name
-                    var qualityInt = Qualities.Unknown.value
-
-                    if (qMatch != null) {
-                        val qStr = qMatch.groupValues[1]
-                        displayLabel = "$name ${qStr}p"
-                        qualityInt = qStr.toIntOrNull() ?: Qualities.Unknown.value
-                    }
-
-                    callback(
-                        newExtractorLink(
-                            name,
-                            displayLabel,
-                            cleanUrl,
-                            INFER_TYPE
-                        ) {
-                            this.referer = effectiveReferer
-                            this.quality = qualityInt
-                        }
-                    )
-                }
+                extractVideoUrl(cleanUrl, match, html, effectiveReferer, callback)
             }
         }
 
-        // ----- 2. If no direct URLs, try JavaScript "source" array -----
-        if (scrapedUrls.isEmpty()) {
-            Log.d(name, "No direct URLs, trying to extract from JavaScript")
-            val jsonRegex = Regex("""source\s*:\s*(\[[^\]]+\])""")
-            val jsonMatch = jsonRegex.find(html)
-            if (jsonMatch != null) {
-                val jsonStr = jsonMatch.groupValues[1]
-                val urlQualityRegex = Regex(""""url"\s*:\s*"(https?://[^"]+\.mp4[^"]*)"[^}]*"height"\s*:\s*(\d+)""")
-                val matches = urlQualityRegex.findAll(jsonStr)
-                matches.forEach { match ->
-                    val videoUrl = match.groupValues[1]
-                    val quality = match.groupValues[2].toIntOrNull() ?: Qualities.Unknown.value
-                    val displayLabel = "$name ${quality}p"
+        // ----- 2. JSON-like structures with common keys -----
+        val jsonPatterns = listOf(
+            Regex("""\{[^{}]*"(?:url|videoUrl|src|file)"\s*:\s*"(https?://[^"]+\.(?:mp4|m3u8)[^"]*)"[^{}]*\}"""),
+            Regex("""\{(?:[^{}]*"(?:url|src|file)"\s*:\s*"(https?://[^"]+\.(?:mp4|m3u8)[^"]*)"[^{}]*?)\}""")
+        )
+        for (pattern in jsonPatterns) {
+            pattern.findAll(html).forEach { match ->
+                val videoUrl = match.groupValues[1]
+                if (scrapedUrls.add(videoUrl)) {
+                    val quality = findQuality(match.range, html)
+                    val displayLabel = if (quality > 0) "$name ${quality}p" else name
                     callback(
                         newExtractorLink(
                             name,
@@ -185,13 +152,86 @@ class Rumble : ExtractorApi() {
                         }
                     )
                 }
-                if (matches.any()) return
             }
+        }
 
-            // Fallback to generic extractor
+        // ----- 3. JavaScript `window` objects containing video data -----
+        val windowPatterns = listOf(
+            Regex("""window\.VIDEO\s*=\s*(\{.*?\});""", RegexOption.DOT_MATCHES_ALL),
+            Regex("""window\.rumble\s*=\s*(\{.*?\});""", RegexOption.DOT_MATCHES_ALL),
+            Regex("""window\.videoData\s*=\s*(\{.*?\});""", RegexOption.DOT_MATCHES_ALL)
+        )
+        for (pattern in windowPatterns) {
+            val match = pattern.find(html)
+            if (match != null) {
+                val jsonStr = match.groupValues[1]
+                val urlMatches = Regex(""""(?:url|videoUrl|src|file|hls|mp4)"\s*:\s*"(https?://[^"]+\.(?:mp4|m3u8)[^"]*)""").findAll(jsonStr)
+                urlMatches.forEach { urlMatch ->
+                    val videoUrl = urlMatch.groupValues[1]
+                    if (scrapedUrls.add(videoUrl)) {
+                        val quality = findQuality(urlMatch.range, jsonStr)
+                        val displayLabel = if (quality > 0) "$name ${quality}p" else name
+                        callback(
+                            newExtractorLink(
+                                name,
+                                displayLabel,
+                                videoUrl,
+                                INFER_TYPE
+                            ) {
+                                this.referer = effectiveReferer
+                                this.quality = quality
+                            }
+                        )
+                    }
+                }
+                // If we found at least one URL, break out of the window loop
+                if (scrapedUrls.isNotEmpty()) break
+            }
+        }
+
+        // ----- 4. Fallback to generic extractor -----
+        if (scrapedUrls.isEmpty()) {
             Log.d(name, "No video found, falling back to generic loadExtractor")
             loadExtractor(url, referer = effectiveReferer, subtitleCallback, callback)
         }
+    }
+
+    // Helper: extract and emit video link with quality
+    private fun extractVideoUrl(
+        cleanUrl: String,
+        match: MatchResult,
+        html: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        if (cleanUrl.contains(".m3u8")) {
+            M3u8Helper.generateM3u8(name, cleanUrl, referer).forEach(callback)
+        } else if (cleanUrl.contains(".mp4")) {
+            val quality = findQuality(match.range, html)
+            val displayLabel = if (quality > 0) "$name ${quality}p" else name
+            callback(
+                newExtractorLink(
+                    name,
+                    displayLabel,
+                    cleanUrl,
+                    INFER_TYPE
+                ) {
+                    this.referer = referer
+                    this.quality = quality
+                }
+            )
+        }
+    }
+
+    // Helper: find quality number from surrounding text
+    private fun findQuality(range: IntRange, text: String): Int {
+        val start = maxOf(0, range.first - 250)
+        val preceding = text.substring(start, range.first)
+        val qMatch = Regex("""(?:\\"h\\"|"h"|height|quality)\s*:\s*(\d{3,4})""")
+            .findAll(preceding).lastOrNull()
+            ?: Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
+                .findAll(preceding).lastOrNull()
+        return qMatch?.groupValues?.get(1)?.toIntOrNull() ?: Qualities.Unknown.value
     }
 }
 
