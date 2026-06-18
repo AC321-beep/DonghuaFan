@@ -26,30 +26,47 @@ open class DonghuastreamProvider : MainAPI() {
         "anime/?status=&type=&order=update&page=" to "Special Edition"
     )
 
+    // ---------- getMainPage (unchanged for Recently Updated) ----------
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val isSpecialEdition = request.name == "Special Edition"
 
-        // --- Normal (Recently Updated) logic ---
+        // --- Recently Updated: keep original logic exactly ---
         if (!isSpecialEdition) {
-            val url = "$mainUrl/${request.data}$page"
-            val document = app.get(url).document
-            val items = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
-            val hasNext = document.selectFirst(".next, .pagination .next") != null
+            var currentPage = page
+            val items = mutableListOf<SearchResponse>()
+            var hasNextPage = true
+            val maxPagesToSearch = 1 // as per original code
+            var pagesSearched = 0
+
+            while (items.isEmpty() && hasNextPage && pagesSearched < maxPagesToSearch) {
+                val url = "$mainUrl/${request.data}$currentPage"
+                val document = try { app.get(url).document } catch (e: Exception) { null }
+                val elements = document?.select("div.listupd > article")
+                if (elements.isNullOrEmpty()) {
+                    hasNextPage = false
+                    break
+                }
+                val mappedItems = elements.mapNotNull { it.toSearchResult() }
+                items.addAll(mappedItems)
+                pagesSearched++
+                if (items.isEmpty()) currentPage++
+            }
+
             return newHomePageResponse(
                 list = HomePageList(
                     name = request.name,
                     list = items,
                     isHorizontalImages = false
                 ),
-                hasNext = hasNext
+                hasNext = hasNextPage
             )
         }
 
-        // --- Special Edition: use search for "movie" and filter by type badge ---
+        // --- Special Edition: new logic using search and type filtering ---
         val items = mutableListOf<SearchResponse>()
         var currentPage = page
         var hasNextPage = true
-        val maxPages = 3 // enough to cover most specials
+        val maxPages = 3 // search up to 3 pages
 
         while (items.isEmpty() && hasNextPage && currentPage <= maxPages) {
             val searchUrl = "$mainUrl/?s=movie&page=$currentPage"
@@ -86,7 +103,7 @@ open class DonghuastreamProvider : MainAPI() {
         )
     }
 
-    // ---------- Helpers ----------
+    // ---------- Helpers (unchanged) ----------
     fun Element.toSearchResult(): SearchResponse {
         val title = this.select("div.bsx > a").attr("title").ifEmpty { this.text() }
         val href = fixUrl(this.select("div.bsx > a").attr("href"))
@@ -104,41 +121,33 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    // ---------- Search ----------
+    // ---------- Search (unchanged) ----------
     override suspend fun search(query: String): List<SearchResponse> {
-        val results = mutableListOf<SearchResponse>()
+        val searchResponse = mutableListOf<SearchResponse>()
         for (i in 1..3) {
             val document = app.get("${mainUrl}/pagg/$i/?s=$query").document
-            val pageItems = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
-            if (pageItems.isEmpty()) break
-            results.addAll(pageItems)
-            if (results.distinctBy { it.url }.size == results.size) break // no duplicates
+            val results = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
+            if (!searchResponse.containsAll(results)) {
+                searchResponse.addAll(results)
+            } else {
+                break
+            }
+            if (results.isEmpty()) break
         }
-        return results.distinctBy { it.url }
+        return searchResponse
     }
 
-    // ---------- Load Episode / Movie ----------
+    // ---------- Load Episode / Movie (unchanged) ----------
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
         val title = document.selectFirst("h1.entry-title")?.text()?.trim().toString()
+        val href = document.selectFirst(".eplister li > a")?.attr("href") ?: ""
         var poster = document.select("div.ime > img").attr("data-src")
-        if (poster.isEmpty()) {
-            poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim().toString()
-        }
         val description = document.selectFirst("div.entry-content")?.text()?.trim()
-        val type = document.selectFirst(".spe")?.text()?.trim() ?: ""
+        val type = document.selectFirst(".spe")?.text().toString()
+        val tvtag = if (type.contains("Movie")) TvType.Movie else TvType.TvSeries
 
-        return if (type.contains("Movie", ignoreCase = true) ||
-                   type.contains("Special", ignoreCase = true) ||
-                   type.contains("ONA", ignoreCase = true)) {
-            // Movie/Special
-            val href = document.selectFirst(".eplister li > a")?.attr("href") ?: ""
-            newMovieLoadResponse(title, url, TvType.Movie, href) {
-                this.posterUrl = poster
-                this.plot = description
-            }
-        } else {
-            // TV Series
+        return if (tvtag == TvType.TvSeries) {
             val epPage = document.selectFirst(".eplister li > a")?.attr("href") ?: ""
             val doc = app.get(epPage).document
             val episodes = doc.select("div.episodelist > ul > li").map { info ->
@@ -146,19 +155,30 @@ open class DonghuastreamProvider : MainAPI() {
                 val episode = info.select("a span").text().substringAfter("-").substringBeforeLast("-")
                 val posterr = info.selectFirst("a img")?.attr("data-src") ?: ""
                 newEpisode(href1) {
-                    this.name = episode.replace(title, "", ignoreCase = true).trim()
+                    this.name = episode.replace(title, "", ignoreCase = true)
                     this.episode = episode.toIntOrNull()
                     this.posterUrl = posterr
                 }
             }
+            if (poster.isEmpty()) {
+                poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim().toString()
+            }
             newTvSeriesLoadResponse(title, url, TvType.Anime, episodes.reversed()) {
+                this.posterUrl = poster
+                this.plot = description
+            }
+        } else {
+            if (poster.isEmpty()) {
+                poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim().toString()
+            }
+            newMovieLoadResponse(title, url, TvType.Movie, href) {
                 this.posterUrl = poster
                 this.plot = description
             }
         }
     }
 
-    // ---------- Load Links (with fallback for direct iframes) ----------
+    // ---------- Load Links (added fallback for direct iframes) ----------
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -168,7 +188,7 @@ open class DonghuastreamProvider : MainAPI() {
         val doc = app.get(data, headers = defaultHeaders).document
         var linksFound = false
 
-        // 1) Try mirror select
+        // 1) Try mirror select (original logic)
         val options = doc.select("option[data-index]")
         if (options.isNotEmpty()) {
             options.amap { option ->
@@ -178,16 +198,19 @@ open class DonghuastreamProvider : MainAPI() {
                 val decodedHtml = try {
                     base64Decode(base64)
                 } catch (_: Exception) {
+                    Log.w("Error", "Base64 decode failed: $base64")
                     return@amap
                 }
+
                 val iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
                 if (iframeUrl.isNullOrEmpty()) return@amap
+
                 processIframeUrl(iframeUrl, label, data, subtitleCallback, callback)
                 linksFound = true
             }
         }
 
-        // 2) If no links yet, look for a direct iframe
+        // 2) If no links found yet, look for a direct iframe (NEW fallback)
         if (!linksFound) {
             val directIframe = doc.selectFirst(
                 "#embed_holder iframe, .player-embed iframe, .video-content iframe, iframe[src*='play.streamplay.co.in']"
