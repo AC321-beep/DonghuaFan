@@ -21,7 +21,6 @@ open class DonghuastreamProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
-    // Strictly Recently Updated and Special Edition scanning the general pool for complete results
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update&page=" to "Recently Updated",
         "anime/?status=&type=&order=update&page=" to "Special Edition"
@@ -33,7 +32,6 @@ open class DonghuastreamProvider : MainAPI() {
         val items = mutableListOf<SearchResponse>()
         var hasNextPage = true
         
-        // Deep scan 5 pages sequentially to populate the Special Edition row entirely
         val maxPagesToSearch = if (isSpecialEdition) 5 else 1
         var pagesSearched = 0
 
@@ -47,7 +45,6 @@ open class DonghuastreamProvider : MainAPI() {
                 break
             }
 
-            // Word boundary regex prevents double-digit matches like "part 10"
             val specialRegex = Regex("""\b(special|edition|part 0?1|ova)\b""", RegexOption.IGNORE_CASE)
 
             val mappedItems = elements.mapNotNull { element ->
@@ -57,7 +54,6 @@ open class DonghuastreamProvider : MainAPI() {
                     
                     val hasKeyword = specialRegex.containsMatchIn(title)
 
-                    // Grab the last number found to avoid reading seasons as episodes
                     val epText = element.selectFirst(".epx, .ep")?.text() ?: ""
                     val epCount = Regex("""\d+""").findAll(epText).lastOrNull()?.value?.toIntOrNull() ?: 1
 
@@ -177,8 +173,8 @@ open class DonghuastreamProvider : MainAPI() {
             if (iframeUrl.isNullOrEmpty()) return@amap
 
             if (label.contains("dailymotion", ignoreCase = true) || "dailymotion" in iframeUrl) {
-                // Hands off execution cleanly to your standalone Extractor class
-                DonghuastreamExtractor().getUrl(iframeUrl, data, subtitleCallback, callback)
+                // Calls your renamed Extractor class
+                Extractor().getUrl(iframeUrl, data, subtitleCallback, callback)
             } else when {
                 "rumble.com" in iframeUrl -> {
                     Rumble().getUrl(iframeUrl, data, subtitleCallback, callback)
@@ -193,7 +189,7 @@ open class DonghuastreamProvider : MainAPI() {
                 iframeUrl.endsWith(".mp4") -> {
                     callback(
                         newExtractorLink(label, label, iframeUrl, INFER_TYPE) {
-                            this.referer = data // Spoof main domain referer to bypass older CDN blocks
+                            this.referer = data 
                             this.quality = getQualityFromName(label)
                         }
                     )
