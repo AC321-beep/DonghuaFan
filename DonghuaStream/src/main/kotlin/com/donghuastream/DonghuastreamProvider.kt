@@ -23,20 +23,63 @@ open class DonghuastreamProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
+    // Added Special Edition category
     override val mainPage = mainPageOf(
-        "anime/?status=&type=&order=update&page=" to "Recently Updated"
+        "anime/?status=&type=&order=update&page=" to "Recently Updated",
+        "anime/?status=&type=&order=update&page=" to "Special Edition"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val document = app.get("$mainUrl/${request.data}$page").document
-        val home = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
+        val isSpecial = request.name == "Special Edition"
+        var currentPage = page
+        val items = mutableListOf<SearchResponse>()
+        var hasNextPage = true
+        
+        // Scan up to 5 pages deep if we are looking for sparse Special Editions
+        val maxPagesToSearch = if (isSpecial) 5 else 1
+        var pagesSearched = 0
+
+        while (items.isEmpty() && hasNextPage && pagesSearched < maxPagesToSearch) {
+            val document = app.get("$mainUrl/${request.data}$currentPage").document
+            val elements = document.select("div.listupd > article")
+            
+            if (elements.isEmpty()) {
+                hasNextPage = false
+                break
+            }
+
+            val filteredElements = elements.filter { element ->
+                if (isSpecial) {
+                    // Extract Title and check case-insensitive keywords
+                    val title = element.select("div.bsx > a").attr("title").lowercase()
+                    val keywords = listOf("special", "edition", "part 1", "part 01")
+                    val hasKeyword = keywords.any { title.contains(it) }
+
+                    // Extract Episode Count
+                    val epText = element.selectFirst(".epx, .ep")?.text() ?: ""
+                    val epCount = Regex("""\d+""").find(epText)?.value?.toIntOrNull() ?: 1 // Default to 1 if no number (e.g. Movies)
+
+                    // Both constraints must be met
+                    hasKeyword && epCount <= 6
+                } else {
+                    true // Return all items for Recently Updated
+                }
+            }.mapNotNull { it.toSearchResult() }
+
+            items.addAll(filteredElements)
+            pagesSearched++
+            
+            // If we didn't find any items on this page, move to the next one
+            if (items.isEmpty()) currentPage++
+        }
+
         return newHomePageResponse(
             list = HomePageList(
                 name = request.name,
-                list = home,
+                list = items,
                 isHorizontalImages = false
             ),
-            hasNext = true
+            hasNext = hasNextPage
         )
     }
 
