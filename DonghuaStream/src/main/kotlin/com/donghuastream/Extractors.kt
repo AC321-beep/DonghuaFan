@@ -71,7 +71,7 @@ class Extractor : ExtractorApi() {
     }
 }
 
-// ----- 2. Rumble Extractor (improved for trailers) -----
+// ----- 2. Rumble Extractor (improved for trailers) – FIXED SUSPEND ISSUES -----
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
     override var mainUrl = "https://rumble.com"
@@ -106,22 +106,21 @@ class Rumble : ExtractorApi() {
 
         val scrapedUrls = mutableSetOf<String>()
 
-        // ----- 1. Direct URLs (.mp4 / .m3u8) with standard pattern -----
+        // ----- 1. Direct URLs (.mp4 / .m3u8) -----
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
 
-        matches.forEach { match ->
+        for (match in matches) {
             val rawUrl = match.value
             val cleanUrl = rawUrl.replace("\\/", "/")
 
-            // Skip obvious non-video assets
             if (cleanUrl.contains("/assets/", ignoreCase = true) ||
                 cleanUrl.contains("loop", ignoreCase = true) ||
                 cleanUrl.contains("preview", ignoreCase = true) ||
                 cleanUrl.contains("tracker", ignoreCase = true) ||
                 cleanUrl.contains("thumb", ignoreCase = true) ||
                 cleanUrl.contains("poster", ignoreCase = true)) {
-                return@forEach
+                continue
             }
 
             if (scrapedUrls.add(cleanUrl)) {
@@ -135,7 +134,7 @@ class Rumble : ExtractorApi() {
             Regex("""\{(?:[^{}]*"(?:url|src|file)"\s*:\s*"(https?://[^"]+\.(?:mp4|m3u8)[^"]*)"[^{}]*?)\}""")
         )
         for (pattern in jsonPatterns) {
-            pattern.findAll(html).forEach { match ->
+            for (match in pattern.findAll(html)) {
                 val videoUrl = match.groupValues[1]
                 if (scrapedUrls.add(videoUrl)) {
                     val quality = findQuality(match.range, html)
@@ -166,7 +165,7 @@ class Rumble : ExtractorApi() {
             if (match != null) {
                 val jsonStr = match.groupValues[1]
                 val urlMatches = Regex(""""(?:url|videoUrl|src|file|hls|mp4)"\s*:\s*"(https?://[^"]+\.(?:mp4|m3u8)[^"]*)""").findAll(jsonStr)
-                urlMatches.forEach { urlMatch ->
+                for (urlMatch in urlMatches) {
                     val videoUrl = urlMatch.groupValues[1]
                     if (scrapedUrls.add(videoUrl)) {
                         val quality = findQuality(urlMatch.range, jsonStr)
@@ -184,7 +183,6 @@ class Rumble : ExtractorApi() {
                         )
                     }
                 }
-                // If we found at least one URL, break out of the window loop
                 if (scrapedUrls.isNotEmpty()) break
             }
         }
@@ -196,8 +194,8 @@ class Rumble : ExtractorApi() {
         }
     }
 
-    // Helper: extract and emit video link with quality
-    private fun extractVideoUrl(
+    // Marked as suspend because it calls suspend functions
+    private suspend fun extractVideoUrl(
         cleanUrl: String,
         match: MatchResult,
         html: String,
@@ -223,7 +221,6 @@ class Rumble : ExtractorApi() {
         }
     }
 
-    // Helper: find quality number from surrounding text
     private fun findQuality(range: IntRange, text: String): Int {
         val start = maxOf(0, range.first - 250)
         val preceding = text.substring(start, range.first)
@@ -235,7 +232,7 @@ class Rumble : ExtractorApi() {
     }
 }
 
-// ----- 3. PlayStreamplay (allsub player) – improved -----
+// ----- 3. PlayStreamplay (allsub player) – improved (no suspend issues) -----
 class PlayStreamplay : ExtractorApi() {
     override var name = "All sub player"
     override var mainUrl = "https://play.streamplay.co.in"
