@@ -4,9 +4,6 @@ import android.util.Base64
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
@@ -33,54 +30,50 @@ open class DonghuastreamProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val isSpecial = request.name == "Special Edition"
+        var currentPage = page
         val items = mutableListOf<SearchResponse>()
         var hasNextPage = true
+        
+        // Scan up to 5 pages deep to find sparse Special Editions safely
+        val maxPagesToSearch = if (isSpecial) 5 else 1
+        var pagesSearched = 0
 
-        if (isSpecial) {
-            // ASYNC FETCH: Scrape 10 pages simultaneously to find sparse Special Editions instantly
-            // Page 1 scans 1..10, Page 2 scans 11..20, etc.
-            val startPage = (page - 1) * 10 + 1
-            val pagesToFetch = (startPage until startPage + 10).toList()
+        while (items.isEmpty() && hasNextPage && pagesSearched < maxPagesToSearch) {
+            val document = try {
+                app.get("$mainUrl/${request.data}$currentPage").document
+            } catch (e: Exception) { null }
 
-            val elements = coroutineScope {
-                pagesToFetch.map { pageNum ->
-                    async {
-                        try {
-                            app.get("$mainUrl/${request.data}$pageNum").document.select("div.listupd > article")
-                        } catch (e: Exception) {
-                            emptyList<Element>() // Ignore dead pages
-                        }
-                    }
-                }.awaitAll().flatten()
+            val elements = document?.select("div.listupd > article")
+            
+            if (elements.isNullOrEmpty()) {
+                hasNextPage = false
+                break
             }
 
-            if (elements.isEmpty()) hasNextPage = false
+            if (isSpecial) {
+                val keywords = listOf("special", "edition", "part 1", "part 01")
+                val filtered = elements.filter { element ->
+                    // Fallback to raw element text if the 'title' attribute is hidden/missing
+                    val title = element.selectFirst("a")?.attr("title").toString()
+                        .ifEmpty { element.text() }
+                        .lowercase()
 
-            val keywords = listOf("special", "edition", "part 1", "part 01")
-            
-            val filtered = elements.filter { element ->
-                // Fallback to raw element text if the 'title' attribute is hidden/missing
-                val title = element.selectFirst("a")?.attr("title").toString()
-                    .ifEmpty { element.text() }
-                    .lowercase()
+                    val hasKeyword = keywords.any { title.contains(it) }
 
-                val hasKeyword = keywords.any { title.contains(it) }
+                    // Parse episode text, default to 1 for movies/specials with no explicit number
+                    val epText = element.selectFirst(".epx, .ep")?.text() ?: ""
+                    val epCount = Regex("""\d+""").find(epText)?.value?.toIntOrNull() ?: 1
 
-                // Parse episode text, default to 1 for movies/specials with no explicit number
-                val epText = element.selectFirst(".epx, .ep")?.text() ?: ""
-                val epCount = Regex("""\d+""").find(epText)?.value?.toIntOrNull() ?: 1
+                    hasKeyword && epCount <= 6
+                }.mapNotNull { it.toSearchResult() }
+                
+                items.addAll(filtered)
+            } else {
+                items.addAll(elements.mapNotNull { it.toSearchResult() })
+            }
 
-                hasKeyword && epCount <= 6
-            }.mapNotNull { it.toSearchResult() }.distinctBy { it.url }
-
-            items.addAll(filtered)
-
-        } else {
-            // Standard single-page fetch for "Recently Updated"
-            val document = app.get("$mainUrl/${request.data}$page").document
-            val elements = document.select("div.listupd > article")
-            if (elements.isEmpty()) hasNextPage = false
-            items.addAll(elements.mapNotNull { it.toSearchResult() })
+            pagesSearched++
+            if (items.isEmpty()) currentPage++
         }
 
         return newHomePageResponse(
