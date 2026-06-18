@@ -1,4 +1,4 @@
-package com.Donghuastream
+package com.donghuastream
 
 import android.util.Base64
 import com.lagradost.api.Log
@@ -8,9 +8,10 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
 
-open class Donghuastream : MainAPI() {
+// Restored the correct class name so DonghuastreamPlugin.kt can find it
+open class DonghuastreamProvider : MainAPI() {
     override var mainUrl          = "https://donghuastream.org"
-    override var name             = "Donghuastream"
+    override var name             = "DonghuaStream"
     override val hasMainPage      = true
     override var lang             = "zh"
     override val hasDownloadSupport = true
@@ -22,7 +23,6 @@ open class Donghuastream : MainAPI() {
         "Origin" to mainUrl
     )
 
-    // IMPROVEMENT: Utilizing Phisher98's native URL structure (type=special)
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update&page=" to "Recently Updated",
         "anime/?status=completed&type=&order=update&page=" to "Completed",
@@ -61,7 +61,6 @@ open class Donghuastream : MainAPI() {
                 list = items,
                 isHorizontalImages = false
             ),
-            // Let the native website pagination handle "hasNext"
             hasNext = elements.isNotEmpty() 
         )
     }
