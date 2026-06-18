@@ -6,6 +6,10 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.*
 
+// ----- Dailymotion Extractor (unchanged from your second file) -----
+// (If you have it, keep it as is. If not, ignore.)
+
+// ----- Rumble Extractor (unchanged from your second file) -----
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
     override var mainUrl = "https://rumble.com"
@@ -27,7 +31,6 @@ class Rumble : ExtractorApi() {
 
         val scrapedUrls = mutableSetOf<String>()
 
-        // 1. Unified Regex: Captures both standard (https://) and JSON-escaped (https:\/\/) URLs
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
 
@@ -35,7 +38,6 @@ class Rumble : ExtractorApi() {
             val rawUrl = match.value
             val cleanUrl = rawUrl.replace("\\/", "/")
 
-            // 2. The Quarantine Filter: Destroys the garbage links that caused the ExoPlayer to crash
             if (cleanUrl.contains("/assets/", ignoreCase = true) ||
                 cleanUrl.contains("loop", ignoreCase = true) ||
                 cleanUrl.contains("preview", ignoreCase = true) ||
@@ -46,22 +48,17 @@ class Rumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8")) {
-                    // Flawless HLS stream with the Multi-Quality Selector (Tick mark)
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
-                    
                 } else if (cleanUrl.contains(".mp4")) {
-                    // 3. Smart Quality Locator: Reads the raw HTML immediately preceding the URL to find the resolution tag
-                    val startIndex = Math.max(0, match.range.first - 150)
+                    val startIndex = maxOf(0, match.range.first - 150)
                     val precedingText = html.substring(startIndex, match.range.first)
 
-                    // Scans the preceding text for "h":720 or "720":{
                     val qMatch = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""").findAll(precedingText).lastOrNull()
                         ?: Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""").findAll(precedingText).lastOrNull()
 
                     var displayLabel = name
                     var qualityInt = Qualities.Unknown.value
 
-                    // If it finds the resolution tag, apply it to the label
                     if (qMatch != null) {
                         val qStr = qMatch.groupValues[1]
                         displayLabel = "$name ${qStr}p"
@@ -85,10 +82,20 @@ class Rumble : ExtractorApi() {
     }
 }
 
+// ----- IMPROVED PlayStreamplay (All sub player) -----
 class PlayStreamplay : ExtractorApi() {
     override var name = "All sub player"
     override var mainUrl = "https://play.streamplay.co.in"
     override val requiresReferer = false
+
+    // Browser headers to avoid blocking
+    private val headers = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language" to "en-US,en;q=0.5",
+        "Referer" to mainUrl,
+        "Origin" to mainUrl
+    )
 
     override suspend fun getUrl(
         url: String,
@@ -96,39 +103,92 @@ class PlayStreamplay : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        Log.d(name, "Loading: $url")
-        val html = app.get(url).text
+        Log.d(name, "Loading embed: $url")
+        val effectiveReferer = referer ?: mainUrl
 
-        // Direct m3u8
-        var m3u8 = Regex("""(https?://[^"'\s]+\.m3u8[^"'\s]*)""").find(html)?.value
+        // Fetch the embed page with proper headers
+        val html = try {
+            val requestHeaders = headers.toMutableMap().apply {
+                this["Referer"] = effectiveReferer
+            }
+            app.get(url, headers = requestHeaders).text
+        } catch (e: Exception) {
+            Log.e(name, "Failed to fetch embed page: ${e.message}")
+            return
+        }
+
+        // 1) Direct m3u8 URL in HTML
+        var m3u8 = findUrl(html, Regex("""(https?://[^"'\s]+\.m3u8[^"'\s]*)"""))
         if (m3u8 != null) {
             Log.d(name, "Found direct m3u8: $m3u8")
-            M3u8Helper.generateM3u8(name, m3u8, mainUrl).forEach(callback)
+            M3u8Helper.generateM3u8(name, m3u8, effectiveReferer).forEach(callback)
             return
         }
 
-        // Unpacked script
-        val packed = Regex("""eval\(function\(p,a,c,k,e,d\).*?\)\)\)""", RegexOption.DOT_MATCHES_ALL)
-            .find(html)?.value ?: return
-        val unpacked = JsUnpacker(packed).unpack() ?: return
-
-        m3u8 = Regex(""""file"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""").find(unpacked)?.groupValues?.get(1)
-        if (m3u8 != null) {
-            Log.d(name, "Found m3u8 in unpacked: $m3u8")
-            M3u8Helper.generateM3u8(name, m3u8, mainUrl).forEach(callback)
-            return
+        // 2) Unpack packed JavaScript (eval(...))
+        val packedRegex = Regex("""eval\s*\(function\s*\([^)]*\)\s*\{[^}]*\}\s*\)\s*\)""", RegexOption.DOT_MATCHES_ALL)
+        val packedMatch = packedRegex.find(html)
+        if (packedMatch != null) {
+            try {
+                val unpacked = JsUnpacker(packedMatch.value).unpack()
+                if (unpacked != null) {
+                    // Search for m3u8 in the unpacked code
+                    m3u8 = findUrl(unpacked, Regex("""(https?://[^"'\s]+\.m3u8[^"'\s]*)"""))
+                    if (m3u8 == null) {
+                        m3u8 = Regex(""""file"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""").find(unpacked)?.groupValues?.get(1)
+                    }
+                    if (m3u8 != null) {
+                        Log.d(name, "Found m3u8 in unpacked: $m3u8")
+                        M3u8Helper.generateM3u8(name, m3u8, effectiveReferer).forEach(callback)
+                        return
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(name, "Failed to unpack JavaScript: ${e.message}")
+            }
         }
 
-        // Token API fallback
-        val token = Regex("""kaken\s*=\s*"([^"]+)"""").find(unpacked)?.groupValues?.get(1)
+        // 3) Search for m3u8 inside JSON structures with common keys
+        val jsonPatterns = listOf(
+            Regex("""\{[^{}]*"file"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"[^{}]*\}"""),
+            Regex("""\{[^{}]*"src"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"[^{}]*\}"""),
+            Regex("""\{[^{}]*"url"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"[^{}]*\}""")
+        )
+        for (pattern in jsonPatterns) {
+            val match = pattern.find(html)
+            if (match != null) {
+                m3u8 = match.groupValues[1]
+                Log.d(name, "Found m3u8 in JSON: $m3u8")
+                M3u8Helper.generateM3u8(name, m3u8, effectiveReferer).forEach(callback)
+                return
+            }
+        }
+
+        // 4) Token-based API (kaken)
+        val token = Regex("""kaken\s*=\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         if (token != null) {
             val apiUrl = "$mainUrl/api/?$token"
             Log.d(name, "Calling API: $apiUrl")
-            val apiJson = app.get(apiUrl).text
-            val apiM3u8 = Regex(""""file"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""").find(apiJson)?.groupValues?.get(1)
-            if (apiM3u8 != null) {
-                M3u8Helper.generateM3u8(name, apiM3u8, mainUrl).forEach(callback)
+            try {
+                val apiJson = app.get(apiUrl, headers = headers).text
+                val apiM3u8 = Regex(""""file"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""").find(apiJson)?.groupValues?.get(1)
+                if (apiM3u8 != null) {
+                    Log.d(name, "Found m3u8 via API: $apiM3u8")
+                    M3u8Helper.generateM3u8(name, apiM3u8, effectiveReferer).forEach(callback)
+                    return
+                }
+            } catch (e: Exception) {
+                Log.w(name, "API call failed: ${e.message}")
             }
         }
+
+        // 5) Final fallback – try generic extractor
+        Log.d(name, "No m3u8 found, falling back to generic loadExtractor")
+        loadExtractor(url, referer = effectiveReferer, subtitleCallback, callback)
+    }
+
+    // Helper to find the first matching URL with a given regex
+    private fun findUrl(text: String, regex: Regex): String? {
+        return regex.find(text)?.groupValues?.get(1)
     }
 }
