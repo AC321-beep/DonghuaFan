@@ -26,7 +26,6 @@ open class DonghuastreamProvider : MainAPI() {
         "anime/?status=&type=&order=update&page=" to "Special Edition"
     )
 
-    // ---------- getMainPage (unchanged for Recently Updated) ----------
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val isSpecialEdition = request.name == "Special Edition"
 
@@ -35,7 +34,7 @@ open class DonghuastreamProvider : MainAPI() {
             var currentPage = page
             val items = mutableListOf<SearchResponse>()
             var hasNextPage = true
-            val maxPagesToSearch = 1 // as per original code
+            val maxPagesToSearch = 1
             var pagesSearched = 0
 
             while (items.isEmpty() && hasNextPage && pagesSearched < maxPagesToSearch) {
@@ -62,25 +61,23 @@ open class DonghuastreamProvider : MainAPI() {
             )
         }
 
-        // --- Special Edition: new logic using search and type filtering ---
+        // --- Special Edition: improved filtering using type badge ---
         val items = mutableListOf<SearchResponse>()
         var currentPage = page
         var hasNextPage = true
-        val maxPages = 3 // search up to 3 pages
+        val maxPagesToSearch = 5
 
-        while (items.isEmpty() && hasNextPage && currentPage <= maxPages) {
-            val searchUrl = "$mainUrl/?s=movie&page=$currentPage"
-            val document = try {
-                app.get(searchUrl).document
-            } catch (_: Exception) { null }
-
+        while (items.isEmpty() && hasNextPage && currentPage <= maxPagesToSearch) {
+            val url = "$mainUrl/${request.data}$currentPage"
+            val document = try { app.get(url).document } catch (e: Exception) { null }
             val elements = document?.select("div.listupd > article")
+
             if (elements.isNullOrEmpty()) {
                 hasNextPage = false
                 break
             }
 
-            val mapped = elements.mapNotNull { element ->
+            val mappedItems = elements.mapNotNull { element ->
                 val typez = element.selectFirst("div.typez")?.text()?.trim() ?: ""
                 if (typez.equals("Movie", ignoreCase = true) ||
                     typez.equals("Special", ignoreCase = true) ||
@@ -89,8 +86,30 @@ open class DonghuastreamProvider : MainAPI() {
                 } else null
             }
 
-            items.addAll(mapped)
+            items.addAll(mappedItems)
             currentPage++
+            hasNextPage = document.selectFirst(".next, .pagination .next") != null
+        }
+
+        // Fallback: search for "movie" and filter by badge
+        if (items.isEmpty()) {
+            var searchPage = 1
+            while (items.isEmpty() && searchPage <= 3) {
+                val searchUrl = "$mainUrl/?s=movie&page=$searchPage"
+                val searchDoc = try { app.get(searchUrl).document } catch (_: Exception) { null }
+                val searchElements = searchDoc?.select("div.listupd > article")
+                if (searchElements.isNullOrEmpty()) break
+                val mapped = searchElements.mapNotNull { element ->
+                    val typez = element.selectFirst("div.typez")?.text()?.trim() ?: ""
+                    if (typez.equals("Movie", ignoreCase = true) ||
+                        typez.equals("Special", ignoreCase = true) ||
+                        typez.equals("ONA", ignoreCase = true)) {
+                        element.toSearchResult()
+                    } else null
+                }
+                items.addAll(mapped)
+                searchPage++
+            }
         }
 
         return newHomePageResponse(
@@ -99,11 +118,11 @@ open class DonghuastreamProvider : MainAPI() {
                 list = items,
                 isHorizontalImages = false
             ),
-            hasNext = false // we limit pages, so no further pages
+            hasNext = false
         )
     }
 
-    // ---------- Helpers (unchanged) ----------
+    // ---------- Helper: Element -> SearchResponse ----------
     fun Element.toSearchResult(): SearchResponse {
         val title = this.select("div.bsx > a").attr("title").ifEmpty { this.text() }
         val href = fixUrl(this.select("div.bsx > a").attr("href"))
@@ -121,7 +140,7 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    // ---------- Search (unchanged) ----------
+    // ---------- Search ----------
     override suspend fun search(query: String): List<SearchResponse> {
         val searchResponse = mutableListOf<SearchResponse>()
         for (i in 1..3) {
@@ -137,7 +156,7 @@ open class DonghuastreamProvider : MainAPI() {
         return searchResponse
     }
 
-    // ---------- Load Episode / Movie (unchanged) ----------
+    // ---------- Load Episode / Movie ----------
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
         val title = document.selectFirst("h1.entry-title")?.text()?.trim().toString()
@@ -178,7 +197,7 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    // ---------- Load Links (added fallback for direct iframes) ----------
+    // ---------- Load Links (with fallback for direct iframes) ----------
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -188,7 +207,7 @@ open class DonghuastreamProvider : MainAPI() {
         val doc = app.get(data, headers = defaultHeaders).document
         var linksFound = false
 
-        // 1) Try mirror select (original logic)
+        // 1) Try mirror select (base64 encoded options)
         val options = doc.select("option[data-index]")
         if (options.isNotEmpty()) {
             options.amap { option ->
@@ -210,10 +229,10 @@ open class DonghuastreamProvider : MainAPI() {
             }
         }
 
-        // 2) If no links found yet, look for a direct iframe (NEW fallback)
+        // 2) If no links found yet, look for a direct iframe (including rumble)
         if (!linksFound) {
             val directIframe = doc.selectFirst(
-                "#embed_holder iframe, .player-embed iframe, .video-content iframe, iframe[src*='play.streamplay.co.in']"
+                "#embed_holder iframe, .player-embed iframe, .video-content iframe, iframe[src*='play.streamplay.co.in'], iframe[src*='rumble.com']"
             )
             if (directIframe != null) {
                 val iframeUrl = httpsify(directIframe.attr("src"))
@@ -227,7 +246,7 @@ open class DonghuastreamProvider : MainAPI() {
         return linksFound
     }
 
-    // ---------- Helper: process iframe URL ----------
+    // ---------- Helper: process a single iframe URL ----------
     private suspend fun processIframeUrl(
         iframeUrl: String,
         label: String,
