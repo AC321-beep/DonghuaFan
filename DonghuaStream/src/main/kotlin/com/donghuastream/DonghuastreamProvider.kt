@@ -21,13 +21,11 @@ open class DonghuastreamProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
-    // Only "Recently Updated" – no Special Edition
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update&page=" to "Recently Updated"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Original logic for Recently Updated (unchanged)
         var currentPage = page
         val items = mutableListOf<SearchResponse>()
         var hasNextPage = true
@@ -58,7 +56,6 @@ open class DonghuastreamProvider : MainAPI() {
         )
     }
 
-    // ---------- Helper: Element -> SearchResponse ----------
     fun Element.toSearchResult(): SearchResponse {
         val title = this.select("div.bsx > a").attr("title").ifEmpty { this.text() }
         val href = fixUrl(this.select("div.bsx > a").attr("href"))
@@ -76,7 +73,6 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    // ---------- Search ----------
     override suspend fun search(query: String): List<SearchResponse> {
         val searchResponse = mutableListOf<SearchResponse>()
         for (i in 1..3) {
@@ -92,7 +88,6 @@ open class DonghuastreamProvider : MainAPI() {
         return searchResponse
     }
 
-    // ---------- Load Episode / Movie ----------
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
         val title = document.selectFirst("h1.entry-title")?.text()?.trim().toString()
@@ -133,7 +128,7 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    // ---------- Load Links (with fallback for ALL direct iframes) ----------
+    // ---------- Load Links (always try both select and direct iframes) ----------
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -141,48 +136,41 @@ open class DonghuastreamProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val doc = app.get(data, headers = defaultHeaders).document
-        var linksFound = false
+        val processedUrls = mutableSetOf<String>()
 
-        // 1) Try mirror select (base64 encoded options)
+        // 1) Process mirror select (base64 encoded options)
         val options = doc.select("option[data-index]")
-        if (options.isNotEmpty()) {
-            options.amap { option ->
-                val base64 = option.attr("value")
-                if (base64.isBlank()) return@amap
+        options.amap { option ->
+            val base64 = option.attr("value")
+            if (base64.isBlank()) return@amap
+            val decodedHtml = try {
+                base64Decode(base64)
+            } catch (_: Exception) {
+                Log.w("Error", "Base64 decode failed: $base64")
+                return@amap
+            }
+
+            val iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
+            if (!iframeUrl.isNullOrEmpty() && processedUrls.add(iframeUrl)) {
                 val label = option.text().trim()
-                val decodedHtml = try {
-                    base64Decode(base64)
-                } catch (_: Exception) {
-                    Log.w("Error", "Base64 decode failed: $base64")
-                    return@amap
-                }
-
-                val iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
-                if (iframeUrl.isNullOrEmpty()) return@amap
-
                 processIframeUrl(iframeUrl, label, data, subtitleCallback, callback)
-                linksFound = true
             }
         }
 
-        // 2) If no links from select, try ALL direct iframes (not just the first)
-        if (!linksFound) {
-            val directIframes = doc.select(
-                "#embed_holder iframe, .player-embed iframe, .video-content iframe, iframe[src*='play.streamplay.co.in'], iframe[src*='rumble.com']"
-            )
-            for (iframe in directIframes) {
-                val iframeUrl = httpsify(iframe.attr("src"))
-                if (!iframeUrl.isNullOrEmpty()) {
-                    processIframeUrl(iframeUrl, "Direct Source", data, subtitleCallback, callback)
-                }
+        // 2) Process ALL direct iframes (including those not in select)
+        val directIframes = doc.select(
+            "#embed_holder iframe, .player-embed iframe, .video-content iframe, iframe[src*='play.streamplay.co.in'], iframe[src*='rumble.com']"
+        )
+        for (iframe in directIframes) {
+            val iframeUrl = httpsify(iframe.attr("src"))
+            if (!iframeUrl.isNullOrEmpty() && processedUrls.add(iframeUrl)) {
+                processIframeUrl(iframeUrl, "Direct Source", data, subtitleCallback, callback)
             }
-            linksFound = directIframes.isNotEmpty()
         }
 
-        return linksFound
+        return processedUrls.isNotEmpty()
     }
 
-    // ---------- Helper: process a single iframe URL ----------
     private suspend fun processIframeUrl(
         iframeUrl: String,
         label: String,
@@ -218,7 +206,6 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    // ---------- Utility ----------
     private fun base64Decode(str: String): String {
         return String(Base64.decode(str, Base64.DEFAULT))
     }
