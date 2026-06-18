@@ -71,11 +71,19 @@ class Extractor : ExtractorApi() {
     }
 }
 
-// ----- 2. Rumble Extractor (unchanged) -----
+// ----- 2. Rumble Extractor (improved) -----
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
     override var mainUrl = "https://rumble.com"
     override val requiresReferer = false
+
+    private val headers = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language" to "en-US,en;q=0.5",
+        "Referer" to mainUrl,
+        "Origin" to mainUrl
+    )
 
     override suspend fun getUrl(
         url: String,
@@ -84,14 +92,21 @@ class Rumble : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         Log.d(name, "Starting extraction for: $url")
+        val effectiveReferer = referer ?: mainUrl
+
         val html = try {
-            app.get(url, referer = referer ?: mainUrl).text
+            val requestHeaders = headers.toMutableMap().apply {
+                this["Referer"] = effectiveReferer
+            }
+            app.get(url, headers = requestHeaders).text
         } catch (e: Exception) {
             Log.e(name, "Failed to fetch Rumble embed page: ${e.message}")
             return
         }
 
         val scrapedUrls = mutableSetOf<String>()
+
+        // ----- 1. Find all mp4/m3u8 URLs in the page -----
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
 
@@ -99,23 +114,27 @@ class Rumble : ExtractorApi() {
             val rawUrl = match.value
             val cleanUrl = rawUrl.replace("\\/", "/")
 
+            // Skip known non-video assets
             if (cleanUrl.contains("/assets/", ignoreCase = true) ||
                 cleanUrl.contains("loop", ignoreCase = true) ||
                 cleanUrl.contains("preview", ignoreCase = true) ||
                 cleanUrl.contains("tracker", ignoreCase = true) ||
-                cleanUrl.contains("thumb", ignoreCase = true)) {
+                cleanUrl.contains("thumb", ignoreCase = true) ||
+                cleanUrl.contains("poster", ignoreCase = true)) {
                 return@forEach
             }
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8")) {
-                    M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
+                    M3u8Helper.generateM3u8(name, cleanUrl, effectiveReferer).forEach(callback)
                 } else if (cleanUrl.contains(".mp4")) {
-                    val startIndex = maxOf(0, match.range.first - 150)
+                    val startIndex = maxOf(0, match.range.first - 250)
                     val precedingText = html.substring(startIndex, match.range.first)
 
-                    val qMatch = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""").findAll(precedingText).lastOrNull()
-                        ?: Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""").findAll(precedingText).lastOrNull()
+                    val qMatch = Regex("""(?:\\"h\\"|"h"|height)\s*:\s*(\d{3,4})""")
+                        .findAll(precedingText).lastOrNull()
+                        ?: Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
+                            .findAll(precedingText).lastOrNull()
 
                     var displayLabel = name
                     var qualityInt = Qualities.Unknown.value
@@ -133,23 +152,55 @@ class Rumble : ExtractorApi() {
                             cleanUrl,
                             INFER_TYPE
                         ) {
-                            this.referer = url
+                            this.referer = effectiveReferer
                             this.quality = qualityInt
                         }
                     )
                 }
             }
         }
+
+        // ----- 2. If no direct URLs, try JavaScript "source" array -----
+        if (scrapedUrls.isEmpty()) {
+            Log.d(name, "No direct URLs, trying to extract from JavaScript")
+            val jsonRegex = Regex("""source\s*:\s*(\[[^\]]+\])""")
+            val jsonMatch = jsonRegex.find(html)
+            if (jsonMatch != null) {
+                val jsonStr = jsonMatch.groupValues[1]
+                val urlQualityRegex = Regex(""""url"\s*:\s*"(https?://[^"]+\.mp4[^"]*)"[^}]*"height"\s*:\s*(\d+)""")
+                val matches = urlQualityRegex.findAll(jsonStr)
+                matches.forEach { match ->
+                    val videoUrl = match.groupValues[1]
+                    val quality = match.groupValues[2].toIntOrNull() ?: Qualities.Unknown.value
+                    val displayLabel = "$name ${quality}p"
+                    callback(
+                        newExtractorLink(
+                            name,
+                            displayLabel,
+                            videoUrl,
+                            INFER_TYPE
+                        ) {
+                            this.referer = effectiveReferer
+                            this.quality = quality
+                        }
+                    )
+                }
+                if (matches.any()) return
+            }
+
+            // Fallback to generic extractor
+            Log.d(name, "No video found, falling back to generic loadExtractor")
+            loadExtractor(url, referer = effectiveReferer, subtitleCallback, callback)
+        }
     }
 }
 
-// ----- 3. PlayStreamplay (allsub player) – IMPROVED -----
+// ----- 3. PlayStreamplay (allsub player) – improved -----
 class PlayStreamplay : ExtractorApi() {
     override var name = "All sub player"
     override var mainUrl = "https://play.streamplay.co.in"
     override val requiresReferer = false
 
-    // Headers to mimic a real browser
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -165,12 +216,9 @@ class PlayStreamplay : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         Log.d(name, "Loading embed: $url")
-
-        // Use the provided referer or fallback to mainUrl
         val effectiveReferer = referer ?: mainUrl
 
         val html = try {
-            // Use headers with the referer
             val requestHeaders = headers.toMutableMap().apply {
                 this["Referer"] = effectiveReferer
             }
@@ -180,7 +228,7 @@ class PlayStreamplay : ExtractorApi() {
             return
         }
 
-        // ----- 1. Try direct m3u8 in HTML -----
+        // 1) Direct m3u8
         var m3u8 = findUrl(html, Regex("""(https?://[^"'\s]+\.m3u8[^"'\s]*)"""))
         if (m3u8 != null) {
             Log.d(name, "Found direct m3u8: $m3u8")
@@ -188,24 +236,19 @@ class PlayStreamplay : ExtractorApi() {
             return
         }
 
-        // ----- 2. Unpack packed JavaScript (eval(...)) -----
+        // 2) Unpack packed JavaScript (eval(...))
         val packedRegex = Regex("""eval\s*\(function\s*\([^)]*\)\s*\{[^}]*\}\s*\)\s*\)""", RegexOption.DOT_MATCHES_ALL)
         val packedMatch = packedRegex.find(html)
         if (packedMatch != null) {
             try {
                 val unpacked = JsUnpacker(packedMatch.value).unpack()
                 if (unpacked != null) {
-                    Log.d(name, "Unpacked JavaScript, searching for m3u8")
                     m3u8 = findUrl(unpacked, Regex("""(https?://[^"'\s]+\.m3u8[^"'\s]*)"""))
+                    if (m3u8 == null) {
+                        m3u8 = Regex(""""file"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""").find(unpacked)?.groupValues?.get(1)
+                    }
                     if (m3u8 != null) {
                         Log.d(name, "Found m3u8 in unpacked: $m3u8")
-                        M3u8Helper.generateM3u8(name, m3u8, effectiveReferer).forEach(callback)
-                        return
-                    }
-                    // Also look for "file" or "src" in unpacked
-                    m3u8 = Regex(""""file"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""").find(unpacked)?.groupValues?.get(1)
-                    if (m3u8 != null) {
-                        Log.d(name, "Found m3u8 in 'file' field: $m3u8")
                         M3u8Helper.generateM3u8(name, m3u8, effectiveReferer).forEach(callback)
                         return
                     }
@@ -215,7 +258,7 @@ class PlayStreamplay : ExtractorApi() {
             }
         }
 
-        // ----- 3. Search for common video config patterns (JSON) -----
+        // 3) JSON patterns
         val jsonPatterns = listOf(
             Regex("""\{[^{}]*"file"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"[^{}]*\}"""),
             Regex("""\{[^{}]*"src"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"[^{}]*\}"""),
@@ -231,7 +274,7 @@ class PlayStreamplay : ExtractorApi() {
             }
         }
 
-        // ----- 4. Look for kaken token and call API -----
+        // 4) kaken token → API
         val token = Regex("""kaken\s*=\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         if (token != null) {
             val apiUrl = "$mainUrl/api/?$token"
@@ -249,12 +292,11 @@ class PlayStreamplay : ExtractorApi() {
             }
         }
 
-        // ----- 5. Last resort: use generic extractor (might work for some) -----
+        // 5) Fallback to generic extractor
         Log.d(name, "No m3u8 found, falling back to generic loadExtractor")
         loadExtractor(url, referer = effectiveReferer, subtitleCallback, callback)
     }
 
-    // Helper to find first URL matching a regex
     private fun findUrl(text: String, regex: Regex): String? {
         return regex.find(text)?.groupValues?.get(1)
     }
