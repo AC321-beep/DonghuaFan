@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import java.net.URLDecoder
 
 open class DonghuastreamProvider : MainAPI() {
     override var mainUrl = "https://donghuastream.org"
@@ -15,6 +16,7 @@ open class DonghuastreamProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime)
 
+    // Custom headers to mimic a real browser (improves Dailymotion extraction)
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         "Referer" to mainUrl,
@@ -22,98 +24,24 @@ open class DonghuastreamProvider : MainAPI() {
     )
 
     override val mainPage = mainPageOf(
-        "anime/?status=&type=&order=update&page=" to "Recently Updated",
-        "anime/?status=&type=&order=update&page=" to "Special Edition"
+        "anime/?status=&type=&order=update&page=" to "Recently Updated"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val isSpecialEdition = request.name == "Special Edition"
-
-        // --- Recently Updated: keep original logic exactly ---
-        if (!isSpecialEdition) {
-            var currentPage = page
-            val items = mutableListOf<SearchResponse>()
-            var hasNextPage = true
-            val maxPagesToSearch = 1
-            var pagesSearched = 0
-
-            while (items.isEmpty() && hasNextPage && pagesSearched < maxPagesToSearch) {
-                val url = "$mainUrl/${request.data}$currentPage"
-                val document = try { app.get(url).document } catch (e: Exception) { null }
-                val elements = document?.select("div.listupd > article")
-                if (elements.isNullOrEmpty()) {
-                    hasNextPage = false
-                    break
-                }
-                val mappedItems = elements.mapNotNull { it.toSearchResult() }
-                items.addAll(mappedItems)
-                pagesSearched++
-                if (items.isEmpty()) currentPage++
-            }
-
-            return newHomePageResponse(
-                list = HomePageList(
-                    name = request.name,
-                    list = items,
-                    isHorizontalImages = false
-                ),
-                hasNext = hasNextPage
-            )
-        }
-
-        // --- Special Edition: use search + keyword loop (case‑insensitive) ---
-        val items = mutableListOf<SearchResponse>()
-        var currentPage = page
-        var hasNextPage = true
-        val maxPagesToSearch = 5
-
-        // Keywords (case‑insensitive)
-        val keywords = listOf("special", "specials", "spacial")
-
-        while (items.isEmpty() && hasNextPage && currentPage <= maxPagesToSearch) {
-            val searchUrl = "$mainUrl/?s=movie&page=$currentPage"
-            val document = try {
-                app.get(searchUrl).document
-            } catch (_: Exception) { null }
-
-            val elements = document?.select("div.listupd > article")
-            if (elements.isNullOrEmpty()) {
-                hasNextPage = false
-                break
-            }
-
-            val mappedItems = elements.mapNotNull { element ->
-                val title = element.select("div.bsx > a").attr("title")
-                    .ifEmpty { element.text() }
-                    .trim()
-                
-                val containsKeyword = keywords.any { keyword ->
-                    title.contains(keyword, ignoreCase = true)
-                }
-
-                if (containsKeyword) {
-                    element.toSearchResult()
-                } else null
-            }
-
-            items.addAll(mappedItems)
-            currentPage++
-            hasNextPage = document.selectFirst(".next, .pagination .next") != null
-        }
-
+        val document = app.get("$mainUrl/${request.data}$page").document
+        val home = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
         return newHomePageResponse(
             list = HomePageList(
                 name = request.name,
-                list = items,
+                list = home,
                 isHorizontalImages = false
             ),
-            hasNext = false
+            hasNext = true
         )
     }
 
-    // ---------- All helper functions remain unchanged ----------
     fun Element.toSearchResult(): SearchResponse {
-        val title = this.select("div.bsx > a").attr("title").ifEmpty { this.text() }
+        val title = this.select("div.bsx > a").attr("title")
         val href = fixUrl(this.select("div.bsx > a").attr("href"))
         val posterUrl = fixUrlNull(this.selectFirst("div.bsx a img")?.getImageAttr())
         return newMovieSearchResponse(title, href, TvType.Movie) {
@@ -191,81 +119,96 @@ open class DonghuastreamProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val doc = app.get(data, headers = defaultHeaders).document
-        var linksFound = false
-
         val options = doc.select("option[data-index]")
-        if (options.isNotEmpty()) {
-            options.amap { option ->
-                val base64 = option.attr("value")
-                if (base64.isBlank()) return@amap
-                val label = option.text().trim()
-                val decodedHtml = try {
-                    base64Decode(base64)
-                } catch (_: Exception) {
-                    Log.w("Error", "Base64 decode failed: $base64")
-                    return@amap
+
+        // ----- Helper function to extract Dailymotion token from a page (mirrors DonghuaFun logic) -----
+        suspend fun extractDailymotionToken(pageUrl: String): String? {
+            val pageHtml = try {
+                app.get(pageUrl, headers = defaultHeaders).text
+            } catch (e: Exception) { return null }
+            val pageDoc = try { Jsoup.parse(pageHtml) } catch (e: Exception) { null }
+
+            // 1) Look for iframe with dailymotion in src
+            pageDoc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
+                val src = iframe.attr("src")
+                val match = Regex("""[?&]video=([^&]+)""").find(src)
+                if (match != null) return match.groupValues[1]
+            }
+
+            // 2) Fallback: parse player_aaaa JSON
+            val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+                .find(pageHtml)?.groupValues?.get(1)
+            if (playerJson != null) {
+                var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+                val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
+                val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+
+                if (encrypt == 1) rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+                else if (encrypt == 2) {
+                    rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
+                    rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
                 }
 
-                val iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
-                if (iframeUrl.isNullOrEmpty()) return@amap
-
-                processIframeUrl(iframeUrl, label, data, subtitleCallback, callback)
-                linksFound = true
-            }
-        }
-
-        if (!linksFound) {
-            val directIframe = doc.selectFirst(
-                "#embed_holder iframe, .player-embed iframe, .video-content iframe, iframe[src*='play.streamplay.co.in'], iframe[src*='rumble.com']"
-            )
-            if (directIframe != null) {
-                val iframeUrl = httpsify(directIframe.attr("src"))
-                if (!iframeUrl.isNullOrEmpty()) {
-                    processIframeUrl(iframeUrl, "Direct Source", data, subtitleCallback, callback)
-                    linksFound = true
+                if (from.equals("dailymotion", ignoreCase = true)) {
+                    return rawUrl
                 }
             }
+            return null
         }
 
-        return linksFound
-    }
+        for (option in options) {
+            val base64 = option.attr("value")
+            if (base64.isBlank()) continue
+            val label = option.text().trim()
+            val decodedHtml = try {
+                base64Decode(base64)
+            } catch (_: Exception) {
+                Log.w("Error", "Base64 decode failed: $base64")
+                continue
+            }
 
-    private suspend fun processIframeUrl(
-        iframeUrl: String,
-        label: String,
-        referer: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        when {
-            label.contains("dailymotion", ignoreCase = true) || "dailymotion" in iframeUrl -> {
-                Extractor().getUrl(iframeUrl, referer, subtitleCallback, callback)
-            }
-            "rumble.com" in iframeUrl -> {
-                Rumble().getUrl(iframeUrl, referer, subtitleCallback, callback)
-            }
-            "play.streamplay.co.in" in iframeUrl -> {
-                PlayStreamplay().getUrl(iframeUrl, referer, subtitleCallback, callback)
-            }
-            "vidmoly" in iframeUrl -> {
-                val cleanedUrl = "http:" + iframeUrl.substringAfter("=\"").substringBefore("\"")
-                loadExtractor(cleanedUrl, referer = referer, subtitleCallback, callback)
-            }
-            iframeUrl.endsWith(".mp4") -> {
-                callback(
-                    newExtractorLink(label, label, iframeUrl, INFER_TYPE) {
-                        this.referer = referer
-                        this.quality = getQualityFromName(label)
+            val iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
+            if (iframeUrl.isNullOrEmpty()) continue
+
+            // ----- Dailymotion branch (improved with DonghuaFun logic) -----
+            if (label.contains("dailymotion", ignoreCase = true) || "dailymotion" in iframeUrl) {
+                var token: String? = null
+                // First try to get token from the iframe URL itself
+                token = Regex("""[?&]video=([^&]+)""").find(iframeUrl)?.groupValues?.get(1)
+                // If not found, fetch the iframe page and extract using the helper
+                if (token == null) {
+                    token = extractDailymotionToken(iframeUrl)
+                }
+                if (token != null) {
+                    val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$token"
+                    if (loadExtractor(embedUrl, data, subtitleCallback, callback)) {
+                        continue // success, move to next mirror
                     }
-                )
+                }
+                // If token extraction failed, fall through to generic extractor
             }
-            else -> {
-                loadExtractor(iframeUrl, referer = referer, subtitleCallback, callback)
+
+            // ----- Known extractors for other domains (vidmoly removed) -----
+            when {
+                "rumble.com" in iframeUrl -> {
+                    Rumble().getUrl(iframeUrl, iframeUrl, subtitleCallback, callback)
+                }
+                "play.streamplay.co.in" in iframeUrl -> {
+                    PlayStreamplay().getUrl(iframeUrl, iframeUrl, subtitleCallback, callback)
+                }
+                iframeUrl.endsWith(".mp4") -> {
+                    callback(
+                        newExtractorLink(label, label, iframeUrl, INFER_TYPE) {
+                            this.referer = ""
+                            this.quality = getQualityFromName(label)
+                        }
+                    )
+                }
+                else -> {
+                    loadExtractor(iframeUrl, referer = iframeUrl, subtitleCallback, callback)
+                }
             }
         }
-    }
-
-    private fun base64Decode(str: String): String {
-        return String(Base64.decode(str, Base64.DEFAULT))
+        return true
     }
 }
