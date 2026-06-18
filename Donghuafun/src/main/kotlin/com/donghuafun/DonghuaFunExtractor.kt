@@ -19,7 +19,6 @@ class DonghuaFunExtractor : ExtractorApi() {
         } else url
 
         // 1. Fetch the iframe page first to establish a session and grab cookies.
-        // CDNs like cloudokyo return 403 (Error 2004) if they don't see a valid session cookie.
         var cookieString = ""
         try {
             val iframeResponse = app.get(
@@ -39,7 +38,7 @@ class DonghuaFunExtractor : ExtractorApi() {
         val m3u8Headers = mutableMapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Origin" to "https://play.donghuafun.com",
-            "Referer" to "https://play.donghuafun.com/m3u8/", // Target the exact iframe path
+            "Referer" to "https://play.donghuafun.com/", // Target the exact iframe domain
             "Accept" to "*/*"
         )
         
@@ -47,16 +46,23 @@ class DonghuaFunExtractor : ExtractorApi() {
             m3u8Headers["Cookie"] = cookieString
         }
 
-        // 3. Extract the M3U8 links safely
-        try {
+        // 3. Extract the M3U8 links safely. Assign it to a variable instead of immediately looping.
+        val extractedLinks = try {
             M3u8Helper.generateM3u8(
                 this.name,
                 m3u8Url,
-                "https://play.donghuafun.com/m3u8/",
+                "https://play.donghuafun.com/",
                 headers = m3u8Headers
-            ).forEach(callback)
+            )
         } catch (e: Exception) {
-            // 4. Fallback directly to ExoPlayer with cookies attached
+            emptyList()
+        }
+
+        // 4. Actively check if the helper succeeded. If empty, the server blocked the background scrape.
+        // We must fallback to natively passing it to ExoPlayer.
+        if (extractedLinks.isNotEmpty()) {
+            extractedLinks.forEach(callback)
+        } else {
             callback.invoke(
                 newExtractorLink(
                     this.name,
@@ -65,7 +71,7 @@ class DonghuaFunExtractor : ExtractorApi() {
                     ExtractorLinkType.M3U8
                 ) {
                     this.quality = Qualities.Unknown.value
-                    this.referer = "https://play.donghuafun.com/m3u8/" 
+                    this.referer = "https://play.donghuafun.com/" 
                     this.headers = m3u8Headers
                 }
             )
