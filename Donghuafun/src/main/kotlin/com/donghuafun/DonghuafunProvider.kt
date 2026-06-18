@@ -33,11 +33,13 @@ class DonghuaFunProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val isComingSoon = request.name == "Coming Soon"
+        val isRecentlyUpdated = request.name == "Recently Updated"
         var currentPage = page
         val items = mutableListOf<SearchResponse>()
         var hasNextPage = true
         
-        val maxPagesToSearch = if (isComingSoon) 5 else 1 
+        // Increased max pages for Recently Updated to ensure the row doesn't return empty if heavily filtered
+        val maxPagesToSearch = if (isComingSoon || isRecentlyUpdated) 5 else 1 
         var pagesSearched = 0
 
         while (items.isEmpty() && hasNextPage && pagesSearched < maxPagesToSearch) {
@@ -45,7 +47,10 @@ class DonghuaFunProvider : MainAPI() {
             val doc = app.get(pageUrl).document
             val elements = doc.select("a[href*='/vod/detail/id/']")
             if (elements.isEmpty()) { hasNextPage = false; break }
-            items.addAll(parseShowCards(doc, isComingSoon))
+            
+            // Pass both flags so parseShowCards knows how to filter
+            items.addAll(parseShowCards(doc, isComingSoon, isRecentlyUpdated))
+            
             pagesSearched++
             if (items.isEmpty()) currentPage++ 
         }
@@ -56,7 +61,7 @@ class DonghuaFunProvider : MainAPI() {
         val results = mutableListOf<SearchResponse>()
         for (page in 1..3) {
             val doc = try { app.get("$mainUrl/index.php/vod/search.html", params = mapOf("wd" to query, "page" to page.toString())).document } catch (e: Exception) { null } ?: break
-            val pageResults = parseShowCards(doc)
+            val pageResults = parseShowCards(doc) // Defaults to false for both flags
             if (pageResults.isEmpty()) break
             results.addAll(pageResults)
             val hasNext = doc.select("a.page-next:not(.disabled), a:contains(Next), a:contains(下一页)").isNotEmpty()
@@ -208,24 +213,29 @@ class DonghuaFunProvider : MainAPI() {
         return false
     }
 
-    private fun parseShowCards(doc: Document, isComingSoon: Boolean = false): List<SearchResponse> {
+    private fun parseShowCards(doc: Document, isComingSoon: Boolean = false, isRecentlyUpdated: Boolean = false): List<SearchResponse> {
         return doc.select("a[href*='/vod/detail/id/']")
             .distinctBy { it.attr("href") }
             .filter { a -> 
-                if (!isComingSoon) { true } else {
-                    val parent1 = a.parent()
-                    val parent2 = a.parent()?.parent()
-                    val parent3 = a.parent()?.parent()?.parent()
+                val parent1 = a.parent()
+                val parent2 = a.parent()?.parent()
+                val parent3 = a.parent()?.parent()?.parent()
 
-                    val container = when {
-                        parent3 != null && parent3.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent3
-                        parent2 != null && parent2.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent2
-                        parent1 != null && parent1.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent1
-                        else -> a
-                    }
-                    val cardText = container.text()
-                    val keywords = listOf("trailer", "coming soon", "not yet aired", "upcoming", "releasing soon", "0 episode")
-                    keywords.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
+                val container = when {
+                    parent3 != null && parent3.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent3
+                    parent2 != null && parent2.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent2
+                    parent1 != null && parent1.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent1
+                    else -> a
+                }
+                
+                val cardText = container.text()
+                val keywords = listOf("trailer", "coming soon", "not yet aired", "upcoming", "releasing soon", "0 episode")
+                val containsTrailerKeyword = keywords.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
+
+                when {
+                    isComingSoon -> containsTrailerKeyword       // ONLY show items with trailer keywords
+                    isRecentlyUpdated -> !containsTrailerKeyword // FILTER OUT items with trailer keywords
+                    else -> true                                 // For Most Popular/Search: Keep everything
                 }
             }
             .mapNotNull { a ->
