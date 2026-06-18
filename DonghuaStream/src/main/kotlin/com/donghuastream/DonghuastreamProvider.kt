@@ -4,6 +4,9 @@ import android.util.Base64
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
@@ -23,7 +26,6 @@ open class DonghuastreamProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
-    // Added Special Edition category
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update&page=" to "Recently Updated",
         "anime/?status=&type=&order=update&page=" to "Special Edition"
@@ -31,46 +33,54 @@ open class DonghuastreamProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val isSpecial = request.name == "Special Edition"
-        var currentPage = page
         val items = mutableListOf<SearchResponse>()
         var hasNextPage = true
-        
-        // Scan up to 5 pages deep if we are looking for sparse Special Editions
-        val maxPagesToSearch = if (isSpecial) 5 else 1
-        var pagesSearched = 0
 
-        while (items.isEmpty() && hasNextPage && pagesSearched < maxPagesToSearch) {
-            val document = app.get("$mainUrl/${request.data}$currentPage").document
-            val elements = document.select("div.listupd > article")
-            
-            if (elements.isEmpty()) {
-                hasNextPage = false
-                break
+        if (isSpecial) {
+            // ASYNC FETCH: Scrape 10 pages simultaneously to find sparse Special Editions instantly
+            // Page 1 scans 1..10, Page 2 scans 11..20, etc.
+            val startPage = (page - 1) * 10 + 1
+            val pagesToFetch = (startPage until startPage + 10).toList()
+
+            val elements = coroutineScope {
+                pagesToFetch.map { pageNum ->
+                    async {
+                        try {
+                            app.get("$mainUrl/${request.data}$pageNum").document.select("div.listupd > article")
+                        } catch (e: Exception) {
+                            emptyList<Element>() // Ignore dead pages
+                        }
+                    }
+                }.awaitAll().flatten()
             }
 
-            val filteredElements = elements.filter { element ->
-                if (isSpecial) {
-                    // Extract Title and check case-insensitive keywords
-                    val title = element.select("div.bsx > a").attr("title").lowercase()
-                    val keywords = listOf("special", "edition", "part 1", "part 01")
-                    val hasKeyword = keywords.any { title.contains(it) }
+            if (elements.isEmpty()) hasNextPage = false
 
-                    // Extract Episode Count
-                    val epText = element.selectFirst(".epx, .ep")?.text() ?: ""
-                    val epCount = Regex("""\d+""").find(epText)?.value?.toIntOrNull() ?: 1 // Default to 1 if no number (e.g. Movies)
-
-                    // Both constraints must be met
-                    hasKeyword && epCount <= 6
-                } else {
-                    true // Return all items for Recently Updated
-                }
-            }.mapNotNull { it.toSearchResult() }
-
-            items.addAll(filteredElements)
-            pagesSearched++
+            val keywords = listOf("special", "edition", "part 1", "part 01")
             
-            // If we didn't find any items on this page, move to the next one
-            if (items.isEmpty()) currentPage++
+            val filtered = elements.filter { element ->
+                // Fallback to raw element text if the 'title' attribute is hidden/missing
+                val title = element.selectFirst("a")?.attr("title").toString()
+                    .ifEmpty { element.text() }
+                    .lowercase()
+
+                val hasKeyword = keywords.any { title.contains(it) }
+
+                // Parse episode text, default to 1 for movies/specials with no explicit number
+                val epText = element.selectFirst(".epx, .ep")?.text() ?: ""
+                val epCount = Regex("""\d+""").find(epText)?.value?.toIntOrNull() ?: 1
+
+                hasKeyword && epCount <= 6
+            }.mapNotNull { it.toSearchResult() }.distinctBy { it.url }
+
+            items.addAll(filtered)
+
+        } else {
+            // Standard single-page fetch for "Recently Updated"
+            val document = app.get("$mainUrl/${request.data}$page").document
+            val elements = document.select("div.listupd > article")
+            if (elements.isEmpty()) hasNextPage = false
+            items.addAll(elements.mapNotNull { it.toSearchResult() })
         }
 
         return newHomePageResponse(
@@ -84,7 +94,7 @@ open class DonghuastreamProvider : MainAPI() {
     }
 
     fun Element.toSearchResult(): SearchResponse {
-        val title = this.select("div.bsx > a").attr("title")
+        val title = this.select("div.bsx > a").attr("title").ifEmpty { this.text() }
         val href = fixUrl(this.select("div.bsx > a").attr("href"))
         val posterUrl = fixUrlNull(this.selectFirst("div.bsx a img")?.getImageAttr())
         return newMovieSearchResponse(title, href, TvType.Movie) {
@@ -164,21 +174,19 @@ open class DonghuastreamProvider : MainAPI() {
         val doc = app.get(data, headers = defaultHeaders).document
         val options = doc.select("option[data-index]")
 
-        // ----- Helper function to extract Dailymotion token from a page (mirrors DonghuaFun logic) -----
+        // ----- Helper function to extract Dailymotion token from a page -----
         suspend fun extractDailymotionToken(pageUrl: String): String? {
             val pageHtml = try {
                 app.get(pageUrl, headers = defaultHeaders).text
             } catch (e: Exception) { return null }
             val pageDoc = try { Jsoup.parse(pageHtml) } catch (e: Exception) { null }
 
-            // 1) Look for iframe with dailymotion in src
             pageDoc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
                 val src = iframe.attr("src")
                 val match = Regex("""[?&]video=([^&]+)""").find(src)
                 if (match != null) return match.groupValues[1]
             }
 
-            // 2) Fallback: parse player_aaaa JSON
             val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
                 .find(pageHtml)?.groupValues?.get(1)
             if (playerJson != null) {
@@ -213,25 +221,22 @@ open class DonghuastreamProvider : MainAPI() {
             val iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
             if (iframeUrl.isNullOrEmpty()) continue
 
-            // ----- Dailymotion branch (improved with DonghuaFun logic) -----
+            // ----- Dailymotion branch -----
             if (label.contains("dailymotion", ignoreCase = true) || "dailymotion" in iframeUrl) {
                 var token: String? = null
-                // First try to get token from the iframe URL itself
                 token = Regex("""[?&]video=([^&]+)""").find(iframeUrl)?.groupValues?.get(1)
-                // If not found, fetch the iframe page and extract using the helper
                 if (token == null) {
                     token = extractDailymotionToken(iframeUrl)
                 }
                 if (token != null) {
                     val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$token"
                     if (loadExtractor(embedUrl, data, subtitleCallback, callback)) {
-                        continue // success, move to next mirror
+                        continue
                     }
                 }
-                // If token extraction failed, fall through to generic extractor
             }
 
-            // ----- Known extractors for other domains (vidmoly removed) -----
+            // ----- Known extractors for other domains -----
             when {
                 "rumble.com" in iframeUrl -> {
                     Rumble().getUrl(iframeUrl, iframeUrl, subtitleCallback, callback)
