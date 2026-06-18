@@ -61,27 +61,37 @@ open class DonghuastreamProvider : MainAPI() {
             )
         }
 
-        // --- Special Edition: improved filtering using type badge ---
+        // --- Special Edition: use search + keyword loop (case‑insensitive) ---
         val items = mutableListOf<SearchResponse>()
         var currentPage = page
         var hasNextPage = true
         val maxPagesToSearch = 5
 
-        while (items.isEmpty() && hasNextPage && currentPage <= maxPagesToSearch) {
-            val url = "$mainUrl/${request.data}$currentPage"
-            val document = try { app.get(url).document } catch (e: Exception) { null }
-            val elements = document?.select("div.listupd > article")
+        // Keywords (case‑insensitive)
+        val keywords = listOf("special", "specials", "spacial")
 
+        while (items.isEmpty() && hasNextPage && currentPage <= maxPagesToSearch) {
+            val searchUrl = "$mainUrl/?s=movie&page=$currentPage"
+            val document = try {
+                app.get(searchUrl).document
+            } catch (_: Exception) { null }
+
+            val elements = document?.select("div.listupd > article")
             if (elements.isNullOrEmpty()) {
                 hasNextPage = false
                 break
             }
 
             val mappedItems = elements.mapNotNull { element ->
-                val typez = element.selectFirst("div.typez")?.text()?.trim() ?: ""
-                if (typez.equals("Movie", ignoreCase = true) ||
-                    typez.equals("Special", ignoreCase = true) ||
-                    typez.equals("ONA", ignoreCase = true)) {
+                val title = element.select("div.bsx > a").attr("title")
+                    .ifEmpty { element.text() }
+                    .trim()
+                
+                val containsKeyword = keywords.any { keyword ->
+                    title.contains(keyword, ignoreCase = true)
+                }
+
+                if (containsKeyword) {
                     element.toSearchResult()
                 } else null
             }
@@ -89,27 +99,6 @@ open class DonghuastreamProvider : MainAPI() {
             items.addAll(mappedItems)
             currentPage++
             hasNextPage = document.selectFirst(".next, .pagination .next") != null
-        }
-
-        // Fallback: search for "movie" and filter by badge
-        if (items.isEmpty()) {
-            var searchPage = 1
-            while (items.isEmpty() && searchPage <= 3) {
-                val searchUrl = "$mainUrl/?s=movie&page=$searchPage"
-                val searchDoc = try { app.get(searchUrl).document } catch (_: Exception) { null }
-                val searchElements = searchDoc?.select("div.listupd > article")
-                if (searchElements.isNullOrEmpty()) break
-                val mapped = searchElements.mapNotNull { element ->
-                    val typez = element.selectFirst("div.typez")?.text()?.trim() ?: ""
-                    if (typez.equals("Movie", ignoreCase = true) ||
-                        typez.equals("Special", ignoreCase = true) ||
-                        typez.equals("ONA", ignoreCase = true)) {
-                        element.toSearchResult()
-                    } else null
-                }
-                items.addAll(mapped)
-                searchPage++
-            }
         }
 
         return newHomePageResponse(
@@ -122,7 +111,7 @@ open class DonghuastreamProvider : MainAPI() {
         )
     }
 
-    // ---------- Helper: Element -> SearchResponse ----------
+    // ---------- All helper functions remain unchanged ----------
     fun Element.toSearchResult(): SearchResponse {
         val title = this.select("div.bsx > a").attr("title").ifEmpty { this.text() }
         val href = fixUrl(this.select("div.bsx > a").attr("href"))
@@ -140,7 +129,6 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    // ---------- Search ----------
     override suspend fun search(query: String): List<SearchResponse> {
         val searchResponse = mutableListOf<SearchResponse>()
         for (i in 1..3) {
@@ -156,7 +144,6 @@ open class DonghuastreamProvider : MainAPI() {
         return searchResponse
     }
 
-    // ---------- Load Episode / Movie ----------
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
         val title = document.selectFirst("h1.entry-title")?.text()?.trim().toString()
@@ -197,7 +184,6 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    // ---------- Load Links (with fallback for direct iframes) ----------
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -207,7 +193,6 @@ open class DonghuastreamProvider : MainAPI() {
         val doc = app.get(data, headers = defaultHeaders).document
         var linksFound = false
 
-        // 1) Try mirror select (base64 encoded options)
         val options = doc.select("option[data-index]")
         if (options.isNotEmpty()) {
             options.amap { option ->
@@ -229,7 +214,6 @@ open class DonghuastreamProvider : MainAPI() {
             }
         }
 
-        // 2) If no links found yet, look for a direct iframe (including rumble)
         if (!linksFound) {
             val directIframe = doc.selectFirst(
                 "#embed_holder iframe, .player-embed iframe, .video-content iframe, iframe[src*='play.streamplay.co.in'], iframe[src*='rumble.com']"
@@ -246,7 +230,6 @@ open class DonghuastreamProvider : MainAPI() {
         return linksFound
     }
 
-    // ---------- Helper: process a single iframe URL ----------
     private suspend fun processIframeUrl(
         iframeUrl: String,
         label: String,
@@ -282,7 +265,6 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    // ---------- Utility ----------
     private fun base64Decode(str: String): String {
         return String(Base64.decode(str, Base64.DEFAULT))
     }
