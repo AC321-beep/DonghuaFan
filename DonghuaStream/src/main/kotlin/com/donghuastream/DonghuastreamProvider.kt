@@ -23,13 +23,27 @@ open class DonghuastreamProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
+    // Added the new "Special Edition" category mapped to the "movie" search query
     override val mainPage = mainPageOf(
-        "anime/?status=&type=&order=update&page=" to "Recently Updated"
+        "anime/?status=&type=&order=update&page=" to "Recently Updated",
+        "movie" to "Special Edition"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val document = app.get("$mainUrl/${request.data}$page").document
+        // Automatically route Special Edition to use the site's search pagination format
+        val url = if (request.name == "Special Edition") {
+            if (page == 1) {
+                "$mainUrl/?s=${request.data}"
+            } else {
+                "$mainUrl/pagg/$page/?s=${request.data}"
+            }
+        } else {
+            "$mainUrl/${request.data}$page"
+        }
+
+        val document = app.get(url).document
         val home = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
+        
         return newHomePageResponse(
             list = HomePageList(
                 name = request.name,
