@@ -96,23 +96,78 @@ class PlayStreamplay : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Fix 1: Handle missing protocol URLs (resolves the Allsub1 crash)
+        // Fix for missing protocol
         val fixedUrl = if (url.startsWith("//")) "https:$url" else url
+        val pageReferer = referer ?: mainUrl
 
         Log.d(name, "Loading: $fixedUrl")
-        val html = try { 
-            app.get(fixedUrl).text 
-        } catch (e: Exception) { 
-            return 
+        val html = try {
+            app.get(fixedUrl, referer = pageReferer).text
+        } catch (e: Exception) {
+            return
         }
 
-        // Helper function to process the media securely without modifying your core logic
-        suspend fun invokeMedia(mediaUrlRaw: String) {
-            val mediaUrl = mediaUrlRaw.replace("\\/", "/")
-            if (mediaUrl.contains(".m3u8", ignoreCase = true)) {
-                M3u8Helper.generateM3u8(name, mediaUrl, mainUrl).forEach(callback)
+        val mediaUrls = mutableSetOf<String>()
+
+        // Helper to grab links but safely exclude images/subtitles that might cause ExoPlayer to crash
+        fun addMedia(rawUrl: String) {
+            val cleanUrl = rawUrl.replace("\\/", "/")
+            if (cleanUrl.startsWith("http") && 
+                !cleanUrl.endsWith(".jpg", true) && 
+                !cleanUrl.endsWith(".png", true) && 
+                !cleanUrl.endsWith(".vtt", true) && 
+                !cleanUrl.endsWith(".srt", true)) {
+                mediaUrls.add(cleanUrl)
+            }
+        }
+
+        // 1. Broad Packer Extraction (Fixes "No Link Found")
+        // Uses a highly resilient regex that catches filemoon/streamplay scripts even if variables change
+        val packerMatches = Regex("""eval\(function\(p,a,c,k,e,?[d|r]?\).*?\)\)""", RegexOption.DOT_MATCHES_ALL).findAll(html).toList()
+            .ifEmpty { Regex("""eval\(\s*function\([^)]+\).*?split\('\|'\).*?\)\)""", RegexOption.DOT_MATCHES_ALL).findAll(html).toList() }
+
+        packerMatches.forEach { match ->
+            val unpacked = JsUnpacker(match.value).unpack() ?: return@forEach
+            
+            // Extract standard file:"url" or src:"url" inside the JSON config
+            Regex("""(?:file|src)\s*:\s*["']([^"']+)["']""").findAll(unpacked).forEach { 
+                addMedia(it.groupValues[1]) 
+            }
+
+            // Extract Token API fallback
+            val token = Regex("""kaken\s*=\s*["']([^"']+)["']""").find(unpacked)?.groupValues?.get(1)
+            if (token != null) {
+                try {
+                    val apiJson = app.get("$mainUrl/api/?$token", referer = fixedUrl).text
+                    Regex("""(?:file|src)\s*:\s*["']([^"']+)["']""").findAll(apiJson).forEach {
+                        addMedia(it.groupValues[1])
+                    }
+                } catch (e: Exception) { }
+            }
+        }
+
+        // 2. Direct HTML match fallback (If it isn't packed)
+        Regex("""(?:file|src)\s*:\s*["']([^"']+)["']""").findAll(html).forEach { addMedia(it.groupValues[1]) }
+        Regex("""["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""").findAll(html).forEach { addMedia(it.groupValues[1]) }
+
+        Log.d(name, "Streamplay discovered media URLs: $mediaUrls")
+
+        // 3. Routing links to ExoPlayer safely (Fixes "Error 3003")
+        for (mediaUrl in mediaUrls) {
+            val isM3u8 = mediaUrl.contains("m3u8", ignoreCase = true) || mediaUrl.contains("hls", ignoreCase = true)
+            
+            if (isM3u8) {
+                M3u8Helper.generateM3u8(
+                    name,
+                    mediaUrl,
+                    referer = fixedUrl,
+                    headers = mapOf(
+                        "Origin" to "https://play.streamplay.co.in",
+                        "Referer" to fixedUrl,
+                        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    )
+                ).forEach(callback)
             } else {
-                // Fix 2: Correctly pass .mp4 links so ExoPlayer doesn't crash expecting an m3u8
                 callback(
                     newExtractorLink(
                         name,
@@ -120,43 +175,16 @@ class PlayStreamplay : ExtractorApi() {
                         mediaUrl,
                         INFER_TYPE
                     ) {
+                        // These exact headers prevent the CDN from returning a 403 Forbidden HTML page.
                         this.referer = fixedUrl
+                        this.headers = mapOf(
+                            "Origin" to "https://play.streamplay.co.in",
+                            "Referer" to fixedUrl,
+                            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                        )
                         this.quality = Qualities.Unknown.value
                     }
                 )
-            }
-        }
-
-        // Direct m3u8 or mp4
-        var media = Regex("""(https?://[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*)""").find(html)?.value
-        if (media != null) {
-            Log.d(name, "Found direct media: $media")
-            invokeMedia(media)
-            return
-        }
-
-        // Unpacked script
-        val packed = Regex("""eval\(function\(p,a,c,k,e,d\).*?\)\)\)""", RegexOption.DOT_MATCHES_ALL)
-            .find(html)?.value ?: return
-        val unpacked = JsUnpacker(packed).unpack() ?: return
-
-        media = Regex(""""file"\s*:\s*"(https?://[^"]+\.(?:m3u8|mp4)[^"]*)"""").find(unpacked)?.groupValues?.get(1)
-        if (media != null) {
-            Log.d(name, "Found media in unpacked: $media")
-            invokeMedia(media)
-            return
-        }
-
-        // Token API fallback
-        val token = Regex("""kaken\s*=\s*"([^"]+)"""").find(unpacked)?.groupValues?.get(1)
-        if (token != null) {
-            val apiUrl = "$mainUrl/api/?$token"
-            Log.d(name, "Calling API: $apiUrl")
-            val apiJson = try { app.get(apiUrl).text } catch (e: Exception) { "" }
-            
-            val apiMedia = Regex(""""file"\s*:\s*"(https?://[^"]+\.(?:m3u8|mp4)[^"]*)"""").find(apiJson)?.groupValues?.get(1)
-            if (apiMedia != null) {
-                invokeMedia(apiMedia)
             }
         }
     }
