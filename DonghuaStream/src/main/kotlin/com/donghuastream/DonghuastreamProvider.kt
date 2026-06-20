@@ -23,35 +23,51 @@ open class DonghuastreamProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
-    // Added the new "Special Edition" category mapped to the "movie" search query
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update&page=" to "Recently Updated",
-        "movie" to "Special Edition"
+        "special_edition" to "Special Edition" 
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Automatically route Special Edition to use the site's search pagination format
-        val url = if (request.name == "Special Edition") {
-            if (page == 1) {
-                "$mainUrl/?s=${request.data}"
-            } else {
-                "$mainUrl/pagg/$page/?s=${request.data}"
-            }
-        } else {
-            "$mainUrl/${request.data}$page"
-        }
+        // --- Custom Dual-Fetch Logic for Special Edition ---
+        if (request.name == "Special Edition") {
+            // 1. Fetch "movie" results
+            val movieUrl = if (page == 1) "$mainUrl/?s=movie" else "$mainUrl/pagg/$page/?s=movie"
+            val movieDoc = try { app.get(movieUrl).document } catch(e: Exception) { null }
+            val movieResults = movieDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
 
-        val document = app.get(url).document
-        val home = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
-        
-        return newHomePageResponse(
-            list = HomePageList(
-                name = request.name,
-                list = home,
-                isHorizontalImages = false
-            ),
-            hasNext = true
-        )
+            // 2. Fetch "special" results
+            val specialUrl = if (page == 1) "$mainUrl/?s=special" else "$mainUrl/pagg/$page/?s=special"
+            val specialDoc = try { app.get(specialUrl).document } catch(e: Exception) { null }
+            val specialResults = specialDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+
+            // 3. Combine both lists and remove any duplicates
+            val combinedResults = (movieResults + specialResults).distinctBy { it.url }
+
+            return newHomePageResponse(
+                list = HomePageList(
+                    name = request.name,
+                    list = combinedResults,
+                    isHorizontalImages = false
+                ),
+                hasNext = movieResults.isNotEmpty() || specialResults.isNotEmpty()
+            )
+        } 
+        // --- Standard Logic for Recently Updated ---
+        else {
+            val url = "$mainUrl/${request.data}$page"
+            val document = app.get(url).document
+            val home = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
+            
+            return newHomePageResponse(
+                list = HomePageList(
+                    name = request.name,
+                    list = home,
+                    isHorizontalImages = false
+                ),
+                hasNext = true
+            )
+        }
     }
 
     fun Element.toSearchResult(): SearchResponse {
@@ -202,7 +218,7 @@ open class DonghuastreamProvider : MainAPI() {
                 // If token extraction failed, fall through to generic extractor
             }
 
-            // ----- Known extractors for other domains (vidmoly removed) -----
+            // ----- Known extractors for other domains -----
             when {
                 "rumble.com" in iframeUrl -> {
                     Rumble().getUrl(iframeUrl, iframeUrl, subtitleCallback, callback)
