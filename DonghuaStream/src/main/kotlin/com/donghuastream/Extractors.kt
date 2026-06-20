@@ -98,28 +98,28 @@ class PlayStreamplay : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Fix for missing protocol in certain iframes
         val fixedUrl = if (url.startsWith("//")) "https:$url" else url
         
-        // Use the original parent site referer to prevent CDN 403 Forbidden errors
-        val pageReferer = referer ?: fixedUrl
+        // CRITICAL FIX: The referer MUST be the iframe URL itself. 
+        // If it's the parent website, the Streamplay CDN will throw a 403 Forbidden (causing Error 3003).
+        val embedReferer = fixedUrl
 
-        Log.d(name, "Loading: $fixedUrl with referer $pageReferer")
+        Log.d(name, "Loading: $fixedUrl")
         val html = try {
-            app.get(fixedUrl, referer = pageReferer).text
+            app.get(fixedUrl, referer = referer ?: mainUrl).text
         } catch (e: Exception) {
             Log.e(name, "Failed to load PlayStreamplay URL: ${e.message}")
             return
         }
 
-        // Helper function to safely route media format to ExoPlayer
         suspend fun invokeMedia(mediaUrlRaw: String) {
             val mediaUrl = mediaUrlRaw.replace("\\/", "/") // Clean escaped JSON slashes
             val isM3u8 = mediaUrl.contains(".m3u8", ignoreCase = true) || mediaUrl.contains("m3u8", ignoreCase = true)
             
             if (isM3u8) {
-                M3u8Helper.generateM3u8(name, mediaUrl, referer = pageReferer).forEach(callback)
+                M3u8Helper.generateM3u8(name, mediaUrl, referer = embedReferer).forEach(callback)
             } else {
+                // Ping Validator removed to prevent token-consumption which triggers Error 3003.
                 callback(
                     newExtractorLink(
                         name,
@@ -127,7 +127,7 @@ class PlayStreamplay : ExtractorApi() {
                         mediaUrl,
                         INFER_TYPE
                     ) {
-                        this.referer = pageReferer
+                        this.referer = embedReferer
                         this.quality = Qualities.Unknown.value
                     }
                 )
@@ -152,7 +152,7 @@ class PlayStreamplay : ExtractorApi() {
                 if (token != null) {
                     val apiUrl = "$mainUrl/api/?$token"
                     Log.d(name, "Calling API: $apiUrl")
-                    val apiJson = try { app.get(apiUrl, referer = pageReferer).text } catch(e: Exception) { "" }
+                    val apiJson = try { app.get(apiUrl, referer = embedReferer).text } catch(e: Exception) { "" }
                     
                     val apiMedia = Regex(""""file"\s*:\s*"(https?:(?:\\/|/)(?:\\/|/)[^"]+)"""").find(apiJson)?.groupValues?.get(1)
                     if (apiMedia != null) {
@@ -177,6 +177,44 @@ class PlayStreamplay : ExtractorApi() {
         if (rawFile != null) {
             Log.d(name, "Found raw file fallback: $rawFile")
             invokeMedia(rawFile)
+        }
+    }
+}
+
+class Dailymotion : ExtractorApi() {
+    override var name = "Dailymotion"
+    override var mainUrl = "https://www.dailymotion.com"
+    override val requiresReferer = false
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val fixedUrl = if (url.startsWith("//")) "https:$url" else url
+        Log.d(name, "Loading Dailymotion: $fixedUrl")
+        
+        // Extract the unique video ID from the embed URL
+        val idMatch = Regex("""video/([a-zA-Z0-9_]+)""").find(fixedUrl)
+        val id = idMatch?.groupValues?.get(1) ?: return
+        
+        // Fetch the internal Dailymotion metadata API to bypass the HTML wrapper
+        val apiUrl = "https://www.dailymotion.com/player/metadata/video/$id"
+        val response = try {
+            app.get(apiUrl).text
+        } catch (e: Exception) {
+            Log.e(name, "Failed to fetch Dailymotion API: ${e.message}")
+            return
+        }
+        
+        // Isolate the true .m3u8 stream link to prevent ExoPlayer 3003 container errors
+        val m3u8Url = Regex(""""type"\s*:\s*"application/x-mpegURL"\s*,\s*"url"\s*:\s*"([^"]+)"""").find(response)?.groupValues?.get(1)?.replace("\\/", "/")
+        
+        if (m3u8Url != null) {
+            M3u8Helper.generateM3u8(name, m3u8Url, mainUrl).forEach(callback)
+        } else {
+            Log.e(name, "Could not find m3u8 in Dailymotion API response.")
         }
     }
 }
