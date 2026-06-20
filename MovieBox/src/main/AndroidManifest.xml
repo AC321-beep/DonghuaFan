@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.moviebox">
-
-    <!-- Allows the plugin to access the internet -->
-    <uses-permission android:name="android.permission.INTERNET"/>
-
-    <!-- No other permissions are needed -->
-</manifest>
