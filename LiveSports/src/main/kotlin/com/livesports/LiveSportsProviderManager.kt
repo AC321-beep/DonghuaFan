@@ -9,7 +9,6 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 object LiveSportsProviderManager {
-    // New updated fallback domain from CNC smali
     private const val FALLBACK_BASE_URL = "https://cfymarkscanjiostar80.top"
     private const val PACKAGE_NAME = "com.cricfy.tv"
     private var cachedBaseUrl: String? = null
@@ -63,7 +62,6 @@ object LiveSportsProviderManager {
 
     suspend fun fetchLiveEvents(): List<LiveEventData> {
         try {
-            // FIXED: Added the /categories/ path you extracted from the Smali!
             val url = "${getBaseUrl()}/categories/live-events.txt"
             
             val request = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
