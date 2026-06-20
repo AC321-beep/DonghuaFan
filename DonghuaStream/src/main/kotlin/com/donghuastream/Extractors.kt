@@ -100,38 +100,77 @@ class PlayStreamplay : ExtractorApi() {
         val fixedUrl = if (url.startsWith("//")) "https:$url" else url
 
         Log.d(name, "Loading: $fixedUrl")
-        val html = app.get(fixedUrl).text
-
-        // Direct m3u8
-        var m3u8 = Regex("""(https?://[^"'\s]+\.m3u8[^"'\s]*)""").find(html)?.value
-        if (m3u8 != null) {
-            Log.d(name, "Found direct m3u8: $m3u8")
-            M3u8Helper.generateM3u8(name, m3u8, mainUrl).forEach(callback)
+        val html = try {
+            app.get(fixedUrl).text
+        } catch (e: Exception) {
+            Log.e(name, "Failed to load PlayStreamplay URL: ${e.message}")
             return
         }
 
-        // Unpacked script
-        val packed = Regex("""eval\(function\(p,a,c,k,e,d\).*?\)\)\)""", RegexOption.DOT_MATCHES_ALL)
-            .find(html)?.value ?: return
-        val unpacked = JsUnpacker(packed).unpack() ?: return
-
-        m3u8 = Regex(""""file"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""").find(unpacked)?.groupValues?.get(1)
-        if (m3u8 != null) {
-            Log.d(name, "Found m3u8 in unpacked: $m3u8")
-            M3u8Helper.generateM3u8(name, m3u8, mainUrl).forEach(callback)
-            return
-        }
-
-        // Token API fallback
-        val token = Regex("""kaken\s*=\s*"([^"]+)"""").find(unpacked)?.groupValues?.get(1)
-        if (token != null) {
-            val apiUrl = "$mainUrl/api/?$token"
-            Log.d(name, "Calling API: $apiUrl")
-            val apiJson = app.get(apiUrl).text
-            val apiM3u8 = Regex(""""file"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""").find(apiJson)?.groupValues?.get(1)
-            if (apiM3u8 != null) {
-                M3u8Helper.generateM3u8(name, apiM3u8, mainUrl).forEach(callback)
+        // Helper function to safely route media format to ExoPlayer
+        suspend fun invokeMedia(mediaUrlRaw: String) {
+            val mediaUrl = mediaUrlRaw.replace("\\/", "/") // Clean escaped JSON slashes
+            val isM3u8 = mediaUrl.contains(".m3u8", ignoreCase = true)
+            
+            if (isM3u8) {
+                M3u8Helper.generateM3u8(name, mediaUrl, mainUrl).forEach(callback)
+            } else {
+                callback(
+                    ExtractorLink(
+                        source = name,
+                        name = name,
+                        url = mediaUrl,
+                        referer = mainUrl,
+                        quality = Qualities.Unknown.value,
+                        isM3u8 = false
+                    )
+                )
             }
+        }
+
+        // 1. Unified Regex for any .m3u8 or .mp4 directly in the HTML (handles escaped slashes)
+        val directMedia = Regex("""(https?:(?:\\/|/)(?:\\/|/)[^"'\s<>]+\.(?:m3u8|mp4)[^"'\s<>]*)""", RegexOption.IGNORE_CASE).find(html)?.groupValues?.get(1)
+        if (directMedia != null) {
+            Log.d(name, "Found direct media: $directMedia")
+            invokeMedia(directMedia)
+            return
+        }
+
+        // 2. Unpacked script handling
+        val packed = Regex("""eval\(function\(p,a,c,k,e,d\).*?\)\)\)""", RegexOption.DOT_MATCHES_ALL).find(html)?.value
+        if (packed != null) {
+            val unpacked = JsUnpacker(packed).unpack()
+            if (unpacked != null) {
+                // Look for "file":"url" inside unpacked script
+                val unpackedMedia = Regex(""""file"\s*:\s*"(https?:(?:\\/|/)(?:\\/|/)[^"]+)"""").find(unpacked)?.groupValues?.get(1)
+                if (unpackedMedia != null) {
+                    Log.d(name, "Found media in unpacked: $unpackedMedia")
+                    invokeMedia(unpackedMedia)
+                    return
+                }
+
+                // Token API Fallback
+                val token = Regex("""kaken\s*=\s*"([^"]+)"""").find(unpacked)?.groupValues?.get(1)
+                if (token != null) {
+                    val apiUrl = "$mainUrl/api/?$token"
+                    Log.d(name, "Calling API: $apiUrl")
+                    val apiJson = try { app.get(apiUrl).text } catch(e: Exception) { "" }
+                    
+                    val apiMedia = Regex(""""file"\s*:\s*"(https?:(?:\\/|/)(?:\\/|/)[^"]+)"""").find(apiJson)?.groupValues?.get(1)
+                    if (apiMedia != null) {
+                        Log.d(name, "Found media in API JSON: $apiMedia")
+                        invokeMedia(apiMedia)
+                        return
+                    }
+                }
+            }
+        }
+
+        // 3. Ultimate Fallback: Scrape any "file" string from the raw HTML
+        val rawFile = Regex(""""file"\s*:\s*"(https?:(?:\\/|/)(?:\\/|/)[^"]+)"""").find(html)?.groupValues?.get(1)
+        if (rawFile != null) {
+            Log.d(name, "Found raw file fallback: $rawFile")
+            invokeMedia(rawFile)
         }
     }
 }
