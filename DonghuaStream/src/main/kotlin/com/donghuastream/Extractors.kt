@@ -115,15 +115,17 @@ class PlayStreamplay : ExtractorApi() {
             if (isM3u8) {
                 M3u8Helper.generateM3u8(name, mediaUrl, mainUrl).forEach(callback)
             } else {
+                // FIXED: Replaced deprecated ExtractorLink constructor with newExtractorLink
                 callback(
-                    ExtractorLink(
-                        source = name,
-                        name = name,
-                        url = mediaUrl,
-                        referer = mainUrl,
-                        quality = Qualities.Unknown.value,
-                        isM3u8 = false
-                    )
+                    newExtractorLink(
+                        name,
+                        name,
+                        mediaUrl,
+                        INFER_TYPE
+                    ) {
+                        this.referer = mainUrl
+                        this.quality = Qualities.Unknown.value
+                    }
                 )
             }
         }
