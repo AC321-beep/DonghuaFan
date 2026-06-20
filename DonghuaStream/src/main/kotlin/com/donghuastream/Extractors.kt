@@ -96,77 +96,34 @@ class PlayStreamplay : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Fix for missing protocol
         val fixedUrl = if (url.startsWith("//")) "https:$url" else url
         val pageReferer = referer ?: mainUrl
 
-        Log.d(name, "Loading: $fixedUrl")
+        Log.d(name, "Loading Streamplay: $fixedUrl")
         val html = try {
             app.get(fixedUrl, referer = pageReferer).text
         } catch (e: Exception) {
             return
         }
 
-        val mediaUrls = mutableSetOf<String>()
-
-        // Helper to grab links but safely exclude images/subtitles that might cause ExoPlayer to crash
-        fun addMedia(rawUrl: String) {
-            val cleanUrl = rawUrl.replace("\\/", "/")
-            if (cleanUrl.startsWith("http") && 
-                !cleanUrl.endsWith(".jpg", true) && 
-                !cleanUrl.endsWith(".png", true) && 
-                !cleanUrl.endsWith(".vtt", true) && 
-                !cleanUrl.endsWith(".srt", true)) {
-                mediaUrls.add(cleanUrl)
-            }
-        }
-
-        // 1. Broad Packer Extraction (Fixes "No Link Found")
-        // Uses a highly resilient regex that catches filemoon/streamplay scripts even if variables change
-        val packerMatches = Regex("""eval\(function\(p,a,c,k,e,?[d|r]?\).*?\)\)""", RegexOption.DOT_MATCHES_ALL).findAll(html).toList()
-            .ifEmpty { Regex("""eval\(\s*function\([^)]+\).*?split\('\|'\).*?\)\)""", RegexOption.DOT_MATCHES_ALL).findAll(html).toList() }
-
-        packerMatches.forEach { match ->
-            val unpacked = JsUnpacker(match.value).unpack() ?: return@forEach
+        suspend fun invokeMedia(mediaUrlRaw: String) {
+            val mediaUrl = mediaUrlRaw.replace("\\/", "/")
+            if (!mediaUrl.startsWith("http")) return
             
-            // Extract standard file:"url" or src:"url" inside the JSON config
-            Regex("""(?:file|src)\s*:\s*["']([^"']+)["']""").findAll(unpacked).forEach { 
-                addMedia(it.groupValues[1]) 
+            // Filters out subtitle/image tracks dynamically fetched from JSON to prevent 3003 crashes
+            if (mediaUrl.endsWith(".jpg") || mediaUrl.endsWith(".png") || mediaUrl.endsWith(".vtt") || mediaUrl.endsWith(".srt")) {
+                return
             }
 
-            // Extract Token API fallback
-            val token = Regex("""kaken\s*=\s*["']([^"']+)["']""").find(unpacked)?.groupValues?.get(1)
-            if (token != null) {
-                try {
-                    val apiJson = app.get("$mainUrl/api/?$token", referer = fixedUrl).text
-                    Regex("""(?:file|src)\s*:\s*["']([^"']+)["']""").findAll(apiJson).forEach {
-                        addMedia(it.groupValues[1])
-                    }
-                } catch (e: Exception) { }
-            }
-        }
-
-        // 2. Direct HTML match fallback (If it isn't packed)
-        Regex("""(?:file|src)\s*:\s*["']([^"']+)["']""").findAll(html).forEach { addMedia(it.groupValues[1]) }
-        Regex("""["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""").findAll(html).forEach { addMedia(it.groupValues[1]) }
-
-        Log.d(name, "Streamplay discovered media URLs: $mediaUrls")
-
-        // 3. Routing links to ExoPlayer safely (Fixes "Error 3003")
-        for (mediaUrl in mediaUrls) {
             val isM3u8 = mediaUrl.contains("m3u8", ignoreCase = true) || mediaUrl.contains("hls", ignoreCase = true)
-            
+            val customHeaders = mapOf(
+                "Origin" to mainUrl,
+                "Referer" to fixedUrl,
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+
             if (isM3u8) {
-                M3u8Helper.generateM3u8(
-                    name,
-                    mediaUrl,
-                    referer = fixedUrl,
-                    headers = mapOf(
-                        "Origin" to "https://play.streamplay.co.in",
-                        "Referer" to fixedUrl,
-                        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                    )
-                ).forEach(callback)
+                M3u8Helper.generateM3u8(name, mediaUrl, referer = fixedUrl, headers = customHeaders).forEach(callback)
             } else {
                 callback(
                     newExtractorLink(
@@ -175,16 +132,57 @@ class PlayStreamplay : ExtractorApi() {
                         mediaUrl,
                         INFER_TYPE
                     ) {
-                        // These exact headers prevent the CDN from returning a 403 Forbidden HTML page.
                         this.referer = fixedUrl
-                        this.headers = mapOf(
-                            "Origin" to "https://play.streamplay.co.in",
-                            "Referer" to fixedUrl,
-                            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                        )
+                        this.headers = customHeaders
                         this.quality = Qualities.Unknown.value
                     }
                 )
+            }
+        }
+
+        var foundLink = false
+
+        // 1. Broad Unpacker (handles Streamplay / Filemoon dynamic JS packing signatures)
+        val packedMatches = Regex("""eval\(\s*function\(p,a,c,k,e,[^)]*\).*?\)\)""", RegexOption.DOT_MATCHES_ALL).findAll(html)
+        for (match in packedMatches) {
+            val unpacked = JsUnpacker(match.value).unpack() ?: continue
+
+            // A) Token API Fallback
+            val token = Regex("""kaken\s*=\s*["']([^"']+)["']""").find(unpacked)?.groupValues?.get(1)
+            if (token != null) {
+                val apiUrl = "$mainUrl/api/?$token"
+                val apiJson = try { app.get(apiUrl, referer = fixedUrl).text } catch(e: Exception) { "" }
+                
+                // Extension-Agnostic capture: grabs the URL whether it has .mp4 or not.
+                val apiMediaMatches = Regex("""["']?file["']?\s*:\s*["']([^"']+)["']""").findAll(apiJson)
+                for (apiMatch in apiMediaMatches) {
+                    invokeMedia(apiMatch.groupValues[1])
+                    foundLink = true
+                }
+                if (foundLink) return
+            }
+
+            // B) Look for "file" or "src" directly in unpacked JSON arrays (captures multiple qualities)
+            val unpackedMediaMatches = Regex("""["']?(?:file|src)["']?\s*:\s*["']([^"']+)["']""").findAll(unpacked)
+            for (unpackedMatch in unpackedMediaMatches) {
+                invokeMedia(unpackedMatch.groupValues[1])
+                foundLink = true
+            }
+            if (foundLink) return
+        }
+
+        // 2. Direct HTML match (if JS packing isn't used at all)
+        val directMediaMatches = Regex("""["']?(?:file|src)["']?\s*:\s*["'](https?://[^"']+)["']""").findAll(html)
+        for (directMatch in directMediaMatches) {
+            invokeMedia(directMatch.groupValues[1])
+            foundLink = true
+        }
+        
+        if (!foundLink) {
+            // Ultimate Fallback: scan HTML strictly for media URLs to avoid scraping random tracker logic
+            val rawMediaMatches = Regex("""["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""").findAll(html)
+            for (rawMatch in rawMediaMatches) {
+                invokeMedia(rawMatch.groupValues[1])
             }
         }
     }
