@@ -17,12 +17,9 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Bulletproof the incoming URL against protocol-relative structures
-        val fixedUrl = if (url.startsWith("//")) "https:$url" else url
-        
-        Log.d(name, "Starting extraction for: $fixedUrl")
+        Log.d(name, "Starting extraction for: $url")
         val html = try {
-            app.get(fixedUrl, referer = referer ?: mainUrl).text
+            app.get(url, referer = referer ?: mainUrl).text
         } catch (e: Exception) {
             Log.e(name, "Failed to fetch Rumble embed page: ${e.message}")
             return
@@ -30,40 +27,41 @@ class Rumble : ExtractorApi() {
 
         val scrapedUrls = mutableSetOf<String>()
 
-        // Make the Regex more resilient (makes 'https?:' optional so it catches '//...' too)
-        val urlRegex = Regex("""(?:https?:)?(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
+        // 1. Unified Regex: Captures both standard (https://) and JSON-escaped (https:\/\/) URLs
+        val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
 
         matches.forEach { match ->
             val rawUrl = match.value
             val cleanUrl = rawUrl.replace("\\/", "/")
-            
-            // Ensure the final scraped media link has a protocol
-            val finalMediaUrl = if (cleanUrl.startsWith("//")) "https:$cleanUrl" else cleanUrl
 
-            // Quarantine filter
-            if (finalMediaUrl.contains("/assets/", ignoreCase = true) ||
-                finalMediaUrl.contains("loop", ignoreCase = true) ||
-                finalMediaUrl.contains("preview", ignoreCase = true) ||
-                finalMediaUrl.contains("tracker", ignoreCase = true) ||
-                finalMediaUrl.contains("thumb", ignoreCase = true)) {
+            // 2. The Quarantine Filter: Destroys the garbage links that caused the ExoPlayer to crash
+            if (cleanUrl.contains("/assets/", ignoreCase = true) ||
+                cleanUrl.contains("loop", ignoreCase = true) ||
+                cleanUrl.contains("preview", ignoreCase = true) ||
+                cleanUrl.contains("tracker", ignoreCase = true) ||
+                cleanUrl.contains("thumb", ignoreCase = true)) {
                 return@forEach
             }
 
-            if (scrapedUrls.add(finalMediaUrl)) {
-                if (finalMediaUrl.contains(".m3u8")) {
-                    M3u8Helper.generateM3u8(name, finalMediaUrl, fixedUrl).forEach(callback)
+            if (scrapedUrls.add(cleanUrl)) {
+                if (cleanUrl.contains(".m3u8")) {
+                    // Flawless HLS stream with the Multi-Quality Selector (Tick mark)
+                    M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
                     
-                } else if (finalMediaUrl.contains(".mp4")) {
+                } else if (cleanUrl.contains(".mp4")) {
+                    // 3. Smart Quality Locator: Reads the raw HTML immediately preceding the URL to find the resolution tag
                     val startIndex = Math.max(0, match.range.first - 150)
                     val precedingText = html.substring(startIndex, match.range.first)
 
+                    // Scans the preceding text for "h":720 or "720":{
                     val qMatch = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""").findAll(precedingText).lastOrNull()
                         ?: Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""").findAll(precedingText).lastOrNull()
 
                     var displayLabel = name
                     var qualityInt = Qualities.Unknown.value
 
+                    // If it finds the resolution tag, apply it to the label
                     if (qMatch != null) {
                         val qStr = qMatch.groupValues[1]
                         displayLabel = "$name ${qStr}p"
@@ -74,10 +72,10 @@ class Rumble : ExtractorApi() {
                         newExtractorLink(
                             name,
                             displayLabel,
-                            finalMediaUrl,
+                            cleanUrl,
                             INFER_TYPE
                         ) {
-                            this.referer = fixedUrl
+                            this.referer = url
                             this.quality = qualityInt
                         }
                     )
@@ -98,28 +96,23 @@ class PlayStreamplay : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        // Fix 1: Handle missing protocol URLs (resolves the Allsub1 crash)
         val fixedUrl = if (url.startsWith("//")) "https:$url" else url
-        
-        // CRITICAL FIX: The referer MUST be the iframe URL itself. 
-        // If it's the parent website, the Streamplay CDN will throw a 403 Forbidden (causing Error 3003).
-        val embedReferer = fixedUrl
 
         Log.d(name, "Loading: $fixedUrl")
-        val html = try {
-            app.get(fixedUrl, referer = referer ?: mainUrl).text
-        } catch (e: Exception) {
-            Log.e(name, "Failed to load PlayStreamplay URL: ${e.message}")
-            return
+        val html = try { 
+            app.get(fixedUrl).text 
+        } catch (e: Exception) { 
+            return 
         }
 
+        // Helper function to process the media securely without modifying your core logic
         suspend fun invokeMedia(mediaUrlRaw: String) {
-            val mediaUrl = mediaUrlRaw.replace("\\/", "/") // Clean escaped JSON slashes
-            val isM3u8 = mediaUrl.contains(".m3u8", ignoreCase = true) || mediaUrl.contains("m3u8", ignoreCase = true)
-            
-            if (isM3u8) {
-                M3u8Helper.generateM3u8(name, mediaUrl, referer = embedReferer).forEach(callback)
+            val mediaUrl = mediaUrlRaw.replace("\\/", "/")
+            if (mediaUrl.contains(".m3u8", ignoreCase = true)) {
+                M3u8Helper.generateM3u8(name, mediaUrl, mainUrl).forEach(callback)
             } else {
-                // Ping Validator removed to prevent token-consumption which triggers Error 3003.
+                // Fix 2: Correctly pass .mp4 links so ExoPlayer doesn't crash expecting an m3u8
                 callback(
                     newExtractorLink(
                         name,
@@ -127,94 +120,44 @@ class PlayStreamplay : ExtractorApi() {
                         mediaUrl,
                         INFER_TYPE
                     ) {
-                        this.referer = embedReferer
+                        this.referer = fixedUrl
                         this.quality = Qualities.Unknown.value
                     }
                 )
             }
         }
 
-        // 1. Unpacked script handling (Safest way to avoid scraping ad videos)
-        val packed = Regex("""eval\(function\(p,a,c,k,e,d\).*?\)\)\)""", RegexOption.DOT_MATCHES_ALL).find(html)?.value
-        if (packed != null) {
-            val unpacked = JsUnpacker(packed).unpack()
-            if (unpacked != null) {
-                // Look for "file":"url" inside unpacked script
-                val unpackedMedia = Regex(""""file"\s*:\s*"(https?:(?:\\/|/)(?:\\/|/)[^"]+)"""").find(unpacked)?.groupValues?.get(1)
-                if (unpackedMedia != null) {
-                    Log.d(name, "Found media in unpacked: $unpackedMedia")
-                    invokeMedia(unpackedMedia)
-                    return
-                }
+        // Direct m3u8 or mp4
+        var media = Regex("""(https?://[^"'\s]+\.(?:m3u8|mp4)[^"'\s]*)""").find(html)?.value
+        if (media != null) {
+            Log.d(name, "Found direct media: $media")
+            invokeMedia(media)
+            return
+        }
 
-                // Token API Fallback
-                val token = Regex("""kaken\s*=\s*"([^"]+)"""").find(unpacked)?.groupValues?.get(1)
-                if (token != null) {
-                    val apiUrl = "$mainUrl/api/?$token"
-                    Log.d(name, "Calling API: $apiUrl")
-                    val apiJson = try { app.get(apiUrl, referer = embedReferer).text } catch(e: Exception) { "" }
-                    
-                    val apiMedia = Regex(""""file"\s*:\s*"(https?:(?:\\/|/)(?:\\/|/)[^"]+)"""").find(apiJson)?.groupValues?.get(1)
-                    if (apiMedia != null) {
-                        Log.d(name, "Found media in API JSON: $apiMedia")
-                        invokeMedia(apiMedia)
-                        return
-                    }
-                }
+        // Unpacked script
+        val packed = Regex("""eval\(function\(p,a,c,k,e,d\).*?\)\)\)""", RegexOption.DOT_MATCHES_ALL)
+            .find(html)?.value ?: return
+        val unpacked = JsUnpacker(packed).unpack() ?: return
+
+        media = Regex(""""file"\s*:\s*"(https?://[^"]+\.(?:m3u8|mp4)[^"]*)"""").find(unpacked)?.groupValues?.get(1)
+        if (media != null) {
+            Log.d(name, "Found media in unpacked: $media")
+            invokeMedia(media)
+            return
+        }
+
+        // Token API fallback
+        val token = Regex("""kaken\s*=\s*"([^"]+)"""").find(unpacked)?.groupValues?.get(1)
+        if (token != null) {
+            val apiUrl = "$mainUrl/api/?$token"
+            Log.d(name, "Calling API: $apiUrl")
+            val apiJson = try { app.get(apiUrl).text } catch (e: Exception) { "" }
+            
+            val apiMedia = Regex(""""file"\s*:\s*"(https?://[^"]+\.(?:m3u8|mp4)[^"]*)"""").find(apiJson)?.groupValues?.get(1)
+            if (apiMedia != null) {
+                invokeMedia(apiMedia)
             }
-        }
-
-        // 2. Direct m3u8 in the HTML (Safe raw HTML match)
-        val directM3u8 = Regex("""(https?:(?:\\/|/)(?:\\/|/)[^"'\s<>]+\.m3u8[^"'\s<>]*)""", RegexOption.IGNORE_CASE).find(html)?.groupValues?.get(1)
-        if (directM3u8 != null) {
-            Log.d(name, "Found direct m3u8: $directM3u8")
-            invokeMedia(directM3u8)
-            return
-        }
-
-        // 3. Ultimate Fallback: Scrape any "file" string from the raw HTML
-        val rawFile = Regex(""""file"\s*:\s*"(https?:(?:\\/|/)(?:\\/|/)[^"]+)"""").find(html)?.groupValues?.get(1)
-        if (rawFile != null) {
-            Log.d(name, "Found raw file fallback: $rawFile")
-            invokeMedia(rawFile)
-        }
-    }
-}
-
-class Dailymotion : ExtractorApi() {
-    override var name = "Dailymotion"
-    override var mainUrl = "https://www.dailymotion.com"
-    override val requiresReferer = false
-
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val fixedUrl = if (url.startsWith("//")) "https:$url" else url
-        Log.d(name, "Loading Dailymotion: $fixedUrl")
-        
-        // Extract the unique video ID from the embed URL
-        val idMatch = Regex("""video/([a-zA-Z0-9_]+)""").find(fixedUrl)
-        val id = idMatch?.groupValues?.get(1) ?: return
-        
-        // Fetch the internal Dailymotion metadata API to bypass the HTML wrapper
-        val apiUrl = "https://www.dailymotion.com/player/metadata/video/$id"
-        val response = try {
-            app.get(apiUrl).text
-        } catch (e: Exception) {
-            Log.e(name, "Failed to fetch Dailymotion API: ${e.message}")
-            return
-        }
-        
-        // Isolate the true .m3u8 stream link to prevent ExoPlayer 3003 container errors
-        val m3u8Url = Regex(""""type"\s*:\s*"application/x-mpegURL"\s*,\s*"url"\s*:\s*"([^"]+)"""").find(response)?.groupValues?.get(1)?.replace("\\/", "/")
-        
-        if (m3u8Url != null) {
-            M3u8Helper.generateM3u8(name, m3u8Url, mainUrl).forEach(callback)
-        } else {
-            Log.e(name, "Could not find m3u8 in Dailymotion API response.")
         }
     }
 }
