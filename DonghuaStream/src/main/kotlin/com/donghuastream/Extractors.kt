@@ -1,9 +1,11 @@
 package com.donghuastream
 
 import android.util.Base64
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.*
 
 class Rumble : ExtractorApi() {
@@ -85,7 +87,7 @@ class Rumble : ExtractorApi() {
     }
 }
 
-class PlayStreamplay : ExtractorApi() {
+open class PlayStreamplay : ExtractorApi() {
     override var name = "All sub player"
     override var mainUrl = "https://play.streamplay.co.in"
     override val requiresReferer = false
@@ -96,94 +98,77 @@ class PlayStreamplay : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        // Safe-check to prevent OkHttp crashes if the URL arrives as protocol-relative //
         val fixedUrl = if (url.startsWith("//")) "https:$url" else url
-        val pageReferer = referer ?: mainUrl
 
-        Log.d(name, "Loading Streamplay: $fixedUrl")
-        val html = try {
-            app.get(fixedUrl, referer = pageReferer).text
-        } catch (e: Exception) {
-            return
-        }
+        val doc = app.get(fixedUrl, timeout = 10000).document
+        val packedScript = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return
+        val evalRegex = Regex("""eval\(.*?\)\)\)""", RegexOption.DOT_MATCHES_ALL)
+        val packedCode = evalRegex.find(packedScript)?.value ?: return
+        val unpackedJs = JsUnpacker(packedCode).unpack() ?: return
+        val token = Regex("""kaken="(.*?)"""").find(unpackedJs)?.groupValues?.getOrNull(1) ?: return
+        val apiUrl = "$mainUrl/api/?$token"
+        val response = app.get(apiUrl, timeout = 10000).parsedSafe<Response>() ?: return
 
-        suspend fun invokeMedia(mediaUrlRaw: String) {
-            val mediaUrl = mediaUrlRaw.replace("\\/", "/")
-            if (!mediaUrl.startsWith("http")) return
-            
-            // Filters out subtitle/image tracks dynamically fetched from JSON to prevent 3003 crashes
-            if (mediaUrl.endsWith(".jpg") || mediaUrl.endsWith(".png") || mediaUrl.endsWith(".vtt") || mediaUrl.endsWith(".srt")) {
-                return
-            }
-
-            val isM3u8 = mediaUrl.contains("m3u8", ignoreCase = true) || mediaUrl.contains("hls", ignoreCase = true)
-            val customHeaders = mapOf(
-                "Origin" to mainUrl,
-                "Referer" to fixedUrl,
-                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        val m3u8Url = response.sources.find { it.file.isNotBlank() }?.file
+        if (!m3u8Url.isNullOrEmpty()) {
+            val headers = mapOf(
+                "pragma" to "no-cache",
+                "priority" to "u=0, i",
+                "sec-ch-ua" to "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
+                "sec-ch-ua-mobile" to "?0",
+                "sec-ch-ua-platform" to "\"Windows\"",
+                "sec-fetch-dest" to "document",
+                "sec-fetch-mode" to "navigate",
+                "sec-fetch-site" to "none",
+                "sec-fetch-user" to "?1",
+                "upgrade-insecure-requests" to "1",
+                "user-agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
             )
+            M3u8Helper.generateM3u8(name, m3u8Url, mainUrl, headers = headers).forEach(callback)
+        }
 
-            if (isM3u8) {
-                M3u8Helper.generateM3u8(name, mediaUrl, referer = fixedUrl, headers = customHeaders).forEach(callback)
-            } else {
-                callback(
-                    newExtractorLink(
-                        name,
-                        name,
-                        mediaUrl,
-                        INFER_TYPE
-                    ) {
-                        this.referer = fixedUrl
-                        this.headers = customHeaders
-                        this.quality = Qualities.Unknown.value
-                    }
+        response.tracks.forEach { subtitle ->
+            subtitleCallback(
+                newSubtitleFile(
+                    lang = subtitle.label,
+                    url = subtitle.file
                 )
-            }
-        }
-
-        var foundLink = false
-
-        // 1. Broad Unpacker (handles Streamplay / Filemoon dynamic JS packing signatures)
-        val packedMatches = Regex("""eval\(\s*function\(p,a,c,k,e,[^)]*\).*?\)\)""", RegexOption.DOT_MATCHES_ALL).findAll(html)
-        for (match in packedMatches) {
-            val unpacked = JsUnpacker(match.value).unpack() ?: continue
-
-            // A) Token API Fallback
-            val token = Regex("""kaken\s*=\s*["']([^"']+)["']""").find(unpacked)?.groupValues?.get(1)
-            if (token != null) {
-                val apiUrl = "$mainUrl/api/?$token"
-                val apiJson = try { app.get(apiUrl, referer = fixedUrl).text } catch(e: Exception) { "" }
-                
-                // Extension-Agnostic capture: grabs the URL whether it has .mp4 or not.
-                val apiMediaMatches = Regex("""["']?file["']?\s*:\s*["']([^"']+)["']""").findAll(apiJson)
-                for (apiMatch in apiMediaMatches) {
-                    invokeMedia(apiMatch.groupValues[1])
-                    foundLink = true
-                }
-                if (foundLink) return
-            }
-
-            // B) Look for "file" or "src" directly in unpacked JSON arrays (captures multiple qualities)
-            val unpackedMediaMatches = Regex("""["']?(?:file|src)["']?\s*:\s*["']([^"']+)["']""").findAll(unpacked)
-            for (unpackedMatch in unpackedMediaMatches) {
-                invokeMedia(unpackedMatch.groupValues[1])
-                foundLink = true
-            }
-            if (foundLink) return
-        }
-
-        // 2. Direct HTML match (if JS packing isn't used at all)
-        val directMediaMatches = Regex("""["']?(?:file|src)["']?\s*:\s*["'](https?://[^"']+)["']""").findAll(html)
-        for (directMatch in directMediaMatches) {
-            invokeMedia(directMatch.groupValues[1])
-            foundLink = true
-        }
-        
-        if (!foundLink) {
-            // Ultimate Fallback: scan HTML strictly for media URLs to avoid scraping random tracker logic
-            val rawMediaMatches = Regex("""["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""").findAll(html)
-            for (rawMatch in rawMediaMatches) {
-                invokeMedia(rawMatch.groupValues[1])
-            }
+            )
         }
     }
+
+    data class Response(
+        val query: Query,
+        val status: String,
+        val message: String,
+        @param:JsonProperty("embed_url")
+        val embedUrl: String,
+        @param:JsonProperty("download_url")
+        val downloadUrl: String,
+        val title: String,
+        val poster: String,
+        val filmstrip: String,
+        val sources: List<Source>,
+        val tracks: List<Track>,
+    )
+
+    data class Query(
+        val source: String,
+        val id: String,
+        val download: String,
+    )
+
+    data class Source(
+        val file: String,
+        val type: String,
+        val label: String,
+        val default: Boolean,
+    )
+
+    data class Track(
+        val file: String,
+        val label: String,
+        val default: Boolean?,
+    )
 }
