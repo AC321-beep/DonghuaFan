@@ -53,25 +53,25 @@ data class IptvLoadData(
 )
 
 // ==========================================
-// Added FifaLive (CloudPlay) Specific Models
+// Renamed FifaLive Specific Models
 // ==========================================
-data class CloudPlayResponse(
+data class FifaLiveResponse(
     val payload: String,
     val iv: String,
     val expires: Long?
 )
 
-data class CloudPlayStreams(
-    val streams: List<CloudPlayStream>
+data class FifaLiveStreams(
+    val streams: List<FifaLiveStream>
 )
 
-data class CloudPlayStream(
+data class FifaLiveStream(
     val name: String?,
     val url: String,
     val logo: String?
 )
 
-data class CloudPlayChannel(
+data class FifaLiveChannel(
     val id: String?,
     val name: String?,
     val group: String?,
