@@ -58,7 +58,6 @@ cloudstream {
     language = "en"
     version = 9 
     iconUrl = "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/refs/heads/master/LiveSports/Icon.png"
-    ]7"
 }
 
 dependencies {
