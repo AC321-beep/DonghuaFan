@@ -28,7 +28,7 @@ import javax.crypto.spec.SecretKeySpec
 class FifaLive : MainAPI() {
     override var lang = "en"
     override var mainUrl: String = base64Decode("aHR0cHM6Ly9ob3N0LmNsb3VkcGxheS5tZQ==")
-    override var name = "LiveSports"
+    override var name = "FifaLive"
     override val hasMainPage = true
     override val hasChromecastSupport = true
     override val supportedTypes = setOf(TvType.Live)
