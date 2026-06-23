@@ -46,13 +46,8 @@ class FifaLive : MainAPI() {
 
         val decryptedJson = decryptPayload(res.payload, res.iv)
         
-        // --- FILTERING LOGIC ---
-        // We parse the master list and immediately throw away any playlist 
-        // that is not related to "fifa" or "fancode"
-        val streams = parseJson<CloudPlayStreams>(decryptedJson).streams.filter { stream ->
-            val folderName = stream.name?.lowercase() ?: ""
-            folderName.contains("fifa") || folderName.contains("fancode")
-        }
+        // Let it fetch the top level streams normally (e.g., "Sports", "Live TV")
+        val streams = parseJson<CloudPlayStreams>(decryptedJson).streams
 
         val homePageLists = mutableListOf<HomePageList>()
         streams.amap { stream ->
@@ -60,7 +55,31 @@ class FifaLive : MainAPI() {
             homePageLists.addAll(sections)
         }
 
-        return newHomePageResponse(homePageLists)
+        // --- FILTERING LOGIC ---
+        // Now that we have all the actual sections and channels, we filter them.
+        val finalLists = homePageLists.mapNotNull { list ->
+            val listName = list.name.lowercase()
+            
+            // If the folder/section itself is named Fifa or Fancode, keep everything in it
+            if (listName.contains("fifa") || listName.contains("fancode")) {
+                list
+            } else {
+                // Otherwise, check if any individual channels inside match our keywords
+                val filteredItems = list.list.filter { item ->
+                    val itemName = item.name.lowercase()
+                    itemName.contains("fifa") || itemName.contains("fancode")
+                }
+                
+                // Only keep this section if it has matching channels inside
+                if (filteredItems.isNotEmpty()) {
+                    HomePageList(list.name, filteredItems, isHorizontalImages = list.isHorizontalImages)
+                } else {
+                    null
+                }
+            }
+        }
+
+        return newHomePageResponse(finalLists)
     }
 
     private suspend fun fetchHomeSections(
@@ -146,18 +165,17 @@ class FifaLive : MainAPI() {
             ?: return emptyList()
 
         val decryptedJson = decryptPayload(res.payload, res.iv)
-        
-        // Also apply the filter to search so JioTV junk doesn't appear in results
-        val streams = parseJson<CloudPlayStreams>(decryptedJson).streams.filter { stream ->
-            val folderName = stream.name?.lowercase() ?: ""
-            folderName.contains("fifa") || folderName.contains("fancode")
-        }
+        val streams = parseJson<CloudPlayStreams>(decryptedJson).streams
 
         val allChannels = streams.amap { stream ->
             fetchChannels(stream.url, stream.logo)
         }.flatten()
 
-        return allChannels.filter { it.name.contains(query, ignoreCase = true) }
+        // Apply the same strict filter to the search results
+        return allChannels.filter { item -> 
+            val name = item.name.lowercase()
+            (name.contains("fifa") || name.contains("fancode")) && name.contains(query, ignoreCase = true) 
+        }
     }
 
     override suspend fun load(url: String): LoadResponse {
