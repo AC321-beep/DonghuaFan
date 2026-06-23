@@ -45,11 +45,11 @@ class FifaLive : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val req = app.get("$mainUrl/app.php", headers = apiHeaders)
-        val res = req.parsedSafe<CloudPlayResponse>()
+        val res = req.parsedSafe<FifaLiveResponse>()
             ?: throw Error("Failed to parse app.php. Text: ${req.text}")
 
         val decryptedJson = decryptPayload(res.payload, res.iv)
-        val streams = parseJson<CloudPlayStreams>(decryptedJson).streams
+        val streams = parseJson<FifaLiveStreams>(decryptedJson).streams
 
         // 1. Fetch EVERYTHING normally first so we don't break the recursive folders
         val homePageLists = mutableListOf<HomePageList>()
@@ -92,7 +92,7 @@ class FifaLive : MainAPI() {
         }
 
         try {
-            val channels = parseJson<List<CloudPlayChannel>>(resText)
+            val channels = parseJson<List<FifaLiveChannel>>(resText)
             if (channels.isNotEmpty() && (channels[0].m3u8_url != null || channels[0].mpd_url != null)) {
                 val shows = channels.map { channel ->
                     val channelName = channel.name ?: "Unknown"
@@ -106,7 +106,7 @@ class FifaLive : MainAPI() {
         } catch (_: Exception) {}
 
         try {
-            val subStreams = parseJson<List<CloudPlayStream>>(resText)
+            val subStreams = parseJson<List<FifaLiveStream>>(resText)
             if (subStreams.isNotEmpty()) {
                 val sections = mutableListOf<HomePageList>()
                 subStreams.amap { subStream ->
@@ -125,11 +125,11 @@ class FifaLive : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val res = app.get("$mainUrl/app.php", headers = apiHeaders).parsedSafe<CloudPlayResponse>()
+        val res = app.get("$mainUrl/app.php", headers = apiHeaders).parsedSafe<FifaLiveResponse>()
             ?: return emptyList()
 
         val decryptedJson = decryptPayload(res.payload, res.iv)
-        val streams = parseJson<CloudPlayStreams>(decryptedJson).streams
+        val streams = parseJson<FifaLiveStreams>(decryptedJson).streams
 
         // Map out the sections exactly like getMainPage
         val homePageLists = mutableListOf<HomePageList>()
@@ -147,7 +147,7 @@ class FifaLive : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val data = parseJson<CloudPlayChannel>(url)
+        val data = parseJson<FifaLiveChannel>(url)
         val title = data.name ?: "Unknown"
         val poster = data.logo ?: ""
 
@@ -157,9 +157,9 @@ class FifaLive : MainAPI() {
         }
     }
 
-    private fun parseM3u(m3uText: String): List<CloudPlayChannel> {
+    private fun parseM3u(m3uText: String): List<FifaLiveChannel> {
         val lines = m3uText.split("\n")
-        val channels = mutableListOf<CloudPlayChannel>()
+        val channels = mutableListOf<FifaLiveChannel>()
 
         var currentName = ""
         var currentLogo = ""
@@ -204,7 +204,7 @@ class FifaLive : MainAPI() {
                 if (urlUserAgent.isNotEmpty()) headersMap["User-Agent"] = urlUserAgent
                 if (urlReferer.isNotEmpty()) headersMap["Referer"] = urlReferer
 
-                channels.add(CloudPlayChannel(
+                channels.add(FifaLiveChannel(
                     type = type,
                     id = null,
                     name = currentName,
@@ -275,7 +275,7 @@ class FifaLive : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val channel = parseJson<CloudPlayChannel>(data)
+        val channel = parseJson<FifaLiveChannel>(data)
 
         if (channel.mpd_url != null) {
             val licenseUrl = channel.license_url ?: ""
@@ -293,43 +293,35 @@ class FifaLive : MainAPI() {
                 keyStr = getDRMKeysFromLicenseServer(licenseUrl, kidStr)
             }
 
+            val drmUuid = if (kidStr.isNotEmpty() && keyStr.isNotEmpty()) CLEARKEY_UUID else UUID.fromString("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")
+
             callback.invoke(
                 newDrmExtractorLink(
-                    this.name,
-                    channel.name ?: "DASH",
-                    channel.mpd_url,
-                    INFER_TYPE,
-                    if (kidStr.isNotEmpty() && keyStr.isNotEmpty()) CLEARKEY_UUID else UUID.fromString("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")
-                ) {
-                    if (channel.headers != null) {
-                        this.headers = channel.headers
-                    }
-                    if (kidStr.isNotEmpty() && keyStr.isNotEmpty()) {
-                        this.kid = kidStr
-                        this.key = keyStr
-                    } else if (licenseUrl.isNotEmpty()) {
-                        this.licenseUrl = licenseUrl
-                    }
-                }
+                    source = this.name,
+                    name = channel.name ?: "DASH",
+                    url = channel.mpd_url,
+                    type = INFER_TYPE,
+                    uuid = drmUuid,
+                    licenseUrl = if (kidStr.isEmpty() || keyStr.isEmpty()) licenseUrl else "",
+                    kid = kidStr,
+                    key = keyStr,
+                    headers = channel.headers ?: emptyMap()
+                )
             )
         } else if (channel.m3u8_url != null) {
             val isTs = channel.m3u8_url.contains(".ts", ignoreCase = true)
+            val refererUrl = channel.headers?.entries?.find { it.key.equals("referer", ignoreCase = true) }?.value ?: ""
+
             callback.invoke(
                 newExtractorLink(
-                    this.name,
-                    channel.name ?: "HLS",
-                    channel.m3u8_url,
-                    if (isTs) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
-                ) {
-                    if (channel.headers != null) {
-                        this.headers = channel.headers
-                    }
-                    channel.headers?.forEach { (key, value) ->
-                        if (key.equals("referer", ignoreCase = true)) {
-                            this.referer = value
-                        }
-                    }
-                }
+                    source = this.name,
+                    name = channel.name ?: "HLS",
+                    url = channel.m3u8_url,
+                    referer = refererUrl,
+                    quality = 0,
+                    type = if (isTs) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8,
+                    headers = channel.headers ?: emptyMap()
+                )
             )
         }
 
@@ -352,33 +344,35 @@ class FifaLive : MainAPI() {
         val decrypted = cipher.doFinal(base64DecodeArray(payloadBase64))
         return String(decrypted, Charsets.UTF_8)
     }
-
-    data class CloudPlayResponse(
-        val payload: String,
-        val iv: String,
-        val expires: Long?
-    )
-
-    data class CloudPlayStreams(
-        val streams: List<CloudPlayStream>
-    )
-
-    data class CloudPlayStream(
-        val name: String?,
-        val url: String,
-        val logo: String?
-    )
-
-    data class CloudPlayChannel(
-        val type: String?,
-        val id: String?,
-        val name: String?,
-        val group: String?,
-        val logo: String?,
-        val user_agent: String?,
-        val m3u8_url: String?,
-        val mpd_url: String?,
-        val license_url: String?,
-        val headers: Map<String, String>?
-    )
 }
+
+// Renamed and safe data classes structure below
+
+data class FifaLiveResponse(
+    val payload: String,
+    val iv: String,
+    val expires: Long?
+)
+
+data class FifaLiveStreams(
+    val streams: List<FifaLiveStream>
+)
+
+data class FifaLiveStream(
+    val name: String?,
+    val url: String,
+    val logo: String?
+)
+
+data class FifaLiveChannel(
+    val type: String?,
+    val id: String?,
+    val name: String?,
+    val group: String?,
+    val logo: String?,
+    val user_agent: String?,
+    val m3u8_url: String?,
+    val mpd_url: String?,
+    val license_url: String?,
+    val headers: Map<String, String>?
+)
