@@ -207,28 +207,3 @@ class FifaLive : MainAPI() {
         return String(decrypted, Charsets.UTF_8)
     }
 }
-
-data class CloudPlayResponse(
-    val payload: String,
-    val iv: String,
-    val expires: Long?
-)
-
-data class CloudPlayStreams(
-    val streams: List<CloudPlayStream>
-)
-
-data class CloudPlayStream(
-    val name: String?,
-    val url: String,
-    val logo: String?
-)
-
-data class CloudPlayChannel(
-    val id: String?,
-    val name: String?,
-    val group: String?,
-    val logo: String?,
-    val m3u8_url: String?,
-    val headers: Map<String, String>?
-)
