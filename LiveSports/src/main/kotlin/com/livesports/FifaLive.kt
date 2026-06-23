@@ -28,7 +28,7 @@ import javax.crypto.spec.SecretKeySpec
 class FifaLive : MainAPI() {
     override var lang = "en"
     override var mainUrl: String = base64Decode("aHR0cHM6Ly9ob3N0LmNsb3VkcGxheS5tZQ==")
-    override var name = "FifaLive"
+    override var name = "⚽FifaLive" 
     override val hasMainPage = true
     override val hasChromecastSupport = true
     override val supportedTypes = setOf(TvType.Live)
@@ -45,7 +45,14 @@ class FifaLive : MainAPI() {
             ?: throw Error("Failed to parse app.php. Text: ${req.text}")
 
         val decryptedJson = decryptPayload(res.payload, res.iv)
-        val streams = parseJson<CloudPlayStreams>(decryptedJson).streams
+        
+        // --- FILTERING LOGIC ---
+        // We parse the master list and immediately throw away any playlist 
+        // that is not related to "fifa" or "fancode"
+        val streams = parseJson<CloudPlayStreams>(decryptedJson).streams.filter { stream ->
+            val folderName = stream.name?.lowercase() ?: ""
+            folderName.contains("fifa") || folderName.contains("fancode")
+        }
 
         val homePageLists = mutableListOf<HomePageList>()
         streams.amap { stream ->
@@ -139,7 +146,12 @@ class FifaLive : MainAPI() {
             ?: return emptyList()
 
         val decryptedJson = decryptPayload(res.payload, res.iv)
-        val streams = parseJson<CloudPlayStreams>(decryptedJson).streams
+        
+        // Also apply the filter to search so JioTV junk doesn't appear in results
+        val streams = parseJson<CloudPlayStreams>(decryptedJson).streams.filter { stream ->
+            val folderName = stream.name?.lowercase() ?: ""
+            folderName.contains("fifa") || folderName.contains("fancode")
+        }
 
         val allChannels = streams.amap { stream ->
             fetchChannels(stream.url, stream.logo)
