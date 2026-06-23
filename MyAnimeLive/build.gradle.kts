@@ -9,7 +9,9 @@ cloudstream {
     tvTypes = listOf("Anime")
     language = "en"
     version = 4
-    iconUrl = "https://myanime.live/favicon.ico"
+    iconUrl = "cloudstream {
+    // ... your other properties
+    iconUrl = "https://static.everythingmoe.com/icons/myanimelive.png"
 }
 
 dependencies {
