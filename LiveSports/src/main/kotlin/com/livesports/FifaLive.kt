@@ -1,6 +1,5 @@
 package com.livesports
 
-
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -30,7 +29,7 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-class Fifalive : MainAPI() {
+class FifaLive : MainAPI() {
     override var lang = "en"
     override var mainUrl: String = base64Decode("aHR0cHM6Ly9ob3N0LmNsb3VkcGxheS5tZQ==")
     override var name = "CloudPlay"
@@ -223,18 +222,20 @@ class Fifalive : MainAPI() {
                 if (urlUserAgent.isNotEmpty()) headersMap["User-Agent"] = urlUserAgent
                 if (urlReferer.isNotEmpty()) headersMap["Referer"] = urlReferer
 
-                channels.add(CloudPlayChannel(
-                    type = type,
-                    id = null,
-                    name = currentName,
-                    group = currentGroup,
-                    logo = currentLogo,
-                    user_agent = urlUserAgent,
-                    m3u8_url = if (type == "hls") rawUrl else null,
-                    mpd_url = if (type == "dash") rawUrl else null,
-                    license_url = licenseUrl,
-                    headers = headersMap
-                ))
+                channels.add(
+                    CloudPlayChannel(
+                        type = type,
+                        id = null,
+                        name = currentName,
+                        group = currentGroup,
+                        logo = currentLogo,
+                        user_agent = urlUserAgent,
+                        m3u8_url = if (type == "hls") rawUrl else null,
+                        mpd_url = if (type == "dash") rawUrl else null,
+                        license_url = licenseUrl,
+                        headers = headersMap
+                    )
+                )
 
                 // reset
                 currentName = ""
@@ -337,35 +338,43 @@ class Fifalive : MainAPI() {
                 keyStr = getDRMKeysFromLicenseServer(licenseUrl, kidStr)
             }
 
-            val drmUuid = if (kidStr.isNotEmpty() && keyStr.isNotEmpty()) CLEARKEY_UUID else UUID.fromString("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")
-
             callback.invoke(
                 newDrmExtractorLink(
-                    source = this.name,
-                    name = channel.name ?: "DASH",
-                    url = channel.mpd_url,
-                    type = INFER_TYPE,
-                    uuid = drmUuid,
-                    licenseUrl = if (kidStr.isEmpty() || keyStr.isEmpty()) licenseUrl else "",
-                    kid = kidStr,
-                    key = keyStr,
-                    headers = channel.headers ?: emptyMap()
-                )
+                    this.name,
+                    channel.name ?: "DASH",
+                    channel.mpd_url,
+                    INFER_TYPE,
+                    if (kidStr.isNotEmpty() && keyStr.isNotEmpty()) CLEARKEY_UUID else UUID.fromString("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")
+                ) {
+                    if (channel.headers != null) {
+                        this.headers = channel.headers
+                    }
+                    if (kidStr.isNotEmpty() && keyStr.isNotEmpty()) {
+                        this.kid = kidStr
+                        this.key = keyStr
+                    } else if (licenseUrl.isNotEmpty()) {
+                        this.licenseUrl = licenseUrl
+                    }
+                }
             )
         } else if (channel.m3u8_url != null) {
             val isTs = channel.m3u8_url.contains(".ts", ignoreCase = true)
-            val refererUrl = channel.headers?.entries?.find { it.key.equals("referer", ignoreCase = true) }?.value ?: ""
-
             callback.invoke(
                 newExtractorLink(
-                    source = this.name,
-                    name = channel.name ?: "HLS",
-                    url = channel.m3u8_url,
-                    referer = refererUrl,
-                    quality = 0,
-                    type = if (isTs) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8,
-                    headers = channel.headers ?: emptyMap()
-                )
+                    this.name,
+                    channel.name ?: "HLS",
+                    channel.m3u8_url,
+                    if (isTs) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
+                ) {
+                    if (channel.headers != null) {
+                        this.headers = channel.headers
+                    }
+                    channel.headers?.forEach { (key, value) ->
+                        if (key.equals("referer", ignoreCase = true)) {
+                            this.referer = value
+                        }
+                    }
+                }
             )
         }
 
@@ -375,21 +384,22 @@ class Fifalive : MainAPI() {
     private fun decryptPayload(payloadBase64: String, ivBase64: String): String {
         val SECRET = base64Decode("YmFja3VwLXVwZGF0ZS0zLjM=")
         val PACKAGE = base64Decode("Y29tLmNsb3VkcGxheS5hcHA=")
-        
+
         val digest = MessageDigest.getInstance("SHA-256")
         val keyHash = digest.digest((SECRET + PACKAGE).toByteArray(Charsets.UTF_8))
-        
+
         val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
         val secretKeySpec = SecretKeySpec(keyHash, "AES")
         val ivParameterSpec = IvParameterSpec(base64DecodeArray(ivBase64))
-        
+
         cipher.init(Cipher.DECRYPT_MODE, secretKeySpec, ivParameterSpec)
-        
+
         val decrypted = cipher.doFinal(base64DecodeArray(payloadBase64))
         return String(decrypted, Charsets.UTF_8)
     }
 }
 
+// Moved Data Classes outside to prevent Generic Type Erasure issues during JSON parsing
 data class CloudPlayResponse(
     val payload: String,
     val iv: String,
