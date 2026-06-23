@@ -7,13 +7,13 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class LiveSportsPlugin : Plugin() {
     override fun load(context: Context) {
-        // Share context for the WebView player resolver
+        // Share context for the LiveSportsEvents WebView player resolver
         LiveSportsEvents.context = context
 
-        // Provider 1: Your original Live Events
+        // Provider 1: Your original Live Events provider
         registerMainAPI(LiveSportsEvents())
 
-        // Provider 2: Your new FIFA-only scraper (Capital F, lowercase ifa)
+        // Provider 2: Your standalone FIFA/CloudPlay provider
         registerMainAPI(FifaLive())
     }
 }
