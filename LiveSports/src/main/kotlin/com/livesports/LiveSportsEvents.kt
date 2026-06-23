@@ -44,7 +44,7 @@ class LiveSportsEvents : MainAPI() {
         val grouped = events.groupBy { it.eventInfo?.eventCat ?: it.cat ?: "Other" }
         
         // STRICT CUSTOM ORDER: Football -> Cricket -> Boxing -> Motorsports
-        val categoryOrder = listOf("football", "cricket", "boxing", "motorsport", "motorsports")
+        val categoryOrder = listOf("football", "cricket", "boxing", "motorsport")
         
         // Sort the categories. Anything not in the list gets pushed to the bottom.
         val sortedCategories = grouped.keys.sortedBy { category ->
@@ -56,7 +56,7 @@ class LiveSportsEvents : MainAPI() {
             val list = grouped[category] ?: return@mapNotNull null
             
             val icon = when (category.lowercase()) { 
-                "cricket" -> "🏏"; "football" -> "⚽"; "motorsport", "motorsports" -> "🏎️"; "boxing" -> "🥊"; "basketball" -> "🏀"; "tennis" -> "🎾"; "ice hockey" -> "🏒"; "baseball" -> "⚾"; else -> "📺" 
+                "cricket" -> "🏏"; "football" -> "⚽"; "motorsport" -> "🏎️"; "boxing" -> "🥊"; "basketball" -> "🏀"; "tennis" -> "🎾"; "ice hockey" -> "🏒"; "baseball" -> "⚾"; else -> "📺" 
             }
             
             val items = list.sortedByDescending { isEventLive(it) }.map { event ->
@@ -208,14 +208,13 @@ class LiveSportsEvents : MainAPI() {
         return if (info?.teamA != null && info.teamB != null && info.teamA != info.teamB) "${info.teamA} vs ${info.teamB}" else event.title
     }
 
-    // New helper function to format the date beautifully
     private fun getFormattedTime(event: LiveEventData): String {
         val timeStr = event.eventInfo?.startTime ?: return ""
         return try {
             val parsed = SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US).parse(timeStr)
             parsed?.let { SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()).format(it) } ?: ""
         } catch (e: Exception) {
-            "" // Fallback to empty if parsing fails
+            "" 
         }
     }
 
