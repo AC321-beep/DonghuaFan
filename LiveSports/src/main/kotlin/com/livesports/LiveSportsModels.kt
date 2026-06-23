@@ -72,10 +72,14 @@ data class FifaLiveStream(
 )
 
 data class FifaLiveChannel(
+    val type: String?,
     val id: String?,
     val name: String?,
     val group: String?,
     val logo: String?,
+    val user_agent: String?,
     val m3u8_url: String?,
+    val mpd_url: String?,
+    val license_url: String?,
     val headers: Map<String, String>?
 )
