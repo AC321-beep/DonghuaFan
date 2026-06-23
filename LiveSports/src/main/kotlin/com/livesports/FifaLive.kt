@@ -42,6 +42,24 @@ class FifaLive : MainAPI() {
         "X-Package" to base64Decode("Y29tLmNsb3VkcGxheS5hcHA=")
     )
 
+    // Moved up to ensure the compiler scopes it before usage
+    private fun decryptPayload(payloadBase64: String, ivBase64: String): String {
+        val SECRET = base64Decode("YmFja3VwLXVwZGF0ZS0zLjM=")
+        val PACKAGE = base64Decode("Y29tLmNsb3VkcGxheS5hcHA=")
+
+        val digest = MessageDigest.getInstance("SHA-256")
+        val keyHash = digest.digest((SECRET + PACKAGE).toByteArray(Charsets.UTF_8))
+
+        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        val secretKeySpec = SecretKeySpec(keyHash, "AES")
+        val ivParameterSpec = IvParameterSpec(base64DecodeArray(ivBase64))
+
+        cipher.init(Cipher.DECRYPT_MODE, secretKeySpec, ivParameterSpec)
+
+        val decrypted = cipher.doFinal(base64DecodeArray(payloadBase64))
+        return String(decrypted, Charsets.UTF_8)
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val req = app.get("$mainUrl/app.php", headers = apiHeaders)
         val res = req.parsedSafe<FifaLiveResponse>()
@@ -50,14 +68,12 @@ class FifaLive : MainAPI() {
         val decryptedJson = decryptPayload(res.payload, res.iv)
         val streams = parseJson<FifaLiveStreams>(decryptedJson).streams
 
-        // 1. Fetch EVERYTHING normally first so we don't break the recursive folders
         val homePageLists = mutableListOf<HomePageList>()
         streams.amap { stream ->
             val sections = fetchHomeSections(stream.name ?: "Unknown", stream.url, stream.logo)
             homePageLists.addAll(sections)
         }
 
-        // 2. Apply strict filter: ONLY keep categories named "FIFA" or "Fancode"
         val filteredLists = homePageLists.filter { list ->
             val listName = list.name.lowercase()
             listName.contains("fifa") || listName.contains("fancode")
@@ -278,6 +294,7 @@ class FifaLive : MainAPI() {
             val licenseUrl = channel.license_url ?: ""
             var keyStr = ""
             var kidStr = ""
+            
             if (licenseUrl.contains("keyid=") && licenseUrl.contains("key=")) {
                 kidStr = Regex("keyid=([^&]+)").find(licenseUrl)?.groupValues?.get(1)?.hexToBase64Url() ?: ""
                 keyStr = Regex("key=([^&]+)").find(licenseUrl)?.groupValues?.get(1)?.hexToBase64Url() ?: ""
@@ -292,24 +309,27 @@ class FifaLive : MainAPI() {
 
             val drmUuid = if (kidStr.isNotEmpty() && keyStr.isNotEmpty()) CLEARKEY_UUID else UUID.fromString("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")
 
+            // Corrected DRM builder structure
             callback.invoke(
                 newDrmExtractorLink(
                     source = this.name,
                     name = channel.name ?: "DASH",
                     url = channel.mpd_url,
                     type = INFER_TYPE,
-                    uuid = drmUuid,
-                    licenseUrl = if (kidStr.isEmpty() || keyStr.isEmpty()) licenseUrl else "",
-                    kid = kidStr,
-                    key = keyStr,
-                    headers = channel.headers ?: emptyMap()
-                )
+                    uuid = drmUuid
+                ) {
+                    this.kid = kidStr
+                    this.key = keyStr
+                }
             )
         } else if (channel.m3u8_url != null) {
             val isTs = channel.m3u8_url.contains(".ts", ignoreCase = true)
             val refererUrl = channel.headers?.entries?.find { it.key.equals("referer", ignoreCase = true) }?.value ?: ""
 
-            // Directly invoking ExtractorLink completely bypasses the ephemeralKey missing parameter error
+            // Extracted link type to prevent compiler expression confusion
+            val linkType = if (isTs) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8
+
+            // Cleaned constructor to perfectly match ExtractorLink definition
             callback.invoke(
                 ExtractorLink(
                     source = this.name,
@@ -317,6 +337,12 @@ class FifaLive : MainAPI() {
                     url = channel.m3u8_url,
                     referer = refererUrl,
                     quality = 0,
-                    isM3u8 = !isTs,
                     headers = channel.headers ?: emptyMap(),
-                    type = if (
+                    type = linkType
+                )
+            )
+        }
+
+        return true
+    }
+}
