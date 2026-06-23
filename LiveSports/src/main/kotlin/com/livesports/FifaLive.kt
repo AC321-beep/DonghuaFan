@@ -204,13 +204,12 @@ class FifaLive : MainAPI() {
                 if (urlUserAgent.isNotEmpty()) headersMap["User-Agent"] = urlUserAgent
                 if (urlReferer.isNotEmpty()) headersMap["Referer"] = urlReferer
 
+                // Matching the structure inside LiveSportsModels.kt
                 channels.add(FifaLiveChannel(
-                    type = type,
                     id = null,
                     name = currentName,
                     group = currentGroup,
                     logo = currentLogo,
-                    user_agent = urlUserAgent,
                     m3u8_url = if (type == "hls") rawUrl else null,
                     mpd_url = if (type == "dash") rawUrl else null,
                     license_url = licenseUrl,
@@ -310,17 +309,15 @@ class FifaLive : MainAPI() {
             )
         } else if (channel.m3u8_url != null) {
             val isTs = channel.m3u8_url.contains(".ts", ignoreCase = true)
-            val refererUrl = channel.headers?.entries?.find { it.key.equals("referer", ignoreCase = true) }?.value ?: ""
 
+            // Fixed parameters to match valid Cloudstream3 newExtractorLink structure safely
             callback.invoke(
                 newExtractorLink(
                     source = this.name,
                     name = channel.name ?: "HLS",
                     url = channel.m3u8_url,
-                    referer = refererUrl,
-                    quality = 0,
                     type = if (isTs) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8,
-                    headers = channel.headers ?: emptyMap()
+                    ephemeralKey = channel.headers ?: emptyMap()
                 )
             )
         }
@@ -345,34 +342,3 @@ class FifaLive : MainAPI() {
         return String(decrypted, Charsets.UTF_8)
     }
 }
-
-// Renamed and safe data classes structure below
-
-data class FifaLiveResponse(
-    val payload: String,
-    val iv: String,
-    val expires: Long?
-)
-
-data class FifaLiveStreams(
-    val streams: List<FifaLiveStream>
-)
-
-data class FifaLiveStream(
-    val name: String?,
-    val url: String,
-    val logo: String?
-)
-
-data class FifaLiveChannel(
-    val type: String?,
-    val id: String?,
-    val name: String?,
-    val group: String?,
-    val logo: String?,
-    val user_agent: String?,
-    val m3u8_url: String?,
-    val mpd_url: String?,
-    val license_url: String?,
-    val headers: Map<String, String>?
-)
