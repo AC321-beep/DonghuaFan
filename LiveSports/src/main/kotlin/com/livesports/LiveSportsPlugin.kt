@@ -13,7 +13,7 @@ class LiveSportsPlugin : Plugin() {
         // Provider 1: Your original Live Events provider
         registerMainAPI(LiveSportsEvents())
 
-        // Provider 2: Your standalone FIFA/CloudPlay provider
+        // Provider 2: Your standalone FIFA
         registerMainAPI(FifaLive())
     }
 }
