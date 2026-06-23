@@ -19,7 +19,7 @@ fun String.hexToBase64UrlOrNull(): String? {
     if (hex.isEmpty() || hex.length % 2 != 0 || !hex.matches(Regex("^[0-9a-fA-F]+$"))) return null
     return try {
         val bytes = hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
-        Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
+        Base64.encodeToString(bytes, Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP)
     } catch (_: Exception) { null }
 }
 
@@ -50,4 +50,32 @@ data class IptvLoadData(
     val url: String, val title: String, val poster: String, val nation: String,
     val key: String, val keyid: String, val userAgent: String, val cookie: String,
     val licenseUrl: String, val drmKeys: Map<String, String>, val headers: Map<String, String>
+)
+
+// ==========================================
+// Added FifaLive (CloudPlay) Specific Models
+// ==========================================
+data class CloudPlayResponse(
+    val payload: String,
+    val iv: String,
+    val expires: Long?
+)
+
+data class CloudPlayStreams(
+    val streams: List<CloudPlayStream>
+)
+
+data class CloudPlayStream(
+    val name: String?,
+    val url: String,
+    val logo: String?
+)
+
+data class CloudPlayChannel(
+    val id: String?,
+    val name: String?,
+    val group: String?,
+    val logo: String?,
+    val m3u8_url: String?,
+    val headers: Map<String, String>?
 )
