@@ -22,7 +22,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.newDrmExtractorLink
-import com.lagradost.cloudstream3.utils.newExtractorLink
 import java.security.MessageDigest
 import java.util.UUID
 import javax.crypto.Cipher
@@ -131,13 +130,11 @@ class FifaLive : MainAPI() {
         val decryptedJson = decryptPayload(res.payload, res.iv)
         val streams = parseJson<FifaLiveStreams>(decryptedJson).streams
 
-        // Map out the sections exactly like getMainPage
         val homePageLists = mutableListOf<HomePageList>()
         streams.amap { stream ->
             homePageLists.addAll(fetchHomeSections(stream.name ?: "Unknown", stream.url, stream.logo))
         }
 
-        // Only allow search results from channels that are inside FIFA or Fancode categories
         val allowedChannels = homePageLists.filter { list ->
             val listName = list.name.lowercase()
             listName.contains("fifa") || listName.contains("fancode")
@@ -204,12 +201,13 @@ class FifaLive : MainAPI() {
                 if (urlUserAgent.isNotEmpty()) headersMap["User-Agent"] = urlUserAgent
                 if (urlReferer.isNotEmpty()) headersMap["Referer"] = urlReferer
 
-                // Matching the structure inside LiveSportsModels.kt
                 channels.add(FifaLiveChannel(
+                    type = type,
                     id = null,
                     name = currentName,
                     group = currentGroup,
                     logo = currentLogo,
+                    user_agent = urlUserAgent,
                     m3u8_url = if (type == "hls") rawUrl else null,
                     mpd_url = if (type == "dash") rawUrl else null,
                     license_url = licenseUrl,
@@ -309,36 +307,16 @@ class FifaLive : MainAPI() {
             )
         } else if (channel.m3u8_url != null) {
             val isTs = channel.m3u8_url.contains(".ts", ignoreCase = true)
+            val refererUrl = channel.headers?.entries?.find { it.key.equals("referer", ignoreCase = true) }?.value ?: ""
 
-            // Fixed parameters to match valid Cloudstream3 newExtractorLink structure safely
+            // Directly invoking ExtractorLink completely bypasses the ephemeralKey missing parameter error
             callback.invoke(
-                newExtractorLink(
+                ExtractorLink(
                     source = this.name,
                     name = channel.name ?: "HLS",
                     url = channel.m3u8_url,
-                    type = if (isTs) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8,
-                    ephemeralKey = channel.headers ?: emptyMap()
-                )
-            )
-        }
-
-        return true
-    }
-
-    private fun decryptPayload(payloadBase64: String, ivBase64: String): String {
-        val SECRET = base64Decode("YmFja3VwLXVwZGF0ZS0zLjM=")
-        val PACKAGE = base64Decode("Y29tLmNsb3VkcGxheS5hcHA=")
-
-        val digest = MessageDigest.getInstance("SHA-256")
-        val keyHash = digest.digest((SECRET + PACKAGE).toByteArray(Charsets.UTF_8))
-
-        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-        val secretKeySpec = SecretKeySpec(keyHash, "AES")
-        val ivParameterSpec = IvParameterSpec(base64DecodeArray(ivBase64))
-
-        cipher.init(Cipher.DECRYPT_MODE, secretKeySpec, ivParameterSpec)
-
-        val decrypted = cipher.doFinal(base64DecodeArray(payloadBase64))
-        return String(decrypted, Charsets.UTF_8)
-    }
-}
+                    referer = refererUrl,
+                    quality = 0,
+                    isM3u8 = !isTs,
+                    headers = channel.headers ?: emptyMap(),
+                    type = if (
