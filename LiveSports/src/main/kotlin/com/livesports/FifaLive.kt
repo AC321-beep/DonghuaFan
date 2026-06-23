@@ -337,28 +337,84 @@ class Fifalive : MainAPI() {
                 keyStr = getDRMKeysFromLicenseServer(licenseUrl, kidStr)
             }
 
+            val drmUuid = if (kidStr.isNotEmpty() && keyStr.isNotEmpty()) CLEARKEY_UUID else UUID.fromString("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")
+
             callback.invoke(
                 newDrmExtractorLink(
-                    this.name,
-                    channel.name ?: "DASH",
-                    channel.mpd_url,
-                    INFER_TYPE,
-                    if (kidStr.isNotEmpty() && keyStr.isNotEmpty()) CLEARKEY_UUID else UUID.fromString("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")
-                ) {
-                    if (channel.headers != null) {
-                        this.headers = channel.headers
-                    }
-                    if (kidStr.isNotEmpty() && keyStr.isNotEmpty()) {
-                        this.kid = kidStr
-                        this.key = keyStr
-                    } else if (licenseUrl.isNotEmpty()) {
-                        this.licenseUrl = licenseUrl
-                    }
-                }
+                    source = this.name,
+                    name = channel.name ?: "DASH",
+                    url = channel.mpd_url,
+                    type = INFER_TYPE,
+                    uuid = drmUuid,
+                    licenseUrl = if (kidStr.isEmpty() || keyStr.isEmpty()) licenseUrl else "",
+                    kid = kidStr,
+                    key = keyStr,
+                    headers = channel.headers ?: emptyMap()
+                )
             )
         } else if (channel.m3u8_url != null) {
             val isTs = channel.m3u8_url.contains(".ts", ignoreCase = true)
+            val refererUrl = channel.headers?.entries?.find { it.key.equals("referer", ignoreCase = true) }?.value ?: ""
+
             callback.invoke(
                 newExtractorLink(
-                    this.name,
-                    channel.
+                    source = this.name,
+                    name = channel.name ?: "HLS",
+                    url = channel.m3u8_url,
+                    referer = refererUrl,
+                    quality = 0,
+                    type = if (isTs) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8,
+                    headers = channel.headers ?: emptyMap()
+                )
+            )
+        }
+
+        return true
+    }
+
+    private fun decryptPayload(payloadBase64: String, ivBase64: String): String {
+        val SECRET = base64Decode("YmFja3VwLXVwZGF0ZS0zLjM=")
+        val PACKAGE = base64Decode("Y29tLmNsb3VkcGxheS5hcHA=")
+        
+        val digest = MessageDigest.getInstance("SHA-256")
+        val keyHash = digest.digest((SECRET + PACKAGE).toByteArray(Charsets.UTF_8))
+        
+        val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        val secretKeySpec = SecretKeySpec(keyHash, "AES")
+        val ivParameterSpec = IvParameterSpec(base64DecodeArray(ivBase64))
+        
+        cipher.init(Cipher.DECRYPT_MODE, secretKeySpec, ivParameterSpec)
+        
+        val decrypted = cipher.doFinal(base64DecodeArray(payloadBase64))
+        return String(decrypted, Charsets.UTF_8)
+    }
+}
+
+data class CloudPlayResponse(
+    val payload: String,
+    val iv: String,
+    val expires: Long?
+)
+
+data class CloudPlayStreams(
+    val streams: List<CloudPlayStream>
+)
+
+data class CloudPlayStream(
+    val name: String?,
+    val url: String,
+    val logo: String?
+)
+
+data class CloudPlayChannel(
+    val type: String?,
+    val id: String?,
+    val name: String?,
+    val group: String?,
+    val logo: String?,
+    val user_agent: String?,
+    val m3u8_url: String?,
+    val mpd_url: String?,
+    val license_url: String?,
+    val headers: Map<String, String>?
+)
