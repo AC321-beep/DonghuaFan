@@ -13,7 +13,10 @@ class LiveSportsPlugin : Plugin() {
         // Provider 1: Your original Live Events provider
         registerMainAPI(LiveSportsEvents())
 
-        // Provider 2: Your standalone FIFA
+        // Provider 2: Your standalone FIFA provider
         registerMainAPI(FifaLive())
+
+        // Provider 3: Your newly customized SportsZone provider
+        registerMainAPI(SportsZoneProvider())
     }
 }
