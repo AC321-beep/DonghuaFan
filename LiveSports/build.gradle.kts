@@ -51,12 +51,12 @@ android {
 
 cloudstream {
     // Updated to reflect the massive changes we made!
-    description = "Premium Live Sports Events & FIFA Streams"
+    description = "Premium Live Sports Events"
     authors = listOf("AC321-beep")
     status = 1
     tvTypes = listOf("Live")
     language = "en"
-    version = 9 
+    version = 10 
     iconUrl = "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/refs/heads/master/LiveSports/Icon.png"
 }
 
