@@ -5,7 +5,6 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.fasterxml.jackson.annotation.JsonProperty
-import java.util.Locale
 
 class SportsZoneProvider : MainAPI() {
 
@@ -130,7 +129,7 @@ class SportsZoneProvider : MainAPI() {
         if (timestamp == null) return "soon"
         return try {
             val date = java.util.Date(timestamp)
-            val sdf = java.text.SimpleDateFormat("dd MMM, HH:mm", Locale.US)
+            val sdf = java.text.SimpleDateFormat("dd MMM, HH:mm", java.util.Locale.US)
             sdf.timeZone = java.util.TimeZone.getDefault()
             sdf.format(date)
         } catch (e: Exception) {
@@ -138,78 +137,46 @@ class SportsZoneProvider : MainAPI() {
         }
     }
 
-    private fun getCategoryIcon(category: String): String {
-        return when (category.lowercase()) {
-            "cricket" -> "🏏"
-            "football", "soccer" -> "⚽"
-            "motorsport", "f1", "racing" -> "🏎️"
-            "boxing", "ufc", "mma", "wwe" -> "🥊"
-            "basketball", "nba" -> "🏀"
-            "tennis" -> "🎾"
-            "ice hockey", "nhl" -> "🏒"
-            "baseball", "mlb" -> "⚾"
-            "american football", "nfl" -> "🏈"
-            "rugby" -> "🏉"
-            else -> "📺"
-        }
-    }
-
-    // Generates the customized match poster exactly matching the provided image sample
-    private fun generateMatchCardUrl(match: SportsZoneMatch): String {
-        val title = match.title
-        val cat = match.category?.replaceFirstChar { it.uppercase() } ?: "Sports"
-        val isLive = match.status?.lowercase() == "live"
-        val timeStr = formatMatchDate(match.date)
-        
-        val hasVs = title.contains(" vs ", ignoreCase = true)
-        val teamA = if (hasVs) title.split(" vs ", ignoreCase = true)[0].trim() else title
-        val teamB = if (hasVs) title.split(" vs ", ignoreCase = true)[1].trim() else ""
-
-        return buildString {
-            append("https://live-card-png.cricify.workers.dev/?")
-            // Pass the category as 'title' so it appears in the top left corner of the generated image
-            append("title=${java.net.URLEncoder.encode(cat, "UTF-8")}") 
-            append("&teamA=${java.net.URLEncoder.encode(teamA, "UTF-8")}")
-            if (teamB.isNotEmpty()) {
-                append("&teamB=${java.net.URLEncoder.encode(teamB, "UTF-8")}")
-            }
-            append("&isLive=$isLive")
-            if (!isLive && timeStr != "soon") {
-                append("&time=${java.net.URLEncoder.encode(timeStr, "UTF-8")}")
-            }
-        }
-    }
-
-    // Unified item builder for both Live and Upcoming Matches
     private fun matchToSearchResponse(match: SportsZoneMatch): SearchResponse {
-        val isLive = match.status?.lowercase() == "live"
-        val statusIcon = if (isLive) "🔴" else "🔜"
-        val timeStr = formatMatchDate(match.date)
         val catDisplay = match.category?.replaceFirstChar { it.uppercase() } ?: "Sports"
+        // Adds 🔴 LIVE and the Sport Category to the title
+        val title = "🔴 LIVE [$catDisplay] ${match.title}"
+        val posterUrl = match.poster ?: ""
         
-        // Constructs title format: 🔴 [Cricket] England vs New Zealand • 12 Oct, 14:00
-        val displayTitle = buildString {
-            append("$statusIcon [$catDisplay] ${match.title}")
-            if (!isLive && timeStr != "soon") {
-                append(" • $timeStr")
-            }
-        }
-
-        val generatedPoster = generateMatchCardUrl(match)
-
         val loadData = EventLoadData(
-            title = displayTitle,
+            title = title,
             url = match.id,
-            posterUrl = generatedPoster,
+            posterUrl = posterUrl,
             category = match.category,
             status = match.status,
             date = match.date,
             isDaddyLive = match.isDaddyLive,
             tvChannels = match.tvChannels
         )
+        return newLiveSearchResponse(title, loadData.toJson(), TvType.Live) {
+            this.posterUrl = posterUrl
+        }
+    }
 
-        return newLiveSearchResponse(displayTitle, loadData.toJson(), TvType.Live) {
-            this.posterUrl = generatedPoster
+    private fun matchToUpcomingSearchResponse(match: SportsZoneMatch): SearchResponse {
+        val dateStr = formatMatchDate(match.date)
+        val catDisplay = match.category?.replaceFirstChar { it.uppercase() } ?: "Sports"
+        // Adds 🔜 UPCOMING and the Sport Category to the title
+        val title = "🔜 UPCOMING [$catDisplay] ${match.title} • $dateStr"
+        val posterUrl = match.poster ?: ""
+        
+        val loadData = EventLoadData(
+            title = title,
+            url = match.id,
+            posterUrl = posterUrl,
+            category = match.category,
+            status = match.status,
+            date = match.date,
+            isDaddyLive = match.isDaddyLive,
+            tvChannels = match.tvChannels
+        )
+        return newLiveSearchResponse(title, loadData.toJson(), TvType.Live) {
+            this.posterUrl = posterUrl
         }
     }
 
@@ -226,35 +193,26 @@ class SportsZoneProvider : MainAPI() {
             val allText = app.get("$mainUrl/papi/matches/all", headers = apiHeaders).text
             val allMatches = parseJson<List<SportsZoneMatch>>(allText)
 
-            // 1. Filter out invalid/non-sport events
-            val validMatches = allMatches.filter { match ->
-                val cat = match.category?.lowercase() ?: ""
+            // 1. Live Matches List
+            val liveMatches = allMatches.filter { match ->
                 val status = match.status?.lowercase() ?: ""
-                cat.isNotBlank() && cat != "24/7-streams" && cat != "live-tv" && cat != "channels" && !cat.contains("stream") && (status == "live" || status == "upcoming")
+                val cat = match.category?.lowercase() ?: ""
+                status == "live" && cat.isNotBlank() && cat != "24/7-streams" && cat != "live-tv" && cat != "channels" && !cat.contains("stream")
+            }
+            if (liveMatches.isNotEmpty()) {
+                val items = liveMatches.map { matchToSearchResponse(it) }
+                lists.add(HomePageList("🟢 Live Sports Events", items, isHorizontalImages = true))
             }
 
-            // 2. Group by sports category
-            val grouped = validMatches.groupBy { it.category?.lowercase() ?: "other" }
-            
-            // 3. Define the strict category display order
-            val categoryOrder = listOf("football", "cricket", "boxing", "motorsport", "basketball", "tennis", "wwe", "ufc")
-            val sortedCategories = grouped.keys.sortedBy { category ->
-                val index = categoryOrder.indexOf(category)
-                if (index == -1) Int.MAX_VALUE else index 
+            // 2. Upcoming Matches List
+            val upcomingMatches = allMatches.filter { match ->
+                val status = match.status?.lowercase() ?: ""
+                val cat = match.category?.lowercase() ?: ""
+                status == "upcoming" && cat.isNotBlank() && cat != "24/7-streams" && cat != "live-tv" && cat != "channels" && !cat.contains("stream")
             }
-
-            // 4. Build the dynamic homepage lists
-            sortedCategories.forEach { category ->
-                val list = grouped[category] ?: return@forEach
-                val icon = getCategoryIcon(category)
-                val displayCatName = category.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
-                
-                // Sort the items within each sport: Live matches appear first, followed by upcoming
-                val items = list.sortedByDescending { it.status?.lowercase() == "live" }.map { match ->
-                    matchToSearchResponse(match)
-                }
-                
-                lists.add(HomePageList("$icon $displayCatName", items, isHorizontalImages = true))
+            if (upcomingMatches.isNotEmpty()) {
+                val items = upcomingMatches.map { matchToUpcomingSearchResponse(it) }
+                lists.add(HomePageList("📅 Upcoming Matches (Live soon)", items, isHorizontalImages = true))
             }
         } catch (e: Exception) {
             println("SportsZone: Failed to load matches - ${e.message}")
@@ -277,7 +235,11 @@ class SportsZoneProvider : MainAPI() {
                 val leagueMatches = match.league?.contains(query, ignoreCase = true) ?: false
                 isSport && (titleMatches || leagueMatches)
             }.map { match ->
-                matchToSearchResponse(match) // Re-uses the unified item generator
+                if (match.status == "upcoming") {
+                    matchToUpcomingSearchResponse(match)
+                } else {
+                    matchToSearchResponse(match)
+                }
             }
         } catch (e: Exception) {
             println("SportsZone: Search failed - ${e.message}")
