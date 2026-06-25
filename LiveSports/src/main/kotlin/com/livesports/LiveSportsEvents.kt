@@ -74,17 +74,14 @@ class LiveSportsEvents : MainAPI() {
                     }
                 }
                 
-                // Strictly use the native app poster provided by the API
-                val nativePoster = event.eventInfo?.eventLogo ?: ""
-                
                 val loadData = LiveEventLoadData(
                     eventId = event.id, title = baseTitle,
-                    poster = nativePoster, slug = event.slug,
+                    poster = generateMatchCardUrl(event), slug = event.slug,
                     formats = event.formats ?: emptyList(), eventInfo = event.eventInfo
                 )
                 
                 newLiveSearchResponse(title, loadData.toJson(), TvType.Live) { 
-                    this.posterUrl = nativePoster 
+                    this.posterUrl = generateMatchCardUrl(event) 
                 }
             }
             HomePageList("$icon $category", items, isHorizontalImages = true)
@@ -215,8 +212,8 @@ class LiveSportsEvents : MainAPI() {
         }
 
         // ANTI-BUFFERING HEADERS FOR EXOPLAYER
+        // Note: Strict "Cache-Control: no-cache" was removed here so the app can buffer properly
         headers["Connection"] = "keep-alive"
-        headers["Cache-Control"] = "no-cache"
 
         return parts[0] to headers
     }
@@ -303,5 +300,24 @@ class LiveSportsEvents : MainAPI() {
             val end = info.endTime?.let { format.parse(it)?.time }
             (end == null || now < end) && start != null && now >= start
         } catch (e: Exception) { false }
+    }
+
+    private fun generateMatchCardUrl(event: LiveEventData): String {
+        val info = event.eventInfo
+        val time = getFormattedTime(event)
+        return buildString {
+            append("https://live-card-png.cricify.workers.dev/?")
+            append("title=${java.net.URLEncoder.encode(info?.eventName ?: event.title, "UTF-8")}")
+            append("&teamA=${java.net.URLEncoder.encode(info?.teamA ?: "Team A", "UTF-8")}")
+            append("&teamB=${java.net.URLEncoder.encode(info?.teamB ?: "Team B", "UTF-8")}")
+            info?.teamAFlag?.let { append("&teamAImg=$it") }
+            info?.teamBFlag?.let { append("&teamBImg=$it") }
+            info?.eventLogo?.let { append("&eventLogo=$it") }
+            append("&isLive=${isEventLive(event)}")
+            
+            if (time.isNotBlank() && !isEventLive(event)) {
+                append("&time=${java.net.URLEncoder.encode(time, "UTF-8")}")
+            }
+        }
     }
 }
