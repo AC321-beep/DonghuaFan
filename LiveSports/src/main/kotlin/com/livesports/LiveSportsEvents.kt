@@ -2,6 +2,8 @@ package com.livesports
 
 import android.os.Handler
 import android.os.Looper
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
@@ -16,6 +18,7 @@ import com.lagradost.cloudstream3.utils.newDrmExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import java.net.URI
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.TimeUnit
@@ -46,7 +49,6 @@ class LiveSportsEvents : MainAPI() {
         // STRICT CUSTOM ORDER: Football -> Cricket -> Boxing -> Motorsports
         val categoryOrder = listOf("football", "cricket", "boxing", "motorsport")
         
-        // Sort the categories. Anything not in the list gets pushed to the bottom.
         val sortedCategories = grouped.keys.sortedBy { category ->
             val index = categoryOrder.indexOf(category.lowercase())
             if (index == -1) Int.MAX_VALUE else index 
@@ -64,7 +66,6 @@ class LiveSportsEvents : MainAPI() {
                 val time = getFormattedTime(event)
                 val baseTitle = createDisplayTitle(event)
                 
-                // Add the time to the text title if the event is upcoming
                 val title = buildString {
                     if (status.isNotBlank()) append("$status ")
                     append(baseTitle)
@@ -74,12 +75,14 @@ class LiveSportsEvents : MainAPI() {
                 }
                 
                 val loadData = LiveEventLoadData(
-                    eventId = event.id, title = baseTitle, // Keep load title clean
+                    eventId = event.id, title = baseTitle,
                     poster = generateMatchCardUrl(event), slug = event.slug,
                     formats = event.formats ?: emptyList(), eventInfo = event.eventInfo
                 )
                 
-                newLiveSearchResponse(title, loadData.toJson(), TvType.Live) { this.posterUrl = generateMatchCardUrl(event) }
+                newLiveSearchResponse(title, loadData.toJson(), TvType.Live) { 
+                    this.posterUrl = generateMatchCardUrl(event) 
+                }
             }
             HomePageList("$icon $category", items, isHorizontalImages = true)
         }
@@ -103,41 +106,58 @@ class LiveSportsEvents : MainAPI() {
             }
             append("\n📡 Available Servers: ${data.formats.size}")
         }
-        return newLiveStreamLoadResponse(data.title, url, url) { this.posterUrl = data.poster; this.plot = plot }
+        return newLiveStreamLoadResponse(data.title, url, url) { 
+            this.posterUrl = data.poster
+            this.plot = plot 
+        }
     }
 
-    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+    override suspend fun loadLinks(
+        data: String, 
+        isCasting: Boolean, 
+        subtitleCallback: (SubtitleFile) -> Unit, 
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
         val loadData = parseJson<LiveEventLoadData>(data)
         val streamResponse = fetchChannelStreams(loadData.slug) ?: return false
 
         streamResponse.streamUrls?.forEach { stream ->
             val serverName = stream.title ?: "Server"
+            
+            // 1. Extract URL and robust headers
             val (url, headers) = parseStreamLink(stream.link ?: return@forEach)
             if (url.isBlank()) return@forEach
-            val resolved = resolveEmbedUrlIfNeeded(url) ?: return@forEach
+            
+            // 2. Pass BOTH url and headers to WebView if extraction is needed
+            val resolved = resolveEmbedUrlIfNeeded(url, headers) ?: return@forEach
 
             when (stream.type) {
-                "7" -> {
+                "7" -> { // DRM / ClearKey Streams
                     val drmParts = stream.api?.split(":") ?: return@forEach
                     if (drmParts.size == 2) {
                         val kid = drmParts[0].hexToBase64UrlOrNull() ?: drmParts[0]
                         val key = drmParts[1].hexToBase64UrlOrNull() ?: drmParts[1]
                         val drmHeaders = headers.toMutableMap()
+                        
                         drmHeaders["drm_scheme"] = "clearkey"
                         drmHeaders["drm_license_key"] = "{\"keys\":[{\"kty\":\"oct\",\"k\":\"${key}\",\"kid\":\"${kid}\"}]}"
                         
                         callback.invoke(newDrmExtractorLink(name, serverName, resolved, INFER_TYPE, CLEARKEY_UUID) {
-                            quality = Qualities.Unknown.value; if (drmHeaders.isNotEmpty()) this.headers = drmHeaders
-                            this.kid = kid; this.key = key
+                            quality = Qualities.Unknown.value
+                            if (drmHeaders.isNotEmpty()) this.headers = drmHeaders
+                            this.kid = kid
+                            this.key = key
                         })
                     } else {
                         callback.invoke(createExtractor(resolved, ExtractorLinkType.DASH, headers, serverName))
                     }
                 }
-                else -> {
+                else -> { // Standard HLS/DASH Streams
                     val type = if (resolved.contains(".mpd")) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
                     val finalHeaders = headers.toMutableMap()
-                    if (type == ExtractorLinkType.M3U8 && !finalHeaders.containsKey("User-Agent")) finalHeaders["User-Agent"] = "Mozilla/5.0"
+                    if (type == ExtractorLinkType.M3U8 && !finalHeaders.containsKey("User-Agent")) {
+                        finalHeaders["User-Agent"] = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
+                    }
                     callback.invoke(createExtractor(resolved, type, finalHeaders, serverName))
                 }
             }
@@ -168,37 +188,75 @@ class LiveSportsEvents : MainAPI() {
         if (!link.contains("|")) return link to emptyMap()
         val parts = link.split("|", limit = 2)
         val headers = mutableMapOf<String, String>()
+        
         parts.getOrNull(1)?.split("&")?.forEach { pair ->
             val kv = pair.split("=", limit = 2)
             if (kv.size == 2) {
-                val key = when (kv[0].lowercase()) { "user-agent" -> "User-Agent"; "referer" -> "Referer"; else -> kv[0] }
+                val key = when (kv[0].lowercase()) { 
+                    "user-agent" -> "User-Agent"
+                    "referer" -> "Referer"
+                    "origin" -> "Origin"
+                    else -> kv[0] 
+                }
                 headers[key] = kv[1]
             }
         }
+
+        // AUTO-INJECT MISSING ORIGIN FOR CDN 2004 FIX
+        if (headers.containsKey("Referer") && !headers.containsKey("Origin")) {
+            try {
+                val uri = URI(headers["Referer"]!!)
+                val portStr = if (uri.port != -1) ":${uri.port}" else ""
+                headers["Origin"] = "${uri.scheme}://${uri.host}$portStr"
+            } catch (e: Exception) { }
+        }
+
+        // ANTI-BUFFERING HEADERS FOR EXOPLAYER
+        headers["Connection"] = "keep-alive"
+        headers["Cache-Control"] = "no-cache"
+
         return parts[0] to headers
     }
 
-    private suspend fun resolveEmbedUrlIfNeeded(url: String): String? {
+    // UPDATED: Now accepts headers and passes them to the WebView
+    private suspend fun resolveEmbedUrlIfNeeded(url: String, headers: Map<String, String>): String? {
         if (url.contains(".m3u8") || url.contains(".mpd") || url.contains(".mp4") || url.contains(".ts")) return url
+        
         return suspendCoroutine { cont ->
             Handler(Looper.getMainLooper()).post {
                 val ctx = context
                 if (ctx == null) { cont.resume(null); return@post }
+                
                 val webView = WebView(ctx).apply {
-                    settings.apply { javaScriptEnabled = true; domStorageEnabled = true; mediaPlaybackRequiresUserGesture = false }
+                    settings.apply { 
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        mediaPlaybackRequiresUserGesture = false 
+                        // Set fallback UA if one wasn't provided in the parsed headers
+                        userAgentString = headers["User-Agent"] ?: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
+                    }
                     var urlCaptured = false
+                    
                     webViewClient = object : WebViewClient() {
-                        override fun shouldInterceptRequest(view: WebView, request: android.webkit.WebResourceRequest): android.webkit.WebResourceResponse? {
+                        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                             val reqUrl = request.url.toString()
                             if ((reqUrl.contains(".m3u8") || reqUrl.contains(".mpd")) && !urlCaptured) {
-                                urlCaptured = true; Handler(Looper.getMainLooper()).post { cont.resume(reqUrl); destroy() }
+                                urlCaptured = true
+                                Handler(Looper.getMainLooper()).post { cont.resume(reqUrl); destroy() }
                             }
                             return super.shouldInterceptRequest(view, request)
                         }
                     }
-                    loadUrl(url) 
+                    
+                    // CRITICAL FIX: Pass the parsed API headers into the WebView request
+                    loadUrl(url, headers) 
                 }
-                Handler(Looper.getMainLooper()).postDelayed({ if (!webView.url.isNullOrEmpty()) { try { cont.resume(null); webView.destroy() } catch (e: Exception) {} } }, 15000)
+                
+                Handler(Looper.getMainLooper()).postDelayed({ 
+                    if (!webView.url.isNullOrEmpty() && !urlCaptured) { 
+                        try { cont.resume(null); webView.destroy() } catch (e: Exception) {} 
+                    } 
+                }, 15000) // 15s timeout
             }
         }
     }
@@ -213,9 +271,7 @@ class LiveSportsEvents : MainAPI() {
         return try {
             val parsed = SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US).parse(timeStr)
             parsed?.let { SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()).format(it) } ?: ""
-        } catch (e: Exception) {
-            "" 
-        }
+        } catch (e: Exception) { "" }
     }
 
     private fun getEventStatus(event: LiveEventData): String {
@@ -225,7 +281,12 @@ class LiveSportsEvents : MainAPI() {
             val format = SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US)
             val start = info.startTime?.let { format.parse(it)?.time }
             val end = info.endTime?.let { format.parse(it)?.time }
-            when { end != null && now >= end -> "✅"; start != null && now >= start -> "🔴"; start != null && now < start -> "🔜"; else -> "" }
+            when { 
+                end != null && now >= end -> "✅"
+                start != null && now >= start -> "🔴"
+                start != null && now < start -> "🔜"
+                else -> "" 
+            }
         } catch (e: Exception) { "" }
     }
 
@@ -253,7 +314,6 @@ class LiveSportsEvents : MainAPI() {
             info?.eventLogo?.let { append("&eventLogo=$it") }
             append("&isLive=${isEventLive(event)}")
             
-            // Pass the time parameter to the image generator if it's an upcoming match
             if (time.isNotBlank() && !isEventLive(event)) {
                 append("&time=${java.net.URLEncoder.encode(time, "UTF-8")}")
             }
