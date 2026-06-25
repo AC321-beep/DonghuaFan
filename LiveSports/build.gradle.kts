@@ -51,7 +51,7 @@ android {
 
 cloudstream {
     // Updated to reflect the massive changes we made!
-    description = "Premium Live Sports Events"
+    description = "Premium Live Sports Events (Livesports + SportsZone)"
     authors = listOf("AC321-beep")
     status = 1
     tvTypes = listOf("Live")
