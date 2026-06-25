@@ -218,7 +218,6 @@ class LiveSportsEvents : MainAPI() {
         return parts[0] to headers
     }
 
-    // UPDATED: Now accepts headers and passes them to the WebView
     private suspend fun resolveEmbedUrlIfNeeded(url: String, headers: Map<String, String>): String? {
         if (url.contains(".m3u8") || url.contains(".mpd") || url.contains(".mp4") || url.contains(".ts")) return url
         
@@ -227,7 +226,6 @@ class LiveSportsEvents : MainAPI() {
                 val ctx = context
                 if (ctx == null) { cont.resume(null); return@post }
                 
-                // CRITICAL FIX: Declare this flag here so both WebViewClient and the timeout Handler can see it
                 var urlCaptured = false
                 
                 val webView = WebView(ctx).apply {
@@ -259,7 +257,7 @@ class LiveSportsEvents : MainAPI() {
                             webView.destroy() 
                         } catch (e: Exception) {} 
                     } 
-                }, 15000) // 15s timeout
+                }, 15000)
             }
         }
     }
@@ -316,6 +314,7 @@ class LiveSportsEvents : MainAPI() {
             info?.teamBFlag?.let { append("&teamBImg=$it") }
             info?.eventLogo?.let { append("&eventLogo=$it") }
             append("&isLive=${isEventLive(event)}")
+            append("&watermark=false") // Injected watermark removal parameter
             
             if (time.isNotBlank() && !isEventLive(event)) {
                 append("&time=${java.net.URLEncoder.encode(time, "UTF-8")}")
