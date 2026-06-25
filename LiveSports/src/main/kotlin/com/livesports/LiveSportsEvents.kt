@@ -74,14 +74,17 @@ class LiveSportsEvents : MainAPI() {
                     }
                 }
                 
+                // Use native app logo/poster directly
+                val nativePoster = event.eventInfo?.eventLogo ?: ""
+                
                 val loadData = LiveEventLoadData(
                     eventId = event.id, title = baseTitle,
-                    poster = generateMatchCardUrl(event), slug = event.slug,
+                    poster = nativePoster, slug = event.slug,
                     formats = event.formats ?: emptyList(), eventInfo = event.eventInfo
                 )
                 
                 newLiveSearchResponse(title, loadData.toJson(), TvType.Live) { 
-                    this.posterUrl = generateMatchCardUrl(event) 
+                    this.posterUrl = nativePoster
                 }
             }
             HomePageList("$icon $category", items, isHorizontalImages = true)
@@ -233,7 +236,7 @@ class LiveSportsEvents : MainAPI() {
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         mediaPlaybackRequiresUserGesture = false 
-                        userAgentString = headers["User-Agent"] ?: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
+                        userAgentString = headers["User-Agent"] ?: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
                     }
                     
                     webViewClient = object : WebViewClient() {
@@ -300,25 +303,5 @@ class LiveSportsEvents : MainAPI() {
             val end = info.endTime?.let { format.parse(it)?.time }
             (end == null || now < end) && start != null && now >= start
         } catch (e: Exception) { false }
-    }
-
-    private fun generateMatchCardUrl(event: LiveEventData): String {
-        val info = event.eventInfo
-        val time = getFormattedTime(event)
-        return buildString {
-            append("https://live-card-png.cricify.workers.dev/?")
-            append("title=${java.net.URLEncoder.encode(info?.eventName ?: event.title, "UTF-8")}")
-            append("&teamA=${java.net.URLEncoder.encode(info?.teamA ?: "Team A", "UTF-8")}")
-            append("&teamB=${java.net.URLEncoder.encode(info?.teamB ?: "Team B", "UTF-8")}")
-            info?.teamAFlag?.let { append("&teamAImg=$it") }
-            info?.teamBFlag?.let { append("&teamBImg=$it") }
-            info?.eventLogo?.let { append("&eventLogo=$it") }
-            append("&isLive=${isEventLive(event)}")
-            append("&watermark=false") // Injected watermark removal parameter
-            
-            if (time.isNotBlank() && !isEventLive(event)) {
-                append("&time=${java.net.URLEncoder.encode(time, "UTF-8")}")
-            }
-        }
     }
 }
