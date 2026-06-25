@@ -74,7 +74,7 @@ class LiveSportsEvents : MainAPI() {
                     }
                 }
                 
-                // Use native app logo/poster directly
+                // Strictly use the native app poster provided by the API
                 val nativePoster = event.eventInfo?.eventLogo ?: ""
                 
                 val loadData = LiveEventLoadData(
@@ -84,7 +84,7 @@ class LiveSportsEvents : MainAPI() {
                 )
                 
                 newLiveSearchResponse(title, loadData.toJson(), TvType.Live) { 
-                    this.posterUrl = nativePoster
+                    this.posterUrl = nativePoster 
                 }
             }
             HomePageList("$icon $category", items, isHorizontalImages = true)
@@ -236,7 +236,7 @@ class LiveSportsEvents : MainAPI() {
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         mediaPlaybackRequiresUserGesture = false 
-                        userAgentString = headers["User-Agent"] ?: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
+                        userAgentString = headers["User-Agent"] ?: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
                     }
                     
                     webViewClient = object : WebViewClient() {
