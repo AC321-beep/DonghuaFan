@@ -50,12 +50,16 @@ class SportsZoneProvider : MainAPI() {
             "Origin" to mainUrl
         )
 
+    // ANTI-BUFFERING & ANTI-2004 ERROR HEADERS
     private val hlsPlayHeaders: Map<String, String>
         get() = mapOf(
             "User-Agent" to "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
             "Referer" to "$mainUrl/",
             "Origin" to mainUrl,
-            "Accept" to "*/*"
+            "Accept" to "*/*",
+            "Connection" to "keep-alive", // Prevents TCP handshake drops between chunks
+            "Cache-Control" to "no-cache", // Forces fresh live playlist fetching
+            "Pragma" to "no-cache"
         )
 
     // ── Data classes ───────────────────────────────────────────────────────────
@@ -318,10 +322,13 @@ class SportsZoneProvider : MainAPI() {
                             url = stream.url,
                             type = ExtractorLinkType.M3U8
                         ) {
+                            // Apply keep-alive constraints here as well to stabilize the DaddyLive proxy
                             this.headers = mapOf(
                                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
                                 "Referer" to "$mainUrl/",
-                                "Origin" to mainUrl
+                                "Origin" to mainUrl,
+                                "Connection" to "keep-alive",
+                                "Cache-Control" to "no-cache"
                             )
                         }
                     )
@@ -343,7 +350,7 @@ class SportsZoneProvider : MainAPI() {
                                     url = hlsUrlStr,
                                     type = ExtractorLinkType.M3U8
                                 ) {
-                                    this.headers = hlsPlayHeaders
+                                    this.headers = hlsPlayHeaders // Includes keep-alive & no-cache
                                 }
                             )
                             foundAny = true
@@ -372,7 +379,7 @@ class SportsZoneProvider : MainAPI() {
                                             url = m3u8Url,
                                             type = ExtractorLinkType.M3U8
                                         ) {
-                                            this.headers = hlsPlayHeaders
+                                            this.headers = hlsPlayHeaders // Includes keep-alive & no-cache
                                         }
                                     )
                                     foundAny = true
@@ -402,7 +409,7 @@ class SportsZoneProvider : MainAPI() {
                                                     url = cleanUrl.replace("\\u0026", "&").replace("\\/", "/"),
                                                     type = ExtractorLinkType.M3U8
                                                 ) {
-                                                    this.headers = hlsPlayHeaders
+                                                    this.headers = hlsPlayHeaders // Includes keep-alive & no-cache
                                                 }
                                             )
                                             foundAny = true
