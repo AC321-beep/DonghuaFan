@@ -227,15 +227,16 @@ class LiveSportsEvents : MainAPI() {
                 val ctx = context
                 if (ctx == null) { cont.resume(null); return@post }
                 
+                // CRITICAL FIX: Declare this flag here so both WebViewClient and the timeout Handler can see it
+                var urlCaptured = false
+                
                 val webView = WebView(ctx).apply {
                     settings.apply { 
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         mediaPlaybackRequiresUserGesture = false 
-                        // Set fallback UA if one wasn't provided in the parsed headers
                         userAgentString = headers["User-Agent"] ?: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
                     }
-                    var urlCaptured = false
                     
                     webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
@@ -248,13 +249,15 @@ class LiveSportsEvents : MainAPI() {
                         }
                     }
                     
-                    // CRITICAL FIX: Pass the parsed API headers into the WebView request
                     loadUrl(url, headers) 
                 }
                 
                 Handler(Looper.getMainLooper()).postDelayed({ 
-                    if (!webView.url.isNullOrEmpty() && !urlCaptured) { 
-                        try { cont.resume(null); webView.destroy() } catch (e: Exception) {} 
+                    if (!urlCaptured) { 
+                        try { 
+                            cont.resume(null)
+                            webView.destroy() 
+                        } catch (e: Exception) {} 
                     } 
                 }, 15000) // 15s timeout
             }
