@@ -50,15 +50,14 @@ class SportsZoneProvider : MainAPI() {
             "Origin" to mainUrl
         )
 
-    // ANTI-BUFFERING & ANTI-2004 ERROR HEADERS
     private val hlsPlayHeaders: Map<String, String>
         get() = mapOf(
             "User-Agent" to "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
             "Referer" to "$mainUrl/",
             "Origin" to mainUrl,
             "Accept" to "*/*",
-            "Connection" to "keep-alive", // Prevents TCP handshake drops between chunks
-            "Cache-Control" to "no-cache", // Forces fresh live playlist fetching
+            "Connection" to "keep-alive",
+            "Cache-Control" to "no-cache",
             "Pragma" to "no-cache"
         )
 
@@ -137,11 +136,36 @@ class SportsZoneProvider : MainAPI() {
         }
     }
 
+    // Safely structuralizes the parameters for your custom image renderer
+    private fun generateMatchCardUrl(match: SportsZoneMatch): String {
+        val title = match.title
+        val cat = match.category?.replaceFirstChar { it.uppercase() } ?: "Sports"
+        val isLive = match.status?.lowercase() == "live"
+        val timeStr = formatMatchDate(match.date)
+        
+        val hasVs = title.contains(" vs ", ignoreCase = true)
+        val teamA = if (hasVs) title.split(Regex(" vs ", RegexOption.IGNORE_CASE), limit = 2)[0].trim() else title
+        val teamB = if (hasVs) title.split(Regex(" vs ", RegexOption.IGNORE_CASE), limit = 2).getOrNull(1)?.trim() ?: "" else ""
+
+        val finalTeamA = teamA.ifBlank { "Live Event" }
+        val finalTeamB = teamB.ifBlank { " " } // Fallback empty space avoids worker processing faults
+
+        return buildString {
+            append("https://live-card-png.cricify.workers.dev/?")
+            append("title=${java.net.URLEncoder.encode(cat, "UTF-8")}")
+            append("&teamA=${java.net.URLEncoder.encode(finalTeamA, "UTF-8")}")
+            append("&teamB=${java.net.URLEncoder.encode(finalTeamB, "UTF-8")}")
+            append("&isLive=$isLive")
+            if (!isLive && timeStr != "soon") {
+                append("&time=${java.net.URLEncoder.encode(timeStr, "UTF-8")}")
+            }
+        }
+    }
+
     private fun matchToSearchResponse(match: SportsZoneMatch): SearchResponse {
         val catDisplay = match.category?.replaceFirstChar { it.uppercase() } ?: "Sports"
-        // Adds 🔴 LIVE and the Sport Category to the title
         val title = "🔴 LIVE [$catDisplay] ${match.title}"
-        val posterUrl = match.poster ?: ""
+        val posterUrl = generateMatchCardUrl(match)
         
         val loadData = EventLoadData(
             title = title,
@@ -161,9 +185,8 @@ class SportsZoneProvider : MainAPI() {
     private fun matchToUpcomingSearchResponse(match: SportsZoneMatch): SearchResponse {
         val dateStr = formatMatchDate(match.date)
         val catDisplay = match.category?.replaceFirstChar { it.uppercase() } ?: "Sports"
-        // Adds 🔜 UPCOMING and the Sport Category to the title
         val title = "🔜 UPCOMING [$catDisplay] ${match.title} • $dateStr"
-        val posterUrl = match.poster ?: ""
+        val posterUrl = generateMatchCardUrl(match)
         
         val loadData = EventLoadData(
             title = title,
@@ -193,7 +216,7 @@ class SportsZoneProvider : MainAPI() {
             val allText = app.get("$mainUrl/papi/matches/all", headers = apiHeaders).text
             val allMatches = parseJson<List<SportsZoneMatch>>(allText)
 
-            // 1. Live Matches List
+            // 1. Original Category List: Live Matches
             val liveMatches = allMatches.filter { match ->
                 val status = match.status?.lowercase() ?: ""
                 val cat = match.category?.lowercase() ?: ""
@@ -204,7 +227,7 @@ class SportsZoneProvider : MainAPI() {
                 lists.add(HomePageList("🟢 Live Sports Events", items, isHorizontalImages = true))
             }
 
-            // 2. Upcoming Matches List
+            // 2. Original Category List: Upcoming Matches
             val upcomingMatches = allMatches.filter { match ->
                 val status = match.status?.lowercase() ?: ""
                 val cat = match.category?.lowercase() ?: ""
@@ -348,7 +371,6 @@ class SportsZoneProvider : MainAPI() {
                         val hlsUrlStr = response.hlsUrl
                         val embedUrlStr = response.embedUrl
 
-                        // === PRIMARY: Direct HLS ===
                         if (!hlsUrlStr.isNullOrBlank()) {
                             callback.invoke(
                                 newExtractorLink(
@@ -357,13 +379,12 @@ class SportsZoneProvider : MainAPI() {
                                     url = hlsUrlStr,
                                     type = ExtractorLinkType.M3U8
                                 ) {
-                                    this.headers = hlsPlayHeaders // Includes keep-alive & no-cache
+                                    this.headers = hlsPlayHeaders
                                 }
                             )
                             foundAny = true
                         }
 
-                        // === FALLBACK: Embed Extraction ===
                         if (!embedUrlStr.isNullOrBlank()) {
                             try {
                                 val embedHtml = app.get(
@@ -427,7 +448,6 @@ class SportsZoneProvider : MainAPI() {
                                 println("SportsZone: Embed extraction failed for ${stream.name} - ${embedError.message}")
                             }
 
-                            // CloudStream built-in Extractor Fallback
                             try {
                                 loadExtractor(embedUrlStr, "$mainUrl/", subtitleCallback, callback)
                                 foundAny = true
