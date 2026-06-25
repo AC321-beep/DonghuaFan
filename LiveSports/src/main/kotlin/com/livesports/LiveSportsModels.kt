@@ -51,35 +51,3 @@ data class IptvLoadData(
     val key: String, val keyid: String, val userAgent: String, val cookie: String,
     val licenseUrl: String, val drmKeys: Map<String, String>, val headers: Map<String, String>
 )
-
-// ==========================================
-// Renamed FifaLive Specific Models
-// ==========================================
-data class FifaLiveResponse(
-    val payload: String,
-    val iv: String,
-    val expires: Long?
-)
-
-data class FifaLiveStreams(
-    val streams: List<FifaLiveStream>
-)
-
-data class FifaLiveStream(
-    val name: String?,
-    val url: String,
-    val logo: String?
-)
-
-data class FifaLiveChannel(
-    val type: String?,
-    val id: String?,
-    val name: String?,
-    val group: String?,
-    val logo: String?,
-    val user_agent: String?,
-    val m3u8_url: String?,
-    val mpd_url: String?,
-    val license_url: String?,
-    val headers: Map<String, String>?
-)
