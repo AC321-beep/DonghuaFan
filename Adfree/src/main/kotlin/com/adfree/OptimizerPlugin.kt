@@ -1,4 +1,4 @@
-package com.netoptimizer
+package com.net.optimizer
 
 import android.content.Context
 import android.util.Log
