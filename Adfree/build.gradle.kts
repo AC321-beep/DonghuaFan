@@ -1,21 +1,12 @@
-import com.lagradost.cloudstream3.gradle.CloudstreamExtension
-
 plugins {
     id("com.android.library") 
     kotlin("android")
     id("com.lagradost.cloudstream3.gradle")
 }
-
+version = "1"
 cloudstream {
+    // This tells the GitHub Action where to host your plugin
     setRepo(System.getenv("REPO_URL") ?: "https://github.com/AC321-beep/DonghuaFan")
-}
-
-// 👑 THIS IS THE CORRECT PLUGIN BLOCK FOR CONFIGURATION AND VERSIONING
-cloudstreamPlugin {
-    className = "com.netoptimizer.OptimizerPlugin"
-    description = "Network Traffic Optimizer"
-    author = "SysDev"
-    version = 1 // 🌟 HERE IS YOUR VERSION NUMBER! Change to 2, 3, etc. to trigger updates.
 }
 
 android {
