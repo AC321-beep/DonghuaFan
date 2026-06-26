@@ -167,6 +167,52 @@ class DonghuaFunProvider : MainAPI() {
             rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
         }
 
+        // ==========================================
+        // --- IMPROVED SUBTITLE EXTRACTION START ---
+        // ==========================================
+
+        // 1. Extract from MacCMS player_aaaa JSON keys
+        val subUrlRaw = Regex(""""(?:subt|vtt|zimu|subtitle|sub)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE)
+            .find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+
+        if (subUrlRaw.isNotEmpty()) {
+            var decodedSub = subUrlRaw
+            try {
+                // Decode according to MacCMS encryption, unless it's already a plain HTTP/relative URL
+                if (encrypt == 1 && !decodedSub.startsWith("http")) {
+                    decodedSub = URLDecoder.decode(decodedSub, "UTF-8")
+                } else if (encrypt == 2 && !decodedSub.startsWith("http") && !decodedSub.startsWith("/")) {
+                    decodedSub = String(Base64.decode(decodedSub, Base64.DEFAULT))
+                    decodedSub = URLDecoder.decode(decodedSub, "UTF-8")
+                }
+            } catch (e: Exception) {
+                decodedSub = subUrlRaw // Fallback to raw string if decoding fails
+            }
+            if (decodedSub.isNotBlank()) {
+                subtitleCallback.invoke(SubtitleFile("English", fixUrl(decodedSub)))
+            }
+        }
+
+        // 2. Extract from standard HTML <track> elements
+        doc?.select("track")?.forEach { track ->
+            val trackSrc = track.attr("src")
+            if (trackSrc.isNotBlank()) {
+                val label = track.attr("label").ifEmpty { track.attr("srclang") }.ifEmpty { track.attr("lang") }.ifEmpty { "English" }
+                subtitleCallback.invoke(SubtitleFile(label, fixUrl(trackSrc)))
+            }
+        }
+
+        // 3. Fallback: Extract from generic player configurations (e.g., DPlayer, ArtPlayer)
+        val playerConfigSub = Regex("""subtitle:\s*\{\s*url:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
+            .find(html)?.groupValues?.get(1)?.replace("\\/", "/")
+        if (!playerConfigSub.isNullOrBlank()) {
+            subtitleCallback.invoke(SubtitleFile("English", fixUrl(playerConfigSub)))
+        }
+
+        // ========================================
+        // --- IMPROVED SUBTITLE EXTRACTION END ---
+        // ========================================
+
         if (from.equals("dailymotion", ignoreCase = true)) {
             val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
             if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
