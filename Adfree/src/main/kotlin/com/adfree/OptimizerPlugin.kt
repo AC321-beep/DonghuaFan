@@ -1,4 +1,4 @@
-package com.net.optimizer
+package com.netoptimizer
 
 import android.content.Context
 import android.util.Log
@@ -9,9 +9,11 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class OptimizerPlugin : Plugin() {
     private val TAG = "NetOpt"
+    private var pluginContext: Context? = null
 
     override fun load(context: Context) {
         Log.i(TAG, "Initializing System Traffic Optimizer...")
+        pluginContext = context
         
         FilterStore.init(context)
         SystemInterceptor.inject(context)
@@ -23,6 +25,19 @@ class OptimizerPlugin : Plugin() {
         }
 
         sanitizeActions()
+
+        // CRITICAL: This connects the gear icon in CloudStream to your custom UI
+        openSettings = {
+            // Use the application context or an available activity context to launch the dialog
+            val dialogContext = context
+            try {
+                SettingsDialog(dialogContext) {
+                    Log.i(TAG, "Settings saved.")
+                }.show()
+            } catch (t: Throwable) {
+                Log.e(TAG, "Failed to open settings", t)
+            }
+        }
     }
 
     private fun sanitizeActions() {
