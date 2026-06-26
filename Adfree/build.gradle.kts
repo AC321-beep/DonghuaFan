@@ -8,7 +8,8 @@ version = "2"
 
 cloudstream {
     setRepo(System.getenv("REPO_URL") ?: "https://github.com/AC321-beep/DonghuaFan")
-    setRepoIcon("https://raw.githubusercontent.com/AC321-beep/DonghuaFan/refs/heads/master/Adfree/Icon.png")
+    
+    iconUrl = "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/refs/heads/master/Adfree/Icon.png"
 }
 
 android {
