@@ -1,4 +1,4 @@
-package com.netoptimizer
+package com.net.optimizer
 
 import android.app.AlertDialog
 import android.content.Context
