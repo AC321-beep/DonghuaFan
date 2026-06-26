@@ -3,7 +3,8 @@ plugins {
     kotlin("android")
     id("com.lagradost.cloudstream3.gradle")
 }
-version = "1"
+iconUrl = "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/refs/heads/master/Adfree/Icon.png
+version = "2"
 cloudstream {
     // This tells the GitHub Action where to host your plugin
     setRepo(System.getenv("REPO_URL") ?: "https://github.com/AC321-beep/DonghuaFan")
