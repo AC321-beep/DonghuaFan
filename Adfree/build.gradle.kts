@@ -1,43 +1,36 @@
 import com.lagradost.cloudstream3.gradle.CloudstreamExtension
 
 plugins {
-    id("com.android.application") // or "com.android.library" depending on your exact setup
+    id("com.android.library") 
     kotlin("android")
     id("com.lagradost.cloudstream3.gradle")
 }
 
 cloudstream {
-    // 🛡️ STEALTH: Do not use your real username or "guard" in the repo name
-    setRepo(System.getenv("REPO_URL") ?: "https://github.com/user/repo")
-    setRepoName(System.getenv("REPO_NAME") ?: "System Utilities")
+    setRepo(System.getenv("REPO_URL") ?: "https://github.com/AC321-beep/DonghuaFan")
+    setRepoName(System.getenv("REPO_NAME") ?: "DonghuaFan")
     
-    // 🛡️ STEALTH: This is what CloudStream registers internally. 
-    // Argument 1: The exact path to your new main plugin class
-    // Argument 2: The public display name of the plugin
-    // Argument 3: The author name (keep it generic)
-    // Argument 4: Version
+    // CloudStream registers updates based on this integer.
+    // When you want to push an update, just change 1 to 2, 3, etc.
     addPlugin(
-        "com.net.optimizer.OptimizerPlugin", 
+        "com.netoptimizer.OptimizerPlugin", 
         "Network Optimizer", 
         "SysDev", 
-        "1.0.0"
-        version = 1
+        1
     )
 }
 
 android {
-    // 🛡️ STEALTH: This replaces the package name in the AndroidManifest.xml
-    namespace = "com.net.optimizer"
+    namespace = "com.netoptimizer" 
     compileSdk = 34
 
     defaultConfig {
         minSdk = 21
-        targetSdk = 34
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = true // Highly recommended to further obfuscate the code
+            isMinifyEnabled = true 
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -57,6 +50,4 @@ android {
 dependencies {
     val cloudstreamVersion = "master-SNAPSHOT"
     implementation("com.github.recloudstream:cloudstream:$cloudstreamVersion")
-    
-    // Add any other specific dependencies your plugin needs here
 }
