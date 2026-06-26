@@ -8,16 +8,14 @@ plugins {
 
 cloudstream {
     setRepo(System.getenv("REPO_URL") ?: "https://github.com/AC321-beep/DonghuaFan")
-    setRepoName(System.getenv("REPO_NAME") ?: "DonghuaFan")
-    
-    // CloudStream registers updates based on this integer.
-    // When you want to push an update, just change 1 to 2, 3, etc.
-    addPlugin(
-        "com.netoptimizer.OptimizerPlugin", 
-        "Network Optimizer", 
-        "SysDev", 
-        1
-    )
+}
+
+// 👑 THIS IS THE CORRECT PLUGIN BLOCK FOR CONFIGURATION AND VERSIONING
+cloudstreamPlugin {
+    className = "com.netoptimizer.OptimizerPlugin"
+    description = "Network Traffic Optimizer"
+    author = "SysDev"
+    version = 1 // 🌟 HERE IS YOUR VERSION NUMBER! Change to 2, 3, etc. to trigger updates.
 }
 
 android {
@@ -42,9 +40,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
     }
-    kotlinOptions {
-        jvmTarget = "1.8"
-    }
+}
+
+kotlin {
+    jvmToolchain(8)
 }
 
 dependencies {
