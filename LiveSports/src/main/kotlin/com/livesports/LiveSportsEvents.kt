@@ -40,15 +40,94 @@ class LiveSportsEvents : MainAPI() {
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
+    // 1. Centralized Enum for clear states (Order defines sorting priority)
+    enum class EventState(val emoji: String, val text: String) {
+        LIVE("🔴", "Live"),
+        UPCOMING("🔜", "Upcoming"),
+        ENDED("✅", "Ended"),
+        UNKNOWN("📺", "Unknown")
+    }
+
+    // 2. Single robust date parser
+    private fun parseEventDate(dateStr: String?): Long? {
+        if (dateStr.isNullOrBlank()) return null
+        return try {
+            SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US).parse(dateStr)?.time
+        } catch (e: Exception) { null }
+    }
+
+    // 3. Centralized state logic with a 4-hour fallback
+    private fun getEventState(event: LiveEventData): EventState {
+        val info = event.eventInfo ?: return EventState.UNKNOWN
+        val start = parseEventDate(info.startTime) ?: return EventState.UNKNOWN
+        
+        // If API doesn't provide an end time, assume the match lasts 4 hours
+        val end = parseEventDate(info.endTime) ?: (start + TimeUnit.HOURS.toMillis(4))
+        val now = System.currentTimeMillis()
+
+        return when {
+            now >= end -> EventState.ENDED
+            now in start..end -> EventState.LIVE
+            now < start -> EventState.UPCOMING
+            else -> EventState.UNKNOWN
+        }
+    }
+
+    // 4. 12-Hour format clean time string
+    private fun getFormattedTime(event: LiveEventData): String {
+        val timeMs = parseEventDate(event.eventInfo?.startTime) ?: return ""
+        return try {
+            // 12-hour format: hh:mm a (e.g., 05:30 PM)
+            SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()).format(Date(timeMs))
+        } catch (e: Exception) { "" }
+    }
+
+    private fun createDisplayTitle(event: LiveEventData): String {
+        val info = event.eventInfo
+        return if (info?.teamA != null && info.teamB != null && info.teamA != info.teamB) "${info.teamA} vs ${info.teamB}" else event.title
+    }
+
+    // 5. Fixed Match Card Generator
+    private fun generateMatchCardUrl(event: LiveEventData): String {
+        val info = event.eventInfo
+        val state = getEventState(event)
+        val time = getFormattedTime(event)
+        
+        return buildString {
+            append("https://live-card-png.cricify.workers.dev/?")
+            append("title=${java.net.URLEncoder.encode(info?.eventName ?: event.title, "UTF-8")}")
+            append("&teamA=${java.net.URLEncoder.encode(info?.teamA ?: "Team A", "UTF-8")}")
+            append("&teamB=${java.net.URLEncoder.encode(info?.teamB ?: "Team B", "UTF-8")}")
+            info?.teamAFlag?.let { append("&teamAImg=$it") }
+            info?.teamBFlag?.let { append("&teamBImg=$it") }
+            info?.eventLogo?.let { append("&eventLogo=$it") }
+            
+            // Fix for Cloudflare Worker enforcing "ENDED" on missing flags
+            when (state) {
+                EventState.LIVE -> append("&isLive=true")
+                EventState.ENDED -> append("&isLive=false")
+                EventState.UPCOMING -> {
+                    // Force the worker to recognize upcoming parameters
+                    append("&status=Upcoming&state=upcoming&isUpcoming=true") 
+                }
+                else -> {}
+            }
+            
+            // Only append time for upcoming matches
+            if (state == EventState.UPCOMING && time.isNotBlank()) {
+                append("&time=${java.net.URLEncoder.encode(time, "UTF-8")}")
+            }
+        }
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val events = LiveSportsProviderManager.fetchLiveEvents()
         
         // Group events by category
         val grouped = events.groupBy { it.eventInfo?.eventCat ?: it.cat ?: "Other" }
         
-        // STRICT CUSTOM ORDER: Football -> Cricket -> Boxing -> Motorsports
+        // STRICT CUSTOM ORDER
         val categoryOrder = listOf("football", "cricket", "boxing", "motorsport")
-        
         val sortedCategories = grouped.keys.sortedBy { category ->
             val index = categoryOrder.indexOf(category.lowercase())
             if (index == -1) Int.MAX_VALUE else index 
@@ -61,15 +140,36 @@ class LiveSportsEvents : MainAPI() {
                 "cricket" -> "🏏"; "football" -> "⚽"; "motorsport" -> "🏎️"; "boxing" -> "🥊"; "basketball" -> "🏀"; "tennis" -> "🎾"; "ice hockey" -> "🏒"; "baseball" -> "⚾"; else -> "📺" 
             }
             
-            val items = list.sortedByDescending { isEventLive(it) }.map { event ->
-                val status = getEventStatus(event)
+            // SORTING LOGIC: State Priority, then Chronological
+            val sortedList = list.sortedWith(Comparator { a, b ->
+                val stateA = getEventState(a)
+                val stateB = getEventState(b)
+                
+                // 1. Sort by State: LIVE(0) -> UPCOMING(1) -> ENDED(2) -> UNKNOWN(3)
+                if (stateA != stateB) return@Comparator stateA.compareTo(stateB)
+                
+                // 2. Sort by Time based on state
+                val timeA = parseEventDate(a.eventInfo?.startTime) ?: 0L
+                val timeB = parseEventDate(b.eventInfo?.startTime) ?: 0L
+                
+                when (stateA) {
+                    // For upcoming, closest matches appear first (Ascending)
+                    EventState.UPCOMING -> timeA.compareTo(timeB) 
+                    // For live/ended, most recently started matches appear first (Descending)
+                    else -> timeB.compareTo(timeA) 
+                }
+            })
+
+            val items = sortedList.map { event ->
+                val state = getEventState(event)
                 val time = getFormattedTime(event)
                 val baseTitle = createDisplayTitle(event)
                 
                 val title = buildString {
-                    if (status.isNotBlank()) append("$status ")
+                    if (state != EventState.UNKNOWN) append("${state.emoji} ")
                     append(baseTitle)
-                    if (time.isNotBlank() && !isEventLive(event)) {
+                    
+                    if (state == EventState.UPCOMING && time.isNotBlank()) {
                         append(" • $time")
                     }
                 }
@@ -81,7 +181,7 @@ class LiveSportsEvents : MainAPI() {
                 )
                 
                 newLiveSearchResponse(title, loadData.toJson(), TvType.Live) { 
-                    this.posterUrl = generateMatchCardUrl(event) 
+                    this.posterUrl = loadData.poster 
                 }
             }
             HomePageList("$icon $category", items, isHorizontalImages = true)
@@ -97,11 +197,14 @@ class LiveSportsEvents : MainAPI() {
             data.eventInfo?.let {
                 it.eventType?.let { append("📌 $it\n") }
                 it.eventName?.let { append("🏆 $it\n") }
-                it.startTime?.let { time ->
-                    try {
-                        val parsed = SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US).parse(time)
-                        parsed?.let { d -> append("🕐 ${SimpleDateFormat("MMM dd, yyyy HH:mm", Locale.US).format(d)}\n") }
-                    } catch (e: Exception) { append("🕐 $time\n") }
+                it.startTime?.let { timeStr ->
+                    val parsedMs = parseEventDate(timeStr)
+                    if (parsedMs != null) {
+                        // 12-hour format applied to stream load info as well
+                        append("🕐 ${SimpleDateFormat("MMM dd, yyyy hh:mm a", Locale.US).format(Date(parsedMs))}\n")
+                    } else {
+                        append("🕐 $timeStr\n")
+                    }
                 }
             }
             append("\n📡 Available Servers: ${data.formats.size}")
@@ -212,7 +315,6 @@ class LiveSportsEvents : MainAPI() {
         }
 
         // ANTI-BUFFERING HEADERS FOR EXOPLAYER
-        // Note: Strict "Cache-Control: no-cache" was removed here so the app can buffer properly
         headers["Connection"] = "keep-alive"
 
         return parts[0] to headers
@@ -258,65 +360,6 @@ class LiveSportsEvents : MainAPI() {
                         } catch (e: Exception) {} 
                     } 
                 }, 15000)
-            }
-        }
-    }
-
-    private fun createDisplayTitle(event: LiveEventData): String {
-        val info = event.eventInfo
-        return if (info?.teamA != null && info.teamB != null && info.teamA != info.teamB) "${info.teamA} vs ${info.teamB}" else event.title
-    }
-
-    private fun getFormattedTime(event: LiveEventData): String {
-        val timeStr = event.eventInfo?.startTime ?: return ""
-        return try {
-            val parsed = SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US).parse(timeStr)
-            parsed?.let { SimpleDateFormat("dd MMM, HH:mm", Locale.getDefault()).format(it) } ?: ""
-        } catch (e: Exception) { "" }
-    }
-
-    private fun getEventStatus(event: LiveEventData): String {
-        val info = event.eventInfo ?: return ""
-        val now = System.currentTimeMillis()
-        return try {
-            val format = SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US)
-            val start = info.startTime?.let { format.parse(it)?.time }
-            val end = info.endTime?.let { format.parse(it)?.time }
-            when { 
-                end != null && now >= end -> "✅"
-                start != null && now >= start -> "🔴"
-                start != null && now < start -> "🔜"
-                else -> "" 
-            }
-        } catch (e: Exception) { "" }
-    }
-
-    private fun isEventLive(event: LiveEventData): Boolean {
-        val info = event.eventInfo ?: return false
-        val now = System.currentTimeMillis()
-        return try {
-            val format = SimpleDateFormat("yyyy/MM/dd HH:mm:ss Z", Locale.US)
-            val start = info.startTime?.let { format.parse(it)?.time }
-            val end = info.endTime?.let { format.parse(it)?.time }
-            (end == null || now < end) && start != null && now >= start
-        } catch (e: Exception) { false }
-    }
-
-    private fun generateMatchCardUrl(event: LiveEventData): String {
-        val info = event.eventInfo
-        val time = getFormattedTime(event)
-        return buildString {
-            append("https://live-card-png.cricify.workers.dev/?")
-            append("title=${java.net.URLEncoder.encode(info?.eventName ?: event.title, "UTF-8")}")
-            append("&teamA=${java.net.URLEncoder.encode(info?.teamA ?: "Team A", "UTF-8")}")
-            append("&teamB=${java.net.URLEncoder.encode(info?.teamB ?: "Team B", "UTF-8")}")
-            info?.teamAFlag?.let { append("&teamAImg=$it") }
-            info?.teamBFlag?.let { append("&teamBImg=$it") }
-            info?.eventLogo?.let { append("&eventLogo=$it") }
-            append("&isLive=${isEventLive(event)}")
-            
-            if (time.isNotBlank() && !isEventLive(event)) {
-                append("&time=${java.net.URLEncoder.encode(time, "UTF-8")}")
             }
         }
     }
