@@ -4,14 +4,12 @@ plugins {
     id("com.lagradost.cloudstream3.gradle")
 }
 
-version = "2"
-
 cloudstream {
     description = "Aim to piss Adsproviders"
     authors = listOf("AC321-beep")   
     status = 1
     language = "en"
-    version = 2
+    version = 3
     iconUrl = "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/refs/heads/master/Adfree/Icon.png"
 }
 
