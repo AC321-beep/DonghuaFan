@@ -7,8 +7,11 @@ plugins {
 version = "2"
 
 cloudstream {
-    setRepo(System.getenv("REPO_URL") ?: "https://github.com/AC321-beep/DonghuaFan")
-    
+    description = "Aim to piss Adsproviders"
+    authors = listOf("AC321-beep")   
+    status = 1
+    language = "en"
+    version = 2
     iconUrl = "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/refs/heads/master/Adfree/Icon.png"
 }
 
