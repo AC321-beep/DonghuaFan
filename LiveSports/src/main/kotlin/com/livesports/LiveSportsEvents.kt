@@ -40,12 +40,12 @@ class LiveSportsEvents : MainAPI() {
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    // 1. Centralized Enum for clear states (Order defines sorting priority)
-    enum class EventState(val emoji: String, val text: String) {
-        LIVE("🔴", "Live"),
-        UPCOMING("🔜", "Upcoming"),
-        ENDED("✅", "Ended"),
-        UNKNOWN("📺", "Unknown")
+    // 1. Centralized Enum for clear states
+    enum class EventState(val emoji: String) {
+        LIVE("🔴"),
+        UPCOMING("🔜"),
+        ENDED("✅"),
+        UNKNOWN("📺")
     }
 
     // 2. Single robust date parser
@@ -56,36 +56,26 @@ class LiveSportsEvents : MainAPI() {
         } catch (e: Exception) { null }
     }
 
-    // 3. Centralized state logic with a 4-hour fallback
+    // 3. Status Logic (Mirrors the working code's exact chronological checks)
     private fun getEventState(event: LiveEventData): EventState {
         val info = event.eventInfo ?: return EventState.UNKNOWN
-        val start = parseEventDate(info.startTime) ?: return EventState.UNKNOWN
-        
-        // If API doesn't provide an end time, assume the match lasts 4 hours
-        val end = parseEventDate(info.endTime) ?: (start + TimeUnit.HOURS.toMillis(4))
+        val startTime = parseEventDate(info.startTime)
+        val endTime = parseEventDate(info.endTime)
         val now = System.currentTimeMillis()
 
         return when {
-            now >= end -> EventState.ENDED
-            now in start..end -> EventState.LIVE
-            now < start -> EventState.UPCOMING
+            endTime != null && now >= endTime -> EventState.ENDED
+            startTime != null && now >= startTime -> EventState.LIVE
+            startTime != null && now < startTime -> EventState.UPCOMING
             else -> EventState.UNKNOWN
         }
     }
 
-    // 4a. 12-Hour format for the Cloudstream UI (looks clean)
-    private fun getFormattedTimeForUI(event: LiveEventData): String {
+    // 4. Time format matching the working code exactly (MMM dd, yyyy hh:mm a)
+    private fun getFormattedTime(event: LiveEventData): String {
         val timeMs = parseEventDate(event.eventInfo?.startTime) ?: return ""
         return try {
-            SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()).format(Date(timeMs))
-        } catch (e: Exception) { "" }
-    }
-
-    // 4b. 24-Hour format strictly for the Worker API (prevents the worker from crashing)
-    private fun getFormattedTimeForWorker(event: LiveEventData): String {
-        val timeMs = parseEventDate(event.eventInfo?.startTime) ?: return ""
-        return try {
-            SimpleDateFormat("dd MMM, HH:mm", Locale.US).format(Date(timeMs))
+            SimpleDateFormat("MMM dd, yyyy hh:mm a", Locale.US).format(Date(timeMs))
         } catch (e: Exception) { "" }
     }
 
@@ -94,11 +84,15 @@ class LiveSportsEvents : MainAPI() {
         return if (info?.teamA != null && info.teamB != null && info.teamA != info.teamB) "${info.teamA} vs ${info.teamB}" else event.title
     }
 
-    // 5. Bulletproof Match Card Generator
+    // 5. The Solved Match Card Generator
     private fun generateMatchCardUrl(event: LiveEventData): String {
         val info = event.eventInfo
         val state = getEventState(event)
-        val timeForWorker = getFormattedTimeForWorker(event)
+        val time = getFormattedTime(event)
+        
+        // This is the core fix: Map the Enum strictly to the two boolean flags the Worker demands
+        val isLive = state == EventState.LIVE
+        val isEnded = state == EventState.ENDED
         
         return buildString {
             append("https://live-card-png.cricify.workers.dev/?")
@@ -109,34 +103,20 @@ class LiveSportsEvents : MainAPI() {
             info?.teamBFlag?.let { append("&teamBImg=$it") }
             info?.eventLogo?.let { append("&eventLogo=$it") }
             
-            // CACHE BUSTER: Forces Cloudflare to generate a fresh image, clearing old caches.
-            append("&cb=${System.currentTimeMillis() / 100000}")
+            // Send exactly what the working code sends
+            append("&isLive=$isLive")
+            append("&isEnded=$isEnded")
             
-            // Fix for Cloudflare Worker enforcing "ENDED" on missing flags
-            when (state) {
-                EventState.LIVE -> append("&isLive=true")
-                EventState.ENDED -> append("&isLive=false")
-                EventState.UPCOMING -> {
-                    // Send false so it bypasses Live, but flood the API with Upcoming text overrides
-                    append("&isLive=false&status=Upcoming&state=upcoming&badge=Upcoming") 
-                }
-                else -> {}
-            }
-            
-            // Only append the 24-hour time for upcoming matches so the worker JS doesn't crash
-            if (state == EventState.UPCOMING && timeForWorker.isNotBlank()) {
-                append("&time=${java.net.URLEncoder.encode(timeForWorker, "UTF-8")}")
+            if (time.isNotBlank()) {
+                append("&time=${java.net.URLEncoder.encode(time, "UTF-8")}")
             }
         }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val events = LiveSportsProviderManager.fetchLiveEvents()
-        
-        // Group events by category
         val grouped = events.groupBy { it.eventInfo?.eventCat ?: it.cat ?: "Other" }
         
-        // STRICT CUSTOM ORDER
         val categoryOrder = listOf("football", "cricket", "boxing", "motorsport")
         val sortedCategories = grouped.keys.sortedBy { category ->
             val index = categoryOrder.indexOf(category.lowercase())
@@ -146,7 +126,6 @@ class LiveSportsEvents : MainAPI() {
         val lists = sortedCategories.mapNotNull { category ->
             val list = grouped[category] ?: return@mapNotNull null
             
-            // FIXED: Separated branches down onto distinct lines to fix compiler syntax parsing
             val icon = when (category.lowercase()) { 
                 "cricket" -> "🏏"
                 "football" -> "⚽"
@@ -159,7 +138,7 @@ class LiveSportsEvents : MainAPI() {
                 else -> "📺" 
             }
             
-            // FIXED: Sorting logic refactored to complete expression architecture to drop problematic labels
+            // Advanced Chronological Sorting Retained
             val sortedList = list.sortedWith(Comparator { a, b ->
                 val stateA = getEventState(a)
                 val stateB = getEventState(b)
@@ -180,13 +159,14 @@ class LiveSportsEvents : MainAPI() {
 
             val items = sortedList.map { event ->
                 val state = getEventState(event)
-                val time = getFormattedTimeForUI(event) 
+                val time = getFormattedTime(event) 
                 val baseTitle = createDisplayTitle(event)
                 
                 val title = buildString {
                     if (state != EventState.UNKNOWN) append("${state.emoji} ")
                     append(baseTitle)
                     
+                    // Display time on UI only if not live and not ended
                     if (state == EventState.UPCOMING && time.isNotBlank()) {
                         append(" • $time")
                     }
@@ -243,20 +223,16 @@ class LiveSportsEvents : MainAPI() {
 
         streamResponse.streamUrls?.forEach { stream ->
             val serverName = stream.title ?: "Server"
-            
-            // 1. Extract URL and robust headers
             val (url, headers) = parseStreamLink(stream.link ?: return@forEach)
             if (url.isBlank()) return@forEach
-            
-            // 2. Pass BOTH url and headers to WebView if extraction is needed
             val resolved = resolveEmbedUrlIfNeeded(url, headers) ?: return@forEach
 
             when (stream.type) {
-                "7" -> { // DRM / ClearKey Streams
+                "7" -> { 
                     val drmParts = stream.api?.split(":") ?: return@forEach
                     if (drmParts.size == 2) {
-                        val kid = drmParts[0].hexToBase64UrlOrNull() ?: drmParts[0]
-                        val key = drmParts[1].hexToBase64UrlOrNull() ?: drmParts[1]
+                        val kid = drmParts[0].replace("-", "").hexToBase64UrlOrNull() ?: drmParts[0]
+                        val key = drmParts[1].replace("-", "").hexToBase64UrlOrNull() ?: drmParts[1]
                         val drmHeaders = headers.toMutableMap()
                         
                         drmHeaders["drm_scheme"] = "clearkey"
@@ -272,7 +248,7 @@ class LiveSportsEvents : MainAPI() {
                         callback.invoke(createExtractor(resolved, ExtractorLinkType.DASH, headers, serverName))
                     }
                 }
-                else -> { // Standard HLS/DASH Streams
+                else -> { 
                     val type = if (resolved.contains(".mpd")) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
                     val finalHeaders = headers.toMutableMap()
                     if (type == ExtractorLinkType.M3U8 && !finalHeaders.containsKey("User-Agent")) {
@@ -322,7 +298,6 @@ class LiveSportsEvents : MainAPI() {
             }
         }
 
-        // AUTO-INJECT MISSING ORIGIN FOR CDN 2004 FIX
         if (headers.containsKey("Referer") && !headers.containsKey("Origin")) {
             try {
                 val uri = URI(headers["Referer"]!!)
@@ -331,9 +306,7 @@ class LiveSportsEvents : MainAPI() {
             } catch (e: Exception) { }
         }
 
-        // ANTI-BUFFERING HEADERS FOR EXOPLAYER
         headers["Connection"] = "keep-alive"
-
         return parts[0] to headers
     }
 
