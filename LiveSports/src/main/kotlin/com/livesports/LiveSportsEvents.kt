@@ -88,7 +88,7 @@ class LiveSportsEvents : MainAPI() {
     }
 
     // 5. Fixed Match Card Generator
-    private fun generateMatchCardUrl(event: LiveEventData): String {
+   private fun generateMatchCardUrl(event: LiveEventData): String {
         val info = event.eventInfo
         val state = getEventState(event)
         val time = getFormattedTime(event)
@@ -102,14 +102,12 @@ class LiveSportsEvents : MainAPI() {
             info?.teamBFlag?.let { append("&teamBImg=$it") }
             info?.eventLogo?.let { append("&eventLogo=$it") }
             
-            // Fix for Cloudflare Worker enforcing "ENDED" on missing flags
+            // THE FIX: Send the string "Upcoming" directly to the isLive parameter.
+            // If the worker supports it, this overrides the "ENDED" text on the badge.
             when (state) {
                 EventState.LIVE -> append("&isLive=true")
                 EventState.ENDED -> append("&isLive=false")
-                EventState.UPCOMING -> {
-                    // Force the worker to recognize upcoming parameters
-                    append("&status=Upcoming&state=upcoming&isUpcoming=true") 
-                }
+                EventState.UPCOMING -> append("&isLive=Upcoming") 
                 else -> {}
             }
             
