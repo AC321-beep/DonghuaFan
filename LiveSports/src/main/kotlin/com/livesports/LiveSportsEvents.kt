@@ -74,11 +74,19 @@ class LiveSportsEvents : MainAPI() {
     }
 
     // 4. 12-Hour format clean time string
-    private fun getFormattedTime(event: LiveEventData): String {
+    // 4a. 12-Hour format for the Cloudstream UI (looks clean)
+    private fun getFormattedTimeForUI(event: LiveEventData): String {
         val timeMs = parseEventDate(event.eventInfo?.startTime) ?: return ""
         return try {
-            // 12-hour format: hh:mm a (e.g., 05:30 PM)
             SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()).format(Date(timeMs))
+        } catch (e: Exception) { "" }
+    }
+
+    // 4b. 24-Hour format strictly for the Worker API (prevents the worker from crashing)
+    private fun getFormattedTimeForWorker(event: LiveEventData): String {
+        val timeMs = parseEventDate(event.eventInfo?.startTime) ?: return ""
+        return try {
+            SimpleDateFormat("dd MMM, HH:mm", Locale.US).format(Date(timeMs))
         } catch (e: Exception) { "" }
     }
 
@@ -87,11 +95,11 @@ class LiveSportsEvents : MainAPI() {
         return if (info?.teamA != null && info.teamB != null && info.teamA != info.teamB) "${info.teamA} vs ${info.teamB}" else event.title
     }
 
-    // 5. Fixed Match Card Generator
-   private fun generateMatchCardUrl(event: LiveEventData): String {
+    // 5. Bulletproof Match Card Generator
+    private fun generateMatchCardUrl(event: LiveEventData): String {
         val info = event.eventInfo
         val state = getEventState(event)
-        val time = getFormattedTime(event)
+        val timeForWorker = getFormattedTimeForWorker(event)
         
         return buildString {
             append("https://live-card-png.cricify.workers.dev/?")
@@ -102,22 +110,25 @@ class LiveSportsEvents : MainAPI() {
             info?.teamBFlag?.let { append("&teamBImg=$it") }
             info?.eventLogo?.let { append("&eventLogo=$it") }
             
-            // THE FIX: Send the string "Upcoming" directly to the isLive parameter.
-            // If the worker supports it, this overrides the "ENDED" text on the badge.
+            // CACHE BUSTER: Forces Cloudflare to generate a fresh image, clearing old "Ended" caches.
+            // Divides by 100000 so the cache resets roughly every 1.5 minutes instead of every millisecond.
+            append("&cb=${System.currentTimeMillis() / 100000}")
+            
+            // Revert isLive to false so it doesn't break strict boolean checks, 
+            // but flood it with every known status parameter for "Upcoming"
             when (state) {
                 EventState.LIVE -> append("&isLive=true")
                 EventState.ENDED -> append("&isLive=false")
-                EventState.UPCOMING -> append("&isLive=Upcoming") 
+                EventState.UPCOMING -> append("&isLive=false&status=Upcoming&state=upcoming&badge=Upcoming") 
                 else -> {}
             }
             
-            // Only append time for upcoming matches
-            if (state == EventState.UPCOMING && time.isNotBlank()) {
-                append("&time=${java.net.URLEncoder.encode(time, "UTF-8")}")
+            // Send the 24-hour time format so the worker's parser doesn't crash
+            if (state == EventState.UPCOMING && timeForWorker.isNotBlank()) {
+                append("&time=${java.net.URLEncoder.encode(timeForWorker, "UTF-8")}")
             }
         }
     }
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val events = LiveSportsProviderManager.fetchLiveEvents()
         
