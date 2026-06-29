@@ -6,7 +6,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
-import kotlinx.coroutines.runBlocking // FIXED: Added missing Coroutines import
 
 class FootballReplays : MainAPI() {
     override var mainUrl = "https://www.footreplays.com"
@@ -133,14 +132,12 @@ class FootballReplays : MainAPI() {
         Log.d("FootballReplays", "Iframe Url: $iframeUrl")
 
         loadExtractor(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
-            val extractedLink = runBlocking {
-                newExtractorLink(
-                    source = customName,
-                    name = customName,
-                    url = link.url,
-                    type = link.type
-                )
-            }
+            // Use Kotlin's .copy() to rename the link synchronously.
+            // This safely avoids all coroutine crash issues AND preserves essential video headers.
+            val extractedLink = link.copy(
+                source = customName,
+                name = customName
+            )
             callback(extractedLink)
         }
 
