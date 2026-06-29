@@ -4,7 +4,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.extractors.VidHidePro
 import org.jsoup.nodes.Element
-import java.net.URI
 import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
     override var name = "Lucifer Donghua"
@@ -93,11 +92,10 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                         else -> httpsUrl
                     }
 
-                    // Execute Extractors using the final immutable URL
+                    // Execute Extractors directly using the URL
                     if (finalUrl.contains("vidhide", true)) {
                         try { 
-                            val domain = "https://" + URI(finalUrl).host
-                            VidHidePro().apply { mainUrl = domain }.getUrl(finalUrl, referer, subtitleCallback, callback)
+                            VidHidePro().getUrl(finalUrl, referer, subtitleCallback, callback)
                             anyStreamFound = true 
                         } catch(e: Exception) {}
                     } else if (loadExtractor(finalUrl, referer, subtitleCallback, callback)) {
@@ -150,8 +148,7 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
 
                             if (finalDest.contains("vidhide", true)) {
                                 try {
-                                    val domain = "https://" + URI(finalDest).host
-                                    VidHidePro().apply { mainUrl = domain }.getUrl(finalDest, data, subtitleCallback, callback)
+                                    VidHidePro().getUrl(finalDest, data, subtitleCallback, callback)
                                     anyStreamFound = true
                                 } catch(e: Exception) {}
                             } else if (loadExtractor(finalDest, data, subtitleCallback, callback)) {
