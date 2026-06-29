@@ -21,8 +21,8 @@ class LuciferDonghuaProvider : MainAPI() {
         "$mainUrl/anime/?status=completed" to "Completed"
     )
 
-    // Register all custom extractors + built‑ins are auto‑registered
-    override val extractorApis: List<ExtractorApi> = listOf(
+    // ✅ Fix: override fun, not val
+    override fun getExtractorApis(): List<ExtractorApi> = listOf(
         Rumble(),
         PlayStreamplay(),
         VidHideCustom(),
@@ -153,7 +153,6 @@ class LuciferDonghuaProvider : MainAPI() {
                             loadExtractor(clean, mainUrl, subtitleCallback, callback)
                         }
                     } else {
-                        // Fallback: video tag or script regex
                         val video = mirrorDoc.selectFirst("video[src]")
                         if (video != null) {
                             callback(
