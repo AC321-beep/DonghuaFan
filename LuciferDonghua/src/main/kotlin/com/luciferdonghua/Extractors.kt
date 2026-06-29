@@ -10,6 +10,7 @@ import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.INFER_TYPE
+import com.lagradost.cloudstream3.utils.JsUnpacker       // ✅ added import
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.newExtractorLink
@@ -106,7 +107,7 @@ class PlayStreamplay : ExtractorApi() {
         val packedScript = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return
         val evalRegex = Regex("""eval\(.*?\)\)\)""", RegexOption.DOT_MATCHES_ALL)
         val packedCode = evalRegex.find(packedScript)?.value ?: return
-        val unpackedJs = JsUnpacker(packedCode).unpack() ?: return
+        val unpackedJs = JsUnpacker(packedCode).unpack() ?: return   // ✅ now works
         val token = Regex("""kaken="(.*?)"""").find(unpackedJs)?.groupValues?.getOrNull(1) ?: return
         val apiUrl = "$mainUrl/api/?$token"
         val response = app.get(apiUrl, timeout = 10000).parsedSafe<Response>() ?: return
@@ -145,6 +146,10 @@ class VidHideProCustom : VidHidePro() {
 // ==========================================
 // RUMBLE SUBCLASSES for specific domains
 // ==========================================
+class PlayerDonghuaworld : Rumble() {
+    override var mainUrl = "https://player.donghuaworld.in"
+    override val requiresReferer = true
+}
 
 class Donghuaplanet : Rumble() {
     override var mainUrl = "https://player.donghuaplanet.com"
