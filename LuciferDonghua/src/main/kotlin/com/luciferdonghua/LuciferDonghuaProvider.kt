@@ -3,15 +3,17 @@ package com.luciferdonghua
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.extractors.VidhideExtractor
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
+import java.net.URI
 
 class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
     override var name = "Lucifer Donghua"
     override val hasMainPage = true
-    override var lang = "zh"
+    override var lang = "en"
     override val hasQuickSearch = true
 
     private val defaultHeaders = mapOf(
@@ -109,7 +111,6 @@ class LuciferDonghuaProvider : MainAPI() {
         }
     }
 
-    // Your Dailymotion Token logic
     private suspend fun extractDailymotionToken(pageUrl: String): String? {
         val pageHtml = try { app.get(pageUrl, headers = defaultHeaders).text } catch (e: Exception) { return null }
         val pageDoc = try { Jsoup.parse(pageHtml) } catch (e: Exception) { null }
@@ -145,48 +146,43 @@ class LuciferDonghuaProvider : MainAPI() {
     ): Boolean {
         var anyStreamFound = false
 
-        // Enhanced Core Helper: Domain Normalization
         suspend fun extractIframes(doc: org.jsoup.nodes.Document, refererUrl: String) {
             doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
                 var src = iframe.attr("src")
                 if (src.startsWith("//")) src = "https:$src"
-                val clean = fixUrlNull(src)
+                val clean = fixUrlNull(src) ?: return@forEach
                 
-                if (clean != null && clean.isNotBlank() && !clean.contains("about:blank")) {
+                if (clean.isNotBlank() && !clean.contains("about:blank")) {
                     
-                    // --- 1. DAILYMOTION FIX ---
+                    // --- 1. RESTORED DAILYMOTION LOGIC ---
                     if ("dailymotion" in clean) {
                         var token = Regex("""[?&]video=([^&]+)""").find(clean)?.groupValues?.get(1)
                         if (token == null) token = extractDailymotionToken(refererUrl)
                         if (token != null) {
-                            // Convert back to standard DM url so Cloudstream's native extractor catches it!
-                            val embedUrl = "https://www.dailymotion.com/video/$token"
-                            if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
-                                anyStreamFound = true
-                            }
+                            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$token"
+                            loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)
+                            anyStreamFound = true
                             return@forEach 
                         }
                     }
 
-                    // --- 2. VIDHIDE & STREAMPLAY NORMALIZATION ---
-                    var extractorUrl = clean
-                    
-                    // Forces vidhideplus, vidhidevip, etc. to match the "vidhide.com" extractor you registered
+                    // --- 2. DYNAMIC VIDHIDE EXTRACTION ---
                     if (clean.contains("vidhide", ignoreCase = true)) {
-                        extractorUrl = clean.replace(Regex("""vidhide\w*\.[a-z]+"""), "vidhide.com")
-                    }
-                    
-                    // Forces streamplay.to, streamplay.cc, etc. to match "play.streamplay.co.in"
-                    if (clean.contains("streamplay", ignoreCase = true)) {
-                        extractorUrl = clean.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
+                        try {
+                            val domain = "https://" + URI(clean).host
+                            // We dynamically instantiate the built-in extractor and assign the live domain
+                            val extractor = VidhideExtractor().apply { mainUrl = domain }
+                            extractor.getUrl(clean, refererUrl, subtitleCallback, callback)
+                            anyStreamFound = true
+                        } catch (e: Exception) {}
+                        return@forEach
                     }
 
-                    // --- 3. TRIGGER EXTRACTORS ---
-                    if (loadExtractor(extractorUrl, refererUrl, subtitleCallback, callback)) {
+                    // --- 3. STANDARD EXTRACTORS (Rumble, OK.ru, etc.) ---
+                    if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
                         anyStreamFound = true
                     } else {
-                        // --- 4. BRUTEFORCE HTML FALLBACK ---
-                        // If an extractor fails (or is missing), we visit the iframe directly and hunt for .m3u8 files in the raw text
+                        // Fallback: Manually scrape .m3u8 files from unmapped iframes
                         try {
                             val iframeHtml = app.get(clean, headers = mapOf("Referer" to refererUrl)).text
                             val rawStreamRegex = Regex("""["'](https?[^"']+\.(?:m3u8|mp4)[^"']*)["']""")
