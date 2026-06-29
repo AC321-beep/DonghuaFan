@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
 import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
+import kotlinx.coroutines.runBlocking // FIXED: Added missing Coroutines import
 
 class FootballReplays : MainAPI() {
     override var mainUrl = "https://www.footreplays.com"
@@ -132,7 +133,7 @@ class FootballReplays : MainAPI() {
         Log.d("FootballReplays", "Iframe Url: $iframeUrl")
 
         loadExtractor(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
-            val extractedLink = kotlinx.coroutines.runBlocking {
+            val extractedLink = runBlocking {
                 newExtractorLink(
                     source = customName,
                     name = customName,
