@@ -3,7 +3,11 @@ package com.luciferdonghua
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.extractors.VidhideExtractor
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import java.net.URLDecoder
+import java.net.URI
 
 class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
@@ -115,12 +119,10 @@ class LuciferDonghuaProvider : MainAPI() {
     ): Boolean {
         var anyStreamFound = false
 
-        // Core processing function applied to both Main Page and Mirror sub-pages
         suspend fun processDocument(doc: org.jsoup.nodes.Document, refererUrl: String) {
-            
-            // =========================================================
-            // 1. EXACT Dailymotion Logic Intact (From Donghuafun code)
-            // =========================================================
+            // ==========================================
+            // 1. EXACT Dailymotion Logic Intact
+            // ==========================================
             var dailymotionToken: String? = null
             doc.select("iframe[src*='dailymotion']").forEach { iframe ->
                 val src = iframe.attr("src")
@@ -137,23 +139,29 @@ class LuciferDonghuaProvider : MainAPI() {
                 }
             }
 
-            // =========================================================
-            // 2. Main Player Logic for other Servers (Rumble, Vidhide)
-            // =========================================================
+            // ==========================================
+            // 2. Extract Other Iframes (Rumble, Vidhide, etc.)
+            // ==========================================
             doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
                 var src = iframe.attr("src")
                 if (src.startsWith("//")) src = "https:$src"
                 var cleanUrl = fixUrlNull(src) ?: return@forEach
-                
-                // Skip if it's blank or if we already caught it in the Dailymotion block above
+
+                // Skip if blank, or if it's dailymotion (already handled above)
                 if (cleanUrl.isNotBlank() && !cleanUrl.contains("about:blank") && !cleanUrl.contains("dailymotion", ignoreCase = true)) {
                     
-                    // Vidhide Domain Normalization (So it matches your Extractors.kt)
+                    // --- VidHide dynamic extraction to handle domain rotation ---
                     if (cleanUrl.contains("vidhide", ignoreCase = true)) {
-                        cleanUrl = cleanUrl.replace(Regex("""vidhide\w*\.[a-z]+"""), "vidhide.com")
+                        try {
+                            val domain = "https://" + URI(cleanUrl).host
+                            val extractor = VidhideExtractor().apply { mainUrl = domain }
+                            extractor.getUrl(cleanUrl, refererUrl, subtitleCallback, callback)
+                            anyStreamFound = true
+                        } catch (e: Exception) {}
+                        return@forEach
                     }
 
-                    // StreamPlay Domain Normalization
+                    // --- StreamPlay Domain Normalization ---
                     if (cleanUrl.contains("streamplay", ignoreCase = true)) {
                         cleanUrl = cleanUrl.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
                     }
@@ -167,11 +175,11 @@ class LuciferDonghuaProvider : MainAPI() {
 
         // --- Execute Flow ---
         
-        // 1. Process the primary episode page
+        // 1. Process Main Episode Page
         val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return false }
         processDocument(baseDocument, data)
 
-        // 2. Find and visit all mirror pages in the dropdown
+        // 2. Process all Mirror Dropdown URLs (/v/1/, /v/2/, etc.)
         val mirrorUrls = baseDocument.select("select.mirror option").mapNotNull { option ->
             val url = option.attr("value")
             if (url.startsWith("http") && url != data) url else null
@@ -186,17 +194,23 @@ class LuciferDonghuaProvider : MainAPI() {
                     var cleanDest = response.url
                     
                     if (cleanDest.contains("vidhide", ignoreCase = true)) {
-                        cleanDest = cleanDest.replace(Regex("""vidhide\w*\.[a-z]+"""), "vidhide.com")
-                    }
-                    if (loadExtractor(cleanDest, data, subtitleCallback, callback)) {
-                        anyStreamFound = true
+                        try {
+                            val domain = "https://" + URI(cleanDest).host
+                            val extractor = VidhideExtractor().apply { mainUrl = domain }
+                            extractor.getUrl(cleanDest, data, subtitleCallback, callback)
+                            anyStreamFound = true
+                        } catch (e: Exception) {}
+                    } else if (!cleanDest.contains("dailymotion", ignoreCase = true)) {
+                        if (loadExtractor(cleanDest, data, subtitleCallback, callback)) {
+                            anyStreamFound = true
+                        }
                     }
                 } else {
-                    // Otherwise, process the standard mirror iframe page
+                    // Standard mirror iframe page
                     processDocument(response.document, mirrorUrl)
                 }
             } catch (e: Exception) {
-                // Safely skip dead/timing-out mirror servers
+                // Ignore dead servers gracefully
             }
         }
 
