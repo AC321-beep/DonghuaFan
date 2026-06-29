@@ -7,7 +7,6 @@ import org.jsoup.nodes.Element
 class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
     override var name = "Lucifer Donghua"
-    // iconUrl is now set in build.gradle.kts (cloudstream block)
     override val hasMainPage = true
     override var lang = "en"
     override val hasQuickSearch = true
@@ -22,14 +21,12 @@ class LuciferDonghuaProvider : MainAPI() {
         "$mainUrl/anime/?status=completed" to "Completed"
     )
 
-    // ✅ Use override val instead of fun
+    // Register all custom extractors + built‑ins are auto‑registered
     override val extractorApis: List<ExtractorApi> = listOf(
         Rumble(),
         PlayStreamplay(),
         VidHideCustom(),
-        VidHideProCustom(),
-        PlayerDonghuaworld(),
-        Donghuaplanet()
+        VidHideProCustom()
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -120,7 +117,7 @@ class LuciferDonghuaProvider : MainAPI() {
     ): Boolean {
         val document = app.get(data).document
 
-        // 1️⃣ Default iframe (Dailymotion, etc.) – loadExtractor handles it
+        // 1️⃣ Default iframe (Dailymotion)
         val defaultIframe = document.selectFirst("#pembed iframe, .player-embed iframe")
         if (defaultIframe != null) {
             var src = defaultIframe.attr("src")
@@ -131,7 +128,7 @@ class LuciferDonghuaProvider : MainAPI() {
             }
         }
 
-        // 2️⃣ Parse mirror dropdown and scrape each server
+        // 2️⃣ Mirror dropdown – fetch each mirror page and extract
         val mirrorSelect = document.selectFirst("select.mirror")
         if (mirrorSelect != null) {
             val options = mirrorSelect.select("option")
@@ -156,6 +153,7 @@ class LuciferDonghuaProvider : MainAPI() {
                             loadExtractor(clean, mainUrl, subtitleCallback, callback)
                         }
                     } else {
+                        // Fallback: video tag or script regex
                         val video = mirrorDoc.selectFirst("video[src]")
                         if (video != null) {
                             callback(
