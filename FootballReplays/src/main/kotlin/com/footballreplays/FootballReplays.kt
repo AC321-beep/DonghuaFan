@@ -4,9 +4,6 @@ import android.util.Log
 import org.jsoup.nodes.Element
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 class FootballReplays : MainAPI() {
     override var mainUrl = "https://www.footreplays.com"
@@ -28,20 +25,6 @@ class FootballReplays : MainAPI() {
         "${mainUrl}/portugal/" to "Portugal",
         "${mainUrl}/other/" to "Other"
     )
-
-    // SAFE DATE PARSER: Mimics the working logic from LiveSportsEvents
-    private fun parseEventDate(dateStr: String?): Long? {
-        if (dateStr.isNullOrBlank()) return null
-        return try {
-            // Converts web format "2023-11-04T12:00:00+00:00" -> safely readable "2023-11-04 12:00:00+0000"
-            val cleanStr = dateStr.replace("T", " ").let {
-                if (it.length >= 25 && it[22] == ':') {
-                    it.substring(0, 22) + it.substring(23)
-                } else it
-            }
-            SimpleDateFormat("yyyy-MM-dd HH:mm:ssZ", Locale.US).parse(cleanStr)?.time
-        } catch (e: Exception) { null }
-    }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val siteurl = if (page > 1) "${request.data.removeSuffix("/")}/page/$page/" else request.data
@@ -85,11 +68,21 @@ class FootballReplays : MainAPI() {
 
         val title = document.selectFirst("h1.s-title")?.text()?.trim() ?: return null
         val poster = fixUrlNull(document.selectFirst("div.s-feat img")?.attr("src"))
+        val year = document.selectFirst("time.updated-date")?.attr("datetime")?.substringBefore("-")?.toIntOrNull()
         
-        val timeElement = document.selectFirst("time.updated-date")
-        val rawDateText = timeElement?.text()?.trim()
-        val datetimeAttr = timeElement?.attr("datetime")
-        val year = datetimeAttr?.substringBefore("-")?.toIntOrNull()
+        // Grab the raw description
+        val rawDescription = document.selectFirst("meta[property=og:description]")?.attr("content")?.trim() ?: ""
+        
+        // 1. Try to find the exact "Kick-off" time buried in the description
+        val kickOffRegex = Regex("""Kick-off:\s*([^.]+)""", RegexOption.IGNORE_CASE)
+        val kickOffMatch = kickOffRegex.find(rawDescription)?.groupValues?.getOrNull(1)
+
+        // 2. Fallback to the web article date, but strip the ugly "Last updated: " text
+        val fallbackDate = document.selectFirst("time.updated-date")?.text()
+            ?.replace("Last updated:", "", ignoreCase = true)?.trim()
+
+        // Choose the best available date
+        val displayDate = kickOffMatch ?: fallbackDate
 
         val episodes = mutableListOf<Episode>()
         document.select("table.video-table").forEach { table ->
@@ -104,7 +97,6 @@ class FootballReplays : MainAPI() {
                 val currentEpisodeSize = episodes.size
 
                 episodes.add(
-                    // STRICTLY safe Episode creation. No custom date properties here to avoid crashes.
                     newEpisode(data = episodeData) {
                         this.name = "$sourceName - $part"
                         this.episode = currentEpisodeSize + 1
@@ -113,24 +105,14 @@ class FootballReplays : MainAPI() {
             }
         }
 
-        // DATE & TIME BUILDER: Exact match of the LiveSportsEvents plot generation logic
+        // PERFECTLY FORMATTED SYNOPSIS
         val plotText = buildString {
-            if (!datetimeAttr.isNullOrBlank()) {
-                val parsedMs = parseEventDate(datetimeAttr)
-                if (parsedMs != null) {
-                    append("🕐 ${SimpleDateFormat("MMM dd, yyyy hh:mm a", Locale.US).format(Date(parsedMs))}\n\n")
-                } else if (!rawDateText.isNullOrBlank()) {
-                    append("🕐 $rawDateText\n\n")
-                }
-            } else if (!rawDateText.isNullOrBlank()) {
-                append("🕐 $rawDateText\n\n")
+            if (!displayDate.isNullOrBlank()) {
+                append("🕒 Match Date: $displayDate\n\n")
             }
-
-            val rawDescription = document.selectFirst("meta[property=og:description]")?.attr("content")?.trim()
-            if (!rawDescription.isNullOrBlank()) {
+            if (rawDescription.isNotBlank()) {
                 append("$rawDescription\n\n")
             }
-            
             append("📡 Available Streams: ${episodes.size}")
         }
 
@@ -138,21 +120,33 @@ class FootballReplays : MainAPI() {
 
         return newTvSeriesLoadResponse(title, url, TvType.Others, episodes) {
             this.posterUrl = poster
-            this.plot = plotText // The UI handles all standard text perfectly without crashing
+            this.plot = plotText
             this.year = year
             this.tags = document.select("div.efoot-bar.tag-bar a").map { it.text() }
             this.recommendations = document.select("div.p-wrap.p-grid").mapNotNull { it.toRecommendationResult() }
         }
     }
 
+    // HOME PAGE CARD FORMATTER
     private fun Element.toRecommendationResult(): SearchResponse? {
-        val title = this.selectFirst("h4.entry-title a, a.p-flink")?.attr("title")
+        val baseTitle = this.selectFirst("h4.entry-title a, a.p-flink")?.attr("title")
             ?.takeIf { it.isNotBlank() } ?: this.selectFirst("h4.entry-title a")?.text()?.trim()
             ?: return null
         val href = fixUrlNull(this.selectFirst("a.p-flink, h4.entry-title a")?.attr("href")) ?: return null
         val posterUrl = fixUrlNull(this.selectFirst("div.p-featured img")?.attr("src"))
 
-        return newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+        // Grab the date from the homepage card and clean it up
+        val dateText = this.selectFirst("time")?.text()
+            ?.replace("Last updated:", "", ignoreCase = true)?.trim()
+
+        // Combine title and date for a perfect UI display (e.g. "Team A vs Team B • 28/06/2026")
+        val displayTitle = if (!dateText.isNullOrBlank()) {
+            "$baseTitle • $dateText"
+        } else {
+            baseTitle
+        }
+
+        return newTvSeriesSearchResponse(displayTitle, href, TvType.TvSeries) {
             this.posterUrl = posterUrl
         }
     }
