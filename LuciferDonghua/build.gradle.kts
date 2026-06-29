@@ -5,5 +5,5 @@ cloudstream {
     tvTypes = listOf("Anime")
     language = "zh"
     version = 1
-    iconUrl = "https://donghuastream.org/wp-content/uploads/2023/05/Donghua-Stream--1024x1024.jpeg"
+    iconUrl = "https://i0.wp.com/luciferdonghua.in/wp-content/uploads/2022/12/cropped-lucifer-donghua-DP-192x192.webp"
 }
