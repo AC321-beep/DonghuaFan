@@ -14,10 +14,9 @@ class LuciferDonghuaProvider : MainAPI() {
     override var lang = "en"
     override val hasQuickSearch = true
 
-    // Custom headers – essential for Dailymotion and to avoid blocking
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-        "Referer" to mainUrl,
+        "Referer" to "$mainUrl/",
         "Origin" to mainUrl
     )
 
@@ -85,8 +84,7 @@ class LuciferDonghuaProvider : MainAPI() {
         document.select(".eplister ul li, #episode_list li, .listeps ul li").forEach { ep ->
             val linkElement = ep.selectFirst("a") ?: return@forEach
             val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
-            val epName = linkElement.selectFirst(".epl-num, .epnum")?.text()?.trim()
-                ?: ep.text().trim()
+            val epName = linkElement.selectFirst(".epl-num, .epnum")?.text()?.trim() ?: ep.text().trim()
             val epNum = epName.filter { it.isDigit() }.toIntOrNull()
 
             episodes.add(
@@ -111,21 +109,18 @@ class LuciferDonghuaProvider : MainAPI() {
         }
     }
 
-    // ----- Dailymotion token extraction (matching Donghuastream logic) -----
     private suspend fun extractDailymotionToken(pageUrl: String): String? {
         val pageHtml = try {
             app.get(pageUrl, headers = defaultHeaders).text
         } catch (e: Exception) { return null }
         val pageDoc = try { Jsoup.parse(pageHtml) } catch (e: Exception) { null }
 
-        // 1) Look for iframe with dailymotion in src
         pageDoc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
             val src = iframe.attr("src")
             val match = Regex("""[?&]video=([^&]+)""").find(src)
             if (match != null) return match.groupValues[1]
         }
 
-        // 2) Fallback: parse player_aaaa JSON
         val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
             .find(pageHtml)?.groupValues?.get(1)
         if (playerJson != null) {
@@ -146,138 +141,82 @@ class LuciferDonghuaProvider : MainAPI() {
         return null
     }
 
+    private suspend fun tryExtractFromPage(pageUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        var found = false
+        val html = try { app.get(pageUrl, headers = architectureHeaders(pageUrl)).text } catch (e: Exception) { return false }
+        val doc = Jsoup.parse(html)
+
+        doc.select("iframe, .player-embed iframe, div[id*='player'] iframe").forEach { iframe ->
+            var iframeUrl = iframe.attr("src")
+            if (iframeUrl.startsWith("//")) iframeUrl = "https:$iframeUrl"
+            val cleanUrl = fixUrlNull(iframeUrl)
+            
+            if (cleanUrl != null && !cleanUrl.contains("about:blank")) {
+                if (loadExtractor(cleanUrl, pageUrl, subtitleCallback, callback)) {
+                    found = true
+                }
+            }
+        }
+        
+        // Final fallback script-comber for loose stream configurations
+        val rawStreamRegex = Regex("""["'](https?[^"']+\.(?:m3u8|mpd|mp4)[^"']*)["']""")
+        rawStreamRegex.findAll(html).forEach { match ->
+            val cleanStreamUrl = match.groupValues[1].replace("\\/", "/")
+            val linkType = if (cleanStreamUrl.contains(".mpd")) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
+            
+            callback(
+                ExtractorLink(
+                    source = "Lucifer Mirror",
+                    name = "Lucifer Mirror",
+                    url = cleanStreamUrl,
+                    referer = pageUrl,
+                    quality = Qualities.Unknown.value,
+                    type = linkType,
+                    headers = architectureHeaders(pageUrl)
+                )
+            )
+            found = true
+        }
+        
+        return found
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data, headers = defaultHeaders).document
-
-        // Helper: try to extract from a page (mirror or main)
-        suspend fun tryExtractFromPage(pageUrl: String, pageDoc: org.jsoup.nodes.Document): Boolean {
-            // 1. Try any iframe via loadExtractor with the pageUrl as referer
-            val iframe = pageDoc.selectFirst("iframe[src]")
-            if (iframe != null) {
-                var src = iframe.attr("src")
-                if (src.startsWith("//")) src = "https:$src"
-                val clean = fixUrlNull(src)
-                if (clean != null && clean.isNotBlank()) {
-                    // Special Dailymotion handling
-                    if ("dailymotion" in clean) {
-                        var token = Regex("""[?&]video=([^&]+)""").find(clean)?.groupValues?.get(1)
-                        if (token == null) {
-                            token = extractDailymotionToken(clean)
-                        }
-                        if (token != null) {
-                            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$token"
-                            val success = loadExtractor(embedUrl, pageUrl, subtitleCallback, callback)
-                            if (success) return true
-                        }
-                        // If token extraction failed, fall through to generic loadExtractor
-                    }
-
-                    val success = loadExtractor(clean, pageUrl, subtitleCallback, callback)
-                    if (success) return true
+        // First try processing the base page itself
+        var anyStreamFound = tryExtractFromPage(data, subtitleCallback, callback)
+        
+        val baseDocument = try { app.get(data, headers = architectureHeaders(data)).document } catch(e: Exception) { return false }
+        
+        // Scan for alternative options/servers in the WordPress selector dropdowns
+        baseDocument.select(".custom-menu li a, .player-option, #player-option-list li").forEach { option ->
+            val optionValue = option.attr("data-value") ?: option.attr("value") ?: ""
+            if (optionValue.isNotBlank()) {
+                // Correctly resolve paths whether they are absolute links or relative parameters
+                val targetUrl = when {
+                    optionValue.startsWith("http") -> optionValue
+                    optionValue.startsWith("?") -> "${data.substringBefore("?")}$optionValue"
+                    else -> "${data.removeSuffix("/")}/${optionValue.removePrefix("/")}"
                 }
-            }
-
-            // 2. Try to use loadExtractor on the page itself (in case the page is a player)
-            val pageExtractSuccess = loadExtractor(pageUrl, pageUrl, subtitleCallback, callback)
-            if (pageExtractSuccess) return true
-
-            // 3. Fallback: regex for video URLs in the page
-            val scriptRegex = Regex("""(?:file|video_url|source|src)\s*:\s*["']([^"']+\.(?:m3u8|mp4))["']""")
-            pageDoc.select("script").forEach { script ->
-                scriptRegex.find(script.html())?.let { match ->
-                    val videoUrl = match.groupValues[1]
-                    callback(
-                        newExtractorLink(name, name, videoUrl, ExtractorLinkType.M3U8) {
-                            this.referer = pageUrl
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    return true
-                }
-            }
-
-            // 4. Check for video tag
-            val video = pageDoc.selectFirst("video[src]")
-            if (video != null) {
-                callback(
-                    newExtractorLink(name, name, video.attr("src"), ExtractorLinkType.M3U8) {
-                        this.referer = pageUrl
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-                return true
-            }
-
-            return false
-        }
-
-        // 1️⃣ Default iframe (Dailymotion, Rumble, etc.) with data as referer
-        val defaultIframe = document.selectFirst("#pembed iframe, .player-embed iframe")
-        if (defaultIframe != null) {
-            var src = defaultIframe.attr("src")
-            if (src.startsWith("//")) src = "https:$src"
-            val clean = fixUrlNull(src)
-            if (clean != null && clean.isNotBlank()) {
-                // Special Dailymotion handling
-                if ("dailymotion" in clean) {
-                    var token = Regex("""[?&]video=([^&]+)""").find(clean)?.groupValues?.get(1)
-                    if (token == null) {
-                        token = extractDailymotionToken(clean)
-                    }
-                    if (token != null) {
-                        val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$token"
-                        loadExtractor(embedUrl, data, subtitleCallback, callback)
-                    } else {
-                        loadExtractor(clean, data, subtitleCallback, callback)
-                    }
-                } else {
-                    loadExtractor(clean, data, subtitleCallback, callback)
-                }
+                
+                val success = tryExtractFromPage(targetUrl, subtitleCallback, callback)
+                if (success) anyStreamFound = true
             }
         }
 
-        // 2️⃣ Mirror dropdown – fetch each mirror page and extract
-        val mirrorSelect = document.selectFirst("select.mirror")
-        if (mirrorSelect != null) {
-            val options = mirrorSelect.select("option")
-            val mirrors = options.mapNotNull { option ->
-                val value = option.attr("value")
-                val label = option.text()
-                if (value.isNotBlank() && !label.contains("Select", ignoreCase = true)) {
-                    label to value
-                } else null
-            }
-
-            mirrors.forEach { (label, suffix) ->
-                val mirrorUrl = "$data$suffix"
-                try {
-                    val mirrorDoc = app.get(mirrorUrl, headers = defaultHeaders).document
-                    tryExtractFromPage(mirrorUrl, mirrorDoc)
-                } catch (e: Exception) {
-                    // ignore
-                }
-            }
-        }
-
-        // 3️⃣ Final regex fallback on main page (if nothing else worked)
-        val scriptRegex = Regex("""(?:file|video_url|source|src)\s*:\s*["']([^"']+\.(?:m3u8|mp4))["']""")
-        document.select("script").forEach { script ->
-            scriptRegex.find(script.html())?.let { match ->
-                val videoUrl = match.groupValues[1]
-                callback(
-                    newExtractorLink(name, name, videoUrl, ExtractorLinkType.M3U8) {
-                        this.referer = data
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-            }
-        }
-
-        return true
+        return anyStreamFound
     }
-}
+
+    private fun architectureHeaders(url: String): Map<String, String> {
+        return mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer" to url,
+            "Origin" to mainUrl
+        )
+    }
+                             }
+                             
