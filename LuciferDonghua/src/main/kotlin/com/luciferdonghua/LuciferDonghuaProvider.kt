@@ -4,7 +4,9 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.extractors.VidHidePro
 import org.jsoup.nodes.Element
-import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
+import kotlinx.coroutines.*
+
+class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
     override var name = "Lucifer Donghua"
     override val hasMainPage = true
@@ -69,7 +71,7 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
         var anyStreamFound = false
 
         suspend fun processDoc(doc: org.jsoup.nodes.Document, referer: String) {
-            // 1. Process Iframes
+            // 1. Process Iframes safely
             doc.select("iframe").forEach { iframe ->
                 val rawSrc = iframe.attr("data-src").takeIf { it.isNotBlank() }
                     ?: iframe.attr("data-lazy-src").takeIf { it.isNotBlank() }
@@ -80,19 +82,17 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
 
                 if (httpsUrl.isNotBlank() && !httpsUrl.contains("about:blank")) {
                     
-                    // Immutable URL resolution based on site logic
-                    val finalUrl = when {
-                        httpsUrl.contains("dailymotion", true) -> {
-                            val match = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(httpsUrl)
-                            if (match != null) "https://www.dailymotion.com/video/${match.groupValues[1]}" else httpsUrl
-                        }
-                        httpsUrl.contains("streamplay", true) -> {
-                            httpsUrl.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
-                        }
-                        else -> httpsUrl
+                    // Pure immutable URL translation
+                    val finalUrl = if (httpsUrl.contains("dailymotion", true)) {
+                        val match = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(httpsUrl)
+                        if (match != null) "https://www.dailymotion.com/video/${match.groupValues[1]}" else httpsUrl
+                    } else if (httpsUrl.contains("streamplay", true)) {
+                        httpsUrl.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
+                    } else {
+                        httpsUrl
                     }
 
-                    // Execute Extractors directly using the URL
+                    // Execute
                     if (finalUrl.contains("vidhide", true)) {
                         try { 
                             VidHidePro().getUrl(finalUrl, referer, subtitleCallback, callback)
@@ -104,7 +104,7 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                 }
             }
             
-            // 2. Global Regex Failsafe for hidden URLs
+            // 2. Global Regex Failsafe
             val html = doc.html()
             val embedRegex = Regex("""https?://(?:www\.)?(?:vidhidevip|vidhidepro|vidhide|play\.streamplay|rumble)[^\s"'<>]+""")
             embedRegex.findAll(html).forEach { match ->
@@ -113,7 +113,6 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                 }
             }
             
-            // Regex specifically for hidden Dailymotion iframes
             val dmRegex = Regex("""https?://(?:geo\.)?dailymotion\.com/[^\s"'<>]+video=([^&\s"'<>]+)""")
             dmRegex.findAll(html).forEach { match ->
                 val standardUrl = "https://www.dailymotion.com/video/${match.groupValues[1]}"
@@ -127,7 +126,7 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
         val baseDoc = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return@coroutineScope false }
         processDoc(baseDoc, data)
 
-        // 3. Process External Mirrors
+        // 3. Process External Mirrors in Parallel
         baseDoc.select("select.mirror option")
             .mapNotNull { it.attr("value") }
             .filter { it.startsWith("http") && it != data }
@@ -140,12 +139,15 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                             
                             val destUrl = resp.url
                             
-                            // Immutable translation for Dailymotion redirects
+                            // Immutable URL translation
                             val finalDest = if (destUrl.contains("dailymotion", true)) {
                                 val match = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(destUrl)
                                 if (match != null) "https://www.dailymotion.com/video/${match.groupValues[1]}" else destUrl
-                            } else destUrl
+                            } else {
+                                destUrl
+                            }
 
+                            // Execute
                             if (finalDest.contains("vidhide", true)) {
                                 try {
                                     VidHidePro().getUrl(finalDest, data, subtitleCallback, callback)
