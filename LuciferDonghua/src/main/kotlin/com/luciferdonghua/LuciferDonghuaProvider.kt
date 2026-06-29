@@ -11,7 +11,7 @@ class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
     override var name = "Lucifer Donghua"
     override val hasMainPage = true
-    override var lang = "en"
+    override var lang = "zh"
     override val hasQuickSearch = true
 
     private val defaultHeaders = mapOf(
@@ -109,11 +109,9 @@ class LuciferDonghuaProvider : MainAPI() {
         }
     }
 
-    // Restored: Your proven Dailymotion Token extraction logic
+    // Your Dailymotion Token logic
     private suspend fun extractDailymotionToken(pageUrl: String): String? {
-        val pageHtml = try {
-            app.get(pageUrl, headers = defaultHeaders).text
-        } catch (e: Exception) { return null }
+        val pageHtml = try { app.get(pageUrl, headers = defaultHeaders).text } catch (e: Exception) { return null }
         val pageDoc = try { Jsoup.parse(pageHtml) } catch (e: Exception) { null }
 
         pageDoc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
@@ -134,10 +132,7 @@ class LuciferDonghuaProvider : MainAPI() {
                 rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
                 rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
             }
-
-            if (from.equals("dailymotion", ignoreCase = true)) {
-                return rawUrl
-            }
+            if (from.equals("dailymotion", ignoreCase = true)) return rawUrl
         }
         return null
     }
@@ -150,7 +145,7 @@ class LuciferDonghuaProvider : MainAPI() {
     ): Boolean {
         var anyStreamFound = false
 
-        // Enhanced Core Helper: Handles Dailymotion explicitly alongside standard Extractors
+        // Enhanced Core Helper: Domain Normalization
         suspend fun extractIframes(doc: org.jsoup.nodes.Document, refererUrl: String) {
             doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
                 var src = iframe.attr("src")
@@ -159,24 +154,52 @@ class LuciferDonghuaProvider : MainAPI() {
                 
                 if (clean != null && clean.isNotBlank() && !clean.contains("about:blank")) {
                     
-                    // Restored: Dailymotion Geo-Bypass interception
+                    // --- 1. DAILYMOTION FIX ---
                     if ("dailymotion" in clean) {
                         var token = Regex("""[?&]video=([^&]+)""").find(clean)?.groupValues?.get(1)
-                        if (token == null) {
-                            token = extractDailymotionToken(refererUrl)
-                        }
+                        if (token == null) token = extractDailymotionToken(refererUrl)
                         if (token != null) {
-                            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$token"
+                            // Convert back to standard DM url so Cloudstream's native extractor catches it!
+                            val embedUrl = "https://www.dailymotion.com/video/$token"
                             if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
                                 anyStreamFound = true
                             }
-                            return@forEach // Skip standard loadExtractor flow to prevent duplication
+                            return@forEach 
                         }
                     }
 
-                    // Standard Extractor route for Rumble, Vidhide, etc.
-                    if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
+                    // --- 2. VIDHIDE & STREAMPLAY NORMALIZATION ---
+                    var extractorUrl = clean
+                    
+                    // Forces vidhideplus, vidhidevip, etc. to match the "vidhide.com" extractor you registered
+                    if (clean.contains("vidhide", ignoreCase = true)) {
+                        extractorUrl = clean.replace(Regex("""vidhide\w*\.[a-z]+"""), "vidhide.com")
+                    }
+                    
+                    // Forces streamplay.to, streamplay.cc, etc. to match "play.streamplay.co.in"
+                    if (clean.contains("streamplay", ignoreCase = true)) {
+                        extractorUrl = clean.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
+                    }
+
+                    // --- 3. TRIGGER EXTRACTORS ---
+                    if (loadExtractor(extractorUrl, refererUrl, subtitleCallback, callback)) {
                         anyStreamFound = true
+                    } else {
+                        // --- 4. BRUTEFORCE HTML FALLBACK ---
+                        // If an extractor fails (or is missing), we visit the iframe directly and hunt for .m3u8 files in the raw text
+                        try {
+                            val iframeHtml = app.get(clean, headers = mapOf("Referer" to refererUrl)).text
+                            val rawStreamRegex = Regex("""["'](https?[^"']+\.(?:m3u8|mp4)[^"']*)["']""")
+                            rawStreamRegex.findAll(iframeHtml).forEach { match ->
+                                val cleanStreamUrl = match.groupValues[1].replace("\\/", "/")
+                                callback(
+                                    newExtractorLink(name, "Fallback Server", cleanStreamUrl, INFER_TYPE) {
+                                        this.referer = clean
+                                    }
+                                )
+                                anyStreamFound = true
+                            }
+                        } catch (e: Exception) {}
                     }
                 }
             }
@@ -184,24 +207,20 @@ class LuciferDonghuaProvider : MainAPI() {
 
         // 1️⃣ Fetch the primary episode page
         val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return false }
-        
-        // Extract the default player (Triggers the Dailymotion check)
         extractIframes(baseDocument, data)
 
-        // 2️⃣ Collect all Mirror URLs from the dropdown (e.g., /v/1/, /v/2/)
+        // 2️⃣ Collect all Mirror URLs from the dropdown (e.g., /v/2/, /v/3/)
         val mirrorUrls = baseDocument.select("select.mirror option").mapNotNull { option ->
             val url = option.attr("value")
             if (url.startsWith("http") && url != data) url else null
         }.distinct()
 
-        // 3️⃣ Visit each mirror URL to grab the other servers
+        // 3️⃣ Visit each mirror URL in the background to grab their specific iframes
         mirrorUrls.forEach { mirrorUrl ->
             try {
                 val mirrorDoc = app.get(mirrorUrl, headers = defaultHeaders).document
                 extractIframes(mirrorDoc, mirrorUrl)
-            } catch (e: Exception) {
-                // Safely skip broken mirrors
-            }
+            } catch (e: Exception) {}
         }
 
         return anyStreamFound
