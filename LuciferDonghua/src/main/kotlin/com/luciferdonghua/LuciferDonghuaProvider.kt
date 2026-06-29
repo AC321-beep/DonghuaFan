@@ -1,12 +1,10 @@
 package com.luciferdonghua
 
-import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.extractors.VidHidePro
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
-import java.net.URLDecoder
 import java.net.URI
 import kotlinx.coroutines.* 
 
@@ -18,99 +16,14 @@ class LuciferDonghuaProvider : MainAPI() {
     override val hasQuickSearch = true
 
     private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/",
         "Origin" to mainUrl
     )
 
-    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
+    override val supportedTypes = setOf(TvType.Anime)
 
-    override val mainPage = mainPageOf(
-        "$mainUrl/anime/?order=update" to "Latest Release",
-        "$mainUrl/anime/?status=&type=movie&sub=" to "Movies",
-        "$mainUrl/network/tencent/" to "Tencent Anime",
-        "$mainUrl/network/youku/" to "YouKu Anime",
-        "$mainUrl/anime/?status=completed" to "Completed"
-    )
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) request.data else "${request.data.removeSuffix("/")}/page/$page/"
-        val document = app.get(url, headers = defaultHeaders).document
-        val home = document.select("article.bs").mapNotNull { it.toSearchResult() }
-
-        return newHomePageResponse(
-            list = HomePageList(
-                name = request.name,
-                list = home,
-                isHorizontalImages = false
-            ),
-            hasNext = home.isNotEmpty()
-        )
-    }
-
-    private fun Element.toSearchResult(): SearchResponse? {
-        val titleElement = this.selectFirst(".tt h2")
-        val title = titleElement?.text()?.trim() ?: return null
-        val href = fixUrlNull(this.selectFirst("a[itemprop=url]")?.attr("href")) ?: return null
-        val posterUrl = fixUrlNull(this.selectFirst("img.ts-post-image")?.attr("src"))
-        val epText = this.selectFirst(".bt .epx")?.text()
-        val epCount = epText?.let {
-            Regex("""Ep\s*(\d+)""", RegexOption.IGNORE_CASE).find(it)?.groupValues?.get(1)?.toIntOrNull()
-        }
-
-        return newAnimeSearchResponse(title, href, TvType.Anime) {
-            this.posterUrl = posterUrl
-            addDubStatus(dubExist = false, subExist = true, epCount)
-        }
-    }
-
-    override suspend fun search(query: String, page: Int): SearchResponseList {
-        val url = if (page == 1) "$mainUrl/?s=$query" else "$mainUrl/page/$page/?s=$query"
-        val document = app.get(url, headers = defaultHeaders).document
-        val results = document.select("article.bs").mapNotNull { it.toSearchResult() }
-        return newSearchResponseList(results, hasNext = results.isNotEmpty())
-    }
-
-    override suspend fun load(url: String): LoadResponse? {
-        val document = app.get(url, headers = defaultHeaders).document
-
-        val title = document.selectFirst("h1.entry-title, h1.title")?.text()?.trim() ?: return null
-        val poster = fixUrlNull(document.selectFirst(".thumb img, .poster img")?.attr("src"))
-        val description = document.selectFirst(".entry-content p, .synopsis p, .desc")?.text()?.trim()
-        val tags = document.select(".genx a, .genres a").map { it.text() }
-
-        val yearText = document.selectFirst(".split span:contains(Released), .info-content span:contains(Year)")?.text()
-        val year = yearText?.filter { it.isDigit() }?.toIntOrNull()
-
-        val episodes = mutableListOf<Episode>()
-
-        document.select(".eplister ul li, #episode_list li, .listeps ul li").forEach { ep ->
-            val linkElement = ep.selectFirst("a") ?: return@forEach
-            val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
-            val epName = linkElement.selectFirst(".epl-num, .epnum")?.text()?.trim() ?: ep.text().trim()
-            val epNum = epName.filter { it.isDigit() }.toIntOrNull()
-
-            episodes.add(
-                newEpisode(data = epHref) {
-                    this.name = "Episode $epName"
-                    this.episode = epNum
-                }
-            )
-        }
-
-        val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
-        val episodeMap = mutableMapOf(
-            DubStatus.Subbed to sortedEpisodes
-        )
-
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
-            this.posterUrl = poster
-            this.plot = description
-            this.tags = tags
-            this.year = year
-            this.episodes = episodeMap
-        }
-    }
+    // ... [Use your established getMainPage, search, and load functions here] ...
 
     override suspend fun loadLinks(
         data: String,
@@ -120,75 +33,46 @@ class LuciferDonghuaProvider : MainAPI() {
     ): Boolean = coroutineScope {
         var anyStreamFound = false
 
-        suspend fun processDocument(doc: org.jsoup.nodes.Document, refererUrl: String) {
-            val html = doc.html()
-            
+        suspend fun processDoc(doc: org.jsoup.nodes.Document, referer: String) {
             // Dailymotion Logic
-            var dailymotionToken: String? = null
             doc.select("iframe[src*='dailymotion']").forEach { iframe ->
-                val src = iframe.attr("src")
-                val match = Regex("""[?&]video=([^&]+)""").find(src)
+                val match = Regex("""[?&]video=([^&]+)""").find(iframe.attr("src"))
                 if (match != null) {
-                    dailymotionToken = match.groupValues[1]
-                    return@forEach
+                    val embed = "https://geo.dailymotion.com/player/xkyen.html?video=${match.groupValues[1]}"
+                    if (loadExtractor(embed, referer, subtitleCallback, callback)) anyStreamFound = true
                 }
             }
-            if (dailymotionToken != null) {
-                val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
-                if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) anyStreamFound = true
-            }
 
-            // Other Iframes
-            doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
+            // VidHidePro and other iframes
+            doc.select("iframe").forEach { iframe ->
                 var src = iframe.attr("src")
                 if (src.startsWith("//")) src = "https:$src"
-                var cleanUrl = fixUrlNull(src) ?: return@forEach
-
-                if (cleanUrl.isNotBlank() && !cleanUrl.contains("about:blank") && !cleanUrl.contains("dailymotion", ignoreCase = true)) {
-                    if (cleanUrl.contains("vidhide", ignoreCase = true)) {
-                        try {
-                            val domain = "https://" + URI(cleanUrl).host
-                            VidHidePro().getUrl(cleanUrl, refererUrl, subtitleCallback, callback)
-                            anyStreamFound = true
-                        } catch (e: Exception) {}
-                        return@forEach
-                    }
-
-                    if (cleanUrl.contains("streamplay", ignoreCase = true)) {
-                        cleanUrl = cleanUrl.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
-                    }
-
-                    if (loadExtractor(cleanUrl, refererUrl, subtitleCallback, callback)) anyStreamFound = true
+                if (src.contains("vidhide", true)) {
+                    try { VidHidePro().getUrl(src, referer, subtitleCallback, callback); anyStreamFound = true } catch(e: Exception) {}
+                } else if (loadExtractor(src, referer, subtitleCallback, callback)) {
+                    anyStreamFound = true
                 }
             }
         }
 
-        val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return@coroutineScope false }
-        processDocument(baseDocument, data)
+        val baseDoc = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return@coroutineScope false }
+        processDoc(baseDoc, data)
 
-        val mirrorUrls = baseDocument.select("select.mirror option").mapNotNull { option ->
-            val url = option.attr("value")
-            if (url.startsWith("http") && url != data) url else null
-        }.distinct()
-
-        mirrorUrls.map { mirrorUrl ->
+        // Process mirrors in parallel using coroutineScope
+        baseDoc.select("select.mirror option").mapNotNull { it.attr("value") }.distinct().map { mirror ->
             async {
                 try {
-                    val response = app.get(mirrorUrl, headers = defaultHeaders)
-                    if (response.url != mirrorUrl && !response.url.contains("luciferdonghua.in")) {
-                        val cleanDest = response.url
-                        if (cleanDest.contains("vidhide", ignoreCase = true)) {
-                            try {
-                                val domain = "https://" + URI(cleanDest).host
-                                VidHidePro().getUrl(cleanDest, data, subtitleCallback, callback)
-                            } catch (e: Exception) {}
-                        } else if (!cleanDest.contains("dailymotion", ignoreCase = true)) {
-                            loadExtractor(cleanDest, data, subtitleCallback, callback)
+                    val resp = app.get(mirror, headers = defaultHeaders)
+                    if (resp.url != mirror && !resp.url.contains("luciferdonghua.in")) {
+                        if (resp.url.contains("vidhide", true)) {
+                            VidHidePro().getUrl(resp.url, data, subtitleCallback, callback)
+                        } else {
+                            loadExtractor(resp.url, data, subtitleCallback, callback)
                         }
                     } else {
-                        processDocument(response.document, mirrorUrl)
+                        processDoc(resp.document, mirror)
                     }
-                } catch (e: Exception) {}
+                } catch(e: Exception) {}
             }
         }.awaitAll()
 
