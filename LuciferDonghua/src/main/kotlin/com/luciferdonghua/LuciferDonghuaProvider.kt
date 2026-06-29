@@ -13,9 +13,9 @@ class LuciferDonghuaProvider : MainAPI() {
     
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    // Updated precisely to match the menus found in your HTML
+    // ✅ Changed: Removed "Home", added "Latest Release" (using order=update)
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Home",
+        "$mainUrl/anime/?order=update" to "Latest Release",
         "$mainUrl/anime/?status=&type=movie&sub=" to "Movies",
         "$mainUrl/network/tencent/" to "Tencent Anime",
         "$mainUrl/network/youku/" to "YouKu Anime",
@@ -23,18 +23,16 @@ class LuciferDonghuaProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // AnimeStream theme handles pagination via /page/X/
         val url = if (page == 1) request.data else "${request.data.removeSuffix("/")}/page/$page/"
         val document = app.get(url).document
         
-        // Target specifically the 'article.bs' containers used in the HTML
         val home = document.select("article.bs").mapNotNull { it.toSearchResult() }
 
         return newHomePageResponse(
             list = HomePageList(
                 name = request.name,
                 list = home,
-                isHorizontalImages = false // AnimeStream uses vertical posters
+                isHorizontalImages = false
             ),
             hasNext = home.isNotEmpty()
         )
@@ -47,9 +45,10 @@ class LuciferDonghuaProvider : MainAPI() {
         val href = fixUrlNull(this.selectFirst("a[itemprop=url]")?.attr("href")) ?: return null
         val posterUrl = fixUrlNull(this.selectFirst("img.ts-post-image")?.attr("src"))
         
-        // Precision Regex to extract "147" from strings like "Ep 147 [4K]"
         val epText = this.selectFirst(".bt .epx")?.text()
-        val epCount = epText?.let { Regex("""Ep\s*(\d+)""", RegexOption.IGNORE_CASE).find(it)?.groupValues?.get(1)?.toIntOrNull() }
+        val epCount = epText?.let { 
+            Regex("""Ep\s*(\d+)""", RegexOption.IGNORE_CASE).find(it)?.groupValues?.get(1)?.toIntOrNull() 
+        }
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = posterUrl
@@ -58,7 +57,6 @@ class LuciferDonghuaProvider : MainAPI() {
     }
 
     override suspend fun search(query: String, page: Int): SearchResponseList {
-        // AnimeStream default search structure
         val url = if (page == 1) "$mainUrl/?s=$query" else "$mainUrl/page/$page/?s=$query"
         val document = app.get(url).document
         
@@ -97,11 +95,9 @@ class LuciferDonghuaProvider : MainAPI() {
             )
         }
 
-       // ... (previous code inside load function)
-
         val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
 
-        // FIXED: Changed mapOf() to mutableMapOf()
+        // ✅ Correctly uses mutableMapOf to match the expected type
         val episodeMap = mutableMapOf(
             DubStatus.Subbed to sortedEpisodes
         )
@@ -123,18 +119,50 @@ class LuciferDonghuaProvider : MainAPI() {
     ): Boolean {
         val document = app.get(data).document
         
-        // Extracts the iframes specifically placed in the player area of the AnimeStream theme
-        document.select(".player-area iframe, .playcon iframe, iframe").forEach { iframe ->
-            var iframeUrl = iframe.attr("src")
-            if (iframeUrl.startsWith("//")) {
-                iframeUrl = "https:$iframeUrl"
+        // 1️⃣ Try iframes first (uses built-in Dailymotion extractor via loadExtractor)
+        val iframeCandidates = document.select("iframe[src]")
+            .filter { it.attr("src").isNotBlank() }
+            .map { it.attr("src") }
+            .filter { 
+                !it.contains("about:blank") && 
+                !it.contains("googleads") && 
+                !it.contains("doubleclick") 
             }
-            
-            val cleanUrl = fixUrlNull(iframeUrl)
-            if (cleanUrl != null && !cleanUrl.contains("about:blank")) {
-                loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
+
+        if (iframeCandidates.isNotEmpty()) {
+            for (src in iframeCandidates) {
+                val cleanUrl = fixUrlNull(src)
+                if (cleanUrl != null) {
+                    val success = loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
+                    if (success) return true
+                }
             }
         }
-        return true
+
+        // 2️⃣ Regex fallback: find video URLs inside JavaScript
+        val scriptRegex = Regex("""(?:file|video_url|source|src)\s*:\s*["']([^"']+\.(?:m3u8|mp4|mkv))["']""")
+        val scripts = document.select("script")
+        for (script in scripts) {
+            val matches = scriptRegex.findAll(script.html())
+            for (match in matches) {
+                val videoUrl = match.groupValues[1]
+                callback.invoke(
+                    ExtractorLink(
+                        name,
+                        name,
+                        videoUrl,
+                        data,
+                        Qualities.Unknown.value,
+                        ExtractorLinkType.M3U8
+                    )
+                )
+                return true
+            }
+        }
+
+        // 3️⃣ Ultimate fallback: use WebView to render JavaScript and extract
+        val webViewLinks = app.extractFromWebView(data)
+        webViewLinks.forEach { callback.invoke(it) }
+        return webViewLinks.isNotEmpty()
     }
 }
