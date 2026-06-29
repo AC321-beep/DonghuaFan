@@ -2,13 +2,8 @@ package com.luciferdonghua
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.extractors.VidHidePro
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
-import java.net.URI
-import kotlinx.coroutines.* 
-
-class LuciferDonghuaProvider : MainAPI() {
+import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
     override var name = "Lucifer Donghua"
     override val hasMainPage = true
@@ -23,7 +18,46 @@ class LuciferDonghuaProvider : MainAPI() {
 
     override val supportedTypes = setOf(TvType.Anime)
 
-    // ... [Use your established getMainPage, search, and load functions here] ...
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val url = if (page == 1) request.data else "${request.data.removeSuffix("/")}/page/$page/"
+        val document = app.get(url, headers = defaultHeaders).document
+        val home = document.select("article.bs").mapNotNull { it.toSearchResult() }
+        return newHomePageResponse(HomePageList(request.name, home, false), home.isNotEmpty())
+    }
+
+    private fun Element.toSearchResult(): SearchResponse? {
+        val titleElement = this.selectFirst(".tt h2") ?: return null
+        val href = fixUrlNull(this.selectFirst("a[itemprop=url]")?.attr("href")) ?: return null
+        val posterUrl = fixUrlNull(this.selectFirst("img.ts-post-image")?.attr("src"))
+        return newAnimeSearchResponse(titleElement.text().trim(), href, TvType.Anime) {
+            this.posterUrl = posterUrl
+        }
+    }
+
+    override suspend fun search(query: String, page: Int): SearchResponseList {
+        val url = if (page == 1) "$mainUrl/?s=$query" else "$mainUrl/page/$page/?s=$query"
+        val document = app.get(url, headers = defaultHeaders).document
+        return newSearchResponseList(document.select("article.bs").mapNotNull { it.toSearchResult() }, true)
+    }
+
+    override suspend fun load(url: String): LoadResponse? {
+        val document = app.get(url, headers = defaultHeaders).document
+        val title = document.selectFirst("h1.entry-title, h1.title")?.text()?.trim() ?: return null
+        val poster = fixUrlNull(document.selectFirst(".thumb img, .poster img")?.attr("src"))
+        val description = document.selectFirst(".entry-content p, .synopsis p, .desc")?.text()?.trim()
+        val episodes = mutableListOf<Episode>()
+
+        document.select(".eplister ul li, #episode_list li, .listeps ul li").forEach { ep ->
+            val link = ep.selectFirst("a")?.attr("href") ?: return@forEach
+            episodes.add(newEpisode(fixUrl(link)) { name = ep.text().trim() })
+        }
+
+        return newAnimeLoadResponse(title, url, TvType.Anime) {
+            this.posterUrl = poster
+            this.plot = description
+            addEpisodes(DubStatus.Subbed, episodes)
+        }
+    }
 
     override suspend fun loadLinks(
         data: String,
@@ -34,22 +68,42 @@ class LuciferDonghuaProvider : MainAPI() {
         var anyStreamFound = false
 
         suspend fun processDoc(doc: org.jsoup.nodes.Document, referer: String) {
-            // Dailymotion Logic
-            doc.select("iframe[src*='dailymotion']").forEach { iframe ->
-                val match = Regex("""[?&]video=([^&]+)""").find(iframe.attr("src"))
-                if (match != null) {
-                    val embed = "https://geo.dailymotion.com/player/xkyen.html?video=${match.groupValues[1]}"
-                    if (loadExtractor(embed, referer, subtitleCallback, callback)) anyStreamFound = true
+            // 1. Process Iframes (Properly checking lazy-load attributes)
+            doc.select("iframe").forEach { iframe ->
+                // Look for data-src first, fallback to standard src
+                val rawSrc = iframe.attr("data-src").takeIf { it.isNotBlank() }
+                    ?: iframe.attr("data-lazy-src").takeIf { it.isNotBlank() }
+                    ?: iframe.attr("src")
+                
+                var cleanUrl = fixUrlNull(rawSrc) ?: return@forEach
+                if (cleanUrl.startsWith("//")) cleanUrl = "https:$cleanUrl"
+
+                if (cleanUrl.isNotBlank() && !cleanUrl.contains("about:blank")) {
+                    // Custom StreamPlay correction
+                    if (cleanUrl.contains("streamplay", true)) {
+                        cleanUrl = cleanUrl.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
+                    }
+
+                    // Dailymotion explicit conversion
+                    if (cleanUrl.contains("dailymotion", true)) {
+                        val match = Regex("""[?&]video=([^&]+)""").find(cleanUrl)
+                        if (match != null) {
+                            cleanUrl = "https://geo.dailymotion.com/player/xkyen.html?video=${match.groupValues[1]}"
+                        }
+                    }
+
+                    // Let Cloudstream and YOUR Custom Extractors handle everything automatically
+                    if (loadExtractor(cleanUrl, referer, subtitleCallback, callback)) {
+                        anyStreamFound = true
+                    }
                 }
             }
-
-            // VidHidePro and other iframes
-            doc.select("iframe").forEach { iframe ->
-                var src = iframe.attr("src")
-                if (src.startsWith("//")) src = "https:$src"
-                if (src.contains("vidhide", true)) {
-                    try { VidHidePro().getUrl(src, referer, subtitleCallback, callback); anyStreamFound = true } catch(e: Exception) {}
-                } else if (loadExtractor(src, referer, subtitleCallback, callback)) {
+            
+            // 2. Global Regex Failsafe for hidden/JS-embedded URLs
+            val html = doc.html()
+            val embedRegex = Regex("""https?://(?:www\.)?(?:vidhidevip|vidhidepro|vidhide|play\.streamplay|rumble)[^\s"'<>]+""")
+            embedRegex.findAll(html).forEach { match ->
+                if (loadExtractor(match.value, referer, subtitleCallback, callback)) {
                     anyStreamFound = true
                 }
             }
@@ -58,23 +112,27 @@ class LuciferDonghuaProvider : MainAPI() {
         val baseDoc = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return@coroutineScope false }
         processDoc(baseDoc, data)
 
-        // Process mirrors in parallel using coroutineScope
-        baseDoc.select("select.mirror option").mapNotNull { it.attr("value") }.distinct().map { mirror ->
-            async {
-                try {
-                    val resp = app.get(mirror, headers = defaultHeaders)
-                    if (resp.url != mirror && !resp.url.contains("luciferdonghua.in")) {
-                        if (resp.url.contains("vidhide", true)) {
-                            VidHidePro().getUrl(resp.url, data, subtitleCallback, callback)
+        // 3. Process External Mirrors (If any valid URLs exist in dropdowns)
+        baseDoc.select("select.mirror option")
+            .mapNotNull { it.attr("value") }
+            .filter { it.startsWith("http") && it != data } // Ensure it's a real URL, not base64/ID
+            .distinct()
+            .map { mirror ->
+                async {
+                    try {
+                        val resp = app.get(mirror, headers = defaultHeaders)
+                        if (resp.url != mirror && !resp.url.contains("luciferdonghua.in")) {
+                            // Caught a redirect to a server
+                            if (loadExtractor(resp.url, data, subtitleCallback, callback)) {
+                                anyStreamFound = true
+                            }
                         } else {
-                            loadExtractor(resp.url, data, subtitleCallback, callback)
+                            // Internal page
+                            processDoc(resp.document, mirror)
                         }
-                    } else {
-                        processDoc(resp.document, mirror)
-                    }
-                } catch(e: Exception) {}
-            }
-        }.awaitAll()
+                    } catch(e: Exception) {}
+                }
+            }.awaitAll()
 
         return@coroutineScope anyStreamFound
     }
