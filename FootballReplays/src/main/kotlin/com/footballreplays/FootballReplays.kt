@@ -132,15 +132,16 @@ class FootballReplays : MainAPI() {
         Log.d("FootballReplays", "Iframe Url: $iframeUrl")
 
         loadExtractor(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
+            // Matches the exact constructor your compiler expects:
+            // source, name, url, referer, quality, type, headers
             val extractedLink = ExtractorLink(
                 source = customName,
                 name = customName,
                 url = link.url,
                 referer = link.referer,
                 quality = link.quality,
-                isM3u8 = link.isM3u8,
-                headers = link.headers,
-                type = link.type
+                type = link.type,
+                headers = link.headers
             )
             callback(extractedLink)
         }
