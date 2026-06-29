@@ -111,58 +111,60 @@ class LuciferDonghuaProvider : MainAPI() {
         }
     }
 
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val document = app.get(data).document
-        
-        // 1️⃣ Try iframes first (uses built-in Dailymotion extractor via loadExtractor)
-        val iframeCandidates = document.select("iframe[src]")
-            .filter { it.attr("src").isNotBlank() }
-            .map { it.attr("src") }
-            .filter { 
-                !it.contains("about:blank") && 
-                !it.contains("googleads") && 
-                !it.contains("doubleclick") 
-            }
+   override suspend fun loadLinks(
+    data: String,
+    isCasting: Boolean,
+    subtitleCallback: (SubtitleFile) -> Unit,
+    callback: (ExtractorLink) -> Unit
+): Boolean {
+    val document = app.get(data).document
 
-        if (iframeCandidates.isNotEmpty()) {
-            for (src in iframeCandidates) {
-                val cleanUrl = fixUrlNull(src)
-                if (cleanUrl != null) {
-                    val success = loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
-                    if (success) return true
-                }
-            }
+    // 1️⃣ Look for the player iframe (Dailymotion, Rumble, OK.RU, etc.)
+    val iframe = document.selectFirst("#pembed iframe, .player-embed iframe, iframe[src*='dailymotion'], iframe[src*='rumble'], iframe[src*='ok.ru']")
+    if (iframe != null) {
+        var iframeUrl = iframe.attr("src")
+        if (iframeUrl.startsWith("//")) {
+            iframeUrl = "https:$iframeUrl"
         }
-
-        // 2️⃣ Regex fallback: find video URLs inside JavaScript
-        val scriptRegex = Regex("""(?:file|video_url|source|src)\s*:\s*["']([^"']+\.(?:m3u8|mp4|mkv))["']""")
-        val scripts = document.select("script")
-        for (script in scripts) {
-            val matches = scriptRegex.findAll(script.html())
-            for (match in matches) {
-                val videoUrl = match.groupValues[1]
-                callback.invoke(
-                    ExtractorLink(
-                        name,
-                        name,
-                        videoUrl,
-                        data,
-                        Qualities.Unknown.value,
-                        ExtractorLinkType.M3U8
-                    )
-                )
+        val cleanUrl = fixUrlNull(iframeUrl)
+        if (cleanUrl != null && cleanUrl.isNotBlank()) {
+            // This automatically uses built‑in extractors (Dailymotion, etc.)
+            val success = loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
+            if (success) {
                 return true
             }
         }
-
-        // 3️⃣ Ultimate fallback: use WebView to render JavaScript and extract
-        val webViewLinks = app.extractFromWebView(data)
-        webViewLinks.forEach { callback.invoke(it) }
-        return webViewLinks.isNotEmpty()
     }
+
+    // 2️⃣ Fallback: find any iframe on the page
+    document.select("iframe[src]").forEach { iframeElement ->
+        var src = iframeElement.attr("src")
+        if (src.startsWith("//")) src = "https:$src"
+        val clean = fixUrlNull(src)
+        if (clean != null && !clean.contains("about:blank") && !clean.contains("googleads") && !clean.contains("doubleclick")) {
+            val success = loadExtractor(clean, mainUrl, subtitleCallback, callback)
+            if (success) return true
+        }
+    }
+
+    // 3️⃣ Regex fallback: find video URLs in JavaScript (if iframe is missing)
+    val scriptRegex = Regex("""(?:file|video_url|source|src)\s*:\s*["']([^"']+\.(?:m3u8|mp4|mkv))["']""")
+    document.select("script").forEach { script ->
+        scriptRegex.findAll(script.html()).forEach { match ->
+            val videoUrl = match.groupValues[1]
+            callback.invoke(
+                newExtractorLink(
+                    source = name,
+                    name = name,
+                    url = videoUrl,
+                    referer = data,
+                    quality = Qualities.Unknown.value,
+                    type = ExtractorLinkType.M3U8
+                )
+            )
+            return true
+        }
+    }
+
+    return false
 }
