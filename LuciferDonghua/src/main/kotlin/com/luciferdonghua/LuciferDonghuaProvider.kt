@@ -5,7 +5,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
-import java.net.URLDecoder
 
 class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
@@ -109,114 +108,99 @@ class LuciferDonghuaProvider : MainAPI() {
         }
     }
 
-    private suspend fun extractDailymotionToken(pageUrl: String): String? {
-        val pageHtml = try {
-            app.get(pageUrl, headers = defaultHeaders).text
-        } catch (e: Exception) { return null }
-        val pageDoc = try { Jsoup.parse(pageHtml) } catch (e: Exception) { null }
-
-        pageDoc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
-            val src = iframe.attr("src")
-            val match = Regex("""[?&]video=([^&]+)""").find(src)
-            if (match != null) return match.groupValues[1]
-        }
-
-        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-            .find(pageHtml)?.groupValues?.get(1)
-        if (playerJson != null) {
-            var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
-            val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
-            val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-
-            if (encrypt == 1) rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-            else if (encrypt == 2) {
-                rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
-                rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-            }
-
-            if (from.equals("dailymotion", ignoreCase = true)) {
-                return rawUrl
-            }
-        }
-        return null
-    }
-
-    private suspend fun tryExtractFromPage(pageUrl: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        var found = false
-        val html = try { app.get(pageUrl, headers = architectureHeaders(pageUrl)).text } catch (e: Exception) { return false }
-        val doc = Jsoup.parse(html)
-
-        doc.select("iframe, .player-embed iframe, div[id*='player'] iframe").forEach { iframe ->
-            var iframeUrl = iframe.attr("src")
-            if (iframeUrl.startsWith("//")) iframeUrl = "https:$iframeUrl"
-            val cleanUrl = fixUrlNull(iframeUrl)
-            
-            if (cleanUrl != null && !cleanUrl.contains("about:blank")) {
-                if (loadExtractor(cleanUrl, pageUrl, subtitleCallback, callback)) {
-                    found = true
-                }
-            }
-        }
-        
-        // Final fallback script-comber for loose stream configurations
-        val rawStreamRegex = Regex("""["'](https?[^"']+\.(?:m3u8|mpd|mp4)[^"']*)["']""")
-        rawStreamRegex.findAll(html).forEach { match ->
-            val cleanStreamUrl = match.groupValues[1].replace("\\/", "/")
-            val linkType = if (cleanStreamUrl.contains(".mpd")) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
-            
-            callback(
-                ExtractorLink(
-                    source = "Lucifer Mirror",
-                    name = "Lucifer Mirror",
-                    url = cleanStreamUrl,
-                    referer = pageUrl,
-                    quality = Qualities.Unknown.value,
-                    type = linkType,
-                    headers = architectureHeaders(pageUrl)
-                )
-            )
-            found = true
-        }
-        
-        return found
-    }
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // First try processing the base page itself
-        var anyStreamFound = tryExtractFromPage(data, subtitleCallback, callback)
+        var anyStreamFound = false
+        val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return false }
         
-        val baseDocument = try { app.get(data, headers = architectureHeaders(data)).document } catch(e: Exception) { return false }
-        
-        // Scan for alternative options/servers in the WordPress selector dropdowns
-        baseDocument.select(".custom-menu li a, .player-option, #player-option-list li").forEach { option ->
-            val optionValue = option.attr("data-value") ?: option.attr("value") ?: ""
-            if (optionValue.isNotBlank()) {
-                // Correctly resolve paths whether they are absolute links or relative parameters
-                val targetUrl = when {
-                    optionValue.startsWith("http") -> optionValue
-                    optionValue.startsWith("?") -> "${data.substringBefore("?")}$optionValue"
-                    else -> "${data.removeSuffix("/")}/${optionValue.removePrefix("/")}"
+        // 1️⃣ Extract default active iframe on the page (usually Rumble or Dailymotion)
+        baseDocument.select(".player-area iframe, .playcon iframe, iframe").forEach { iframe ->
+            var src = iframe.attr("src")
+            if (src.startsWith("//")) src = "https:$src"
+            val clean = fixUrlNull(src)
+            if (clean != null && clean.isNotBlank() && !clean.contains("about:blank")) {
+                if (loadExtractor(clean, data, subtitleCallback, callback)) {
+                    anyStreamFound = true
                 }
+            }
+        }
+
+        // 2️⃣ Base64 Encoded Mirrors (AnimeStream Standard)
+        baseDocument.select("select.mirror option, .server_option li, ul#playeroptionsul li").forEach { option ->
+            val value = option.attr("data-video").takeIf { it.isNotBlank() }
+                ?: option.attr("value").takeIf { it.isNotBlank() }
+                ?: return@forEach
                 
-                val success = tryExtractFromPage(targetUrl, subtitleCallback, callback)
-                if (success) anyStreamFound = true
+            if (value.contains("Choose", ignoreCase = true) || value.isBlank()) return@forEach
+
+            // Attempt to Base64 decode the hidden iframe
+            val decoded = try {
+                if (value.matches(Regex("^[A-Za-z0-9+/=]+$")) && value.length % 4 == 0) {
+                    String(Base64.decode(value, Base64.DEFAULT))
+                } else value
+            } catch (e: Exception) { value }
+
+            // Extract the actual URL from the decoded HTML iframe
+            val iframeUrl = Jsoup.parse(decoded).selectFirst("iframe")?.attr("src") ?: decoded
+            var clean = fixUrlNull(if (iframeUrl.startsWith("//")) "https:$iframeUrl" else iframeUrl)
+
+            if (clean != null && clean.startsWith("http")) {
+                if (loadExtractor(clean, data, subtitleCallback, callback)) {
+                    anyStreamFound = true
+                }
+            }
+        }
+
+        // 3️⃣ AJAX Mirrors (AnimeStream Fallback Method)
+        baseDocument.select("ul#playeroptionsul li").forEach { li ->
+            val post = li.attr("data-post")
+            val nume = li.attr("data-nume")
+            val type = li.attr("data-type")
+            if (post.isNotBlank() && nume.isNotBlank()) {
+                try {
+                    val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
+                    val response = app.post(
+                        ajaxUrl,
+                        data = mapOf("action" to "player_ajax", "post" to post, "nume" to nume, "type" to type),
+                        headers = defaultHeaders + mapOf("X-Requested-With" to "XMLHttpRequest")
+                    ).text
+                    
+                    val iframeSrc = Jsoup.parse(response).selectFirst("iframe")?.attr("src")
+                        ?: Regex("""src=\\?["']([^"']+)""").find(response)?.groupValues?.get(1)?.replace("\\/", "/")
+                        
+                    val clean = fixUrlNull(if (iframeSrc?.startsWith("//") == true) "https:$iframeSrc" else iframeSrc)
+                    if (clean != null && clean.startsWith("http")) {
+                        if (loadExtractor(clean, data, subtitleCallback, callback)) {
+                            anyStreamFound = true
+                        }
+                    }
+                } catch (e: Exception) {
+                    // Ignore AJAX failures
+                }
+            }
+        }
+
+        // 4️⃣ Final regex fallback on main page scripts
+        if (!anyStreamFound) {
+            val scriptRegex = Regex("""(?:file|video_url|source|src)\s*:\s*["']([^"']+\.(?:m3u8|mp4))["']""")
+            baseDocument.select("script").forEach { script ->
+                scriptRegex.find(script.html())?.let { match ->
+                    val videoUrl = match.groupValues[1]
+                    callback(
+                        newExtractorLink(name, name, videoUrl, ExtractorLinkType.M3U8) {
+                            this.referer = data
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                    anyStreamFound = true
+                }
             }
         }
 
         return anyStreamFound
     }
-
-    private fun architectureHeaders(url: String): Map<String, String> {
-        return mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer" to url,
-            "Origin" to mainUrl
-        )
-    }
-                             }
-                             
+}
