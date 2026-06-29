@@ -15,7 +15,7 @@ class FootballReplays : MainAPI() {
     
     // REORDERED AND RENAMED MAIN PAGE CATEGORIES
     override val mainPage = mainPageOf(
-        "${mainUrl}/international/" to "FIFA",
+        "${mainUrl}/international/" to "FIFA/International",
         "${mainUrl}/uefa/" to "UEFA",
         "${mainUrl}/england/" to "England",
         "${mainUrl}/spain/" to "Spain",
