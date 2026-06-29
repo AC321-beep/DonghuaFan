@@ -4,6 +4,6 @@ cloudstream {
     status = 1
     tvTypes = listOf("Anime")
     language = "zh"
-    version = 1
+    version = 2
     iconUrl = "https://i0.wp.com/luciferdonghua.in/wp-content/uploads/2022/12/cropped-lucifer-donghua-DP-192x192.webp"
 }
