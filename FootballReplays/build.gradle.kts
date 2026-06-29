@@ -2,7 +2,7 @@ version = 1
 
 cloudstream {
     authors = listOf("AC321-beep")
-    descriptions = ("Watch Football Match Replays & Highlights")
+    description = "Watch Football Match Replays & Highlights"
     language = "en"
     status  = 1 // will be 3 if unspecified
     tvTypes = listOf("Sports") 
