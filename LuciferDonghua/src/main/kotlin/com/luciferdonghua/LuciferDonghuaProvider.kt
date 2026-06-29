@@ -3,11 +3,14 @@ package com.luciferdonghua
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.extractors.VidhideExtractor
+import com.lagradost.cloudstream3.extractors.VidHidePro
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
 import java.net.URI
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 
 class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
@@ -120,10 +123,6 @@ class LuciferDonghuaProvider : MainAPI() {
         var anyStreamFound = false
 
         suspend fun processDocument(doc: org.jsoup.nodes.Document, refererUrl: String) {
-            
-            // =========================================================
-            // 1. EXACT Dailymotion Logic (Imported from DonghuaFun)
-            // =========================================================
             var dailymotionToken: String? = null
             doc.select("iframe[src*='dailymotion']").forEach { iframe ->
                 val src = iframe.attr("src")
@@ -140,28 +139,21 @@ class LuciferDonghuaProvider : MainAPI() {
                 }
             }
 
-            // =========================================================
-            // 2. Extract Other Iframes (Rumble, Vidhide, Streamplay)
-            // =========================================================
             doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
                 var src = iframe.attr("src")
                 if (src.startsWith("//")) src = "https:$src"
                 var cleanUrl = fixUrlNull(src) ?: return@forEach
 
                 if (cleanUrl.isNotBlank() && !cleanUrl.contains("about:blank") && !cleanUrl.contains("dailymotion", ignoreCase = true)) {
-                    
-                    // --- VidHide dynamic extraction to handle domain rotation ---
                     if (cleanUrl.contains("vidhide", ignoreCase = true)) {
                         try {
                             val domain = "https://" + URI(cleanUrl).host
-                            val extractor = VidhideExtractor().apply { mainUrl = domain }
-                            extractor.getUrl(cleanUrl, refererUrl, subtitleCallback, callback)
+                            VidHidePro().getUrl(cleanUrl, refererUrl, subtitleCallback, callback)
                             anyStreamFound = true
                         } catch (e: Exception) {}
                         return@forEach
                     }
 
-                    // --- StreamPlay Domain Normalization ---
                     if (cleanUrl.contains("streamplay", ignoreCase = true)) {
                         cleanUrl = cleanUrl.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
                     }
@@ -173,50 +165,38 @@ class LuciferDonghuaProvider : MainAPI() {
             }
         }
 
-        // --- Execute Flow ---
-        
-        // 1. Process Main Episode Page
         val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return false }
         processDocument(baseDocument, data)
 
-        // 2. Process all Mirror Dropdown URLs using 'apmap' (Parallel Fetching)
-        // This prevents the 10-second timeout that was killing VidHide at index 3
         val mirrorUrls = baseDocument.select("select.mirror option").mapNotNull { option ->
             val url = option.attr("value")
             if (url.startsWith("http") && url != data) url else null
         }.distinct()
 
-        mirrorUrls.apmap { mirrorUrl ->
-            try {
-                val response = app.get(mirrorUrl, headers = defaultHeaders)
-                
-                // Handle external redirects (e.g. direct to Vidhide)
-                if (response.url != mirrorUrl && !response.url.contains("luciferdonghua.in")) {
-                    val cleanDest = response.url
-                    if (cleanDest.contains("vidhide", ignoreCase = true)) {
-                        try {
-                            val domain = "https://" + URI(cleanDest).host
-                            val extractor = VidhideExtractor().apply { mainUrl = domain }
-                            extractor.getUrl(cleanDest, data, subtitleCallback, callback)
-                            anyStreamFound = true
-                        } catch (e: Exception) {}
-                    } else if (!cleanDest.contains("dailymotion", ignoreCase = true)) {
-                        if (loadExtractor(cleanDest, data, subtitleCallback, callback)) {
-                            anyStreamFound = true
+        // Non-blocking parallel execution replacing deprecated apmap
+        coroutineScope {
+            mirrorUrls.map { mirrorUrl ->
+                async {
+                    try {
+                        val response = app.get(mirrorUrl, headers = defaultHeaders)
+                        if (response.url != mirrorUrl && !response.url.contains("luciferdonghua.in")) {
+                            val cleanDest = response.url
+                            if (cleanDest.contains("vidhide", ignoreCase = true)) {
+                                try {
+                                    val domain = "https://" + URI(cleanDest).host
+                                    VidHidePro().getUrl(cleanDest, data, subtitleCallback, callback)
+                                } catch (e: Exception) {}
+                            } else if (!cleanDest.contains("dailymotion", ignoreCase = true)) {
+                                loadExtractor(cleanDest, data, subtitleCallback, callback)
+                            }
+                        } else {
+                            processDocument(response.document, mirrorUrl)
                         }
-                    }
-                } else {
-                    // Process internal mirror iframe page
-                    processDocument(response.document, mirrorUrl)
+                    } catch (e: Exception) {}
                 }
-            } catch (e: Exception) {
-                // Ignore dead servers gracefully without crashing parallel tasks
-            }
+            }.awaitAll()
         }
 
         return anyStreamFound
     }
 }
-
-    
-                                                                                    
