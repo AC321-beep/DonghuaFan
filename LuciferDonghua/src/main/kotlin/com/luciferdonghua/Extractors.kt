@@ -17,7 +17,7 @@ import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
 // ==========================================
-// RUMBLE – improved: no early return, regex fallback
+// RUMBLE (Advanced JWPlayer & Regex Fallback)
 // ==========================================
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
@@ -125,7 +125,7 @@ class Rumble : ExtractorApi() {
 }
 
 // ==========================================
-// PLAYSTREAMPLAY – unchanged
+// PLAYSTREAMPLAY (JS Unpacker & API Fetch)
 // ==========================================
 class PlayStreamplay : ExtractorApi() {
     override var name = "StreamPlay"
@@ -164,16 +164,13 @@ class PlayStreamplay : ExtractorApi() {
 }
 
 // ==========================================
-// VIDHIDE – extends built‑in extractor
+// VIDHIDE (Built-in Extensions)
 // ==========================================
 class VidHideCustom : VidhideExtractor() {
     override var mainUrl = "https://vidhide.com"
     override val requiresReferer = true
 }
 
-// ==========================================
-// VIDHIDE PRO – extends built‑in Pro extractor
-// ==========================================
 class VidHideProCustom : VidHidePro() {
     override var mainUrl = "https://vidhidevip.com"
     override val requiresReferer = true
