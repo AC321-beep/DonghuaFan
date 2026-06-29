@@ -76,34 +76,31 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                     ?: iframe.attr("data-lazy-src").takeIf { it.isNotBlank() }
                     ?: iframe.attr("src")
                 
-                var cleanUrl = fixUrlNull(rawSrc) ?: return@forEach
-                if (cleanUrl.startsWith("//")) cleanUrl = "https:$cleanUrl"
+                val cleanUrlRaw = fixUrlNull(rawSrc) ?: return@forEach
+                val httpsUrl = if (cleanUrlRaw.startsWith("//")) "https:$cleanUrlRaw" else cleanUrlRaw
 
-                if (cleanUrl.isNotBlank() && !cleanUrl.contains("about:blank")) {
+                if (httpsUrl.isNotBlank() && !httpsUrl.contains("about:blank")) {
                     
-                    // --- Dailymotion Normalization ---
-                    if (cleanUrl.contains("dailymotion", true)) {
-                        // Extract the exact video ID regardless of the embed format
-                        val match = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(cleanUrl)
-                        if (match != null) {
-                            // Translate to standard URL for Cloudstream's native extractor
-                            cleanUrl = "https://www.dailymotion.com/video/${match.groupValues[1]}"
+                    // Immutable URL resolution based on site logic
+                    val finalUrl = when {
+                        httpsUrl.contains("dailymotion", true) -> {
+                            val match = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(httpsUrl)
+                            if (match != null) "https://www.dailymotion.com/video/${match.groupValues[1]}" else httpsUrl
                         }
+                        httpsUrl.contains("streamplay", true) -> {
+                            httpsUrl.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
+                        }
+                        else -> httpsUrl
                     }
 
-                    // --- StreamPlay Normalization ---
-                    if (cleanUrl.contains("streamplay", true)) {
-                        cleanUrl = cleanUrl.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
-                    }
-
-                    // Execute Extractors
-                    if (cleanUrl.contains("vidhide", true)) {
+                    // Execute Extractors using the final immutable URL
+                    if (finalUrl.contains("vidhide", true)) {
                         try { 
-                            val domain = "https://" + URI(cleanUrl).host
-                            VidHidePro().apply { mainUrl = domain }.getUrl(cleanUrl, referer, subtitleCallback, callback)
+                            val domain = "https://" + URI(finalUrl).host
+                            VidHidePro().apply { mainUrl = domain }.getUrl(finalUrl, referer, subtitleCallback, callback)
                             anyStreamFound = true 
                         } catch(e: Exception) {}
-                    } else if (loadExtractor(cleanUrl, referer, subtitleCallback, callback)) {
+                    } else if (loadExtractor(finalUrl, referer, subtitleCallback, callback)) {
                         anyStreamFound = true
                     }
                 }
@@ -118,7 +115,7 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                 }
             }
             
-            // Regex specifically for Dailymotion hidden inside base64/js
+            // Regex specifically for hidden Dailymotion iframes
             val dmRegex = Regex("""https?://(?:geo\.)?dailymotion\.com/[^\s"'<>]+video=([^&\s"'<>]+)""")
             dmRegex.findAll(html).forEach { match ->
                 val standardUrl = "https://www.dailymotion.com/video/${match.groupValues[1]}"
@@ -143,24 +140,21 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                         val resp = app.get(mirror, headers = defaultHeaders)
                         if (resp.url != mirror && !resp.url.contains("luciferdonghua.in")) {
                             
-                            var cleanDest = resp.url
+                            val destUrl = resp.url
                             
-                            // --- Dailymotion Redirect Normalization ---
-                            if (cleanDest.contains("dailymotion", true)) {
-                                val match = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(cleanDest)
-                                if (match != null) {
-                                    cleanDest = "https://www.dailymotion.com/video/${match.groupValues[1]}"
-                                }
-                            }
+                            // Immutable translation for Dailymotion redirects
+                            val finalDest = if (destUrl.contains("dailymotion", true)) {
+                                val match = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(destUrl)
+                                if (match != null) "https://www.dailymotion.com/video/${match.groupValues[1]}" else destUrl
+                            } else destUrl
 
-                            // Caught a redirect to a server
-                            if (cleanDest.contains("vidhide", true)) {
+                            if (finalDest.contains("vidhide", true)) {
                                 try {
-                                    val domain = "https://" + URI(cleanDest).host
-                                    VidHidePro().apply { mainUrl = domain }.getUrl(cleanDest, data, subtitleCallback, callback)
+                                    val domain = "https://" + URI(finalDest).host
+                                    VidHidePro().apply { mainUrl = domain }.getUrl(finalDest, data, subtitleCallback, callback)
                                     anyStreamFound = true
                                 } catch(e: Exception) {}
-                            } else if (loadExtractor(cleanDest, data, subtitleCallback, callback)) {
+                            } else if (loadExtractor(finalDest, data, subtitleCallback, callback)) {
                                 anyStreamFound = true
                             }
                         } else {
