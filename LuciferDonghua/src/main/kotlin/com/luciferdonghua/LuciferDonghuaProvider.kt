@@ -11,39 +11,45 @@ class LuciferDonghuaProvider : MainAPI() {
     override var lang = "en"
     override val hasQuickSearch = true
     
-    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.AsianDrama)
+    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    // TODO: Step 1 - Update these URLs to match the actual category menus on the site
+    // Updated precisely to match the menus found in your HTML
     override val mainPage = mainPageOf(
-        "$mainUrl/trending/" to "Trending",
-        "$mainUrl/movies/" to "Movies",
-        "$mainUrl/series/" to "Series",
-        "$mainUrl/ongoing/" to "Ongoing"
+        "$mainUrl/" to "Home",
+        "$mainUrl/anime/?status=&type=movie&sub=" to "Movies",
+        "$mainUrl/network/tencent/" to "Tencent Anime",
+        "$mainUrl/network/youku/" to "YouKu Anime",
+        "$mainUrl/anime/?status=completed" to "Completed"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) request.data else "${request.data}/page/$page/"
+        // AnimeStream theme handles pagination via /page/X/
+        val url = if (page == 1) request.data else "${request.data.removeSuffix("/")}/page/$page/"
         val document = app.get(url).document
         
-        // TODO: Step 2 - Replace "div.post-item" with the actual HTML class of the anime cards
-        val home = document.select("div.post-item").mapNotNull { it.toSearchResult() }
+        // Target specifically the 'article.bs' containers used in the HTML
+        val home = document.select("article.bs").mapNotNull { it.toSearchResult() }
 
         return newHomePageResponse(
             list = HomePageList(
                 name = request.name,
                 list = home,
-                isHorizontalImages = true 
+                isHorizontalImages = false // AnimeStream uses vertical posters
             ),
-            hasNext = true 
+            hasNext = home.isNotEmpty()
         )
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        // TODO: Step 3 - Update the CSS selectors below to match the elements inside the Anime card
-        val title = this.selectFirst("h3, .title")?.text()?.trim() ?: return null
-        val href = fixUrlNull(this.selectFirst("a")?.attr("href")) ?: return null
-        val posterUrl = fixUrlNull(this.selectFirst("img")?.attr("src"))
-        val epCount = this.selectFirst(".ep-status, .episode")?.text()?.filter { it.isDigit() }?.toIntOrNull()
+        val titleElement = this.selectFirst(".tt h2")
+        val title = titleElement?.text()?.trim() ?: return null
+        
+        val href = fixUrlNull(this.selectFirst("a[itemprop=url]")?.attr("href")) ?: return null
+        val posterUrl = fixUrlNull(this.selectFirst("img.ts-post-image")?.attr("src"))
+        
+        // Precision Regex to extract "147" from strings like "Ep 147 [4K]"
+        val epText = this.selectFirst(".bt .epx")?.text()
+        val epCount = epText?.let { Regex("""Ep\s*(\d+)""", RegexOption.IGNORE_CASE).find(it)?.groupValues?.get(1)?.toIntOrNull() }
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = posterUrl
@@ -52,11 +58,11 @@ class LuciferDonghuaProvider : MainAPI() {
     }
 
     override suspend fun search(query: String, page: Int): SearchResponseList {
-        val url = "$mainUrl/page/$page/?s=$query"
+        // AnimeStream default search structure
+        val url = if (page == 1) "$mainUrl/?s=$query" else "$mainUrl/page/$page/?s=$query"
         val document = app.get(url).document
         
-        // TODO: Step 4 - Replace with the actual search result item selector
-        val results = document.select("div.search-item, div.post-item").mapNotNull { it.toSearchResult() }
+        val results = document.select("article.bs").mapNotNull { it.toSearchResult() }
         
         return newSearchResponseList(results, hasNext = results.isNotEmpty())
     }
@@ -64,35 +70,43 @@ class LuciferDonghuaProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         val document = app.get(url).document
 
-        // TODO: Step 5 - Update page detail selectors
-        val title = document.selectFirst("h1.title, .entry-title")?.text()?.trim() ?: return null
-        val poster = fixUrlNull(document.selectFirst(".poster img, .thumb img")?.attr("src"))
-        val description = document.selectFirst(".description, .synopsis")?.text()?.trim()
-        val tags = document.select(".genres a").map { it.text() }
-        val year = document.selectFirst(".year, .released")?.text()?.toIntOrNull()
+        // AnimeStream theme details page selectors
+        val title = document.selectFirst("h1.entry-title")?.text()?.trim() ?: return null
+        val poster = fixUrlNull(document.selectFirst(".thumb img")?.attr("src"))
+        val description = document.selectFirst(".entry-content p")?.text()?.trim()
+        val tags = document.select(".genxed a").map { it.text() }
+        
+        val yearText = document.selectFirst(".spe span:contains(Released)")?.text()
+        val year = yearText?.filter { it.isDigit() }?.toIntOrNull()
 
         val episodes = mutableListOf<Episode>()
         
-        // TODO: Step 6 - Update episode list selector
-        document.select("ul.episodes li, .ep-list a").forEach { ep ->
-            val epHref = fixUrlNull(ep.selectFirst("a")?.attr("href") ?: ep.attr("href")) ?: return@forEach
-            val epName = ep.text().trim()
+        // AnimeStream theme episode list selector
+        document.select(".eplister ul li").forEach { ep ->
+            val linkElement = ep.selectFirst("a") ?: return@forEach
+            val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
+            
+            // Grabs the clean episode number text, e.g., "147"
+            val epName = linkElement.selectFirst(".epl-num")?.text()?.trim() ?: ep.text().trim()
             val epNum = epName.filter { it.isDigit() }.toIntOrNull()
 
             episodes.add(
                 newEpisode(data = epHref) {
-                    this.name = epName
+                    this.name = "Episode $epName"
                     this.episode = epNum
                 }
             )
         }
+
+        // Ensure episodes are sorted ascending (1 to Latest)
+        val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
             this.plot = description
             this.tags = tags
             this.year = year
-            this.episodes = episodes.associateBy { it.episode ?: 0 }
+            this.episodes = sortedEpisodes.associateBy { it.episode ?: 0 }
         }
     }
 
@@ -104,11 +118,16 @@ class LuciferDonghuaProvider : MainAPI() {
     ): Boolean {
         val document = app.get(data).document
         
-        // TODO: Step 7 - Adjust the iframe selector based on the site's player box
-        document.select("iframe").forEach { iframe ->
-            val iframeUrl = fixUrlNull(iframe.attr("src"))
-            if (iframeUrl != null) {
-                loadExtractor(iframeUrl, mainUrl, subtitleCallback, callback)
+        // Extracts the iframes specifically placed in the player area of the AnimeStream theme
+        document.select(".player-area iframe, .playcon iframe, iframe").forEach { iframe ->
+            var iframeUrl = iframe.attr("src")
+            if (iframeUrl.startsWith("//")) {
+                iframeUrl = "https:$iframeUrl"
+            }
+            
+            val cleanUrl = fixUrlNull(iframeUrl)
+            if (cleanUrl != null && !cleanUrl.contains("about:blank")) {
+                loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
             }
         }
         return true
