@@ -6,10 +6,13 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class LuciferDonghuaPlugin : Plugin() {
     override fun load() {
-        // Registers the main web scraper
+        // 1. Register the Main Scraper
         registerMainAPI(LuciferDonghuaProvider())
         
-        // Register any custom extractors you build in Extractors.kt here later.
-        // Example: registerExtractorAPI(VidhideExtractor())
+        // 2. Register all Extractors so loadExtractor() can use them
+        registerExtractorAPI(Rumble())
+        registerExtractorAPI(PlayStreamplay())
+        registerExtractorAPI(VidHideCustom())
+        registerExtractorAPI(VidHideProCustom())
     }
 }
