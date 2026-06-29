@@ -192,7 +192,8 @@ open class VkExtractor : ExtractorApi() {
         }
     }
 
-    private fun linkcikart(
+    // FIXED: Added 'suspend' modifier here
+    private suspend fun linkcikart(
         text: String,
         userAgent: String,
         callback: (ExtractorLink) -> Unit
