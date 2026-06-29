@@ -1,15 +1,29 @@
-cloudstream {
-    description = "Watch Donghua from Multi-Source"
-    authors = listOf("AC321-beep")
-    status = 1
-    tvTypes = listOf("Anime")
-    language = "zh"
-    version = 2
-    iconUrl = "https://i0.wp.com/luciferdonghua.in/wp-content/uploads/2022/12/cropped-lucifer-donghua-DP-192x192.webp"
+plugins {
+    id("com.android.library")
+    id("kotlin-android")
+    id("com.lagradost.cloudstream3.gradle")
+}
+
+android {
+    namespace = "com.luciferdonghua"
+    compileSdk = 34
+    defaultConfig {
+        minSdk = 24
+    }
 }
 
 dependencies {
-    // These dependencies are required to resolve 'kotlinx', 'coroutineScope', and 'TvType'
+    // We use 'api' so these libraries are visible to the Kotlin compiler 
+    // without triggering configuration cache errors.
+    api("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
     compileOnly("com.lagradost:cloudstream3:pre-release")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
+}
+
+cloudstream {
+    description = "Watch Donghua from Multi-Source"
+    authors = listOf("AC321-beep")
+    tvTypes = listOf("Anime")
+    language = "zh"
+    version = 4
+    iconUrl = "https://i0.wp.com/luciferdonghua.in/wp-content/uploads/2022/12/cropped-lucifer-donghua-DP-192x192.webp"
 }
