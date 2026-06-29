@@ -7,7 +7,7 @@ import org.jsoup.nodes.Element
 class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
     override var name = "Lucifer Donghua"
-    override val iconUrl = "https://i0.wp.com/luciferdonghua.in/wp-content/uploads/2022/12/cropped-lucifer-donghua-DP-192x192.webp"
+    // iconUrl is now set in build.gradle.kts (cloudstream block)
     override val hasMainPage = true
     override var lang = "en"
     override val hasQuickSearch = true
@@ -22,16 +22,15 @@ class LuciferDonghuaProvider : MainAPI() {
         "$mainUrl/anime/?status=completed" to "Completed"
     )
 
-    override fun getExtractorApis(): List<ExtractorApi> {
-        return listOf(
-            Rumble(),
-            PlayStreamplay(),
-            VidHideCustom(),
-            VidHideProCustom(),
-            PlayerDonghuaworld(),
-            Donghuaplanet()
-        )
-    }
+    // ✅ Use override val instead of fun
+    override val extractorApis: List<ExtractorApi> = listOf(
+        Rumble(),
+        PlayStreamplay(),
+        VidHideCustom(),
+        VidHideProCustom(),
+        PlayerDonghuaworld(),
+        Donghuaplanet()
+    )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) request.data else "${request.data.removeSuffix("/")}/page/$page/"
@@ -154,63 +153,48 @@ class LuciferDonghuaProvider : MainAPI() {
                         if (src.startsWith("//")) src = "https:$src"
                         val clean = fixUrlNull(src)
                         if (clean != null && clean.isNotBlank()) {
-                            // This will use our registered extractors
                             loadExtractor(clean, mainUrl, subtitleCallback, callback)
                         }
                     } else {
-                        // If no iframe, try to find video directly
                         val video = mirrorDoc.selectFirst("video[src]")
                         if (video != null) {
                             callback(
-                                newExtractorLink(
-                                    "$name - $label",
-                                    label,
-                                    video.attr("src"),
-                                    mirrorUrl,
-                                    Qualities.Unknown.value,
-                                    ExtractorLinkType.M3U8
-                                )
+                                newExtractorLink("$name - $label", label, video.attr("src"), ExtractorLinkType.M3U8) {
+                                    this.referer = mirrorUrl
+                                    this.quality = Qualities.Unknown.value
+                                }
                             )
                         } else {
-                            // Regex fallback for direct m3u8/mp4
                             val scriptRegex = Regex("""(?:file|video_url|source|src)\s*:\s*["']([^"']+\.(?:m3u8|mp4))["']""")
                             mirrorDoc.select("script").forEach { script ->
                                 scriptRegex.find(script.html())?.let { match ->
                                     val videoUrl = match.groupValues[1]
                                     callback(
-                                        newExtractorLink(
-                                            "$name - $label",
-                                            label,
-                                            videoUrl,
-                                            mirrorUrl,
-                                            Qualities.Unknown.value,
-                                            ExtractorLinkType.M3U8
-                                        )
+                                        newExtractorLink("$name - $label", label, videoUrl, ExtractorLinkType.M3U8) {
+                                            this.referer = mirrorUrl
+                                            this.quality = Qualities.Unknown.value
+                                        }
                                     )
                                 }
                             }
                         }
                     }
                 } catch (e: Exception) {
-                    // ignore – just skip this mirror
+                    // ignore
                 }
             }
         }
 
-        // 3️⃣ Final regex fallback on main page (if nothing else worked)
+        // 3️⃣ Final regex fallback on main page
         val scriptRegex = Regex("""(?:file|video_url|source|src)\s*:\s*["']([^"']+\.(?:m3u8|mp4))["']""")
         document.select("script").forEach { script ->
             scriptRegex.find(script.html())?.let { match ->
                 val videoUrl = match.groupValues[1]
                 callback(
-                    newExtractorLink(
-                        name,
-                        name,
-                        videoUrl,
-                        data,
-                        Qualities.Unknown.value,
-                        ExtractorLinkType.M3U8
-                    )
+                    newExtractorLink(name, name, videoUrl, ExtractorLinkType.M3U8) {
+                        this.referer = data
+                        this.quality = Qualities.Unknown.value
+                    }
                 )
             }
         }
