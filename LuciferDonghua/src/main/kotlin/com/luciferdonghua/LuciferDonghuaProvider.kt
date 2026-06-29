@@ -70,24 +70,23 @@ class LuciferDonghuaProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         val document = app.get(url).document
 
-        // AnimeStream theme details page selectors
-        val title = document.selectFirst("h1.entry-title")?.text()?.trim() ?: return null
-        val poster = fixUrlNull(document.selectFirst(".thumb img")?.attr("src"))
-        val description = document.selectFirst(".entry-content p")?.text()?.trim()
-        val tags = document.select(".genxed a").map { it.text() }
+        val title = document.selectFirst("h1.entry-title, h1.title")?.text()?.trim() ?: return null
+        val poster = fixUrlNull(document.selectFirst(".thumb img, .poster img")?.attr("src"))
+        val description = document.selectFirst(".entry-content p, .synopsis p, .desc")?.text()?.trim()
+        val tags = document.select(".genx a, .genres a").map { it.text() }
         
-        val yearText = document.selectFirst(".spe span:contains(Released)")?.text()
+        val yearText = document.selectFirst(".split span:contains(Released), .info-content span:contains(Year)")?.text()
         val year = yearText?.filter { it.isDigit() }?.toIntOrNull()
 
         val episodes = mutableListOf<Episode>()
         
-        // AnimeStream theme episode list selector
-        document.select(".eplister ul li").forEach { ep ->
+        document.select(".eplister ul li, #episode_list li, .listeps ul li").forEach { ep ->
             val linkElement = ep.selectFirst("a") ?: return@forEach
             val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
             
-            // Grabs the clean episode number text, e.g., "147"
-            val epName = linkElement.selectFirst(".epl-num")?.text()?.trim() ?: ep.text().trim()
+            val epName = linkElement.selectFirst(".epl-num, .epnum")?.text()?.trim() 
+                ?: ep.text().trim()
+                
             val epNum = epName.filter { it.isDigit() }.toIntOrNull()
 
             episodes.add(
@@ -98,15 +97,19 @@ class LuciferDonghuaProvider : MainAPI() {
             )
         }
 
-        // Ensure episodes are sorted ascending (1 to Latest)
         val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
+
+        // EXPLICIT GROUPING FOR COMPILER
+        val episodeMap = mapOf(
+            DubStatus.Subbed to sortedEpisodes
+        )
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
             this.plot = description
             this.tags = tags
             this.year = year
-            this.episodes = sortedEpisodes.associateBy { it.episode ?: 0 }
+            this.episodes = episodeMap 
         }
     }
 
