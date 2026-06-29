@@ -132,11 +132,15 @@ class FootballReplays : MainAPI() {
         Log.d("FootballReplays", "Iframe Url: $iframeUrl")
 
         loadExtractor(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
-            // Use Kotlin's .copy() to rename the link synchronously.
-            // This safely avoids all coroutine crash issues AND preserves essential video headers.
-            val extractedLink = link.copy(
+            val extractedLink = ExtractorLink(
                 source = customName,
-                name = customName
+                name = customName,
+                url = link.url,
+                referer = link.referer,
+                quality = link.quality,
+                isM3u8 = link.isM3u8,
+                headers = link.headers,
+                type = link.type
             )
             callback(extractedLink)
         }
