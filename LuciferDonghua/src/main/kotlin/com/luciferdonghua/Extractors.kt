@@ -12,6 +12,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.M3u8Helper
+import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
@@ -29,7 +30,6 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Use the same headers as the provider for consistency
         val headers = mapOf(
             "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
         )
@@ -75,7 +75,6 @@ class Rumble : ExtractorApi() {
                 }
             }
 
-            // Video ID fallback (even if sources found, still try)
             val videoId = url.substringAfter("/embed/v").substringBefore("/")
             if (videoId.isNotEmpty()) {
                 val fallback = "$mainUrl/hls-vod/$videoId/playlist.m3u8?u=0&b=0"
@@ -126,7 +125,7 @@ class Rumble : ExtractorApi() {
 }
 
 // ==========================================
-// PLAYSTREAMPLAY – unchanged, but can add headers if needed
+// PLAYSTREAMPLAY – unchanged
 // ==========================================
 class PlayStreamplay : ExtractorApi() {
     override var name = "StreamPlay"
