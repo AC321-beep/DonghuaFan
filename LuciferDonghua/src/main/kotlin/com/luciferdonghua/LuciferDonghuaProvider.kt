@@ -1,65 +1,140 @@
 package com.luciferdonghua
 
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.extractors.VidHidePro
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
-import kotlinx.coroutines.*
+import java.net.URLDecoder
+import kotlinx.coroutines.* // Required for parallel mirror processing
 
 class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
     override var name = "Lucifer Donghua"
     override val hasMainPage = true
-    override var lang = "zh"
+    override var lang = "en"
     override val hasQuickSearch = true
 
     private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         "Referer" to "$mainUrl/",
         "Origin" to mainUrl
     )
 
-    override val supportedTypes = setOf(TvType.Anime)
+    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
+
+    override val mainPage = mainPageOf(
+        "$mainUrl/anime/?order=update" to "Latest Release",
+        "$mainUrl/anime/?status=&type=movie&sub=" to "Movies",
+        "$mainUrl/network/tencent/" to "Tencent Anime",
+        "$mainUrl/network/youku/" to "YouKu Anime",
+        "$mainUrl/anime/?status=completed" to "Completed"
+    )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) request.data else "${request.data.removeSuffix("/")}/page/$page/"
         val document = app.get(url, headers = defaultHeaders).document
         val home = document.select("article.bs").mapNotNull { it.toSearchResult() }
-        return newHomePageResponse(HomePageList(request.name, home, false), home.isNotEmpty())
+
+        return newHomePageResponse(
+            list = HomePageList(
+                name = request.name,
+                list = home,
+                isHorizontalImages = false
+            ),
+            hasNext = home.isNotEmpty()
+        )
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        val titleElement = this.selectFirst(".tt h2") ?: return null
+        val titleElement = this.selectFirst(".tt h2")
+        val title = titleElement?.text()?.trim() ?: return null
         val href = fixUrlNull(this.selectFirst("a[itemprop=url]")?.attr("href")) ?: return null
         val posterUrl = fixUrlNull(this.selectFirst("img.ts-post-image")?.attr("src"))
-        return newAnimeSearchResponse(titleElement.text().trim(), href, TvType.Anime) {
+        val epText = this.selectFirst(".bt .epx")?.text()
+        val epCount = epText?.let {
+            Regex("""Ep\s*(\d+)""", RegexOption.IGNORE_CASE).find(it)?.groupValues?.get(1)?.toIntOrNull()
+        }
+
+        return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = posterUrl
+            addDubStatus(dubExist = false, subExist = true, epCount)
         }
     }
 
     override suspend fun search(query: String, page: Int): SearchResponseList {
         val url = if (page == 1) "$mainUrl/?s=$query" else "$mainUrl/page/$page/?s=$query"
         val document = app.get(url, headers = defaultHeaders).document
-        return newSearchResponseList(document.select("article.bs").mapNotNull { it.toSearchResult() }, true)
+        val results = document.select("article.bs").mapNotNull { it.toSearchResult() }
+        return newSearchResponseList(results, hasNext = results.isNotEmpty())
     }
 
     override suspend fun load(url: String): LoadResponse? {
         val document = app.get(url, headers = defaultHeaders).document
+
         val title = document.selectFirst("h1.entry-title, h1.title")?.text()?.trim() ?: return null
         val poster = fixUrlNull(document.selectFirst(".thumb img, .poster img")?.attr("src"))
         val description = document.selectFirst(".entry-content p, .synopsis p, .desc")?.text()?.trim()
+        val tags = document.select(".genx a, .genres a").map { it.text() }
+
+        val yearText = document.selectFirst(".split span:contains(Released), .info-content span:contains(Year)")?.text()
+        val year = yearText?.filter { it.isDigit() }?.toIntOrNull()
+
         val episodes = mutableListOf<Episode>()
 
         document.select(".eplister ul li, #episode_list li, .listeps ul li").forEach { ep ->
-            val link = ep.selectFirst("a")?.attr("href") ?: return@forEach
-            episodes.add(newEpisode(fixUrl(link)) { name = ep.text().trim() })
+            val linkElement = ep.selectFirst("a") ?: return@forEach
+            val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
+            val epName = linkElement.selectFirst(".epl-num, .epnum")?.text()?.trim() ?: ep.text().trim()
+            val epNum = epName.filter { it.isDigit() }.toIntOrNull()
+
+            episodes.add(
+                newEpisode(data = epHref) {
+                    this.name = "Episode $epName"
+                    this.episode = epNum
+                }
+            )
         }
+
+        val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
+        val episodeMap = mutableMapOf(
+            DubStatus.Subbed to sortedEpisodes
+        )
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
             this.plot = description
-            addEpisodes(DubStatus.Subbed, episodes)
+            this.tags = tags
+            this.year = year
+            this.episodes = episodeMap
         }
+    }
+
+    private suspend fun extractDailymotionToken(pageUrl: String): String? {
+        val pageHtml = try { app.get(pageUrl, headers = defaultHeaders).text } catch (e: Exception) { return null }
+        val pageDoc = try { Jsoup.parse(pageHtml) } catch (e: Exception) { null }
+
+        pageDoc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
+            val src = iframe.attr("src")
+            val match = Regex("""[?&]video=([^&]+)""").find(src)
+            if (match != null) return match.groupValues[1]
+        }
+
+        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+            .find(pageHtml)?.groupValues?.get(1)
+        if (playerJson != null) {
+            var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+            val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
+            val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+
+            if (encrypt == 1) rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+            else if (encrypt == 2) {
+                rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
+                rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+            }
+            if (from.equals("dailymotion", ignoreCase = true)) return rawUrl
+        }
+        return null
     }
 
     override suspend fun loadLinks(
@@ -70,101 +145,100 @@ class LuciferDonghuaProvider : MainAPI() {
     ): Boolean = coroutineScope {
         var anyStreamFound = false
 
-        suspend fun processDoc(doc: org.jsoup.nodes.Document, referer: String) {
-            // 1. Process Iframes
-            doc.select("iframe").forEach { iframe ->
-                val rawSrc = iframe.attr("data-src").takeIf { it.isNotBlank() }
+        suspend fun extractIframes(doc: org.jsoup.nodes.Document, refererUrl: String) {
+            doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
+                
+                // 🔴 FIX 1: Grab lazy-loaded attributes so VidHide and Streamplay aren't skipped
+                var src = iframe.attr("data-src").takeIf { it.isNotBlank() }
                     ?: iframe.attr("data-lazy-src").takeIf { it.isNotBlank() }
                     ?: iframe.attr("src")
                 
-                val cleanUrlRaw = fixUrlNull(rawSrc) ?: return@forEach
-                val httpsUrl = if (cleanUrlRaw.startsWith("//")) "https:$cleanUrlRaw" else cleanUrlRaw
-
-                if (httpsUrl.isNotBlank() && !httpsUrl.contains("about:blank")) {
+                if (src.startsWith("//")) src = "https:$src"
+                val clean = fixUrlNull(src) ?: return@forEach
+                
+                if (clean.isNotBlank() && !clean.contains("about:blank")) {
                     
-                    // Immutable URL resolution based on site logic
-                    val finalUrl = when {
-                        httpsUrl.contains("dailymotion", true) -> {
-                            val match = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(httpsUrl)
-                            if (match != null) "https://www.dailymotion.com/video/${match.groupValues[1]}" else httpsUrl
+                    // --- 1. RESTORED DAILYMOTION LOGIC ---
+                    if ("dailymotion" in clean) {
+                        var token = Regex("""[?&]video=([^&]+)""").find(clean)?.groupValues?.get(1)
+                        if (token == null) token = extractDailymotionToken(refererUrl)
+                        if (token != null) {
+                            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$token"
+                            if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
+                                anyStreamFound = true
+                            }
+                            return@forEach 
                         }
-                        httpsUrl.contains("streamplay", true) -> {
-                            httpsUrl.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
-                        }
-                        else -> httpsUrl
                     }
 
-                    // Execute Extractors directly using the final URL
-                    if (finalUrl.contains("vidhide", true)) {
-                        try { 
-                            VidHidePro().getUrl(finalUrl, referer, subtitleCallback, callback)
-                            anyStreamFound = true 
-                        } catch(e: Exception) {}
-                    } else if (loadExtractor(finalUrl, referer, subtitleCallback, callback)) {
-                        anyStreamFound = true
+                    // 🔴 FIX 2: Domain Normalization
+                    // Cloudstream natively supports VidHide and StreamPlay, but only if the domain exactly matches.
+                    // This forces rogue domains into the standard format so Cloudstream's extractors catch them.
+                    val normalizedUrl = when {
+                        clean.contains("vidhide", ignoreCase = true) -> clean.replace(Regex("""vidhide[a-z0-9A-Z]*\.[a-z]+"""), "vidhidepro.com")
+                        clean.contains("streamplay", ignoreCase = true) -> clean.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
+                        else -> clean
                     }
-                }
-            }
-            
-            // 2. Global Regex Failsafe for hidden URLs
-            val html = doc.html()
-            val embedRegex = Regex("""https?://(?:www\.)?(?:vidhidevip|vidhidepro|vidhide|play\.streamplay|rumble)[^\s"'<>]+""")
-            embedRegex.findAll(html).forEach { match ->
-                if (loadExtractor(match.value, referer, subtitleCallback, callback)) {
-                    anyStreamFound = true
-                }
-            }
-            
-            // Regex specifically for hidden Dailymotion iframes
-            val dmRegex = Regex("""https?://(?:geo\.)?dailymotion\.com/[^\s"'<>]+video=([^&\s"'<>]+)""")
-            dmRegex.findAll(html).forEach { match ->
-                val standardUrl = "https://www.dailymotion.com/video/${match.groupValues[1]}"
-                if (loadExtractor(standardUrl, referer, subtitleCallback, callback)) {
-                    anyStreamFound = true
+
+                    // --- 3. STANDARD EXTRACTORS (VidHide, StreamPlay, OK.ru, Rumble) ---
+                    // By passing the normalized URL directly to loadExtractor, we bypass the Kotlin compiler errors.
+                    if (loadExtractor(normalizedUrl, refererUrl, subtitleCallback, callback)) {
+                        anyStreamFound = true
+                    } else {
+                        // --- 4. Fallback: Manually scrape .m3u8 files from unmapped iframes ---
+                        try {
+                            val iframeHtml = app.get(normalizedUrl, headers = mapOf("Referer" to refererUrl)).text
+                            val rawStreamRegex = Regex("""["'](https?[^"']+\.(?:m3u8|mp4)[^"']*)["']""")
+                            rawStreamRegex.findAll(iframeHtml).forEach { match ->
+                                val cleanStreamUrl = match.groupValues[1].replace("\\/", "/")
+                                callback(
+                                    newExtractorLink(name, "Fallback Server", cleanStreamUrl, INFER_TYPE) {
+                                        this.referer = normalizedUrl
+                                    }
+                                )
+                                anyStreamFound = true
+                            }
+                        } catch (e: Exception) {}
+                    }
                 }
             }
         }
 
-        // Fetch Main Document
-        val baseDoc = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return@coroutineScope false }
-        processDoc(baseDoc, data)
+        // 1️⃣ Fetch the primary episode page
+        val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return@coroutineScope false }
+        extractIframes(baseDocument, data)
 
-        // 3. Process External Mirrors
-        baseDoc.select("select.mirror option")
-            .mapNotNull { it.attr("value") }
-            .filter { it.startsWith("http") && it != data }
-            .distinct()
-            .map { mirror ->
-                async {
-                    try {
-                        val resp = app.get(mirror, headers = defaultHeaders)
-                        if (resp.url != mirror && !resp.url.contains("luciferdonghua.in")) {
-                            
-                            val destUrl = resp.url
-                            
-                            // Immutable translation for Dailymotion redirects
-                            val finalDest = if (destUrl.contains("dailymotion", true)) {
-                                val match = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(destUrl)
-                                if (match != null) "https://www.dailymotion.com/video/${match.groupValues[1]}" else destUrl
-                            } else {
-                                destUrl
-                            }
+        // 2️⃣ Collect all Mirror URLs from the dropdown
+        val mirrorUrls = baseDocument.select("select.mirror option").mapNotNull { option ->
+            val url = option.attr("value")
+            if (url.startsWith("http") && url != data) url else null
+        }.distinct()
 
-                            if (finalDest.contains("vidhide", true)) {
-                                try {
-                                    VidHidePro().getUrl(finalDest, data, subtitleCallback, callback)
-                                    anyStreamFound = true
-                                } catch(e: Exception) {}
-                            } else if (loadExtractor(finalDest, data, subtitleCallback, callback)) {
-                                anyStreamFound = true
-                            }
-                        } else {
-                            // Internal page
-                            processDoc(resp.document, mirror)
+        // 🔴 FIX 3: Parallel Mirror Processing
+        // Doing this sequentially causes timeouts and dropped links. `async` fetches them all simultaneously.
+        mirrorUrls.map { mirrorUrl ->
+            async {
+                try {
+                    val resp = app.get(mirrorUrl, headers = defaultHeaders)
+                    val destUrl = resp.url
+                    
+                    // If the mirror redirects directly to the video host (e.g. vidhide) without an iframe
+                    if (destUrl != mirrorUrl && !destUrl.contains("luciferdonghua.in")) {
+                        val normalizedDest = when {
+                            destUrl.contains("vidhide", ignoreCase = true) -> destUrl.replace(Regex("""vidhide[a-z0-9A-Z]*\.[a-z]+"""), "vidhidepro.com")
+                            destUrl.contains("streamplay", ignoreCase = true) -> destUrl.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
+                            else -> destUrl
                         }
-                    } catch(e: Exception) {}
-                }
-            }.awaitAll()
+                        if (loadExtractor(normalizedDest, data, subtitleCallback, callback)) {
+                            anyStreamFound = true
+                        }
+                    } else {
+                        // It stayed on a Lucifer Donghua page, parse its iframes
+                        extractIframes(resp.document, mirrorUrl)
+                    }
+                } catch (e: Exception) {}
+            }
+        }.awaitAll()
 
         return@coroutineScope anyStreamFound
     }
