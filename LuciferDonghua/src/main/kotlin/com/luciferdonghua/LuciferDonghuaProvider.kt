@@ -97,10 +97,12 @@ class LuciferDonghuaProvider : MainAPI() {
             )
         }
 
+       // ... (previous code inside load function)
+
         val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
 
-        // EXPLICIT GROUPING FOR COMPILER
-        val episodeMap = mapOf(
+        // FIXED: Changed mapOf() to mutableMapOf()
+        val episodeMap = mutableMapOf(
             DubStatus.Subbed to sortedEpisodes
         )
 
