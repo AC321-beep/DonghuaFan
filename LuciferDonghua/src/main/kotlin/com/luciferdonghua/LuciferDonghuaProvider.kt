@@ -21,13 +21,7 @@ class LuciferDonghuaProvider : MainAPI() {
         "$mainUrl/anime/?status=completed" to "Completed"
     )
 
-    // ✅ Fix: override fun, not val
-    override fun getExtractorApis(): List<ExtractorApi> = listOf(
-        Rumble(),
-        PlayStreamplay(),
-        VidHideCustom(),
-        VidHideProCustom()
-    )
+    // ✅ Removed getExtractorApis – extractors are auto‑detected
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) request.data else "${request.data.removeSuffix("/")}/page/$page/"
