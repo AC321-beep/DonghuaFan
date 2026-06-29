@@ -15,7 +15,6 @@ class FootballReplays : MainAPI() {
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Others)
     
-    // 1. REORDERED AND RENAMED MAIN PAGE CATEGORIES
     override val mainPage = mainPageOf(
         "${mainUrl}/international/" to "FIFA",
         "${mainUrl}/uefa/" to "UEFA",
@@ -71,12 +70,10 @@ class FootballReplays : MainAPI() {
         val title = document.selectFirst("h1.s-title")?.text()?.trim() ?: return null
         val poster = fixUrlNull(document.selectFirst("div.s-feat img")?.attr("src"))
         
-        // 2. EXTRACT FULL DATE AND TIME
         val timeElement = document.selectFirst("time.updated-date")
-        val fullDateText = timeElement?.text()?.trim() // Gets readable text like "May 12, 2024"
+        val fullDateText = timeElement?.text()?.trim()
         val year = timeElement?.attr("datetime")?.substringBefore("-")?.toIntOrNull()
         
-        // FORMAT THE PLOT SYNOPSIS
         val rawDescription = document.selectFirst("meta[property=og:description]")?.attr("content")?.trim() ?: ""
         val finalDescription = if (!fullDateText.isNullOrEmpty()) {
             "🕒 Match Date: $fullDateText\n\n$rawDescription"
@@ -106,8 +103,7 @@ class FootballReplays : MainAPI() {
                         this.name = "$sourceName - $part"
                         this.episode = currentEpisodeSize + 1
                         
-                        // INJECT DATE INTO EPISODE DETAILS
-                        this.dateAdded = fullDateText
+                        // FIXED: Replaced invalid dateAdded reference with standard description
                         this.description = fullDateText
                     }
                 )
@@ -116,7 +112,7 @@ class FootballReplays : MainAPI() {
 
         return newTvSeriesLoadResponse(title, url, TvType.Others, episodes) {
             this.posterUrl = poster
-            this.plot = finalDescription // Using the updated plot containing the Match Date
+            this.plot = finalDescription
             this.year = year
             this.tags = tags
             this.recommendations = recommendations
@@ -149,7 +145,6 @@ class FootballReplays : MainAPI() {
         Log.d("FootballReplays", "Iframe Url: $iframeUrl")
 
         loadExtractor(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
-            // 3. COMPILER SAFE EXTRACTOR LINK BUILDER
             val extractedLink = ExtractorLink(
                 source = customName,
                 name = customName,
