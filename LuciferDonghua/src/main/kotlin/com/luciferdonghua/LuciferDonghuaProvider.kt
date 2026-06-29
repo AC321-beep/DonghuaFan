@@ -163,7 +163,7 @@ class LuciferDonghuaProvider : MainAPI() {
                         var token = Regex("""[?&]video=([^&]+)""").find(clean)?.groupValues?.get(1)
                         if (token == null) token = extractDailymotionToken(refererUrl)
                         if (token != null) {
-                            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$token"
+                            val embedUrl = "https://www.dailymotion.com/video/$token"
                             if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
                                 anyStreamFound = true
                             }
