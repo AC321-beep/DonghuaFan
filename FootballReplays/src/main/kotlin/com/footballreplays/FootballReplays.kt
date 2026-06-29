@@ -15,15 +15,16 @@ class FootballReplays : MainAPI() {
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Others)
     
+    // 1. REORDERED AND RENAMED MAIN PAGE CATEGORIES
     override val mainPage = mainPageOf(
+        "${mainUrl}/international/" to "FIFA",
+        "${mainUrl}/uefa/" to "UEFA",
         "${mainUrl}/england/" to "England",
         "${mainUrl}/spain/" to "Spain",
         "${mainUrl}/italy/" to "Italy",
         "${mainUrl}/germany/" to "Germany",
         "${mainUrl}/france/" to "France",
         "${mainUrl}/portugal/" to "Portugal",
-        "${mainUrl}/uefa/" to "UEFA",
-        "${mainUrl}/international/" to "International",
         "${mainUrl}/other/" to "Other"
     )
 
@@ -69,12 +70,24 @@ class FootballReplays : MainAPI() {
 
         val title = document.selectFirst("h1.s-title")?.text()?.trim() ?: return null
         val poster = fixUrlNull(document.selectFirst("div.s-feat img")?.attr("src"))
-        val description = document.selectFirst("meta[property=og:description]")?.attr("content")?.trim()
-        val year = document.selectFirst("time.updated-date")?.attr("datetime")?.substringBefore("-")?.toIntOrNull()
+        
+        // 2. EXTRACT FULL DATE AND TIME
+        val timeElement = document.selectFirst("time.updated-date")
+        val fullDateText = timeElement?.text()?.trim() // Gets readable text like "May 12, 2024"
+        val year = timeElement?.attr("datetime")?.substringBefore("-")?.toIntOrNull()
+        
+        // FORMAT THE PLOT SYNOPSIS
+        val rawDescription = document.selectFirst("meta[property=og:description]")?.attr("content")?.trim() ?: ""
+        val finalDescription = if (!fullDateText.isNullOrEmpty()) {
+            "🕒 Match Date: $fullDateText\n\n$rawDescription"
+        } else {
+            rawDescription
+        }
+
         val tags = document.select("div.efoot-bar.tag-bar a").map { it.text() }
         val recommendations = document.select("div.p-wrap.p-grid").mapNotNull { it.toRecommendationResult() }
 
-        Log.d("FootballReplays", "Title: $title | Url: $url")
+        Log.d("FootballReplays", "Title: $title | Url: $url | Date: $fullDateText")
 
         val episodes = mutableListOf<Episode>()
         document.select("table.video-table").forEach { table ->
@@ -92,6 +105,10 @@ class FootballReplays : MainAPI() {
                     newEpisode(data = episodeData) {
                         this.name = "$sourceName - $part"
                         this.episode = currentEpisodeSize + 1
+                        
+                        // INJECT DATE INTO EPISODE DETAILS
+                        this.dateAdded = fullDateText
+                        this.description = fullDateText
                     }
                 )
             }
@@ -99,7 +116,7 @@ class FootballReplays : MainAPI() {
 
         return newTvSeriesLoadResponse(title, url, TvType.Others, episodes) {
             this.posterUrl = poster
-            this.plot = description
+            this.plot = finalDescription // Using the updated plot containing the Match Date
             this.year = year
             this.tags = tags
             this.recommendations = recommendations
@@ -132,8 +149,7 @@ class FootballReplays : MainAPI() {
         Log.d("FootballReplays", "Iframe Url: $iframeUrl")
 
         loadExtractor(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
-            // Matches the exact constructor your compiler expects:
-            // source, name, url, referer, quality, type, headers
+            // 3. COMPILER SAFE EXTRACTOR LINK BUILDER
             val extractedLink = ExtractorLink(
                 source = customName,
                 name = customName,
