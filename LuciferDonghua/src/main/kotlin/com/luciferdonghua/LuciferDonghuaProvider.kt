@@ -13,7 +13,7 @@ class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
     override var name = "Lucifer Donghua"
     override val hasMainPage = true
-    override var lang = "en"
+    override var lang = "zh"
     override val hasQuickSearch = true
 
     private val defaultHeaders = mapOf(
@@ -120,10 +120,14 @@ class LuciferDonghuaProvider : MainAPI() {
         var anyStreamFound = false
 
         suspend fun processDocument(doc: org.jsoup.nodes.Document, refererUrl: String) {
-            // ==========================================
-            // 1. EXACT Dailymotion Logic Intact
-            // ==========================================
+            val html = doc.html()
+            
+            // =========================================================
+            // 1. EXACT Dailymotion Logic from Donghuafun
+            // =========================================================
             var dailymotionToken: String? = null
+            
+            // Method A: Check iframes directly
             doc.select("iframe[src*='dailymotion']").forEach { iframe ->
                 val src = iframe.attr("src")
                 val match = Regex("""[?&]video=([^&]+)""").find(src)
@@ -132,22 +136,46 @@ class LuciferDonghuaProvider : MainAPI() {
                     return@forEach
                 }
             }
+            
             if (dailymotionToken != null) {
                 val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
                 if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
                     anyStreamFound = true
                 }
+            } else {
+                // Method B: Check player_aaaa JSON
+                val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+                    .find(html)?.groupValues?.get(1)
+                
+                if (playerJson != null) {
+                    val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
+                    if (from.equals("dailymotion", ignoreCase = true)) {
+                        var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+                        val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+
+                        if (encrypt == 1) {
+                            rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+                        } else if (encrypt == 2) {
+                            rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
+                            rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+                        }
+                        
+                        val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
+                        if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
+                            anyStreamFound = true
+                        }
+                    }
+                }
             }
 
-            // ==========================================
+            // =========================================================
             // 2. Extract Other Iframes (Rumble, Vidhide, etc.)
-            // ==========================================
+            // =========================================================
             doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
                 var src = iframe.attr("src")
                 if (src.startsWith("//")) src = "https:$src"
                 var cleanUrl = fixUrlNull(src) ?: return@forEach
 
-                // Skip if blank, or if it's dailymotion (already handled above)
                 if (cleanUrl.isNotBlank() && !cleanUrl.contains("about:blank") && !cleanUrl.contains("dailymotion", ignoreCase = true)) {
                     
                     // --- VidHide dynamic extraction to handle domain rotation ---
@@ -189,10 +217,9 @@ class LuciferDonghuaProvider : MainAPI() {
             try {
                 val response = app.get(mirrorUrl, headers = defaultHeaders)
                 
-                // If it performed an external redirect (Direct link instead of an iframe page)
+                // Handle external redirects (VidHide or other direct embeds)
                 if (response.url != mirrorUrl && !response.url.contains("luciferdonghua.in")) {
-                    var cleanDest = response.url
-                    
+                    val cleanDest = response.url
                     if (cleanDest.contains("vidhide", ignoreCase = true)) {
                         try {
                             val domain = "https://" + URI(cleanDest).host
@@ -206,7 +233,7 @@ class LuciferDonghuaProvider : MainAPI() {
                         }
                     }
                 } else {
-                    // Standard mirror iframe page
+                    // Process internal mirror page
                     processDocument(response.document, mirrorUrl)
                 }
             } catch (e: Exception) {
@@ -216,4 +243,5 @@ class LuciferDonghuaProvider : MainAPI() {
 
         return anyStreamFound
     }
-}
+                                           }
+                                           
