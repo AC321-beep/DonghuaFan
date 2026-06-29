@@ -8,9 +8,7 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
 import java.net.URI
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.* 
 
 class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
@@ -119,10 +117,13 @@ class LuciferDonghuaProvider : MainAPI() {
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    ): Boolean = coroutineScope {
         var anyStreamFound = false
 
         suspend fun processDocument(doc: org.jsoup.nodes.Document, refererUrl: String) {
+            val html = doc.html()
+            
+            // Dailymotion Logic
             var dailymotionToken: String? = null
             doc.select("iframe[src*='dailymotion']").forEach { iframe ->
                 val src = iframe.attr("src")
@@ -134,11 +135,10 @@ class LuciferDonghuaProvider : MainAPI() {
             }
             if (dailymotionToken != null) {
                 val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
-                if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
-                    anyStreamFound = true
-                }
+                if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) anyStreamFound = true
             }
 
+            // Other Iframes
             doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
                 var src = iframe.attr("src")
                 if (src.startsWith("//")) src = "https:$src"
@@ -158,14 +158,12 @@ class LuciferDonghuaProvider : MainAPI() {
                         cleanUrl = cleanUrl.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
                     }
 
-                    if (loadExtractor(cleanUrl, refererUrl, subtitleCallback, callback)) {
-                        anyStreamFound = true
-                    }
+                    if (loadExtractor(cleanUrl, refererUrl, subtitleCallback, callback)) anyStreamFound = true
                 }
             }
         }
 
-        val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return false }
+        val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return@coroutineScope false }
         processDocument(baseDocument, data)
 
         val mirrorUrls = baseDocument.select("select.mirror option").mapNotNull { option ->
@@ -173,30 +171,27 @@ class LuciferDonghuaProvider : MainAPI() {
             if (url.startsWith("http") && url != data) url else null
         }.distinct()
 
-        // Non-blocking parallel execution replacing deprecated apmap
-        coroutineScope {
-            mirrorUrls.map { mirrorUrl ->
-                async {
-                    try {
-                        val response = app.get(mirrorUrl, headers = defaultHeaders)
-                        if (response.url != mirrorUrl && !response.url.contains("luciferdonghua.in")) {
-                            val cleanDest = response.url
-                            if (cleanDest.contains("vidhide", ignoreCase = true)) {
-                                try {
-                                    val domain = "https://" + URI(cleanDest).host
-                                    VidHidePro().getUrl(cleanDest, data, subtitleCallback, callback)
-                                } catch (e: Exception) {}
-                            } else if (!cleanDest.contains("dailymotion", ignoreCase = true)) {
-                                loadExtractor(cleanDest, data, subtitleCallback, callback)
-                            }
-                        } else {
-                            processDocument(response.document, mirrorUrl)
+        mirrorUrls.map { mirrorUrl ->
+            async {
+                try {
+                    val response = app.get(mirrorUrl, headers = defaultHeaders)
+                    if (response.url != mirrorUrl && !response.url.contains("luciferdonghua.in")) {
+                        val cleanDest = response.url
+                        if (cleanDest.contains("vidhide", ignoreCase = true)) {
+                            try {
+                                val domain = "https://" + URI(cleanDest).host
+                                VidHidePro().getUrl(cleanDest, data, subtitleCallback, callback)
+                            } catch (e: Exception) {}
+                        } else if (!cleanDest.contains("dailymotion", ignoreCase = true)) {
+                            loadExtractor(cleanDest, data, subtitleCallback, callback)
                         }
-                    } catch (e: Exception) {}
-                }
-            }.awaitAll()
-        }
+                    } else {
+                        processDocument(response.document, mirrorUrl)
+                    }
+                } catch (e: Exception) {}
+            }
+        }.awaitAll()
 
-        return anyStreamFound
+        return@coroutineScope anyStreamFound
     }
 }
