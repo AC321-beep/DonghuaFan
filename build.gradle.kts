@@ -27,8 +27,6 @@ allprojects {
 fun Project.cloudstream(configuration: CloudstreamExtension.() -> Unit) = extensions.getByName<CloudstreamExtension>("cloudstream").configuration()
 fun Project.android(configuration: BaseExtension.() -> Unit) = extensions.getByName<BaseExtension>("android").configuration()
 
-// ... (keep the top of the file exactly as you provided it) ...
-
 subprojects {
     apply(plugin = "com.android.library")
     apply(plugin = "kotlin-android")
@@ -39,7 +37,7 @@ subprojects {
     }
 
     android {
-        namespace = "com.example"
+        namespace = "com.example" // Your dynamic fallback
         defaultConfig {
             minSdk = 21
             compileSdkVersion(35)
@@ -65,12 +63,11 @@ subprojects {
         val cloudstream by configurations
         val implementation by configurations
 
-        // This is the official Cloudstream library
         cloudstream("com.lagradost:cloudstream3:pre-release")
         implementation(kotlin("stdlib"))
         
-        // 🟢 ADDED: This fixes the "Unresolved reference" for coroutines (async/await)
-        implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3") 
+        // ADDED: Globally provides coroutines to all your dynamic modules
+        implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
         
         implementation("com.github.Blatzar:NiceHttp:0.4.11")
         implementation("org.jsoup:jsoup:1.18.3")
