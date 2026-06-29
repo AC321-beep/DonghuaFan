@@ -1,205 +1,295 @@
-package com.luciferdonghua
+package com.donghuafun
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.nodes.Element
+import org.jsoup.nodes.Document
+import java.net.URLDecoder
 
-class LuciferDonghuaProvider : MainAPI() {
-    override var mainUrl = "https://luciferdonghua.in"
-    override var name = "Lucifer Donghua"
-    override val hasMainPage = true
+class DonghuaFunProvider : MainAPI() {
+    override var mainUrl = "https://donghuafun.com"
+    override var name = "Donghuafun (4K)"
     override var lang = "zh"
-    override val hasQuickSearch = true
+    override val hasMainPage = true
+    override val hasDownloadSupport = true
+    override val supportedTypes = setOf(TvType.Anime)
 
-    private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-        "Referer" to "$mainUrl/",
-        "Origin" to mainUrl
-    )
+    companion object {
+        private const val TAG = "Donghuafun"
+        // Desktop User-Agent to bypass mobile scraper blocks
+        private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
 
-    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
+    private fun detailUrlToId(url: String): String =
+        Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
+    // EXACT original working homepage order
     override val mainPage = mainPageOf(
-        "$mainUrl/anime/?order=update" to "Latest Release",
-        "$mainUrl/anime/?status=&type=movie&sub=" to "Movies",
-        "$mainUrl/network/tencent/" to "Tencent Anime",
-        "$mainUrl/network/youku/" to "YouKu Anime",
-        "$mainUrl/anime/?status=completed" to "Completed"
+        "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
+        "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
+        "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Coming Soon"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) request.data else "${request.data.removeSuffix("/")}/page/$page/"
-        val document = app.get(url, headers = defaultHeaders).document
-        val home = document.select("article.bs").mapNotNull { it.toSearchResult() }
+        val isComingSoon = request.name == "Coming Soon"
+        val isRecentlyUpdated = request.name == "Recently Updated"
+        var currentPage = page
+        val items = mutableListOf<SearchResponse>()
+        var hasNextPage = true
+        
+        // Increased max pages for Recently Updated to ensure the row doesn't return empty if heavily filtered
+        val maxPagesToSearch = if (isComingSoon || isRecentlyUpdated) 5 else 1 
+        var pagesSearched = 0
 
-        return newHomePageResponse(
-            list = HomePageList(
-                name = request.name,
-                list = home,
-                isHorizontalImages = false
-            ),
-            hasNext = home.isNotEmpty()
-        )
-    }
-
-    private fun Element.toSearchResult(): SearchResponse? {
-        val titleElement = this.selectFirst(".tt h2")
-        val title = titleElement?.text()?.trim() ?: return null
-        val href = fixUrlNull(this.selectFirst("a[itemprop=url]")?.attr("href")) ?: return null
-        val posterUrl = fixUrlNull(this.selectFirst("img.ts-post-image")?.attr("src"))
-        val epText = this.selectFirst(".bt .epx")?.text()
-        val epCount = epText?.let {
-            Regex("""Ep\s*(\d+)""", RegexOption.IGNORE_CASE).find(it)?.groupValues?.get(1)?.toIntOrNull()
+        while (items.isEmpty() && hasNextPage && pagesSearched < maxPagesToSearch) {
+            val pageUrl = if (currentPage == 1) request.data else request.data.replace(".html", "/page/$currentPage.html")
+            val doc = app.get(pageUrl).document
+            val elements = doc.select("a[href*='/vod/detail/id/']")
+            if (elements.isEmpty()) { hasNextPage = false; break }
+            
+            // Pass both flags so parseShowCards knows how to filter
+            items.addAll(parseShowCards(doc, isComingSoon, isRecentlyUpdated))
+            
+            pagesSearched++
+            if (items.isEmpty()) currentPage++ 
         }
+        return newHomePageResponse(request.name, items, hasNextPage)
+    }
 
-        return newAnimeSearchResponse(title, href, TvType.Anime) {
-            this.posterUrl = posterUrl
-            addDubStatus(dubExist = false, subExist = true, epCount)
+    override suspend fun search(query: String): List<SearchResponse> {
+        val results = mutableListOf<SearchResponse>()
+        for (page in 1..3) {
+            val doc = try { app.get("$mainUrl/index.php/vod/search.html", params = mapOf("wd" to query, "page" to page.toString())).document } catch (e: Exception) { null } ?: break
+            val pageResults = parseShowCards(doc) // Defaults to false for both flags
+            if (pageResults.isEmpty()) break
+            results.addAll(pageResults)
+            val hasNext = doc.select("a.page-next:not(.disabled), a:contains(Next), a:contains(下一页)").isNotEmpty()
+            if (!hasNext) break
         }
+        return results.distinctBy { it.url }
     }
 
-    override suspend fun search(query: String, page: Int): SearchResponseList {
-        val url = if (page == 1) "$mainUrl/?s=$query" else "$mainUrl/page/$page/?s=$query"
-        val document = app.get(url, headers = defaultHeaders).document
-        val results = document.select("article.bs").mapNotNull { it.toSearchResult() }
-        return newSearchResponseList(results, hasNext = results.isNotEmpty())
-    }
+    override suspend fun load(url: String): LoadResponse {
+        val doc = app.get(url).document
+        val showId = detailUrlToId(url)
 
-    override suspend fun load(url: String): LoadResponse? {
-        val document = app.get(url, headers = defaultHeaders).document
-
-        val title = document.selectFirst("h1.entry-title, h1.title")?.text()?.trim() ?: return null
-        val poster = fixUrlNull(document.selectFirst(".thumb img, .poster img")?.attr("src"))
-        val description = document.selectFirst(".entry-content p, .synopsis p, .desc")?.text()?.trim()
-        val tags = document.select(".genx a, .genres a").map { it.text() }
-
-        val yearText = document.selectFirst(".split span:contains(Released), .info-content span:contains(Year)")?.text()
-        val year = yearText?.filter { it.isDigit() }?.toIntOrNull()
+        val title = doc.selectFirst("h1, .video-title, .detail-title")?.text()?.trim() ?: doc.title().substringBefore(" Donghua").trim()
+        val poster = doc.selectFirst("meta[property='og:image']")?.attr("content") ?: doc.selectFirst(".detail-pic img, .video-cover img, .card-top img")?.attr("data-src") ?: doc.selectFirst("img.lazy")?.attr("data-src")
+        val description = doc.selectFirst(".video-desc, .detail-desc, .card-text")?.text()?.trim() ?: doc.selectFirst("meta[name='description']")?.attr("content")
+        val tags = doc.select("a[href*='/class/']").mapNotNull { it.text().trim().takeIf(String::isNotEmpty) }
+        val year = doc.selectFirst("a[href*='/year/']")?.text()?.toIntOrNull()
 
         val episodes = mutableListOf<Episode>()
+        val tabs = doc.select(".anthology-tab a.vod-playerUrl")
+        val fourKTabIndex = tabs.indexOfFirst { it.text().contains("4K", ignoreCase = true) }
+        val targetIndex = if (fourKTabIndex != -1) fourKTabIndex else 0
 
-        document.select(".eplister ul li, #episode_list li, .listeps ul li").forEach { ep ->
-            val linkElement = ep.selectFirst("a") ?: return@forEach
-            val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
-            val epName = linkElement.selectFirst(".epl-num, .epnum")?.text()?.trim() ?: ep.text().trim()
-            val epNum = epName.filter { it.isDigit() }.toIntOrNull()
+        val listContainers = doc.select(".anthology-list-box")
+        if (targetIndex < listContainers.size) {
+            val container = listContainers[targetIndex]
+            val episodeLinks = container.select("a[href*='/vod/play/id/$showId/']")
+            val episodeMap = mutableMapOf<Int, Episode>()
 
-            episodes.add(
-                newEpisode(data = epHref) {
-                    this.name = "Episode $epName"
-                    this.episode = epNum
+            for (a in episodeLinks) {
+                val epUrl = fixUrl(a.attr("href"))
+                val epName = a.selectFirst("span")?.text()?.trim() ?: a.text().trim()
+                val epNumber = parseEpisodeNumber(epName)
+                val finalNumber = if (epNumber > 0) epNumber else episodeMap.size + 1
+                
+                if (!episodeMap.containsKey(finalNumber)) {
+                    episodeMap[finalNumber] = newEpisode(epUrl) { 
+                        name = epName.ifEmpty { "Episode $finalNumber" }; episode = finalNumber
+                    }
                 }
-            )
+            }
+            episodes.addAll(episodeMap.toSortedMap().values)
         }
 
-        val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
-        val episodeMap = mutableMapOf(
-            DubStatus.Subbed to sortedEpisodes
-        )
+        if (episodes.isEmpty() && showId.isNotEmpty()) {
+            for (n in 1..300) {
+                val epUrl = "$mainUrl/index.php/vod/play/id/$showId/sid/1/nid/$n.html"
+                episodes.add(newEpisode(epUrl) { name = "EP$n" })
+            }
+        }
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
-            this.posterUrl = poster
-            this.plot = description
-            this.tags = tags
-            this.year = year
-            this.episodes = episodeMap
+            posterUrl = poster?.let { fixUrl(it) }
+            plot = description
+            tags?.let { this.tags = it }
+            year?.let { this.year = it }
+            addEpisodes(DubStatus.None, episodes)
         }
     }
 
+    private fun parseEpisodeNumber(name: String): Int {
+        return Regex("""(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull() ?: -1
+    }
+
+    @Suppress("DEPRECATION", "DEPRECATION_ERROR")
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        var anyStreamFound = false
+        val detailPageUrl = data
+        val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to detailPageUrl, "Origin" to mainUrl)
+        val html = try { app.get(detailPageUrl, headers = headers).text } catch (e: Exception) { "" }
+        val doc = try { app.get(detailPageUrl, headers = headers).document } catch (e: Exception) { null }
 
-        // Core processing function applied to both Main Page and Mirror sub-pages
-        suspend fun processDocument(doc: org.jsoup.nodes.Document, refererUrl: String) {
-            
-            // =========================================================
-            // 1. EXACT Dailymotion Logic Intact (From Donghuafun code)
-            // =========================================================
-            var dailymotionToken: String? = null
-            doc.select("iframe[src*='dailymotion']").forEach { iframe ->
-                val src = iframe.attr("src")
-                val match = Regex("""[?&]video=([^&]+)""").find(src)
-                if (match != null) {
-                    dailymotionToken = match.groupValues[1]
-                    return@forEach
-                }
-            }
-            if (dailymotionToken != null) {
-                val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
-                if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
-                    anyStreamFound = true
-                }
-            }
-
-            // =========================================================
-            // 2. Main Player Logic for other Servers (Rumble, Vidhide)
-            // =========================================================
-            doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
-                var src = iframe.attr("src")
-                if (src.startsWith("//")) src = "https:$src"
-                var cleanUrl = fixUrlNull(src) ?: return@forEach
-                
-                // Skip if it's blank or if we already caught it in the Dailymotion block above
-                if (cleanUrl.isNotBlank() && !cleanUrl.contains("about:blank") && !cleanUrl.contains("dailymotion", ignoreCase = true)) {
-                    
-                    // Vidhide Domain Normalization (So it matches your Extractors.kt)
-                    if (cleanUrl.contains("vidhide", ignoreCase = true)) {
-                        cleanUrl = cleanUrl.replace(Regex("""vidhide\w*\.[a-z]+"""), "vidhide.com")
-                    }
-
-                    // StreamPlay Domain Normalization
-                    if (cleanUrl.contains("streamplay", ignoreCase = true)) {
-                        cleanUrl = cleanUrl.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
-                    }
-
-                    if (loadExtractor(cleanUrl, refererUrl, subtitleCallback, callback)) {
-                        anyStreamFound = true
-                    }
-                }
+        // --- Dailymotion Logic Intact ---
+        var dailymotionToken: String? = null
+        doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
+            val src = iframe.attr("src")
+            val match = Regex("""[?&]video=([^&]+)""").find(src)
+            if (match != null) {
+                dailymotionToken = match.groupValues[1]
+                return@forEach
             }
         }
+        if (dailymotionToken != null) {
+            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
+            if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
+        }
 
-        // --- Execute Flow ---
-        
-        // 1. Process the primary episode page
-        val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return false }
-        processDocument(baseDocument, data)
+        // --- Main Player Logic ---
+        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+            .find(html)?.groupValues?.get(1) ?: return false
 
-        // 2. Find and visit all mirror pages in the dropdown
-        val mirrorUrls = baseDocument.select("select.mirror option").mapNotNull { option ->
-            val url = option.attr("value")
-            if (url.startsWith("http") && url != data) url else null
-        }.distinct()
+        var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+        val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
+        val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
-        mirrorUrls.forEach { mirrorUrl ->
+        if (encrypt == 1) rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+        else if (encrypt == 2) {
+            rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
+            rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+        }
+
+        // ==========================================
+        // --- IMPROVED SUBTITLE EXTRACTION START ---
+        // ==========================================
+
+        // 1. Extract from MacCMS player_aaaa JSON keys
+        val subUrlRaw = Regex(""""(?:subt|vtt|zimu|subtitle|sub)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE)
+            .find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+
+        if (subUrlRaw.isNotEmpty()) {
+            var decodedSub = subUrlRaw
             try {
-                val response = app.get(mirrorUrl, headers = defaultHeaders)
-                
-                // If it performed an external redirect (Direct link instead of an iframe page)
-                if (response.url != mirrorUrl && !response.url.contains("luciferdonghua.in")) {
-                    var cleanDest = response.url
-                    
-                    if (cleanDest.contains("vidhide", ignoreCase = true)) {
-                        cleanDest = cleanDest.replace(Regex("""vidhide\w*\.[a-z]+"""), "vidhide.com")
-                    }
-                    if (loadExtractor(cleanDest, data, subtitleCallback, callback)) {
-                        anyStreamFound = true
-                    }
-                } else {
-                    // Otherwise, process the standard mirror iframe page
-                    processDocument(response.document, mirrorUrl)
+                // Decode according to MacCMS encryption, unless it's already a plain HTTP/relative URL
+                if (encrypt == 1 && !decodedSub.startsWith("http")) {
+                    decodedSub = URLDecoder.decode(decodedSub, "UTF-8")
+                } else if (encrypt == 2 && !decodedSub.startsWith("http") && !decodedSub.startsWith("/")) {
+                    decodedSub = String(Base64.decode(decodedSub, Base64.DEFAULT))
+                    decodedSub = URLDecoder.decode(decodedSub, "UTF-8")
                 }
             } catch (e: Exception) {
-                // Safely skip dead/timing-out mirror servers
+                decodedSub = subUrlRaw // Fallback to raw string if decoding fails
+            }
+            if (decodedSub.isNotBlank()) {
+                subtitleCallback.invoke(SubtitleFile("English", fixUrl(decodedSub)))
             }
         }
 
-        return anyStreamFound
+        // 2. Extract from standard HTML <track> elements
+        doc?.select("track")?.forEach { track ->
+            val trackSrc = track.attr("src")
+            if (trackSrc.isNotBlank()) {
+                val label = track.attr("label").ifEmpty { track.attr("srclang") }.ifEmpty { track.attr("lang") }.ifEmpty { "English" }
+                subtitleCallback.invoke(SubtitleFile(label, fixUrl(trackSrc)))
+            }
+        }
+
+        // 3. Fallback: Extract from generic player configurations (e.g., DPlayer, ArtPlayer)
+        val playerConfigSub = Regex("""subtitle:\s*\{\s*url:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
+            .find(html)?.groupValues?.get(1)?.replace("\\/", "/")
+        if (!playerConfigSub.isNullOrBlank()) {
+            subtitleCallback.invoke(SubtitleFile("English", fixUrl(playerConfigSub)))
+        }
+
+        // ========================================
+        // --- IMPROVED SUBTITLE EXTRACTION END ---
+        // ========================================
+
+        if (from.equals("dailymotion", ignoreCase = true)) {
+            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
+            if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
+        } 
+        else if (rawUrl.isNotEmpty()) {
+            if (rawUrl.contains("url=")) {
+                rawUrl = rawUrl.substringAfter("url=")
+                rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+            }
+
+            val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
+            val streamHeaders = mapOf(
+                "User-Agent" to USER_AGENT,
+                "Referer" to "https://donghuafun.com/",
+                "Origin" to "https://donghuafun.com"
+            )
+
+            if (isM3u8) {
+                // Route to our newly created DonghuaFunExtractor by prepending the domain
+                val extractorUrl = if (rawUrl.startsWith("http")) {
+                    "https://play.donghuafun.com/m3u8/?url=$rawUrl"
+                } else rawUrl
+
+                if (loadExtractor(extractorUrl, "https://donghuafun.com/", subtitleCallback, callback)) {
+                    return true
+                }
+            } else {
+                // Strict positional mapping fallback
+                callback.invoke(
+                    newExtractorLink(
+                        this.name,
+                        from.ifEmpty { "Server 1" },
+                        rawUrl,
+                        ExtractorLinkType.VIDEO
+                    ) {
+                        this.headers = streamHeaders
+                        this.referer = "https://donghuafun.com/"
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            }
+            return true
+        }
+        return false
     }
-}
+
+    private fun parseShowCards(doc: Document, isComingSoon: Boolean = false, isRecentlyUpdated: Boolean = false): List<SearchResponse> {
+        return doc.select("a[href*='/vod/detail/id/']")
+            .distinctBy { it.attr("href") }
+            .filter { a -> 
+                val parent1 = a.parent()
+                val parent2 = a.parent()?.parent()
+                val parent3 = a.parent()?.parent()?.parent()
+
+                val container = when {
+                    parent3 != null && parent3.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent3
+                    parent2 != null && parent2.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent2
+                    parent1 != null && parent1.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent1
+                    else -> a
+                }
+                
+                val cardText = container.text()
+                val keywords = listOf("trailer", "coming soon", "not yet aired", "upcoming", "releasing soon", "0 episode")
+                val containsTrailerKeyword = keywords.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
+
+                when {
+                    isComingSoon -> containsTrailerKeyword       // ONLY show items with trailer keywords
+                    isRecentlyUpdated -> !containsTrailerKeyword // FILTER OUT items with trailer keywords
+                    else -> true                                 // For Most Popular/Search: Keep everything
+                }
+            }
+            .mapNotNull { a ->
+                val href = fixUrl(a.attr("href"))
+                val title = a.attr("title").ifEmpty { a.selectFirst("img")?.attr("alt") ?: a.text() }.trim()
+                if (title.isEmpty()) return@mapNotNull null
+                val poster = a.selectFirst("img")?.let { it.attr("data-src").ifEmpty { it.attr("src") } }?.takeUnless { it.startsWith("data:") }?.let { fixUrl(it) }
+                newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
+            }
+    }
+                              }
