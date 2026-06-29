@@ -120,14 +120,11 @@ class LuciferDonghuaProvider : MainAPI() {
         var anyStreamFound = false
 
         suspend fun processDocument(doc: org.jsoup.nodes.Document, refererUrl: String) {
-            val html = doc.html()
             
             // =========================================================
-            // 1. EXACT Dailymotion Logic from Donghuafun
+            // 1. EXACT Dailymotion Logic (Imported from DonghuaFun)
             // =========================================================
             var dailymotionToken: String? = null
-            
-            // Method A: Check iframes directly
             doc.select("iframe[src*='dailymotion']").forEach { iframe ->
                 val src = iframe.attr("src")
                 val match = Regex("""[?&]video=([^&]+)""").find(src)
@@ -136,40 +133,15 @@ class LuciferDonghuaProvider : MainAPI() {
                     return@forEach
                 }
             }
-            
             if (dailymotionToken != null) {
                 val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
                 if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
                     anyStreamFound = true
                 }
-            } else {
-                // Method B: Check player_aaaa JSON
-                val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-                    .find(html)?.groupValues?.get(1)
-                
-                if (playerJson != null) {
-                    val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
-                    if (from.equals("dailymotion", ignoreCase = true)) {
-                        var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
-                        val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-
-                        if (encrypt == 1) {
-                            rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-                        } else if (encrypt == 2) {
-                            rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
-                            rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-                        }
-                        
-                        val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
-                        if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
-                            anyStreamFound = true
-                        }
-                    }
-                }
             }
 
             // =========================================================
-            // 2. Extract Other Iframes (Rumble, Vidhide, etc.)
+            // 2. Extract Other Iframes (Rumble, Vidhide, Streamplay)
             // =========================================================
             doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
                 var src = iframe.attr("src")
@@ -207,17 +179,18 @@ class LuciferDonghuaProvider : MainAPI() {
         val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return false }
         processDocument(baseDocument, data)
 
-        // 2. Process all Mirror Dropdown URLs (/v/1/, /v/2/, etc.)
+        // 2. Process all Mirror Dropdown URLs using 'apmap' (Parallel Fetching)
+        // This prevents the 10-second timeout that was killing VidHide at index 3
         val mirrorUrls = baseDocument.select("select.mirror option").mapNotNull { option ->
             val url = option.attr("value")
             if (url.startsWith("http") && url != data) url else null
         }.distinct()
 
-        mirrorUrls.forEach { mirrorUrl ->
+        mirrorUrls.apmap { mirrorUrl ->
             try {
                 val response = app.get(mirrorUrl, headers = defaultHeaders)
                 
-                // Handle external redirects (VidHide or other direct embeds)
+                // Handle external redirects (e.g. direct to Vidhide)
                 if (response.url != mirrorUrl && !response.url.contains("luciferdonghua.in")) {
                     val cleanDest = response.url
                     if (cleanDest.contains("vidhide", ignoreCase = true)) {
@@ -233,15 +206,17 @@ class LuciferDonghuaProvider : MainAPI() {
                         }
                     }
                 } else {
-                    // Process internal mirror page
+                    // Process internal mirror iframe page
                     processDocument(response.document, mirrorUrl)
                 }
             } catch (e: Exception) {
-                // Ignore dead servers gracefully
+                // Ignore dead servers gracefully without crashing parallel tasks
             }
         }
 
         return anyStreamFound
     }
-                                           }
-                                           
+}
+
+    
+                                                                                    
