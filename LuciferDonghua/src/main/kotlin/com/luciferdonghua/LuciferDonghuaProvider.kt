@@ -71,7 +71,7 @@ class LuciferDonghuaProvider : MainAPI() {
         var anyStreamFound = false
 
         suspend fun processDoc(doc: org.jsoup.nodes.Document, referer: String) {
-            // 1. Process Iframes safely
+            // 1. Process Iframes
             doc.select("iframe").forEach { iframe ->
                 val rawSrc = iframe.attr("data-src").takeIf { it.isNotBlank() }
                     ?: iframe.attr("data-lazy-src").takeIf { it.isNotBlank() }
@@ -82,17 +82,19 @@ class LuciferDonghuaProvider : MainAPI() {
 
                 if (httpsUrl.isNotBlank() && !httpsUrl.contains("about:blank")) {
                     
-                    // Pure immutable URL translation
-                    val finalUrl = if (httpsUrl.contains("dailymotion", true)) {
-                        val match = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(httpsUrl)
-                        if (match != null) "https://www.dailymotion.com/video/${match.groupValues[1]}" else httpsUrl
-                    } else if (httpsUrl.contains("streamplay", true)) {
-                        httpsUrl.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
-                    } else {
-                        httpsUrl
+                    // Immutable URL resolution based on site logic
+                    val finalUrl = when {
+                        httpsUrl.contains("dailymotion", true) -> {
+                            val match = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(httpsUrl)
+                            if (match != null) "https://www.dailymotion.com/video/${match.groupValues[1]}" else httpsUrl
+                        }
+                        httpsUrl.contains("streamplay", true) -> {
+                            httpsUrl.replace(Regex("""streamplay\.[a-z\.]+"""), "play.streamplay.co.in")
+                        }
+                        else -> httpsUrl
                     }
 
-                    // Execute
+                    // Execute Extractors directly using the final URL
                     if (finalUrl.contains("vidhide", true)) {
                         try { 
                             VidHidePro().getUrl(finalUrl, referer, subtitleCallback, callback)
@@ -104,7 +106,7 @@ class LuciferDonghuaProvider : MainAPI() {
                 }
             }
             
-            // 2. Global Regex Failsafe
+            // 2. Global Regex Failsafe for hidden URLs
             val html = doc.html()
             val embedRegex = Regex("""https?://(?:www\.)?(?:vidhidevip|vidhidepro|vidhide|play\.streamplay|rumble)[^\s"'<>]+""")
             embedRegex.findAll(html).forEach { match ->
@@ -113,6 +115,7 @@ class LuciferDonghuaProvider : MainAPI() {
                 }
             }
             
+            // Regex specifically for hidden Dailymotion iframes
             val dmRegex = Regex("""https?://(?:geo\.)?dailymotion\.com/[^\s"'<>]+video=([^&\s"'<>]+)""")
             dmRegex.findAll(html).forEach { match ->
                 val standardUrl = "https://www.dailymotion.com/video/${match.groupValues[1]}"
@@ -126,7 +129,7 @@ class LuciferDonghuaProvider : MainAPI() {
         val baseDoc = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return@coroutineScope false }
         processDoc(baseDoc, data)
 
-        // 3. Process External Mirrors in Parallel
+        // 3. Process External Mirrors
         baseDoc.select("select.mirror option")
             .mapNotNull { it.attr("value") }
             .filter { it.startsWith("http") && it != data }
@@ -139,7 +142,7 @@ class LuciferDonghuaProvider : MainAPI() {
                             
                             val destUrl = resp.url
                             
-                            // Immutable URL translation
+                            // Immutable translation for Dailymotion redirects
                             val finalDest = if (destUrl.contains("dailymotion", true)) {
                                 val match = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(destUrl)
                                 if (match != null) "https://www.dailymotion.com/video/${match.groupValues[1]}" else destUrl
@@ -147,7 +150,6 @@ class LuciferDonghuaProvider : MainAPI() {
                                 destUrl
                             }
 
-                            // Execute
                             if (finalDest.contains("vidhide", true)) {
                                 try {
                                     VidHidePro().getUrl(finalDest, data, subtitleCallback, callback)
