@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import java.net.URLDecoder
 
 class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
@@ -108,6 +109,39 @@ class LuciferDonghuaProvider : MainAPI() {
         }
     }
 
+    // Restored: Your proven Dailymotion Token extraction logic
+    private suspend fun extractDailymotionToken(pageUrl: String): String? {
+        val pageHtml = try {
+            app.get(pageUrl, headers = defaultHeaders).text
+        } catch (e: Exception) { return null }
+        val pageDoc = try { Jsoup.parse(pageHtml) } catch (e: Exception) { null }
+
+        pageDoc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
+            val src = iframe.attr("src")
+            val match = Regex("""[?&]video=([^&]+)""").find(src)
+            if (match != null) return match.groupValues[1]
+        }
+
+        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+            .find(pageHtml)?.groupValues?.get(1)
+        if (playerJson != null) {
+            var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+            val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
+            val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+
+            if (encrypt == 1) rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+            else if (encrypt == 2) {
+                rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
+                rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+            }
+
+            if (from.equals("dailymotion", ignoreCase = true)) {
+                return rawUrl
+            }
+        }
+        return null
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -115,92 +149,62 @@ class LuciferDonghuaProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var anyStreamFound = false
-        val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return false }
-        
-        // 1️⃣ Extract default active iframe on the page (usually Rumble or Dailymotion)
-        baseDocument.select(".player-area iframe, .playcon iframe, iframe").forEach { iframe ->
-            var src = iframe.attr("src")
-            if (src.startsWith("//")) src = "https:$src"
-            val clean = fixUrlNull(src)
-            if (clean != null && clean.isNotBlank() && !clean.contains("about:blank")) {
-                if (loadExtractor(clean, data, subtitleCallback, callback)) {
-                    anyStreamFound = true
-                }
-            }
-        }
 
-        // 2️⃣ Base64 Encoded Mirrors (AnimeStream Standard)
-        baseDocument.select("select.mirror option, .server_option li, ul#playeroptionsul li").forEach { option ->
-            val value = option.attr("data-video").takeIf { it.isNotBlank() }
-                ?: option.attr("value").takeIf { it.isNotBlank() }
-                ?: return@forEach
+        // Enhanced Core Helper: Handles Dailymotion explicitly alongside standard Extractors
+        suspend fun extractIframes(doc: org.jsoup.nodes.Document, refererUrl: String) {
+            doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
+                var src = iframe.attr("src")
+                if (src.startsWith("//")) src = "https:$src"
+                val clean = fixUrlNull(src)
                 
-            if (value.contains("Choose", ignoreCase = true) || value.isBlank()) return@forEach
-
-            // Attempt to Base64 decode the hidden iframe
-            val decoded = try {
-                if (value.matches(Regex("^[A-Za-z0-9+/=]+$")) && value.length % 4 == 0) {
-                    String(Base64.decode(value, Base64.DEFAULT))
-                } else value
-            } catch (e: Exception) { value }
-
-            // Extract the actual URL from the decoded HTML iframe
-            val iframeUrl = Jsoup.parse(decoded).selectFirst("iframe")?.attr("src") ?: decoded
-            var clean = fixUrlNull(if (iframeUrl.startsWith("//")) "https:$iframeUrl" else iframeUrl)
-
-            if (clean != null && clean.startsWith("http")) {
-                if (loadExtractor(clean, data, subtitleCallback, callback)) {
-                    anyStreamFound = true
-                }
-            }
-        }
-
-        // 3️⃣ AJAX Mirrors (AnimeStream Fallback Method)
-        baseDocument.select("ul#playeroptionsul li").forEach { li ->
-            val post = li.attr("data-post")
-            val nume = li.attr("data-nume")
-            val type = li.attr("data-type")
-            if (post.isNotBlank() && nume.isNotBlank()) {
-                try {
-                    val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
-                    val response = app.post(
-                        ajaxUrl,
-                        data = mapOf("action" to "player_ajax", "post" to post, "nume" to nume, "type" to type),
-                        headers = defaultHeaders + mapOf("X-Requested-With" to "XMLHttpRequest")
-                    ).text
+                if (clean != null && clean.isNotBlank() && !clean.contains("about:blank")) {
                     
-                    val iframeSrc = Jsoup.parse(response).selectFirst("iframe")?.attr("src")
-                        ?: Regex("""src=\\?["']([^"']+)""").find(response)?.groupValues?.get(1)?.replace("\\/", "/")
-                        
-                    val clean = fixUrlNull(if (iframeSrc?.startsWith("//") == true) "https:$iframeSrc" else iframeSrc)
-                    if (clean != null && clean.startsWith("http")) {
-                        if (loadExtractor(clean, data, subtitleCallback, callback)) {
-                            anyStreamFound = true
+                    // Restored: Dailymotion Geo-Bypass interception
+                    if ("dailymotion" in clean) {
+                        var token = Regex("""[?&]video=([^&]+)""").find(clean)?.groupValues?.get(1)
+                        if (token == null) {
+                            token = extractDailymotionToken(refererUrl)
+                        }
+                        if (token != null) {
+                            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$token"
+                            if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
+                                anyStreamFound = true
+                            }
+                            return@forEach // Skip standard loadExtractor flow to prevent duplication
                         }
                     }
-                } catch (e: Exception) {
-                    // Ignore AJAX failures
+
+                    // Standard Extractor route for Rumble, Vidhide, etc.
+                    if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
+                        anyStreamFound = true
+                    }
                 }
             }
         }
 
-        // 4️⃣ Final regex fallback on main page scripts
-        if (!anyStreamFound) {
-            val scriptRegex = Regex("""(?:file|video_url|source|src)\s*:\s*["']([^"']+\.(?:m3u8|mp4))["']""")
-            baseDocument.select("script").forEach { script ->
-                scriptRegex.find(script.html())?.let { match ->
-                    val videoUrl = match.groupValues[1]
-                    callback(
-                        newExtractorLink(name, name, videoUrl, ExtractorLinkType.M3U8) {
-                            this.referer = data
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    anyStreamFound = true
-                }
+        // 1️⃣ Fetch the primary episode page
+        val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return false }
+        
+        // Extract the default player (Triggers the Dailymotion check)
+        extractIframes(baseDocument, data)
+
+        // 2️⃣ Collect all Mirror URLs from the dropdown (e.g., /v/1/, /v/2/)
+        val mirrorUrls = baseDocument.select("select.mirror option").mapNotNull { option ->
+            val url = option.attr("value")
+            if (url.startsWith("http") && url != data) url else null
+        }.distinct()
+
+        // 3️⃣ Visit each mirror URL to grab the other servers
+        mirrorUrls.forEach { mirrorUrl ->
+            try {
+                val mirrorDoc = app.get(mirrorUrl, headers = defaultHeaders).document
+                extractIframes(mirrorDoc, mirrorUrl)
+            } catch (e: Exception) {
+                // Safely skip broken mirrors
             }
         }
 
         return anyStreamFound
     }
-}
+                             }
+                             
