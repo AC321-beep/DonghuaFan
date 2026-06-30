@@ -6,7 +6,7 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
-import kotlinx.coroutines.* // Required for parallel mirror processing
+import kotlinx.coroutines.* 
 
 class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
@@ -82,36 +82,35 @@ class LuciferDonghuaProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
 
-        // Covers all site layouts (Grids, Lists, etc.)
         document.select(".eplister ul li, #episode_list li, .listeps ul li, .bxcl ul li, .epcl li, .episodelist ul li").forEach { ep ->
             val linkElement = ep.selectFirst("a") ?: return@forEach
             val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
             
-            // Extracts exact texts gracefully
             val eplNum = ep.selectFirst(".epl-num, .epnum, .ts-chl-te")?.text()?.trim()
             val eplTitle = ep.selectFirst(".epl-title, .title")?.text()?.trim() ?: ""
             
             val rawName = eplNum ?: linkElement.ownText().trim().takeIf { it.isNotBlank() } ?: linkElement.text().trim()
             
-            // 🔴 SMART SEASON EXTRACTOR: Looks for "Season X" or "S X" in the title
             val fullTextToSearch = "$rawName $eplTitle"
             val seasonNum = Regex("""(?:Season|S)\s*(\d+)""", RegexOption.IGNORE_CASE)
                 .find(fullTextToSearch)?.groupValues?.get(1)?.toIntOrNull()
 
-            // Safely grabs the first number to avoid grabbing the "4" in "[4K]"
             var epNum = Regex("""(?:Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(rawName)?.groupValues?.get(1)?.toIntOrNull()
             if (epNum == null) {
                 epNum = Regex("""\d+""").find(rawName)?.value?.toIntOrNull()
             }
 
-            // Enforces clean episode names
+            // 🔴 DYNAMIC NORMALIZER: Fixes the 1117 -> 117 typo  
+            if (epNum != null && epNum in 1000..1999) {
+                epNum -= 1000
+            }
+
             var cleanName = if (rawName.contains("Episode", ignoreCase = true) || rawName.contains("Ep", ignoreCase = true)) {
                 rawName
             } else {
-                "Episode $rawName"
+                "Episode ${epNum ?: rawName}"
             }
             
-            // Appends episode title (if the site provides one)
             if (eplTitle.isNotBlank() && !cleanName.contains(eplTitle)) {
                 cleanName = "$cleanName - $eplTitle"
             }
@@ -120,14 +119,11 @@ class LuciferDonghuaProvider : MainAPI() {
                 newEpisode(data = epHref) {
                     this.name = cleanName
                     this.episode = epNum
-                    this.season = seasonNum // Cloudstream natively organizes this into Season Tabs!
+                    this.season = seasonNum
                 }
             )
         }
 
-        // 🔴 SMART SORTING ALGORITHM
-        // Analyzes if the site listed the episodes descending (100 -> 1) or ascending (1 -> 100).
-        // It flips them if needed without ruining multi-season order!
         val isDescending = (episodes.firstOrNull()?.episode ?: 0) > (episodes.lastOrNull()?.episode ?: 0)
         val finalEpisodes = if (isDescending) episodes.reversed() else episodes
 
@@ -155,14 +151,12 @@ class LuciferDonghuaProvider : MainAPI() {
         suspend fun extractVideoLinks(html: String, refererUrl: String) {
             val urlsToProcess = mutableSetOf<String>()
 
-            // 1. GLOBAL DAILYMOTION SCANNER
             val dmRegex = Regex("""dailymotion\.com/(?:embed/video/|video/|[^"']+\?video=)([a-zA-Z0-9]+)""")
             dmRegex.findAll(html).forEach { match ->
                 val token = match.groupValues[1]
                 urlsToProcess.add("https://www.dailymotion.com/video/$token")
             }
 
-            // 2. Standard Iframe & Script Scanner
             val doc = Jsoup.parse(html)
             doc.select("iframe, .player-embed script, #pembed script, .playcon script").forEach { element ->
                 var rawSrc = element.attr("src")
@@ -177,7 +171,6 @@ class LuciferDonghuaProvider : MainAPI() {
                 }
             }
 
-            // 3. Hidden player_aaaa JSON
             val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1)
             if (playerJson != null) {
                 var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
@@ -191,10 +184,8 @@ class LuciferDonghuaProvider : MainAPI() {
                 if (rawUrl.isNotBlank()) urlsToProcess.add(rawUrl)
             }
 
-            // --- PROCESS ALL FOUND URLS ---
             urlsToProcess.filter { it.startsWith("http") }.forEach { clean ->
                 
-                // Vidhide Alias Bypass
                 if (clean.contains("yurn.online", ignoreCase = true) || clean.contains("vidhide", ignoreCase = true)) {
                     val vidhideUrl = clean.replace(Regex("""(yurn\.online|vidhide[a-z0-9A-Z]*\.[a-z]+)"""), "vidhidepro.com")
                     if (loadExtractor(vidhideUrl, refererUrl, subtitleCallback, callback)) {
@@ -203,7 +194,6 @@ class LuciferDonghuaProvider : MainAPI() {
                     return@forEach
                 }
 
-                // Dailymotion Direct API Extraction
                 if ("dailymotion.com/video/" in clean) {
                     val token = clean.substringAfterLast("/")
                     var foundDm = false
@@ -235,7 +225,6 @@ class LuciferDonghuaProvider : MainAPI() {
                     return@forEach 
                 }
 
-                // OK.RU Regex Fix
                 var okruUrl = clean
                 if (okruUrl.contains("ok.ru", ignoreCase = true)) {
                     okruUrl = okruUrl.substringBefore("?")
@@ -261,7 +250,6 @@ class LuciferDonghuaProvider : MainAPI() {
                     return@forEach
                 }
 
-                // Standard Default Extractor Fallback
                 if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
                     anyStreamFound = true
                 }
