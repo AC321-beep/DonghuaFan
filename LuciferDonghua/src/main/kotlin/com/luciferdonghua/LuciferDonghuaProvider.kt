@@ -69,7 +69,6 @@ class LuciferDonghuaProvider : MainAPI() {
         return newSearchResponseList(results, hasNext = results.isNotEmpty())
     }
 
-    // 🔴 ONLY THIS FUNCTION WAS MODIFIED FOR THE EPISODE LIST IMPROVEMENTS
     override suspend fun load(url: String): LoadResponse? {
         val document = app.get(url, headers = defaultHeaders).document
 
@@ -90,10 +89,15 @@ class LuciferDonghuaProvider : MainAPI() {
             
             // Extracts exact texts gracefully
             val eplNum = ep.selectFirst(".epl-num, .epnum, .ts-chl-te")?.text()?.trim()
-            val eplTitle = ep.selectFirst(".epl-title, .title")?.text()?.trim()
+            val eplTitle = ep.selectFirst(".epl-title, .title")?.text()?.trim() ?: ""
             
             val rawName = eplNum ?: linkElement.ownText().trim().takeIf { it.isNotBlank() } ?: linkElement.text().trim()
             
+            // 🔴 SMART SEASON EXTRACTOR: Looks for "Season X" or "S X" in the title
+            val fullTextToSearch = "$rawName $eplTitle"
+            val seasonNum = Regex("""(?:Season|S)\s*(\d+)""", RegexOption.IGNORE_CASE)
+                .find(fullTextToSearch)?.groupValues?.get(1)?.toIntOrNull()
+
             // Safely grabs the first number to avoid grabbing the "4" in "[4K]"
             var epNum = Regex("""(?:Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(rawName)?.groupValues?.get(1)?.toIntOrNull()
             if (epNum == null) {
@@ -108,7 +112,7 @@ class LuciferDonghuaProvider : MainAPI() {
             }
             
             // Appends episode title (if the site provides one)
-            if (!eplTitle.isNullOrBlank() && !cleanName.contains(eplTitle)) {
+            if (eplTitle.isNotBlank() && !cleanName.contains(eplTitle)) {
                 cleanName = "$cleanName - $eplTitle"
             }
 
@@ -116,6 +120,7 @@ class LuciferDonghuaProvider : MainAPI() {
                 newEpisode(data = epHref) {
                     this.name = cleanName
                     this.episode = epNum
+                    this.season = seasonNum // Cloudstream natively organizes this into Season Tabs!
                 }
             )
         }
@@ -139,7 +144,6 @@ class LuciferDonghuaProvider : MainAPI() {
         }
     }
 
-    // 🟢 LOAD LINKS IS UNTOUCHED (Dailymotion & Selectors will continue to work perfectly)
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
