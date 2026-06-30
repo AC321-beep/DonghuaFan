@@ -87,7 +87,7 @@ class LuciferDonghuaProvider : MainAPI() {
             val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
             val epName = linkElement.selectFirst(".epl-num, .epnum")?.text()?.trim() ?: ep.text().trim()
             
-            // Regex strictly grabs the primary episode number
+            // EXACT EPISODE FIX
             val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
 
             val cleanName = if (epName.contains("Episode", ignoreCase = true)) epName else "Episode $epName"
@@ -161,14 +161,10 @@ class LuciferDonghuaProvider : MainAPI() {
                 
                 if (clean.isNotBlank() && !clean.contains("about:blank")) {
                     
-                    // --- DAILYMOTION FIX ---
+                    // --- 1. DAILYMOTION FIX ---
                     if ("dailymotion" in clean) {
-                        // Grab either the result of your function or use the raw iframe URL
-                        val dmSource = extractDailymotionToken(refererUrl) ?: clean
-                        
-                        // Extract ONLY the token ID to prevent URL duplication bugs
-                        val token = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(dmSource)?.groupValues?.get(1)
-                        
+                        var token = Regex("""[?&]video=([^&]+)""").find(clean)?.groupValues?.get(1)
+                        if (token == null) token = extractDailymotionToken(refererUrl)
                         if (token != null) {
                             val embedUrl = "https://www.dailymotion.com/video/$token"
                             if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
@@ -178,11 +174,11 @@ class LuciferDonghuaProvider : MainAPI() {
                         }
                     }
 
-                    // --- VIDHIDE FIX ---
-                    // Passed directly to loadExtractor without domain normalization so your Custom Extractors catch them!
+                    // --- 2. STANDARD EXTRACTORS (Passed cleanly with no normalizations) ---
                     if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
                         anyStreamFound = true
                     } else {
+                        // --- 3. FALLBACK SCRAPER ---
                         try {
                             val iframeHtml = app.get(clean, headers = mapOf("Referer" to refererUrl)).text
                             val rawStreamRegex = Regex("""["'](https?[^"']+\.(?:m3u8|mp4)[^"']*)["']""")
@@ -201,14 +197,17 @@ class LuciferDonghuaProvider : MainAPI() {
             }
         }
 
+        // 1️⃣ Fetch the primary episode page
         val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return@coroutineScope false }
         extractIframes(baseDocument, data)
 
+        // 2️⃣ Collect all Mirror URLs from the dropdown
         val mirrorUrls = baseDocument.select("select.mirror option").mapNotNull { option ->
             val url = option.attr("value")
             if (url.startsWith("http") && url != data) url else null
         }.distinct()
 
+        // 3️⃣ Visit each mirror URL in the background
         mirrorUrls.map { mirrorUrl ->
             async {
                 try {
@@ -216,7 +215,7 @@ class LuciferDonghuaProvider : MainAPI() {
                     val destUrl = resp.url
                     
                     if (destUrl != mirrorUrl && !destUrl.contains("luciferdonghua.in")) {
-                        // Pass directly! Custom Extractors will handle Vidhidevip/Vidhide etc. natively.
+                        // Pass cleanly without normalization
                         if (loadExtractor(destUrl, data, subtitleCallback, callback)) {
                             anyStreamFound = true
                         }
