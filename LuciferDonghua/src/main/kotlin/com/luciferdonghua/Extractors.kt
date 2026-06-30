@@ -3,8 +3,6 @@ package com.luciferdonghua
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.extractors.VidHidePro
-import com.lagradost.cloudstream3.extractors.VidhideExtractor
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorApi
@@ -121,17 +119,4 @@ class Rumble : ExtractorApi() {
             }
         }
     }
-}
-
-// ==========================================
-// VIDHIDE (Built-in Extensions)
-// ==========================================
-class VidHideCustom : VidhideExtractor() {
-    override var mainUrl = "https://vidhide.com"
-    override val requiresReferer = true
-}
-
-class VidHideProCustom : VidHidePro() {
-    override var mainUrl = "https://vidhidevip.com"
-    override val requiresReferer = true
 }
