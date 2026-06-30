@@ -119,8 +119,7 @@ class LuciferDonghuaProvider : MainAPI() {
 
         pageDoc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
             val src = iframe.attr("src")
-            // 🔴 UNIVERSAL REGEX FIX APPLIED HERE
-            val match = Regex("""(?:video=|/video/)([^&?"']+)""").find(src)
+            val match = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(src)
             if (match != null) return match.groupValues[1]
         }
 
@@ -151,13 +150,21 @@ class LuciferDonghuaProvider : MainAPI() {
 
         suspend fun extractIframes(doc: org.jsoup.nodes.Document, refererUrl: String) {
             doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
-                var src = iframe.attr("src")
-                if (src.startsWith("//")) src = "https:$src"
-                val clean = fixUrlNull(src) ?: return@forEach
+                
+                // 🔴 1. LAZY-LOAD SAFETY FIX
+                var rawSrc = iframe.attr("src")
+                if (rawSrc.isBlank() || rawSrc == "about:blank" || rawSrc.contains("data:image")) {
+                    rawSrc = iframe.attr("data-src").takeIf { it.isNotBlank() } 
+                             ?: iframe.attr("data-lazy-src").takeIf { it.isNotBlank() } 
+                             ?: ""
+                }
+                
+                if (rawSrc.startsWith("//")) rawSrc = "https:$rawSrc"
+                val clean = fixUrlNull(rawSrc) ?: return@forEach
                 
                 if (clean.isNotBlank() && !clean.contains("about:blank")) {
                     
-                    // --- 1. VIDHIDE ALIAS FIX ---
+                    // --- VIDHIDE ALIAS FIX ---
                     if (clean.contains("yurn.online", ignoreCase = true) || clean.contains("vidhide", ignoreCase = true)) {
                         val vidhideUrl = clean.replace(Regex("""(yurn\.online|vidhide[a-z0-9A-Z]*\.[a-z]+)"""), "vidhidepro.com")
                         if (loadExtractor(vidhideUrl, refererUrl, subtitleCallback, callback)) {
@@ -166,46 +173,48 @@ class LuciferDonghuaProvider : MainAPI() {
                         return@forEach
                     }
 
-                    // --- 2. DAILYMOTION MANUAL EXTRACTION BYPASS ---
+                    // 🔴 2. DAILYMOTION MANUAL EXTRACTION OVERRIDE ---
                     if ("dailymotion" in clean) {
-                        // 🔴 UNIVERSAL REGEX FIX APPLIED HERE
-                        var token = Regex("""(?:video=|/video/)([^&?"']+)""").find(clean)?.groupValues?.get(1)
+                        var token = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(clean)?.groupValues?.get(1)
                         if (token == null) token = extractDailymotionToken(refererUrl)
                         
                         if (token != null) {
-                            val embedUrl = "https://www.dailymotion.com/video/$token"
-                            
-                            if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
-                                anyStreamFound = true
-                            } else {
-                                try {
-                                    val apiResponse = app.get("https://www.dailymotion.com/player/metadata/video/$token").text
-                                    val m3u8Match = Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""")
-                                        .find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/")
+                            var foundDm = false
+                            // FORCE API EXTRACTION FIRST (Bypasses Native False-Positives on Private Videos)
+                            try {
+                                val apiResponse = app.get("https://www.dailymotion.com/player/metadata/video/$token").text
+                                val m3u8Match = Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""")
+                                    .find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/")
 
-                                    if (m3u8Match != null) {
-                                        M3u8Helper.generateM3u8(
-                                            "Dailymotion",
-                                            m3u8Match,
-                                            "https://www.dailymotion.com/"
-                                        ).forEach { link ->
-                                            callback(link)
-                                        }
+                                if (m3u8Match != null) {
+                                    M3u8Helper.generateM3u8("Dailymotion", m3u8Match, "https://www.dailymotion.com/").forEach { link ->
+                                        callback(link)
+                                        foundDm = true
                                         anyStreamFound = true
                                     }
-                                } catch (e: Exception) {}
+                                }
+                            } catch (e: Exception) {}
+
+                            // If direct API fails, fallback to native extractor
+                            if (!foundDm) {
+                                val embedUrl = "https://www.dailymotion.com/video/$token"
+                                if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
+                                    anyStreamFound = true
+                                }
                             }
                             return@forEach 
                         }
                     }
 
-                    // --- 3. OK.RU REGEX BYPASS ---
+                    // 🔴 3. OK.RU REGEX BYPASS FIX ---
                     var okruUrl = clean
-                    if (okruUrl.contains("ok.ru/videoembed", ignoreCase = true)) {
+                    if (okruUrl.contains("ok.ru", ignoreCase = true)) {
+                        // Strips queries and tricks Cloudstream Native regex by forcing /video/
                         okruUrl = okruUrl.substringBefore("?")
+                        okruUrl = okruUrl.replace("videoembed", "video")
                     }
 
-                    // --- 4. STANDARD EXTRACTORS ---
+                    // --- STANDARD EXTRACTORS ---
                     if (loadExtractor(okruUrl, refererUrl, subtitleCallback, callback)) {
                         anyStreamFound = true
                     } else {
