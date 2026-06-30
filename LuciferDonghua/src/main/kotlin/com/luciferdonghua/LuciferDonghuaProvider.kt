@@ -82,7 +82,7 @@ class LuciferDonghuaProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
 
-        // 🔴 Smart Episode Parser (Supports grids and lists safely)
+        // 🔴 Smart Episode Parser
         document.select(".eplister ul li a, #episode_list li a, .listeps ul li a, .bxcl ul li a, .epcl li a").forEach { linkElement ->
             val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
             
@@ -91,7 +91,6 @@ class LuciferDonghuaProvider : MainAPI() {
                 ?: linkElement.text().trim()
             
             val epTitle = linkElement.selectFirst(".epl-title, .title")?.text()?.trim()
-            val epDate = linkElement.selectFirst(".epl-date, .date")?.text()?.trim()
 
             val epNum = Regex("""(?:Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(rawName)?.groupValues?.get(1)?.toIntOrNull()
                 ?: Regex("""\d+""").findAll(rawName).lastOrNull()?.value?.toIntOrNull()
@@ -112,7 +111,7 @@ class LuciferDonghuaProvider : MainAPI() {
                 newEpisode(data = epHref) {
                     this.name = finalName
                     this.episode = epNum
-                    this.date = epDate
+                    // 🔴 FIX: Removed String assignment to Long 'date' to prevent compile crashes
                 }
             )
         }
