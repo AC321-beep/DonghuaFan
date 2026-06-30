@@ -6,11 +6,13 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
-import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
+import kotlinx.coroutines.* // Required for parallel mirror processing
+
+class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
     override var name = "Lucifer Donghua"
     override val hasMainPage = true
-    override var lang = "zh" 
+    override var lang = "zh"
     override val hasQuickSearch = true
 
     private val defaultHeaders = mapOf(
@@ -148,36 +150,80 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
 
         suspend fun extractIframes(doc: org.jsoup.nodes.Document, refererUrl: String) {
             doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
-                // EXACTLY your code: No data-src priority filtering here. 
                 var src = iframe.attr("src")
                 if (src.startsWith("//")) src = "https:$src"
                 val clean = fixUrlNull(src) ?: return@forEach
                 
                 if (clean.isNotBlank() && !clean.contains("about:blank")) {
                     
+                    // --- 1. VIDHIDE ALIAS FIX ---
+                    if (clean.contains("yurn.online", ignoreCase = true) || clean.contains("vidhide", ignoreCase = true)) {
+                        val vidhideUrl = clean.replace(Regex("""(yurn\.online|vidhide[a-z0-9A-Z]*\.[a-z]+)"""), "vidhidepro.com")
+                        if (loadExtractor(vidhideUrl, refererUrl, subtitleCallback, callback)) {
+                            anyStreamFound = true
+                        }
+                        return@forEach
+                    }
+
+                    // --- 2. DAILYMOTION MANUAL EXTRACTION BYPASS ---
                     if ("dailymotion" in clean) {
                         var token = Regex("""[?&]video=([^&]+)""").find(clean)?.groupValues?.get(1)
                         if (token == null) token = extractDailymotionToken(refererUrl)
+                        
                         if (token != null) {
                             val embedUrl = "https://www.dailymotion.com/video/$token"
-                            loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)
-                            anyStreamFound = true
+                            
+                            // Try native first, but if it fails...
+                            if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
+                                anyStreamFound = true
+                            } else {
+                                // NATIVE FAILED (Private ID block). Force direct API Extraction!
+                                try {
+                                    val apiResponse = app.get("https://www.dailymotion.com/player/metadata/video/$token").text
+                                    val m3u8Match = Regex(""""type"\s*:\s*"application\\/x-mpegURL"\s*,\s*"url"\s*:\s*"([^"]+)"""")
+                                        .find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/") 
+                                        ?: Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""")
+                                        .find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/")
+
+                                    if (m3u8Match != null) {
+                                        M3u8Helper.generateM3u8(name, m3u8Match, "https://www.dailymotion.com/").forEach { link ->
+                                            callback(
+                                                newExtractorLink(
+                                                    name,
+                                                    "Dailymotion Server",
+                                                    link.url,
+                                                    link.type,
+                                                    link.quality,
+                                                    link.isM3u8
+                                                )
+                                            )
+                                        }
+                                        anyStreamFound = true
+                                    }
+                                } catch (e: Exception) {}
+                            }
                             return@forEach 
                         }
                     }
 
-                    // EXACTLY your code: Passed directly to loadExtractor
-                    if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
+                    // --- 3. OK.RU REGEX BYPASS ---
+                    var okruUrl = clean
+                    if (okruUrl.contains("ok.ru/videoembed", ignoreCase = true)) {
+                        okruUrl = okruUrl.substringBefore("?")
+                    }
+
+                    // --- 4. STANDARD EXTRACTORS ---
+                    if (loadExtractor(okruUrl, refererUrl, subtitleCallback, callback)) {
                         anyStreamFound = true
                     } else {
                         try {
-                            val iframeHtml = app.get(clean, headers = mapOf("Referer" to refererUrl)).text
+                            val iframeHtml = app.get(okruUrl, headers = mapOf("Referer" to refererUrl)).text
                             val rawStreamRegex = Regex("""["'](https?[^"']+\.(?:m3u8|mp4)[^"']*)["']""")
                             rawStreamRegex.findAll(iframeHtml).forEach { match ->
                                 val cleanStreamUrl = match.groupValues[1].replace("\\/", "/")
                                 callback(
                                     newExtractorLink(name, "Fallback Server", cleanStreamUrl, INFER_TYPE) {
-                                        this.referer = clean
+                                        this.referer = okruUrl
                                     }
                                 )
                                 anyStreamFound = true
@@ -196,7 +242,6 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
             if (url.startsWith("http") && url != data) url else null
         }.distinct()
 
-        // 🔴 FIX: No redirect URL intercepting. It fetches the document and passes it EXACTLY as your code originally did.
         mirrorUrls.map { mirrorUrl ->
             async {
                 try {
