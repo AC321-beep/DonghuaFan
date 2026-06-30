@@ -82,36 +82,19 @@ class LuciferDonghuaProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
 
-        // 🔴 Smart Episode Parser
-        document.select(".eplister ul li a, #episode_list li a, .listeps ul li a, .bxcl ul li a, .epcl li a").forEach { linkElement ->
+        // 🟢 Reverted back to the original layout selector logic
+        document.select(".eplister ul li, #episode_list li, .listeps ul li").forEach { ep ->
+            val linkElement = ep.selectFirst("a") ?: return@forEach
             val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
+            val epName = linkElement.selectFirst(".epl-num, .epnum")?.text()?.trim() ?: ep.text().trim()
             
-            val rawName = linkElement.selectFirst(".epl-num, .epnum")?.text()?.trim() 
-                ?: linkElement.ownText().trim().takeIf { it.isNotBlank() }
-                ?: linkElement.text().trim()
-            
-            val epTitle = linkElement.selectFirst(".epl-title, .title")?.text()?.trim()
-
-            val epNum = Regex("""(?:Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(rawName)?.groupValues?.get(1)?.toIntOrNull()
-                ?: Regex("""\d+""").findAll(rawName).lastOrNull()?.value?.toIntOrNull()
-
-            val cleanName = if (rawName.matches(Regex("""^\d+$"""))) {
-                "Episode $rawName"
-            } else if (rawName.contains("Episode", ignoreCase = true)) {
-                rawName
-            } else {
-                epNum?.let { "Episode $it" } ?: rawName
-            }
-
-            val finalName = if (!epTitle.isNullOrBlank() && !cleanName.contains(epTitle)) {
-                "$cleanName - $epTitle"
-            } else cleanName
+            val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
+            val cleanName = if (epName.contains("Episode", ignoreCase = true)) epName else "Episode $epName"
 
             episodes.add(
                 newEpisode(data = epHref) {
-                    this.name = finalName
+                    this.name = cleanName
                     this.episode = epNum
-                    // 🔴 FIX: Removed String assignment to Long 'date' to prevent compile crashes
                 }
             )
         }
@@ -138,12 +121,10 @@ class LuciferDonghuaProvider : MainAPI() {
     ): Boolean = coroutineScope {
         var anyStreamFound = false
 
-        // 🔴 Dual-Extractor: Pulls URLs from both iframes AND hidden player_aaaa JSON
         suspend fun extractVideoLinks(html: String, refererUrl: String) {
             val doc = Jsoup.parse(html)
             val urlsToProcess = mutableListOf<String>()
 
-            // 1. Check for standard iframes
             doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
                 var rawSrc = iframe.attr("src")
                 if (rawSrc.isBlank() || rawSrc == "about:blank" || rawSrc.contains("data:image")) {
@@ -155,7 +136,6 @@ class LuciferDonghuaProvider : MainAPI() {
                 fixUrlNull(rawSrc)?.let { urlsToProcess.add(it) }
             }
 
-            // 2. Check for hidden player_aaaa script (Catches Dailymotion missing links!)
             val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1)
             if (playerJson != null) {
                 var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
@@ -169,10 +149,8 @@ class LuciferDonghuaProvider : MainAPI() {
                 if (rawUrl.isNotBlank()) urlsToProcess.add(rawUrl)
             }
 
-            // 3. Process every link we found
             urlsToProcess.distinct().filter { it.isNotBlank() && !it.contains("about:blank") }.forEach { clean ->
                 
-                // --- VIDHIDE ALIAS FIX ---
                 if (clean.contains("yurn.online", ignoreCase = true) || clean.contains("vidhide", ignoreCase = true)) {
                     val vidhideUrl = clean.replace(Regex("""(yurn\.online|vidhide[a-z0-9A-Z]*\.[a-z]+)"""), "vidhidepro.com")
                     if (loadExtractor(vidhideUrl, refererUrl, subtitleCallback, callback)) {
@@ -181,7 +159,6 @@ class LuciferDonghuaProvider : MainAPI() {
                     return@forEach
                 }
 
-                // --- DAILYMOTION MANUAL EXTRACTION OVERRIDE ---
                 if ("dailymotion" in clean) {
                     val token = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(clean)?.groupValues?.get(1)
                     if (token != null) {
@@ -217,14 +194,12 @@ class LuciferDonghuaProvider : MainAPI() {
                     }
                 }
 
-                // --- OK.RU REGEX BYPASS FIX ---
                 var okruUrl = clean
                 if (okruUrl.contains("ok.ru", ignoreCase = true)) {
                     okruUrl = okruUrl.substringBefore("?")
                     okruUrl = okruUrl.replace("videoembed", "video")
                 }
 
-                // --- STANDARD EXTRACTORS ---
                 if (loadExtractor(okruUrl, refererUrl, subtitleCallback, callback)) {
                     anyStreamFound = true
                 } else {
