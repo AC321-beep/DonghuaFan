@@ -82,23 +82,45 @@ class LuciferDonghuaProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
 
-        document.select(".eplister ul li, #episode_list li, .listeps ul li").forEach { ep ->
-            val linkElement = ep.selectFirst("a") ?: return@forEach
+        // 🔴 IMPROVED EPISODE EXTRACTION (Supports Grids & Lists safely)
+        document.select(".eplister ul li a, #episode_list li a, .listeps ul li a, .bxcl ul li a, .epcl li a").forEach { linkElement ->
             val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
-            val epName = linkElement.selectFirst(".epl-num, .epnum")?.text()?.trim() ?: ep.text().trim()
             
-            val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
+            val rawName = linkElement.selectFirst(".epl-num, .epnum")?.text()?.trim() 
+                ?: linkElement.ownText().trim().takeIf { it.isNotBlank() }
+                ?: linkElement.text().trim()
+            
+            val epTitle = linkElement.selectFirst(".epl-title, .title")?.text()?.trim()
+            val epDate = linkElement.selectFirst(".epl-date, .date")?.text()?.trim()
 
-            val cleanName = if (epName.contains("Episode", ignoreCase = true)) epName else "Episode $epName"
+            // Grabs the exact episode number dynamically, ignoring "Season 2" or "[4K]" prefixes
+            val epNum = Regex("""(?:Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(rawName)?.groupValues?.get(1)?.toIntOrNull()
+                ?: Regex("""\d+""").findAll(rawName).lastOrNull()?.value?.toIntOrNull()
+
+            // Formats the display name cleanly for Cloudstream
+            val cleanName = if (rawName.matches(Regex("""^\d+$"""))) {
+                "Episode $rawName"
+            } else if (rawName.contains("Episode", ignoreCase = true)) {
+                rawName
+            } else {
+                epNum?.let { "Episode $it" } ?: rawName
+            }
+
+            // Appends episode title if it exists on the site
+            val finalName = if (!epTitle.isNullOrBlank() && !cleanName.contains(epTitle)) {
+                "$cleanName - $epTitle"
+            } else cleanName
 
             episodes.add(
                 newEpisode(data = epHref) {
-                    this.name = cleanName
+                    this.name = finalName
                     this.episode = epNum
+                    this.date = epDate
                 }
             )
         }
 
+        // Sort dynamically to ensure episode 100 doesn't show up before episode 2
         val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
         val episodeMap = mutableMapOf(
             DubStatus.Subbed to sortedEpisodes
@@ -163,7 +185,6 @@ class LuciferDonghuaProvider : MainAPI() {
                 
                 if (clean.isNotBlank() && !clean.contains("about:blank")) {
                     
-                    // --- VIDHIDE ALIAS FIX ---
                     if (clean.contains("yurn.online", ignoreCase = true) || clean.contains("vidhide", ignoreCase = true)) {
                         val vidhideUrl = clean.replace(Regex("""(yurn\.online|vidhide[a-z0-9A-Z]*\.[a-z]+)"""), "vidhidepro.com")
                         if (loadExtractor(vidhideUrl, refererUrl, subtitleCallback, callback)) {
@@ -172,7 +193,6 @@ class LuciferDonghuaProvider : MainAPI() {
                         return@forEach
                     }
 
-                    // --- DAILYMOTION DOMAIN SPOOFING BYPASS ---
                     if ("dailymotion" in clean) {
                         var token = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(clean)?.groupValues?.get(1)
                         if (token == null) token = extractDailymotionToken(refererUrl)
@@ -180,7 +200,6 @@ class LuciferDonghuaProvider : MainAPI() {
                         if (token != null) {
                             var foundDm = false
                             try {
-                                // 🔴 FIX: Injects the Referer to bypass the 403 Forbidden error on geo/private videos
                                 val apiResponse = app.get(
                                     "https://www.dailymotion.com/player/metadata/video/$token",
                                     headers = mapOf(
@@ -189,7 +208,6 @@ class LuciferDonghuaProvider : MainAPI() {
                                     )
                                 ).text
                                 
-                                // Broader Regex to catch URL regardless of structure changes
                                 val m3u8Match = Regex("""(?:\"url\"|\"stream_url\")\s*:\s*\"([^\"]+\.m3u8[^\"]*)\"""")
                                     .find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/")
 
@@ -212,14 +230,12 @@ class LuciferDonghuaProvider : MainAPI() {
                         }
                     }
 
-                    // --- OK.RU REGEX BYPASS FIX ---
                     var okruUrl = clean
                     if (okruUrl.contains("ok.ru", ignoreCase = true)) {
                         okruUrl = okruUrl.substringBefore("?")
                         okruUrl = okruUrl.replace("videoembed", "video")
                     }
 
-                    // --- STANDARD EXTRACTORS ---
                     if (loadExtractor(okruUrl, refererUrl, subtitleCallback, callback)) {
                         anyStreamFound = true
                     } else {
@@ -241,7 +257,6 @@ class LuciferDonghuaProvider : MainAPI() {
             }
         }
 
-        // 1️⃣ Fetch primary page with explicit 15s timeout
         val baseDocument = try { app.get(data, headers = defaultHeaders, timeout = 15000).document } catch(e: Exception) { return@coroutineScope false }
         extractIframes(baseDocument, data)
 
@@ -250,10 +265,9 @@ class LuciferDonghuaProvider : MainAPI() {
             if (url.startsWith("http") && url != data) url else null
         }.distinct()
 
-        // 🔴 FIX: Staggered fetching to bypass WordPress/Cloudflare DDoS protection
         mirrorUrls.mapIndexed { index, mirrorUrl ->
             async {
-                delay(index * 300L) // Waits 0.3s, 0.6s, 0.9s between requests so the site firewall stays calm
+                delay(index * 300L) 
                 try {
                     val mirrorDoc = app.get(mirrorUrl, headers = defaultHeaders, timeout = 15000).document
                     extractIframes(mirrorDoc, mirrorUrl)
