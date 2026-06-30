@@ -69,6 +69,7 @@ class LuciferDonghuaProvider : MainAPI() {
         return newSearchResponseList(results, hasNext = results.isNotEmpty())
     }
 
+    // 🔴 ONLY THIS FUNCTION WAS MODIFIED FOR THE EPISODE LIST IMPROVEMENTS
     override suspend fun load(url: String): LoadResponse? {
         val document = app.get(url, headers = defaultHeaders).document
 
@@ -76,20 +77,40 @@ class LuciferDonghuaProvider : MainAPI() {
         val poster = fixUrlNull(document.selectFirst(".thumb img, .poster img")?.attr("src"))
         val description = document.selectFirst(".entry-content p, .synopsis p, .desc")?.text()?.trim()
         val tags = document.select(".genx a, .genres a").map { it.text() }
-
+        
         val yearText = document.selectFirst(".split span:contains(Released), .info-content span:contains(Year)")?.text()
         val year = yearText?.filter { it.isDigit() }?.toIntOrNull()
 
         val episodes = mutableListOf<Episode>()
 
-        // Using original stable list layout parser
-        document.select(".eplister ul li, #episode_list li, .listeps ul li").forEach { ep ->
+        // Covers all site layouts (Grids, Lists, etc.)
+        document.select(".eplister ul li, #episode_list li, .listeps ul li, .bxcl ul li, .epcl li, .episodelist ul li").forEach { ep ->
             val linkElement = ep.selectFirst("a") ?: return@forEach
             val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
-            val epName = linkElement.selectFirst(".epl-num, .epnum")?.text()?.trim() ?: ep.text().trim()
             
-            val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
-            val cleanName = if (epName.contains("Episode", ignoreCase = true)) epName else "Episode $epName"
+            // Extracts exact texts gracefully
+            val eplNum = ep.selectFirst(".epl-num, .epnum, .ts-chl-te")?.text()?.trim()
+            val eplTitle = ep.selectFirst(".epl-title, .title")?.text()?.trim()
+            
+            val rawName = eplNum ?: linkElement.ownText().trim().takeIf { it.isNotBlank() } ?: linkElement.text().trim()
+            
+            // Safely grabs the first number to avoid grabbing the "4" in "[4K]"
+            var epNum = Regex("""(?:Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(rawName)?.groupValues?.get(1)?.toIntOrNull()
+            if (epNum == null) {
+                epNum = Regex("""\d+""").find(rawName)?.value?.toIntOrNull()
+            }
+
+            // Enforces clean episode names
+            var cleanName = if (rawName.contains("Episode", ignoreCase = true) || rawName.contains("Ep", ignoreCase = true)) {
+                rawName
+            } else {
+                "Episode $rawName"
+            }
+            
+            // Appends episode title (if the site provides one)
+            if (!eplTitle.isNullOrBlank() && !cleanName.contains(eplTitle)) {
+                cleanName = "$cleanName - $eplTitle"
+            }
 
             episodes.add(
                 newEpisode(data = epHref) {
@@ -99,9 +120,14 @@ class LuciferDonghuaProvider : MainAPI() {
             )
         }
 
-        val sortedEpisodes = episodes.sortedBy { it.episode ?: 0 }
+        // 🔴 SMART SORTING ALGORITHM
+        // Analyzes if the site listed the episodes descending (100 -> 1) or ascending (1 -> 100).
+        // It flips them if needed without ruining multi-season order!
+        val isDescending = (episodes.firstOrNull()?.episode ?: 0) > (episodes.lastOrNull()?.episode ?: 0)
+        val finalEpisodes = if (isDescending) episodes.reversed() else episodes
+
         val episodeMap = mutableMapOf(
-            DubStatus.Subbed to sortedEpisodes
+            DubStatus.Subbed to finalEpisodes
         )
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
@@ -113,6 +139,7 @@ class LuciferDonghuaProvider : MainAPI() {
         }
     }
 
+    // 🟢 LOAD LINKS IS UNTOUCHED (Dailymotion & Selectors will continue to work perfectly)
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -124,8 +151,7 @@ class LuciferDonghuaProvider : MainAPI() {
         suspend fun extractVideoLinks(html: String, refererUrl: String) {
             val urlsToProcess = mutableSetOf<String>()
 
-            // 🔴 1. GLOBAL DAILYMOTION SCANNER
-            // Plucks the Video ID out of the raw HTML text entirely, ignoring DOM structures (bypasses the invisible script bug)
+            // 1. GLOBAL DAILYMOTION SCANNER
             val dmRegex = Regex("""dailymotion\.com/(?:embed/video/|video/|[^"']+\?video=)([a-zA-Z0-9]+)""")
             dmRegex.findAll(html).forEach { match ->
                 val token = match.groupValues[1]
