@@ -114,7 +114,7 @@ class LuciferDonghuaProvider : MainAPI() {
     }
 
     private suspend fun extractDailymotionToken(pageUrl: String): String? {
-        val pageHtml = try { app.get(pageUrl, headers = defaultHeaders).text } catch (e: Exception) { return null }
+        val pageHtml = try { app.get(pageUrl, headers = defaultHeaders, timeout = 15000).text } catch (e: Exception) { return null }
         val pageDoc = try { Jsoup.parse(pageHtml) } catch (e: Exception) { null }
 
         pageDoc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
@@ -151,7 +151,6 @@ class LuciferDonghuaProvider : MainAPI() {
         suspend fun extractIframes(doc: org.jsoup.nodes.Document, refererUrl: String) {
             doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
                 
-                // 🔴 1. LAZY-LOAD SAFETY FIX
                 var rawSrc = iframe.attr("src")
                 if (rawSrc.isBlank() || rawSrc == "about:blank" || rawSrc.contains("data:image")) {
                     rawSrc = iframe.attr("data-src").takeIf { it.isNotBlank() } 
@@ -173,17 +172,25 @@ class LuciferDonghuaProvider : MainAPI() {
                         return@forEach
                     }
 
-                    // 🔴 2. DAILYMOTION MANUAL EXTRACTION OVERRIDE ---
+                    // --- DAILYMOTION DOMAIN SPOOFING BYPASS ---
                     if ("dailymotion" in clean) {
                         var token = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(clean)?.groupValues?.get(1)
                         if (token == null) token = extractDailymotionToken(refererUrl)
                         
                         if (token != null) {
                             var foundDm = false
-                            // FORCE API EXTRACTION FIRST (Bypasses Native False-Positives on Private Videos)
                             try {
-                                val apiResponse = app.get("https://www.dailymotion.com/player/metadata/video/$token").text
-                                val m3u8Match = Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""")
+                                // 🔴 FIX: Injects the Referer to bypass the 403 Forbidden error on geo/private videos
+                                val apiResponse = app.get(
+                                    "https://www.dailymotion.com/player/metadata/video/$token",
+                                    headers = mapOf(
+                                        "User-Agent" to defaultHeaders["User-Agent"]!!,
+                                        "Referer" to refererUrl
+                                    )
+                                ).text
+                                
+                                // Broader Regex to catch URL regardless of structure changes
+                                val m3u8Match = Regex("""(?:\"url\"|\"stream_url\")\s*:\s*\"([^\"]+\.m3u8[^\"]*)\"""")
                                     .find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/")
 
                                 if (m3u8Match != null) {
@@ -195,7 +202,6 @@ class LuciferDonghuaProvider : MainAPI() {
                                 }
                             } catch (e: Exception) {}
 
-                            // If direct API fails, fallback to native extractor
                             if (!foundDm) {
                                 val embedUrl = "https://www.dailymotion.com/video/$token"
                                 if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
@@ -206,10 +212,9 @@ class LuciferDonghuaProvider : MainAPI() {
                         }
                     }
 
-                    // 🔴 3. OK.RU REGEX BYPASS FIX ---
+                    // --- OK.RU REGEX BYPASS FIX ---
                     var okruUrl = clean
                     if (okruUrl.contains("ok.ru", ignoreCase = true)) {
-                        // Strips queries and tricks Cloudstream Native regex by forcing /video/
                         okruUrl = okruUrl.substringBefore("?")
                         okruUrl = okruUrl.replace("videoembed", "video")
                     }
@@ -219,7 +224,7 @@ class LuciferDonghuaProvider : MainAPI() {
                         anyStreamFound = true
                     } else {
                         try {
-                            val iframeHtml = app.get(okruUrl, headers = mapOf("Referer" to refererUrl)).text
+                            val iframeHtml = app.get(okruUrl, headers = mapOf("Referer" to refererUrl), timeout = 15000).text
                             val rawStreamRegex = Regex("""["'](https?[^"']+\.(?:m3u8|mp4)[^"']*)["']""")
                             rawStreamRegex.findAll(iframeHtml).forEach { match ->
                                 val cleanStreamUrl = match.groupValues[1].replace("\\/", "/")
@@ -236,7 +241,8 @@ class LuciferDonghuaProvider : MainAPI() {
             }
         }
 
-        val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return@coroutineScope false }
+        // 1️⃣ Fetch primary page with explicit 15s timeout
+        val baseDocument = try { app.get(data, headers = defaultHeaders, timeout = 15000).document } catch(e: Exception) { return@coroutineScope false }
         extractIframes(baseDocument, data)
 
         val mirrorUrls = baseDocument.select("select.mirror option").mapNotNull { option ->
@@ -244,10 +250,12 @@ class LuciferDonghuaProvider : MainAPI() {
             if (url.startsWith("http") && url != data) url else null
         }.distinct()
 
-        mirrorUrls.map { mirrorUrl ->
+        // 🔴 FIX: Staggered fetching to bypass WordPress/Cloudflare DDoS protection
+        mirrorUrls.mapIndexed { index, mirrorUrl ->
             async {
+                delay(index * 300L) // Waits 0.3s, 0.6s, 0.9s between requests so the site firewall stays calm
                 try {
-                    val mirrorDoc = app.get(mirrorUrl, headers = defaultHeaders).document
+                    val mirrorDoc = app.get(mirrorUrl, headers = defaultHeaders, timeout = 15000).document
                     extractIframes(mirrorDoc, mirrorUrl)
                 } catch (e: Exception) {}
             }
