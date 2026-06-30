@@ -119,7 +119,8 @@ class LuciferDonghuaProvider : MainAPI() {
 
         pageDoc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
             val src = iframe.attr("src")
-            val match = Regex("""[?&]video=([^&]+)""").find(src)
+            // 🔴 UNIVERSAL REGEX FIX APPLIED HERE
+            val match = Regex("""(?:video=|/video/)([^&?"']+)""").find(src)
             if (match != null) return match.groupValues[1]
         }
 
@@ -167,7 +168,8 @@ class LuciferDonghuaProvider : MainAPI() {
 
                     // --- 2. DAILYMOTION MANUAL EXTRACTION BYPASS ---
                     if ("dailymotion" in clean) {
-                        var token = Regex("""[?&]video=([^&]+)""").find(clean)?.groupValues?.get(1)
+                        // 🔴 UNIVERSAL REGEX FIX APPLIED HERE
+                        var token = Regex("""(?:video=|/video/)([^&?"']+)""").find(clean)?.groupValues?.get(1)
                         if (token == null) token = extractDailymotionToken(refererUrl)
                         
                         if (token != null) {
