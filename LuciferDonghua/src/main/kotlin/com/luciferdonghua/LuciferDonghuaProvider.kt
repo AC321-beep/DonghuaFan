@@ -117,6 +117,10 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                     this.name = cleanName
                     this.episode = epNum
                     this.season = seasonNum
+                    
+                    // 💡 FORCES PLAYER TO AUTOMATICALLY START PLAYING PAST THE INTRO 
+                    // 1 minute 27 seconds = 87 seconds * 1000ms = 87000L
+                    this.startAt = 87000L
                 }
             )
         }
@@ -163,7 +167,6 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                              ?: ""
                 }
                 
-                // 🔴 FIX: Restored fixUrlNull to catch relative/proxy iframe links (like Rumble)
                 val cleanUrl = fixUrlNull(rawSrc)
                 if (!cleanUrl.isNullOrBlank() && !cleanUrl.contains("about:blank")) {
                     urlsToProcess.add(cleanUrl)
@@ -181,12 +184,10 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                     rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
                 }
                 
-                // 🔴 FIX: Also fixUrlNull here just in case JSON returns relative paths
                 val cleanJsonUrl = fixUrlNull(rawUrl)
                 if (!cleanJsonUrl.isNullOrBlank()) urlsToProcess.add(cleanJsonUrl)
             }
 
-            // 🔴 FIX: Removed the aggressive `.filter { it.startsWith("http") }` that was deleting valid links
             urlsToProcess.forEach { clean ->
                 
                 if (clean.contains("yurn.online", ignoreCase = true) || clean.contains("vidhide", ignoreCase = true)) {
@@ -253,7 +254,6 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                     return@forEach
                 }
 
-                // If it's Rumble (or anything else), it will cleanly fall through to here now!
                 if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
                     anyStreamFound = true
                 }
