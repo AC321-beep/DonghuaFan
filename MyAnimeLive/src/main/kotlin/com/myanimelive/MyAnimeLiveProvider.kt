@@ -3,6 +3,7 @@ package com.myanimelive
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.AppUtils.apmap
 import java.net.URLEncoder
 
 class MyAnimeLiveProvider : MainAPI() {
@@ -34,11 +35,13 @@ class MyAnimeLiveProvider : MainAPI() {
             val seriesName = extractSeriesName(title)
             if (seriesName.isBlank()) return@forEach
 
-            val poster = article.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
+            // Optimizing string allocations by encoding immediately
             val encodedName = URLEncoder.encode(seriesName, "UTF-8")
             val seriesUrl = "$mainUrl/?s=$encodedName"
 
+            // Skip DOM extraction if we already cataloged this series in the UI
             if (!seriesMap.containsKey(seriesUrl)) {
+                val poster = article.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
                 val response = newAnimeSearchResponse(seriesName, seriesUrl, TvType.Anime)
                 response.posterUrl = poster
                 seriesMap[seriesUrl] = response
@@ -61,17 +64,6 @@ class MyAnimeLiveProvider : MainAPI() {
         if (articles.isEmpty()) {
             articles = doc.select(".post, .entry, li.type-post")
         }
-        if (articles.isEmpty()) {
-            val fallbackLinks = doc.select("a[href*='/20']")
-            return fallbackLinks.mapNotNull { link ->
-                val url = fixUrl(link.attr("href"))
-                val title = link.text().trim()
-                if (title.isNotBlank() && url.contains("/20")) {
-                    val seriesName = extractSeriesName(title)
-                    newAnimeSearchResponse(seriesName, url, TvType.Anime)
-                } else null
-            }.distinctBy { it.url }
-        }
 
         val seriesMap = mutableMapOf<String, SearchResponse>()
         articles.forEach { article ->
@@ -80,11 +72,11 @@ class MyAnimeLiveProvider : MainAPI() {
             val seriesName = extractSeriesName(title)
             if (seriesName.isBlank()) return@forEach
 
-            val poster = article.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
             val encodedName = URLEncoder.encode(seriesName, "UTF-8")
             val seriesUrl = "$mainUrl/?s=$encodedName"
 
             if (!seriesMap.containsKey(seriesUrl)) {
+                val poster = article.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
                 val response = newAnimeSearchResponse(seriesName, seriesUrl, TvType.Anime)
                 response.posterUrl = poster
                 seriesMap[seriesUrl] = response
@@ -101,26 +93,43 @@ class MyAnimeLiveProvider : MainAPI() {
             val poster = doc.selectFirst("article img")?.attr("src")?.let { fixUrl(it) }
 
             val allEpisodes = mutableListOf<Episode>()
-            var currentUrl = url
-            while (currentUrl.isNotBlank()) {
-                val pageDoc = app.get(currentUrl).document
+            
+            // Gather all available pagination index pages up front
+            val pagesToFetch = mutableListOf(url)
+            doc.select("a.page-numbers").forEach { 
+                val href = it.attr("href")
+                if (href.isNotBlank() && !pagesToFetch.contains(href)) {
+                    pagesToFetch.add(fixUrl(href))
+                }
+            }
+
+            // High performance parallel fetching of search pagination index targets via apmap
+            pagesToFetch.apmap { pageUrl ->
+                val pageDoc = app.get(pageUrl).document
                 val episodes = pageDoc.select("article").mapNotNull { article ->
                     val link = article.selectFirst("h2.entry-header-title a")
                     val epUrl = link?.attr("href")?.let { fixUrl(it) } ?: return@mapNotNull null
                     val epTitle = link.text().trim()
+                    
                     val epNum = extractEpisodeNumber(epTitle)
+                    val seasonNum = extractSeasonNumber(epTitle) // Groups separated seasons into one UI container
+
                     newEpisode(epUrl) {
                         name = if (epNum != null) "Episode $epNum" else epTitle
                         episode = epNum
+                        season = seasonNum
                         posterUrl = article.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
                     }
                 }
-                allEpisodes.addAll(episodes)
-
-                val nextLink = pageDoc.selectFirst("a.next.page-numbers")?.attr("href")
-                currentUrl = if (nextLink != null && nextLink != currentUrl) fixUrl(nextLink) else ""
+                synchronized(allEpisodes) {
+                    allEpisodes.addAll(episodes)
+                }
             }
-            val sortedEpisodes = allEpisodes.sortedBy { it.episode ?: Int.MAX_VALUE }
+
+            // Sort by season value, then by chronological episode indexing
+            val sortedEpisodes = allEpisodes.distinctBy { it.url }
+                .sortedWith(compareBy<Episode> { it.season ?: 1 }.thenBy { it.episode ?: Int.MAX_VALUE })
+
             return newAnimeLoadResponse(seriesName, url, TvType.Anime) {
                 addEpisodes(DubStatus.None, sortedEpisodes)
                 posterUrl = poster
@@ -164,6 +173,16 @@ class MyAnimeLiveProvider : MainAPI() {
         return patterns.firstNotNullOfOrNull { it.find(text)?.groupValues?.get(1)?.toIntOrNull() }
     }
 
+    private fun extractSeasonNumber(text: String): Int {
+        val sMatch = Regex("""(?:season|s)\s*(\d+)""", RegexOption.IGNORE_CASE).find(text)
+        if (sMatch != null) return sMatch.groupValues[1].toIntOrNull() ?: 1
+        
+        val ordinalMatch = Regex("""(\d+)(?:st|nd|rd|th)\s*season""", RegexOption.IGNORE_CASE).find(text)
+        if (ordinalMatch != null) return ordinalMatch.groupValues[1].toIntOrNull() ?: 1
+        
+        return 1
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -171,87 +190,42 @@ class MyAnimeLiveProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val doc = app.get(data).document
-        val html = doc.html()
-        
-        // Tracking variable to prevent early exit
         var linksLoaded = false
 
-        // Helper to fix protocol-relative URLs
         fun fixUrlIfRelative(url: String): String {
             return if (url.startsWith("//")) "https:$url" else url
-        }
-
-        // Helper to use custom YouTube extractor (ARCHIVED FOR NOW)
-        suspend fun handleYoutube(rawUrl: String) {
-            val fullUrl = fixUrlIfRelative(rawUrl)
-            Log.d(TAG, "Handling YouTube URL: $fullUrl")
-            val ytExtractor = YoutubeExtractor()
-            ytExtractor.getUrl(fullUrl, null, subtitleCallback, callback)
-            linksLoaded = true // Mark as success without exiting the method
         }
 
         suspend fun handleGeneric(rawUrl: String) {
             val fullUrl = fixUrlIfRelative(rawUrl)
             val success = loadExtractor(fullUrl, data, subtitleCallback, callback)
             if (success) {
-                linksLoaded = true // Accumulate success without breaking the loop
+                linksLoaded = true
             }
         }
 
-        // 1. Process iframes (No more 'return' keywords here)
-        for (iframe in doc.select("iframe")) {
+        // Parallelize mirror iframe parsing via apmap
+        val iframes = doc.select("iframe")
+        iframes.apmap { iframe ->
             val src = iframe.attr("src")
-            if (src.isBlank()) continue
-            
-            val fixedSrc = fixUrlIfRelative(src)
-            when {
-                fixedSrc.contains("dailymotion.com") -> {
-                    val videoId = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(fixedSrc)?.groupValues?.get(1)
-                    if (videoId != null) {
-                        handleGeneric("https://www.dailymotion.com/video/$videoId")
-                    } else {
+            if (src.isNotBlank()) {
+                val fixedSrc = fixUrlIfRelative(src)
+                when {
+                    fixedSrc.contains("dailymotion.com") -> {
+                        val videoId = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(fixedSrc)?.groupValues?.get(1)
+                        handleGeneric(videoId?.let { "https://www.dailymotion.com/video/$it" } ?: fixedSrc)
+                    }
+                    fixedSrc.contains("youtube.com/embed/") || 
+                    fixedSrc.contains("youtu.be") || 
+                    fixedSrc.contains("ok.ru") || 
+                    fixedSrc.contains("streamtape") || 
+                    fixedSrc.contains("mp4upload") -> {
                         handleGeneric(fixedSrc)
                     }
                 }
-                fixedSrc.contains("youtube.com/embed/") || fixedSrc.contains("youtu.be") -> {
-                    // ARCHIVED: Using built-in generic extractor instead of handleYoutube
-                    handleGeneric(fixedSrc)
-                }
-                fixedSrc.contains("ok.ru") -> {
-                    handleGeneric(fixedSrc)
-                }
-                fixedSrc.contains("streamtape") || fixedSrc.contains("mp4upload") -> {
-                    handleGeneric(fixedSrc)
-                }
             }
         }
 
-        // 2. Direct Dailymotion links
-        doc.selectFirst("a[href*='dailymotion.com/video/']")?.attr("href")?.let { 
-            handleGeneric(fixUrlIfRelative(it)) 
-        }
-
-        // 3. Direct YouTube links
-        doc.selectFirst("a[href*='youtube.com/watch?v=']")?.attr("href")?.let { 
-            handleGeneric(fixUrlIfRelative(it)) 
-        }
-
-        // 4. Dailymotion ID via regex
-        val dmId = Regex("""dailymotion\.com/video/([a-zA-Z0-9]+)""").find(html)?.groupValues?.get(1)
-        if (dmId != null) {
-            handleGeneric("https://www.dailymotion.com/video/$dmId")
-        }
-
-        // 5. ok.ru direct links
-        doc.selectFirst("a[href*='ok.ru/video/']")?.attr("href")?.let { 
-            handleGeneric(fixUrlIfRelative(it)) 
-        }
-
-        if (!linksLoaded) {
-            Log.d(TAG, "No supported video source found for $data")
-        }
-        
-        // Finally, return whether any sources were successfully loaded
         return linksLoaded
     }
 }
