@@ -11,7 +11,6 @@ class LuciferDonghuaPlugin : Plugin() {
         
         // 2. Register all Extractors so loadExtractor() can use them
         registerExtractorAPI(Rumble())
-        registerExtractorAPI(PlayStreamplay())
         registerExtractorAPI(VidHideCustom())
         registerExtractorAPI(VidHideProCustom())
     }
