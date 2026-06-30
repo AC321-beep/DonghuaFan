@@ -173,30 +173,21 @@ class LuciferDonghuaProvider : MainAPI() {
                         if (token != null) {
                             val embedUrl = "https://www.dailymotion.com/video/$token"
                             
-                            // Try native first, but if it fails...
                             if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
                                 anyStreamFound = true
                             } else {
-                                // NATIVE FAILED (Private ID block). Force direct API Extraction!
                                 try {
                                     val apiResponse = app.get("https://www.dailymotion.com/player/metadata/video/$token").text
-                                    val m3u8Match = Regex(""""type"\s*:\s*"application\\/x-mpegURL"\s*,\s*"url"\s*:\s*"([^"]+)"""")
-                                        .find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/") 
-                                        ?: Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""")
+                                    val m3u8Match = Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""")
                                         .find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/")
 
                                     if (m3u8Match != null) {
-                                        M3u8Helper.generateM3u8(name, m3u8Match, "https://www.dailymotion.com/").forEach { link ->
-                                            callback(
-                                                newExtractorLink(
-                                                    name,
-                                                    "Dailymotion Server",
-                                                    link.url,
-                                                    link.type,
-                                                    link.quality,
-                                                    link.isM3u8
-                                                )
-                                            )
+                                        M3u8Helper.generateM3u8(
+                                            "Dailymotion",
+                                            m3u8Match,
+                                            "https://www.dailymotion.com/"
+                                        ).forEach { link ->
+                                            callback(link)
                                         }
                                         anyStreamFound = true
                                     }
