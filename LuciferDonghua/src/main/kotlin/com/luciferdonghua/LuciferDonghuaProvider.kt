@@ -6,13 +6,11 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
-import kotlinx.coroutines.* // Required for parallel mirror processing
-
-class LuciferDonghuaProvider : MainAPI() {
+import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
     override var name = "Lucifer Donghua"
     override val hasMainPage = true
-    override var lang = "zh" // 🔴 CHANGED TO "zh"
+    override var lang = "zh" 
     override val hasQuickSearch = true
 
     private val defaultHeaders = mapOf(
@@ -87,7 +85,6 @@ class LuciferDonghuaProvider : MainAPI() {
             val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
             val epName = linkElement.selectFirst(".epl-num, .epnum")?.text()?.trim() ?: ep.text().trim()
             
-            // EPISODE FIX
             val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
 
             val cleanName = if (epName.contains("Episode", ignoreCase = true)) epName else "Episode $epName"
@@ -151,44 +148,28 @@ class LuciferDonghuaProvider : MainAPI() {
 
         suspend fun extractIframes(doc: org.jsoup.nodes.Document, refererUrl: String) {
             doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
-                
-                // 🔴 FIX 1: OK.RU FIX
-                // Prioritize 'src' to avoid capturing invisible data-src placeholder images. 
-                // Only falls back to data-src if the primary src is empty or blank.
-                var rawSrc = iframe.attr("src")
-                if (rawSrc.isBlank() || rawSrc.contains("about:blank")) {
-                    rawSrc = iframe.attr("data-src")
-                }
-                if (rawSrc.isBlank() || rawSrc.contains("about:blank")) {
-                    rawSrc = iframe.attr("data-lazy-src")
-                }
-                
-                if (rawSrc.startsWith("//")) rawSrc = "https:$rawSrc"
-                val clean = fixUrlNull(rawSrc) ?: return@forEach
+                // EXACTLY your code: No data-src priority filtering here. 
+                var src = iframe.attr("src")
+                if (src.startsWith("//")) src = "https:$src"
+                val clean = fixUrlNull(src) ?: return@forEach
                 
                 if (clean.isNotBlank() && !clean.contains("about:blank")) {
                     
-                    // --- DAILYMOTION LOGIC ---
                     if ("dailymotion" in clean) {
                         var token = Regex("""[?&]video=([^&]+)""").find(clean)?.groupValues?.get(1)
                         if (token == null) token = extractDailymotionToken(refererUrl)
-                        
                         if (token != null) {
-                            // 🔴 FIX 2: DAILYMOTION DOUBLE-URL FIX
-                            // Checks if the extracted token is already a full URL before appending
-                            val embedUrl = if (token.startsWith("http")) token else "https://www.dailymotion.com/video/$token"
-                            if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
-                                anyStreamFound = true
-                            }
+                            val embedUrl = "https://www.dailymotion.com/video/$token"
+                            loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)
+                            anyStreamFound = true
                             return@forEach 
                         }
                     }
 
-                    // --- NATIVE EXTRACTORS (OK.ru, VidHide, etc.) ---
+                    // EXACTLY your code: Passed directly to loadExtractor
                     if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
                         anyStreamFound = true
                     } else {
-                        // --- FALLBACK SCRAPER ---
                         try {
                             val iframeHtml = app.get(clean, headers = mapOf("Referer" to refererUrl)).text
                             val rawStreamRegex = Regex("""["'](https?[^"']+\.(?:m3u8|mp4)[^"']*)["']""")
@@ -207,30 +188,20 @@ class LuciferDonghuaProvider : MainAPI() {
             }
         }
 
-        // 1️⃣ Fetch the primary episode page
         val baseDocument = try { app.get(data, headers = defaultHeaders).document } catch(e: Exception) { return@coroutineScope false }
         extractIframes(baseDocument, data)
 
-        // 2️⃣ Collect all Mirror URLs from the dropdown
         val mirrorUrls = baseDocument.select("select.mirror option").mapNotNull { option ->
             val url = option.attr("value")
             if (url.startsWith("http") && url != data) url else null
         }.distinct()
 
-        // 3️⃣ Visit each mirror URL in the background to prevent timeouts
+        // 🔴 FIX: No redirect URL intercepting. It fetches the document and passes it EXACTLY as your code originally did.
         mirrorUrls.map { mirrorUrl ->
             async {
                 try {
-                    val resp = app.get(mirrorUrl, headers = defaultHeaders)
-                    val destUrl = resp.url
-                    
-                    if (destUrl != mirrorUrl && !destUrl.contains("luciferdonghua.in")) {
-                        if (loadExtractor(destUrl, data, subtitleCallback, callback)) {
-                            anyStreamFound = true
-                        }
-                    } else {
-                        extractIframes(resp.document, mirrorUrl)
-                    }
+                    val mirrorDoc = app.get(mirrorUrl, headers = defaultHeaders).document
+                    extractIframes(mirrorDoc, mirrorUrl)
                 } catch (e: Exception) {}
             }
         }.awaitAll()
