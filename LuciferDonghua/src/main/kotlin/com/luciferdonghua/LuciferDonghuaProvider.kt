@@ -6,9 +6,7 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
-import kotlinx.coroutines.* 
-
-class LuciferDonghuaProvider : MainAPI() {
+import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
     override var name = "Lucifer Donghua"
     override val hasMainPage = true
@@ -100,7 +98,6 @@ class LuciferDonghuaProvider : MainAPI() {
                 epNum = Regex("""\d+""").find(rawName)?.value?.toIntOrNull()
             }
 
-            // 🔴 DYNAMIC NORMALIZER: Fixes the 1117 -> 117 typo  
             if (epNum != null && epNum in 1000..1999) {
                 epNum -= 1000
             }
@@ -165,9 +162,11 @@ class LuciferDonghuaProvider : MainAPI() {
                              ?: element.attr("data-lazy-src").takeIf { it.isNotBlank() } 
                              ?: ""
                 }
-                if (rawSrc.startsWith("//")) rawSrc = "https:$rawSrc"
-                if (rawSrc.isNotBlank() && !rawSrc.contains("about:blank")) {
-                    urlsToProcess.add(rawSrc)
+                
+                // 🔴 FIX: Restored fixUrlNull to catch relative/proxy iframe links (like Rumble)
+                val cleanUrl = fixUrlNull(rawSrc)
+                if (!cleanUrl.isNullOrBlank() && !cleanUrl.contains("about:blank")) {
+                    urlsToProcess.add(cleanUrl)
                 }
             }
 
@@ -181,10 +180,14 @@ class LuciferDonghuaProvider : MainAPI() {
                     rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
                     rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
                 }
-                if (rawUrl.isNotBlank()) urlsToProcess.add(rawUrl)
+                
+                // 🔴 FIX: Also fixUrlNull here just in case JSON returns relative paths
+                val cleanJsonUrl = fixUrlNull(rawUrl)
+                if (!cleanJsonUrl.isNullOrBlank()) urlsToProcess.add(cleanJsonUrl)
             }
 
-            urlsToProcess.filter { it.startsWith("http") }.forEach { clean ->
+            // 🔴 FIX: Removed the aggressive `.filter { it.startsWith("http") }` that was deleting valid links
+            urlsToProcess.forEach { clean ->
                 
                 if (clean.contains("yurn.online", ignoreCase = true) || clean.contains("vidhide", ignoreCase = true)) {
                     val vidhideUrl = clean.replace(Regex("""(yurn\.online|vidhide[a-z0-9A-Z]*\.[a-z]+)"""), "vidhidepro.com")
@@ -250,6 +253,7 @@ class LuciferDonghuaProvider : MainAPI() {
                     return@forEach
                 }
 
+                // If it's Rumble (or anything else), it will cleanly fall through to here now!
                 if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
                     anyStreamFound = true
                 }
