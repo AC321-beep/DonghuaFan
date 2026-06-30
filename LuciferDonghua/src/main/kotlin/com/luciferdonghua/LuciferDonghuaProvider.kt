@@ -82,7 +82,7 @@ class LuciferDonghuaProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
 
-        // 🟢 Reverted back to the original layout selector logic
+        // Using original stable list layout parser
         document.select(".eplister ul li, #episode_list li, .listeps ul li").forEach { ep ->
             val linkElement = ep.selectFirst("a") ?: return@forEach
             val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
@@ -122,20 +122,32 @@ class LuciferDonghuaProvider : MainAPI() {
         var anyStreamFound = false
 
         suspend fun extractVideoLinks(html: String, refererUrl: String) {
-            val doc = Jsoup.parse(html)
-            val urlsToProcess = mutableListOf<String>()
+            val urlsToProcess = mutableSetOf<String>()
 
-            doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
-                var rawSrc = iframe.attr("src")
+            // 🔴 1. GLOBAL DAILYMOTION SCANNER
+            // Plucks the Video ID out of the raw HTML text entirely, ignoring DOM structures (bypasses the invisible script bug)
+            val dmRegex = Regex("""dailymotion\.com/(?:embed/video/|video/|[^"']+\?video=)([a-zA-Z0-9]+)""")
+            dmRegex.findAll(html).forEach { match ->
+                val token = match.groupValues[1]
+                urlsToProcess.add("https://www.dailymotion.com/video/$token")
+            }
+
+            // 2. Standard Iframe & Script Scanner
+            val doc = Jsoup.parse(html)
+            doc.select("iframe, .player-embed script, #pembed script, .playcon script").forEach { element ->
+                var rawSrc = element.attr("src")
                 if (rawSrc.isBlank() || rawSrc == "about:blank" || rawSrc.contains("data:image")) {
-                    rawSrc = iframe.attr("data-src").takeIf { it.isNotBlank() } 
-                             ?: iframe.attr("data-lazy-src").takeIf { it.isNotBlank() } 
+                    rawSrc = element.attr("data-src").takeIf { it.isNotBlank() } 
+                             ?: element.attr("data-lazy-src").takeIf { it.isNotBlank() } 
                              ?: ""
                 }
                 if (rawSrc.startsWith("//")) rawSrc = "https:$rawSrc"
-                fixUrlNull(rawSrc)?.let { urlsToProcess.add(it) }
+                if (rawSrc.isNotBlank() && !rawSrc.contains("about:blank")) {
+                    urlsToProcess.add(rawSrc)
+                }
             }
 
+            // 3. Hidden player_aaaa JSON
             val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL).find(html)?.groupValues?.get(1)
             if (playerJson != null) {
                 var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
@@ -149,8 +161,10 @@ class LuciferDonghuaProvider : MainAPI() {
                 if (rawUrl.isNotBlank()) urlsToProcess.add(rawUrl)
             }
 
-            urlsToProcess.distinct().filter { it.isNotBlank() && !it.contains("about:blank") }.forEach { clean ->
+            // --- PROCESS ALL FOUND URLS ---
+            urlsToProcess.filter { it.startsWith("http") }.forEach { clean ->
                 
+                // Vidhide Alias Bypass
                 if (clean.contains("yurn.online", ignoreCase = true) || clean.contains("vidhide", ignoreCase = true)) {
                     val vidhideUrl = clean.replace(Regex("""(yurn\.online|vidhide[a-z0-9A-Z]*\.[a-z]+)"""), "vidhidepro.com")
                     if (loadExtractor(vidhideUrl, refererUrl, subtitleCallback, callback)) {
@@ -159,63 +173,67 @@ class LuciferDonghuaProvider : MainAPI() {
                     return@forEach
                 }
 
-                if ("dailymotion" in clean) {
-                    val token = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(clean)?.groupValues?.get(1)
-                    if (token != null) {
-                        var foundDm = false
-                        try {
-                            val apiResponse = app.get(
-                                "https://www.dailymotion.com/player/metadata/video/$token",
-                                headers = mapOf(
-                                    "User-Agent" to defaultHeaders["User-Agent"]!!,
-                                    "Referer" to refererUrl
-                                )
-                            ).text
-                            
-                            val m3u8Match = Regex("""(?:\"url\"|\"stream_url\")\s*:\s*\"([^\"]+\.m3u8[^\"]*)\"""")
-                                .find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/")
+                // Dailymotion Direct API Extraction
+                if ("dailymotion.com/video/" in clean) {
+                    val token = clean.substringAfterLast("/")
+                    var foundDm = false
+                    try {
+                        val apiResponse = app.get(
+                            "https://www.dailymotion.com/player/metadata/video/$token",
+                            headers = mapOf("Referer" to "https://www.dailymotion.com/")
+                        ).text
+                        
+                        val m3u8Match = Regex(""""type"\s*:\s*"application\\?/x-mpegURL"[^}]+"url"\s*:\s*"([^"]+)"""")
+                            .find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/")
+                            ?: Regex("""(?:\"url\"|\"stream_url\")\s*:\s*\"([^\"]+\.m3u8[^\"]*)\"""")
+                            .find(apiResponse)?.groupValues?.get(1)?.replace("\\/", "/")
 
-                            if (m3u8Match != null) {
-                                M3u8Helper.generateM3u8("Dailymotion", m3u8Match, "https://www.dailymotion.com/").forEach { link ->
-                                    callback(link)
-                                    foundDm = true
-                                    anyStreamFound = true
-                                }
-                            }
-                        } catch (e: Exception) {}
-
-                        if (!foundDm) {
-                            val embedUrl = "https://www.dailymotion.com/video/$token"
-                            if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
+                        if (m3u8Match != null) {
+                            M3u8Helper.generateM3u8("Dailymotion", m3u8Match, "https://www.dailymotion.com/").forEach { link ->
+                                callback(link)
+                                foundDm = true
                                 anyStreamFound = true
                             }
                         }
-                        return@forEach 
+                    } catch (e: Exception) {}
+
+                    if (!foundDm) {
+                        if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
+                            anyStreamFound = true
+                        }
                     }
+                    return@forEach 
                 }
 
+                // OK.RU Regex Fix
                 var okruUrl = clean
                 if (okruUrl.contains("ok.ru", ignoreCase = true)) {
                     okruUrl = okruUrl.substringBefore("?")
                     okruUrl = okruUrl.replace("videoembed", "video")
+                    
+                    if (loadExtractor(okruUrl, refererUrl, subtitleCallback, callback)) {
+                        anyStreamFound = true
+                    } else {
+                        try {
+                            val iframeHtml = app.get(okruUrl, headers = mapOf("Referer" to refererUrl), timeout = 15000).text
+                            val rawStreamRegex = Regex("""["'](https?[^"']+\.(?:m3u8|mp4)[^"']*)["']""")
+                            rawStreamRegex.findAll(iframeHtml).forEach { match ->
+                                val cleanStreamUrl = match.groupValues[1].replace("\\/", "/")
+                                callback(
+                                    newExtractorLink(name, "Fallback Server", cleanStreamUrl, INFER_TYPE) {
+                                        this.referer = okruUrl
+                                    }
+                                )
+                                anyStreamFound = true
+                            }
+                        } catch (e: Exception) {}
+                    }
+                    return@forEach
                 }
 
-                if (loadExtractor(okruUrl, refererUrl, subtitleCallback, callback)) {
+                // Standard Default Extractor Fallback
+                if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
                     anyStreamFound = true
-                } else {
-                    try {
-                        val iframeHtml = app.get(okruUrl, headers = mapOf("Referer" to refererUrl), timeout = 15000).text
-                        val rawStreamRegex = Regex("""["'](https?[^"']+\.(?:m3u8|mp4)[^"']*)["']""")
-                        rawStreamRegex.findAll(iframeHtml).forEach { match ->
-                            val cleanStreamUrl = match.groupValues[1].replace("\\/", "/")
-                            callback(
-                                newExtractorLink(name, "Fallback Server", cleanStreamUrl, INFER_TYPE) {
-                                    this.referer = okruUrl
-                                }
-                            )
-                            anyStreamFound = true
-                        }
-                    } catch (e: Exception) {}
                 }
             }
         }
