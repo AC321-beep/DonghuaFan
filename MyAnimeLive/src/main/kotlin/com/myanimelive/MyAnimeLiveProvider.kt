@@ -3,7 +3,9 @@ package com.myanimelive
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.AppUtils.apmap
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import java.net.URLEncoder
 
 class MyAnimeLiveProvider : MainAPI() {
@@ -35,11 +37,9 @@ class MyAnimeLiveProvider : MainAPI() {
             val seriesName = extractSeriesName(title)
             if (seriesName.isBlank()) return@forEach
 
-            // Optimizing string allocations by encoding immediately
             val encodedName = URLEncoder.encode(seriesName, "UTF-8")
             val seriesUrl = "$mainUrl/?s=$encodedName"
 
-            // Skip DOM extraction if we already cataloged this series in the UI
             if (!seriesMap.containsKey(seriesUrl)) {
                 val poster = article.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
                 val response = newAnimeSearchResponse(seriesName, seriesUrl, TvType.Anime)
@@ -93,9 +93,8 @@ class MyAnimeLiveProvider : MainAPI() {
             val poster = doc.selectFirst("article img")?.attr("src")?.let { fixUrl(it) }
 
             val allEpisodes = mutableListOf<Episode>()
-            
-            // Gather all available pagination index pages up front
             val pagesToFetch = mutableListOf(url)
+            
             doc.select("a.page-numbers").forEach { 
                 val href = it.attr("href")
                 if (href.isNotBlank() && !pagesToFetch.contains(href)) {
@@ -103,32 +102,38 @@ class MyAnimeLiveProvider : MainAPI() {
                 }
             }
 
-            // High performance parallel fetching of search pagination index targets via apmap
-            pagesToFetch.apmap { pageUrl ->
-                val pageDoc = app.get(pageUrl).document
-                val episodes = pageDoc.select("article").mapNotNull { article ->
-                    val link = article.selectFirst("h2.entry-header-title a")
-                    val epUrl = link?.attr("href")?.let { fixUrl(it) } ?: return@mapNotNull null
-                    val epTitle = link.text().trim()
-                    
-                    val epNum = extractEpisodeNumber(epTitle)
-                    val seasonNum = extractSeasonNumber(epTitle) // Groups separated seasons into one UI container
+            // Safe, non-blocking parallel execution using modern coroutines
+            coroutineScope {
+                pagesToFetch.map { pageUrl ->
+                    async {
+                        val pageDoc = app.get(pageUrl).document
+                        val episodes = pageDoc.select("article").mapNotNull { article ->
+                            val link = article.selectFirst("h2.entry-header-title a")
+                            val epUrl = link?.attr("href")?.let { fixUrl(it) } ?: return@mapNotNull null
+                            val epTitle = link.text().trim()
+                            
+                            val epNum = extractEpisodeNumber(epTitle)
+                            val seasonNum = extractSeasonNumber(epTitle)
 
-                    newEpisode(epUrl) {
-                        name = if (epNum != null) "Episode $epNum" else epTitle
-                        episode = epNum
-                        season = seasonNum
-                        posterUrl = article.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
+                            newEpisode(epUrl) {
+                                name = if (epNum != null) "Episode $epNum" else epTitle
+                                episode = epNum
+                                season = seasonNum
+                                posterUrl = article.selectFirst("img")?.attr("src")?.let { fixUrl(it) }
+                            }
+                        }
+                        synchronized(allEpisodes) {
+                            allEpisodes.addAll(episodes)
+                        }
                     }
-                }
-                synchronized(allEpisodes) {
-                    allEpisodes.addAll(episodes)
-                }
+                }.awaitAll()
             }
 
-            // Sort by season value, then by chronological episode indexing
-            val sortedEpisodes = allEpisodes.distinctBy { it.url }
-                .sortedWith(compareBy<Episode> { it.season ?: 1 }.thenBy { it.episode ?: Int.MAX_VALUE })
+            // Fixed: distinctBy checks the proper Episode field 'data', then passes cleanly to sorting loops
+            val uniqueEpisodes = allEpisodes.distinctBy { it.data }
+            val sortedEpisodes = uniqueEpisodes.sortedWith(
+                compareBy<Episode> { it.season ?: 1 }.thenBy { it.episode ?: Int.MAX_VALUE }
+            )
 
             return newAnimeLoadResponse(seriesName, url, TvType.Anime) {
                 addEpisodes(DubStatus.None, sortedEpisodes)
@@ -204,26 +209,29 @@ class MyAnimeLiveProvider : MainAPI() {
             }
         }
 
-        // Parallelize mirror iframe parsing via apmap
         val iframes = doc.select("iframe")
-        iframes.apmap { iframe ->
-            val src = iframe.attr("src")
-            if (src.isNotBlank()) {
-                val fixedSrc = fixUrlIfRelative(src)
-                when {
-                    fixedSrc.contains("dailymotion.com") -> {
-                        val videoId = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(fixedSrc)?.groupValues?.get(1)
-                        handleGeneric(videoId?.let { "https://www.dailymotion.com/video/$it" } ?: fixedSrc)
-                    }
-                    fixedSrc.contains("youtube.com/embed/") || 
-                    fixedSrc.contains("youtu.be") || 
-                    fixedSrc.contains("ok.ru") || 
-                    fixedSrc.contains("streamtape") || 
-                    fixedSrc.contains("mp4upload") -> {
-                        handleGeneric(fixedSrc)
+        coroutineScope {
+            iframes.map { iframe ->
+                async {
+                    val src = iframe.attr("src")
+                    if (src.isNotBlank()) {
+                        val fixedSrc = fixUrlIfRelative(src)
+                        when {
+                            fixedSrc.contains("dailymotion.com") -> {
+                                val videoId = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(fixedSrc)?.groupValues?.get(1)
+                                handleGeneric(videoId?.let { "https://www.dailymotion.com/video/$it" } ?: fixedSrc)
+                            }
+                            fixedSrc.contains("youtube.com/embed/") || 
+                            fixedSrc.contains("youtu.be") || 
+                            fixedSrc.contains("ok.ru") || 
+                            fixedSrc.contains("streamtape") || 
+                            fixedSrc.contains("mp4upload") -> {
+                                handleGeneric(fixedSrc)
+                            }
+                        }
                     }
                 }
-            }
+            }.awaitAll()
         }
 
         return linksLoaded
