@@ -87,7 +87,7 @@ class LuciferDonghuaProvider : MainAPI() {
             val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
             val epName = linkElement.selectFirst(".epl-num, .epnum")?.text()?.trim() ?: ep.text().trim()
             
-            // EPISODE FIX: Regex only grabs the first number, ignoring [4K]
+            // Regex strictly grabs the primary episode number
             val epNum = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
 
             val cleanName = if (epName.contains("Episode", ignoreCase = true)) epName else "Episode $epName"
@@ -151,6 +151,7 @@ class LuciferDonghuaProvider : MainAPI() {
 
         suspend fun extractIframes(doc: org.jsoup.nodes.Document, refererUrl: String) {
             doc.select(".player-embed iframe, #pembed iframe, .playcon iframe, iframe").forEach { iframe ->
+                
                 var src = iframe.attr("data-src").takeIf { it.isNotBlank() }
                     ?: iframe.attr("data-lazy-src").takeIf { it.isNotBlank() }
                     ?: iframe.attr("src")
@@ -160,11 +161,15 @@ class LuciferDonghuaProvider : MainAPI() {
                 
                 if (clean.isNotBlank() && !clean.contains("about:blank")) {
                     
+                    // --- DAILYMOTION FIX ---
                     if ("dailymotion" in clean) {
-                        var token = Regex("""[?&]video=([^&]+)""").find(clean)?.groupValues?.get(1)
-                        if (token == null) token = extractDailymotionToken(refererUrl)
+                        // Grab either the result of your function or use the raw iframe URL
+                        val dmSource = extractDailymotionToken(refererUrl) ?: clean
+                        
+                        // Extract ONLY the token ID to prevent URL duplication bugs
+                        val token = Regex("""(?:video=|/video/|/embed/video/)([^&?"']+)""").find(dmSource)?.groupValues?.get(1)
+                        
                         if (token != null) {
-                            // DAILYMOTION FIX: Standard URL
                             val embedUrl = "https://www.dailymotion.com/video/$token"
                             if (loadExtractor(embedUrl, refererUrl, subtitleCallback, callback)) {
                                 anyStreamFound = true
@@ -173,6 +178,8 @@ class LuciferDonghuaProvider : MainAPI() {
                         }
                     }
 
+                    // --- VIDHIDE FIX ---
+                    // Passed directly to loadExtractor without domain normalization so your Custom Extractors catch them!
                     if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
                         anyStreamFound = true
                     } else {
@@ -206,7 +213,16 @@ class LuciferDonghuaProvider : MainAPI() {
             async {
                 try {
                     val resp = app.get(mirrorUrl, headers = defaultHeaders)
-                    extractIframes(resp.document, mirrorUrl)
+                    val destUrl = resp.url
+                    
+                    if (destUrl != mirrorUrl && !destUrl.contains("luciferdonghua.in")) {
+                        // Pass directly! Custom Extractors will handle Vidhidevip/Vidhide etc. natively.
+                        if (loadExtractor(destUrl, data, subtitleCallback, callback)) {
+                            anyStreamFound = true
+                        }
+                    } else {
+                        extractIframes(resp.document, mirrorUrl)
+                    }
                 } catch (e: Exception) {}
             }
         }.awaitAll()
