@@ -6,7 +6,9 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
-import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
+import kotlinx.coroutines.* 
+
+class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
     override var name = "Lucifer Donghua"
     override val hasMainPage = true
@@ -78,57 +80,105 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
         val yearText = document.selectFirst(".split span:contains(Released), .info-content span:contains(Year)")?.text()
         val year = yearText?.filter { it.isDigit() }?.toIntOrNull()
 
-        val episodes = mutableListOf<Episode>()
+        // Local function to handle episode parsing across multiple documents
+        fun extractEpisodes(doc: org.jsoup.nodes.Document, fallbackSeason: Int? = null): List<Episode> {
+            val episodes = mutableListOf<Episode>()
+            doc.select(".eplister ul li, #episode_list li, .listeps ul li, .bxcl ul li, .epcl li, .episodelist ul li").forEach { ep ->
+                val linkElement = ep.selectFirst("a") ?: return@forEach
+                val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
+                
+                val eplNum = ep.selectFirst(".epl-num, .epnum, .ts-chl-te")?.text()?.trim()
+                val eplTitle = ep.selectFirst(".epl-title, .title")?.text()?.trim() ?: ""
+                
+                val rawName = eplNum ?: linkElement.ownText().trim().takeIf { it.isNotBlank() } ?: linkElement.text().trim()
+                
+                val fullTextToSearch = "$rawName $eplTitle"
+                var seasonNum = Regex("""(?:Season|S)\s*(\d+)""", RegexOption.IGNORE_CASE)
+                    .find(fullTextToSearch)?.groupValues?.get(1)?.toIntOrNull()
 
-        document.select(".eplister ul li, #episode_list li, .listeps ul li, .bxcl ul li, .epcl li, .episodelist ul li").forEach { ep ->
-            val linkElement = ep.selectFirst("a") ?: return@forEach
-            val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
-            
-            val eplNum = ep.selectFirst(".epl-num, .epnum, .ts-chl-te")?.text()?.trim()
-            val eplTitle = ep.selectFirst(".epl-title, .title")?.text()?.trim() ?: ""
-            
-            val rawName = eplNum ?: linkElement.ownText().trim().takeIf { it.isNotBlank() } ?: linkElement.text().trim()
-            
-            val fullTextToSearch = "$rawName $eplTitle"
-            val seasonNum = Regex("""(?:Season|S)\s*(\d+)""", RegexOption.IGNORE_CASE)
-                .find(fullTextToSearch)?.groupValues?.get(1)?.toIntOrNull()
+                if (seasonNum == null) seasonNum = fallbackSeason
 
-            var epNum = Regex("""(?:Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(rawName)?.groupValues?.get(1)?.toIntOrNull()
-            if (epNum == null) {
-                epNum = Regex("""\d+""").find(rawName)?.value?.toIntOrNull()
-            }
-
-            if (epNum != null && epNum in 1000..1999) {
-                epNum -= 1000
-            }
-
-            var cleanName = if (rawName.contains("Episode", ignoreCase = true) || rawName.contains("Ep", ignoreCase = true)) {
-                rawName
-            } else {
-                "Episode ${epNum ?: rawName}"
-            }
-            
-            if (eplTitle.isNotBlank() && !cleanName.contains(eplTitle)) {
-                cleanName = "$cleanName - $eplTitle"
-            }
-
-            episodes.add(
-                newEpisode(data = epHref) {
-                    this.name = cleanName
-                    this.episode = epNum
-                    this.season = seasonNum
+                var epNum = Regex("""(?:Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(rawName)?.groupValues?.get(1)?.toIntOrNull()
+                if (epNum == null) {
+                    epNum = Regex("""\d+""").find(rawName)?.value?.toIntOrNull()
                 }
-            )
+
+                if (epNum != null && epNum in 1000..1999) {
+                    epNum -= 1000
+                }
+
+                var cleanName = if (rawName.contains("Episode", ignoreCase = true) || rawName.contains("Ep", ignoreCase = true)) {
+                    rawName
+                } else {
+                    "Episode ${epNum ?: rawName}"
+                }
+                
+                if (eplTitle.isNotBlank() && !cleanName.contains(eplTitle)) {
+                    cleanName = "$cleanName - $eplTitle"
+                }
+
+                episodes.add(
+                    newEpisode(data = epHref) {
+                        this.name = cleanName
+                        this.episode = epNum
+                        this.season = seasonNum
+                    }
+                )
+            }
+            return episodes
         }
 
-        val isDescending = (episodes.firstOrNull()?.episode ?: 0) > (episodes.lastOrNull()?.episode ?: 0)
-        val finalEpisodes = if (isDescending) episodes.reversed() else episodes
+        val allEpisodes = mutableListOf<Episode>()
+
+        // 1. Add current page episodes
+        val mainSeasonNum = Regex("""(?i)(?:Season|S)\s*(\d+)""").find(title)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+        allEpisodes.addAll(extractEpisodes(document, mainSeasonNum))
+
+        // 2. Look for external season links (Includes standard WordPress anime theme selectors)
+        val seasonUrls = document.select(".liteseasons ul li a, .season-list a, .seasons a, .series-sys a, select.season-select option, .half-nav a")
+            .mapNotNull { if (it.tagName() == "option") it.attr("value") else it.attr("href") }
+            .filter { it.startsWith("http") && it != url && !it.contains("mirror") && !it.contains("player") }
+            .distinct()
+
+        // 3. Concurrently fetch extra seasons using native Kotlin coroutines (no guessed utility functions)
+        if (seasonUrls.isNotEmpty()) {
+            val otherSeasonEpisodes = coroutineScope {
+                seasonUrls.map { seasonUrl ->
+                    async {
+                        try {
+                            val seasonDoc = app.get(seasonUrl, headers = defaultHeaders).document
+                            val seasonTitle = seasonDoc.selectFirst("h1.entry-title, .title")?.text()?.trim() ?: ""
+                            
+                            val seasonNum = Regex("""(?i)(?:Season|S)\s*(\d+)""").find(seasonTitle)?.groupValues?.get(1)?.toIntOrNull() 
+                                ?: Regex("""season[-_](\d+)""", RegexOption.IGNORE_CASE).find(seasonUrl)?.groupValues?.get(1)?.toIntOrNull()
+                            
+                            extractEpisodes(seasonDoc, seasonNum)
+                        } catch (e: Exception) {
+                            emptyList<Episode>()
+                        }
+                    }
+                }.awaitAll()
+            }
+            otherSeasonEpisodes.forEach { allEpisodes.addAll(it) }
+        }
+
+        // Clean up duplicates and ensure final sorting
+        val distinctEpisodes = allEpisodes.distinctBy { it.data }
+        val isDescending = (distinctEpisodes.firstOrNull()?.episode ?: 0) > (distinctEpisodes.lastOrNull()?.episode ?: 0)
+        val finalEpisodes = if (isDescending) distinctEpisodes.reversed() else distinctEpisodes
 
         val episodeMap = mutableMapOf(
             DubStatus.Subbed to finalEpisodes
         )
 
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
+        // Remove trailing "Season X" from the main title if we successfully grouped seasons
+        val cleanTitle = if (seasonUrls.isNotEmpty()) {
+            title.replace(Regex("""(?i)\s*(?:Season|S)\s*\d+.*"""), "").trim()
+        } else {
+            title
+        }
+
+        return newAnimeLoadResponse(cleanTitle, url, TvType.Anime) {
             this.posterUrl = poster
             this.plot = description
             this.tags = tags
@@ -163,7 +213,6 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                              ?: ""
                 }
                 
-                // 🔴 FIX: Restored fixUrlNull to catch relative/proxy iframe links (like Rumble)
                 val cleanUrl = fixUrlNull(rawSrc)
                 if (!cleanUrl.isNullOrBlank() && !cleanUrl.contains("about:blank")) {
                     urlsToProcess.add(cleanUrl)
@@ -181,12 +230,10 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                     rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
                 }
                 
-                // 🔴 FIX: Also fixUrlNull here just in case JSON returns relative paths
                 val cleanJsonUrl = fixUrlNull(rawUrl)
                 if (!cleanJsonUrl.isNullOrBlank()) urlsToProcess.add(cleanJsonUrl)
             }
 
-            // 🔴 FIX: Removed the aggressive `.filter { it.startsWith("http") }` that was deleting valid links
             urlsToProcess.forEach { clean ->
                 
                 if (clean.contains("yurn.online", ignoreCase = true) || clean.contains("vidhide", ignoreCase = true)) {
@@ -253,7 +300,6 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                     return@forEach
                 }
 
-                // If it's Rumble (or anything else), it will cleanly fall through to here now!
                 if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
                     anyStreamFound = true
                 }
