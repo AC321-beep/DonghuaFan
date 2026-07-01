@@ -69,19 +69,32 @@ class LuciferDonghuaProvider : MainAPI() {
         return newSearchResponseList(results, hasNext = results.isNotEmpty())
     }
 
+    // --- Dynamic Season Helpers ---
+    
+    // Extracts season number from variations like "Season 2", "S02", "Part 2", "Book 2", "2nd Season"
+    private fun extractSeasonNumber(text: String?): Int? {
+        if (text.isNullOrBlank()) return null
+        val match = Regex("""(?i)(?:Season|S|Part|Book)\s*(\d+)|(\d+)(?:st|nd|rd|th)\s*Season""").find(text)
+        return match?.groupValues?.get(1)?.toIntOrNull() ?: match?.groupValues?.get(2)?.toIntOrNull()
+    }
+
+    // Strips away season descriptors to get the pure base title
+    private fun getBaseTitle(text: String): String {
+        return text.replace(Regex("""(?i)\s*(?:[-–|]*\s*(?:Season|S|Part|Book)\s*\d+|(?:\d+(?:st|nd|rd|th)\s*Season)).*"""), "").trim()
+    }
+
     override suspend fun load(url: String): LoadResponse? {
         val document = app.get(url, headers = defaultHeaders).document
 
-        val title = document.selectFirst("h1.entry-title, .title")?.text()?.trim() ?: return null
+        val rawTitle = document.selectFirst("h1.entry-title, .title")?.text()?.trim() ?: return null
         val poster = fixUrlNull(document.selectFirst(".thumb img, .poster img")?.attr("src"))
         val description = document.selectFirst(".entry-content p, .synopsis p, .desc")?.text()?.trim()
         val tags = document.select(".genx a, .genres a").map { it.text() }
-        
         val yearText = document.selectFirst(".split span:contains(Released), .info-content span:contains(Year)")?.text()
         val year = yearText?.filter { it.isDigit() }?.toIntOrNull()
 
-        // Local function to handle episode parsing across multiple documents
-        fun extractEpisodes(doc: org.jsoup.nodes.Document, fallbackSeason: Int? = null): List<Episode> {
+        // Core episode extractor that adapts dynamically per-episode
+        fun extractEpisodes(doc: org.jsoup.nodes.Document, defaultSeason: Int = 1): List<Episode> {
             val episodes = mutableListOf<Episode>()
             doc.select(".eplister ul li, #episode_list li, .listeps ul li, .bxcl ul li, .epcl li, .episodelist ul li").forEach { ep ->
                 val linkElement = ep.selectFirst("a") ?: return@forEach
@@ -91,23 +104,21 @@ class LuciferDonghuaProvider : MainAPI() {
                 val eplTitle = ep.selectFirst(".epl-title, .title")?.text()?.trim() ?: ""
                 
                 val rawName = eplNum ?: linkElement.ownText().trim().takeIf { it.isNotBlank() } ?: linkElement.text().trim()
-                
                 val fullTextToSearch = "$rawName $eplTitle"
-                var seasonNum = Regex("""(?:Season|S)\s*(\d+)""", RegexOption.IGNORE_CASE)
-                    .find(fullTextToSearch)?.groupValues?.get(1)?.toIntOrNull()
+                
+                // DYNAMIC: Check if this specific episode string has a season identifier, otherwise fallback to page season
+                val seasonNum = extractSeasonNumber(fullTextToSearch) ?: defaultSeason
 
-                if (seasonNum == null) seasonNum = fallbackSeason
-
-                var epNum = Regex("""(?:Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(rawName)?.groupValues?.get(1)?.toIntOrNull()
+                var epNum = Regex("""(?i)(?:Episode|Ep)\s*(\d+)""").find(rawName)?.groupValues?.get(1)?.toIntOrNull()
                 if (epNum == null) {
                     epNum = Regex("""\d+""").find(rawName)?.value?.toIntOrNull()
                 }
 
                 if (epNum != null && epNum in 1000..1999) {
-                    epNum -= 1000
+                    epNum -= 1000 // Handle weird absolute numbering occasionally used
                 }
 
-                var cleanName = if (rawName.contains("Episode", ignoreCase = true) || rawName.contains("Ep", ignoreCase = true)) {
+                var cleanName = if (rawName.contains(Regex("""(?i)(Episode|Ep)"""))) {
                     rawName
                 } else {
                     "Episode ${epNum ?: rawName}"
@@ -129,30 +140,54 @@ class LuciferDonghuaProvider : MainAPI() {
         }
 
         val allEpisodes = mutableListOf<Episode>()
+        val baseTitle = getBaseTitle(rawTitle)
+        val mainSeasonNum = extractSeasonNumber(rawTitle) ?: 1
 
         // 1. Add current page episodes
-        val mainSeasonNum = Regex("""(?i)(?:Season|S)\s*(\d+)""").find(title)?.groupValues?.get(1)?.toIntOrNull() ?: 1
         allEpisodes.addAll(extractEpisodes(document, mainSeasonNum))
 
-        // 2. Look for external season links (Includes standard WordPress anime theme selectors)
-        val seasonUrls = document.select(".liteseasons ul li a, .season-list a, .seasons a, .series-sys a, select.season-select option, .half-nav a")
-            .mapNotNull { if (it.tagName() == "option") it.attr("value") else it.attr("href") }
-            .filter { it.startsWith("http") && it != url && !it.contains("mirror") && !it.contains("player") }
-            .distinct()
+        // We will store URLs to fetch here, mapped to their target season number
+        val seasonUrlsToFetch = mutableMapOf<String, Int>()
 
-        // 3. Concurrently fetch extra seasons using native Kotlin coroutines (no guessed utility functions)
-        if (seasonUrls.isNotEmpty()) {
+        // 2. Look for hardcoded HTML season links on the page (dropdowns, lists)
+        document.select(".liteseasons ul li a, .season-list a, .seasons a, .series-sys a, select.season-select option, .half-nav a").forEach { element ->
+            val sUrl = if (element.tagName() == "option") element.attr("value") else element.attr("href")
+            if (sUrl.startsWith("http") && sUrl != url && !sUrl.contains("mirror") && !sUrl.contains("player")) {
+                val sText = element.text()
+                val sNum = extractSeasonNumber(sText) ?: extractSeasonNumber(sUrl.substringAfterLast("/")) ?: 1
+                seasonUrlsToFetch[sUrl] = sNum
+            }
+        }
+
+        // 3. Simultaneously Search the site for the base title to catch unlinked pages
+        try {
+            val searchUrl = "$mainUrl/?s=${baseTitle.replace(" ", "+")}"
+            val searchDoc = app.get(searchUrl, headers = defaultHeaders).document
+            
+            searchDoc.select("article.bs").forEach { result ->
+                val resultTitle = result.selectFirst(".tt h2")?.text()?.trim() ?: return@forEach
+                val resultUrl = fixUrlNull(result.selectFirst("a[itemprop=url]")?.attr("href")) ?: return@forEach
+                
+                if (resultUrl != url && !seasonUrlsToFetch.containsKey(resultUrl)) {
+                    val resultBaseTitle = getBaseTitle(resultTitle)
+                    
+                    // Verify the search result is actually the same show (similarity check)
+                    if (resultBaseTitle.equals(baseTitle, ignoreCase = true) || resultTitle.contains(baseTitle, ignoreCase = true)) {
+                        val sNum = extractSeasonNumber(resultTitle) ?: extractSeasonNumber(resultUrl.substringAfterLast("/")) ?: 1
+                        seasonUrlsToFetch[resultUrl] = sNum
+                    }
+                }
+            }
+        } catch (e: Exception) {}
+
+        // 4. Fetch all discovered seasons concurrently
+        if (seasonUrlsToFetch.isNotEmpty()) {
             val otherSeasonEpisodes = coroutineScope {
-                seasonUrls.map { seasonUrl ->
+                seasonUrlsToFetch.map { (seasonUrl, targetSeasonNum) ->
                     async {
                         try {
                             val seasonDoc = app.get(seasonUrl, headers = defaultHeaders).document
-                            val seasonTitle = seasonDoc.selectFirst("h1.entry-title, .title")?.text()?.trim() ?: ""
-                            
-                            val seasonNum = Regex("""(?i)(?:Season|S)\s*(\d+)""").find(seasonTitle)?.groupValues?.get(1)?.toIntOrNull() 
-                                ?: Regex("""season[-_](\d+)""", RegexOption.IGNORE_CASE).find(seasonUrl)?.groupValues?.get(1)?.toIntOrNull()
-                            
-                            extractEpisodes(seasonDoc, seasonNum)
+                            extractEpisodes(seasonDoc, targetSeasonNum)
                         } catch (e: Exception) {
                             emptyList<Episode>()
                         }
@@ -162,7 +197,7 @@ class LuciferDonghuaProvider : MainAPI() {
             otherSeasonEpisodes.forEach { allEpisodes.addAll(it) }
         }
 
-        // Clean up duplicates and ensure final sorting
+        // 5. Clean up duplicates, preventing overlapping search and HTML link episodes
         val distinctEpisodes = allEpisodes.distinctBy { it.data }
         val isDescending = (distinctEpisodes.firstOrNull()?.episode ?: 0) > (distinctEpisodes.lastOrNull()?.episode ?: 0)
         val finalEpisodes = if (isDescending) distinctEpisodes.reversed() else distinctEpisodes
@@ -171,14 +206,7 @@ class LuciferDonghuaProvider : MainAPI() {
             DubStatus.Subbed to finalEpisodes
         )
 
-        // Remove trailing "Season X" from the main title if we successfully grouped seasons
-        val cleanTitle = if (seasonUrls.isNotEmpty()) {
-            title.replace(Regex("""(?i)\s*(?:Season|S)\s*\d+.*"""), "").trim()
-        } else {
-            title
-        }
-
-        return newAnimeLoadResponse(cleanTitle, url, TvType.Anime) {
+        return newAnimeLoadResponse(baseTitle, url, TvType.Anime) {
             this.posterUrl = poster
             this.plot = description
             this.tags = tags
