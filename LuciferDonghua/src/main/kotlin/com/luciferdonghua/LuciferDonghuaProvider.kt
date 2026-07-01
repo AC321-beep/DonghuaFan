@@ -69,7 +69,7 @@ class LuciferDonghuaProvider : MainAPI() {
         return newSearchResponseList(results, hasNext = results.isNotEmpty())
     }
 
-    // --- Dynamic Season Helpers (Added for Season Grouping) ---
+    // --- Dynamic Season Helpers ---
     private fun extractSeasonNumber(text: String?): Int? {
         if (text.isNullOrBlank()) return null
         val match = Regex("""(?i)(?:Season|S|Part|Book)\s*(\d+)|(\d+)(?:st|nd|rd|th)\s*Season""").find(text)
@@ -153,6 +153,8 @@ class LuciferDonghuaProvider : MainAPI() {
 
         try {
             val searchUrl = "$mainUrl/?s=${baseTitle.replace(" ", "+")}"
+            // Small delay to prevent rate-limiting the search endpoint
+            delay(300)
             val searchDoc = app.get(searchUrl, headers = defaultHeaders).document
             
             searchDoc.select("article.bs").forEach { result ->
@@ -172,9 +174,11 @@ class LuciferDonghuaProvider : MainAPI() {
 
         if (seasonUrlsToFetch.isNotEmpty()) {
             val otherSeasonEpisodes = coroutineScope {
-                seasonUrlsToFetch.map { (seasonUrl, targetSeasonNum) ->
+                seasonUrlsToFetch.entries.mapIndexed { index, (seasonUrl, targetSeasonNum) ->
                     async {
                         try {
+                            // Stagger the requests so we don't trigger DDoS protection
+                            delay(index * 300L)
                             val seasonDoc = app.get(seasonUrl, headers = defaultHeaders).document
                             extractEpisodes(seasonDoc, targetSeasonNum)
                         } catch (e: Exception) {
@@ -203,7 +207,7 @@ class LuciferDonghuaProvider : MainAPI() {
         }
     }
 
-    // --- EXACT ORIGINAL LOADLINKS PASTED FROM YOUR FIRST MESSAGE ---
+    // --- YOUR EXACT ORIGINAL EXTRACTOR CODE BELOW ---
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -298,7 +302,7 @@ class LuciferDonghuaProvider : MainAPI() {
                 var okruUrl = clean
                 if (okruUrl.contains("ok.ru", ignoreCase = true)) {
                     okruUrl = okruUrl.substringBefore("?")
-                    okruUrl = okruUrl.replace("videoembed", "video")
+                    okruUrl = okruUrl.replace("videoembed", "video") // This is your exact original line!
                     
                     if (loadExtractor(okruUrl, refererUrl, subtitleCallback, callback)) {
                         anyStreamFound = true
@@ -320,7 +324,6 @@ class LuciferDonghuaProvider : MainAPI() {
                     return@forEach
                 }
 
-                // If it's Rumble (or anything else), it will cleanly fall through to here now!
                 if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
                     anyStreamFound = true
                 }
