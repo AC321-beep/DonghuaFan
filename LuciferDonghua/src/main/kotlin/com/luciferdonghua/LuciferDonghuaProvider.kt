@@ -69,16 +69,13 @@ class LuciferDonghuaProvider : MainAPI() {
         return newSearchResponseList(results, hasNext = results.isNotEmpty())
     }
 
-    // --- Dynamic Season Helpers ---
-    
-    // Extracts season number from variations like "Season 2", "S02", "Part 2", "Book 2", "2nd Season"
+    // --- Dynamic Season Helpers (Added for Season Grouping) ---
     private fun extractSeasonNumber(text: String?): Int? {
         if (text.isNullOrBlank()) return null
         val match = Regex("""(?i)(?:Season|S|Part|Book)\s*(\d+)|(\d+)(?:st|nd|rd|th)\s*Season""").find(text)
         return match?.groupValues?.get(1)?.toIntOrNull() ?: match?.groupValues?.get(2)?.toIntOrNull()
     }
 
-    // Strips away season descriptors to get the pure base title
     private fun getBaseTitle(text: String): String {
         return text.replace(Regex("""(?i)\s*(?:[-–|]*\s*(?:Season|S|Part|Book)\s*\d+|(?:\d+(?:st|nd|rd|th)\s*Season)).*"""), "").trim()
     }
@@ -93,7 +90,6 @@ class LuciferDonghuaProvider : MainAPI() {
         val yearText = document.selectFirst(".split span:contains(Released), .info-content span:contains(Year)")?.text()
         val year = yearText?.filter { it.isDigit() }?.toIntOrNull()
 
-        // Core episode extractor that adapts dynamically per-episode
         fun extractEpisodes(doc: org.jsoup.nodes.Document, defaultSeason: Int = 1): List<Episode> {
             val episodes = mutableListOf<Episode>()
             doc.select(".eplister ul li, #episode_list li, .listeps ul li, .bxcl ul li, .epcl li, .episodelist ul li").forEach { ep ->
@@ -106,7 +102,6 @@ class LuciferDonghuaProvider : MainAPI() {
                 val rawName = eplNum ?: linkElement.ownText().trim().takeIf { it.isNotBlank() } ?: linkElement.text().trim()
                 val fullTextToSearch = "$rawName $eplTitle"
                 
-                // DYNAMIC: Check if this specific episode string has a season identifier, otherwise fallback to page season
                 val seasonNum = extractSeasonNumber(fullTextToSearch) ?: defaultSeason
 
                 var epNum = Regex("""(?i)(?:Episode|Ep)\s*(\d+)""").find(rawName)?.groupValues?.get(1)?.toIntOrNull()
@@ -115,7 +110,7 @@ class LuciferDonghuaProvider : MainAPI() {
                 }
 
                 if (epNum != null && epNum in 1000..1999) {
-                    epNum -= 1000 // Handle weird absolute numbering occasionally used
+                    epNum -= 1000 
                 }
 
                 var cleanName = if (rawName.contains(Regex("""(?i)(Episode|Ep)"""))) {
@@ -143,13 +138,10 @@ class LuciferDonghuaProvider : MainAPI() {
         val baseTitle = getBaseTitle(rawTitle)
         val mainSeasonNum = extractSeasonNumber(rawTitle) ?: 1
 
-        // 1. Add current page episodes
         allEpisodes.addAll(extractEpisodes(document, mainSeasonNum))
 
-        // We will store URLs to fetch here, mapped to their target season number
         val seasonUrlsToFetch = mutableMapOf<String, Int>()
 
-        // 2. Look for hardcoded HTML season links on the page (dropdowns, lists)
         document.select(".liteseasons ul li a, .season-list a, .seasons a, .series-sys a, select.season-select option, .half-nav a").forEach { element ->
             val sUrl = if (element.tagName() == "option") element.attr("value") else element.attr("href")
             if (sUrl.startsWith("http") && sUrl != url && !sUrl.contains("mirror") && !sUrl.contains("player")) {
@@ -159,7 +151,6 @@ class LuciferDonghuaProvider : MainAPI() {
             }
         }
 
-        // 3. Simultaneously Search the site for the base title to catch unlinked pages
         try {
             val searchUrl = "$mainUrl/?s=${baseTitle.replace(" ", "+")}"
             val searchDoc = app.get(searchUrl, headers = defaultHeaders).document
@@ -171,7 +162,6 @@ class LuciferDonghuaProvider : MainAPI() {
                 if (resultUrl != url && !seasonUrlsToFetch.containsKey(resultUrl)) {
                     val resultBaseTitle = getBaseTitle(resultTitle)
                     
-                    // Verify the search result is actually the same show (similarity check)
                     if (resultBaseTitle.equals(baseTitle, ignoreCase = true) || resultTitle.contains(baseTitle, ignoreCase = true)) {
                         val sNum = extractSeasonNumber(resultTitle) ?: extractSeasonNumber(resultUrl.substringAfterLast("/")) ?: 1
                         seasonUrlsToFetch[resultUrl] = sNum
@@ -180,7 +170,6 @@ class LuciferDonghuaProvider : MainAPI() {
             }
         } catch (e: Exception) {}
 
-        // 4. Fetch all discovered seasons concurrently
         if (seasonUrlsToFetch.isNotEmpty()) {
             val otherSeasonEpisodes = coroutineScope {
                 seasonUrlsToFetch.map { (seasonUrl, targetSeasonNum) ->
@@ -197,7 +186,6 @@ class LuciferDonghuaProvider : MainAPI() {
             otherSeasonEpisodes.forEach { allEpisodes.addAll(it) }
         }
 
-        // 5. Clean up duplicates, preventing overlapping search and HTML link episodes
         val distinctEpisodes = allEpisodes.distinctBy { it.data }
         val isDescending = (distinctEpisodes.firstOrNull()?.episode ?: 0) > (distinctEpisodes.lastOrNull()?.episode ?: 0)
         val finalEpisodes = if (isDescending) distinctEpisodes.reversed() else distinctEpisodes
@@ -215,6 +203,7 @@ class LuciferDonghuaProvider : MainAPI() {
         }
     }
 
+    // --- EXACT ORIGINAL LOADLINKS PASTED FROM YOUR FIRST MESSAGE ---
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -241,6 +230,7 @@ class LuciferDonghuaProvider : MainAPI() {
                              ?: ""
                 }
                 
+                // 🔴 FIX: Restored fixUrlNull to catch relative/proxy iframe links (like Rumble)
                 val cleanUrl = fixUrlNull(rawSrc)
                 if (!cleanUrl.isNullOrBlank() && !cleanUrl.contains("about:blank")) {
                     urlsToProcess.add(cleanUrl)
@@ -258,10 +248,12 @@ class LuciferDonghuaProvider : MainAPI() {
                     rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
                 }
                 
+                // 🔴 FIX: Also fixUrlNull here just in case JSON returns relative paths
                 val cleanJsonUrl = fixUrlNull(rawUrl)
                 if (!cleanJsonUrl.isNullOrBlank()) urlsToProcess.add(cleanJsonUrl)
             }
 
+            // 🔴 FIX: Removed the aggressive `.filter { it.startsWith("http") }` that was deleting valid links
             urlsToProcess.forEach { clean ->
                 
                 if (clean.contains("yurn.online", ignoreCase = true) || clean.contains("vidhide", ignoreCase = true)) {
@@ -328,6 +320,7 @@ class LuciferDonghuaProvider : MainAPI() {
                     return@forEach
                 }
 
+                // If it's Rumble (or anything else), it will cleanly fall through to here now!
                 if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
                     anyStreamFound = true
                 }
