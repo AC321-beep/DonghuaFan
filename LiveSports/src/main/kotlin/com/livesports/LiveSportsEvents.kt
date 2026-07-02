@@ -84,37 +84,29 @@ class LiveSportsEvents : MainAPI() {
         return if (info?.teamA != null && info.teamB != null && info.teamA != info.teamB) "${info.teamA} vs ${info.teamB}" else event.title
     }
 
-    // 5. The Solved Match Card Generator – UPDATED to include 'sport' parameter
+    // 5. The Solved Match Card Generator
     private fun generateMatchCardUrl(event: LiveEventData): String {
         val info = event.eventInfo
         val state = getEventState(event)
         val time = getFormattedTime(event)
         
+        // This is the core fix: Map the Enum strictly to the two boolean flags the Worker demands
         val isLive = state == EventState.LIVE
         val isEnded = state == EventState.ENDED
         
-        // Map event category to sport (used as top-left title)
-        val sport = info?.eventCat ?: when {
-            info?.eventName?.contains("Cricket", ignoreCase = true) == true -> "Cricket"
-            info?.eventName?.contains("Football", ignoreCase = true) == true -> "Football"
-            info?.eventName?.contains("Boxing", ignoreCase = true) == true -> "Boxing"
-            info?.eventName?.contains("Motorsport", ignoreCase = true) == true -> "Motorsport"
-            else -> "Match"
-        }
-        
         return buildString {
-            append("https://sportslivecard.livesportz.workers.dev/?")
-            // Use 'sport' for the category title
-            append("sport=${java.net.URLEncoder.encode(sport, "UTF-8")}")
-            // Also keep 'title' for backward compatibility (optional)
-            append("&title=${java.net.URLEncoder.encode(info?.eventName ?: event.title, "UTF-8")}")
+            append("https://live-card-png.cricify.workers.dev/?")
+            append("title=${java.net.URLEncoder.encode(info?.eventName ?: event.title, "UTF-8")}")
             append("&teamA=${java.net.URLEncoder.encode(info?.teamA ?: "Team A", "UTF-8")}")
             append("&teamB=${java.net.URLEncoder.encode(info?.teamB ?: "Team B", "UTF-8")}")
             info?.teamAFlag?.let { append("&teamAImg=$it") }
             info?.teamBFlag?.let { append("&teamBImg=$it") }
             info?.eventLogo?.let { append("&eventLogo=$it") }
+            
+            // Send exactly what the working code sends
             append("&isLive=$isLive")
             append("&isEnded=$isEnded")
+            
             if (time.isNotBlank()) {
                 append("&time=${java.net.URLEncoder.encode(time, "UTF-8")}")
             }
@@ -146,6 +138,7 @@ class LiveSportsEvents : MainAPI() {
                 else -> "📺" 
             }
             
+            // Advanced Chronological Sorting Retained
             val sortedList = list.sortedWith(Comparator { a, b ->
                 val stateA = getEventState(a)
                 val stateB = getEventState(b)
@@ -172,18 +165,16 @@ class LiveSportsEvents : MainAPI() {
                 val title = buildString {
                     if (state != EventState.UNKNOWN) append("${state.emoji} ")
                     append(baseTitle)
+                    
+                    // Display time on UI only if not live and not ended
                     if (state == EventState.UPCOMING && time.isNotBlank()) {
                         append(" • $time")
                     }
                 }
                 
-                val posterUrl = generateMatchCardUrl(event)
-                // Log the URL for debugging (optional)
-                // println("Poster URL: $posterUrl")
-                
                 val loadData = LiveEventLoadData(
                     eventId = event.id, title = baseTitle,
-                    poster = posterUrl, slug = event.slug,
+                    poster = generateMatchCardUrl(event), slug = event.slug,
                     formats = event.formats ?: emptyList(), eventInfo = event.eventInfo
                 )
                 
