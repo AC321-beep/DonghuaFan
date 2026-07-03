@@ -95,7 +95,8 @@ class LiveSportsEvents : MainAPI() {
         val isEnded = state == EventState.ENDED
         
         return buildString {
-            append("https://live-card-png.cricify.workers.dev/?")
+            // Replace:
+            append("https://sportslivecard.livesportz.workers.dev/?")
             append("title=${java.net.URLEncoder.encode(info?.eventName ?: event.title, "UTF-8")}")
             append("&teamA=${java.net.URLEncoder.encode(info?.teamA ?: "Team A", "UTF-8")}")
             append("&teamB=${java.net.URLEncoder.encode(info?.teamB ?: "Team B", "UTF-8")}")
