@@ -52,6 +52,7 @@ jobs:
           cd $GITHUB_WORKSPACE/src
           mkdir -p gradle/wrapper
           wget -q "https://raw.githubusercontent.com/recloudstream/extensions/master/gradle/wrapper/gradle-wrapper.jar" -O gradle/wrapper/gradle-wrapper.jar
+          wget -q "https://raw.githubusercontent.com/recloudstream/extensions/master/gradle/wrapper/gradle-wrapper.properties" -O gradle/wrapper/gradle-wrapper.properties
           wget -q "https://raw.githubusercontent.com/recloudstream/extensions/master/gradlew" -O gradlew
           chmod +x gradlew
           ./gradlew make makePluginsJson
