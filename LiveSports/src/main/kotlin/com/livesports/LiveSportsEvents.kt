@@ -40,8 +40,7 @@ class LiveSportsEvents : MainAPI() {
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    // 1. Centralized Enum for clear states
-    enum class EventState(val emoji: String) {
+       enum class EventState(val emoji: String) {
         LIVE("🔴"),
         UPCOMING("🔜"),
         ENDED("✅"),
@@ -71,8 +70,7 @@ class LiveSportsEvents : MainAPI() {
         }
     }
 
-    // 4. Time format matching the working code exactly (MMM dd, yyyy hh:mm a)
-    private fun getFormattedTime(event: LiveEventData): String {
+      private fun getFormattedTime(event: LiveEventData): String {
         val timeMs = parseEventDate(event.eventInfo?.startTime) ?: return ""
         return try {
             SimpleDateFormat("MMM dd, yyyy hh:mm a", Locale.US).format(Date(timeMs))
@@ -84,18 +82,15 @@ class LiveSportsEvents : MainAPI() {
         return if (info?.teamA != null && info.teamB != null && info.teamA != info.teamB) "${info.teamA} vs ${info.teamB}" else event.title
     }
 
-    // 5. The Solved Match Card Generator
-    private fun generateMatchCardUrl(event: LiveEventData): String {
+     private fun generateMatchCardUrl(event: LiveEventData): String {
         val info = event.eventInfo
         val state = getEventState(event)
         val time = getFormattedTime(event)
         
-        // This is the core fix: Map the Enum strictly to the two boolean flags the Worker demands
         val isLive = state == EventState.LIVE
         val isEnded = state == EventState.ENDED
         
         return buildString {
-            // Replace:
             append("https://sportslivecard.livesportz.workers.dev/?")
             append("title=${java.net.URLEncoder.encode(info?.eventName ?: event.title, "UTF-8")}")
             append("&teamA=${java.net.URLEncoder.encode(info?.teamA ?: "Team A", "UTF-8")}")
@@ -104,7 +99,6 @@ class LiveSportsEvents : MainAPI() {
             info?.teamBFlag?.let { append("&teamBImg=$it") }
             info?.eventLogo?.let { append("&eventLogo=$it") }
             
-            // Send exactly what the working code sends
             append("&isLive=$isLive")
             append("&isEnded=$isEnded")
             
@@ -139,7 +133,7 @@ class LiveSportsEvents : MainAPI() {
                 else -> "📺" 
             }
             
-            // Advanced Chronological Sorting Retained
+            // Advanced Chronological Sorting 
             val sortedList = list.sortedWith(Comparator { a, b ->
                 val stateA = getEventState(a)
                 val stateB = getEventState(b)
