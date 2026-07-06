@@ -101,53 +101,66 @@ class LuciferDonghuaProvider : MainAPI() {
 
             var epNum: Int? = null
 
-            // 2️⃣ Dynamic Episode Extraction (Priority Hierarchy)
-            // Priority A: Explicitly labeled "Episode X" or "Ep X"
+            // 2️⃣ Dynamic Episode Extraction
             val explicitEp = Regex("""(?:Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(fullTextToSearch)
             if (explicitEp != null) {
                 epNum = explicitEp.groupValues[1].toIntOrNull()
             }
-
-            // Priority B: Leading number in the dedicated number column (e.g., "71 [135]")
             if (epNum == null && eplNum.isNotBlank()) {
                 epNum = Regex("""^(\d+)""").find(eplNum)?.groupValues?.get(1)?.toIntOrNull()
             }
-
-            // Priority C: Bracket or Parenthesis notation [135] or (135)
             if (epNum == null) {
                 epNum = Regex("""[\[\(](\d+)[\]\)]""").find(fullTextToSearch)?.groupValues?.get(1)?.toIntOrNull()
             }
-
-            // Priority D: First raw digit that isn't the season number
             if (epNum == null) {
                 val allNumbers = Regex("""\d+""").findAll(fullTextToSearch).map { it.value.toInt() }.toList()
                 epNum = allNumbers.firstOrNull { it != seasonNum }
             }
 
-            // 3️⃣ Dynamic Typo Correction (No Hardcoding)
+            // 3️⃣ Dynamic Typo Correction
             if (epNum != null && epNum > 100) {
                 val epStr = epNum.toString()
-                val assumedSeason = seasonNum ?: 1 // Default to 1 if missing but numbers are huge
+                val assumedSeason = seasonNum ?: 1 
                 val seasonStr = assumedSeason.toString()
                 
-                // If uploader mashed Season and Episode (e.g., Season 2 + Ep 74 = "2074", strip the "2")
                 if (epStr.startsWith(seasonStr) && epStr.length > seasonStr.length) {
                     val potentialFix = epStr.removePrefix(seasonStr).toIntOrNull()
                     if (potentialFix != null && potentialFix > 0) {
                         epNum = potentialFix
                     }
-                } 
-                // Ultimate Fallback: If it's a massive number (like 1117) and we don't know the season, truncate it safely
-                else if (epNum > 1000) {
+                } else if (epNum > 1000) {
                     epNum = epNum % 1000
                 }
             }
 
-            // Fallback for episode name if it couldn't find a clean title
-            val epName = playInfoH3 ?: (if (eplTitle.isNotBlank()) eplTitle else fullTextToSearch)
+            // 4️⃣ Trim Name for Cloudstream UI to prevent duplicates
+            val rawEpName = playInfoH3 ?: (if (eplTitle.isNotBlank()) eplTitle else fullTextToSearch)
+            
+            var cleanName = rawEpName.replace(title, "", ignoreCase = true)
+                .replace(Regex("""(?i)Season\s*\d+"""), "")
+                .replace(Regex("""(?i)S\d+"""), "")
+                .replace(Regex("""(?i)Episode\s*\d+"""), "")
+                .replace(Regex("""(?i)Ep\s*\d+"""), "")
+                .replace(Regex("""(?i)Eps\s*\d+"""), "")
+                .replace(Regex("""(?i)English\s+Sub(?:title)?s?"""), "")
+                .replace(Regex("""(?i)Sub(?:title)?s?"""), "")
+                .replace(Regex("""\[4K\]|\(4K\)|4K"""), "") 
+                .trim(' ', '-', ':', '|', '_', '.', '/', '\\')
+
+            // Remove any leading standalone episode numbers to avoid "Episode 72. 72"
+            if (epNum != null) {
+                var previousName = ""
+                while (cleanName != previousName) {
+                    previousName = cleanName
+                    cleanName = cleanName.replace(Regex("""^0*$epNum\b\s*[\-\.]*\s*"""), "")
+                }
+            }
+            cleanName = cleanName.trim(' ', '-', ':', '|', '_', '.', '/', '\\')
+
+            val finalName = cleanName.takeIf { it.isNotBlank() }
 
             episodes.add(newEpisode(epHref) {
-                this.name = epName
+                this.name = finalName
                 this.episode = epNum
                 this.season = seasonNum
             })
