@@ -50,8 +50,9 @@ jobs:
           LIVESPORTS_PROVIDER_SECRET2: ${{ secrets.LIVESPORTS_PROVIDER_SECRET2 }}
         run: |
           cd $GITHUB_WORKSPACE/src
-          wget -q "https://github.com/phisher98/cloudstream-extensions-phisher/raw/master/gradle/wrapper/gradle-wrapper.jar" -O gradle/wrapper/gradle-wrapper.jar
-          wget -q "https://github.com/phisher98/cloudstream-extensions-phisher/raw/master/gradlew" -O gradlew
+          mkdir -p gradle/wrapper
+          wget -q "https://raw.githubusercontent.com/recloudstream/extensions/master/gradle/wrapper/gradle-wrapper.jar" -O gradle/wrapper/gradle-wrapper.jar
+          wget -q "https://raw.githubusercontent.com/recloudstream/extensions/master/gradlew" -O gradlew
           chmod +x gradlew
           ./gradlew make makePluginsJson
           cp **/build/*.cs3 $GITHUB_WORKSPACE/builds || true
