@@ -10,10 +10,7 @@ class LiveSportsPlugin : Plugin() {
         // Share context for the LiveSportsEvents WebView player resolver
         LiveSportsEvents.context = context
 
-        // Provider 1: Your original Live Events provider
         registerMainAPI(LiveSportsEvents())
-
-        // Provider 2: Your newly customized SportsZone provider
         registerMainAPI(SportsZoneProvider())
     }
 }
