@@ -14,7 +14,7 @@ import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
 // ==========================================
-// RUMBLE (Advanced JWPlayer & Regex Fallback)
+// RUMBLE (Modern API, JWPlayer & Regex Fallbacks)
 // ==========================================
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
@@ -35,8 +35,93 @@ class Rumble : ExtractorApi() {
         val document = response.document
 
         var found = false
+        var embedId = ""
+        var pub = ""
 
-        // 1️⃣ Try JWPlayer
+        // 0️⃣ Extract ID and Publisher Token securely (Direct URL or Raw HTML Fallback)
+        if (url.contains("rumble.com/embed/")) {
+            embedId = url.substringAfter("/embed/").substringBefore("/").substringBefore("?")
+            if (url.contains("pub=")) {
+                pub = url.substringAfter("pub=").substringBefore("&")
+            }
+        } else {
+            // Find iframe src containing rumble.com/embed/ in case raw host HTML is passed
+            val match = Regex("""rumble\.com/embed/([a-zA-Z0-9.\-_]+)[^"'>]*?(?:pub=([a-zA-Z0-9.\-_]+))?""").find(html)
+            if (match != null) {
+                embedId = match.groupValues.getOrNull(1) ?: ""
+                pub = match.groupValues.getOrNull(2) ?: ""
+            }
+        }
+
+        // 1️⃣ Try Modern Rumble API First
+        if (embedId.isNotEmpty()) {
+            val apiUrl = if (pub.isNotEmpty()) {
+                "https://rumble.com/embedJS/u3/?request=video&ver=2&v=$embedId&pub=$pub"
+            } else {
+                "https://rumble.com/embedJS/u3/?request=video&ver=2&v=$embedId"
+            }
+            
+            try {
+                val apiResponse = app.get(apiUrl, referer = referer ?: "$mainUrl/", headers = headers)
+                val json = tryParseJson<Map<String, Any>>(apiResponse.text)
+                if (json != null) {
+                    val ua = json["ua"] as? Map<*, *> ?: json["u"] as? Map<*, *>
+                    if (ua != null) {
+                        listOf("mp4", "webm", "hls").forEach { format ->
+                            val formatData = ua[format]
+                            when (formatData) {
+                                is Map<*, *> -> {
+                                    formatData.forEach { (key, value) ->
+                                        val qualityStr = key.toString()
+                                        val streamUrl = when (value) {
+                                            is String -> value
+                                            is Map<*, *> -> value["url"]?.toString()
+                                            else -> null
+                                        }
+
+                                        if (!streamUrl.isNullOrBlank()) {
+                                            if (format == "hls" || streamUrl.contains(".m3u8")) {
+                                                M3u8Helper.generateM3u8(name, streamUrl, mainUrl).forEach(callback)
+                                            } else {
+                                                callback.invoke(
+                                                    newExtractorLink(name, "$name $qualityStr", url = streamUrl, INFER_TYPE) {
+                                                        this.referer = referer ?: mainUrl
+                                                        this.quality = getQualityFromName(qualityStr)
+                                                    }
+                                                )
+                                            }
+                                            found = true
+                                        }
+                                    }
+                                }
+                                is String -> { // Direct String URL fallback
+                                    val streamUrl = formatData
+                                    if (streamUrl.isNotBlank()) {
+                                        if (format == "hls" || streamUrl.contains(".m3u8")) {
+                                            M3u8Helper.generateM3u8(name, streamUrl, mainUrl).forEach(callback)
+                                        } else {
+                                            callback.invoke(
+                                                newExtractorLink(name, name, url = streamUrl, INFER_TYPE) {
+                                                    this.referer = referer ?: mainUrl
+                                                    this.quality = Qualities.Unknown.value
+                                                }
+                                            )
+                                        }
+                                        found = true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(name, "Rumble API failed: ${e.message}")
+            }
+        }
+
+        if (found) return // Found streams with Modern API, bypass legacy extractors entirely
+
+        // 2️⃣ Try JWPlayer (Legacy configuration fallback)
         val playerScript = document.selectFirst("script:containsData(jwplayer)")?.data()
         if (playerScript != null) {
             val sourcesJson = Regex("""sources\s*:\s*(\[[\s\S]*?])""")
@@ -95,7 +180,7 @@ class Rumble : ExtractorApi() {
             }
         }
 
-        // 2️⃣ If nothing found yet, fallback to regex for m3u8/mp4
+        // 3️⃣ If nothing found yet, fallback to regex for m3u8/mp4 inside raw HTML
         if (!found) {
             val urlRegex = Regex("""https?://[^"'\s<>]+\.(?:m3u8|mp4)""")
             urlRegex.findAll(html).forEach { match ->
@@ -110,7 +195,7 @@ class Rumble : ExtractorApi() {
             }
         }
 
-        // 3️⃣ If still nothing, try the video-id fallback (if not already done)
+        // 4️⃣ Strict fallback for standard video-id formatting
         if (!found) {
             val videoId = url.substringAfter("/embed/v").substringBefore("/")
             if (videoId.isNotEmpty()) {
