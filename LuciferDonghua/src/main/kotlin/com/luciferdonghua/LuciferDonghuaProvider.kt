@@ -6,7 +6,9 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
-import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
+import kotlinx.coroutines.*
+
+class LuciferDonghuaProvider : MainAPI() {
     override var mainUrl = "https://luciferdonghua.in"
     override var name = "Lucifer Donghua"
     override val hasMainPage = true
@@ -45,10 +47,10 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        val titleElement = this.selectFirst(".tt h2")
+        val titleElement = this.selectFirst(".tt h2, .tt")
         val title = titleElement?.text()?.trim() ?: return null
-        val href = fixUrlNull(this.selectFirst("a[itemprop=url]")?.attr("href")) ?: return null
-        val posterUrl = fixUrlNull(this.selectFirst("img.ts-post-image")?.attr("src"))
+        val href = fixUrlNull(this.selectFirst("a[itemprop=url], a")?.attr("href")) ?: return null
+        val posterUrl = fixUrlNull(this.selectFirst("img.ts-post-image, img")?.attr("src"))
         val epText = this.selectFirst(".bt .epx")?.text()
         val epCount = epText?.let {
             Regex("""Ep\s*(\d+)""", RegexOption.IGNORE_CASE).find(it)?.groupValues?.get(1)?.toIntOrNull()
@@ -72,53 +74,52 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
 
         val title = document.selectFirst("h1.entry-title, .title")?.text()?.trim() ?: return null
         val poster = fixUrlNull(document.selectFirst(".thumb img, .poster img")?.attr("src"))
-        val description = document.selectFirst(".entry-content p, .synopsis p, .desc")?.text()?.trim()
-        val tags = document.select(".genx a, .genres a").map { it.text() }
+        val description = document.selectFirst(".desc, .entry-content p, .synopsis p")?.text()?.trim()
+        val tags = document.select(".genxed a, .genx a, .genres a").map { it.text() }
         
-        val yearText = document.selectFirst(".split span:contains(Released), .info-content span:contains(Year)")?.text()
-        val year = yearText?.filter { it.isDigit() }?.toIntOrNull()
+        val yearText = document.selectFirst("span.year, span.split:contains(Released), .info-content span:contains(Year)")?.text()
+        val year = Regex("""\d{4}""").find(yearText ?: "")?.value?.toIntOrNull()
 
         val episodes = mutableListOf<Episode>()
 
-        document.select(".eplister ul li, #episode_list li, .listeps ul li, .bxcl ul li, .epcl li, .episodelist ul li").forEach { ep ->
+        document.select(".episodelist ul li, .eplister ul li, #episode_list li, .bxcl ul li").forEach { ep ->
             val linkElement = ep.selectFirst("a") ?: return@forEach
             val epHref = fixUrlNull(linkElement.attr("href")) ?: return@forEach
             
+            val playInfoH3 = ep.selectFirst(".playinfo h3")?.text()?.trim()
+            val playInfoSpan = ep.selectFirst(".playinfo span")?.text()?.trim()
+            
             val eplNum = ep.selectFirst(".epl-num, .epnum, .ts-chl-te")?.text()?.trim()
-            val eplTitle = ep.selectFirst(".epl-title, .title")?.text()?.trim() ?: ""
+            val rawName = eplNum ?: linkElement.ownText().trim().makeSafe()
             
-            val rawName = eplNum ?: linkElement.ownText().trim().takeIf { it.isNotBlank() } ?: linkElement.text().trim()
+            val fullTextToSearch = playInfoH3 ?: (rawName + " " + (ep.selectFirst(".title")?.text() ?: ""))
             
-            val fullTextToSearch = "$rawName $eplTitle"
             val seasonNum = Regex("""(?:Season|S)\s*(\d+)""", RegexOption.IGNORE_CASE)
                 .find(fullTextToSearch)?.groupValues?.get(1)?.toIntOrNull()
 
-            var epNum = Regex("""(?:Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(rawName)?.groupValues?.get(1)?.toIntOrNull()
+            var epNum = Regex("""(?:Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(fullTextToSearch)?.groupValues?.get(1)?.toIntOrNull()
             if (epNum == null) {
-                epNum = Regex("""\d+""").find(rawName)?.value?.toIntOrNull()
+                epNum = Regex("""\[(\d+)\]""").find(fullTextToSearch)?.groupValues?.get(1)?.toIntOrNull()
+            }
+            if (epNum == null && playInfoSpan != null) {
+                epNum = Regex("""(?:Eps|Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(playInfoSpan)?.groupValues?.get(1)?.toIntOrNull()
+            }
+            if (epNum == null) {
+                epNum = Regex("""\d+""").find(fullTextToSearch.substringAfter("Season").substringAfter("S"))?.value?.toIntOrNull()
             }
 
+            // Uploader Typo Correction (e.g. 1117 -> 117)
             if (epNum != null && epNum in 1000..1999) {
                 epNum -= 1000
             }
 
-            var cleanName = if (rawName.contains("Episode", ignoreCase = true) || rawName.contains("Ep", ignoreCase = true)) {
-                rawName
-            } else {
-                "Episode ${epNum ?: rawName}"
-            }
-            
-            if (eplTitle.isNotBlank() && !cleanName.contains(eplTitle)) {
-                cleanName = "$cleanName - $eplTitle"
-            }
+            val epName = playInfoH3 ?: fullTextToSearch
 
-            episodes.add(
-                newEpisode(data = epHref) {
-                    this.name = cleanName
-                    this.episode = epNum
-                    this.season = seasonNum
-                }
-            )
+            episodes.add(newEpisode(epHref) {
+                this.name = epName
+                this.episode = epNum
+                this.season = seasonNum
+            })
         }
 
         val isDescending = (episodes.firstOrNull()?.episode ?: 0) > (episodes.lastOrNull()?.episode ?: 0)
@@ -155,7 +156,7 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
             }
 
             val doc = Jsoup.parse(html)
-            doc.select("iframe, .player-embed script, #pembed script, .playcon script").forEach { element ->
+            doc.select("iframe, .player-embed iframe, #pembed iframe, .video-content iframe, .playcon iframe").forEach { element ->
                 var rawSrc = element.attr("src")
                 if (rawSrc.isBlank() || rawSrc == "about:blank" || rawSrc.contains("data:image")) {
                     rawSrc = element.attr("data-src").takeIf { it.isNotBlank() } 
@@ -163,7 +164,6 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                              ?: ""
                 }
                 
-                // 🔴 FIX: Restored fixUrlNull to catch relative/proxy iframe links (like Rumble)
                 val cleanUrl = fixUrlNull(rawSrc)
                 if (!cleanUrl.isNullOrBlank() && !cleanUrl.contains("about:blank")) {
                     urlsToProcess.add(cleanUrl)
@@ -181,14 +181,11 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                     rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
                 }
                 
-                // 🔴 FIX: Also fixUrlNull here just in case JSON returns relative paths
                 val cleanJsonUrl = fixUrlNull(rawUrl)
                 if (!cleanJsonUrl.isNullOrBlank()) urlsToProcess.add(cleanJsonUrl)
             }
 
-            // 🔴 FIX: Removed the aggressive `.filter { it.startsWith("http") }` that was deleting valid links
             urlsToProcess.forEach { clean ->
-                
                 if (clean.contains("yurn.online", ignoreCase = true) || clean.contains("vidhide", ignoreCase = true)) {
                     val vidhideUrl = clean.replace(Regex("""(yurn\.online|vidhide[a-z0-9A-Z]*\.[a-z]+)"""), "vidhidepro.com")
                     if (loadExtractor(vidhideUrl, refererUrl, subtitleCallback, callback)) {
@@ -253,7 +250,6 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
                     return@forEach
                 }
 
-                // If it's Rumble (or anything else), it will cleanly fall through to here now!
                 if (loadExtractor(clean, refererUrl, subtitleCallback, callback)) {
                     anyStreamFound = true
                 }
@@ -266,9 +262,9 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
         extractVideoLinks(baseHtml, data)
 
         val mirrorUrls = baseDocument.select("select.mirror option").mapNotNull { option ->
-            val url = option.attr("value")
-            if (url.startsWith("http") && url != data) url else null
-        }.distinct()
+            val urlRaw = option.attr("value")
+            if (urlRaw.isBlank()) null else fixUrlNull(urlRaw)
+        }.filter { it != data }.distinct()
 
         mirrorUrls.mapIndexed { index, mirrorUrl ->
             async {
@@ -281,5 +277,9 @@ import kotlinx.coroutines.* class LuciferDonghuaProvider : MainAPI() {
         }.awaitAll()
 
         return@coroutineScope anyStreamFound
+    }
+
+    private fun String.makeSafe(): String {
+        return if (this.isBlank()) "0" else this
     }
 }
