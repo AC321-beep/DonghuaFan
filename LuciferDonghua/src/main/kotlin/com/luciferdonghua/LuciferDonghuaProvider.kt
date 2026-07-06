@@ -89,31 +89,62 @@ class LuciferDonghuaProvider : MainAPI() {
             val playInfoH3 = ep.selectFirst(".playinfo h3")?.text()?.trim()
             val playInfoSpan = ep.selectFirst(".playinfo span")?.text()?.trim()
             
-            val eplNum = ep.selectFirst(".epl-num, .epnum, .ts-chl-te")?.text()?.trim()
-            val rawName = eplNum ?: linkElement.ownText().trim().makeSafe()
+            val eplTitle = ep.selectFirst(".epl-title, .title")?.text()?.trim() ?: ""
+            val eplNum = ep.selectFirst(".epl-num, .epnum, .ts-chl-te")?.text()?.trim() ?: ""
             
-            val fullTextToSearch = playInfoH3 ?: (rawName + " " + (ep.selectFirst(".title")?.text() ?: ""))
+            val rawName = eplNum.takeIf { it.isNotBlank() } ?: linkElement.ownText().trim().makeSafe()
+            val fullTextToSearch = playInfoH3 ?: "$rawName $eplTitle $playInfoSpan"
             
+            // 1️⃣ Dynamic Season Extraction
             val seasonNum = Regex("""(?:Season|S)\s*(\d+)""", RegexOption.IGNORE_CASE)
                 .find(fullTextToSearch)?.groupValues?.get(1)?.toIntOrNull()
 
-            var epNum = Regex("""(?:Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(fullTextToSearch)?.groupValues?.get(1)?.toIntOrNull()
-            if (epNum == null) {
-                epNum = Regex("""\[(\d+)\]""").find(fullTextToSearch)?.groupValues?.get(1)?.toIntOrNull()
-            }
-            if (epNum == null && playInfoSpan != null) {
-                epNum = Regex("""(?:Eps|Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(playInfoSpan)?.groupValues?.get(1)?.toIntOrNull()
-            }
-            if (epNum == null) {
-                epNum = Regex("""\d+""").find(fullTextToSearch.substringAfter("Season").substringAfter("S"))?.value?.toIntOrNull()
+            var epNum: Int? = null
+
+            // 2️⃣ Dynamic Episode Extraction (Priority Hierarchy)
+            // Priority A: Explicitly labeled "Episode X" or "Ep X"
+            val explicitEp = Regex("""(?:Episode|Ep)\s*(\d+)""", RegexOption.IGNORE_CASE).find(fullTextToSearch)
+            if (explicitEp != null) {
+                epNum = explicitEp.groupValues[1].toIntOrNull()
             }
 
-            // Uploader Typo Correction (e.g. 1117 -> 117)
-            if (epNum != null && epNum in 1000..1999) {
-                epNum -= 1000
+            // Priority B: Leading number in the dedicated number column (e.g., "71 [135]")
+            if (epNum == null && eplNum.isNotBlank()) {
+                epNum = Regex("""^(\d+)""").find(eplNum)?.groupValues?.get(1)?.toIntOrNull()
             }
 
-            val epName = playInfoH3 ?: fullTextToSearch
+            // Priority C: Bracket or Parenthesis notation [135] or (135)
+            if (epNum == null) {
+                epNum = Regex("""[\[\(](\d+)[\]\)]""").find(fullTextToSearch)?.groupValues?.get(1)?.toIntOrNull()
+            }
+
+            // Priority D: First raw digit that isn't the season number
+            if (epNum == null) {
+                val allNumbers = Regex("""\d+""").findAll(fullTextToSearch).map { it.value.toInt() }.toList()
+                epNum = allNumbers.firstOrNull { it != seasonNum }
+            }
+
+            // 3️⃣ Dynamic Typo Correction (No Hardcoding)
+            if (epNum != null && epNum > 100) {
+                val epStr = epNum.toString()
+                val assumedSeason = seasonNum ?: 1 // Default to 1 if missing but numbers are huge
+                val seasonStr = assumedSeason.toString()
+                
+                // If uploader mashed Season and Episode (e.g., Season 2 + Ep 74 = "2074", strip the "2")
+                if (epStr.startsWith(seasonStr) && epStr.length > seasonStr.length) {
+                    val potentialFix = epStr.removePrefix(seasonStr).toIntOrNull()
+                    if (potentialFix != null && potentialFix > 0) {
+                        epNum = potentialFix
+                    }
+                } 
+                // Ultimate Fallback: If it's a massive number (like 1117) and we don't know the season, truncate it safely
+                else if (epNum > 1000) {
+                    epNum = epNum % 1000
+                }
+            }
+
+            // Fallback for episode name if it couldn't find a clean title
+            val epName = playInfoH3 ?: (if (eplTitle.isNotBlank()) eplTitle else fullTextToSearch)
 
             episodes.add(newEpisode(epHref) {
                 this.name = epName
