@@ -28,17 +28,20 @@ open class DonghuastreamProvider : MainAPI() {
         "special_edition" to "Special Edition" 
     )
 
- override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // --- Special Edition Logic ---
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        // --- Custom Dual-Fetch Logic for Special Edition ---
         if (request.name == "Special Edition") {
+            // 1. Fetch "movie" results
             val movieUrl = if (page == 1) "$mainUrl/?s=movie" else "$mainUrl/pagg/$page/?s=movie"
             val movieDoc = try { app.get(movieUrl, cacheTime = 0).document } catch(e: Exception) { null }
             val movieResults = movieDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
 
+            // 2. Fetch "special" results
             val specialUrl = if (page == 1) "$mainUrl/?s=special" else "$mainUrl/pagg/$page/?s=special"
             val specialDoc = try { app.get(specialUrl, cacheTime = 0).document } catch(e: Exception) { null }
             val specialResults = specialDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
 
+            // 3. Combine both lists and remove any duplicates
             val combinedResults = (movieResults + specialResults).distinctBy { it.url }
 
             return newHomePageResponse(
@@ -50,7 +53,6 @@ open class DonghuastreamProvider : MainAPI() {
                 hasNext = movieResults.isNotEmpty() || specialResults.isNotEmpty()
             )
         } 
-        
         // --- Standard Logic for Recently Updated ---
         else {
             // Page 1 uses the root homepage to bypass filter delays. Page 2+ uses infinite scroll URLs.
@@ -122,37 +124,90 @@ open class DonghuastreamProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
-        val title = document.selectFirst("h1.entry-title")?.text()?.trim().toString()
-        val href = document.selectFirst(".eplister li > a")?.attr("href") ?: ""
-        var poster = document.select("div.ime > img").attr("data-src")
+        
+        // 1. Detect if we are on a direct Episode page (missing the .eplister container)
+        val isEpisodePage = document.selectFirst(".eplister") == null
+        
+        if (isEpisodePage) {
+            // Because breadcrumb structures can vary, we use multiple fallback methods to find the Series URL.
+            // DonghuaStream stores all its series in the "/anime/" path.
+            val seriesUrl = document.select("div.ts-breadcrumb a").find { it.attr("href").contains("/anime/") }?.attr("href")
+                ?: document.select(".naveps a").find { it.attr("href").contains("/anime/") }?.attr("href")
+                ?: document.select("div.ts-breadcrumb a").lastOrNull()?.attr("href") // Usually the last clickable link is the series
+            
+            // Redirect to the Series page so the user can see all episodes
+            if (!seriesUrl.isNullOrEmpty() && seriesUrl != url) {
+                return load(seriesUrl)
+            }
+            
+            // SECONDARY FALLBACK: If redirect fails, scrape the episodes directly from the episode page!
+            val titleRaw = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
+            val title = titleRaw.substringBefore(" Episode").trim() // Clean "Title Episode 5" to "Title"
+            val poster = document.selectFirst("meta[property=og:image]")?.attr("content") ?: ""
+            
+            val epElements = document.select("div.episodelist > ul > li")
+            if (epElements.isNotEmpty()) {
+                val episodes = epElements.mapNotNull { info ->
+                    val href1 = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
+                    val episodeText = info.selectFirst("a span")?.text() ?: ""
+                    val epName = episodeText.substringAfter("-").substringBeforeLast("-").trim()
+                    val posterr = info.selectFirst("a img")?.attr("data-src") ?: ""
+                    
+                    newEpisode(href1) {
+                        this.name = epName.replace(title, "", ignoreCase = true).trim()
+                        this.episode = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
+                        this.posterUrl = posterr
+                    }
+                }.reversed()
+                
+                return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
+                    this.posterUrl = poster
+                }
+            }
+            
+            // Absolute fallback for standalone Movies
+            return newMovieLoadResponse(titleRaw, url, TvType.Movie, url) {
+                this.posterUrl = poster
+            }
+        }
+
+        // 2. STANDARD SERIES PAGE LOGIC
+        val title = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
+        var poster = document.selectFirst("div.ime > img")?.attr("data-src") ?: ""
+        if (poster.isEmpty()) {
+            poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim() ?: ""
+        }
         val description = document.selectFirst("div.entry-content")?.text()?.trim()
-        val type = document.selectFirst(".spe")?.text().toString()
-        val tvtag = if (type.contains("Movie")) TvType.Movie else TvType.TvSeries
+        val type = document.selectFirst(".spe")?.text() ?: ""
+        val tvtag = if (type.contains("Movie", ignoreCase = true)) TvType.Movie else TvType.TvSeries
 
         return if (tvtag == TvType.TvSeries) {
             val epPage = document.selectFirst(".eplister li > a")?.attr("href") ?: ""
-            val doc = app.get(epPage).document
-            val episodes = doc.select("div.episodelist > ul > li").map { info ->
-                val href1 = info.select("a").attr("href")
-                val episode = info.select("a span").text().substringAfter("-").substringBeforeLast("-")
-                val posterr = info.selectFirst("a img")?.attr("data-src") ?: ""
-                newEpisode(href1) {
-                    this.name = episode.replace(title, "", ignoreCase = true)
-                    this.episode = episode.toIntOrNull()
-                    this.posterUrl = posterr
-                }
+            
+            val episodes = if (epPage.isNotBlank()) {
+                val doc = app.get(epPage).document
+                doc.select("div.episodelist > ul > li").mapNotNull { info ->
+                    val href1 = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
+                    val episodeText = info.selectFirst("a span")?.text() ?: ""
+                    val epName = episodeText.substringAfter("-").substringBeforeLast("-").trim()
+                    val posterr = info.selectFirst("a img")?.attr("data-src") ?: ""
+                    
+                    newEpisode(href1) {
+                        this.name = epName.replace(title, "", ignoreCase = true).trim()
+                        this.episode = Regex("""\d+""").find(epName)?.value?.toIntOrNull()
+                        this.posterUrl = posterr
+                    }
+                }.reversed()
+            } else {
+                emptyList()
             }
-            if (poster.isEmpty()) {
-                poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim().toString()
-            }
-            newTvSeriesLoadResponse(title, url, TvType.Anime, episodes.reversed()) {
+            
+            newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
                 this.plot = description
             }
         } else {
-            if (poster.isEmpty()) {
-                poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim().toString()
-            }
+            val href = document.selectFirst(".eplister li > a")?.attr("href") ?: url
             newMovieLoadResponse(title, url, TvType.Movie, href) {
                 this.posterUrl = poster
                 this.plot = description
@@ -169,7 +224,7 @@ open class DonghuastreamProvider : MainAPI() {
         val doc = app.get(data, headers = defaultHeaders).document
         val options = doc.select("option[data-index]")
 
-        // ----- Helper function to extract Dailymotion token from a page (mirrors DonghuaFun logic) -----
+        // ----- Helper function to extract Dailymotion token from a page -----
         suspend fun extractDailymotionToken(pageUrl: String): String? {
             val pageHtml = try {
                 app.get(pageUrl, headers = defaultHeaders).text
@@ -218,7 +273,7 @@ open class DonghuastreamProvider : MainAPI() {
             val iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
             if (iframeUrl.isNullOrEmpty()) continue
 
-            // ----- Dailymotion branch (improved with DonghuaFun logic) -----
+            // ----- Dailymotion branch -----
             if (label.contains("dailymotion", ignoreCase = true) || "dailymotion" in iframeUrl) {
                 var token: String? = null
                 // First try to get token from the iframe URL itself
