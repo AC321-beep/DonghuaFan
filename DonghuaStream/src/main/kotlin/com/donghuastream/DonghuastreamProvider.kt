@@ -28,20 +28,17 @@ open class DonghuastreamProvider : MainAPI() {
         "special_edition" to "Special Edition" 
     )
 
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+   override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         // --- Custom Dual-Fetch Logic for Special Edition ---
         if (request.name == "Special Edition") {
-            // 1. Fetch "movie" results
             val movieUrl = if (page == 1) "$mainUrl/?s=movie" else "$mainUrl/pagg/$page/?s=movie"
-            val movieDoc = try { app.get(movieUrl).document } catch(e: Exception) { null }
+            val movieDoc = try { app.get(movieUrl, cacheTime = 0).document } catch(e: Exception) { null }
             val movieResults = movieDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
 
-            // 2. Fetch "special" results
             val specialUrl = if (page == 1) "$mainUrl/?s=special" else "$mainUrl/pagg/$page/?s=special"
-            val specialDoc = try { app.get(specialUrl).document } catch(e: Exception) { null }
+            val specialDoc = try { app.get(specialUrl, cacheTime = 0).document } catch(e: Exception) { null }
             val specialResults = specialDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
 
-            // 3. Combine both lists and remove any duplicates
             val combinedResults = (movieResults + specialResults).distinctBy { it.url }
 
             return newHomePageResponse(
@@ -55,9 +52,27 @@ open class DonghuastreamProvider : MainAPI() {
         } 
         // --- Standard Logic for Recently Updated ---
         else {
-            val url = "$mainUrl/${request.data}$page"
-            val document = app.get(url).document
-            val home = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
+            // 1. Fetch the absolute root homepage for Page 1 to ensure no missing shows.
+            // Use the filter URL for Page 2+ to maintain infinite scrolling.
+            val url = if (page == 1) {
+                "$mainUrl/"
+            } else {
+                "$mainUrl/${request.data}$page"
+            }
+
+            // 2. Keep the cache bypass headers
+            val document = app.get(
+                url,
+                headers = defaultHeaders + mapOf(
+                    "Cache-Control" to "no-cache", 
+                    "Pragma" to "no-cache"
+                ),
+                cacheTime = 0
+            ).document
+            
+            // 3. Use selectFirst to only grab the first list on the homepage (Latest Releases) 
+            // This prevents grabbing "Popular" or "Trending" widgets if they share the same CSS class.
+            val home = document.selectFirst("div.listupd")?.select("article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
             
             return newHomePageResponse(
                 list = HomePageList(
