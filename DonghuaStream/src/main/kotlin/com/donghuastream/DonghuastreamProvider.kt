@@ -66,13 +66,14 @@ open class DonghuastreamProvider : MainAPI() {
             ).document
             
             val home = if (page == 1) {
-                // FIXED: Changed .select to .selectFirst so both sides of ?: return an Element?
-                val latestContainer = document.select("div.bixbox").find { 
-                    it.select("h2, h3").text().contains("Latest", ignoreCase = true)
-                }?.selectFirst("div.listupd") ?: document.selectFirst("div.listupd") 
-                
-                latestContainer?.select("article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+                // EXACT FIX: We target the specific "latesthome" class found in the site's source HTML.
+                // We find the latesthome header, go to its parent container, and select all articles inside it.
+                document.selectFirst("div.releases.latesthome")
+                    ?.parent()
+                    ?.select("article")
+                    ?.mapNotNull { it.toSearchResult() } ?: emptyList()
             } else {
+                // Page 2 and beyond use the standard filter page structure
                 document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
             }
             
