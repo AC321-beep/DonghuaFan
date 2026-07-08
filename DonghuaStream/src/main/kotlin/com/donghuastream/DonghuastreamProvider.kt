@@ -28,8 +28,8 @@ open class DonghuastreamProvider : MainAPI() {
         "special_edition" to "Special Edition" 
     )
 
-   override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // --- Custom Dual-Fetch Logic for Special Edition ---
+  override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        // --- Special Edition Logic ---
         if (request.name == "Special Edition") {
             val movieUrl = if (page == 1) "$mainUrl/?s=movie" else "$mainUrl/pagg/$page/?s=movie"
             val movieDoc = try { app.get(movieUrl, cacheTime = 0).document } catch(e: Exception) { null }
@@ -50,17 +50,12 @@ open class DonghuastreamProvider : MainAPI() {
                 hasNext = movieResults.isNotEmpty() || specialResults.isNotEmpty()
             )
         } 
+        
         // --- Standard Logic for Recently Updated ---
         else {
-            // 1. Fetch the absolute root homepage for Page 1 to ensure no missing shows.
-            // Use the filter URL for Page 2+ to maintain infinite scrolling.
-            val url = if (page == 1) {
-                "$mainUrl/"
-            } else {
-                "$mainUrl/${request.data}$page"
-            }
+            // Page 1 uses the root homepage to bypass filter delays. Page 2+ uses infinite scroll URLs.
+            val url = if (page == 1) "$mainUrl/" else "$mainUrl/${request.data}$page"
 
-            // 2. Keep the cache bypass headers
             val document = app.get(
                 url,
                 headers = defaultHeaders + mapOf(
@@ -70,9 +65,17 @@ open class DonghuastreamProvider : MainAPI() {
                 cacheTime = 0
             ).document
             
-            // 3. Use selectFirst to only grab the first list on the homepage (Latest Releases) 
-            // This prevents grabbing "Popular" or "Trending" widgets if they share the same CSS class.
-            val home = document.selectFirst("div.listupd")?.select("article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+            val home = if (page == 1) {
+                // Find the specific container that contains "Latest" in its title
+                // This explicitly ignores the "Hot Series" block on the homepage
+                val latestContainer = document.select("div.bixbox").find { 
+                    it.select("h2, h3").text().contains("Latest", ignoreCase = true)
+                }?.select("div.listupd") ?: document.selectFirst("div.listupd") // Fallback
+                
+                latestContainer?.select("article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+            } else {
+                document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
+            }
             
             return newHomePageResponse(
                 list = HomePageList(
