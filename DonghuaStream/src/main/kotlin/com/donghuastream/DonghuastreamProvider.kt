@@ -28,7 +28,7 @@ open class DonghuastreamProvider : MainAPI() {
         "special_edition" to "Special Edition" 
     )
 
-  override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+ override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         // --- Special Edition Logic ---
         if (request.name == "Special Edition") {
             val movieUrl = if (page == 1) "$mainUrl/?s=movie" else "$mainUrl/pagg/$page/?s=movie"
@@ -66,11 +66,10 @@ open class DonghuastreamProvider : MainAPI() {
             ).document
             
             val home = if (page == 1) {
-                // Find the specific container that contains "Latest" in its title
-                // This explicitly ignores the "Hot Series" block on the homepage
+                // FIXED: Changed .select to .selectFirst so both sides of ?: return an Element?
                 val latestContainer = document.select("div.bixbox").find { 
                     it.select("h2, h3").text().contains("Latest", ignoreCase = true)
-                }?.select("div.listupd") ?: document.selectFirst("div.listupd") // Fallback
+                }?.selectFirst("div.listupd") ?: document.selectFirst("div.listupd") 
                 
                 latestContainer?.select("article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
             } else {
