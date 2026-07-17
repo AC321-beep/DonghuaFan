@@ -5,7 +5,12 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.fasterxml.jackson.annotation.JsonProperty
+import java.net.URLDecoder
+import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 
 class SportsZoneProvider : MainAPI() {
 
@@ -20,6 +25,9 @@ class SportsZoneProvider : MainAPI() {
 
     companion object {
         private const val EMBED_DOMAIN = "https://embedindia.st"
+        private val USER_AGENT_DESKTOP = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        private val USER_AGENT_MOBILE = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
+        private val EXCLUDED_CATEGORIES = setOf("24/7-streams", "live-tv", "channels")
     }
 
     data class FirebaseConfig(
@@ -35,10 +43,8 @@ class SportsZoneProvider : MainAPI() {
             val response = app.get("https://cloudstreampluginhelper-default-rtdb.firebaseio.com/.json").text
             val json = parseJson<FirebaseConfig>(response)
             val url = json.dami ?: json.dami_url ?: json.damiUrl ?: json.damitvUrl
-            url?.let {
-                if (it.isNotEmpty()) {
-                    mainUrl = it.removeSuffix("/")
-                }
+            url?.takeIf { it.isNotEmpty() }?.let {
+                mainUrl = it.removeSuffix("/")
             }
             isUrlLoaded = true
         } catch (e: Exception) {
@@ -48,34 +54,26 @@ class SportsZoneProvider : MainAPI() {
 
     private val apiHeaders: Map<String, String>
         get() = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "User-Agent" to USER_AGENT_DESKTOP,
             "Accept" to "application/json, text/plain, */*",
             "Referer" to "$mainUrl/",
             "Origin" to mainUrl
         )
 
-    // ANTI-BUFFERING HEADERS (Native Cache Enabled)
     private val hlsPlayHeaders: Map<String, String>
         get() = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
+            "User-Agent" to USER_AGENT_MOBILE,
             "Referer" to "$mainUrl/",
             "Origin" to mainUrl,
             "Accept" to "*/*",
-            "Connection" to "keep-alive" // Sustains connection flow across live segments without re-handshake lag
+            "Connection" to "keep-alive"
         )
 
-    // ── Data classes for API JSON structures ───────────────────────────────────
+    // ── Data classes ──────────────────────────────────────────────────────────
 
-    data class SportsZoneTvChannel(
-        @JsonProperty("id") val id: String,
-        @JsonProperty("name") val name: String
-    )
-
-    data class SportsZoneStreamedSource(
-        @JsonProperty("source") val source: String,
-        @JsonProperty("id") val id: String
-    )
-
+    data class SportsZoneTvChannel(@JsonProperty("id") val id: String, @JsonProperty("name") val name: String)
+    data class SportsZoneStreamedSource(@JsonProperty("source") val source: String, @JsonProperty("id") val id: String)
+    
     data class SportsZoneStreamVariant(
         @JsonProperty("id") val id: String,
         @JsonProperty("streamNo") val streamNo: Int,
@@ -87,40 +85,21 @@ class SportsZoneProvider : MainAPI() {
     )
 
     data class EventLoadData(
-        val title: String,
-        val url: String, 
-        val posterUrl: String?,
-        val category: String?,
-        val status: String? = null,
-        val date: Long? = null,
-        val isDaddyLive: Boolean? = null,
-        val tvChannels: List<SportsZoneTvChannel>? = null,
-        val isStreamed: Boolean? = null,
+        val title: String, val url: String, val posterUrl: String?, val category: String?,
+        val status: String? = null, val date: Long? = null, val isDaddyLive: Boolean? = null,
+        val tvChannels: List<SportsZoneTvChannel>? = null, val isStreamed: Boolean? = null,
         val streamedSources: List<SportsZoneStreamedSource>? = null
     )
 
-    data class StreamLoadData(
-        val title: String,
-        val streams: List<StreamInfo>
-    )
-
-    data class StreamInfo(
-        val name: String,
-        val url: String, 
-        val headers: Map<String, String> = emptyMap()
-    )
+    data class StreamLoadData(val title: String, val streams: List<StreamInfo>)
+    data class StreamInfo(val name: String, val url: String, val headers: Map<String, String> = emptyMap())
 
     data class SportsZoneMatch(
-        @JsonProperty("id") val id: String,
-        @JsonProperty("league") val league: String?,
-        @JsonProperty("title") val title: String,
-        @JsonProperty("category") val category: String?,
-        @JsonProperty("date") val date: Long?,
-        @JsonProperty("popular") val popular: Boolean?,
-        @JsonProperty("poster") val poster: String?,
-        @JsonProperty("status") val status: String?,
-        @JsonProperty("viewers") val viewers: Int?,
-        @JsonProperty("embedUrl") val embedUrl: String?,
+        @JsonProperty("id") val id: String, @JsonProperty("league") val league: String?,
+        @JsonProperty("title") val title: String, @JsonProperty("category") val category: String?,
+        @JsonProperty("date") val date: Long?, @JsonProperty("popular") val popular: Boolean?,
+        @JsonProperty("poster") val poster: String?, @JsonProperty("status") val status: String?,
+        @JsonProperty("viewers") val viewers: Int?, @JsonProperty("embedUrl") val embedUrl: String?,
         @JsonProperty("substreams") val substreams: List<SportsZoneSubstream>?,
         @JsonProperty("isDaddyLive") val isDaddyLive: Boolean?,
         @JsonProperty("tvChannels") val tvChannels: List<SportsZoneTvChannel>?,
@@ -129,19 +108,14 @@ class SportsZoneProvider : MainAPI() {
     )
 
     data class SportsZoneSubstream(
-        @JsonProperty("id") val id: String,
-        @JsonProperty("name") val name: String,
-        @JsonProperty("iframe") val iframe: String?,
-        @JsonProperty("locale") val locale: String?
+        @JsonProperty("id") val id: String, @JsonProperty("name") val name: String,
+        @JsonProperty("iframe") val iframe: String?, @JsonProperty("locale") val locale: String?
     )
 
     data class ExtractUrlResponse(
-        @JsonProperty("success") val success: Boolean,
-        @JsonProperty("hlsUrl") val hlsUrl: String?,
-        @JsonProperty("embedUrl") val embedUrl: String?,
-        @JsonProperty("matchId") val matchId: String?,
-        @JsonProperty("substreams") val substreams: List<SportsZoneSubstream>?,
-        @JsonProperty("error") val error: String?
+        @JsonProperty("success") val success: Boolean, @JsonProperty("hlsUrl") val hlsUrl: String?,
+        @JsonProperty("embedUrl") val embedUrl: String?, @JsonProperty("matchId") val matchId: String?,
+        @JsonProperty("substreams") val substreams: List<SportsZoneSubstream>?, @JsonProperty("error") val error: String?
     )
 
     // ── Helpers ────────────────────────────────────────────────────────────
@@ -149,97 +123,60 @@ class SportsZoneProvider : MainAPI() {
     private fun formatMatchDate(timestamp: Long?): String {
         if (timestamp == null) return "soon"
         return try {
-            val date = java.util.Date(timestamp)
-            val sdf = java.text.SimpleDateFormat("dd MMM, HH:mm", Locale.US)
-            sdf.timeZone = java.util.TimeZone.getDefault()
-            sdf.format(date)
+            val sdf = SimpleDateFormat("dd MMM, HH:mm", Locale.US).apply {
+                timeZone = TimeZone.getDefault()
+            }
+            sdf.format(Date(timestamp))
         } catch (e: Exception) {
             "soon"
         }
     }
 
-    private fun matchToSearchResponse(match: SportsZoneMatch): SearchResponse {
-        val catDisplay = match.category?.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() } ?: "Sports"
+    private fun isSportCategory(category: String?): Boolean {
+        val cat = category?.lowercase() ?: return false
+        return cat.isNotBlank() && cat !in EXCLUDED_CATEGORIES && !cat.contains("stream")
+    }
+
+    private fun SportsZoneMatch.toSearchResponse(): SearchResponse {
+        val isUpcoming = status?.lowercase() == "upcoming"
+        val dateStr = formatMatchDate(date)
+        val catDisplay = category?.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() } ?: "Sports"
         
-        // Clean Title: Sport Category | Match Title
-        val title = "$catDisplay | ${match.title}"
-        val posterUrl = match.poster ?: ""
-        
+        val displayTitle = if (isUpcoming) "$catDisplay | $title • $dateStr" else "$catDisplay | $title"
+        val safePosterUrl = poster ?: ""
+
         val loadData = EventLoadData(
-            title = title,
-            url = match.id,
-            posterUrl = posterUrl,
-            category = match.category,
-            status = match.status,
-            date = match.date,
-            isDaddyLive = match.isDaddyLive,
-            tvChannels = match.tvChannels,
-            isStreamed = match.isStreamed,
-            streamedSources = match.streamedSources
+            title = displayTitle, url = id, posterUrl = safePosterUrl, category = category,
+            status = status, date = date, isDaddyLive = isDaddyLive, tvChannels = tvChannels,
+            isStreamed = isStreamed, streamedSources = streamedSources
         )
-        return newLiveSearchResponse(title, loadData.toJson(), TvType.Live) {
-            this.posterUrl = posterUrl
+
+        return newLiveSearchResponse(displayTitle, loadData.toJson(), TvType.Live) {
+            this.posterUrl = safePosterUrl
         }
     }
 
-    private fun matchToUpcomingSearchResponse(match: SportsZoneMatch): SearchResponse {
-        val dateStr = formatMatchDate(match.date)
-        val catDisplay = match.category?.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() } ?: "Sports"
-        
-        // Clean Title: Sport Category | Match Title • Time
-        val title = "$catDisplay | ${match.title} • $dateStr"
-        val posterUrl = match.poster ?: ""
-        
-        val loadData = EventLoadData(
-            title = title,
-            url = match.id,
-            posterUrl = posterUrl,
-            category = match.category,
-            status = match.status,
-            date = match.date,
-            isDaddyLive = match.isDaddyLive,
-            tvChannels = match.tvChannels,
-            isStreamed = match.isStreamed,
-            streamedSources = match.streamedSources
-        )
-        return newLiveSearchResponse(title, loadData.toJson(), TvType.Live) {
-            this.posterUrl = posterUrl
-        }
-    }
+    private fun encodeUtf8(url: String) = URLEncoder.encode(url, "UTF-8").replace("+", "%20")
+    private fun decodeUtf8(url: String) = URLDecoder.decode(url, "UTF-8")
 
     // ── Main Page ─────────────────────────────────────────────────────────
 
-    override suspend fun getMainPage(
-        page: Int,
-        request: MainPageRequest
-    ): HomePageResponse {
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         loadFirebaseUrl()
         val lists = mutableListOf<HomePageList>()
 
         try {
             val allText = app.get("$mainUrl/papi/matches/all", headers = apiHeaders).text
-            val allMatches = parseJson<List<SportsZoneMatch>>(allText)
+            val allMatches = parseJson<List<SportsZoneMatch>>(allText).filter { isSportCategory(it.category) }
 
-            // 1. Live Matches Category
-            val liveMatches = allMatches.filter { match ->
-                val status = match.status?.lowercase() ?: ""
-                val cat = match.category?.lowercase() ?: ""
-                status == "live" && cat.isNotBlank() && cat != "24/7-streams" && cat != "live-tv" && cat != "channels" && !cat.contains("stream")
-            }
+            // Split into Upcoming and Live in a single pass
+            val (upcomingMatches, liveMatches) = allMatches.partition { it.status?.lowercase() == "upcoming" }
+
             if (liveMatches.isNotEmpty()) {
-                val items = liveMatches.map { matchToSearchResponse(it) }
-                lists.add(HomePageList("🟢 Live Sports Events", items, isHorizontalImages = true))
-            }
-
-            // 2. Upcoming Matches Category
-            val upcomingMatches = allMatches.filter { match ->
-                val status = match.status?.lowercase() ?: ""
-                val cat = match.category?.lowercase() ?: ""
-                status == "upcoming" && cat.isNotBlank() && cat != "24/7-streams" && cat != "live-tv" && cat != "channels" && !cat.contains("stream")
+                lists.add(HomePageList("🟢 Live Sports Events", liveMatches.map { it.toSearchResponse() }, isHorizontalImages = true))
             }
             if (upcomingMatches.isNotEmpty()) {
-                val items = upcomingMatches.map { matchToUpcomingSearchResponse(it) }
-                lists.add(HomePageList("📅 Upcoming Matches (Live soon)", items, isHorizontalImages = true))
+                lists.add(HomePageList("📅 Upcoming Matches (Live soon)", upcomingMatches.map { it.toSearchResponse() }, isHorizontalImages = true))
             }
         } catch (e: Exception) {
             println("SportsZone: Failed to load matches - ${e.message}")
@@ -254,19 +191,9 @@ class SportsZoneProvider : MainAPI() {
         loadFirebaseUrl()
         return try {
             val text = app.get("$mainUrl/papi/matches/all", headers = apiHeaders).text
-            val allMatches = parseJson<List<SportsZoneMatch>>(text)
-            allMatches.filter { match ->
-                val cat = match.category?.lowercase() ?: ""
-                val isSport = cat.isNotBlank() && cat != "24/7-streams" && cat != "live-tv" && cat != "channels" && !cat.contains("stream")
-                isSport && (match.title.contains(query, ignoreCase = true) ||
-                (match.league?.contains(query, ignoreCase = true) ?: false))
-            }.map { match ->
-                if (match.status == "upcoming") {
-                    matchToUpcomingSearchResponse(match)
-                } else {
-                    matchToSearchResponse(match)
-                }
-            }
+            parseJson<List<SportsZoneMatch>>(text)
+                .filter { isSportCategory(it.category) && (it.title.contains(query, true) || it.league?.contains(query, true) == true) }
+                .map { it.toSearchResponse() }
         } catch (e: Exception) {
             println("SportsZone: Search failed - ${e.message}")
             emptyList()
@@ -278,326 +205,167 @@ class SportsZoneProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         loadFirebaseUrl()
         val eventData = parseJson<EventLoadData>(url)
-        val matchId = eventData.url
-        val title = eventData.title
-        val posterUrl = eventData.posterUrl
         val isUpcoming = eventData.status == "upcoming"
         val dateStr = formatMatchDate(eventData.date)
 
-        val streamsList = mutableListOf<StreamInfo>()
-
-        // 1. Parse mapped TV channels directly if present (DaddyLive proxies)
-        if (!eventData.tvChannels.isNullOrEmpty()) {
-            eventData.tvChannels.forEach { ch ->
+        val streamsList = buildList {
+            // 1. DLHD Proxy Channels
+            eventData.tvChannels?.forEach { ch ->
                 val chName = if (isUpcoming) "${ch.name} (Upcoming)" else ch.name
-                val dlhdProxyUrl = "$mainUrl/papi/tv/dlhd/${ch.id}/playlist.m3u8"
-                streamsList.add(StreamInfo(name = chName, url = dlhdProxyUrl))
+                add(StreamInfo(name = chName, url = "$mainUrl/papi/tv/dlhd/${ch.id}/playlist.m3u8"))
             }
-        }
 
-        // 2. Query standard PPV API endpoints (Main Stream & Substreams)
-        var addedPpvStreams = false
-        try {
-            val text = app.get("$mainUrl/papi/extract-url/$matchId", headers = apiHeaders).text
-            val response = parseJson<ExtractUrlResponse>(text)
-            if (response.success) {
-                val mainStreamName = if (isUpcoming) "Upcoming - Live soon (Starts: $dateStr)" else "Main Stream"
-                streamsList.add(StreamInfo(name = mainStreamName, url = matchId))
-                addedPpvStreams = true
+            // 2. PPV API Endpoints
+            var addedPpvOrStreamed = false
+            try {
+                val response = app.get("$mainUrl/papi/extract-url/${eventData.url}", headers = apiHeaders).parsedSafe<ExtractUrlResponse>()
+                if (response?.success == true) {
+                    add(StreamInfo(name = if (isUpcoming) "Upcoming - Live soon (Starts: $dateStr)" else "Main Stream", url = eventData.url))
+                    addedPpvOrStreamed = true
 
-                // Add substreams
-                response.substreams?.forEach { sub ->
-                    val localeSuffix = if (!sub.locale.isNullOrBlank()) " (${sub.locale})" else ""
-                    val subName = if (isUpcoming) "${sub.name}$localeSuffix (Upcoming)" else "${sub.name}$localeSuffix"
-                    streamsList.add(StreamInfo(name = subName, url = sub.id))
-                }
-            }
-        } catch (e: Exception) {
-            println("SportsZone: Load failed to query extract-url - ${e.message}")
-        }
-
-        // 3. Handle streamed.pk sources
-        var addedStreamedSources = false
-        if (!eventData.streamedSources.isNullOrEmpty()) {
-            val sdMulti = eventData.streamedSources.size > 1
-            eventData.streamedSources.forEach { src ->
-                try {
-                    val streamUrl = "$mainUrl/papi/stream/${src.source}/${src.id}"
-                    val streamText = app.get(streamUrl, headers = apiHeaders).text
-                    val variants = parseJson<List<SportsZoneStreamVariant>>(streamText)
-                    variants.forEach { st ->
-                        val sn = st.streamNo
-                        val namePrefix = if (sdMulti) "${src.source.replaceFirstChar { it.uppercase() }} " else "Server "
-                        val stName = "$namePrefix$sn"
-                        
-                        val encodedId = java.net.URLEncoder.encode(src.id, "UTF-8").replace("+", "%20")
-                        val encodedFallback = st.embedUrl?.let { java.net.URLEncoder.encode(it, "UTF-8").replace("+", "%20") } ?: ""
-                        val customUrl = "streamed://${src.source}?id=$encodedId&num=$sn&fallback=$encodedFallback"
-                        
-                        streamsList.add(StreamInfo(name = stName, url = customUrl))
-                        addedStreamedSources = true
+                    response.substreams?.forEach { sub ->
+                        val localeSuffix = sub.locale?.takeIf { it.isNotBlank() }?.let { " ($it)" } ?: ""
+                        add(StreamInfo(name = "${sub.name}$localeSuffix${if (isUpcoming) " (Upcoming)" else ""}", url = sub.id))
                     }
-                } catch (e: Exception) {
-                    println("SportsZone: Failed to load streamed source - ${e.message}")
                 }
+            } catch (e: Exception) {
+                println("SportsZone: Load failed to query extract-url - ${e.message}")
+            }
+
+            // 3. Streamed.pk sources
+            eventData.streamedSources?.let { sources ->
+                val sdMulti = sources.size > 1
+                sources.forEach { src ->
+                    try {
+                        val variants = app.get("$mainUrl/papi/stream/${src.source}/${src.id}", headers = apiHeaders).parsedSafe<List<SportsZoneStreamVariant>>()
+                        variants?.forEach { st ->
+                            val namePrefix = if (sdMulti) "${src.source.replaceFirstChar { it.uppercase() }} " else "Server "
+                            val encodedFallback = st.embedUrl?.let { encodeUtf8(it) } ?: ""
+                            val customUrl = "streamed://${src.source}?id=${encodeUtf8(src.id)}&num=${st.streamNo}&fallback=$encodedFallback"
+                            
+                            add(StreamInfo(name = "$namePrefix${st.streamNo}", url = customUrl))
+                            addedPpvOrStreamed = true
+                        }
+                    } catch (e: Exception) {
+                        println("SportsZone: Failed to load streamed source - ${e.message}")
+                    }
+                }
+            }
+
+            // 4. Fallback if empty
+            if (!addedPpvOrStreamed && isEmpty()) {
+                add(StreamInfo(name = if (isUpcoming) "Upcoming - Live soon (Starts: $dateStr)" else "Main Stream", url = eventData.url))
             }
         }
 
-        // 4. Ensure we have at least one fallback stream if nothing else was loaded
-        if (!addedPpvStreams && !addedStreamedSources) {
-            val mainStreamName = if (isUpcoming) "Upcoming - Live soon (Starts: $dateStr)" else "Main Stream"
-            streamsList.add(StreamInfo(name = mainStreamName, url = matchId))
-        }
-
-        val streamData = StreamLoadData(title, streamsList)
-
-        return newLiveStreamLoadResponse(title, url, this.name) {
-            this.posterUrl = posterUrl
-            this.dataUrl = streamData.toJson()
+        return newLiveStreamLoadResponse(eventData.title, url, this.name) {
+            this.posterUrl = eventData.posterUrl
+            this.dataUrl = StreamLoadData(eventData.title, streamsList).toJson()
         }
     }
 
     // ── Load Links ────────────────────────────────────────────────────────
 
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         loadFirebaseUrl()
-        val streamData = try {
-            parseJson<StreamLoadData>(data)
-        } catch (e: Exception) {
-            println("SportsZone: loadLinks parse error — ${e.message}")
-            return false
-        }
-
+        val streamData = parseJson<StreamLoadData>(data)
         if (streamData.streams.isEmpty()) return false
 
         var foundAny = false
 
         streamData.streams.forEach { stream ->
-            try {
-                // 1. DLHD proxy streams
-                if (stream.url.contains("/papi/tv/dlhd/")) {
+            when {
+                // 1. DLHD Proxy Streams
+                stream.url.contains("/papi/tv/dlhd/") -> {
                     callback.invoke(
-                        newExtractorLink(
-                            source = this.name,
-                            name = stream.name,
-                            url = stream.url,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.headers = mapOf(
-                                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-                                "Referer" to "$mainUrl/",
-                                "Origin" to mainUrl,
-                                "Connection" to "keep-alive"
-                            )
-                        }
+                        ExtractorLink(this.name, stream.name, stream.url, "", ExtractorLinkType.M3U8, headers = hlsPlayHeaders)
                     )
                     foundAny = true
-                } 
+                }
+
                 // 2. Streamed.pk streams
-                else if (stream.url.startsWith("streamed://")) {
+                stream.url.startsWith("streamed://") -> {
                     try {
-                        val stripped = stream.url.substring("streamed://".length)
-                        val queryIndex = stripped.indexOf('?')
-                        val source = if (queryIndex != -1) stripped.substring(0, queryIndex) else stripped
-                        val queryString = if (queryIndex != -1) stripped.substring(queryIndex + 1) else ""
-                        
-                        var streamId = ""
-                        var streamNo = ""
-                        var fallbackUrl = ""
-                        
-                        if (queryString.isNotEmpty()) {
-                            val params = queryString.split('&')
-                            for (param in params) {
-                                val pair = param.split('=', limit = 2)
-                                if (pair.size == 2) {
-                                    when (pair[0]) {
-                                        "id" -> streamId = java.net.URLDecoder.decode(pair[1], "UTF-8")
-                                        "num" -> streamNo = java.net.URLDecoder.decode(pair[1], "UTF-8")
-                                        "fallback" -> fallbackUrl = java.net.URLDecoder.decode(pair[1], "UTF-8")
-                                    }
-                                }
+                        val stripped = stream.url.substringAfter("streamed://")
+                        val source = stripped.substringBefore("?")
+                        val params = stripped.substringAfter("?").split("&").associate { 
+                            it.substringBefore("=") to decodeUtf8(it.substringAfter("="))
+                        }
+
+                        val streamId = params["id"]
+                        val streamNo = params["num"]
+                        val fallbackUrl = params["fallback"] ?: ""
+
+                        if (!source.isBlank() && streamId != null && streamNo != null) {
+                            val tokenData = app.get("$mainUrl/papi/sd-token", headers = apiHeaders).parsedSafe<Map<String, Any>>()
+                            if (tokenData != null) {
+                                val token = tokenData["token"]?.toString() ?: ""
+                                val tokenPath = tokenData["token_path"]?.toString() ?: ""
+                                val expires = (tokenData["expires"] as? Number)?.toLong() ?: 0L
+
+                                val hlsUrl = "https://damitvsd.b-cdn.net/live-sd/streamed/${encodeUtf8(source)}/${encodeUtf8(streamId)}/$streamNo/playlist.m3u8?token=$token&token_path=${encodeUtf8(tokenPath)}&expires=$expires"
+
+                                callback.invoke(ExtractorLink(this.name, "${stream.name} (Direct)", hlsUrl, "", ExtractorLinkType.M3U8, headers = hlsPlayHeaders))
+                                foundAny = true
                             }
                         }
 
-                        if (source.isNotEmpty() && streamId.isNotEmpty() && streamNo.isNotEmpty()) {
-                            val playHeaders = hlsPlayHeaders
+                        if (fallbackUrl.isNotEmpty()) {
+                            foundAny = extractAndLoadEmbeds(fallbackUrl, stream.name, callback, subtitleCallback) || foundAny
+                        }
+                    } catch (e: Exception) {
+                        println("SportsZone: Failed to load streamed link - ${e.message}")
+                    }
+                }
 
-                            // Fetch sd-token
-                            val tokenResponse = app.get("$mainUrl/papi/sd-token", headers = apiHeaders).text
-                            val tokenData = parseJson<Map<String, Any>>(tokenResponse)
-                            val token = tokenData["token"] as? String ?: ""
-                            val tokenPath = tokenData["token_path"] as? String ?: ""
-                            val expires = (tokenData["expires"] as? Number)?.toLong() ?: 0L
+                // 3. Standard PPV extraction
+                else -> {
+                    try {
+                        val response = app.get("$mainUrl/papi/extract-url/${stream.url}", headers = apiHeaders).parsedSafe<ExtractUrlResponse>()
+                        if (response?.success == true) {
+                            response.hlsUrl?.takeIf { it.isNotBlank() }?.let {
+                                callback.invoke(ExtractorLink(this.name, "${stream.name} (Direct)", it, "", ExtractorLinkType.M3U8, headers = hlsPlayHeaders))
+                                foundAny = true
+                            }
 
-                            // URL encode all segments of the path
-                            val encodedSource = java.net.URLEncoder.encode(source, "UTF-8").replace("+", "%20")
-                            val encodedStreamId = java.net.URLEncoder.encode(streamId, "UTF-8").replace("+", "%20")
-                            val encodedTokenPath = java.net.URLEncoder.encode(tokenPath, "UTF-8").replace("+", "%20")
-                            
-                            val hlsUrl = "https://damitvsd.b-cdn.net/live-sd/streamed/$encodedSource/$encodedStreamId/$streamNo/playlist.m3u8?token=$token&token_path=$encodedTokenPath&expires=$expires"
-
-                            // Direct HLS Link
-                            callback.invoke(
-                                newExtractorLink(
-                                    source = this.name,
-                                    name = "${stream.name} (Direct)",
-                                    url = hlsUrl,
-                                    type = ExtractorLinkType.M3U8
-                                ) {
-                                    this.headers = playHeaders
-                                }
-                            )
-                            foundAny = true
-
-                            // Fallback extraction
-                            if (fallbackUrl.isNotEmpty()) {
-                                try {
-                                    val embedHtml = app.get(
-                                        fallbackUrl,
-                                        headers = mapOf(
-                                            "User-Agent" to "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
-                                            "Referer" to "$mainUrl/"
-                                        )
-                                    ).text
-
-                                    // Extract m3u8 matches from embed html
-                                    val m3u8Pattern = Regex("""(https?://[^\s"']+\.m3u8[^\s"']*)""")
-                                    val m3u8Matches = m3u8Pattern.findAll(embedHtml)
-                                    m3u8Matches.forEachIndexed { idx, match ->
-                                        val m3u8Url = match.value
-                                            .replace("\\u0026", "&")
-                                            .replace("\\/", "/")
-                                        callback.invoke(
-                                            newExtractorLink(
-                                                source = this.name,
-                                                name = "${stream.name} (Embed ${idx + 1})",
-                                                url = m3u8Url,
-                                                type = ExtractorLinkType.M3U8
-                                            ) {
-                                                this.headers = playHeaders
-                                            }
-                                        )
-                                        foundAny = true
-                                    }
-
-                                    // Also try built-in extractors
-                                    loadExtractor(fallbackUrl, "$mainUrl/", subtitleCallback, callback)
-                                    foundAny = true
-                                } catch (e: Exception) {
-                                    println("SportsZone: Failed to load fallback stream for ${stream.name} - ${e.message}")
-                                }
+                            response.embedUrl?.takeIf { it.isNotBlank() }?.let { embed ->
+                                foundAny = extractAndLoadEmbeds(embed, stream.name, callback, subtitleCallback) || foundAny
                             }
                         }
                     } catch (e: Exception) {
-                        println("SportsZone: Failed to load streamed link for ${stream.name} - ${e.message}")
-                    }
-                } 
-                // 3. Standard PPV extraction
-                else {
-                    val text = app.get("$mainUrl/papi/extract-url/${stream.url}", headers = apiHeaders).text
-                    val response = parseJson<ExtractUrlResponse>(text)
-                    if (response.success) {
-                        val playHeaders = hlsPlayHeaders
-
-                        // === PRIMARY: Direct HLS from BunnyCDN ===
-                        if (!response.hlsUrl.isNullOrBlank()) {
-                            callback.invoke(
-                                newExtractorLink(
-                                    source = this.name,
-                                    name = "${stream.name} (Direct)",
-                                    url = response.hlsUrl,
-                                    type = ExtractorLinkType.M3U8
-                                ) {
-                                    this.headers = playHeaders
-                                }
-                            )
-                            foundAny = true
-                        }
-
-                        // === FALLBACK: Try embed page extraction ===
-                        if (!response.embedUrl.isNullOrBlank()) {
-                            try {
-                                val embedHtml = app.get(
-                                    response.embedUrl,
-                                    headers = mapOf(
-                                        "User-Agent" to "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
-                                        "Referer" to "$mainUrl/"
-                                    )
-                                ).text
-
-                                // Try to extract any m3u8 URLs from the embed page
-                                val m3u8Pattern = Regex("""(https?://[^\s"']+\.m3u8[^\s"']*)""")
-                                val m3u8Matches = m3u8Pattern.findAll(embedHtml)
-                                m3u8Matches.forEachIndexed { idx, match ->
-                                    val m3u8Url = match.value
-                                        .replace("\\u0026", "&")
-                                        .replace("\\/", "/")
-                                    callback.invoke(
-                                        newExtractorLink(
-                                            source = this.name,
-                                            name = "${stream.name} (Embed ${idx + 1})",
-                                            url = m3u8Url,
-                                            type = ExtractorLinkType.M3U8
-                                        ) {
-                                            this.headers = playHeaders
-                                        }
-                                    )
-                                    foundAny = true
-                                }
-
-                                // Also try to find the stream URL in JavaScript variables
-                                val jsPatterns = listOf(
-                                    Regex("""['"]?(hlsUrl|streamUrl|source|file|src)['"]?\s*[:=]\s*['"]([^'"]+\.m3u8[^'"]*)['"]"""),
-                                    Regex("""setStream\(['"]([^'"]+)['"]"""),
-                                    Regex("""b-cdn\.net[^\s"']*\.m3u8[^\s"']*""")
-                                )
-                                for (pattern in jsPatterns) {
-                                    pattern.findAll(embedHtml).forEach { jsMatch ->
-                                        val extractedUrl = if (jsMatch.groups.size > 2) {
-                                            jsMatch.groups[2]?.value ?: jsMatch.value
-                                        } else {
-                                            jsMatch.value
-                                        }
-                                        if (extractedUrl.contains(".m3u8") && !m3u8Matches.any { it.value == extractedUrl }) {
-                                            val cleanUrl = if (!extractedUrl.startsWith("http")) "https://$extractedUrl" else extractedUrl
-                                            callback.invoke(
-                                                newExtractorLink(
-                                                    source = this.name,
-                                                    name = "${stream.name} (JS)",
-                                                    url = cleanUrl.replace("\\u0026", "&").replace("\\/", "/"),
-                                                    type = ExtractorLinkType.M3U8
-                                                ) {
-                                                    this.headers = playHeaders
-                                                }
-                                            )
-                                            foundAny = true
-                                        }
-                                    }
-                                }
-                            } catch (embedError: Exception) {
-                                println("SportsZone: Embed extraction failed for ${stream.name} - ${embedError.message}")
-                            }
-
-                            // Also try loading via CloudStream's built-in extractors
-                            try {
-                                loadExtractor(response.embedUrl, "$mainUrl/", subtitleCallback, callback)
-                                foundAny = true
-                            } catch (extractError: Exception) {
-                                println("SportsZone: loadExtractor failed for ${stream.name} - ${extractError.message}")
-                            }
-                        }
+                        println("SportsZone: Failed to extract PPV link - ${e.message}")
                     }
                 }
-            } catch (e: Exception) {
-                println("SportsZone: Failed to load stream link for ${stream.name} - ${e.message}")
             }
         }
-
         return foundAny
+    }
+
+    // Extracted helper for parsing embeds & executing extractors
+    private suspend fun extractAndLoadEmbeds(embedUrl: String, streamName: String, callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit): Boolean {
+        var found = false
+        try {
+            val embedHtml = app.get(embedUrl, headers = mapOf("User-Agent" to USER_AGENT_MOBILE, "Referer" to "$mainUrl/")).text
+            
+            // Regex for M3U8 inside quotes or explicit variables
+            val m3u8Matches = Regex("""(https?://[^\s"']+\.m3u8[^\s"']*)""").findAll(embedHtml).map { it.value }.toMutableSet()
+            
+            Regex("""['"]?(hlsUrl|streamUrl|source|file|src)['"]?\s*[:=]\s*['"]([^'"]+\.m3u8[^'"]*)['"]""").findAll(embedHtml).forEach {
+                m3u8Matches.add(it.groupValues[2])
+            }
+
+            m3u8Matches.forEachIndexed { idx, url ->
+                val cleanUrl = url.replace("\\u0026", "&").replace("\\/", "/").let { if (!it.startsWith("http")) "https://$it" else it }
+                callback.invoke(ExtractorLink(this.name, "$streamName (Embed ${idx + 1})", cleanUrl, "", ExtractorLinkType.M3U8, headers = hlsPlayHeaders))
+                found = true
+            }
+
+            // Fallback to internal extractors
+            loadExtractor(embedUrl, "$mainUrl/", subtitleCallback, callback)
+            found = true
+        } catch (e: Exception) {
+            println("SportsZone: Embed extraction failed - ${e.message}")
+        }
+        return found
     }
 }
