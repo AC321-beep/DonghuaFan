@@ -49,6 +49,7 @@ open class DonghuastreamProvider : MainAPI() {
                 hasNext = movieResults.isNotEmpty() || specialResults.isNotEmpty()
             )
         } else {
+            // Restored: Page 1 grabs instant updates from the main homepage, Page 2+ uses the directory
             val url = if (page == 1) "$mainUrl/" else "$mainUrl/${request.data}$page"
 
             val document = app.get(
@@ -115,13 +116,15 @@ open class DonghuastreamProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
         
-        val isEpisodePage = document.selectFirst(".eplister") == null
+        // Accurate Series vs Episode validation (.infox contains the listing meta metrics)
+        val isEpisodePage = document.selectFirst(".infox") == null
         
         if (isEpisodePage) {
             val seriesUrl = document.select("div.ts-breadcrumb a").find { it.attr("href").contains("/anime/") }?.attr("href")
                 ?: document.select(".naveps a").find { it.attr("href").contains("/anime/") }?.attr("href")
                 ?: document.select("div.ts-breadcrumb a").lastOrNull()?.attr("href") 
             
+            // Seamlessly resolves single episode lookups back into complete series objects
             if (!seriesUrl.isNullOrEmpty() && seriesUrl != url) {
                 return load(seriesUrl)
             }
@@ -130,7 +133,9 @@ open class DonghuastreamProvider : MainAPI() {
             val title = titleRaw.substringBefore(" Episode").trim() 
             val poster = document.selectFirst("meta[property=og:image]")?.attr("content") ?: ""
             
-            val epElements = document.select("div.episodelist > ul > li")
+            var epElements = document.select("div.episodelist li")
+            if (epElements.isEmpty()) epElements = document.select("div.episodelist a[href]")
+
             if (epElements.isNotEmpty()) {
                 val episodes = parseEpisodes(epElements)
                 return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
@@ -153,13 +158,9 @@ open class DonghuastreamProvider : MainAPI() {
         val tvtag = if (type.contains("Movie", ignoreCase = true)) TvType.Movie else TvType.TvSeries
 
         return if (tvtag == TvType.TvSeries) {
-            var epElements = document.select(".eplister > ul > li")
-            
+            var epElements = document.select(".eplister li, .episodelist li")
             if (epElements.isEmpty()) {
-                val epPage = document.selectFirst(".eplister li > a")?.attr("href") ?: ""
-                if (epPage.isNotBlank()) {
-                    epElements = app.get(epPage).document.select("div.episodelist > ul > li")
-                }
+                epElements = document.select(".eplister a[href], .episodelist a[href]")
             }
             
             val episodes = parseEpisodes(epElements)
@@ -169,7 +170,7 @@ open class DonghuastreamProvider : MainAPI() {
                 this.plot = description
             }
         } else {
-            val href = document.selectFirst(".eplister li > a")?.attr("href") ?: url
+            val href = document.selectFirst(".eplister a[href], .episodelist a[href]")?.attr("href") ?: url
             newMovieLoadResponse(title, url, TvType.Movie, href) {
                 this.posterUrl = poster
                 this.plot = description
@@ -179,48 +180,40 @@ open class DonghuastreamProvider : MainAPI() {
 
     private fun parseEpisodes(epElements: org.jsoup.select.Elements): List<Episode> {
         return epElements.mapNotNull { info ->
-            val aTag = info.selectFirst("a")
+            val aTag = info.selectFirst("a[href]") ?: info.takeIf { it.tagName() == "a" && it.hasAttr("href") }
             val href1 = aTag?.attr("href") ?: return@mapNotNull null
             
-            var cleanTitle = info.selectFirst(".epl-title")?.text()?.trim() ?: ""
-            if (cleanTitle.isEmpty()) cleanTitle = aTag.ownText().trim() 
-            if (cleanTitle.isEmpty()) cleanTitle = info.selectFirst(".title, .ep-title, h2, h3")?.text()?.trim() ?: ""
-            if (cleanTitle.isEmpty()) cleanTitle = aTag.text().trim()
+            var cleanTitle = info.selectFirst(".epl-title, .ep-title, .title, h2, h3")?.text()?.trim() ?: ""
+            if (cleanTitle.isEmpty()) cleanTitle = aTag.text().trim() 
+            if (cleanTitle.isEmpty()) cleanTitle = info.text().trim()
             
-            var episodeNumber: Int? = null
-            var epName = cleanTitle
+            var episodeNum: Int? = null
 
-            // Extracts just the episode number and any actual subtitle text following it. 
-            // Avoids picking up the full show title before the word "Ep"
-            val epMatch = Regex("""(?i)(?:Ep\.|Eps\.|Ep|Episode)\s*(\d+)(.*)""").find(cleanTitle)
+            val epMatch = Regex("""(?i)(?:Ep|Eps|Episode|Ep\.)\s*(\d+)""").findAll(cleanTitle).lastOrNull()
             
             if (epMatch != null) {
-                episodeNumber = epMatch.groupValues[1].toIntOrNull()
-                // Clean up any remaining junk tags left over after the episode number
-                val extraText = epMatch.groupValues[2]
-                    .replace(Regex("""(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\(4K\)|\[4K\]|\(1080p\)|\[1080p\])"""), "")
-                    .trim(' ', '-', ':', ',')
-                
-                epName = if (extraText.isNotBlank()) "Episode $episodeNumber: $extraText" else "Episode $episodeNumber"
+                episodeNum = epMatch.groupValues[1].toIntOrNull()
             } else {
-                // Fallback if "Ep" is completely missing from the text
-                episodeNumber = Regex("""\d+""").findAll(cleanTitle).map { it.value }.toList().firstOrNull { num ->
-                    val isResolution = (num == "4" && cleanTitle.contains("4K", true)) || 
-                                       (num == "1080" && cleanTitle.contains("1080", true))
-                    !isResolution
+                val numbers = Regex("""\d+""").findAll(cleanTitle).map { it.value }.toList()
+                episodeNum = numbers.lastOrNull { num ->
+                    num != "4" && num != "1080" && num != "720"
                 }?.toIntOrNull()
-                
-                epName = cleanTitle.replace(Regex("""(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\(4K\)|\[4K\]|\(1080p\)|\[1080p\])"""), "").trim(' ', '-', ':', ',')
-                if (epName.isBlank() && episodeNumber != null) {
-                    epName = "Episode $episodeNumber"
-                }
             }
             
-            val posterr = info.selectFirst("a img")?.attr("data-src") ?: ""
+            val junkRegex = Regex("""(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\(4K\)|\[4K\]|\(1080p\)|\[1080p\])""")
+            var epName = cleanTitle.replace(junkRegex, "").trim(' ', '-', ':', ',', '|')
+            
+            if (epName.isBlank() || epName.matches(Regex("""^\d+$"""))) {
+                epName = if (episodeNum != null) "Episode $episodeNum" else "Episode"
+            }
+            
+            val posterr = info.selectFirst("img")?.let { 
+                it.attr("data-src").takeIf { src -> src.isNotBlank() } ?: it.attr("src")
+            } ?: ""
             
             newEpisode(href1) {
                 this.name = epName
-                this.episode = episodeNumber
+                this.episode = episodeNum
                 this.posterUrl = posterr
             }
         }.reversed()
@@ -235,6 +228,36 @@ open class DonghuastreamProvider : MainAPI() {
         val doc = app.get(data, headers = defaultHeaders).document
         val options = doc.select("option[data-index]")
 
+        suspend fun invokeExtractor(iframeUrl: String, label: String) {
+            var finalUrl = iframeUrl
+            if (finalUrl.contains("dailymotion", ignoreCase = true)) {
+                val videoIdMatch = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(finalUrl)
+                if (videoIdMatch != null) {
+                    finalUrl = "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
+                }
+            }
+
+            when {
+                "rumble.com" in finalUrl -> {
+                    Rumble().getUrl(finalUrl, finalUrl, subtitleCallback, callback)
+                }
+                "play.streamplay.co.in" in finalUrl -> {
+                    PlayStreamplay().getUrl(finalUrl, finalUrl, subtitleCallback, callback)
+                }
+                finalUrl.endsWith(".mp4") -> {
+                    callback(
+                        newExtractorLink(label, label, finalUrl, INFER_TYPE) {
+                            this.referer = ""
+                            this.quality = getQualityFromName(label)
+                        }
+                    )
+                }
+                else -> {
+                    loadExtractor(finalUrl, referer = finalUrl, subtitleCallback, callback)
+                }
+            }
+        }
+
         for (option in options) {
             val base64 = option.attr("value")
             if (base64.isBlank()) continue
@@ -246,38 +269,19 @@ open class DonghuastreamProvider : MainAPI() {
                 continue
             }
 
-            var iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
-            if (iframeUrl.isNullOrEmpty()) continue
-
-            // Intercept Dailymotion geo/custom links and convert them to standard embed format
-            // This prevents the built-in extractor from failing and throwing Error 2004
-            if (iframeUrl.contains("dailymotion", ignoreCase = true)) {
-                val videoIdMatch = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(iframeUrl)
-                if (videoIdMatch != null) {
-                    iframeUrl = "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
-                }
-            }
-
-            when {
-                "rumble.com" in iframeUrl -> {
-                    Rumble().getUrl(iframeUrl, iframeUrl, subtitleCallback, callback)
-                }
-                "play.streamplay.co.in" in iframeUrl -> {
-                    PlayStreamplay().getUrl(iframeUrl, iframeUrl, subtitleCallback, callback)
-                }
-                iframeUrl.endsWith(".mp4") -> {
-                    callback(
-                        newExtractorLink(label, label, iframeUrl, INFER_TYPE) {
-                            this.referer = ""
-                            this.quality = getQualityFromName(label)
-                        }
-                    )
-                }
-                else -> {
-                    loadExtractor(iframeUrl, referer = iframeUrl, subtitleCallback, callback)
-                }
+            val iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
+            if (!iframeUrl.isNullOrEmpty()) {
+                invokeExtractor(iframeUrl, label)
             }
         }
+        
+        if (options.isEmpty()) {
+            val directIframe = doc.selectFirst(".player-area iframe, .playcon iframe")?.attr("src")?.let(::httpsify)
+            if (!directIframe.isNullOrEmpty()) {
+                invokeExtractor(directIframe, "Server")
+            }
+        }
+        
         return true
     }
 }
