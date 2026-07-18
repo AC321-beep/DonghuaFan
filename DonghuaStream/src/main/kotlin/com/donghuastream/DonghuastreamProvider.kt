@@ -49,7 +49,7 @@ open class DonghuastreamProvider : MainAPI() {
                 hasNext = movieResults.isNotEmpty() || specialResults.isNotEmpty()
             )
         } else {
-            // Restored: Page 1 grabs instant updates from the main homepage, Page 2+ uses the directory
+            // Page 1 grabs instant updates from the main homepage (bypassing cache delays). Page 2+ uses the directory.
             val url = if (page == 1) "$mainUrl/" else "$mainUrl/${request.data}$page"
 
             val document = app.get(
@@ -116,8 +116,8 @@ open class DonghuastreamProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
         
-        // Accurate Series vs Episode validation (.infox contains the listing meta metrics)
-        val isEpisodePage = document.selectFirst(".infox") == null
+        // Accurate Series vs Episode validation. These classes ONLY exist on the main series page.
+        val isEpisodePage = document.selectFirst(".infox, .tsinfo, .anime-info") == null
         
         if (isEpisodePage) {
             val seriesUrl = document.select("div.ts-breadcrumb a").find { it.attr("href").contains("/anime/") }?.attr("href")
@@ -183,28 +183,46 @@ open class DonghuastreamProvider : MainAPI() {
             val aTag = info.selectFirst("a[href]") ?: info.takeIf { it.tagName() == "a" && it.hasAttr("href") }
             val href1 = aTag?.attr("href") ?: return@mapNotNull null
             
-            var cleanTitle = info.selectFirst(".epl-title, .ep-title, .title, h2, h3")?.text()?.trim() ?: ""
-            if (cleanTitle.isEmpty()) cleanTitle = aTag.text().trim() 
-            if (cleanTitle.isEmpty()) cleanTitle = info.text().trim()
+            var rawTitle = info.selectFirst(".epl-title, .ep-title, .title, h2, h3")?.text()?.trim() ?: ""
+            if (rawTitle.isEmpty()) rawTitle = aTag.text().trim() 
+            if (rawTitle.isEmpty()) rawTitle = info.text().trim()
             
             var episodeNum: Int? = null
+            var epName: String
+            
+            // Comprehensive regex to catch and destroy all SEO tags Admins append to titles
+            val junkRegex = Regex("""(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\(4K\)|\[4K\]|\(1080p\)|\[1080p\]|4K|1080p|720p)""")
 
-            val epMatch = Regex("""(?i)(?:Ep|Eps|Episode|Ep\.)\s*(\d+)""").findAll(cleanTitle).lastOrNull()
+            // Locate the exact anchor of the episode number
+            val epMatch = Regex("""(?i)(?:Ep|Eps|Episode|Ep\.)\s*(\d+)""").findAll(rawTitle).lastOrNull()
             
             if (epMatch != null) {
                 episodeNum = epMatch.groupValues[1].toIntOrNull()
+                
+                // CRITICAL FIX: Delete everything BEFORE the number (the show title). 
+                // Keep only what comes AFTER the number (chapter titles).
+                val afterText = rawTitle.substring(epMatch.range.last + 1)
+                val cleanAfter = afterText.replace(junkRegex, "").trim(' ', '-', ':', ',', '|', '(', ')')
+                
+                epName = if (cleanAfter.isNotBlank()) {
+                    "Episode $episodeNum: $cleanAfter"
+                } else {
+                    "Episode $episodeNum"
+                }
             } else {
-                val numbers = Regex("""\d+""").findAll(cleanTitle).map { it.value }.toList()
+                // FALLBACK: If the word "Ep" is missing entirely
+                val numbers = Regex("""\d+""").findAll(rawTitle).map { it.value }.toList()
                 episodeNum = numbers.lastOrNull { num ->
-                    num != "4" && num != "1080" && num != "720"
+                    num != "4" && num != "1080" && num != "720" && num != "2160"
                 }?.toIntOrNull()
-            }
-            
-            val junkRegex = Regex("""(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\(4K\)|\[4K\]|\(1080p\)|\[1080p\])""")
-            var epName = cleanTitle.replace(junkRegex, "").trim(' ', '-', ':', ',', '|')
-            
-            if (epName.isBlank() || epName.matches(Regex("""^\d+$"""))) {
-                epName = if (episodeNum != null) "Episode $episodeNum" else "Episode"
+
+                val cleanTitle = rawTitle.replace(junkRegex, "").trim(' ', '-', ':', ',', '|', '(', ')')
+                
+                epName = if (episodeNum != null) {
+                    if (cleanTitle.contains(episodeNum.toString())) "Episode $episodeNum" else cleanTitle
+                } else {
+                    cleanTitle.ifEmpty { "Episode" }
+                }
             }
             
             val posterr = info.selectFirst("img")?.let { 
