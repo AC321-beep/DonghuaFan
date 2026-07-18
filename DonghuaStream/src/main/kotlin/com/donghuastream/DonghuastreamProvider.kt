@@ -16,7 +16,7 @@ open class DonghuastreamProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime)
 
-    // Custom headers to mimic a real browser (improves Dailymotion extraction)
+    // Custom headers to mimic a real browser and bypass basic bot protection
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         "Referer" to mainUrl,
@@ -115,7 +115,6 @@ open class DonghuastreamProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
         
-        // 1. Detect if we are on a direct Episode page (missing the .eplister container)
         val isEpisodePage = document.selectFirst(".eplister") == null
         
         if (isEpisodePage) {
@@ -127,14 +126,13 @@ open class DonghuastreamProvider : MainAPI() {
                 return load(seriesUrl)
             }
             
-            // SECONDARY FALLBACK: Scrape from episode page
             val titleRaw = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
             val title = titleRaw.substringBefore(" Episode").trim() 
             val poster = document.selectFirst("meta[property=og:image]")?.attr("content") ?: ""
             
             val epElements = document.select("div.episodelist > ul > li")
             if (epElements.isNotEmpty()) {
-                val episodes = parseEpisodes(epElements, title)
+                val episodes = parseEpisodes(epElements)
                 return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                     this.posterUrl = poster
                 }
@@ -145,7 +143,6 @@ open class DonghuastreamProvider : MainAPI() {
             }
         }
 
-        // 2. STANDARD SERIES PAGE LOGIC
         val title = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
         var poster = document.selectFirst("div.ime > img")?.attr("data-src") ?: ""
         if (poster.isEmpty()) {
@@ -165,7 +162,7 @@ open class DonghuastreamProvider : MainAPI() {
                 }
             }
             
-            val episodes = parseEpisodes(epElements, title)
+            val episodes = parseEpisodes(epElements)
             
             newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
@@ -180,45 +177,43 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    // --- NEW HELPER FUNCTION TO PARSE EPISODES FLAWLESSLY ---
-    private fun parseEpisodes(epElements: org.jsoup.select.Elements, title: String): List<Episode> {
+    private fun parseEpisodes(epElements: org.jsoup.select.Elements): List<Episode> {
         return epElements.mapNotNull { info ->
             val aTag = info.selectFirst("a")
             val href1 = aTag?.attr("href") ?: return@mapNotNull null
             
-            // 1. ISOLATE CLEAN TEXT: Prefer .epl-title to avoid capturing hidden badges, metadata, or typos
             var cleanTitle = info.selectFirst(".epl-title")?.text()?.trim() ?: ""
-            if (cleanTitle.isEmpty()) cleanTitle = aTag.ownText().trim() // Skips child spans
+            if (cleanTitle.isEmpty()) cleanTitle = aTag.ownText().trim() 
             if (cleanTitle.isEmpty()) cleanTitle = info.selectFirst(".title, .ep-title, h2, h3")?.text()?.trim() ?: ""
             if (cleanTitle.isEmpty()) cleanTitle = aTag.text().trim()
             
-            // 2. EPISODE NUMBER EXTRACTION
-            // Remove the show title to prevent number interference (e.g., "100.000 years")
-            var textWithoutTitle = cleanTitle.replace(title, "", ignoreCase = true).trim()
-            if (textWithoutTitle.isEmpty()) textWithoutTitle = cleanTitle
+            var episodeNumber: Int? = null
+            var epName = cleanTitle
 
-            // Try strict format first (e.g., "Episode 14")
-            var episodeNumber = Regex("""(?i)(?:Ep|Eps|Episode)\s*(\d+)""").find(textWithoutTitle)?.groupValues?.get(1)?.toIntOrNull()
+            // Extracts just the episode number and any actual subtitle text following it. 
+            // Avoids picking up the full show title before the word "Ep"
+            val epMatch = Regex("""(?i)(?:Ep\.|Eps\.|Ep|Episode)\s*(\d+)(.*)""").find(cleanTitle)
             
-            // Dynamic fallback if "Episode X" is completely missing
-            if (episodeNumber == null) {
-                val allNumbers = Regex("""\d+""").findAll(textWithoutTitle).map { it.value }.toList()
-                episodeNumber = allNumbers.firstOrNull { num ->
-                    val isResolution = (num == "4" && textWithoutTitle.contains("4K", true)) || 
-                                       (num == "1080" && textWithoutTitle.contains("1080", true))
+            if (epMatch != null) {
+                episodeNumber = epMatch.groupValues[1].toIntOrNull()
+                // Clean up any remaining junk tags left over after the episode number
+                val extraText = epMatch.groupValues[2]
+                    .replace(Regex("""(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\(4K\)|\[4K\]|\(1080p\)|\[1080p\])"""), "")
+                    .trim(' ', '-', ':', ',')
+                
+                epName = if (extraText.isNotBlank()) "Episode $episodeNumber: $extraText" else "Episode $episodeNumber"
+            } else {
+                // Fallback if "Ep" is completely missing from the text
+                episodeNumber = Regex("""\d+""").findAll(cleanTitle).map { it.value }.toList().firstOrNull { num ->
+                    val isResolution = (num == "4" && cleanTitle.contains("4K", true)) || 
+                                       (num == "1080" && cleanTitle.contains("1080", true))
                     !isResolution
                 }?.toIntOrNull()
-            }
-            
-            // 3. CLEAN DISPLAY NAME
-            // Removes any typos or visual clutter admins left behind
-            var epName = textWithoutTitle
-                .replace(Regex("""(?i)(Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\(4K\)|\[4K\]|\(1080p\)|\[1080p\])"""), "")
-                .trim(' ', '+', '-', '|', ':', '(', ')')
                 
-            // If the name is blank or just a raw number after cleaning, format it nicely
-            if (epName.isBlank() || epName.matches(Regex("""^\d+$"""))) {
-                epName = if (episodeNumber != null) "Episode $episodeNumber" else cleanTitle
+                epName = cleanTitle.replace(Regex("""(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\(4K\)|\[4K\]|\(1080p\)|\[1080p\])"""), "").trim(' ', '-', ':', ',')
+                if (epName.isBlank() && episodeNumber != null) {
+                    epName = "Episode $episodeNumber"
+                }
             }
             
             val posterr = info.selectFirst("a img")?.attr("data-src") ?: ""
@@ -251,8 +246,17 @@ open class DonghuastreamProvider : MainAPI() {
                 continue
             }
 
-            val iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
+            var iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
             if (iframeUrl.isNullOrEmpty()) continue
+
+            // Intercept Dailymotion geo/custom links and convert them to standard embed format
+            // This prevents the built-in extractor from failing and throwing Error 2004
+            if (iframeUrl.contains("dailymotion", ignoreCase = true)) {
+                val videoIdMatch = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(iframeUrl)
+                if (videoIdMatch != null) {
+                    iframeUrl = "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
+                }
+            }
 
             when {
                 "rumble.com" in iframeUrl -> {
