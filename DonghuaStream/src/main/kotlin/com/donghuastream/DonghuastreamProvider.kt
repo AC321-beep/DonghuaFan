@@ -240,38 +240,6 @@ open class DonghuastreamProvider : MainAPI() {
         val doc = app.get(data, headers = defaultHeaders).document
         val options = doc.select("option[data-index]")
 
-        suspend fun extractDailymotionToken(pageUrl: String): String? {
-            val pageHtml = try {
-                app.get(pageUrl, headers = defaultHeaders).text
-            } catch (e: Exception) { return null }
-            val pageDoc = try { Jsoup.parse(pageHtml) } catch (e: Exception) { null }
-
-            pageDoc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
-                val src = iframe.attr("src")
-                val match = Regex("""[?&]video=([^&]+)""").find(src)
-                if (match != null) return match.groupValues[1]
-            }
-
-            val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-                .find(pageHtml)?.groupValues?.get(1)
-            if (playerJson != null) {
-                var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
-                val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
-                val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-
-                if (encrypt == 1) rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-                else if (encrypt == 2) {
-                    rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
-                    rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-                }
-
-                if (from.equals("dailymotion", ignoreCase = true)) {
-                    return rawUrl
-                }
-            }
-            return null
-        }
-
         for (option in options) {
             val base64 = option.attr("value")
             if (base64.isBlank()) continue
@@ -285,20 +253,6 @@ open class DonghuastreamProvider : MainAPI() {
 
             val iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
             if (iframeUrl.isNullOrEmpty()) continue
-
-            if (label.contains("dailymotion", ignoreCase = true) || "dailymotion" in iframeUrl) {
-                var token: String? = null
-                token = Regex("""[?&]video=([^&]+)""").find(iframeUrl)?.groupValues?.get(1)
-                if (token == null) {
-                    token = extractDailymotionToken(iframeUrl)
-                }
-                if (token != null) {
-                    val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$token"
-                    if (loadExtractor(embedUrl, data, subtitleCallback, callback)) {
-                        continue
-                    }
-                }
-            }
 
             when {
                 "rumble.com" in iframeUrl -> {
