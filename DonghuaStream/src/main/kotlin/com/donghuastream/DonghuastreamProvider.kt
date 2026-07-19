@@ -199,7 +199,7 @@ open class DonghuastreamProvider : MainAPI() {
             if (epMatch != null) {
                 episodeNum = epMatch.groupValues[1].toIntOrNull()
                 
-                // CRITICAL FIX: Delete everything BEFORE the number (the show title). 
+                // Delete everything BEFORE the number (the show title). 
                 // Keep only what comes AFTER the number (chapter titles).
                 val afterText = rawTitle.substring(epMatch.range.last + 1)
                 val cleanAfter = afterText.replace(junkRegex, "").trim(' ', '-', ':', ',', '|', '(', ')')
@@ -248,10 +248,16 @@ open class DonghuastreamProvider : MainAPI() {
 
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl
+            var extReferer = iframeUrl // By default, use the iframe URL as referer
+
+            // CRITICAL FIX FOR 2004 ERROR:
             if (finalUrl.contains("dailymotion", ignoreCase = true)) {
-                val videoIdMatch = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(finalUrl)
+                // Safely grab the video ID, accommodating hyphens/underscores if they exist
+                val videoIdMatch = Regex("""[?&]video=([a-zA-Z0-9_-]+)""").find(finalUrl)
                 if (videoIdMatch != null) {
                     finalUrl = "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
+                    // Force the extractor to use DonghuaStream as the referer, bypassing Dailymotion's domain restriction
+                    extReferer = mainUrl 
                 }
             }
 
@@ -265,13 +271,14 @@ open class DonghuastreamProvider : MainAPI() {
                 finalUrl.endsWith(".mp4") -> {
                     callback(
                         newExtractorLink(label, label, finalUrl, INFER_TYPE) {
-                            this.referer = ""
+                            this.referer = mainUrl
                             this.quality = getQualityFromName(label)
                         }
                     )
                 }
                 else -> {
-                    loadExtractor(finalUrl, referer = finalUrl, subtitleCallback, callback)
+                    // This dynamically passes either the iframe URL or the corrected Dailymotion referer
+                    loadExtractor(finalUrl, referer = extReferer, subtitleCallback, callback)
                 }
             }
         }
