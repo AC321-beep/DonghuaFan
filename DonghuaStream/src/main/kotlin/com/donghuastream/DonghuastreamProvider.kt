@@ -283,30 +283,24 @@ open class DonghuastreamProvider : MainAPI() {
                             if (isHls) {
                                 // Keep HLS, but label it and tank its quality score so MP4 auto-plays first
                                 callback(
-                                    ExtractorLink(
-                                        source = link.source,
-                                        name = "${link.name} (HLS)",
-                                        url = link.url,
-                                        referer = link.referer,
-                                        quality = Qualities.Unknown.value, 
-                                        isM3u8 = link.isM3u8,
-                                        headers = link.headers,
-                                        extractorData = link.extractorData
-                                    )
+                                    newExtractorLink(link.source, "${link.name} (HLS)", link.url, INFER_TYPE) {
+                                        this.referer = link.referer
+                                        this.quality = Qualities.Unknown.value
+                                        this.isM3u8 = link.isM3u8
+                                        this.headers = link.headers
+                                        this.extractorData = link.extractorData
+                                    }
                                 )
                             } else {
                                 // Explicitly mark MP4s and let them keep their natural, higher quality score
                                 callback(
-                                    ExtractorLink(
-                                        source = link.source,
-                                        name = "${link.name} (MP4)",
-                                        url = link.url,
-                                        referer = link.referer,
-                                        quality = link.quality,
-                                        isM3u8 = link.isM3u8,
-                                        headers = link.headers,
-                                        extractorData = link.extractorData
-                                    )
+                                    newExtractorLink(link.source, "${link.name} (MP4)", link.url, INFER_TYPE) {
+                                        this.referer = link.referer
+                                        this.quality = link.quality
+                                        this.isM3u8 = link.isM3u8
+                                        this.headers = link.headers
+                                        this.extractorData = link.extractorData
+                                    }
                                 )
                             }
                         } else {
