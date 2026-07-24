@@ -248,12 +248,15 @@ open class DonghuastreamProvider : MainAPI() {
 
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl
-            var extReferer = iframeUrl 
+            var extReferer = iframeUrl // By default, use the iframe URL as referer
 
+            // CRITICAL FIX FOR 2004 ERROR:
             if (finalUrl.contains("dailymotion", ignoreCase = true)) {
+                // Safely grab the video ID, accommodating hyphens/underscores if they exist
                 val videoIdMatch = Regex("""[?&]video=([a-zA-Z0-9_-]+)""").find(finalUrl)
                 if (videoIdMatch != null) {
                     finalUrl = "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
+                    // Force the extractor to use DonghuaStream as the referer, bypassing Dailymotion's domain restriction
                     extReferer = mainUrl 
                 }
             }
@@ -274,47 +277,8 @@ open class DonghuastreamProvider : MainAPI() {
                     )
                 }
                 else -> {
-                    loadExtractor(finalUrl, referer = extReferer, subtitleCallback) { link ->
-                        val isDailymotion = finalUrl.contains("dailymotion", ignoreCase = true)
-                        
-                        if (isDailymotion) {
-                            val isHls = link.isM3u8 || link.url.contains(".m3u8", ignoreCase = true)
-                            
-                            @Suppress("DEPRECATION")
-                            if (isHls) {
-                                // Keep HLS, but label it and tank its quality score so MP4 auto-plays first
-                                callback(
-                                    ExtractorLink(
-                                        source = link.source,
-                                        name = "${link.name} (HLS)",
-                                        url = link.url,
-                                        referer = link.referer,
-                                        quality = Qualities.Unknown.value,
-                                        isM3u8 = link.isM3u8,
-                                        headers = link.headers,
-                                        extractorData = link.extractorData
-                                    )
-                                )
-                            } else {
-                                // Explicitly mark MP4s and let them keep their natural, higher quality score
-                                callback(
-                                    ExtractorLink(
-                                        source = link.source,
-                                        name = "${link.name} (MP4)",
-                                        url = link.url,
-                                        referer = link.referer,
-                                        quality = link.quality,
-                                        isM3u8 = link.isM3u8,
-                                        headers = link.headers,
-                                        extractorData = link.extractorData
-                                    )
-                                )
-                            }
-                        } else {
-                            // Standard callback for non-Dailymotion links
-                            callback(link)
-                        }
-                    }
+                    // This dynamically passes either the iframe URL or the corrected Dailymotion referer
+                    loadExtractor(finalUrl, referer = extReferer, subtitleCallback, callback)
                 }
             }
         }
