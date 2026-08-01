@@ -1,7 +1,6 @@
 plugins {
     id("com.android.library") 
-    kotlin("android")
-    id("com.lagradost.cloudstream3.gradle")
+    // REMOVED: kotlin("android") - This is strictly blocked in AGP 9.0+
 }
 
 cloudstream {
@@ -9,18 +8,16 @@ cloudstream {
     authors = listOf("AC321-beep")   
     status = 1
     language = "en"
-    version = 3
+    version = 4
     iconUrl = "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/refs/heads/master/Adfree/Icon.png"
 }
 
 android {
     namespace = "com.net.optimizer" 
-    compileSdk = 34
-
-    defaultConfig {
-        minSdk = 21
-    }
-
+    
+    // minSdk, compileSdk, and compileOptions are removed because your 
+    // root build.gradle.kts automatically handles them for all modules.
+    
     buildTypes {
         release {
             isMinifyEnabled = true 
@@ -30,18 +27,7 @@ android {
             )
         }
     }
-
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
-    }
 }
 
-kotlin {
-    jvmToolchain(8)
-}
-
-dependencies {
-    val cloudstreamVersion = "master-SNAPSHOT"
-    implementation("com.github.recloudstream:cloudstream:$cloudstreamVersion")
-}
+// REMOVED: The kotlin { jvmToolchain(8) } block. Your root file already sets jvmTarget.JVM_1_8.
+// REMOVED: The dependencies { ... } block. Your root file already securely imports the "pre-release" library.
