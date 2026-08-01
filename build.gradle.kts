@@ -34,7 +34,7 @@ fun Project.android(configuration: LibraryExtension.() -> Unit) =
 
 subprojects {
     apply(plugin = "com.android.library")
-    apply(plugin = "kotlin-android")
+    // REMOVED: apply(plugin = "kotlin-android") is no longer allowed in AGP 9.0+
     apply(plugin = "com.lagradost.cloudstream3.gradle")
 
     cloudstream {
