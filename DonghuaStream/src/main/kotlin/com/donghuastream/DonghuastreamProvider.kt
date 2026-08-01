@@ -183,24 +183,28 @@ open class DonghuastreamProvider : MainAPI() {
             val aTag = info.selectFirst("a[href]") ?: info.takeIf { it.tagName() == "a" && it.hasAttr("href") }
             val href1 = aTag?.attr("href") ?: return@mapNotNull null
             
-            var rawTitle = info.selectFirst(".epl-title, .ep-title, .title, h2, h3, h4")?.text()?.trim() ?: ""
+            // EXACT ORIGINAL: Removed h4 so it falls back to aTag.text() and captures the raw date string
+            var rawTitle = info.selectFirst(".epl-title, .ep-title, .title, h2, h3")?.text()?.trim() ?: ""
             if (rawTitle.isEmpty()) rawTitle = aTag.text().trim() 
             if (rawTitle.isEmpty()) rawTitle = info.text().trim()
             
             var episodeNum: Int? = null
             var epName: String
             
-            // Comprehensive regex to catch and destroy all SEO tags Admins append to titles
+            // EXACT ORIGINAL regex
             val junkRegex = Regex("""(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\(4K\)|\[4K\]|\(1080p\)|\[1080p\]|4K|1080p|720p)""")
 
-            // Locate the exact anchor of the episode number
+            // SURGICAL FIX: Get the FIRST match to find the true episode number (164) and ignore the typo (160) at the end of the string
+            val trueEpMatch = Regex("""(?i)(?:Ep|Eps|Episode|Ep\.)\s*(\d+)""").findAll(rawTitle).firstOrNull()
+            
+            // EXACT ORIGINAL: Keep the LAST match to preserve your string formatting so the date text remains untouched
             val epMatch = Regex("""(?i)(?:Ep|Eps|Episode|Ep\.)\s*(\d+)""").findAll(rawTitle).lastOrNull()
             
-            if (epMatch != null) {
-                episodeNum = epMatch.groupValues[1].toIntOrNull()
+            if (epMatch != null && trueEpMatch != null) {
+                // SURGICAL FIX: Assign the accurate number
+                episodeNum = trueEpMatch.groupValues[1].toIntOrNull()
                 
-                // Delete everything BEFORE the number (the show title). 
-                // Keep only what comes AFTER the number (chapter titles).
+                // EXACT ORIGINAL LOGIC
                 val afterText = rawTitle.substring(epMatch.range.last + 1)
                 val cleanAfter = afterText.replace(junkRegex, "").trim(' ', '-', ':', ',', '|', '(', ')')
                 
@@ -210,7 +214,7 @@ open class DonghuastreamProvider : MainAPI() {
                     "Episode $episodeNum"
                 }
             } else {
-                // FALLBACK: If the word "Ep" is missing entirely
+                // EXACT ORIGINAL FALLBACK
                 val numbers = Regex("""\d+""").findAll(rawTitle).map { it.value }.toList()
                 episodeNum = numbers.lastOrNull { num ->
                     num != "4" && num != "1080" && num != "720" && num != "2160"
