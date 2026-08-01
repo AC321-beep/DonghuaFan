@@ -183,7 +183,7 @@ open class DonghuastreamProvider : MainAPI() {
             val aTag = info.selectFirst("a[href]") ?: info.takeIf { it.tagName() == "a" && it.hasAttr("href") }
             val href1 = aTag?.attr("href") ?: return@mapNotNull null
             
-            var rawTitle = info.selectFirst(".epl-title, .ep-title, .title, h2, h3")?.text()?.trim() ?: ""
+            var rawTitle = info.selectFirst(".epl-title, .ep-title, .title, h2, h3, h4")?.text()?.trim() ?: ""
             if (rawTitle.isEmpty()) rawTitle = aTag.text().trim() 
             if (rawTitle.isEmpty()) rawTitle = info.text().trim()
             
