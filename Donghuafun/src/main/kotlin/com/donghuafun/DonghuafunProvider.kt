@@ -24,8 +24,7 @@ class DonghuaFunProvider : MainAPI() {
     private fun detailUrlToId(url: String): String =
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
-    // EXACT original working homepage order
-    override val mainPage = mainPageOf(
+      override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
         "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Coming Soon"
@@ -38,7 +37,6 @@ class DonghuaFunProvider : MainAPI() {
         val items = mutableListOf<SearchResponse>()
         var hasNextPage = true
         
-        // Increased max pages for Recently Updated to ensure the row doesn't return empty if heavily filtered
         val maxPagesToSearch = if (isComingSoon || isRecentlyUpdated) 5 else 1 
         var pagesSearched = 0
 
@@ -59,11 +57,21 @@ class DonghuaFunProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
-        for (page in 1..3) {
-            val doc = try { app.get("$mainUrl/index.php/vod/search.html", params = mapOf("wd" to query, "page" to page.toString())).document } catch (e: Exception) { null } ?: break
+        // Using the help of the homepage directory to search as the site does not have a proper search function
+        for (page in 1..10) { // Search through the first 10 pages of the directory
+            val pageUrl = if (page == 1) {
+                "$mainUrl/index.php/vod/show/id/20/by/time.html"
+            } else {
+                "$mainUrl/index.php/vod/show/id/20/by/time/page/$page.html"
+            }
+            
+            val doc = try { app.get(pageUrl).document } catch (e: Exception) { null } ?: break
             val pageResults = parseShowCards(doc) // Defaults to false for both flags
             if (pageResults.isEmpty()) break
-            results.addAll(pageResults)
+            
+            // Filter locally based on the search query
+            results.addAll(pageResults.filter { it.name.contains(query, ignoreCase = true) })
+            
             val hasNext = doc.select("a.page-next:not(.disabled), a:contains(Next), a:contains(下一页)").isNotEmpty()
             if (!hasNext) break
         }
@@ -292,4 +300,4 @@ class DonghuaFunProvider : MainAPI() {
                 newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
             }
     }
-                              }
+}
