@@ -61,14 +61,14 @@ class Rumble : ExtractorApi() {
 
             if (!videoUrl.isNullOrEmpty()) {
                 callback.invoke(
-                    ExtractorLink(
-                        source = name,
-                        name = name,
-                        url = videoUrl,
-                        referer = mainUrl,
-                        quality = quality.replace("p", "").toIntOrNull() ?: Qualities.Unknown.value,
-                        isM3u8 = videoUrl.contains(".m3u8")
-                    )
+                newExtractorLink(
+                source = name,
+                name = name,
+                url = videoUrl,
+                referer = mainUrl,
+                quality = quality.replace("p", "").toIntOrNull() ?: Qualities.Unknown.value,
+                isM3u8 = videoUrl.contains(".m3u8")
+                   )
                 )
             }
         }
