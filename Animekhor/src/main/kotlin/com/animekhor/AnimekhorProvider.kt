@@ -6,7 +6,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.nodes.Element
-import com.lagradost.cloudstream3.ParCollections.amap
+import com.lagradost.cloudstream3.apmap
 
 class AnimekhorProvider : MainAPI() {
     override var mainUrl = "https://animekhor.org"
@@ -116,7 +116,8 @@ class AnimekhorProvider : MainAPI() {
         val document = app.get(data).document
         val servers = document.select(".mobius option")
         
-        servers.amap { server ->
+     
+            servers.apmap { server ->
             val base64 = server.attr("value")
             val decodedUrl = String(Base64.decode(base64, Base64.DEFAULT))
             val regex = Regex("""src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
