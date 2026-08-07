@@ -10,6 +10,7 @@ import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.newExtractorLink // Critical fix: added missing import
 
 class embedwish : StreamWishExtractor() {
     override var mainUrl = "https://embedwish.com"
@@ -61,14 +62,14 @@ class Rumble : ExtractorApi() {
 
             if (!videoUrl.isNullOrEmpty()) {
                 callback.invoke(
-                newExtractorLink(
-                source = name,
-                name = name,
-                url = videoUrl,
-                referer = mainUrl,
-                quality = quality.replace("p", "").toIntOrNull() ?: Qualities.Unknown.value,
-                isM3u8 = videoUrl.contains(".m3u8")
-                   )
+                    newExtractorLink(
+                        source = name,
+                        name = name,
+                        url = videoUrl,
+                        referer = mainUrl,
+                        quality = quality.replace("p", "").toIntOrNull() ?: Qualities.Unknown.value,
+                        isM3u8 = videoUrl.contains(".m3u8")
+                    )
                 )
             }
         }
