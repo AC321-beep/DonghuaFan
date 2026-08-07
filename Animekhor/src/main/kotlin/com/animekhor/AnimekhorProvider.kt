@@ -33,9 +33,12 @@ class AnimekhorProvider : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse {
         val document = app.get("$mainUrl/${request.data}&page=$page").document
-        val home = document.select("div.listupd > article, div.bsx").mapNotNull {
-            it.toSearchResult()
-        }
+        
+        val home = document.select("div.listupd > article, div.bsx")
+            .mapNotNull { it.toSearchResult() }
+            // FIX: Removes duplicate shows from the home page
+            .distinctBy { it.url }
+            
         return newHomePageResponse(request.name, home)
     }
 
@@ -58,7 +61,7 @@ class AnimekhorProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        return coroutineScope {
+        val results = coroutineScope {
             (1..2).map { page ->
                 async {
                     try {
@@ -72,6 +75,8 @@ class AnimekhorProvider : MainAPI() {
                 }
             }.awaitAll().flatten()
         }
+        // FIX: Removes duplicate shows from search results
+        return results.distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -116,7 +121,10 @@ class AnimekhorProvider : MainAPI() {
                     this.name = episodeName
                     this.posterUrl = poster
                 }
-            }.reversed()
+            }
+            // FIX: Removes duplicate episodes and reverses the list for proper order
+            .distinctBy { it.data }
+            .reversed()
 
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
