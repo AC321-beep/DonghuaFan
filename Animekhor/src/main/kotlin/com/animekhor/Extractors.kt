@@ -9,6 +9,7 @@ import com.lagradost.cloudstream3.extractors.VidhideExtractor
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.newExtractorLink // Added required import for the factory function
 
 class Embedwish : StreamWishExtractor() {
     override var name = "Embedwish"
@@ -67,8 +68,8 @@ class Rumble : ExtractorApi() {
                 
                 if (!videoUrl.isNullOrEmpty()) {
                     callback.invoke(
-                        // Instantiating directly guarantees compatibility across CS3 versions
-                        ExtractorLink(
+                        // Changed back to newExtractorLink to satisfy Cloudstream's strict deprecation rules
+                        newExtractorLink(
                             source = name,
                             name = name,
                             url = videoUrl,
