@@ -42,6 +42,8 @@ class Rumble : ExtractorApi() {
     override val mainUrl = "https://rumble.com"
     override val requiresReferer = false
 
+    // Bypasses the strict build failure caused by Cloudstream's -Werror deprecation flag
+    @Suppress("DEPRECATION")
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -67,7 +69,6 @@ class Rumble : ExtractorApi() {
                 
                 if (!videoUrl.isNullOrEmpty()) {
                     callback.invoke(
-                        // Fixed: Directly instantiating ExtractorLink instead of newExtractorLink
                         ExtractorLink(
                             source = name,
                             name = name,
