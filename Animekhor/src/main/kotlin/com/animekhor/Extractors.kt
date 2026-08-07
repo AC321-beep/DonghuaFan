@@ -53,19 +53,20 @@ class Rumble : ExtractorApi() {
         val html = app.get(url).text
 
         // Isolate the Rumble config JSON block(s)
-        val jsonBlocks = Regex("""\"u(?:a)?\"\s*:\s*(\{.*?\})\s*(?:,|\})""").findAll(html)
+        // Fixed: Removed incorrect escaping (\") from raw string literals.
+        val jsonBlocks = Regex(""""u(?:a)?"\s*:\s*(\{.*?\})\s*(?:,|})""").findAll(html)
         
         jsonBlocks.forEach { blockMatch ->
             val blockData = blockMatch.groupValues[1]
             
             // Extract the embedded video objects using Regex to bypass strict JSON Map/List casting errors
-            val objectRegex = Regex("""\"[a-zA-Z0-9_]+\"\s*:\s*\{([^\}]+)\}""")
+            val objectRegex = Regex(""""[a-zA-Z0-9_]+"\s*:\s*\{([^}]+)\}""")
             
             objectRegex.findAll(blockData).forEach { objMatch ->
                 val innerProps = objMatch.groupValues[1]
                 
-                val videoUrl = Regex("""\"(?:url|path)\"\s*:\s*\"(https?://[^\"]+)\"""").find(innerProps)?.groupValues?.get(1)
-                val metaQuality = Regex("""\"meta\"\s*:\s*\"([^\"]+)\"""").find(innerProps)?.groupValues?.get(1) ?: "720"
+                val videoUrl = Regex(""""(?:url|path)"\s*:\s*"(https?://[^"]+)"""").find(innerProps)?.groupValues?.get(1)
+                val metaQuality = Regex(""""meta"\s*:\s*"([^"]+)"""").find(innerProps)?.groupValues?.get(1) ?: "720"
                 
                 if (!videoUrl.isNullOrEmpty()) {
                     callback.invoke(
@@ -74,7 +75,7 @@ class Rumble : ExtractorApi() {
                             name = name,
                             url = videoUrl,
                             referer = mainUrl,
-                            quality = metaQuality.replace("p", "").toIntOrNull() ?: Qualities.Unknown.value,
+                            quality = metaQuality.replace("p", "", ignoreCase = true).toIntOrNull() ?: Qualities.Unknown.value,
                             isM3u8 = videoUrl.contains(".m3u8")
                         )
                     )
