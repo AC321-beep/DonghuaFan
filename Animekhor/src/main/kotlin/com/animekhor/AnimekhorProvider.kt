@@ -13,7 +13,7 @@ class AnimekhorProvider : MainAPI() {
     override var mainUrl = "https://animekhor.org"
     override var name = "Animekhor"
     override val hasMainPage = true
-    override var lang = "zh"
+    override var lang = "zh" // Keep 'zh' for Donghua, though subs are English
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
@@ -33,16 +33,17 @@ class AnimekhorProvider : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse {
         val document = app.get("$mainUrl/${request.data}&page=$page").document
-        val home = document.select("div.listupd > article").mapNotNull {
+        val home = document.select("div.listupd > article, div.bsx").mapNotNull {
             it.toSearchResult()
         }
         return newHomePageResponse(request.name, home)
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        val title = this.selectFirst("div.bsx > a")?.attr("title") ?: return null
-        val href = fixUrlNull(this.selectFirst("div.bsx > a")?.attr("href")) ?: return null
-        val posterUrl = fixUrlNull(this.selectFirst("div.bsx > a img")?.getsrcAttribute())
+        val linkElement = this.selectFirst("a") ?: return null
+        val title = linkElement.attr("title").ifEmpty { this.selectFirst(".tt")?.text() } ?: return null
+        val href = fixUrlNull(linkElement.attr("href")) ?: return null
+        val posterUrl = fixUrlNull(this.selectFirst("img")?.getsrcAttribute())
         
         return newMovieSearchResponse(title, href, TvType.Movie) {
             this.posterUrl = posterUrl
@@ -50,26 +51,28 @@ class AnimekhorProvider : MainAPI() {
     }
 
     private fun Element.getsrcAttribute(): String {
-        val src = this.attr("src")
-        val dataSrc = this.attr("data-src")
-        return when {
-            dataSrc.startsWith("http") -> dataSrc
-            src.startsWith("http") -> src
-            else -> ""
-        }
+        return this.attr("data-src").takeIf { it.startsWith("http") }
+            ?: this.attr("src").takeIf { it.startsWith("http") }
+            ?: this.attr("data-lazy-src").takeIf { it.startsWith("http") }
+            ?: ""
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val searchResponse = mutableListOf<SearchResponse>()
-        for (i in 1..3) {
-            val document = app.get("$mainUrl/page/$i/?s=$query").document
-            val results = document.select("div.listupd > article").mapNotNull {
-                it.toSearchResult()
-            }
-            searchResponse.addAll(results)
-            if (results.isEmpty()) break
+        // Fetch up to 2 pages concurrently rather than blocking sequentially
+        return coroutineScope {
+            (1..2).map { page ->
+                async {
+                    try {
+                        val document = app.get("$mainUrl/page/$page/?s=$query").document
+                        document.select("div.listupd > article, div.bsx").mapNotNull {
+                            it.toSearchResult()
+                        }
+                    } catch (e: Exception) {
+                        emptyList()
+                    }
+                }
+            }.awaitAll().flatten()
         }
-        return searchResponse
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -82,27 +85,39 @@ class AnimekhorProvider : MainAPI() {
         val tvtag = if (type?.contains("Movie", ignoreCase = true) == true) TvType.Movie else TvType.TvSeries
 
         if (tvtag == TvType.Movie) {
-            val href = document.selectFirst(".eplister li > a")?.attr("href") ?: ""
+            val href = document.selectFirst(".eplister li > a")?.attr("href") ?: url
             return newMovieLoadResponse(title, url, TvType.Movie, href) {
                 this.posterUrl = poster
                 this.plot = description
             }
         } else {
-            val epPage = document.selectFirst(".eplister li > a")?.attr("href") ?: ""
-            val doc = app.get(epPage).document
-            val epPoster = doc.selectFirst("meta[property=og:image]")?.attr("content") ?: poster
+            // Optimization: Try to get episodes from the main page first to save a network request
+            var epListElements = document.select(".eplister li")
             
-            val episodes = doc.select("div.episodelist > ul > li").mapNotNull { info ->
-                val href1 = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
-                val episodeText = info.selectFirst("a span")?.text() ?: ""
+            if (epListElements.isEmpty()) {
+                val epPage = document.selectFirst(".eplister li > a")?.attr("href") ?: ""
+                if (epPage.isNotBlank()) {
+                    val doc = app.get(epPage).document
+                    epListElements = doc.select("div.episodelist > ul > li, .eplister li")
+                }
+            }
+            
+            val episodes = epListElements.mapNotNull { info ->
+                val href = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
+                val episodeText = info.selectFirst(".epl-title")?.text() ?: info.selectFirst("a span")?.text() ?: ""
                 
-                // Safer parsing: Fallback to full text if dashes are missing
-                val parsedEpisode = episodeText.substringAfter("-").substringBeforeLast("-").trim()
+                // Safe parsing for title/episode number
+                val parsedEpisode = if (episodeText.contains("-")) {
+                    episodeText.substringAfter("-").substringBeforeLast("-").trim()
+                } else {
+                    episodeText.trim()
+                }
+                
                 val episodeName = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText
 
-                newEpisode(href1) {
+                newEpisode(href) {
                     this.name = episodeName
-                    this.posterUrl = epPoster
+                    this.posterUrl = poster
                 }
             }.reversed()
 
@@ -122,19 +137,28 @@ class AnimekhorProvider : MainAPI() {
         val document = app.get(data).document
         val servers = document.select(".mobius option")
         
-        // Use standard Coroutines to replace deprecated apmap
         coroutineScope {
             servers.map { server ->
                 async {
                     val base64 = server.attr("value")
-                    if (base64.isEmpty()) return@async // Skip if empty
+                    if (base64.isBlank()) return@async
 
-                    val decodedUrl = String(Base64.decode(base64, Base64.DEFAULT))
-                    val regex = Regex("""src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-                    var url = regex.find(decodedUrl)?.groups?.get(1)?.value
+                    // Prevent crash if a server forgets to encode their mirror string
+                    val decodedUrl = try {
+                        String(Base64.decode(base64, Base64.DEFAULT))
+                    } catch (e: Exception) {
+                        base64 
+                    }
                     
-                    // Prevent passing bad/null URLs to loadExtractor
-                    if (url.isNullOrEmpty()) return@async
+                    var url = if (decodedUrl.contains("src=")) {
+                        Regex("""src=["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(decodedUrl)?.groupValues?.get(1)
+                    } else if (decodedUrl.startsWith("http")) {
+                        decodedUrl
+                    } else {
+                        null
+                    }
+                    
+                    if (url.isNullOrBlank()) return@async
                     
                     if (url.startsWith("//")) {
                         url = "https:$url"
