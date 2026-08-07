@@ -1,4 +1,4 @@
-package com.Animekhor
+package com.animekhor
 
 import android.util.Base64
 import com.lagradost.cloudstream3.*
@@ -13,7 +13,7 @@ class AnimekhorProvider : MainAPI() {
     override var mainUrl = "https://animekhor.org"
     override var name = "Animekhor"
     override val hasMainPage = true
-    override var lang = "zh" // Keep 'zh' for Donghua, though subs are English
+    override var lang = "zh" 
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
@@ -58,7 +58,6 @@ class AnimekhorProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        // Fetch up to 2 pages concurrently rather than blocking sequentially
         return coroutineScope {
             (1..2).map { page ->
                 async {
@@ -91,7 +90,6 @@ class AnimekhorProvider : MainAPI() {
                 this.plot = description
             }
         } else {
-            // Optimization: Try to get episodes from the main page first to save a network request
             var epListElements = document.select(".eplister li")
             
             if (epListElements.isEmpty()) {
@@ -106,7 +104,6 @@ class AnimekhorProvider : MainAPI() {
                 val href = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
                 val episodeText = info.selectFirst(".epl-title")?.text() ?: info.selectFirst("a span")?.text() ?: ""
                 
-                // Safe parsing for title/episode number
                 val parsedEpisode = if (episodeText.contains("-")) {
                     episodeText.substringAfter("-").substringBeforeLast("-").trim()
                 } else {
@@ -143,7 +140,6 @@ class AnimekhorProvider : MainAPI() {
                     val base64 = server.attr("value")
                     if (base64.isBlank()) return@async
 
-                    // Prevent crash if a server forgets to encode their mirror string
                     val decodedUrl = try {
                         String(Base64.decode(base64, Base64.DEFAULT))
                     } catch (e: Exception) {
