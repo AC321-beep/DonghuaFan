@@ -1,4 +1,4 @@
-package com.Animekhor
+package com.animekhor
 
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
@@ -9,7 +9,6 @@ import com.lagradost.cloudstream3.extractors.VidhideExtractor
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.newExtractorLink // Added required import for the factory function
 
 class Embedwish : StreamWishExtractor() {
     override var name = "Embedwish"
@@ -68,8 +67,8 @@ class Rumble : ExtractorApi() {
                 
                 if (!videoUrl.isNullOrEmpty()) {
                     callback.invoke(
-                        // Changed back to newExtractorLink to satisfy Cloudstream's strict deprecation rules
-                        newExtractorLink(
+                        // Fixed: Directly instantiating ExtractorLink instead of newExtractorLink
+                        ExtractorLink(
                             source = name,
                             name = name,
                             url = videoUrl,
