@@ -1,4 +1,4 @@
-package com.Animekhor
+package com.animekhor
 
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
