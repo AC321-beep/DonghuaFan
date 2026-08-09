@@ -5,11 +5,11 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
 import com.lagradost.cloudstream3.extractors.VidHidePro
-import com.lagradost.cloudstream3.extractors.VidStack
 import com.lagradost.cloudstream3.extractors.VidhideExtractor
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.INFER_TYPE
+import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
@@ -24,9 +24,41 @@ class Filelions : VidhideExtractor() {
     override var mainUrl = "https://filelions.live"
 }
 
-class P2pstream : VidStack() {
-    override var name = "P2pstream"
+// 1. FIXED FILEMOON/P2PSTREAM EXTRACTOR: Custom JS Unpacker replacing VidStack
+class P2pstream : ExtractorApi() {
+    override var name = "Filemoon"
     override var mainUrl = "https://animekhor.p2pstream.vip"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        // Fixes the URL structure from /#id to /e/id which Filemoon servers expect
+        val fixedUrl = url.replace("/#", "/e/")
+        val response = app.get(fixedUrl, referer = referer ?: mainUrl).text
+        
+        // Unpack the hidden Filemoon javascript
+        val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
+        
+        val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+        
+        if (m3u8 != null) {
+            val headers = mapOf(
+                "Origin" to mainUrl,
+                "Referer" to "$mainUrl/"
+            )
+            M3u8Helper.generateM3u8(
+                name,
+                m3u8,
+                mainUrl,
+                headers = headers
+            ).forEach(callback)
+        }
+    }
 }
 
 class Swhoi : StreamWishExtractor() {
@@ -39,6 +71,58 @@ class VidHidePro5 : VidHidePro() {
     override var name = "VidHidePro"
     override val mainUrl = "https://vidhidevip.com"
     override val requiresReferer = true
+}
+
+// 2. NEW EMTURBOVID EXTRACTOR: Fixes Error 2004 by injecting mandatory headers
+class Emturbovid : ExtractorApi() {
+    override var name = "Emturbovid"
+    override var mainUrl = "https://emturbovid.com"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val response = app.get(url, referer = referer ?: mainUrl).text
+        
+        // Emturbovid wraps their players in packed JS
+        val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
+        
+        val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+        
+        if (m3u8 != null) {
+            // THE FIX: Forcing Origin and Referer headers prevents the server from dropping the connection
+            val headers = mapOf(
+                "Origin" to mainUrl,
+                "Referer" to url,
+                "Accept" to "*/*"
+            )
+            M3u8Helper.generateM3u8(
+                name,
+                m3u8,
+                url,
+                headers = headers
+            ).forEach(callback)
+        } else {
+            // Fallback for raw mp4 files
+            val mp4 = Regex("""file\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+            if (mp4 != null) {
+                callback.invoke(
+                    newExtractorLink(
+                        name = name,
+                        source = name,
+                        url = mp4,
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = url
+                    }
+                )
+            }
+        }
+    }
 }
 
 class Rumble : ExtractorApi() {
@@ -62,7 +146,6 @@ class Rumble : ExtractorApi() {
 
         val scrapedUrls = mutableSetOf<String>()
 
-        // 1. Unified Regex: Captures both standard and JSON-escaped URLs safely
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
 
@@ -70,7 +153,6 @@ class Rumble : ExtractorApi() {
             val rawUrl = match.value
             val cleanUrl = rawUrl.replace("\\/", "/")
 
-            // 2. The Quarantine Filter: Skips UI/tracker assets so ExoPlayer doesn't crash
             if (cleanUrl.contains("/assets/", ignoreCase = true) ||
                 cleanUrl.contains("loop", ignoreCase = true) ||
                 cleanUrl.contains("preview", ignoreCase = true) ||
@@ -81,11 +163,9 @@ class Rumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8")) {
-                    // M3u8Helper automatically handles HLS playlists in modern Cloudstream
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
                     
                 } else if (cleanUrl.contains(".mp4")) {
-                    // 3. Smart Quality Locator: Reads raw HTML before the URL
                     val startIndex = Math.max(0, match.range.first - 150)
                     val precedingText = html.substring(startIndex, match.range.first)
 
@@ -101,7 +181,6 @@ class Rumble : ExtractorApi() {
                         qualityInt = qStr.toIntOrNull() ?: Qualities.Unknown.value
                     }
 
-                    // 4. The Fix: Using the newExtractorLink builder and lambda block
                     callback(
                         newExtractorLink(
                             name = name,
