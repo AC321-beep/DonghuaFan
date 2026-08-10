@@ -24,7 +24,19 @@ class Filelions : VidhideExtractor() {
     override var mainUrl = "https://filelions.live"
 }
 
-// 1. FIXED FILEMOON EXTRACTOR: Custom script replacing VidStack to handle the "/#" hash fragment
+class Swhoi : StreamWishExtractor() {
+    override var name = "Swhoi"
+    override var mainUrl = "https://swhoi.com"
+    override val requiresReferer = true
+}
+
+class VidHidePro5 : VidHidePro() {
+    override var name = "VidHidePro"
+    override val mainUrl = "https://vidhidevip.com"
+    override val requiresReferer = true
+}
+
+// 1. FIXED FILEMOON EXTRACTOR: Resolves the hash fragment pathing issue
 open class P2pstream : ExtractorApi() {
     override var name = "Filemoon"
     override var mainUrl = "https://animekhor.p2pstream.vip"
@@ -44,11 +56,13 @@ open class P2pstream : ExtractorApi() {
             "Referer" to "https://animekhor.org/"
         )
         
-        val response = app.get(fixedUrl, headers = fetchHeaders).text
+        val response = app.get(fixedUrl, headers = fetchHeaders)
+        val document = response.document
+        val html = response.text
         
-        // Unpack the hidden Filemoon javascript payload
-        val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
-        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
+        // Securely locate the packed script block by interacting directly with the DOM
+        val packedScript = document.select("script").firstOrNull { it.data().contains("eval(function(p,a,c,k,e,d") }?.data()
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: html else html
         
         // Extract the raw stream link
         val streamUrl = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""").find(unpacked)?.groupValues?.get(1)
@@ -72,25 +86,13 @@ open class P2pstream : ExtractorApi() {
     }
 }
 
-// 2. NEW CLOUDPLAYER EXTRACTOR: Captures the second Filemoon clone found in the HTML source
+// 2. NEW CLOUDPLAYER EXTRACTOR: Captures the secondary Filemoon clone
 class UpnsLive : P2pstream() {
     override var name = "CloudPlayer"
     override var mainUrl = "https://animekhor.upns.live"
 }
 
-class Swhoi : StreamWishExtractor() {
-    override var name = "Swhoi"
-    override var mainUrl = "https://swhoi.com"
-    override val requiresReferer = true
-}
-
-class VidHidePro5 : VidHidePro() {
-    override var name = "VidHidePro"
-    override val mainUrl = "https://vidhidevip.com"
-    override val requiresReferer = true
-}
-
-// 3. NEW EMTURBOVID EXTRACTOR: Destroys Error 2004 by forcing strict Origin/Referer headers into ExoPlayer
+// 3. FIXED EMTURBOVID EXTRACTOR: Destroys Error 2004 with strict headers
 class Emturbovid : ExtractorApi() {
     override var name = "Emturbovid"
     override var mainUrl = "https://emturbovid.com"
@@ -107,19 +109,22 @@ class Emturbovid : ExtractorApi() {
             "Referer" to "https://animekhor.org/"
         )
         
-        val response = app.get(url, headers = fetchHeaders).text
+        val response = app.get(url, headers = fetchHeaders)
+        val document = response.document
+        val html = response.text
         
-        // Unpack Emturbovid's obfuscated player wrapper
-        val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
-        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
+        // Securely locate the packed script block across multiple lines
+        val packedScript = document.select("script").firstOrNull { it.data().contains("eval(function(p,a,c,k,e,d") }?.data()
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: html else html
         
         val streamUrl = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""").find(unpacked)?.groupValues?.get(1)
         
         if (streamUrl != null) {
-            // THE FIX: These exact headers authorize the chunks and bypass the 403 Forbidden crash
+            // THE FIX: These exact headers authorize the video chunks to stop Error 2004
             val streamHeaders = mapOf(
                 "Origin" to mainUrl,
-                "Referer" to "$mainUrl/" 
+                "Referer" to url,
+                "Accept" to "*/*"
             )
             
             if (streamUrl.contains(".m3u8")) {
