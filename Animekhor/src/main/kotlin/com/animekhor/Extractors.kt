@@ -5,11 +5,11 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
 import com.lagradost.cloudstream3.extractors.VidHidePro
+import com.lagradost.cloudstream3.extractors.VidStack
 import com.lagradost.cloudstream3.extractors.VidhideExtractor
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.INFER_TYPE
-import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
@@ -36,108 +36,47 @@ class VidHidePro5 : VidHidePro() {
     override val requiresReferer = true
 }
 
-// 1. FILEMOON BASE EXTRACTOR: Changed to 'abstract class' to fix the compiler error
-abstract class BaseFilemoon : ExtractorApi() {
-    override val requiresReferer = true
-
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        try {
-            // Transforms Animekhor's hash fragment (/#video_id) into Filemoon's native embed path (/e/video_id)
-            val fixedUrl = url.replace("/#", "/e/")
-            
-            // Injects strict headers to bypass anti-bot 403 Forbidden drops
-            val fetchHeaders = mapOf(
-                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-                "Referer" to "https://animekhor.org/"
-            )
-            
-            val response = app.get(fixedUrl, headers = fetchHeaders)
-            val doc = response.document
-            
-            // Uses JSoup to safely grab the multi-line obfuscated script, avoiding Regex multi-line crashes
-            val script = doc.selectFirst("script:containsData(eval)")?.data()
-            val unpacked = if (script != null) JsUnpacker(script).unpack() ?: response.text else response.text
-            
-            val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked)?.groupValues?.get(1)
-            
-            if (m3u8 != null) {
-                val streamHeaders = mapOf(
-                    "Origin" to mainUrl,
-                    "Referer" to "$mainUrl/"
-                )
-                M3u8Helper.generateM3u8(name, m3u8, fixedUrl, headers = streamHeaders).forEach(callback)
-            }
-        } catch (e: Exception) {
-            Log.e(name, "Filemoon Extraction Error: ${e.message}")
-        }
-    }
-}
-
-// The two custom Filemoon clones found in Animekhor's source
-class P2pstream : BaseFilemoon() {
+// 1. FILEMOON FIX: We inherit VidStack (which natively supports Filemoon), 
+// but we intercept the broken URL to fix Animekhor's syntax typo before passing it on.
+class P2pstream : VidStack() {
     override var name = "Filemoon"
     override var mainUrl = "https://animekhor.p2pstream.vip"
-}
-
-class UpnsLive : BaseFilemoon() {
-    override var name = "CloudPlayer"
-    override var mainUrl = "https://animekhor.upns.live"
-}
-
-// 2. FIXED EMTURBOVID EXTRACTOR: Destroys Error 2004 using strict ExoPlayer headers
-class Emturbovid : ExtractorApi() {
-    override var name = "Emturbovid"
-    override var mainUrl = "https://emturbovid.com"
-    override val requiresReferer = true
-
+    
     override suspend fun getUrl(
         url: String,
         referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        try {
-            val fetchHeaders = mapOf(
-                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-                "Referer" to "https://animekhor.org/"
-            )
-            
-            val response = app.get(url, headers = fetchHeaders)
-            val doc = response.document
-            
-            // Safely grab the script tag using JSoup instead of error-prone string matching
-            val script = doc.selectFirst("script:containsData(eval)")?.data()
-            val unpacked = if (script != null) JsUnpacker(script).unpack() ?: response.text else response.text
-            
-            val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked)?.groupValues?.get(1)
-            
-            if (m3u8 != null) {
-                // THE FIX: Strict Origin and Referer headers applied directly to the M3U8 payload to block Error 2004
-                val streamHeaders = mapOf(
-                    "Origin" to mainUrl,
-                    "Referer" to "$mainUrl/",
-                    "Accept" to "*/*"
-                )
-                M3u8Helper.generateM3u8(name, m3u8, url, headers = streamHeaders).forEach(callback)
-            } else {
-                val mp4 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked)?.groupValues?.get(1)
-                if (mp4 != null) {
-                    callback.invoke(
-                        newExtractorLink(name = name, source = name, url = mp4, type = INFER_TYPE) {
-                            this.headers = mapOf("Referer" to "$mainUrl/")
-                        }
-                    )
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(name, "Emturbovid Extraction Error: ${e.message}")
-        }
+        // Transforms the broken /#yzdsf into the correct /e/yzdsf endpoint VidStack expects
+        val fixedUrl = url.replace("/#", "/e/")
+        super.getUrl(fixedUrl, referer, subtitleCallback, callback)
     }
+}
+
+// Same fix for the secondary Filemoon clone found in Animekhor's source
+class UpnsLive : VidStack() {
+    override var name = "CloudPlayer"
+    override var mainUrl = "https://animekhor.upns.live"
+    
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val fixedUrl = url.replace("/#", "/e/")
+        super.getUrl(fixedUrl, referer, subtitleCallback, callback)
+    }
+}
+
+// 2. EMTURBOVID FIX (Error 2004): Emturbovid operates on the exact same backend as VidHide.
+// By inheriting VidHidePro, Cloudstream automatically handles the complex JS unpacking
+// and injects the perfect anti-bot network headers to stop Error 2004.
+class Emturbovid : VidHidePro() {
+    override var name = "Emturbovid"
+    override val mainUrl = "https://emturbovid.com"
+    override val requiresReferer = true
 }
 
 class Rumble : ExtractorApi() {
