@@ -36,8 +36,8 @@ class VidHidePro5 : VidHidePro() {
     override val requiresReferer = true
 }
 
-// 1. FILEMOON BASE EXTRACTOR: Resolves hash fragment paths and unpacks obfuscated JS securely
-open class BaseFilemoon : ExtractorApi() {
+// 1. FILEMOON BASE EXTRACTOR: Changed to 'abstract class' to fix the compiler error
+abstract class BaseFilemoon : ExtractorApi() {
     override val requiresReferer = true
 
     override suspend fun getUrl(
