@@ -4,6 +4,6 @@ cloudstream {
    status = 1
    tvTypes = listOf("Anime", "Movie")
    language = "zh"
-   version = 2
+   version = 3
    iconUrl = "https://animekhor.org/wp-content/uploads/2021/04/Animekhor-Logo.png"
 }
