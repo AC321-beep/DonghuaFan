@@ -24,8 +24,8 @@ class Filelions : VidhideExtractor() {
     override var mainUrl = "https://filelions.live"
 }
 
-// 1. FIXED FILEMOON/P2PSTREAM EXTRACTOR: Custom JS Unpacker replacing VidStack
-class P2pstream : ExtractorApi() {
+// 1. FIXED FILEMOON EXTRACTOR: Custom script replacing VidStack to handle the "/#" hash fragment
+open class P2pstream : ExtractorApi() {
     override var name = "Filemoon"
     override var mainUrl = "https://animekhor.p2pstream.vip"
     override val requiresReferer = true
@@ -36,29 +36,46 @@ class P2pstream : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Fixes the URL structure from /#id to /e/id which Filemoon servers expect
+        // Fixes the URL structure from /#id to /e/id which Filemoon servers natively expect
         val fixedUrl = url.replace("/#", "/e/")
-        val response = app.get(fixedUrl, referer = referer ?: mainUrl).text
         
-        // Unpack the hidden Filemoon javascript
+        val fetchHeaders = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer" to "https://animekhor.org/"
+        )
+        
+        val response = app.get(fixedUrl, headers = fetchHeaders).text
+        
+        // Unpack the hidden Filemoon javascript payload
         val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
-        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
         
-        val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+        // Extract the raw stream link
+        val streamUrl = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""").find(unpacked)?.groupValues?.get(1)
         
-        if (m3u8 != null) {
-            val headers = mapOf(
+        if (streamUrl != null) {
+            val streamHeaders = mapOf(
                 "Origin" to mainUrl,
                 "Referer" to "$mainUrl/"
             )
-            M3u8Helper.generateM3u8(
-                name,
-                m3u8,
-                mainUrl,
-                headers = headers
-            ).forEach(callback)
+            
+            if (streamUrl.contains(".m3u8")) {
+                M3u8Helper.generateM3u8(name, streamUrl, fixedUrl, headers = streamHeaders).forEach(callback)
+            } else {
+                callback.invoke(
+                    newExtractorLink(name = name, source = name, url = streamUrl, type = INFER_TYPE) {
+                        this.headers = streamHeaders
+                    }
+                )
+            }
         }
     }
+}
+
+// 2. NEW CLOUDPLAYER EXTRACTOR: Captures the second Filemoon clone found in the HTML source
+class UpnsLive : P2pstream() {
+    override var name = "CloudPlayer"
+    override var mainUrl = "https://animekhor.upns.live"
 }
 
 class Swhoi : StreamWishExtractor() {
@@ -73,7 +90,7 @@ class VidHidePro5 : VidHidePro() {
     override val requiresReferer = true
 }
 
-// 2. NEW EMTURBOVID EXTRACTOR: Fixes Error 2004 by injecting mandatory headers
+// 3. NEW EMTURBOVID EXTRACTOR: Destroys Error 2004 by forcing strict Origin/Referer headers into ExoPlayer
 class Emturbovid : ExtractorApi() {
     override var name = "Emturbovid"
     override var mainUrl = "https://emturbovid.com"
@@ -85,39 +102,32 @@ class Emturbovid : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val response = app.get(url, referer = referer ?: mainUrl).text
+        val fetchHeaders = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer" to "https://animekhor.org/"
+        )
         
-        // Emturbovid wraps their players in packed JS
+        val response = app.get(url, headers = fetchHeaders).text
+        
+        // Unpack Emturbovid's obfuscated player wrapper
         val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
-        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
         
-        val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+        val streamUrl = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""").find(unpacked)?.groupValues?.get(1)
         
-        if (m3u8 != null) {
-            // THE FIX: Forcing Origin and Referer headers prevents the server from dropping the connection
-            val headers = mapOf(
+        if (streamUrl != null) {
+            // THE FIX: These exact headers authorize the chunks and bypass the 403 Forbidden crash
+            val streamHeaders = mapOf(
                 "Origin" to mainUrl,
-                "Referer" to url,
-                "Accept" to "*/*"
+                "Referer" to "$mainUrl/" 
             )
-            M3u8Helper.generateM3u8(
-                name,
-                m3u8,
-                url,
-                headers = headers
-            ).forEach(callback)
-        } else {
-            // Fallback for raw mp4 files
-            val mp4 = Regex("""file\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
-            if (mp4 != null) {
+            
+            if (streamUrl.contains(".m3u8")) {
+                M3u8Helper.generateM3u8(name, streamUrl, url, headers = streamHeaders).forEach(callback)
+            } else {
                 callback.invoke(
-                    newExtractorLink(
-                        name = name,
-                        source = name,
-                        url = mp4,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = url
+                    newExtractorLink(name = name, source = name, url = streamUrl, type = INFER_TYPE) {
+                        this.headers = streamHeaders
                     }
                 )
             }
