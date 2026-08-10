@@ -36,8 +36,7 @@ class VidHidePro5 : VidHidePro() {
     override val requiresReferer = true
 }
 
-// 1. STANDALONE FILEMOON EXTRACTOR
-// Uses DOT_MATCHES_ALL to parse multi-line JS and syncs User-Agents to prevent chunk dropping.
+// --- FILEMOON DEBUG EXTRACTOR ---
 abstract class BaseFilemoon : ExtractorApi() {
     override val requiresReferer = true
 
@@ -47,30 +46,50 @@ abstract class BaseFilemoon : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val fixedUrl = url.replace("/#", "/e/")
-        val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        
-        val html = app.get(fixedUrl, headers = mapOf("User-Agent" to userAgent, "Referer" to "https://animekhor.org/")).text
-        
-        // DOT_MATCHES_ALL is mandatory to prevent the regex from failing on line breaks
-        val packedRegex = Regex("""eval\(function\(p,a,c,k,e,[rd]\).*?split\('\|'\).*?\)""", RegexOption.DOT_MATCHES_ALL)
-        val packed = packedRegex.find(html)?.value
-        
-        val unpacked = if (packed != null) JsUnpacker(packed).unpack() ?: html else html
-        
-        val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://.*?\.m3u8.*?)["']""").find(unpacked)?.groupValues?.get(1)
-        
-        if (m3u8 != null) {
-            M3u8Helper.generateM3u8(
-                name, 
-                m3u8, 
-                fixedUrl, 
-                headers = mapOf(
-                    "Origin" to mainUrl, 
-                    "Referer" to "$mainUrl/",
-                    "User-Agent" to userAgent
-                )
-            ).forEach(callback)
+        Log.d(name, "STEP 1: getUrl called with URL: $url")
+        try {
+            val fixedUrl = url.replace("/#", "/e/")
+            Log.d(name, "STEP 2: Fixed URL: $fixedUrl")
+            
+            val fetchHeaders = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+                "Referer" to "https://animekhor.org/"
+            )
+            
+            val response = app.get(fixedUrl, headers = fetchHeaders)
+            Log.d(name, "STEP 3: HTTP GET response code: ${response.code}")
+            
+            val html = response.text
+            Log.d(name, "STEP 4: HTML Length: ${html.length}. Contains eval? ${html.contains("eval(function")}")
+            
+            val packedRegex = Regex("""eval\(function\(p,a,c,k,e,[rd]\).*?split\('\|'\).*?\)""", RegexOption.DOT_MATCHES_ALL)
+            val packed = packedRegex.find(html)?.value
+            
+            if (packed != null) {
+                Log.d(name, "STEP 5: Packed JS found. Length: ${packed.length}")
+            } else {
+                Log.e(name, "STEP 5: Packed JS NOT FOUND. Did Regex fail?")
+            }
+            
+            val unpacked = if (packed != null) JsUnpacker(packed).unpack() ?: html else html
+            Log.d(name, "STEP 6: Unpacked length: ${unpacked.length}. Contains m3u8? ${unpacked.contains(".m3u8")}")
+            
+            val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://.*?\.m3u8.*?)["']""").find(unpacked)?.groupValues?.get(1)
+            
+            if (m3u8 != null) {
+                Log.d(name, "STEP 7: Extracted M3U8: $m3u8")
+                val streamHeaders = mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/")
+                Log.d(name, "STEP 8: Generating links with M3u8Helper. Headers: $streamHeaders")
+                
+                M3u8Helper.generateM3u8(name, m3u8, fixedUrl, headers = streamHeaders).forEach { link ->
+                    Log.d(name, "STEP 9: Emitting Link -> ${link.url}")
+                    callback(link)
+                }
+            } else {
+                Log.e(name, "STEP 7: Failed to extract M3U8 link from unpacked code.")
+            }
+        } catch (e: Exception) {
+            Log.e(name, "CRASH: ${e.stackTraceToString()}")
         }
     }
 }
@@ -85,8 +104,7 @@ class UpnsLive : BaseFilemoon() {
     override var mainUrl = "https://animekhor.upns.live"
 }
 
-// 2. STANDALONE EMTURBOVID EXTRACTOR
-// Completely fixes Error 2004 by synchronizing the ExoPlayer User-Agent with the initial fetch
+// --- EMTURBOVID DEBUG EXTRACTOR ---
 class Emturbovid : ExtractorApi() {
     override var name = "Emturbovid"
     override var mainUrl = "https://emturbovid.com"
@@ -98,43 +116,65 @@ class Emturbovid : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // We MUST hardcode a User-Agent so ExoPlayer doesn't get banned for switching Agents halfway through
-        val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        
-        val html = app.get(url, headers = mapOf("User-Agent" to userAgent, "Referer" to "https://animekhor.org/")).text
-        
-        val packedRegex = Regex("""eval\(function\(p,a,c,k,e,[rd]\).*?split\('\|'\).*?\)""", RegexOption.DOT_MATCHES_ALL)
-        val packed = packedRegex.find(html)?.value
-        
-        val unpacked = if (packed != null) JsUnpacker(packed).unpack() ?: html else html
-        
-        val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://.*?\.m3u8.*?)["']""").find(unpacked)?.groupValues?.get(1)
-        
-        if (m3u8 != null) {
-            M3u8Helper.generateM3u8(
-                name, 
-                m3u8, 
-                url, 
-                // Passing the exact same User-Agent to the video player prevents Error 2004
-                headers = mapOf(
+        Log.d(name, "STEP 1: getUrl called with URL: $url")
+        try {
+            val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+            val fetchHeaders = mapOf(
+                "User-Agent" to userAgent,
+                "Referer" to "https://animekhor.org/"
+            )
+            
+            val response = app.get(url, headers = fetchHeaders)
+            Log.d(name, "STEP 2: HTTP GET response code: ${response.code}")
+            
+            val html = response.text
+            Log.d(name, "STEP 3: HTML Length: ${html.length}. Contains eval? ${html.contains("eval(function")}")
+            
+            val packedRegex = Regex("""eval\(function\(p,a,c,k,e,[rd]\).*?split\('\|'\).*?\)""", RegexOption.DOT_MATCHES_ALL)
+            val packed = packedRegex.find(html)?.value
+            
+            if (packed != null) {
+                Log.d(name, "STEP 4: Packed JS found. Length: ${packed.length}")
+            } else {
+                Log.e(name, "STEP 4: Packed JS NOT FOUND.")
+            }
+            
+            val unpacked = if (packed != null) JsUnpacker(packed).unpack() ?: html else html
+            Log.d(name, "STEP 5: Unpacked length: ${unpacked.length}. Contains m3u8? ${unpacked.contains(".m3u8")}")
+            
+            val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://.*?\.m3u8.*?)["']""").find(unpacked)?.groupValues?.get(1)
+            
+            if (m3u8 != null) {
+                Log.d(name, "STEP 6: Extracted M3U8: $m3u8")
+                val streamHeaders = mapOf(
                     "Origin" to mainUrl, 
                     "Referer" to "$mainUrl/",
-                    "User-Agent" to userAgent
+                    "User-Agent" to userAgent,
+                    "Accept" to "*/*"
                 )
-            ).forEach(callback)
-        } else {
-            val mp4 = Regex("""(?:file|src)\s*:\s*["'](https?://.*?\.mp4.*?)["']""").find(unpacked)?.groupValues?.get(1)
-            if (mp4 != null) {
-                callback.invoke(
-                    newExtractorLink(name = name, source = name, url = mp4, type = INFER_TYPE) {
-                        this.headers = mapOf(
-                            "Origin" to mainUrl, 
-                            "Referer" to "$mainUrl/",
-                            "User-Agent" to userAgent
-                        )
-                    }
-                )
+                Log.d(name, "STEP 7: Handing to M3u8Helper. Headers: $streamHeaders")
+                
+                M3u8Helper.generateM3u8(name, m3u8, url, headers = streamHeaders).forEach { link ->
+                    Log.d(name, "STEP 8: Emitting Link -> ${link.url}")
+                    callback(link)
+                }
+            } else {
+                Log.e(name, "STEP 6: No M3U8 found. Searching for raw MP4...")
+                val mp4 = Regex("""(?:file|src)\s*:\s*["'](https?://.*?\.mp4.*?)["']""").find(unpacked)?.groupValues?.get(1)
+                
+                if (mp4 != null) {
+                    Log.d(name, "STEP 7: MP4 found: $mp4")
+                    callback.invoke(
+                        newExtractorLink(name = name, source = name, url = mp4, type = INFER_TYPE) {
+                            this.headers = mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/")
+                        }
+                    )
+                } else {
+                    Log.e(name, "STEP 7: Extractor failed. No video link found in HTML.")
+                }
             }
+        } catch (e: Exception) {
+            Log.e(name, "CRASH: ${e.stackTraceToString()}")
         }
     }
 }
@@ -150,11 +190,9 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        Log.d(name, "Starting extraction for: $url")
         val html = try {
             app.get(url, referer = referer ?: mainUrl).text
         } catch (e: Exception) {
-            Log.e(name, "Failed to fetch Rumble embed page: ${e.message}")
             return
         }
 
@@ -166,41 +204,26 @@ class Rumble : ExtractorApi() {
             val rawUrl = match.value
             val cleanUrl = rawUrl.replace("\\/", "/")
 
-            if (cleanUrl.contains("/assets/", ignoreCase = true) ||
-                cleanUrl.contains("loop", ignoreCase = true) ||
-                cleanUrl.contains("preview", ignoreCase = true) ||
-                cleanUrl.contains("tracker", ignoreCase = true) ||
-                cleanUrl.contains("thumb", ignoreCase = true)) {
+            if (cleanUrl.contains("/assets/", ignoreCase = true) || cleanUrl.contains("loop", ignoreCase = true) ||
+                cleanUrl.contains("preview", ignoreCase = true) || cleanUrl.contains("tracker", ignoreCase = true)) {
                 return@forEach
             }
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8")) {
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
-                    
                 } else if (cleanUrl.contains(".mp4")) {
                     val startIndex = Math.max(0, match.range.first - 150)
                     val precedingText = html.substring(startIndex, match.range.first)
-
                     val qMatch = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""").findAll(precedingText).lastOrNull()
                         ?: Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""").findAll(precedingText).lastOrNull()
 
-                    var displayLabel = name
-                    var qualityInt = Qualities.Unknown.value
-
-                    if (qMatch != null) {
-                        val qStr = qMatch.groupValues[1]
-                        displayLabel = "$name ${qStr}p"
-                        qualityInt = qStr.toIntOrNull() ?: Qualities.Unknown.value
-                    }
+                    val qStr = qMatch?.groupValues?.get(1)
+                    val qualityInt = qStr?.toIntOrNull() ?: Qualities.Unknown.value
+                    val displayLabel = if (qStr != null) "$name ${qStr}p" else name
 
                     callback(
-                        newExtractorLink(
-                            name = name,
-                            source = displayLabel,
-                            url = cleanUrl,
-                            type = INFER_TYPE
-                        ) {
+                        newExtractorLink(name = name, source = displayLabel, url = cleanUrl, type = INFER_TYPE) {
                             this.referer = url
                             this.quality = qualityInt
                         }
