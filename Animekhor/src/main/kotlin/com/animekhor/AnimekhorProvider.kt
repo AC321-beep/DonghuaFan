@@ -27,14 +27,9 @@ class AnimekhorProvider : MainAPI() {
         "anime/?status=completed&order=update" to "Completed"
     )
 
-    override suspend fun getMainPage(
-        page: Int,
-        request: MainPageRequest
-    ): HomePageResponse {
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val document = app.get("$mainUrl/${request.data}&page=$page").document
-        val home = document.select("div.listupd > article, div.bsx")
-            .mapNotNull { it.toSearchResult() }
-            .distinctBy { it.url }
+        val home = document.select("div.listupd > article, div.bsx").mapNotNull { it.toSearchResult() }.distinctBy { it.url }
         return newHomePageResponse(request.name, home)
     }
 
@@ -49,8 +44,7 @@ class AnimekhorProvider : MainAPI() {
     private fun Element.getsrcAttribute(): String {
         return this.attr("data-src").takeIf { it.startsWith("http") }
             ?: this.attr("src").takeIf { it.startsWith("http") }
-            ?: this.attr("data-lazy-src").takeIf { it.startsWith("http") }
-            ?: ""
+            ?: this.attr("data-lazy-src").takeIf { it.startsWith("http") } ?: ""
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -60,9 +54,7 @@ class AnimekhorProvider : MainAPI() {
                     try {
                         val document = app.get("$mainUrl/page/$page/?s=$query").document
                         document.select("div.listupd > article, div.bsx").mapNotNull { it.toSearchResult() }
-                    } catch (e: Exception) {
-                        emptyList()
-                    }
+                    } catch (e: Exception) { emptyList() }
                 }
             }.awaitAll().flatten()
         }
@@ -75,7 +67,6 @@ class AnimekhorProvider : MainAPI() {
         val poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim() ?: ""
         val description = document.selectFirst("div.entry-content")?.text()?.trim()
         val type = document.selectFirst(".spe")?.text()
-        
         val tvtag = if (type?.contains("Movie", ignoreCase = true) == true) TvType.Movie else TvType.TvSeries
 
         if (tvtag == TvType.Movie) {
@@ -97,11 +88,7 @@ class AnimekhorProvider : MainAPI() {
             val episodes = epListElements.mapNotNull { info ->
                 val href = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
                 val episodeText = info.selectFirst(".epl-title")?.text() ?: info.selectFirst("a span")?.text() ?: ""
-                val parsedEpisode = if (episodeText.contains("-")) {
-                    episodeText.substringAfter("-").substringBeforeLast("-").trim()
-                } else {
-                    episodeText.trim()
-                }
+                val parsedEpisode = if (episodeText.contains("-")) episodeText.substringAfter("-").substringBeforeLast("-").trim() else episodeText.trim()
                 
                 newEpisode(href) {
                     this.name = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText
@@ -116,12 +103,7 @@ class AnimekhorProvider : MainAPI() {
         }
     }
 
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val document = app.get(data).document
         val servers = document.select(".mobius option")
         
@@ -137,14 +119,26 @@ class AnimekhorProvider : MainAPI() {
                         Regex("""src=["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(decodedUrl)?.groupValues?.get(1)
                     } else if (decodedUrl.startsWith("http")) {
                         decodedUrl
-                    } else {
-                        null
-                    }
+                    } else { null }
                     
                     if (url.isNullOrBlank()) return@async
                     if (url.startsWith("//")) url = "https:$url"
                     
-                    loadExtractor(url, mainUrl, subtitleCallback, callback)
+                    // --- DIRECT INVOCATION BYPASS ---
+                    // Bypasses the broken global registry and manually routes to our Extractors.kt classes
+                    when {
+                        url.contains("p2pstream.vip") -> P2pstream().getUrl(url, mainUrl, subtitleCallback, callback)
+                        url.contains("upns.live") -> UpnsLive().getUrl(url, mainUrl, subtitleCallback, callback)
+                        url.contains("emturbovid") -> Emturbovid().getUrl(url, mainUrl, subtitleCallback, callback)
+                        url.contains("listeamed") -> Listeamed().getUrl(url, mainUrl, subtitleCallback, callback)
+                        url.contains("abyssplayer") -> AbyssPlayer().getUrl(url, mainUrl, subtitleCallback, callback)
+                        url.contains("rumble") -> Rumble().getUrl(url, mainUrl, subtitleCallback, callback)
+                        url.contains("embedwish") -> Embedwish().getUrl(url, mainUrl, subtitleCallback, callback)
+                        url.contains("filelions") -> Filelions().getUrl(url, mainUrl, subtitleCallback, callback)
+                        url.contains("swhoi") -> Swhoi().getUrl(url, mainUrl, subtitleCallback, callback)
+                        url.contains("vidhide") -> VidHidePro5().getUrl(url, mainUrl, subtitleCallback, callback)
+                        else -> loadExtractor(url, mainUrl, subtitleCallback, callback) // Native fallback for known core links
+                    }
                 }
             }.awaitAll()
         }
