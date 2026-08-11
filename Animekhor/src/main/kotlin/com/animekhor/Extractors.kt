@@ -24,43 +24,6 @@ class Filelions : VidhideExtractor() {
     override var mainUrl = "https://filelions.live"
 }
 
-// 1. FIXED FILEMOON/P2PSTREAM EXTRACTOR: Custom JS Unpacker replacing VidStack
-class P2pstream : ExtractorApi() {
-    override var name = "Filemoon"
-    override var mainUrl = "https://animekhor.p2pstream.vip"
-    override val requiresReferer = true
-
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        // Fixes the URL structure from /#id to /e/id which Filemoon servers expect
-        val fixedUrl = url.replace("/#", "/e/")
-        val response = app.get(fixedUrl, referer = referer ?: mainUrl).text
-        
-        // Unpack the hidden Filemoon javascript
-        val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
-        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
-        
-        val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
-        
-        if (m3u8 != null) {
-            val headers = mapOf(
-                "Origin" to mainUrl,
-                "Referer" to "$mainUrl/"
-            )
-            M3u8Helper.generateM3u8(
-                name,
-                m3u8,
-                mainUrl,
-                headers = headers
-            ).forEach(callback)
-        }
-    }
-}
-
 class Swhoi : StreamWishExtractor() {
     override var name = "Swhoi"
     override var mainUrl = "https://swhoi.com"
@@ -73,10 +36,9 @@ class VidHidePro5 : VidHidePro() {
     override val requiresReferer = true
 }
 
-// 2. NEW EMTURBOVID EXTRACTOR: Fixes Error 2004 by injecting mandatory headers
-class Emturbovid : ExtractorApi() {
-    override var name = "Emturbovid"
-    override var mainUrl = "https://emturbovid.com"
+// --- FILEMOON & CLONES ---
+
+abstract class BaseFilemoonExtractor : ExtractorApi() {
     override val requiresReferer = true
 
     override suspend fun getUrl(
@@ -85,45 +47,103 @@ class Emturbovid : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val response = app.get(url, referer = referer ?: mainUrl).text
+        val fixedUrl = url.replace("/#", "/e/")
+        val headers = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer" to "https://animekhor.org/"
+        )
         
-        // Emturbovid wraps their players in packed JS
-        val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
+        val response = app.get(fixedUrl, headers = headers).text
+        val packedScript = Regex("""eval\(function\(p,a,c,k,e,.*?\).*?split\('\|'\).*?\)""").find(response)?.value
         val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
         
-        val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
-        
+        val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+            ?: Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(unpacked ?: "")?.groupValues?.get(1)
+
         if (m3u8 != null) {
-            // THE FIX: Forcing Origin and Referer headers prevents the server from dropping the connection
-            val headers = mapOf(
+            val streamHeaders = mapOf(
                 "Origin" to mainUrl,
-                "Referer" to url,
-                "Accept" to "*/*"
+                "Referer" to "$mainUrl/",
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
-            M3u8Helper.generateM3u8(
-                name,
-                m3u8,
-                url,
-                headers = headers
-            ).forEach(callback)
+            M3u8Helper.generateM3u8(name, m3u8, fixedUrl, headers = streamHeaders).forEach(callback)
+        }
+    }
+}
+
+class P2pstream : BaseFilemoonExtractor() {
+    override var name = "Filemoon"
+    override var mainUrl = "https://animekhor.p2pstream.vip"
+}
+
+class UpnsLive : BaseFilemoonExtractor() {
+    override var name = "CloudPlayer"
+    override var mainUrl = "https://animekhor.upns.live"
+}
+
+// --- EMTURBOVID & VIDHIDE CLONES ---
+
+abstract class BaseVidHideCloneExtractor : ExtractorApi() {
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        // Fix endpoint paths from /t/ or /v/ to /e/
+        val fixedUrl = url.replace("/t/", "/e/").replace("/v/", "/e/")
+        val fetchHeaders = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer" to "https://animekhor.org/"
+        )
+        
+        val response = app.get(fixedUrl, headers = fetchHeaders).text
+        val packedScript = Regex("""eval\(function\(p,a,c,k,e,.*?\).*?split\('\|'\).*?\)""").find(response)?.value
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
+        
+        val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+            ?: Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(unpacked ?: "")?.groupValues?.get(1)
+
+        if (m3u8 != null) {
+            // Strict headers sent to ExoPlayer to block Error 2004
+            val streamHeaders = mapOf(
+                "Origin" to mainUrl,
+                "Referer" to fixedUrl,
+                "Accept" to "*/*",
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+            M3u8Helper.generateM3u8(name, m3u8, fixedUrl, headers = streamHeaders).forEach(callback)
         } else {
-            // Fallback for raw mp4 files
-            val mp4 = Regex("""file\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+            val mp4 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
             if (mp4 != null) {
                 callback.invoke(
-                    newExtractorLink(
-                        name = name,
-                        source = name,
-                        url = mp4,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = url
+                    newExtractorLink(name = name, source = name, url = mp4, type = INFER_TYPE) {
+                        this.referer = fixedUrl
                     }
                 )
             }
         }
     }
 }
+
+class Emturbovid : BaseVidHideCloneExtractor() {
+    override var name = "Emturbovid"
+    override var mainUrl = "https://emturbovid.com"
+}
+
+class Listeamed : BaseVidHideCloneExtractor() {
+    override var name = "VGPlayer"
+    override var mainUrl = "https://listeamed.net"
+}
+
+class AbyssPlayer : BaseVidHideCloneExtractor() {
+    override var name = "AbyssPlayer"
+    override var mainUrl = "https://abyssplayer.com"
+}
+
+// --- RUMBLE ---
 
 class Rumble : ExtractorApi() {
     override val name = "Rumble"
@@ -136,22 +156,18 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        Log.d(name, "Starting extraction for: $url")
         val html = try {
             app.get(url, referer = referer ?: mainUrl).text
         } catch (e: Exception) {
-            Log.e(name, "Failed to fetch Rumble embed page: ${e.message}")
             return
         }
 
         val scrapedUrls = mutableSetOf<String>()
-
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
 
         matches.forEach { match ->
-            val rawUrl = match.value
-            val cleanUrl = rawUrl.replace("\\/", "/")
+            val cleanUrl = match.value.replace("\\/", "/")
 
             if (cleanUrl.contains("/assets/", ignoreCase = true) ||
                 cleanUrl.contains("loop", ignoreCase = true) ||
@@ -164,7 +180,6 @@ class Rumble : ExtractorApi() {
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8")) {
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
-                    
                 } else if (cleanUrl.contains(".mp4")) {
                     val startIndex = Math.max(0, match.range.first - 150)
                     val precedingText = html.substring(startIndex, match.range.first)
