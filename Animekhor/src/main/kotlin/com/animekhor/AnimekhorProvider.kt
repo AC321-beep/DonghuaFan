@@ -1,7 +1,6 @@
 package com.animekhor
 
 import android.util.Base64
-import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
@@ -104,11 +103,15 @@ class AnimekhorProvider : MainAPI() {
         }
     }
 
-    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
         val document = app.get(data).document
         val servers = document.select(".mobius option")
-        
-        // Exact logic from the working Donghuastream sample
+
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl
             if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
@@ -140,7 +143,7 @@ class AnimekhorProvider : MainAPI() {
                         Regex("""src=["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(decodedUrl)?.groupValues?.get(1)
                     } else if (decodedUrl.startsWith("http")) {
                         decodedUrl
-                    } else { null }
+                    } else null
                     
                     if (!url.isNullOrBlank()) {
                         invokeExtractor(url, server.text().trim())
