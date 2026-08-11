@@ -1,6 +1,7 @@
 package com.animekhor
 
 import android.util.Base64
+import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
@@ -107,6 +108,26 @@ class AnimekhorProvider : MainAPI() {
         val document = app.get(data).document
         val servers = document.select(".mobius option")
         
+        // Exact logic from the working Donghuastream sample
+        suspend fun invokeExtractor(iframeUrl: String, label: String) {
+            var finalUrl = iframeUrl
+            if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
+
+            when {
+                "p2pstream.vip" in finalUrl -> P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "upns.live" in finalUrl -> UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "listeamed" in finalUrl -> Listeamed().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "abyssplayer" in finalUrl -> AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "embedwish" in finalUrl -> Embedwish().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "filelions" in finalUrl -> Filelions().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "swhoi" in finalUrl -> Swhoi().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "vidhide" in finalUrl -> VidHidePro5().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                else -> loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
+            }
+        }
+
         coroutineScope {
             servers.map { server ->
                 async {
@@ -115,29 +136,14 @@ class AnimekhorProvider : MainAPI() {
 
                     val decodedUrl = try { String(Base64.decode(base64, Base64.DEFAULT)) } catch (e: Exception) { base64 }
                     
-                    var url = if (decodedUrl.contains("src=")) {
+                    val url = if (decodedUrl.contains("src=")) {
                         Regex("""src=["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(decodedUrl)?.groupValues?.get(1)
                     } else if (decodedUrl.startsWith("http")) {
                         decodedUrl
                     } else { null }
                     
-                    if (url.isNullOrBlank()) return@async
-                    if (url.startsWith("//")) url = "https:$url"
-                    
-                    // --- DIRECT INVOCATION BYPASS ---
-                    // Bypasses the broken global registry and manually routes to our Extractors.kt classes
-                    when {
-                        url.contains("p2pstream.vip") -> P2pstream().getUrl(url, mainUrl, subtitleCallback, callback)
-                        url.contains("upns.live") -> UpnsLive().getUrl(url, mainUrl, subtitleCallback, callback)
-                        url.contains("emturbovid") -> Emturbovid().getUrl(url, mainUrl, subtitleCallback, callback)
-                        url.contains("listeamed") -> Listeamed().getUrl(url, mainUrl, subtitleCallback, callback)
-                        url.contains("abyssplayer") -> AbyssPlayer().getUrl(url, mainUrl, subtitleCallback, callback)
-                        url.contains("rumble") -> Rumble().getUrl(url, mainUrl, subtitleCallback, callback)
-                        url.contains("embedwish") -> Embedwish().getUrl(url, mainUrl, subtitleCallback, callback)
-                        url.contains("filelions") -> Filelions().getUrl(url, mainUrl, subtitleCallback, callback)
-                        url.contains("swhoi") -> Swhoi().getUrl(url, mainUrl, subtitleCallback, callback)
-                        url.contains("vidhide") -> VidHidePro5().getUrl(url, mainUrl, subtitleCallback, callback)
-                        else -> loadExtractor(url, mainUrl, subtitleCallback, callback) // Native fallback for known core links
+                    if (!url.isNullOrBlank()) {
+                        invokeExtractor(url, server.text().trim())
                     }
                 }
             }.awaitAll()
