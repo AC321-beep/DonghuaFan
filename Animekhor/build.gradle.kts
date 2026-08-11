@@ -5,5 +5,6 @@ cloudstream {
    tvTypes = listOf("Anime", "Movie")
    language = "zh"
    version = 5
-   iconUrl = "https://animekhor.org/wp-content/uploads/2021/04/Animekhor-Logo.png"
+   // Uses Google's Favicon API to safely fetch the site's high-res logo and bypass hotlink protection
+   iconUrl = "https://www.google.com/s2/favicons?domain=animekhor.org&sz=256"
 }
