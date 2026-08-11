@@ -7,17 +7,18 @@ import android.content.Context
 @CloudstreamPlugin
 class AnimekhorPlugin : Plugin() {
     override fun load(context: Context) {
-        // Register the main provider scraping logic
         registerMainAPI(AnimekhorProvider())
         
-        // Explicitly register all custom extractors to override the broken generic ones
+        // Explicitly register ALL dropdown sources
         registerExtractorAPI(Embedwish())
         registerExtractorAPI(Filelions())
-        registerExtractorAPI(P2pstream())
-        registerExtractorAPI(UpnsLive())
         registerExtractorAPI(Swhoi())
         registerExtractorAPI(VidHidePro5())
+        registerExtractorAPI(P2pstream())
+        registerExtractorAPI(UpnsLive())
         registerExtractorAPI(Emturbovid())
+        registerExtractorAPI(Listeamed())
+        registerExtractorAPI(AbyssPlayer())
         registerExtractorAPI(Rumble())
     }
 }
