@@ -7,8 +7,10 @@ import com.lagradost.cloudstream3.extractors.VidHidePro
 import com.lagradost.cloudstream3.extractors.VidhideExtractor
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.newExtractorLink
 
 class Embedwish : StreamWishExtractor() {
     override var name = "Embedwish"
@@ -46,21 +48,23 @@ abstract class CustomVidHide : ExtractorApi() {
         val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
         
         if (m3u8 != null) {
-            @Suppress("DEPRECATION")
+            // FIX: Migrated to newExtractorLink builder to prevent compiler failure
             callback.invoke(
-                ExtractorLink(
-                    source = name,
+                newExtractorLink(
                     name = name,
+                    source = name,
                     url = m3u8,
-                    referer = fixedUrl,
-                    quality = Qualities.Unknown.value,
-                    isM3u8 = true, // Passes directly to ExoPlayer
-                    headers = mapOf(
+                    type = INFER_TYPE
+                ) {
+                    this.referer = fixedUrl
+                    this.quality = Qualities.Unknown.value
+                    this.isM3u8 = true
+                    this.headers = mapOf(
                         "Origin" to mainUrl,
                         "Referer" to "$mainUrl/",
                         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
                     )
-                )
+                }
             )
         }
     }
@@ -95,21 +99,23 @@ abstract class CustomFilemoon : ExtractorApi() {
         val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
         
         if (m3u8 != null) {
-            @Suppress("DEPRECATION")
+            // FIX: Migrated to newExtractorLink builder
             callback.invoke(
-                ExtractorLink(
-                    source = name,
+                newExtractorLink(
                     name = name,
+                    source = name,
                     url = m3u8,
-                    referer = fixedUrl,
-                    quality = Qualities.Unknown.value,
-                    isM3u8 = true,
-                    headers = mapOf(
+                    type = INFER_TYPE
+                ) {
+                    this.referer = fixedUrl
+                    this.quality = Qualities.Unknown.value
+                    this.isM3u8 = true
+                    this.headers = mapOf(
                         "Origin" to "https://filemoon.sx",
                         "Referer" to "https://filemoon.sx/",
                         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
                     )
-                )
+                }
             )
         }
     }
@@ -137,16 +143,18 @@ class Rumble : ExtractorApi() {
         matches.forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
             if (!cleanUrl.contains("/assets/", true) && !cleanUrl.contains("loop", true)) {
-                @Suppress("DEPRECATION")
+                // FIX: Migrated to newExtractorLink builder
                 callback.invoke(
-                    ExtractorLink(
-                        source = name,
+                    newExtractorLink(
                         name = name,
+                        source = name,
                         url = cleanUrl,
-                        referer = url,
-                        quality = Qualities.Unknown.value,
-                        isM3u8 = cleanUrl.contains(".m3u8")
-                    )
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
+                        this.isM3u8 = cleanUrl.contains(".m3u8")
+                    }
                 )
             }
         }
