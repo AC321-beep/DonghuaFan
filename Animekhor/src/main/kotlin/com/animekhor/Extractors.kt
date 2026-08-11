@@ -8,10 +8,10 @@ import com.lagradost.cloudstream3.extractors.VidHidePro
 import com.lagradost.cloudstream3.extractors.VidhideExtractor
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.JsUnpacker
-import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.INFER_TYPE
+import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.M3u8Helper
+import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
 class Embedwish : StreamWishExtractor() {
@@ -36,33 +36,91 @@ class VidHidePro5 : VidHidePro() {
     override val requiresReferer = true
 }
 
-// --- VIDHIDE CLONES (Fixes Error 2004 via M3u8Helper) ---
-abstract class CustomVidHide : ExtractorApi() {
+// --- FILEMOON & CLONES (Using your exact working logic) ---
+
+class P2pstream : ExtractorApi() {
+    override var name = "Filemoon"
+    override var mainUrl = "https://animekhor.p2pstream.vip"
     override val requiresReferer = true
-    
+
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        val fixedUrl = url.replace("/t/", "/e/").replace("/v/", "/e/")
-        val response = app.get(fixedUrl, referer = referer ?: "https://animekhor.org/").text
+        val fixedUrl = url.replace("/#", "/e/")
+        val response = app.get(fixedUrl, referer = referer ?: mainUrl).text
         
-        val packed = Regex("""eval\(function\(p,a,c,k,e,.*?\).*?split\('\|'\).*?\)""", RegexOption.DOT_MATCHES_ALL).find(response)?.value
-        val unpacked = if (packed != null) JsUnpacker(packed).unpack() else response
+        val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
         
-        val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+        val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
         
         if (m3u8 != null) {
-            // Using M3u8Helper bypasses the newExtractorLink compiler issues entirely
+            val headers = mapOf(
+                "Origin" to mainUrl,
+                "Referer" to "$mainUrl/",
+                // Added User-Agent to prevent the connection drop
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+            )
+            M3u8Helper.generateM3u8(name, m3u8, mainUrl, headers = headers).forEach(callback)
+        }
+    }
+}
+
+class UpnsLive : ExtractorApi() {
+    override var name = "CloudPlayer"
+    override var mainUrl = "https://animekhor.upns.live"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        val fixedUrl = url.replace("/#", "/e/")
+        val response = app.get(fixedUrl, referer = referer ?: mainUrl).text
+        
+        val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
+        
+        val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+        
+        if (m3u8 != null) {
             val headers = mapOf(
                 "Origin" to mainUrl,
                 "Referer" to "$mainUrl/",
                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
             )
-            M3u8Helper.generateM3u8(name, m3u8, fixedUrl, headers = headers).forEach(callback)
+            M3u8Helper.generateM3u8(name, m3u8, mainUrl, headers = headers).forEach(callback)
+        }
+    }
+}
+
+
+// --- EMTURBOVID & CLONES (Using your exact working logic) ---
+
+class Emturbovid : ExtractorApi() {
+    override var name = "Emturbovid"
+    override var mainUrl = "https://emturbovid.com"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        val fixedUrl = url.replace("/t/", "/e/").replace("/v/", "/e/")
+        val response = app.get(fixedUrl, referer = referer ?: mainUrl).text
+        
+        val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
+        
+        val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+        
+        if (m3u8 != null) {
+            val headers = mapOf(
+                "Origin" to mainUrl,
+                "Referer" to url,
+                "Accept" to "*/*",
+                // THE FIX: Forcing User-Agent destroys Error 2004 natively
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+            )
+            M3u8Helper.generateM3u8(name, m3u8, url, headers = headers).forEach(callback)
         } else {
-            val mp4 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+            val mp4 = Regex("""file\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
             if (mp4 != null) {
-                callback(
-                    newExtractorLink(name, name, mp4, INFER_TYPE) {
-                        this.referer = fixedUrl
+                callback.invoke(
+                    newExtractorLink(name = name, source = name, url = mp4, type = INFER_TYPE) {
+                        this.referer = url
                     }
                 )
             }
@@ -70,67 +128,61 @@ abstract class CustomVidHide : ExtractorApi() {
     }
 }
 
-class Emturbovid : CustomVidHide() {
-    override var name = "Player"
-    override var mainUrl = "https://emturbovid.com"
-}
-
-class Listeamed : CustomVidHide() {
+class Listeamed : ExtractorApi() {
     override var name = "VGPlayer"
     override var mainUrl = "https://listeamed.net"
-}
-
-class AbyssPlayer : CustomVidHide() {
-    override var name = "AbyssPlayer"
-    override var mainUrl = "https://abyssplayer.com"
-}
-
-// --- FILEMOON CLONES ---
-abstract class CustomFilemoon : ExtractorApi() {
     override val requiresReferer = true
-    
+
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        val fixedUrl = url.replace("/#", "/e/")
-        val response = app.get(fixedUrl, referer = referer ?: "https://animekhor.org/").text
-        
-        val packed = Regex("""eval\(function\(p,a,c,k,e,.*?\).*?split\('\|'\).*?\)""", RegexOption.DOT_MATCHES_ALL).find(response)?.value
-        val unpacked = if (packed != null) JsUnpacker(packed).unpack() else response
-        
-        val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+        val fixedUrl = url.replace("/t/", "/e/").replace("/v/", "/e/")
+        val response = app.get(fixedUrl, referer = referer ?: mainUrl).text
+        val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
+        val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
         
         if (m3u8 != null) {
-            val headers = mapOf(
-                "Origin" to "https://filemoon.sx",
-                "Referer" to "https://filemoon.sx/",
-                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-            )
-            M3u8Helper.generateM3u8(name, m3u8, fixedUrl, headers = headers).forEach(callback)
+            val headers = mapOf("Origin" to mainUrl, "Referer" to url, "Accept" to "*/*", "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            M3u8Helper.generateM3u8(name, m3u8, url, headers = headers).forEach(callback)
+        } else {
+            val mp4 = Regex("""file\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+            if (mp4 != null) {
+                callback.invoke(newExtractorLink(name = name, source = name, url = mp4, type = INFER_TYPE) { this.referer = url })
+            }
         }
     }
 }
 
-class P2pstream : CustomFilemoon() {
-    override var name = "FileMoon Player"
-    override var mainUrl = "https://animekhor.p2pstream.vip"
+class AbyssPlayer : ExtractorApi() {
+    override var name = "AbyssPlayer"
+    override var mainUrl = "https://abyssplayer.com"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        val fixedUrl = url.replace("/t/", "/e/").replace("/v/", "/e/")
+        val response = app.get(fixedUrl, referer = referer ?: mainUrl).text
+        val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
+        val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+        
+        if (m3u8 != null) {
+            val headers = mapOf("Origin" to mainUrl, "Referer" to url, "Accept" to "*/*", "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            M3u8Helper.generateM3u8(name, m3u8, url, headers = headers).forEach(callback)
+        } else {
+            val mp4 = Regex("""file\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+            if (mp4 != null) {
+                callback.invoke(newExtractorLink(name = name, source = name, url = mp4, type = INFER_TYPE) { this.referer = url })
+            }
+        }
+    }
 }
 
-class UpnsLive : CustomFilemoon() {
-    override var name = "CloudPlayer"
-    override var mainUrl = "https://animekhor.upns.live"
-}
-
-// --- RUMBLE EXTRACTOR (Direct implementation from your working sample) ---
+// --- RUMBLE ---
 class Rumble : ExtractorApi() {
     override val name = "Rumble"
     override val mainUrl = "https://rumble.com"
     override val requiresReferer = false
 
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         Log.d(name, "Starting extraction for: $url")
         val html = try {
             app.get(url, referer = referer ?: mainUrl).text
@@ -158,6 +210,7 @@ class Rumble : ExtractorApi() {
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8")) {
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
+                    
                 } else if (cleanUrl.contains(".mp4")) {
                     val startIndex = Math.max(0, match.range.first - 150)
                     val precedingText = html.substring(startIndex, match.range.first)
@@ -176,10 +229,10 @@ class Rumble : ExtractorApi() {
 
                     callback(
                         newExtractorLink(
-                            name,
-                            displayLabel,
-                            cleanUrl,
-                            INFER_TYPE
+                            name = name,
+                            source = displayLabel,
+                            url = cleanUrl,
+                            type = INFER_TYPE
                         ) {
                             this.referer = url
                             this.quality = qualityInt
