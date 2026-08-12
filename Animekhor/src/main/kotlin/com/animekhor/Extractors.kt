@@ -43,7 +43,6 @@ abstract class BaseFilemoonExtractor : ExtractorApi() {
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val fixedUrl = url.replace("/#", "/e/")
-        Log.e("AnimekhorDebug", "Filemoon Fetching URL: $fixedUrl")
         
         try {
             val headers = mapOf(
@@ -53,20 +52,15 @@ abstract class BaseFilemoonExtractor : ExtractorApi() {
             
             val response = app.get(fixedUrl, headers = headers)
             val html = response.text
-            Log.e("AnimekhorDebug", "Filemoon HTTP: ${response.code} | HTML Length: ${html.length}")
             
-            val snippet = html.substring(0, minOf(html.length, 300)).replace("\n", "")
-            Log.e("AnimekhorDebug", "Filemoon HTML Snippet: $snippet")
+            // Skip processing if the file is deleted
+            if (response.code == 404 || html.contains("404 Not Found")) return
             
             val packedScript = Regex("""eval\(function\(p,a,c,k,e,.*?\).*?split\('\|'\).*?\)""").find(html)?.value
-            Log.e("AnimekhorDebug", "Filemoon Packed JS Found: ${packedScript != null}")
-            
             val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else html
             
             val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
                 ?: Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(unpacked ?: "")?.groupValues?.get(1)
-
-            Log.e("AnimekhorDebug", "Filemoon Final M3U8: $m3u8")
 
             if (m3u8 != null) {
                 val streamHeaders = mapOf(
@@ -75,10 +69,9 @@ abstract class BaseFilemoonExtractor : ExtractorApi() {
                     "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 )
                 M3u8Helper.generateM3u8(name, m3u8, fixedUrl, headers = streamHeaders).forEach(callback)
-                Log.e("AnimekhorDebug", "Filemoon Link successfully sent to Cloudstream!")
             }
         } catch (e: Exception) {
-            Log.e("AnimekhorDebug", "Filemoon CRITICAL ERROR (Likely Cloudflare): ${e.message}")
+            Log.e("AnimekhorDebug", "Filemoon Error: ${e.message}")
         }
     }
 }
@@ -99,7 +92,6 @@ abstract class BaseVidHideCloneExtractor : ExtractorApi() {
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val fixedUrl = url.replace("/t/", "/e/").replace("/v/", "/e/")
-        Log.e("AnimekhorDebug", "VidHide Fetching URL: $fixedUrl")
         
         try {
             val fetchHeaders = mapOf(
@@ -107,21 +99,30 @@ abstract class BaseVidHideCloneExtractor : ExtractorApi() {
                 "Referer" to "https://animekhor.org/"
             )
             
-            val response = app.get(fixedUrl, headers = fetchHeaders)
-            val html = response.text
-            Log.e("AnimekhorDebug", "VidHide HTTP: ${response.code} | HTML Length: ${html.length}")
+            var response = app.get(fixedUrl, headers = fetchHeaders)
+            var html = response.text
             
-            val snippet = html.substring(0, minOf(html.length, 300)).replace("\n", "")
-            Log.e("AnimekhorDebug", "VidHide HTML Snippet: $snippet")
+            // Skip processing if the file is deleted
+            if (response.code == 404 || html.contains("404 Not Found")) return
+            
+            // --- THE FIX: CATCH & FOLLOW JAVASCRIPT REDIRECTS ---
+            val redirectRegex = Regex("""window\.location\.replace\(['"](.*?)['"]\)""")
+            val redirectMatch = redirectRegex.find(html)
+            if (redirectMatch != null) {
+                val newUrl = redirectMatch.groupValues[1]
+                Log.e("AnimekhorDebug", "Following JS Redirect to: $newUrl")
+                // Execute the second network request to bypass the fake page
+                response = app.get(newUrl, headers = fetchHeaders)
+                html = response.text
+            }
             
             val packedScript = Regex("""eval\(function\(p,a,c,k,e,.*?\).*?split\('\|'\).*?\)""").find(html)?.value
-            Log.e("AnimekhorDebug", "VidHide Packed JS Found: ${packedScript != null}")
-            
             val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else html
             
             var m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
                 ?: Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(unpacked ?: "")?.groupValues?.get(1)
 
+            // Decode VidHide Base64 arrays
             if (m3u8 == null && unpacked != null) {
                 val base64Regex = Regex("""["']([A-Za-z0-9+/]{20,}={0,2})["']""")
                 base64Regex.findAll(unpacked).forEach { match ->
@@ -134,30 +135,26 @@ abstract class BaseVidHideCloneExtractor : ExtractorApi() {
                 }
             }
 
-            Log.e("AnimekhorDebug", "VidHide Final M3U8: $m3u8")
-
             if (m3u8 != null) {
                 val streamHeaders = mapOf(
                     "Origin" to mainUrl,
-                    "Referer" to fixedUrl,
+                    "Referer" to response.url, // Bind the Referer to the final redirected URL
                     "Accept" to "*/*",
                     "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 )
-                M3u8Helper.generateM3u8(name, m3u8!!, fixedUrl, headers = streamHeaders).forEach(callback)
-                Log.e("AnimekhorDebug", "VidHide Link successfully sent to Cloudstream!")
+                M3u8Helper.generateM3u8(name, m3u8!!, response.url, headers = streamHeaders).forEach(callback)
             } else {
                 val mp4 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
                 if (mp4 != null) {
                     callback.invoke(
                         newExtractorLink(name = name, source = name, url = mp4, type = INFER_TYPE) {
-                            this.referer = fixedUrl
+                            this.referer = response.url
                         }
                     )
-                    Log.e("AnimekhorDebug", "VidHide MP4 Link successfully sent to Cloudstream!")
                 }
             }
         } catch (e: Exception) {
-            Log.e("AnimekhorDebug", "VidHide CRITICAL ERROR (Likely Cloudflare): ${e.message}")
+            Log.e("AnimekhorDebug", "VidHide Error: ${e.message}")
         }
     }
 }
