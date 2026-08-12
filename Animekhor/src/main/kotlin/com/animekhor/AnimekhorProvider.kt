@@ -1,9 +1,11 @@
 package com.animekhor
 
 import android.util.Base64
+import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -70,18 +72,19 @@ class AnimekhorProvider : MainAPI() {
         val tvtag = if (type?.contains("Movie", ignoreCase = true) == true) TvType.Movie else TvType.TvSeries
 
         if (tvtag == TvType.Movie) {
-            val href = document.selectFirst(".eplister li > a")?.attr("href") ?: url
+            val href = document.selectFirst(".eplister li > a, .episodelist li > a")?.attr("href") ?: url
             return newMovieLoadResponse(title, url, TvType.Movie, href) {
                 this.posterUrl = poster
                 this.plot = description
             }
         } else {
-            var epListElements = document.select(".eplister li")
+            // FIX: Targets the correct HTML div (.episodelist) from your source dump
+            var epListElements = document.select(".episodelist li, .eplister li")
             if (epListElements.isEmpty()) {
-                val epPage = document.selectFirst(".eplister li > a")?.attr("href") ?: ""
+                val epPage = document.selectFirst(".episodelist li > a, .eplister li > a")?.attr("href") ?: ""
                 if (epPage.isNotBlank()) {
                     val doc = app.get(epPage).document
-                    epListElements = doc.select("div.episodelist > ul > li, .eplister li")
+                    epListElements = doc.select(".episodelist li, .eplister li")
                 }
             }
             
@@ -110,11 +113,15 @@ class AnimekhorProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data).document
-        val servers = document.select(".mobius option")
+        val servers = document.select(".mobius option, select.mirror option")
+        
+        Log.e("AnimekhorProvider", "Found ${servers.size} servers on the page.")
 
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl
             if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
+            
+            Log.e("AnimekhorProvider", "Routing -> $finalUrl | Label -> $label")
 
             when {
                 "p2pstream.vip" in finalUrl -> P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
@@ -135,22 +142,29 @@ class AnimekhorProvider : MainAPI() {
             servers.map { server ->
                 async {
                     val base64 = server.attr("value")
-                    if (base64.isBlank()) return@async
-
-                    val decodedUrl = try { String(Base64.decode(base64, Base64.DEFAULT)) } catch (e: Exception) { base64 }
-                    
-                    val url = if (decodedUrl.contains("src=")) {
-                        Regex("""src=["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(decodedUrl)?.groupValues?.get(1)
-                    } else if (decodedUrl.startsWith("http")) {
-                        decodedUrl
-                    } else null
-                    
-                    if (!url.isNullOrBlank()) {
-                        invokeExtractor(url, server.text().trim())
+                    if (base64.isNotBlank()) {
+                        // FIX: Safely uses Jsoup to parse the embedded iframe inside the Base64 string
+                        val decodedHtml = try { String(Base64.decode(base64, Base64.DEFAULT)) } catch (e: Exception) { "" }
+                        val iframeSrc = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")
+                        
+                        if (!iframeSrc.isNullOrBlank()) {
+                            invokeExtractor(iframeSrc, server.text().trim())
+                        }
                     }
                 }
             }.awaitAll()
         }
+        
+        // Final fallback if the dropdown completely fails
+        if (servers.isEmpty()) {
+            document.select("iframe").forEach { iframe ->
+                val src = iframe.attr("src")
+                if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
+                    invokeExtractor(src, "Server")
+                }
+            }
+        }
+
         return true
     }
 }
