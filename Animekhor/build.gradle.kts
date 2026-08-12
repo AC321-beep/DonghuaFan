@@ -4,6 +4,6 @@ cloudstream {
    status = 1
    tvTypes = listOf("Anime", "Movie")
    language = "zh"
-   version = 6
+   version = 7
    iconUrl = "https://www.google.com/s2/favicons?domain=animekhor.org&sz=256"
 }
