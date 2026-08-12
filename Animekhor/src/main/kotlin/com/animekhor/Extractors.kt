@@ -39,31 +39,46 @@ class VidHidePro5 : VidHidePro() {
 
 // --- FILEMOON & CLONES ---
 abstract class BaseFilemoonExtractor : ExtractorApi() {
-    // Disabled to prevent Cloudstream's core API from interfering with our manual app.get()
     override val requiresReferer = false
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val fixedUrl = url.replace("/#", "/e/")
+        Log.e("AnimekhorDebug", "Filemoon Fetching URL: $fixedUrl")
         
-        val fetchHeaders = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer" to "https://animekhor.org/"
-        )
-        
-        val response = app.get(fixedUrl, headers = fetchHeaders).text
-        val packedScript = Regex("""eval\(function\(p,a,c,k,e,.*?\).*?split\('\|'\).*?\)""").find(response)?.value
-        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
-        
-        val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
-            ?: Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(unpacked ?: "")?.groupValues?.get(1)
-
-        if (m3u8 != null) {
-            val streamHeaders = mapOf(
-                "Origin" to mainUrl,
-                "Referer" to "$mainUrl/",
-                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        try {
+            val headers = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Referer" to "https://animekhor.org/"
             )
-            M3u8Helper.generateM3u8(name, m3u8, fixedUrl, headers = streamHeaders).forEach(callback)
+            
+            val response = app.get(fixedUrl, headers = headers)
+            val html = response.text
+            Log.e("AnimekhorDebug", "Filemoon HTTP: ${response.code} | HTML Length: ${html.length}")
+            
+            val snippet = html.substring(0, minOf(html.length, 300)).replace("\n", "")
+            Log.e("AnimekhorDebug", "Filemoon HTML Snippet: $snippet")
+            
+            val packedScript = Regex("""eval\(function\(p,a,c,k,e,.*?\).*?split\('\|'\).*?\)""").find(html)?.value
+            Log.e("AnimekhorDebug", "Filemoon Packed JS Found: ${packedScript != null}")
+            
+            val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else html
+            
+            val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+                ?: Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(unpacked ?: "")?.groupValues?.get(1)
+
+            Log.e("AnimekhorDebug", "Filemoon Final M3U8: $m3u8")
+
+            if (m3u8 != null) {
+                val streamHeaders = mapOf(
+                    "Origin" to mainUrl,
+                    "Referer" to "$mainUrl/",
+                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                )
+                M3u8Helper.generateM3u8(name, m3u8, fixedUrl, headers = streamHeaders).forEach(callback)
+                Log.e("AnimekhorDebug", "Filemoon Link successfully sent to Cloudstream!")
+            }
+        } catch (e: Exception) {
+            Log.e("AnimekhorDebug", "Filemoon CRITICAL ERROR (Likely Cloudflare): ${e.message}")
         }
     }
 }
@@ -78,56 +93,71 @@ class UpnsLive : BaseFilemoonExtractor() {
     override var mainUrl = "https://animekhor.upns.live"
 }
 
-
 // --- EMTURBOVID & VIDHIDE CLONES ---
 abstract class BaseVidHideCloneExtractor : ExtractorApi() {
     override val requiresReferer = false
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val fixedUrl = url.replace("/t/", "/e/").replace("/v/", "/e/")
+        Log.e("AnimekhorDebug", "VidHide Fetching URL: $fixedUrl")
         
-        val fetchHeaders = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer" to "https://animekhor.org/"
-        )
-        
-        val response = app.get(fixedUrl, headers = fetchHeaders).text
-        val packedScript = Regex("""eval\(function\(p,a,c,k,e,.*?\).*?split\('\|'\).*?\)""").find(response)?.value
-        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
-        
-        var m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
-            ?: Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(unpacked ?: "")?.groupValues?.get(1)
-
-        // Decodes the new Base64 array string obfuscation used by Vidhide
-        if (m3u8 == null && unpacked != null) {
-            val base64Regex = Regex("""["']([A-Za-z0-9+/]{20,}={0,2})["']""")
-            base64Regex.findAll(unpacked).forEach { match ->
-                try {
-                    val decoded = String(Base64.decode(match.groupValues[1], Base64.DEFAULT))
-                    if (decoded.contains(".m3u8")) {
-                        m3u8 = decoded
-                    }
-                } catch (_: Exception) {}
-            }
-        }
-
-        if (m3u8 != null) {
-            val streamHeaders = mapOf(
-                "Origin" to mainUrl,
-                "Referer" to fixedUrl,
-                "Accept" to "*/*",
-                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        try {
+            val fetchHeaders = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Referer" to "https://animekhor.org/"
             )
-            M3u8Helper.generateM3u8(name, m3u8!!, fixedUrl, headers = streamHeaders).forEach(callback)
-        } else {
-            val mp4 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
-            if (mp4 != null) {
-                callback.invoke(
-                    newExtractorLink(name = name, source = name, url = mp4, type = INFER_TYPE) {
-                        this.referer = fixedUrl
-                    }
-                )
+            
+            val response = app.get(fixedUrl, headers = fetchHeaders)
+            val html = response.text
+            Log.e("AnimekhorDebug", "VidHide HTTP: ${response.code} | HTML Length: ${html.length}")
+            
+            val snippet = html.substring(0, minOf(html.length, 300)).replace("\n", "")
+            Log.e("AnimekhorDebug", "VidHide HTML Snippet: $snippet")
+            
+            val packedScript = Regex("""eval\(function\(p,a,c,k,e,.*?\).*?split\('\|'\).*?\)""").find(html)?.value
+            Log.e("AnimekhorDebug", "VidHide Packed JS Found: ${packedScript != null}")
+            
+            val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else html
+            
+            var m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+                ?: Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(unpacked ?: "")?.groupValues?.get(1)
+
+            if (m3u8 == null && unpacked != null) {
+                val base64Regex = Regex("""["']([A-Za-z0-9+/]{20,}={0,2})["']""")
+                base64Regex.findAll(unpacked).forEach { match ->
+                    try {
+                        val decoded = String(Base64.decode(match.groupValues[1], Base64.DEFAULT))
+                        if (decoded.contains(".m3u8")) {
+                            m3u8 = decoded
+                        }
+                    } catch (_: Exception) {}
+                }
             }
+
+            Log.e("AnimekhorDebug", "VidHide Final M3U8: $m3u8")
+
+            if (m3u8 != null) {
+                val streamHeaders = mapOf(
+                    "Origin" to mainUrl,
+                    "Referer" to fixedUrl,
+                    "Accept" to "*/*",
+                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                )
+                M3u8Helper.generateM3u8(name, m3u8!!, fixedUrl, headers = streamHeaders).forEach(callback)
+                Log.e("AnimekhorDebug", "VidHide Link successfully sent to Cloudstream!")
+            } else {
+                val mp4 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+                if (mp4 != null) {
+                    callback.invoke(
+                        newExtractorLink(name = name, source = name, url = mp4, type = INFER_TYPE) {
+                            this.referer = fixedUrl
+                        }
+                    )
+                    Log.e("AnimekhorDebug", "VidHide MP4 Link successfully sent to Cloudstream!")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("AnimekhorDebug", "VidHide CRITICAL ERROR (Likely Cloudflare): ${e.message}")
         }
     }
 }
