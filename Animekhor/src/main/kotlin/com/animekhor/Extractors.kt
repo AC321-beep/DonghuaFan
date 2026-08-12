@@ -39,30 +39,23 @@ class VidHidePro5 : VidHidePro() {
 
 // --- FILEMOON & CLONES ---
 abstract class BaseFilemoonExtractor : ExtractorApi() {
-    override val requiresReferer = true
+    // Disabled to prevent Cloudstream's core API from interfering with our manual app.get()
+    override val requiresReferer = false
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val fixedUrl = url.replace("/#", "/e/")
-        Log.d("AnimekhorDebug", "Filemoon Fetching URL: $fixedUrl")
         
-        val headers = mapOf(
+        val fetchHeaders = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Referer" to "https://animekhor.org/"
         )
         
-        val response = app.get(fixedUrl, headers = headers).text
-        Log.d("AnimekhorDebug", "Filemoon HTML Length: ${response.length}")
-        
+        val response = app.get(fixedUrl, headers = fetchHeaders).text
         val packedScript = Regex("""eval\(function\(p,a,c,k,e,.*?\).*?split\('\|'\).*?\)""").find(response)?.value
-        Log.d("AnimekhorDebug", "Filemoon Packed JS Found: ${packedScript != null}")
-        
         val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
-        Log.d("AnimekhorDebug", "Filemoon Unpacked contains m3u8: ${unpacked?.contains(".m3u8")}")
         
         val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
             ?: Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(unpacked ?: "")?.groupValues?.get(1)
-
-        Log.d("AnimekhorDebug", "Filemoon Final M3U8: $m3u8")
 
         if (m3u8 != null) {
             val streamHeaders = mapOf(
@@ -85,13 +78,13 @@ class UpnsLive : BaseFilemoonExtractor() {
     override var mainUrl = "https://animekhor.upns.live"
 }
 
+
 // --- EMTURBOVID & VIDHIDE CLONES ---
 abstract class BaseVidHideCloneExtractor : ExtractorApi() {
-    override val requiresReferer = true
+    override val requiresReferer = false
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val fixedUrl = url.replace("/t/", "/e/").replace("/v/", "/e/")
-        Log.d("AnimekhorDebug", "VidHide Fetching URL: $fixedUrl")
         
         val fetchHeaders = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -99,35 +92,24 @@ abstract class BaseVidHideCloneExtractor : ExtractorApi() {
         )
         
         val response = app.get(fixedUrl, headers = fetchHeaders).text
-        Log.d("AnimekhorDebug", "VidHide HTML Length: ${response.length}")
-        
         val packedScript = Regex("""eval\(function\(p,a,c,k,e,.*?\).*?split\('\|'\).*?\)""").find(response)?.value
-        Log.d("AnimekhorDebug", "VidHide Packed JS Found: ${packedScript != null}")
-        
         val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
-        Log.d("AnimekhorDebug", "VidHide Unpacked contains m3u8 string: ${unpacked?.contains(".m3u8")}")
         
         var m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
             ?: Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(unpacked ?: "")?.groupValues?.get(1)
 
+        // Decodes the new Base64 array string obfuscation used by Vidhide
         if (m3u8 == null && unpacked != null) {
-            Log.d("AnimekhorDebug", "VidHide M3U8 null. Searching for Base64 strings...")
             val base64Regex = Regex("""["']([A-Za-z0-9+/]{20,}={0,2})["']""")
             base64Regex.findAll(unpacked).forEach { match ->
                 try {
                     val decoded = String(Base64.decode(match.groupValues[1], Base64.DEFAULT))
-                    Log.d("AnimekhorDebug", "Decoded Base64 snippet: ${decoded.take(50)}...")
                     if (decoded.contains(".m3u8")) {
                         m3u8 = decoded
-                        Log.d("AnimekhorDebug", "Found M3U8 inside Base64!")
                     }
-                } catch (e: Exception) {
-                    Log.d("AnimekhorDebug", "Base64 decode failed for string.")
-                }
+                } catch (_: Exception) {}
             }
         }
-
-        Log.d("AnimekhorDebug", "VidHide Final M3U8: $m3u8")
 
         if (m3u8 != null) {
             val streamHeaders = mapOf(
@@ -136,10 +118,8 @@ abstract class BaseVidHideCloneExtractor : ExtractorApi() {
                 "Accept" to "*/*",
                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
-            Log.d("AnimekhorDebug", "Passing to M3u8Helper with headers: $streamHeaders")
             M3u8Helper.generateM3u8(name, m3u8!!, fixedUrl, headers = streamHeaders).forEach(callback)
         } else {
-            Log.d("AnimekhorDebug", "M3U8 completely null. Attempting MP4 fallback.")
             val mp4 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
             if (mp4 != null) {
                 callback.invoke(
