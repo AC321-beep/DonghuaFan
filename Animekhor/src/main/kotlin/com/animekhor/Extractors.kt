@@ -88,7 +88,7 @@ private suspend fun extractVideoFromHtml(
 }
 
 // ------------------------------------------------------------
-// Base Filemoon extractor (fixed)
+// Base Filemoon extractor
 // ------------------------------------------------------------
 abstract class BaseFilemoonExtractor : ExtractorApi() {
     override val requiresReferer = false
@@ -148,7 +148,7 @@ abstract class BaseFilemoonExtractor : ExtractorApi() {
 }
 
 // ------------------------------------------------------------
-// Base VidHide clone extractor (fixed)
+// Base VidHide clone extractor
 // ------------------------------------------------------------
 abstract class BaseVidHideCloneExtractor : ExtractorApi() {
     override val requiresReferer = false
@@ -222,7 +222,7 @@ abstract class BaseVidHideCloneExtractor : ExtractorApi() {
 }
 
 // ------------------------------------------------------------
-// Concrete extractor classes (unchanged names)
+// Concrete extractor classes
 // ------------------------------------------------------------
 class Embedwish : StreamWishExtractor() {
     override var name = "Embedwish"
@@ -272,7 +272,8 @@ class AbyssPlayer : BaseVidHideCloneExtractor() {
 }
 
 // ------------------------------------------------------------
-// Rumble extractor (already good, kept as is)
+// Rumble extractor – kept exactly as original, with only a
+// compile‑fix for Math.max → maxOf
 // ------------------------------------------------------------
 class Rumble : ExtractorApi() {
     override val name = "Rumble"
@@ -311,7 +312,8 @@ class Rumble : ExtractorApi() {
                 if (cleanUrl.contains(".m3u8")) {
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
                 } else if (cleanUrl.contains(".mp4")) {
-                    val startIndex = max(0, match.range.first - 150)
+                    // FIX: replaced Math.max with maxOf to compile in Kotlin
+                    val startIndex = maxOf(0, match.range.first - 150)
                     val precedingText = html.substring(startIndex, match.range.first)
 
                     val qMatch = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""").findAll(precedingText).lastOrNull()
