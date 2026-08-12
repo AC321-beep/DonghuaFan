@@ -4,9 +4,12 @@ import android.util.Base64
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.JsUnpacker
+import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import java.net.URI
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -78,7 +81,6 @@ class AnimekhorProvider : MainAPI() {
                 this.plot = description
             }
         } else {
-            // FIX: Targets the correct HTML div (.episodelist) from your source dump
             var epListElements = document.select(".episodelist li, .eplister li")
             if (epListElements.isEmpty()) {
                 val epPage = document.selectFirst(".episodelist li > a, .eplister li > a")?.attr("href") ?: ""
@@ -114,53 +116,86 @@ class AnimekhorProvider : MainAPI() {
     ): Boolean {
         val document = app.get(data).document
         val servers = document.select(".mobius option, select.mirror option")
-        
-        Log.e("AnimekhorProvider", "Found ${servers.size} servers on the page.")
-
-        suspend fun invokeExtractor(iframeUrl: String, label: String) {
-            var finalUrl = iframeUrl
-            if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
-            
-            Log.e("AnimekhorProvider", "Routing -> $finalUrl | Label -> $label")
-
-            when {
-                "p2pstream.vip" in finalUrl -> P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "upns.live" in finalUrl -> UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "listeamed" in finalUrl -> Listeamed().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "abyssplayer" in finalUrl -> AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "embedwish" in finalUrl -> Embedwish().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "filelions" in finalUrl -> Filelions().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "swhoi" in finalUrl -> Swhoi().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "vidhide" in finalUrl -> VidHidePro5().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                else -> loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
-            }
-        }
 
         coroutineScope {
             servers.map { server ->
                 async {
-                    val base64 = server.attr("value")
-                    if (base64.isNotBlank()) {
-                        // FIX: Safely uses Jsoup to parse the embedded iframe inside the Base64 string
+                    try {
+                        val base64 = server.attr("value")
+                        if (base64.isBlank()) return@async
+
                         val decodedHtml = try { String(Base64.decode(base64, Base64.DEFAULT)) } catch (e: Exception) { "" }
-                        val iframeSrc = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")
+                        var finalUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")
                         
-                        if (!iframeSrc.isNullOrBlank()) {
-                            invokeExtractor(iframeSrc, server.text().trim())
+                        if (finalUrl.isNullOrBlank()) return@async
+                        if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
+                        
+                        val label = server.text().trim()
+                        val fetchHeaders = mapOf(
+                            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                            "Referer" to mainUrl
+                        )
+
+                        // --- RAW INLINE EXTRACTION: Bypasses the broken Extractor classes natively ---
+                        if ("emturbovid" in finalUrl || "listeamed" in finalUrl || "abyssplayer" in finalUrl || "p2pstream.vip" in finalUrl || "upns.live" in finalUrl) {
+                            
+                            val fixedUrl = finalUrl.replace("/t/", "/e/").replace("/v/", "/e/").replace("/#", "/e/")
+                            var response = app.get(fixedUrl, headers = fetchHeaders)
+                            var html = response.text
+                            
+                            // 1. Defeat Listeamed's window.location.replace redirect trap
+                            val redirectMatch = Regex("""window\.location\.replace\(['"](.*?)['"]\)""").find(html)
+                            if (redirectMatch != null) {
+                                response = app.get(redirectMatch.groupValues[1], headers = fetchHeaders)
+                                html = response.text
+                            }
+                            
+                            // 2. Unpack JS only if it exists
+                            val packedScript = Regex("""eval\(function\(p,a,c,k,e,.*?\).*?split\('\|'\).*?\)""").find(html)?.value
+                            val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: html else html
+                            
+                            // 3. GREEDY M3U8 EXTRACTION (Rips out any raw M3U8 string, ignoring "source:" or "file:" labels)
+                            var m3u8 = Regex("""https?://[^"'\s<>\[\]\\]+?\.m3u8[^"'\s<>\[\]\\]*""").find(unpacked)?.value
+                            
+                            // 4. GREEDY BASE64 DECODING (If the link is hidden inside a Base64 array, decode it)
+                            if (m3u8 == null) {
+                                Regex("""["']([A-Za-z0-9+/]{20,}={0,2})["']""").findAll(unpacked).forEach { match ->
+                                    try {
+                                        val decoded = String(Base64.decode(match.groupValues[1], Base64.DEFAULT))
+                                        val hiddenLink = Regex("""https?://[^"'\s<>\[\]\\]+?\.m3u8[^"'\s<>\[\]\\]*""").find(decoded)?.value
+                                        if (hiddenLink != null) m3u8 = hiddenLink
+                                    } catch (_: Exception) {}
+                                }
+                            }
+
+                            // 5. INJECT ERROR 2004 BYPASS HEADERS AND SEND TO EXOPLAYER
+                            if (m3u8 != null) {
+                                val host = URI(fixedUrl).host
+                                val streamHeaders = mapOf(
+                                    "Origin" to "https://$host",
+                                    "Referer" to response.url,
+                                    "Accept" to "*/*",
+                                    "User-Agent" to fetchHeaders["User-Agent"]!!
+                                )
+                                M3u8Helper.generateM3u8(label, m3u8!!, response.url, headers = streamHeaders).forEach(callback)
+                            }
+                        } 
+                        else {
+                            // Let Cloudstream natively handle normal URLs (ok.ru, streamwish, rumble, etc.)
+                            loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
                         }
+                    } catch (e: Exception) {
+                        Log.e("Animekhor", "Extraction Crash: ${e.message}")
                     }
                 }
             }.awaitAll()
         }
         
-        // Final fallback if the dropdown completely fails
         if (servers.isEmpty()) {
             document.select("iframe").forEach { iframe ->
                 val src = iframe.attr("src")
                 if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
-                    invokeExtractor(src, "Server")
+                    loadExtractor(src, referer = mainUrl, subtitleCallback, callback)
                 }
             }
         }
