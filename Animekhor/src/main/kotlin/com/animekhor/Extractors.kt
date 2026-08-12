@@ -1,5 +1,6 @@
 package com.animekhor
 
+import android.util.Base64
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
@@ -41,12 +42,7 @@ class VidHidePro5 : VidHidePro() {
 abstract class BaseFilemoonExtractor : ExtractorApi() {
     override val requiresReferer = true
 
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val fixedUrl = url.replace("/#", "/e/")
         val headers = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -86,13 +82,7 @@ class UpnsLive : BaseFilemoonExtractor() {
 abstract class BaseVidHideCloneExtractor : ExtractorApi() {
     override val requiresReferer = true
 
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        // Fix endpoint paths from /t/ or /v/ to /e/
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val fixedUrl = url.replace("/t/", "/e/").replace("/v/", "/e/")
         val fetchHeaders = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -103,18 +93,31 @@ abstract class BaseVidHideCloneExtractor : ExtractorApi() {
         val packedScript = Regex("""eval\(function\(p,a,c,k,e,.*?\).*?split\('\|'\).*?\)""").find(response)?.value
         val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
         
-        val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+        // 1. Try to find the plain text M3U8
+        var m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
             ?: Regex("""(https?://[^\s"'<>]+\.m3u8[^\s"'<>]*)""").find(unpacked ?: "")?.groupValues?.get(1)
 
+        // 2. THE FIX: Decode VidHide's new Base64 obfuscation
+        if (m3u8 == null && unpacked != null) {
+            val base64Regex = Regex("""["']([A-Za-z0-9+/]{20,}={0,2})["']""")
+            base64Regex.findAll(unpacked).forEach { match ->
+                try {
+                    val decoded = String(Base64.decode(match.groupValues[1], Base64.DEFAULT))
+                    if (decoded.contains(".m3u8")) {
+                        m3u8 = decoded
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+
         if (m3u8 != null) {
-            // Strict headers sent to ExoPlayer to block Error 2004
             val streamHeaders = mapOf(
                 "Origin" to mainUrl,
                 "Referer" to fixedUrl,
                 "Accept" to "*/*",
                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
-            M3u8Helper.generateM3u8(name, m3u8, fixedUrl, headers = streamHeaders).forEach(callback)
+            M3u8Helper.generateM3u8(name, m3u8!!, fixedUrl, headers = streamHeaders).forEach(callback)
         } else {
             val mp4 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
             if (mp4 != null) {
@@ -150,12 +153,7 @@ class Rumble : ExtractorApi() {
     override val mainUrl = "https://rumble.com"
     override val requiresReferer = false
 
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val html = try {
             app.get(url, referer = referer ?: mainUrl).text
         } catch (e: Exception) {
