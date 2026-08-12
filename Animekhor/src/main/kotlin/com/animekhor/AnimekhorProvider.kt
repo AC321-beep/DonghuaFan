@@ -15,7 +15,7 @@ class AnimekhorProvider : MainAPI() {
     override var mainUrl = "https://animekhor.org"
     override var name = "Animekhor"
     override val hasMainPage = true
-    override var lang = "zh" 
+    override var lang = "zh"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
@@ -86,12 +86,11 @@ class AnimekhorProvider : MainAPI() {
                     epListElements = doc.select(".episodelist li, .eplister li")
                 }
             }
-            
+
             val episodes = epListElements.mapNotNull { info ->
                 val href = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
                 val episodeText = info.selectFirst(".epl-title")?.text() ?: info.selectFirst("a span")?.text() ?: ""
                 val parsedEpisode = if (episodeText.contains("-")) episodeText.substringAfter("-").substringBeforeLast("-").trim() else episodeText.trim()
-                
                 newEpisode(href) {
                     this.name = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText
                     this.posterUrl = poster
@@ -114,44 +113,50 @@ class AnimekhorProvider : MainAPI() {
         val document = app.get(data).document
         val servers = document.select(".mobius option, select.mirror option")
 
+        Log.e("AnimekhorProvider", "Found ${servers.size} servers on the page.")
+
+        suspend fun invokeExtractor(iframeUrl: String, label: String) {
+            var finalUrl = iframeUrl
+            if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
+
+            Log.e("AnimekhorProvider", "Routing -> $finalUrl | Label -> $label")
+
+            when {
+                "p2pstream.vip" in finalUrl -> P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "upns.live" in finalUrl -> UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "listeamed" in finalUrl -> Listeamed().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "abyssplayer" in finalUrl -> AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "embedwish" in finalUrl -> Embedwish().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "filelions" in finalUrl -> Filelions().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "swhoi" in finalUrl -> Swhoi().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "vidhide" in finalUrl -> VidHidePro5().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                else -> loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
+            }
+        }
+
         coroutineScope {
             servers.map { server ->
                 async {
-                    try {
-                        val base64 = server.attr("value")
-                        if (base64.isBlank()) return@async
-
+                    val base64 = server.attr("value")
+                    if (base64.isNotBlank()) {
                         val decodedHtml = try { String(Base64.decode(base64, Base64.DEFAULT)) } catch (e: Exception) { "" }
-                        var finalUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")
-                        
-                        if (finalUrl.isNullOrBlank()) return@async
-                        if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
-
-                        when {
-                            "p2pstream.vip" in finalUrl -> P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                            "upns.live" in finalUrl -> UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                            "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                            "listeamed" in finalUrl -> Listeamed().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                            "abyssplayer" in finalUrl -> AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                            "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                            "embedwish" in finalUrl -> Embedwish().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                            "filelions" in finalUrl -> Filelions().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                            "swhoi" in finalUrl -> Swhoi().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                            "vidhide" in finalUrl -> VidHidePro5().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                            else -> loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
+                        val iframeSrc = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")
+                        if (!iframeSrc.isNullOrBlank()) {
+                            invokeExtractor(iframeSrc, server.text().trim())
                         }
-                    } catch (e: Exception) {
-                        Log.e("Animekhor", "Silent fail ignored: ${e.message}")
                     }
                 }
             }.awaitAll()
         }
-        
+
+        // Fallback: if no dropdown options found, try any iframe on the page
         if (servers.isEmpty()) {
             document.select("iframe").forEach { iframe ->
                 val src = iframe.attr("src")
                 if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
-                    loadExtractor(src, referer = mainUrl, subtitleCallback, callback)
+                    invokeExtractor(src, "Server")
                 }
             }
         }
