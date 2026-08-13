@@ -16,7 +16,6 @@ open class DonghuastreamProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime)
 
-    // Custom headers to mimic a real browser and bypass basic bot protection
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         "Referer" to mainUrl,
@@ -49,7 +48,6 @@ open class DonghuastreamProvider : MainAPI() {
                 hasNext = movieResults.isNotEmpty() || specialResults.isNotEmpty()
             )
         } else {
-            // Page 1 grabs instant updates from the main homepage (bypassing cache delays). Page 2+ uses the directory.
             val url = if (page == 1) "$mainUrl/" else "$mainUrl/${request.data}$page"
 
             val document = app.get(
@@ -116,7 +114,6 @@ open class DonghuastreamProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
         
-        // Accurate Series vs Episode validation. These classes ONLY exist on the main series page.
         val isEpisodePage = document.selectFirst(".infox, .tsinfo, .anime-info") == null
         
         if (isEpisodePage) {
@@ -124,20 +121,21 @@ open class DonghuastreamProvider : MainAPI() {
                 ?: document.select(".naveps a").find { it.attr("href").contains("/anime/") }?.attr("href")
                 ?: document.select("div.ts-breadcrumb a").lastOrNull()?.attr("href") 
             
-            // Seamlessly resolves single episode lookups back into complete series objects
             if (!seriesUrl.isNullOrEmpty() && seriesUrl != url) {
                 return load(seriesUrl)
             }
             
             val titleRaw = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
-            val title = titleRaw.substringBefore(" Episode").trim() 
+            val title = titleRaw.substringBefore(" Episode").substringBefore(" Movie").trim() 
             val poster = document.selectFirst("meta[property=og:image]")?.attr("content") ?: ""
             
-            var epElements = document.select("div.episodelist li")
-            if (epElements.isEmpty()) epElements = document.select("div.episodelist a[href]")
+            var epElements = document.select("div.episodelist li, .eplister li")
+            if (epElements.isEmpty()) epElements = document.select("div.episodelist a[href], .eplister a[href]")
+            // Catches the related parts/episodes from grid layout below player
+            if (epElements.isEmpty()) epElements = document.select("div.listupd article, div.bixbox article, div.related article")
 
             if (epElements.isNotEmpty()) {
-                val episodes = parseEpisodes(epElements)
+                val episodes = parseEpisodes(epElements, title)
                 return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                     this.posterUrl = poster
                 }
@@ -154,23 +152,20 @@ open class DonghuastreamProvider : MainAPI() {
             poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim() ?: ""
         }
         val description = document.selectFirst("div.entry-content")?.text()?.trim()
-        val type = document.selectFirst(".spe")?.text() ?: ""
-        val tvtag = if (type.contains("Movie", ignoreCase = true)) TvType.Movie else TvType.TvSeries
 
-        return if (tvtag == TvType.TvSeries) {
-            var epElements = document.select(".eplister li, .episodelist li")
-            if (epElements.isEmpty()) {
-                epElements = document.select(".eplister a[href], .episodelist a[href]")
-            }
-            
-            val episodes = parseEpisodes(epElements)
-            
+        var epElements = document.select(".eplister li, .episodelist li")
+        if (epElements.isEmpty()) epElements = document.select(".eplister a[href], .episodelist a[href]")
+        if (epElements.isEmpty()) epElements = document.select("div.listupd article, div.bixbox article, div.related article")
+
+        // If multiple parts/episodes are found (even for movies), treat it as TvSeries so all episodes list out
+        return if (epElements.size > 1) {
+            val episodes = parseEpisodes(epElements, title)
             newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
                 this.plot = description
             }
         } else {
-            val href = document.selectFirst(".eplister a[href], .episodelist a[href]")?.attr("href") ?: url
+            val href = epElements.firstOrNull()?.selectFirst("a[href]")?.attr("href") ?: url
             newMovieLoadResponse(title, url, TvType.Movie, href) {
                 this.posterUrl = poster
                 this.plot = description
@@ -178,12 +173,11 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    private fun parseEpisodes(epElements: org.jsoup.select.Elements): List<Episode> {
+    private fun parseEpisodes(epElements: org.jsoup.select.Elements, seriesTitle: String = ""): List<Episode> {
         return epElements.mapNotNull { info ->
             val aTag = info.selectFirst("a[href]") ?: info.takeIf { it.tagName() == "a" && it.hasAttr("href") }
             val href1 = aTag?.attr("href") ?: return@mapNotNull null
             
-            // EXACT ORIGINAL: Removed h4 so it falls back to aTag.text() and captures the raw date string
             var rawTitle = info.selectFirst(".epl-title, .ep-title, .title, h2, h3")?.text()?.trim() ?: ""
             if (rawTitle.isEmpty()) rawTitle = aTag.text().trim() 
             if (rawTitle.isEmpty()) rawTitle = info.text().trim()
@@ -191,41 +185,47 @@ open class DonghuastreamProvider : MainAPI() {
             var episodeNum: Int? = null
             var epName: String
             
-            // EXACT ORIGINAL regex
             val junkRegex = Regex("""(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\(4K\)|\[4K\]|\(1080p\)|\[1080p\]|4K|1080p|720p)""")
 
-            // SURGICAL FIX: Get the FIRST match to find the true episode number (164) and ignore the typo (160) at the end of the string
-            val trueEpMatch = Regex("""(?i)(?:Ep|Eps|Episode|Ep\.)\s*(\d+)""").findAll(rawTitle).firstOrNull()
+            // Check for Part, Ep, or Special numbers (including "Eps Part4")
+            val trueEpMatch = Regex("""(?i)(?:Eps?\s*Part|Ep|Eps|Episode|Ep\.|Part|Special|SP)\s*(\d+)""").findAll(rawTitle).firstOrNull()
+            val isFullMovie = rawTitle.contains("Full Movie", ignoreCase = true) || rawTitle.contains("Eps Full", ignoreCase = true)
+
+            // Clean title by removing junk keywords
+            var cleanTitle = rawTitle.replace(junkRegex, "").trim(' ', '-', ':', ',', '|', '(', ')')
             
-            // EXACT ORIGINAL: Keep the LAST match to preserve your string formatting so the date text remains untouched
-            val epMatch = Regex("""(?i)(?:Ep|Eps|Episode|Ep\.)\s*(\d+)""").findAll(rawTitle).lastOrNull()
-            
-            if (epMatch != null && trueEpMatch != null) {
-                // SURGICAL FIX: Assign the accurate number
+            // Subtract the show's title to avoid repetition (e.g., removes "Perfect World" from the episode name)
+            if (seriesTitle.isNotBlank()) {
+                cleanTitle = cleanTitle.replace(seriesTitle, "", ignoreCase = true).trim(' ', '-', ':', ',', '|', '(', ')')
+            }
+
+            if (trueEpMatch != null) {
                 episodeNum = trueEpMatch.groupValues[1].toIntOrNull()
+                // Strip the matched tag (e.g., "Eps Part4", "Special 2") to avoid repeating it in the UI
+                cleanTitle = cleanTitle.replace(Regex("""(?i)(?:Eps?\s*Part|Ep|Eps|Episode|Ep\.|Part|Special|SP)\s*\d+"""), "").trim(' ', '-', ':', ',', '|', '(', ')')
                 
-                // EXACT ORIGINAL LOGIC
-                val afterText = rawTitle.substring(epMatch.range.last + 1)
-                val cleanAfter = afterText.replace(junkRegex, "").trim(' ', '-', ':', ',', '|', '(', ')')
-                
-                epName = if (cleanAfter.isNotBlank()) {
-                    "Episode $episodeNum: $cleanAfter"
+                epName = if (cleanTitle.isNotBlank()) {
+                    "Episode $episodeNum: $cleanTitle"
                 } else {
                     "Episode $episodeNum"
                 }
+            } else if (isFullMovie) {
+                // Handle "Full Movie" / "Eps Full" explicitly so it doesn't accidentally grab a day/month number
+                episodeNum = 1
+                cleanTitle = cleanTitle.replace(Regex("""(?i)Eps Full|Full Movie"""), "").trim(' ', '-', ':', ',', '|', '(', ')')
+                epName = if (cleanTitle.isNotBlank()) "Episode 1: Full Movie $cleanTitle" else "Episode 1: Full Movie"
             } else {
-                // EXACT ORIGINAL FALLBACK
+                // Fallback number matching, excluding resolutions and years
                 val numbers = Regex("""\d+""").findAll(rawTitle).map { it.value }.toList()
                 episodeNum = numbers.lastOrNull { num ->
-                    num != "4" && num != "1080" && num != "720" && num != "2160"
+                    num != "4" && num != "1080" && num != "720" && num != "2160" && !(num.length == 4 && num.startsWith("20")) && num.toIntOrDefault(0) < 32
                 }?.toIntOrNull()
 
-                val cleanTitle = rawTitle.replace(junkRegex, "").trim(' ', '-', ':', ',', '|', '(', ')')
-                
-                epName = if (episodeNum != null) {
-                    if (cleanTitle.contains(episodeNum.toString())) "Episode $episodeNum" else cleanTitle
+                if (episodeNum != null) {
+                    cleanTitle = cleanTitle.replaceFirst(Regex("""\b$episodeNum\b"""), "").trim(' ', '-', ':', ',', '|', '(', ')')
+                    epName = if (cleanTitle.isNotBlank()) "Episode $episodeNum: $cleanTitle" else "Episode $episodeNum"
                 } else {
-                    cleanTitle.ifEmpty { "Episode" }
+                    epName = cleanTitle.ifEmpty { "Episode" }
                 }
             }
             
@@ -252,15 +252,12 @@ open class DonghuastreamProvider : MainAPI() {
 
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl
-            var extReferer = iframeUrl // By default, use the iframe URL as referer
+            var extReferer = iframeUrl 
 
-            // CRITICAL FIX FOR 2004 ERROR:
             if (finalUrl.contains("dailymotion", ignoreCase = true)) {
-                // Safely grab the video ID, accommodating hyphens/underscores if they exist
                 val videoIdMatch = Regex("""[?&]video=([a-zA-Z0-9_-]+)""").find(finalUrl)
                 if (videoIdMatch != null) {
                     finalUrl = "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
-                    // Force the extractor to use DonghuaStream as the referer, bypassing Dailymotion's domain restriction
                     extReferer = mainUrl 
                 }
             }
@@ -281,7 +278,6 @@ open class DonghuastreamProvider : MainAPI() {
                     )
                 }
                 else -> {
-                    // This dynamically passes either the iframe URL or the corrected Dailymotion referer
                     loadExtractor(finalUrl, referer = extReferer, subtitleCallback, callback)
                 }
             }
