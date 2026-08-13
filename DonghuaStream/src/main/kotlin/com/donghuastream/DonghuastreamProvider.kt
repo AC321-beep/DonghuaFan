@@ -16,7 +16,6 @@ open class DonghuastreamProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime)
 
-    // Custom headers to mimic a real browser and bypass basic bot protection
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         "Referer" to mainUrl,
@@ -49,30 +48,36 @@ open class DonghuastreamProvider : MainAPI() {
                 hasNext = movieResults.isNotEmpty() || specialResults.isNotEmpty()
             )
         } else {
-            // Page 1 grabs instant updates from the main homepage. Page 2+ uses the directory.
-            val url = if (page == 1) "$mainUrl/" else "$mainUrl/${request.data}$page"
-
-            val document = app.get(
-                url,
-                headers = defaultHeaders + mapOf(
-                    "Cache-Control" to "no-cache", 
-                    "Pragma" to "no-cache"
-                ),
-                cacheTime = 0
-            ).document
-            
             val home = if (page == 1) {
-                // SMART HOMEPAGE SCRAPER: Targets ONLY the "Latest Release" block to avoid old shows from "Hot Series"
-                val containers = document.select(".bixbox, .releases")
-                val latestContainer = containers.find {
+                // 1. Fetch Homepage for instant, uncached updates
+                val homeDoc = try { 
+                    app.get("$mainUrl/", headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache"), cacheTime = 0).document 
+                } catch(e: Exception) { null }
+                
+                val containers = homeDoc?.select(".bixbox, .releases")
+                val latestContainer = containers?.find {
                     val headerTitle = it.selectFirst("h2, h3, .moxhead, .sec-title")?.text() ?: ""
                     headerTitle.contains("Latest", ignoreCase = true) || headerTitle.contains("Recent", ignoreCase = true)
-                } ?: document.selectFirst(".releases.latesthome") ?: containers.lastOrNull()
+                } ?: homeDoc?.selectFirst(".releases.latesthome") ?: containers?.lastOrNull()
                 
-                val articles = latestContainer?.select("article") ?: document.select("div.listupd > article")
+                val homeArticles = latestContainer?.select("article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
                 
-                articles.mapNotNull { it.toSearchResult() }.distinctBy { it.url }
+                // 2. Fetch Directory Page 1 to bridge the 4-item pagination gap (Homepage limit is 20, Directory limit is 24)
+                val dirDoc = try { 
+                    app.get("$mainUrl/${request.data}1", headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache"), cacheTime = 0).document 
+                } catch(e: Exception) { null }
+                
+                val dirArticles = dirDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+                
+                // 3. Merge them. distinctBy keeps the fresh homepage links and safely appends the missing 4 items at the bottom.
+                (homeArticles + dirArticles).distinctBy { it.url }
             } else {
+                val url = "$mainUrl/${request.data}$page"
+                val document = app.get(
+                    url,
+                    headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache"),
+                    cacheTime = 0
+                ).document
                 document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
             }
             
