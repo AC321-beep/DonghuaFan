@@ -181,29 +181,47 @@ open class DonghuastreamProvider : MainAPI() {
             if (rawTitle.isEmpty()) rawTitle = info.text().trim()
             
             var episodeNum: Int? = null
+            var episodeDisplayString: String? = null
             
-            // Directly extract the date format (e.g., "August 8, 2026") ignoring everything else
+            // Extract the date format (e.g., "August 8, 2026")
             val dateMatch = Regex("""([a-zA-Z]+\s+\d{1,2},\s+\d{4})""").find(rawTitle)?.value?.trim()
             
-            // Check for Part, Ep, or Special numbers
-            val trueEpMatch = Regex("""(?i)(?:Eps?\s*Part|Ep|Eps|Episode|Ep\.|Part|Special|SP)\s*(\d+)""").findAll(rawTitle).firstOrNull()
+            // Check for Part, Ep, or Special numbers INCLUDING ranges (e.g., "Episode 3-4")
+            val trueEpMatch = Regex("""(?i)(?:Eps?\s*Part|Ep|Eps|Episode|Ep\.|Part|Special|SP)\s*(\d+(?:\s*[-~]\s*\d+)?)""").findAll(rawTitle).firstOrNull()
             val isFullMovie = rawTitle.contains("Full Movie", ignoreCase = true) || rawTitle.contains("Eps Full", ignoreCase = true)
 
             if (trueEpMatch != null) {
-                episodeNum = trueEpMatch.groupValues[1].toIntOrNull()
+                val rawEpMatch = trueEpMatch.groupValues[1].trim() // Can be "3" or "3-4"
+                episodeDisplayString = rawEpMatch
+                
+                // For internal tracking, grab just the first number (so Cloudstream tracks "3-4" under Episode 3)
+                episodeNum = Regex("""\d+""").find(rawEpMatch)?.value?.toIntOrNull()
             } else if (isFullMovie) {
                 episodeNum = 1
+                episodeDisplayString = "1"
             } else {
-                // Fallback number matching
-                val numbers = Regex("""\d+""").findAll(rawTitle).map { it.value }.toList()
-                episodeNum = numbers.lastOrNull { num ->
-                    num != "4" && num != "1080" && num != "720" && num != "2160" && !(num.length == 4 && num.startsWith("20")) && (num.toIntOrNull() ?: 0) < 32
-                }?.toIntOrNull()
+                // Fallback: see if there's a standalone range (e.g., "1-4" without the "Episode" prefix)
+                val rangeMatch = Regex("""\b(\d+[-~]\d+)\b""").find(rawTitle)
+                if (rangeMatch != null) {
+                    val rawEpMatch = rangeMatch.groupValues[1]
+                    episodeDisplayString = rawEpMatch
+                    episodeNum = Regex("""\d+""").find(rawEpMatch)?.value?.toIntOrNull()
+                } else {
+                    // Standard fallback for a single standalone number
+                    val numbers = Regex("""\d+""").findAll(rawTitle).map { it.value }.toList()
+                    episodeNum = numbers.lastOrNull { num ->
+                        num != "4" && num != "1080" && num != "720" && num != "2160" && !(num.length == 4 && num.startsWith("20")) && (num.toIntOrNull() ?: 0) < 32
+                    }?.toIntOrNull()
+                    
+                    if (episodeNum != null) {
+                        episodeDisplayString = episodeNum.toString()
+                    }
+                }
             }
             
-            val baseLabel = if (episodeNum != null) "Episode $episodeNum" else "Episode"
+            val baseLabel = if (episodeDisplayString != null) "Episode $episodeDisplayString" else "Episode"
             
-            // Strictly enforce the "Episode X: Date" naming convention
+            // Strictly enforce the "Episode [X-Y]: Date" naming convention
             val epName = if (dateMatch != null) {
                 "$baseLabel: $dateMatch"
             } else if (isFullMovie) {
