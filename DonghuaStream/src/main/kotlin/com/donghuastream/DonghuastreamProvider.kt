@@ -49,7 +49,6 @@ open class DonghuastreamProvider : MainAPI() {
                 hasNext = movieResults.isNotEmpty() || specialResults.isNotEmpty()
             )
         } else {
-            // Page 1 grabs instant updates from the main homepage (bypassing cache delays). Page 2+ uses the directory.
             val url = if (page == 1) "$mainUrl/" else "$mainUrl/${request.data}$page"
 
             val document = app.get(
@@ -61,7 +60,7 @@ open class DonghuastreamProvider : MainAPI() {
                 cacheTime = 0
             ).document
             
-            // AGGRESSIVE HOMEPAGE SCRAPER: Catches all update blocks regardless of site layout changes
+            // AGGRESSIVE HOMEPAGE SCRAPER
             val home = if (page == 1) {
                 document.select(".bixbox article, div.listupd > article, .releases article, .postbody article, div.releases.latesthome article")
                     .mapNotNull { it.toSearchResult() }
@@ -81,11 +80,19 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    fun Element.toSearchResult(): SearchResponse {
-        val title = this.select("div.bsx > a").attr("title")
-        val href = fixUrl(this.select("div.bsx > a").attr("href"))
-        val posterUrl = fixUrlNull(this.selectFirst("div.bsx a img")?.getImageAttr())
-        return newMovieSearchResponse(title, href, TvType.Movie) {
+    // ROBUST SEARCH RESULT EXTRACTOR: Protects against missing titles/links
+    fun Element.toSearchResult(): SearchResponse? {
+        val aTag = this.selectFirst("div.bsx > a") ?: this.selectFirst("a[href]") ?: return null
+        
+        var title = aTag.attr("title").trim()
+        if (title.isBlank()) title = this.select(".tt, .tt h2, h2, h3, h4").text().trim()
+        if (title.isBlank()) title = aTag.text().trim()
+        if (title.isBlank()) return null
+        
+        val href = fixUrlNull(aTag.attr("href")) ?: return null
+        val posterUrl = fixUrlNull(this.selectFirst("img")?.getImageAttr())
+        
+        return newMovieSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = posterUrl
         }
     }
@@ -113,7 +120,6 @@ open class DonghuastreamProvider : MainAPI() {
         return searchResponse
     }
 
-    // HELPER: Scans robustly for Table rows, List items, and Grid articles
     private fun getEpisodesElements(document: org.jsoup.nodes.Document): org.jsoup.select.Elements {
         var eps = document.select("table tbody tr:not(:has(th)), div.episodelist ul li, div.eplister ul li, ul.eplister li, .ep_list li, .episodelist li, .eplister li, #episodelist li, .lsteps li, .list1 li")
         if (eps.isEmpty()) {
@@ -128,17 +134,22 @@ open class DonghuastreamProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
         
-        // Accurate Series vs Episode validation. These classes ONLY exist on the main series page.
         val isEpisodePage = document.selectFirst(".infox, .tsinfo, .anime-info") == null
         
         if (isEpisodePage) {
-            val seriesUrl = document.select("div.ts-breadcrumb a").find { it.attr("href").contains("/anime/") }?.attr("href")
-                ?: document.select(".naveps a").find { it.attr("href").contains("/anime/") }?.attr("href")
-                ?: document.select("div.ts-breadcrumb a").lastOrNull()?.attr("href") 
+            // FIX: Uses findLast to get the true series link, ignoring generic directory links
+            var seriesUrl = document.select("div.ts-breadcrumb a").toList().findLast { 
+                val h = it.attr("href")
+                h.isNotBlank() && h != mainUrl && h != "$mainUrl/" && !h.endsWith("/anime/") && !h.endsWith("/movie/") && !h.endsWith("/series/")
+            }?.attr("href")
             
-            // Seamlessly resolves single episode lookups back into complete series objects
-            if (!seriesUrl.isNullOrEmpty() && seriesUrl != url) {
-                return load(seriesUrl)
+            // FALLBACK: Looks for the "All Episodes" button if breadcrumbs fail
+            if (seriesUrl.isNullOrBlank()) {
+                seriesUrl = document.select(".naveps a").find { it.text().contains("All", ignoreCase = true) }?.attr("href")
+            }
+            
+            if (!seriesUrl.isNullOrBlank() && fixUrl(seriesUrl) != url) {
+                return load(fixUrl(seriesUrl))
             }
             
             val titleRaw = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
@@ -170,7 +181,6 @@ open class DonghuastreamProvider : MainAPI() {
 
         val epElements = getEpisodesElements(document)
 
-        // DYNAMIC OVERRIDE: If multiple parts/episodes are found, force TvSeries view
         return if (tvtag == TvType.TvSeries || epElements.size > 1) {
             val episodes = parseEpisodes(epElements)
             
@@ -199,20 +209,15 @@ open class DonghuastreamProvider : MainAPI() {
             var episodeNum: Int? = null
             var epName: String
             
-            // FULL TEXT SCAN: Extracts the date from the entire HTML element to ensure table layouts don't miss dates
             val fullText = info.text()
             val dateMatch = Regex("""([a-zA-Z]+\s+\d{1,2},\s+\d{4})""").find(fullText)?.value?.trim()
-            
-            // Identify if it's a Full Movie file
             val isFullMovie = rawTitle.contains("Full Movie", ignoreCase = true) || 
                               rawTitle.contains("Eps Full", ignoreCase = true) ||
                               Regex("""(?i)\bfull\b""").containsMatchIn(rawTitle)
 
-            // STRICT EPISODE MATCHER: Grabs Episode, Part, SP, and Ranges (e.g. "3-4")
             val trueEpMatch = Regex("""(?i)(?:Ep|Eps|Episode|Ep\.|Part|SP|Special)\s*(\d+(?:\s*[-~]\s*\d+)?)""").findAll(rawTitle).firstOrNull()
             val matchStr = trueEpMatch?.groupValues?.get(1)?.trim()
             
-            // LOGIC BLOCK: Fixes the Episode 1 override bug by forcing Full Movie to be Episode 0
             if (isFullMovie && matchStr == null) {
                 episodeNum = 0 
                 epName = if (dateMatch != null) "Full Movie: $dateMatch" else "Full Movie"
@@ -220,14 +225,12 @@ open class DonghuastreamProvider : MainAPI() {
                 episodeNum = Regex("""\d+""").find(matchStr)?.value?.toIntOrNull()
                 epName = if (dateMatch != null) "Episode $matchStr: $dateMatch" else "Episode $matchStr"
             } else {
-                // Fallback A: Standalone ranges (like "3-4" without prefixes)
                 val rangeMatch = Regex("""\b(\d+[-~]\d+)\b""").find(rawTitle)
                 if (rangeMatch != null) {
                     val rawRange = rangeMatch.groupValues[1]
                     episodeNum = Regex("""\d+""").find(rawRange)?.value?.toIntOrNull()
                     epName = if (dateMatch != null) "Episode $rawRange: $dateMatch" else "Episode $rawRange"
                 } else {
-                    // Fallback B: Standalone digit (ignores resolutions and 20XX years)
                     val numbers = Regex("""\d+""").findAll(rawTitle).map { it.value }.toList()
                     episodeNum = numbers.lastOrNull { num ->
                         num != "4" && num != "1080" && num != "720" && num != "2160" && !(num.length == 4 && num.startsWith("20"))
@@ -264,15 +267,12 @@ open class DonghuastreamProvider : MainAPI() {
 
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl
-            var extReferer = iframeUrl // By default, use the iframe URL as referer
+            var extReferer = iframeUrl 
 
-            // CRITICAL FIX FOR 2004 ERROR:
             if (finalUrl.contains("dailymotion", ignoreCase = true)) {
-                // Safely grab the video ID, accommodating hyphens/underscores if they exist
                 val videoIdMatch = Regex("""[?&]video=([a-zA-Z0-9_-]+)""").find(finalUrl)
                 if (videoIdMatch != null) {
                     finalUrl = "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
-                    // Force the extractor to use DonghuaStream as the referer, bypassing Dailymotion's domain restriction
                     extReferer = mainUrl 
                 }
             }
@@ -293,7 +293,6 @@ open class DonghuastreamProvider : MainAPI() {
                     )
                 }
                 else -> {
-                    // This dynamically passes either the iframe URL or the corrected Dailymotion referer
                     loadExtractor(finalUrl, referer = extReferer, subtitleCallback, callback)
                 }
             }
