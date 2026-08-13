@@ -131,7 +131,6 @@ open class DonghuastreamProvider : MainAPI() {
             
             var epElements = document.select("div.episodelist li, .eplister li")
             if (epElements.isEmpty()) epElements = document.select("div.episodelist a[href], .eplister a[href]")
-            // Catches the related parts/episodes from grid layout below player
             if (epElements.isEmpty()) epElements = document.select("div.listupd article, div.bixbox article, div.related article")
 
             if (epElements.isNotEmpty()) {
@@ -157,7 +156,6 @@ open class DonghuastreamProvider : MainAPI() {
         if (epElements.isEmpty()) epElements = document.select(".eplister a[href], .episodelist a[href]")
         if (epElements.isEmpty()) epElements = document.select("div.listupd article, div.bixbox article, div.related article")
 
-        // If multiple parts/episodes are found (even for movies), treat it as TvSeries so all episodes list out
         return if (epElements.size > 1) {
             val episodes = parseEpisodes(epElements, title)
             newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
@@ -183,50 +181,35 @@ open class DonghuastreamProvider : MainAPI() {
             if (rawTitle.isEmpty()) rawTitle = info.text().trim()
             
             var episodeNum: Int? = null
-            var epName: String
             
-            val junkRegex = Regex("""(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\(4K\)|\[4K\]|\(1080p\)|\[1080p\]|4K|1080p|720p)""")
-
-            // Check for Part, Ep, or Special numbers (including "Eps Part4")
+            // Directly extract the date format (e.g., "August 8, 2026") ignoring everything else
+            val dateMatch = Regex("""([a-zA-Z]+\s+\d{1,2},\s+\d{4})""").find(rawTitle)?.value?.trim()
+            
+            // Check for Part, Ep, or Special numbers
             val trueEpMatch = Regex("""(?i)(?:Eps?\s*Part|Ep|Eps|Episode|Ep\.|Part|Special|SP)\s*(\d+)""").findAll(rawTitle).firstOrNull()
             val isFullMovie = rawTitle.contains("Full Movie", ignoreCase = true) || rawTitle.contains("Eps Full", ignoreCase = true)
 
-            // Clean title by removing junk keywords
-            var cleanTitle = rawTitle.replace(junkRegex, "").trim(' ', '-', ':', ',', '|', '(', ')')
-            
-            // Subtract the show's title to avoid repetition (e.g., removes "Perfect World" from the episode name)
-            if (seriesTitle.isNotBlank()) {
-                cleanTitle = cleanTitle.replace(seriesTitle, "", ignoreCase = true).trim(' ', '-', ':', ',', '|', '(', ')')
-            }
-
             if (trueEpMatch != null) {
                 episodeNum = trueEpMatch.groupValues[1].toIntOrNull()
-                // Strip the matched tag (e.g., "Eps Part4", "Special 2") to avoid repeating it in the UI
-                cleanTitle = cleanTitle.replace(Regex("""(?i)(?:Eps?\s*Part|Ep|Eps|Episode|Ep\.|Part|Special|SP)\s*\d+"""), "").trim(' ', '-', ':', ',', '|', '(', ')')
-                
-                epName = if (cleanTitle.isNotBlank()) {
-                    "Episode $episodeNum: $cleanTitle"
-                } else {
-                    "Episode $episodeNum"
-                }
             } else if (isFullMovie) {
-                // Handle "Full Movie" / "Eps Full" explicitly so it doesn't accidentally grab a day/month number
                 episodeNum = 1
-                cleanTitle = cleanTitle.replace(Regex("""(?i)Eps Full|Full Movie"""), "").trim(' ', '-', ':', ',', '|', '(', ')')
-                epName = if (cleanTitle.isNotBlank()) "Episode 1: Full Movie $cleanTitle" else "Episode 1: Full Movie"
             } else {
-                // Fallback number matching, excluding resolutions and years
+                // Fallback number matching
                 val numbers = Regex("""\d+""").findAll(rawTitle).map { it.value }.toList()
                 episodeNum = numbers.lastOrNull { num ->
                     num != "4" && num != "1080" && num != "720" && num != "2160" && !(num.length == 4 && num.startsWith("20")) && (num.toIntOrNull() ?: 0) < 32
                 }?.toIntOrNull()
-
-                if (episodeNum != null) {
-                    cleanTitle = cleanTitle.replaceFirst(Regex("""\b$episodeNum\b"""), "").trim(' ', '-', ':', ',', '|', '(', ')')
-                    epName = if (cleanTitle.isNotBlank()) "Episode $episodeNum: $cleanTitle" else "Episode $episodeNum"
-                } else {
-                    epName = cleanTitle.ifEmpty { "Episode" }
-                }
+            }
+            
+            val baseLabel = if (episodeNum != null) "Episode $episodeNum" else "Episode"
+            
+            // Strictly enforce the "Episode X: Date" naming convention
+            val epName = if (dateMatch != null) {
+                "$baseLabel: $dateMatch"
+            } else if (isFullMovie) {
+                "$baseLabel: Full Movie"
+            } else {
+                baseLabel
             }
             
             val posterr = info.selectFirst("img")?.let { 
