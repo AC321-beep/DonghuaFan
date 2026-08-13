@@ -49,6 +49,7 @@ open class DonghuastreamProvider : MainAPI() {
                 hasNext = movieResults.isNotEmpty() || specialResults.isNotEmpty()
             )
         } else {
+            // Page 1 grabs instant updates from the main homepage. Page 2+ uses the directory.
             val url = if (page == 1) "$mainUrl/" else "$mainUrl/${request.data}$page"
 
             val document = app.get(
@@ -60,11 +61,17 @@ open class DonghuastreamProvider : MainAPI() {
                 cacheTime = 0
             ).document
             
-            // AGGRESSIVE HOMEPAGE SCRAPER
             val home = if (page == 1) {
-                document.select(".bixbox article, div.listupd > article, .releases article, .postbody article, div.releases.latesthome article")
-                    .mapNotNull { it.toSearchResult() }
-                    .distinctBy { it.url }
+                // SMART HOMEPAGE SCRAPER: Targets ONLY the "Latest Release" block to avoid old shows from "Hot Series"
+                val containers = document.select(".bixbox, .releases")
+                val latestContainer = containers.find {
+                    val headerTitle = it.selectFirst("h2, h3, .moxhead, .sec-title")?.text() ?: ""
+                    headerTitle.contains("Latest", ignoreCase = true) || headerTitle.contains("Recent", ignoreCase = true)
+                } ?: document.selectFirst(".releases.latesthome") ?: containers.lastOrNull()
+                
+                val articles = latestContainer?.select("article") ?: document.select("div.listupd > article")
+                
+                articles.mapNotNull { it.toSearchResult() }.distinctBy { it.url }
             } else {
                 document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
             }
@@ -80,7 +87,6 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    // ROBUST SEARCH RESULT EXTRACTOR: Protects against missing titles/links
     fun Element.toSearchResult(): SearchResponse? {
         val aTag = this.selectFirst("div.bsx > a") ?: this.selectFirst("a[href]") ?: return null
         
@@ -137,13 +143,11 @@ open class DonghuastreamProvider : MainAPI() {
         val isEpisodePage = document.selectFirst(".infox, .tsinfo, .anime-info") == null
         
         if (isEpisodePage) {
-            // FIX: Uses findLast to get the true series link, ignoring generic directory links
             var seriesUrl = document.select("div.ts-breadcrumb a").toList().findLast { 
                 val h = it.attr("href")
                 h.isNotBlank() && h != mainUrl && h != "$mainUrl/" && !h.endsWith("/anime/") && !h.endsWith("/movie/") && !h.endsWith("/series/")
             }?.attr("href")
             
-            // FALLBACK: Looks for the "All Episodes" button if breadcrumbs fail
             if (seriesUrl.isNullOrBlank()) {
                 seriesUrl = document.select(".naveps a").find { it.text().contains("All", ignoreCase = true) }?.attr("href")
             }
