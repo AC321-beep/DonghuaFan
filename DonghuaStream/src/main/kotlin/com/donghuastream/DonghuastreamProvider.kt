@@ -218,7 +218,7 @@ open class DonghuastreamProvider : MainAPI() {
                 // Fallback number matching, excluding resolutions and years
                 val numbers = Regex("""\d+""").findAll(rawTitle).map { it.value }.toList()
                 episodeNum = numbers.lastOrNull { num ->
-                    num != "4" && num != "1080" && num != "720" && num != "2160" && !(num.length == 4 && num.startsWith("20")) && num.toIntOrDefault(0) < 32
+                    num != "4" && num != "1080" && num != "720" && num != "2160" && !(num.length == 4 && num.startsWith("20")) && (num.toIntOrNull() ?: 0) < 32
                 }?.toIntOrNull()
 
                 if (episodeNum != null) {
