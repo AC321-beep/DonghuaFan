@@ -60,10 +60,9 @@ open class DonghuastreamProvider : MainAPI() {
             ).document
             
             val home = if (page == 1) {
-                document.selectFirst("div.releases.latesthome")
-                    ?.parent()
-                    ?.select("article")
-                    ?.mapNotNull { it.toSearchResult() } ?: emptyList()
+                document.select(".bixbox article, div.listupd > article, .releases article, .postbody article")
+                    .mapNotNull { it.toSearchResult() }
+                    .distinctBy { it.url }
             } else {
                 document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
             }
@@ -111,9 +110,8 @@ open class DonghuastreamProvider : MainAPI() {
         return searchResponse
     }
 
-    // A robust helper to grab episodes regardless of the website's UI class
     private fun getEpisodesElements(document: org.jsoup.nodes.Document): org.jsoup.select.Elements {
-        var eps = document.select("div.episodelist ul li, div.eplister ul li, ul.eplister li, .ep_list li, .episodelist li, .eplister li, #episodelist li, .lsteps li, .list1 li")
+        var eps = document.select("table tbody tr:not(:has(th)), div.episodelist ul li, div.eplister ul li, ul.eplister li, .ep_list li, .episodelist li, .eplister li, #episodelist li, .lsteps li, .list1 li")
         if (eps.isEmpty()) {
             eps = document.select("div.episodelist a[href], div.eplister a[href], .ep_list a[href], .episodelist a[href], .eplister a[href], #episodelist a[href], .lsteps a[href], .list1 a[href]")
         }
@@ -166,7 +164,6 @@ open class DonghuastreamProvider : MainAPI() {
 
         val epElements = getEpisodesElements(document)
 
-        // Forces TvSeries format if there are multiple parts found, even if tagged as a Movie
         return if (tvtag == TvType.TvSeries || epElements.size > 1) {
             val episodes = parseEpisodes(epElements)
             
@@ -195,13 +192,12 @@ open class DonghuastreamProvider : MainAPI() {
             var episodeNum: Int? = null
             var epName: String
             
-            // 1. Pluck out the date directly
-            val dateMatch = Regex("""([a-zA-Z]+\s+\d{1,2},\s+\d{4})""").find(rawTitle)?.value?.trim()
-
-            // 2. Identify if it is a standalone Full Movie file
+            // FULL TEXT SCAN: This now scans the entire table row for a date, picking it up even if it's in a separate column.
+            val fullText = info.text()
+            val dateMatch = Regex("""([a-zA-Z]+\s+\d{1,2},\s+\d{4})""").find(fullText)?.value?.trim()
             val isFullMovie = rawTitle.contains("Full Movie", ignoreCase = true) || rawTitle.contains("Eps Full", ignoreCase = true)
 
-            // 3. Match Part, Ep, Episode, Special, SP. Also catches ranges (e.g., 3-4)
+            // Continue parsing the episode number from the strict rawTitle to prevent parsing errors
             val trueEpMatch = Regex("""(?i)(?:Ep|Eps|Episode|Ep\.|Part|SP|Special)\s*(\d+(?:\s*[-~]\s*\d+)?)""").findAll(rawTitle).firstOrNull()
             val matchStr = trueEpMatch?.groupValues?.get(1)?.trim()
             
@@ -209,17 +205,15 @@ open class DonghuastreamProvider : MainAPI() {
                 episodeNum = Regex("""\d+""").find(matchStr)?.value?.toIntOrNull()
                 epName = if (dateMatch != null) "Episode $matchStr: $dateMatch" else "Episode $matchStr"
             } else if (isFullMovie) {
-                episodeNum = null // Keeps it unsorted so it doesn't conflict with Episode 1
+                episodeNum = null 
                 epName = if (dateMatch != null) "Full Movie: $dateMatch" else "Full Movie"
             } else {
-                // Fallback A: Standalone ranges (like "3-4" without the word "Episode")
                 val rangeMatch = Regex("""\b(\d+[-~]\d+)\b""").find(rawTitle)
                 if (rangeMatch != null) {
                     val rawRange = rangeMatch.groupValues[1]
                     episodeNum = Regex("""\d+""").find(rawRange)?.value?.toIntOrNull()
                     epName = if (dateMatch != null) "Episode $rawRange: $dateMatch" else "Episode $rawRange"
                 } else {
-                    // Fallback B: Any standalone digit that isn't a resolution or a year
                     val numbers = Regex("""\d+""").findAll(rawTitle).map { it.value }.toList()
                     episodeNum = numbers.lastOrNull { num ->
                         num != "4" && num != "1080" && num != "720" && num != "2160" && !(num.length == 4 && num.startsWith("20"))
