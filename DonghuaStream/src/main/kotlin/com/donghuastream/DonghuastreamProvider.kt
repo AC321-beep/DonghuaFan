@@ -7,6 +7,8 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 
 open class DonghuastreamProvider : MainAPI() {
     override var mainUrl = "https://donghuastream.org"
@@ -29,15 +31,24 @@ open class DonghuastreamProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (request.name == "Special Edition") {
-            val movieUrl = if (page == 1) "$mainUrl/?s=movie" else "$mainUrl/pagg/$page/?s=movie"
-            val movieDoc = try { app.get(movieUrl, cacheTime = 0).document } catch(e: Exception) { null }
-            val movieResults = movieDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+            val combinedResults = coroutineScope {
+                val movieDeferred = async {
+                    val url = if (page == 1) "$mainUrl/?s=movie" else "$mainUrl/pagg/$page/?s=movie"
+                    try { app.get(url, cacheTime = 0).document } catch(e: Exception) { null }
+                }
+                val specialDeferred = async {
+                    val url = if (page == 1) "$mainUrl/?s=special" else "$mainUrl/pagg/$page/?s=special"
+                    try { app.get(url, cacheTime = 0).document } catch(e: Exception) { null }
+                }
 
-            val specialUrl = if (page == 1) "$mainUrl/?s=special" else "$mainUrl/pagg/$page/?s=special"
-            val specialDoc = try { app.get(specialUrl, cacheTime = 0).document } catch(e: Exception) { null }
-            val specialResults = specialDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+                val movieDoc = movieDeferred.await()
+                val specialDoc = specialDeferred.await()
 
-            val combinedResults = (movieResults + specialResults).distinctBy { it.url }
+                val movieResults = movieDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+                val specialResults = specialDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+
+                (movieResults + specialResults).distinctBy { it.name.trim().lowercase() }
+            }
 
             return newHomePageResponse(
                 list = HomePageList(
@@ -45,32 +56,37 @@ open class DonghuastreamProvider : MainAPI() {
                     list = combinedResults,
                     isHorizontalImages = false
                 ),
-                hasNext = movieResults.isNotEmpty() || specialResults.isNotEmpty()
+                hasNext = combinedResults.isNotEmpty()
             )
         } else {
             val home = if (page == 1) {
-                // 1. Fetch Homepage for instant, uncached updates
-                val homeDoc = try { 
-                    app.get("$mainUrl/", headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache"), cacheTime = 0).document 
-                } catch(e: Exception) { null }
-                
-                val containers = homeDoc?.select(".bixbox, .releases")
-                val latestContainer = containers?.find {
-                    val headerTitle = it.selectFirst("h2, h3, .moxhead, .sec-title")?.text() ?: ""
-                    headerTitle.contains("Latest", ignoreCase = true) || headerTitle.contains("Recent", ignoreCase = true)
-                } ?: homeDoc?.selectFirst(".releases.latesthome") ?: containers?.lastOrNull()
-                
-                val homeArticles = latestContainer?.select("article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
-                
-                // 2. Fetch Directory Page 1 to bridge the 4-item pagination gap (Homepage limit is 20, Directory limit is 24)
-                val dirDoc = try { 
-                    app.get("$mainUrl/${request.data}1", headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache"), cacheTime = 0).document 
-                } catch(e: Exception) { null }
-                
-                val dirArticles = dirDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
-                
-                // 3. Merge them. distinctBy keeps the fresh homepage links and safely appends the missing 4 items at the bottom.
-                (homeArticles + dirArticles).distinctBy { it.url }
+                coroutineScope {
+                    val homeDocDeferred = async {
+                        try { 
+                            app.get("$mainUrl/", headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache"), cacheTime = 0).document 
+                        } catch(e: Exception) { null }
+                    }
+                    val dirDocDeferred = async {
+                        try { 
+                            app.get("$mainUrl/${request.data}1", headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache"), cacheTime = 0).document 
+                        } catch(e: Exception) { null }
+                    }
+
+                    val homeDoc = homeDocDeferred.await()
+                    val dirDoc = dirDocDeferred.await()
+
+                    val containers = homeDoc?.select(".bixbox, .releases")
+                    val latestContainer = containers?.find {
+                        val headerTitle = it.selectFirst("h2, h3, .moxhead, .sec-title")?.text() ?: ""
+                        headerTitle.contains("Latest", ignoreCase = true) || headerTitle.contains("Recent", ignoreCase = true)
+                    } ?: homeDoc?.selectFirst(".releases.latesthome") ?: containers?.lastOrNull()
+                    
+                    val homeArticles = latestContainer?.select("article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+                    val dirArticles = dirDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+                    
+                    // CRITICAL FIX: Deduplicates by exact show title instead of URL to avoid Episode vs Anime page mismatches
+                    (homeArticles + dirArticles).distinctBy { it.name.trim().lowercase() }
+                }
             } else {
                 val url = "$mainUrl/${request.data}$page"
                 val document = app.get(
