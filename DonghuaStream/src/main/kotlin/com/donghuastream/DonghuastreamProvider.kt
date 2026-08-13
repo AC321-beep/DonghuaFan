@@ -61,6 +61,7 @@ open class DonghuastreamProvider : MainAPI() {
         } else {
             val home = if (page == 1) {
                 coroutineScope {
+                    // PARALLEL FETCH: Grabs both the Homepage (for instant updates) and Directory (for pagination) simultaneously 
                     val homeDocDeferred = async {
                         try { 
                             app.get("$mainUrl/", headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache"), cacheTime = 0).document 
@@ -75,6 +76,7 @@ open class DonghuastreamProvider : MainAPI() {
                     val homeDoc = homeDocDeferred.await()
                     val dirDoc = dirDocDeferred.await()
 
+                    // Extract only the "Latest Release" section, ignoring "Hot Series"
                     val containers = homeDoc?.select(".bixbox, .releases")
                     val latestContainer = containers?.find {
                         val headerTitle = it.selectFirst("h2, h3, .moxhead, .sec-title")?.text() ?: ""
@@ -84,8 +86,15 @@ open class DonghuastreamProvider : MainAPI() {
                     val homeArticles = latestContainer?.select("article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
                     val dirArticles = dirDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
                     
-                    // CRITICAL FIX: Deduplicates by exact show title instead of URL to avoid Episode vs Anime page mismatches
-                    (homeArticles + dirArticles).distinctBy { it.name.trim().lowercase() }
+                    // SMART DEDUPLICATION: Trims junk tags and episode numbers from the title to perfectly match Homepage posts with Directory posts
+                    (homeArticles + dirArticles).distinctBy { 
+                        var cleanName = it.name
+                        val junkRegex = Regex("(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\\(4K\\)|\\[4K\\]|\\(1080p\\)|\\[1080p\\]|4K|1080p|720p|Full Movie|Eps Full|Movie)")
+                        cleanName = cleanName.replace(junkRegex, "")
+                        cleanName = cleanName.replace(Regex("(?i)(Episode|Ep\\.?|Part|SP|Special)\\s*\\d+.*"), "")
+                        // Remove all non-alphanumeric characters for a foolproof match
+                        cleanName.replace(Regex("[^a-zA-Z0-9]"), "").lowercase()
+                    }
                 }
             } else {
                 val url = "$mainUrl/${request.data}$page"
