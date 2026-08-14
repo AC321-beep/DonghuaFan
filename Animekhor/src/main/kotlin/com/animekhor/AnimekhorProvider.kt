@@ -1,11 +1,9 @@
 package com.animekhor
 
 import android.util.Base64
-import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -15,7 +13,7 @@ class AnimekhorProvider : MainAPI() {
     override var mainUrl = "https://animekhor.org"
     override var name = "Animekhor"
     override val hasMainPage = true
-    override var lang = "zh"
+    override var lang = "zh" 
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
@@ -29,9 +27,17 @@ class AnimekhorProvider : MainAPI() {
         "anime/?status=completed&order=update" to "Completed"
     )
 
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+    override suspend fun getMainPage(
+        page: Int,
+        request: MainPageRequest
+    ): HomePageResponse {
         val document = app.get("$mainUrl/${request.data}&page=$page").document
-        val home = document.select("div.listupd > article, div.bsx").mapNotNull { it.toSearchResult() }.distinctBy { it.url }
+        
+        val home = document.select("div.listupd > article, div.bsx")
+            .mapNotNull { it.toSearchResult() }
+            // FIX: Removes duplicate shows from the home page
+            .distinctBy { it.url }
+            
         return newHomePageResponse(request.name, home)
     }
 
@@ -39,14 +45,18 @@ class AnimekhorProvider : MainAPI() {
         val linkElement = this.selectFirst("a") ?: return null
         val title = linkElement.attr("title").ifEmpty { this.selectFirst(".tt")?.text() } ?: return null
         val href = fixUrlNull(linkElement.attr("href")) ?: return null
+        val posterUrl = fixUrlNull(this.selectFirst("img")?.getsrcAttribute())
         
-        val posterUrl = fixUrlNull(
-            this.selectFirst("img")?.let { img ->
-                img.attr("data-src").ifEmpty { img.attr("src") }.ifEmpty { img.attr("data-lazy-src") }
-            }
-        )
-        
-        return newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = posterUrl }
+        return newMovieSearchResponse(title, href, TvType.Movie) {
+            this.posterUrl = posterUrl
+        }
+    }
+
+    private fun Element.getsrcAttribute(): String {
+        return this.attr("data-src").takeIf { it.startsWith("http") }
+            ?: this.attr("src").takeIf { it.startsWith("http") }
+            ?: this.attr("data-lazy-src").takeIf { it.startsWith("http") }
+            ?: ""
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -55,13 +65,16 @@ class AnimekhorProvider : MainAPI() {
                 async {
                     try {
                         val document = app.get("$mainUrl/page/$page/?s=$query").document
-                        document.select("div.listupd > article, div.bsx").mapNotNull { it.toSearchResult() }
-                    } catch (e: Exception) { 
-                        emptyList() 
+                        document.select("div.listupd > article, div.bsx").mapNotNull {
+                            it.toSearchResult()
+                        }
+                    } catch (e: Exception) {
+                        emptyList()
                     }
                 }
             }.awaitAll().flatten()
         }
+        // FIX: Removes duplicate shows from search results
         return results.distinctBy { it.url }
     }
 
@@ -71,33 +84,46 @@ class AnimekhorProvider : MainAPI() {
         val poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim() ?: ""
         val description = document.selectFirst("div.entry-content")?.text()?.trim()
         val type = document.selectFirst(".spe")?.text()
+        
         val tvtag = if (type?.contains("Movie", ignoreCase = true) == true) TvType.Movie else TvType.TvSeries
 
         if (tvtag == TvType.Movie) {
-            val href = document.selectFirst(".eplister li > a, .episodelist li > a")?.attr("href") ?: url
+            val href = document.selectFirst(".eplister li > a")?.attr("href") ?: url
             return newMovieLoadResponse(title, url, TvType.Movie, href) {
                 this.posterUrl = poster
                 this.plot = description
             }
         } else {
-            var epListElements = document.select(".episodelist li, .eplister li")
+            var epListElements = document.select(".eplister li")
+            
             if (epListElements.isEmpty()) {
-                val epPage = document.selectFirst(".episodelist li > a, .eplister li > a")?.attr("href") ?: ""
+                val epPage = document.selectFirst(".eplister li > a")?.attr("href") ?: ""
                 if (epPage.isNotBlank()) {
                     val doc = app.get(epPage).document
-                    epListElements = doc.select(".episodelist li, .eplister li")
+                    epListElements = doc.select("div.episodelist > ul > li, .eplister li")
                 }
             }
-
+            
             val episodes = epListElements.mapNotNull { info ->
                 val href = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
                 val episodeText = info.selectFirst(".epl-title")?.text() ?: info.selectFirst("a span")?.text() ?: ""
-                val parsedEpisode = if (episodeText.contains("-")) episodeText.substringAfter("-").substringBeforeLast("-").trim() else episodeText.trim()
+                
+                val parsedEpisode = if (episodeText.contains("-")) {
+                    episodeText.substringAfter("-").substringBeforeLast("-").trim()
+                } else {
+                    episodeText.trim()
+                }
+                
+                val episodeName = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText
+
                 newEpisode(href) {
-                    this.name = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText
+                    this.name = episodeName
                     this.posterUrl = poster
                 }
-            }.distinctBy { it.data }.reversed() // FIXED: Restored to it.data
+            }
+            // FIX: Removes duplicate episodes and reverses the list for proper order
+            .distinctBy { it.data }
+            .reversed()
 
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
@@ -113,52 +139,38 @@ class AnimekhorProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data).document
-        val servers = document.select(".mobius option, select.mirror option")
-
-        Log.e("AnimekhorProvider", "Found ${servers.size} servers on the page.")
-
-        suspend fun invokeExtractor(iframeUrl: String, label: String) {
-            val finalUrl = fixUrl(iframeUrl)
-
-            Log.e("AnimekhorProvider", "Routing -> $finalUrl | Label -> $label")
-
-            when {
-                "p2pstream.vip" in finalUrl -> P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "embedwish" in finalUrl -> Embedwish().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "filelions" in finalUrl -> Filelions().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "swhoi" in finalUrl -> Swhoi().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "vidhide" in finalUrl -> VidHidePro5().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                else -> loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
-            }
-        }
-
+        val servers = document.select(".mobius option")
+        
         coroutineScope {
             servers.map { server ->
                 async {
                     val base64 = server.attr("value")
-                    if (base64.isNotBlank()) {
-                        val decodedHtml = try { String(Base64.decode(base64, Base64.DEFAULT)) } catch (e: Exception) { "" }
-                        val iframeSrc = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")
-                        if (!iframeSrc.isNullOrBlank()) {
-                            invokeExtractor(iframeSrc, server.text().trim())
-                        }
+                    if (base64.isBlank()) return@async
+
+                    val decodedUrl = try {
+                        String(Base64.decode(base64, Base64.DEFAULT))
+                    } catch (e: Exception) {
+                        base64 
                     }
+                    
+                    var url = if (decodedUrl.contains("src=")) {
+                        Regex("""src=["']([^"']+)["']""", RegexOption.IGNORE_CASE).find(decodedUrl)?.groupValues?.get(1)
+                    } else if (decodedUrl.startsWith("http")) {
+                        decodedUrl
+                    } else {
+                        null
+                    }
+                    
+                    if (url.isNullOrBlank()) return@async
+                    
+                    if (url.startsWith("//")) {
+                        url = "https:$url"
+                    }
+                    
+                    loadExtractor(url, mainUrl, subtitleCallback, callback)
                 }
             }.awaitAll()
         }
-
-        // Fallback: if no dropdown options found, try any iframe on the page
-        if (servers.isEmpty()) {
-            document.select("iframe").forEach { iframe ->
-                val src = iframe.attr("src")
-                if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
-                    invokeExtractor(src, "Server")
-                }
-            }
-        }
-
         return true
     }
 }
