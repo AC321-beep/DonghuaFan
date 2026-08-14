@@ -130,7 +130,6 @@ class AnimekhorProvider : MainAPI() {
                 // Strict Header & Custom Extractors
                 "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "bysekoze.com" in finalUrl -> Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "odysee.com" in finalUrl -> Odysee().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 
                 // VidHide & StreamWish Clones
