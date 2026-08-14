@@ -17,8 +17,7 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
 // ============================================================================
-// CENTRALIZED FALLBACK
-// Decodes standard eval(function(p,a,c,k,e,d)) packed scripts for proxy servers
+// CENTRALIZED FALLBACK: Highly Robust JS & DOM Unpacker
 // ============================================================================
 private suspend fun manualJsUnpackExtraction(
     url: String,
@@ -26,22 +25,36 @@ private suspend fun manualJsUnpackExtraction(
     headers: Map<String, String>,
     callback: (ExtractorLink) -> Unit
 ) {
-    val response = app.get(url, headers = headers).text
-    val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
-    val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
+    // Added default User-Agent to prevent bot-blocks
+    val safeHeaders = headers.toMutableMap()
+    if (!safeHeaders.containsKey("User-Agent")) {
+        safeHeaders["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+    }
 
-    val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+    val response = app.get(url, headers = safeHeaders).text
+    
+    // 1. Try unpacking standard eval scripts
+    val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
+    val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
+
+    // 2. Broad Regex to catch file:, src:, source:, or just raw links in the DOM
+    val m3u8Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.m3u8[^"']*)["']""")
+    val m3u8 = m3u8Regex.find(unpacked)?.groupValues?.get(1) 
+        ?: Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(unpacked)?.groupValues?.get(1)
 
     if (m3u8 != null) {
-        // FIXED: Using correct M3u8Helper parameter names (source, streamUrl, referer)
         M3u8Helper.generateM3u8(
             source = name,
             streamUrl = m3u8,
             referer = url,
-            headers = headers
+            headers = safeHeaders
         ).forEach(callback)
     } else {
-        val mp4 = Regex("""file\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+        // Fallback for raw mp4 files if m3u8 is not found
+        val mp4Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.mp4[^"']*)["']""")
+        val mp4 = mp4Regex.find(unpacked)?.groupValues?.get(1)
+            ?: Regex("""(https?://[^"']+\.mp4[^"']*)""").find(unpacked)?.groupValues?.get(1)
+            
         if (mp4 != null) {
             callback.invoke(
                 newExtractorLink(
@@ -83,8 +96,14 @@ class VidHidePro5 : VidHidePro() {
     override val requiresReferer = true
 }
 
+// NEW: VGPlayer Domain mapped to VidHide built-in extractor
+class Bysekoze : VidhideExtractor() {
+    override var name = "VGPlayer"
+    override var mainUrl = "https://bysekoze.com"
+}
+
 // ============================================================================
-// HYBRID EXTRACTORS: Cloudstream Built-in Priority + Deep Dive Fallback
+// HYBRID EXTRACTORS & CUSTOM FALLBACKS
 // ============================================================================
 
 class P2pstream : ExtractorApi() {
@@ -101,9 +120,10 @@ class P2pstream : ExtractorApi() {
         val fixedUrl = url.replace("/#", "/e/")
         
         try {
-            // FIXED: Using Composition. Calling the built-in extractor safely inside the block.
+            // Priority: Built-in Cloudstream VidStack Extractor
             VidStack().getUrl(fixedUrl, referer, subtitleCallback, callback)
         } catch (e: Exception) {
+            // Fallback: Custom Unpacker
             val headers = mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/")
             manualJsUnpackExtraction(fixedUrl, name, headers, callback)
         }
@@ -124,9 +144,10 @@ class UpnsLive : ExtractorApi() {
         val fixedUrl = url.replace("/#", "/e/")
         
         try {
-            // FIXED: Using Composition to bypass the "Final Class" limitation of Upstream.
+            // Priority: Built-in Cloudstream Upstream Extractor
             Upstream().getUrl(fixedUrl, referer, subtitleCallback, callback)
         } catch (e: Exception) {
+            // Fallback: Custom Unpacker
             val headers = mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/")
             manualJsUnpackExtraction(fixedUrl, name, headers, callback)
         }
@@ -153,8 +174,38 @@ class Emturbovid : ExtractorApi() {
     }
 }
 
+// NEW: Odysee Extractor
+class Odysee : ExtractorApi() {
+    override var name = "Odysee"
+    override var mainUrl = "https://odysee.com"
+    override val requiresReferer = false
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val response = app.get(url).text
+        // Parses the raw mp4 file directly from Odysee's JSON state embed data
+        val mp4 = Regex("""contentUrl["']?\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(response)?.groupValues?.get(1)
+            ?: Regex("""src=["'](https?://[^"']+\.mp4[^"']*)["']""").find(response)?.groupValues?.get(1)
+            
+        if (mp4 != null) {
+            callback.invoke(
+                newExtractorLink(
+                    name = name,
+                    source = name,
+                    url = mp4,
+                    type = INFER_TYPE
+                )
+            )
+        }
+    }
+}
+
 // ============================================================================
-// VERBATIM RUMBLE EXTRACTOR
+// VERBATIM RUMBLE EXTRACTOR (DO NOT ALTER)
 // ============================================================================
 
 class Rumble : ExtractorApi() {
@@ -178,6 +229,7 @@ class Rumble : ExtractorApi() {
 
         val scrapedUrls = mutableSetOf<String>()
 
+        // 1. Unified Regex: Captures both standard and JSON-escaped URLs safely
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
 
@@ -185,6 +237,7 @@ class Rumble : ExtractorApi() {
             val rawUrl = match.value
             val cleanUrl = rawUrl.replace("\\/", "/")
 
+            // 2. The Quarantine Filter: Skips UI/tracker assets so ExoPlayer doesn't crash
             if (cleanUrl.contains("/assets/", ignoreCase = true) ||
                 cleanUrl.contains("loop", ignoreCase = true) ||
                 cleanUrl.contains("preview", ignoreCase = true) ||
@@ -195,9 +248,11 @@ class Rumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8")) {
+                    // M3u8Helper automatically handles HLS playlists in modern Cloudstream
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
                     
                 } else if (cleanUrl.contains(".mp4")) {
+                    // 3. Smart Quality Locator: Reads raw HTML before the URL
                     val startIndex = Math.max(0, match.range.first - 150)
                     val precedingText = html.substring(startIndex, match.range.first)
 
@@ -213,6 +268,7 @@ class Rumble : ExtractorApi() {
                         qualityInt = qStr.toIntOrNull() ?: Qualities.Unknown.value
                     }
 
+                    // 4. The Fix: Using the newExtractorLink builder and lambda block
                     callback(
                         newExtractorLink(
                             name = name,
