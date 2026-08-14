@@ -14,7 +14,6 @@ import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
-
 // ============================================================================
 // STANDARD BUILT-IN EXTRACTORS
 // ============================================================================
@@ -42,8 +41,66 @@ class VidHidePro5 : VidHidePro() {
 }
 
 // ============================================================================
-// EXPLICIT JS UNPACKERS (Fixes silent failures from generic functions)
+// EXPLICIT JS UNPACKERS (Fully Armored with User-Agent & Broad Regex)
 // ============================================================================
+
+class Emturbovid : ExtractorApi() {
+    override var name = "Emturbovid"
+    override var mainUrl = "https://emturbovid.com"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        // RESTORED: Swap the /t/ tracker endpoint to the /e/ embed endpoint
+        val fixedUrl = url.replace("/t/", "/e/")
+        
+        val headers = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+            "Origin" to mainUrl,
+            "Referer" to fixedUrl,
+            "Accept" to "*/*"
+        )
+        
+        val response = try { app.get(fixedUrl, headers = headers).text } catch (e: Exception) { return }
+        val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
+        
+        // RESTORED: Broad regex from the successful fallback
+        val m3u8Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
+        val m3u8 = m3u8Regex.find(unpacked)?.groupValues?.get(1) 
+            ?: Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(unpacked)?.groupValues?.get(1)
+        
+        if (m3u8 != null) {
+            M3u8Helper.generateM3u8(
+                source = name,
+                streamUrl = m3u8,
+                referer = fixedUrl,
+                headers = headers
+            ).forEach(callback)
+        } else {
+            val mp4Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.mp4[^"']*)["']""", RegexOption.IGNORE_CASE)
+            val mp4 = mp4Regex.find(unpacked)?.groupValues?.get(1)
+                ?: Regex("""(https?://[^"']+\.mp4[^"']*)""").find(unpacked)?.groupValues?.get(1)
+            
+            if (mp4 != null) {
+                callback.invoke(
+                    newExtractorLink(
+                        name = name,
+                        source = name,
+                        url = mp4,
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = fixedUrl
+                    }
+                )
+            }
+        }
+    }
+}
 
 class P2pstream : ExtractorApi() {
     override var name = "FileMoon"
@@ -57,39 +114,29 @@ class P2pstream : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val fixedUrl = url.replace("/#", "/e/")
-        val response = app.get(fixedUrl, referer = referer ?: mainUrl).text
         
+        val headers = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+            "Origin" to mainUrl, 
+            "Referer" to fixedUrl,
+            "Accept" to "*/*"
+        )
+        
+        val response = try { app.get(fixedUrl, headers = headers).text } catch (e: Exception) { return }
         val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
-        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
         
-        val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+        val m3u8Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
+        val m3u8 = m3u8Regex.find(unpacked)?.groupValues?.get(1) 
+            ?: Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(unpacked)?.groupValues?.get(1)
         
         if (m3u8 != null) {
-            val headers = mapOf(
-                "Origin" to mainUrl, 
-                "Referer" to fixedUrl,
-                "Accept" to "*/*"
-            )
             M3u8Helper.generateM3u8(
                 source = name,
                 streamUrl = m3u8,
                 referer = fixedUrl,
                 headers = headers
             ).forEach(callback)
-        } else {
-            val mp4 = Regex("""file\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
-            if (mp4 != null) {
-                callback.invoke(
-                    newExtractorLink(
-                        name = name,
-                        source = name,
-                        url = mp4,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = fixedUrl
-                    }
-                )
-            }
         }
     }
 }
@@ -106,39 +153,29 @@ class UpnsLive : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val fixedUrl = url.replace("/#", "/e/")
-        val response = app.get(fixedUrl, referer = referer ?: mainUrl).text
         
+        val headers = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+            "Origin" to mainUrl, 
+            "Referer" to fixedUrl,
+            "Accept" to "*/*"
+        )
+        
+        val response = try { app.get(fixedUrl, headers = headers).text } catch (e: Exception) { return }
         val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
-        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
         
-        val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+        val m3u8Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
+        val m3u8 = m3u8Regex.find(unpacked)?.groupValues?.get(1) 
+            ?: Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(unpacked)?.groupValues?.get(1)
         
         if (m3u8 != null) {
-            val headers = mapOf(
-                "Origin" to mainUrl, 
-                "Referer" to fixedUrl,
-                "Accept" to "*/*"
-            )
             M3u8Helper.generateM3u8(
                 source = name,
                 streamUrl = m3u8,
                 referer = fixedUrl,
                 headers = headers
             ).forEach(callback)
-        } else {
-            val mp4 = Regex("""file\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
-            if (mp4 != null) {
-                callback.invoke(
-                    newExtractorLink(
-                        name = name,
-                        source = name,
-                        url = mp4,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = fixedUrl
-                    }
-                )
-            }
         }
     }
 }
@@ -154,20 +191,22 @@ class Bysekoze : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val response = app.get(url, referer = referer ?: mainUrl).text
+        val headers = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+            "Origin" to mainUrl, 
+            "Referer" to url,
+            "Accept" to "*/*"
+        )
         
+        val response = try { app.get(url, headers = headers).text } catch (e: Exception) { return }
         val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
-        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
         
-        // Broadened regex to catch VGPlayer's specific formatting
-        val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
+        val m3u8Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
+        val m3u8 = m3u8Regex.find(unpacked)?.groupValues?.get(1) 
+            ?: Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(unpacked)?.groupValues?.get(1)
         
         if (m3u8 != null) {
-            val headers = mapOf(
-                "Origin" to mainUrl, 
-                "Referer" to url,
-                "Accept" to "*/*"
-            )
             M3u8Helper.generateM3u8(
                 source = name,
                 streamUrl = m3u8,
@@ -189,79 +228,28 @@ class AbyssPlayer : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val response = app.get(url, referer = referer ?: mainUrl).text
+        val headers = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+            "Origin" to mainUrl, 
+            "Referer" to url,
+            "Accept" to "*/*"
+        )
         
+        val response = try { app.get(url, headers = headers).text } catch (e: Exception) { return }
         val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
-        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
         
-        // Abyss uses varying capitalizations (File: vs file: vs src:). Ignoring case catches all.
-        val m3u8 = Regex("""(?:file|src)\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE).find(unpacked ?: "")?.groupValues?.get(1)
-            ?: Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(unpacked ?: "")?.groupValues?.get(1) // Absolute fallback
+        val m3u8Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
+        val m3u8 = m3u8Regex.find(unpacked)?.groupValues?.get(1) 
+            ?: Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(unpacked)?.groupValues?.get(1)
             
         if (m3u8 != null) {
-            val headers = mapOf(
-                "Origin" to mainUrl, 
-                "Referer" to url,
-                "Accept" to "*/*"
-            )
             M3u8Helper.generateM3u8(
                 source = name,
                 streamUrl = m3u8,
                 referer = url,
                 headers = headers
             ).forEach(callback)
-        }
-    }
-}
-
-// ============================================================================
-// EMTURBOVID (VERBATIM - DO NOT ALTER)
-// ============================================================================
-
-class Emturbovid : ExtractorApi() {
-    override var name = "Emturbovid"
-    override var mainUrl = "https://emturbovid.com"
-    override val requiresReferer = true
-
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val response = app.get(url, referer = referer ?: mainUrl).text
-        
-        val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
-        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() else response
-        
-        val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
-        
-        if (m3u8 != null) {
-            val headers = mapOf(
-                "Origin" to mainUrl,
-                "Referer" to url,
-                "Accept" to "*/*"
-            )
-            M3u8Helper.generateM3u8(
-                source = name,
-                streamUrl = m3u8,
-                referer = url,
-                headers = headers
-            ).forEach(callback)
-        } else {
-            val mp4 = Regex("""file\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
-            if (mp4 != null) {
-                callback.invoke(
-                    newExtractorLink(
-                        name = name,
-                        source = name,
-                        url = mp4,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = url
-                    }
-                )
-            }
         }
     }
 }
