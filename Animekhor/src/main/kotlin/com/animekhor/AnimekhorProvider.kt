@@ -123,23 +123,16 @@ class AnimekhorProvider : MainAPI() {
             Log.e("AnimekhorProvider", "Routing -> $finalUrl | Label -> $label")
 
             when {
-                // Proxy & Malformed Hash domains
                 "p2pstream.vip" in finalUrl -> P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "upns.live" in finalUrl -> UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                
-                // Strict Header & Custom Extractors
                 "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "bysekoze.com" in finalUrl -> Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "odysee.com" in finalUrl -> Odysee().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "bysekoze.com" in finalUrl || "listeamed" in finalUrl -> Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "abyssplayer" in finalUrl -> AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                
-                // VidHide & StreamWish Clones
                 "embedwish" in finalUrl -> Embedwish().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "filelions" in finalUrl -> Filelions().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "swhoi" in finalUrl -> Swhoi().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "vidhide" in finalUrl -> VidHidePro5().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                
-                // Fallback to Cloudstream Core (Handles AbyssPlayer, ok.ru, Listeamed, etc.)
                 else -> loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
             }
         }
