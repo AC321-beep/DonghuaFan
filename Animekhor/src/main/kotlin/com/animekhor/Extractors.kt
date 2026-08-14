@@ -17,7 +17,7 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
 // ============================================================================
-// CENTRALIZED FALLBACK: Extracted from HTML Deep Dive Analysis
+// CENTRALIZED FALLBACK
 // Decodes standard eval(function(p,a,c,k,e,d)) packed scripts for proxy servers
 // ============================================================================
 private suspend fun manualJsUnpackExtraction(
@@ -33,14 +33,14 @@ private suspend fun manualJsUnpackExtraction(
     val m3u8 = Regex("""file\s*:\s*["'](https?://[^"']+\.m3u8[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
 
     if (m3u8 != null) {
+        // FIXED: Using correct M3u8Helper parameter names (source, streamUrl, referer)
         M3u8Helper.generateM3u8(
-            name = name,
-            m3u8Url = m3u8,
+            source = name,
+            streamUrl = m3u8,
             referer = url,
             headers = headers
         ).forEach(callback)
     } else {
-        // Fallback for raw mp4 files if m3u8 is not found
         val mp4 = Regex("""file\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
         if (mp4 != null) {
             callback.invoke(
@@ -87,9 +87,10 @@ class VidHidePro5 : VidHidePro() {
 // HYBRID EXTRACTORS: Cloudstream Built-in Priority + Deep Dive Fallback
 // ============================================================================
 
-class P2pstream : VidStack() {
+class P2pstream : ExtractorApi() {
     override var name = "P2pstream"
     override var mainUrl = "https://animekhor.p2pstream.vip"
+    override val requiresReferer = true
 
     override suspend fun getUrl(
         url: String,
@@ -97,23 +98,22 @@ class P2pstream : VidStack() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // 1. Fix the malformed Animekhor URL hash identified in the HTML
         val fixedUrl = url.replace("/#", "/e/")
         
         try {
-            // 2. Priority: Try Cloudstream's native built-in VidStack extractor first
-            super.getUrl(fixedUrl, referer, subtitleCallback, callback)
+            // FIXED: Using Composition. Calling the built-in extractor safely inside the block.
+            VidStack().getUrl(fixedUrl, referer, subtitleCallback, callback)
         } catch (e: Exception) {
-            // 3. Fallback: If native extraction fails, use our manual JS Unpacker fallback
             val headers = mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/")
             manualJsUnpackExtraction(fixedUrl, name, headers, callback)
         }
     }
 }
 
-class UpnsLive : Upstream() {
+class UpnsLive : ExtractorApi() {
     override var name = "CloudPlayer"
     override var mainUrl = "https://animekhor.upns.live"
+    override val requiresReferer = true
 
     override suspend fun getUrl(
         url: String,
@@ -121,14 +121,12 @@ class UpnsLive : Upstream() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // 1. Fix the malformed Animekhor URL hash
         val fixedUrl = url.replace("/#", "/e/")
         
         try {
-            // 2. Priority: Try Cloudstream's native built-in Upstream extractor first
-            super.getUrl(fixedUrl, referer, subtitleCallback, callback)
+            // FIXED: Using Composition to bypass the "Final Class" limitation of Upstream.
+            Upstream().getUrl(fixedUrl, referer, subtitleCallback, callback)
         } catch (e: Exception) {
-            // 3. Fallback: Manual JS Unpacker
             val headers = mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/")
             manualJsUnpackExtraction(fixedUrl, name, headers, callback)
         }
@@ -146,8 +144,6 @@ class Emturbovid : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // No built-in extractor exists for Emturbovid.
-        // MUST use manual JS fallback while enforcing strict Origin/Referer headers to prevent HTTP 2004 Error.
         val headers = mapOf(
             "Origin" to mainUrl,
             "Referer" to url,
@@ -158,7 +154,7 @@ class Emturbovid : ExtractorApi() {
 }
 
 // ============================================================================
-// VERBATIM RUMBLE EXTRACTOR (DO NOT ALTER)
+// VERBATIM RUMBLE EXTRACTOR
 // ============================================================================
 
 class Rumble : ExtractorApi() {
@@ -182,7 +178,6 @@ class Rumble : ExtractorApi() {
 
         val scrapedUrls = mutableSetOf<String>()
 
-        // 1. Unified Regex: Captures both standard and JSON-escaped URLs safely
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
 
@@ -190,7 +185,6 @@ class Rumble : ExtractorApi() {
             val rawUrl = match.value
             val cleanUrl = rawUrl.replace("\\/", "/")
 
-            // 2. The Quarantine Filter: Skips UI/tracker assets so ExoPlayer doesn't crash
             if (cleanUrl.contains("/assets/", ignoreCase = true) ||
                 cleanUrl.contains("loop", ignoreCase = true) ||
                 cleanUrl.contains("preview", ignoreCase = true) ||
@@ -201,11 +195,9 @@ class Rumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8")) {
-                    // M3u8Helper automatically handles HLS playlists in modern Cloudstream
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
                     
                 } else if (cleanUrl.contains(".mp4")) {
-                    // 3. Smart Quality Locator: Reads raw HTML before the URL
                     val startIndex = Math.max(0, match.range.first - 150)
                     val precedingText = html.substring(startIndex, match.range.first)
 
@@ -221,7 +213,6 @@ class Rumble : ExtractorApi() {
                         qualityInt = qStr.toIntOrNull() ?: Qualities.Unknown.value
                     }
 
-                    // 4. The Fix: Using the newExtractorLink builder and lambda block
                     callback(
                         newExtractorLink(
                             name = name,
