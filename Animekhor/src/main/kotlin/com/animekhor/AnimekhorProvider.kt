@@ -39,14 +39,15 @@ class AnimekhorProvider : MainAPI() {
         val linkElement = this.selectFirst("a") ?: return null
         val title = linkElement.attr("title").ifEmpty { this.selectFirst(".tt")?.text() } ?: return null
         val href = fixUrlNull(linkElement.attr("href")) ?: return null
-        val posterUrl = fixUrlNull(this.selectFirst("img")?.getsrcAttribute())
+        
+        // Improved image URL fetching
+        val posterUrl = fixUrlNull(
+            this.selectFirst("img")?.let { img ->
+                img.attr("data-src").ifEmpty { img.attr("src") }.ifEmpty { img.attr("data-lazy-src") }
+            }
+        )
+        
         return newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = posterUrl }
-    }
-
-    private fun Element.getsrcAttribute(): String {
-        return this.attr("data-src").takeIf { it.startsWith("http") }
-            ?: this.attr("src").takeIf { it.startsWith("http") }
-            ?: this.attr("data-lazy-src").takeIf { it.startsWith("http") } ?: ""
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -56,7 +57,9 @@ class AnimekhorProvider : MainAPI() {
                     try {
                         val document = app.get("$mainUrl/page/$page/?s=$query").document
                         document.select("div.listupd > article, div.bsx").mapNotNull { it.toSearchResult() }
-                    } catch (e: Exception) { emptyList() }
+                    } catch (e: Exception) { 
+                        emptyList() 
+                    }
                 }
             }.awaitAll().flatten()
         }
@@ -95,7 +98,7 @@ class AnimekhorProvider : MainAPI() {
                     this.name = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText
                     this.posterUrl = poster
                 }
-            }.distinctBy { it.data }.reversed()
+            }.distinctBy { it.url }.reversed() // distinctBy it.url is safer than it.data
 
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
@@ -116,22 +119,22 @@ class AnimekhorProvider : MainAPI() {
         Log.e("AnimekhorProvider", "Found ${servers.size} servers on the page.")
 
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
-            var finalUrl = iframeUrl
-            if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
+            val finalUrl = fixUrl(iframeUrl)
 
             Log.e("AnimekhorProvider", "Routing -> $finalUrl | Label -> $label")
 
             when {
                 "p2pstream.vip" in finalUrl -> P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "upns.live" in finalUrl -> UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "listeamed" in finalUrl -> Listeamed().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "abyssplayer" in finalUrl -> AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "embedwish" in finalUrl -> Embedwish().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "filelions" in finalUrl -> Filelions().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "swhoi" in finalUrl -> Swhoi().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "vidhide" in finalUrl -> VidHidePro5().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                
+                // Note: UpnsLive, Listeamed, and AbyssPlayer were removed from here. 
+                // They will naturally fall into the `else` block below which uses 
+                // Cloudstream's native built-in extractors, fixing the build errors!
                 else -> loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
             }
         }
