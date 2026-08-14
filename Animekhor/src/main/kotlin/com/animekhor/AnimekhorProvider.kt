@@ -40,7 +40,6 @@ class AnimekhorProvider : MainAPI() {
         val title = linkElement.attr("title").ifEmpty { this.selectFirst(".tt")?.text() } ?: return null
         val href = fixUrlNull(linkElement.attr("href")) ?: return null
         
-        // Improved image URL fetching
         val posterUrl = fixUrlNull(
             this.selectFirst("img")?.let { img ->
                 img.attr("data-src").ifEmpty { img.attr("src") }.ifEmpty { img.attr("data-lazy-src") }
@@ -98,7 +97,7 @@ class AnimekhorProvider : MainAPI() {
                     this.name = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText
                     this.posterUrl = poster
                 }
-            }.distinctBy { it.url }.reversed() // distinctBy it.url is safer than it.data
+            }.distinctBy { it.data }.reversed() // FIXED: Restored to it.data
 
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
@@ -131,10 +130,6 @@ class AnimekhorProvider : MainAPI() {
                 "filelions" in finalUrl -> Filelions().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "swhoi" in finalUrl -> Swhoi().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "vidhide" in finalUrl -> VidHidePro5().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                
-                // Note: UpnsLive, Listeamed, and AbyssPlayer were removed from here. 
-                // They will naturally fall into the `else` block below which uses 
-                // Cloudstream's native built-in extractors, fixing the build errors!
                 else -> loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
             }
         }
