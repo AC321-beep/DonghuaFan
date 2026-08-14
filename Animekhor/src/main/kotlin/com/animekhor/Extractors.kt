@@ -103,14 +103,14 @@ class Emturbovid : ExtractorApi() {
             M3u8Helper.generateM3u8(
                 name,
                 m3u8,
-                url,
+                url, // Used as referer
                 headers = headers
             ).forEach(callback)
         } else {
             // Fallback for raw mp4 files
             val mp4 = Regex("""file\s*:\s*["'](https?://[^"']+\.mp4[^"']*)["']""").find(unpacked ?: "")?.groupValues?.get(1)
             if (mp4 != null) {
-                callback.invoke(
+                    callback.invoke(
                     newExtractorLink(
                         name = name,
                         source = name,
@@ -145,7 +145,6 @@ class Rumble : ExtractorApi() {
         }
 
         val scrapedUrls = mutableSetOf<String>()
-
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
 
@@ -181,15 +180,15 @@ class Rumble : ExtractorApi() {
                         qualityInt = qStr.toIntOrNull() ?: Qualities.Unknown.value
                     }
 
-                    callback(
+                        callback.invoke(
                         newExtractorLink(
                             name = name,
                             source = displayLabel,
                             url = cleanUrl,
+                            quality = qualityInt,
                             type = INFER_TYPE
                         ) {
                             this.referer = url
-                            this.quality = qualityInt
                         }
                     )
                 }
