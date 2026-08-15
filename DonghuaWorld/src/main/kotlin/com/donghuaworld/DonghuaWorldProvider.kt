@@ -15,7 +15,7 @@ class DonghuaWorldProvider : MainAPI() {
     override var mainUrl = "https://donghuaworld.com"
     override var name = "Donghua World"
     override val hasMainPage = true
-    override var lang = "en"
+    override var lang = "zh"
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
 
