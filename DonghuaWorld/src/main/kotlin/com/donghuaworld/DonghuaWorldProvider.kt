@@ -20,7 +20,6 @@ class DonghuaWorldProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
 
     // ---------- MAIN PAGE CATEGORIES ----------
-    // Based on the actual website homepage as shown in the image
     override val mainPage = mainPageOf(
         "page/1/" to "Recently Updated",
         "category/comic-recently-updated/page/1/" to "Comic Recently Updated",
@@ -36,7 +35,6 @@ class DonghuaWorldProvider : MainAPI() {
         val url = "$mainUrl/${request.data}".replace("/page/1/", "/page/$page/")
         val document = app.get(url).document
 
-        // Standard WordPress anime theme selectors
         val home = document.select("div.listupd > article, div.bsx, div.post-item, div.entry")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
@@ -112,8 +110,11 @@ class DonghuaWorldProvider : MainAPI() {
                     ?: info.selectFirst("a")?.text() ?: ""
                 val epNum = Regex("""(?:Episode|EP|E)?\s*(\d+(?:\.\d+)?)""", RegexOption.IGNORE_CASE)
                     .find(episodeText)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
-                newEpisode(href) {
-                    this.name = episodeText.takeIf { it.isNotEmpty() } ?: "Episode $epNum"
+
+                newEpisode(
+                    name = episodeText.takeIf { it.isNotEmpty() } ?: "Episode $epNum",
+                    url = href
+                ) {
                     this.posterUrl = poster
                     this.episode = epNum.toInt()
                 }
