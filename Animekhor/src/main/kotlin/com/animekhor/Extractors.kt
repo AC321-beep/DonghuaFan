@@ -15,28 +15,27 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
 // ============================================================================
-// UNIVERSAL JS UNPACKER (Proven Logic)
-// Guaranteed to execute without being skipped by silent native failures.
+// CENTRALIZED FALLBACK: Highly Robust JS & DOM Unpacker
 // ============================================================================
-private suspend fun forceJsUnpack(
+private suspend fun manualJsUnpackExtraction(
     url: String,
     name: String,
-    mainUrl: String,
+    headers: Map<String, String>,
     callback: (ExtractorLink) -> Unit
 ) {
-    val headers = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-        "Origin" to mainUrl,
-        "Referer" to url,
-        "Accept" to "*/*"
-    )
+    // Added default User-Agent to prevent bot-blocks
+    val safeHeaders = headers.toMutableMap()
+    if (!safeHeaders.containsKey("User-Agent")) {
+        safeHeaders["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+    }
 
-    val response = try { app.get(url, headers = headers).text } catch (e: Exception) { return }
+    val response = try { app.get(url, headers = safeHeaders).text } catch (e: Exception) { return }
     
+    // 1. Try unpacking standard eval scripts
     val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
     val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
 
-    // Broad regex to catch varying video tags
+    // 2. Broad Regex to catch file:, src:, source:, or just raw links in the DOM
     val m3u8Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
     val m3u8 = m3u8Regex.find(unpacked)?.groupValues?.get(1) 
         ?: Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(unpacked)?.groupValues?.get(1)
@@ -46,9 +45,10 @@ private suspend fun forceJsUnpack(
             source = name,
             streamUrl = m3u8,
             referer = url,
-            headers = headers
+            headers = safeHeaders
         ).forEach(callback)
     } else {
+        // Fallback for raw mp4 files if m3u8 is not found
         val mp4Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.mp4[^"']*)["']""", RegexOption.IGNORE_CASE)
         val mp4 = mp4Regex.find(unpacked)?.groupValues?.get(1)
             ?: Regex("""(https?://[^"']+\.mp4[^"']*)""").find(unpacked)?.groupValues?.get(1)
@@ -95,27 +95,23 @@ class VidHidePro5 : VidHidePro() {
 }
 
 // ============================================================================
-// FORCED JS UNPACK EXTRACTORS
+// DIRECT CUSTOM EXTRACTORS (No try/catch traps. Direct execution only.)
 // ============================================================================
 
-class Emturbovid : ExtractorApi() {
-    override var name = "Emturbovid"
-    override var mainUrl = "https://emturbovid.com"
-    override val requiresReferer = true
-
-    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        forceJsUnpack(url, name, mainUrl, callback)
-    }
-}
-
 class P2pstream : ExtractorApi() {
-    override var name = "FileMoon"
+    override var name = "P2pstream"
     override var mainUrl = "https://animekhor.p2pstream.vip"
     override val requiresReferer = true
 
-    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
         val fixedUrl = url.replace("/#", "/e/")
-        forceJsUnpack(fixedUrl, name, mainUrl, callback)
+        val headers = mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/")
+        manualJsUnpackExtraction(fixedUrl, name, headers, callback)
     }
 }
 
@@ -124,9 +120,15 @@ class UpnsLive : ExtractorApi() {
     override var mainUrl = "https://animekhor.upns.live"
     override val requiresReferer = true
 
-    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
         val fixedUrl = url.replace("/#", "/e/")
-        forceJsUnpack(fixedUrl, name, mainUrl, callback)
+        val headers = mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/")
+        manualJsUnpackExtraction(fixedUrl, name, headers, callback)
     }
 }
 
@@ -135,8 +137,14 @@ class Bysekoze : ExtractorApi() {
     override var mainUrl = "https://bysekoze.com"
     override val requiresReferer = true
 
-    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        forceJsUnpack(url, name, mainUrl, callback)
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val headers = mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/")
+        manualJsUnpackExtraction(url, name, headers, callback)
     }
 }
 
@@ -145,13 +153,43 @@ class AbyssPlayer : ExtractorApi() {
     override var mainUrl = "https://abyssplayer.com"
     override val requiresReferer = true
 
-    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        forceJsUnpack(url, name, mainUrl, callback)
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val headers = mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/")
+        manualJsUnpackExtraction(url, name, headers, callback)
     }
 }
 
 // ============================================================================
-// VERBATIM RUMBLE EXTRACTOR
+// EMTURBOVID (VERBATIM - DO NOT ALTER)
+// ============================================================================
+
+class Emturbovid : ExtractorApi() {
+    override var name = "Emturbovid"
+    override var mainUrl = "https://emturbovid.com"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val headers = mapOf(
+            "Origin" to mainUrl,
+            "Referer" to url,
+            "Accept" to "*/*"
+        )
+        manualJsUnpackExtraction(url, name, headers, callback)
+    }
+}
+
+// ============================================================================
+// RUMBLE (VERBATIM - DO NOT ALTER)
 // ============================================================================
 
 class Rumble : ExtractorApi() {
@@ -175,6 +213,7 @@ class Rumble : ExtractorApi() {
 
         val scrapedUrls = mutableSetOf<String>()
 
+        // 1. Unified Regex: Captures both standard and JSON-escaped URLs safely
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
 
@@ -182,6 +221,7 @@ class Rumble : ExtractorApi() {
             val rawUrl = match.value
             val cleanUrl = rawUrl.replace("\\/", "/")
 
+            // 2. The Quarantine Filter: Skips UI/tracker assets so ExoPlayer doesn't crash
             if (cleanUrl.contains("/assets/", ignoreCase = true) ||
                 cleanUrl.contains("loop", ignoreCase = true) ||
                 cleanUrl.contains("preview", ignoreCase = true) ||
@@ -192,9 +232,11 @@ class Rumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8")) {
+                    // M3u8Helper automatically handles HLS playlists in modern Cloudstream
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
                     
                 } else if (cleanUrl.contains(".mp4")) {
+                    // 3. Smart Quality Locator: Reads raw HTML before the URL
                     val startIndex = Math.max(0, match.range.first - 150)
                     val precedingText = html.substring(startIndex, match.range.first)
 
@@ -210,6 +252,7 @@ class Rumble : ExtractorApi() {
                         qualityInt = qStr.toIntOrNull() ?: Qualities.Unknown.value
                     }
 
+                    // 4. The Fix: Using the newExtractorLink builder and lambda block
                     callback(
                         newExtractorLink(
                             name = name,
