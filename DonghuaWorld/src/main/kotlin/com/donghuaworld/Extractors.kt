@@ -3,6 +3,7 @@ package com.donghuaworld
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.fixUrl
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.INFER_TYPE
@@ -10,10 +11,10 @@ import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
-open class BaseRumble : ExtractorApi() {
-    // All derived classes will set their own mainUrl and requiresReferer
-    // but we want the source name to always be "Rumble"
+abstract class BaseRumble : ExtractorApi() {
+    // Force name to "Rumble" for all subclasses
     override val name = "Rumble"
+    // Each subclass must provide mainUrl and requiresReferer
 
     override suspend fun getUrl(
         url: String,
@@ -49,10 +50,8 @@ open class BaseRumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8")) {
-                    // M3u8Helper will extract all quality variants
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
                 } else if (cleanUrl.contains(".mp4")) {
-                    // Try to extract quality from surrounding JSON
                     val startIndex = maxOf(0, match.range.first - 150)
                     val precedingText = html.substring(startIndex, match.range.first)
 
