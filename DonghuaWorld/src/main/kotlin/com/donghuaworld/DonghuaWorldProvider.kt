@@ -11,6 +11,9 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 
+// Explicit import for ShowStatus to resolve Unknown, Completed, Ongoing
+import com.lagradost.cloudstream3.ShowStatus
+
 class DonghuaWorldProvider : MainAPI() {
     override var mainUrl = "https://donghuaworld.com"
     override var name = "Donghua World"
@@ -105,7 +108,6 @@ class DonghuaWorldProvider : MainAPI() {
                 val epNum = Regex("""(?:Episode|EP|E)?\s*(\d+(?:\.\d+)?)""", RegexOption.IGNORE_CASE)
                     .find(episodeText)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
 
-                // Correct usage: newEpisode(url) with block
                 newEpisode(href) {
                     this.name = episodeText.takeIf { it.isNotEmpty() } ?: "Episode $epNum"
                     this.posterUrl = poster
@@ -116,7 +118,7 @@ class DonghuaWorldProvider : MainAPI() {
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
                 this.plot = description
-                // ✅ status is a valid property – now import ShowStatus
+                // Explicitly set status using ShowStatus enum
                 this.status = when {
                     document.selectFirst("span:contains(Completed), .status:contains(Complete)") != null -> ShowStatus.Completed
                     document.selectFirst("span:contains(Ongoing), .status:contains(Releasing)") != null -> ShowStatus.Ongoing
