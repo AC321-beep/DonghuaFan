@@ -31,7 +31,6 @@ class Rumble : ExtractorApi() {
 
         val scrapedUrls = mutableSetOf<String>()
 
-        // Regex to catch both standard and JSON-escaped URLs
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
 
@@ -39,7 +38,6 @@ class Rumble : ExtractorApi() {
             val rawUrl = match.value
             val cleanUrl = rawUrl.replace("\\/", "/")
 
-            // Filter out UI/tracker assets
             if (cleanUrl.contains("/assets/", ignoreCase = true) ||
                 cleanUrl.contains("loop", ignoreCase = true) ||
                 cleanUrl.contains("preview", ignoreCase = true) ||
@@ -52,7 +50,6 @@ class Rumble : ExtractorApi() {
                 if (cleanUrl.contains(".m3u8")) {
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
                 } else if (cleanUrl.contains(".mp4")) {
-                    // Try to extract quality from surrounding JSON
                     val startIndex = maxOf(0, match.range.first - 150)
                     val precedingText = html.substring(startIndex, match.range.first)
 
