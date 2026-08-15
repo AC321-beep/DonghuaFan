@@ -3,7 +3,7 @@ package com.donghuaworld
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.fixUrl
+import com.lagradost.cloudstream3.fixUrl          // import the top‑level function
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.INFER_TYPE
@@ -11,10 +11,10 @@ import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
+// Base class – now abstract, so it doesn't need to implement mainUrl/requiresReferer
 abstract class BaseRumble : ExtractorApi() {
-    // Force name to "Rumble" for all subclasses
+    // Name is always "Rumble" for all sources
     override val name = "Rumble"
-    // Each subclass must provide mainUrl and requiresReferer
 
     override suspend fun getUrl(
         url: String,
@@ -39,7 +39,6 @@ abstract class BaseRumble : ExtractorApi() {
             val rawUrl = match.value
             val cleanUrl = rawUrl.replace("\\/", "/")
 
-            // Filter out UI/tracker assets
             if (cleanUrl.contains("/assets/", ignoreCase = true) ||
                 cleanUrl.contains("loop", ignoreCase = true) ||
                 cleanUrl.contains("preview", ignoreCase = true) ||
@@ -96,15 +95,15 @@ abstract class BaseRumble : ExtractorApi() {
         trackMatches.forEach { match ->
             val url = match.groupValues[1]
             val lang = match.groupValues[2].takeIf { it.isNotBlank() } ?: "Unknown"
-            subtitles[lang] = fixUrl(url)
+            // Fix relative URLs using the top‑level fixUrl
+            subtitles[lang] = fixUrl(url, referer ?: mainUrl) ?: url
         }
 
         subtitleMatches.forEach { match ->
             val url = match.groupValues[1]
-            // Try to extract language from surrounding context (e.g., srclang, label)
             val lang = Regex("""srclang=["']([^"']+)["']""").find(html.substring(maxOf(0, match.range.first - 200), match.range.first))
                 ?.groupValues?.get(1) ?: "Unknown"
-            subtitles[lang] = fixUrl(url)
+            subtitles[lang] = fixUrl(url, referer ?: mainUrl) ?: url
         }
 
         // Also look for subtitle URLs inside JavaScript objects
@@ -113,16 +112,14 @@ abstract class BaseRumble : ExtractorApi() {
         if (jsSubMatch != null) {
             val subBlock = jsSubMatch.groupValues[1]
             val subUrls = Regex("""url\s*[:=]\s*["']([^"']+\.vtt[^"']*)["']""", RegexOption.IGNORE_CASE).findAll(subBlock)
-            val subLangs = Regex("""language\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(subBlock)
-            val subLabels = Regex("""label\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(subBlock)
+            val subLangs = Regex("""(?:language|label)\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(subBlock)
 
             val urlList = subUrls.map { it.groupValues[1] }.toList()
             val langList = subLangs.map { it.groupValues[1] }.toList()
-            val labelList = subLabels.map { it.groupValues[1] }.toList()
 
             for (i in urlList.indices) {
-                val lang = if (i < langList.size) langList[i] else if (i < labelList.size) labelList[i] else "Unknown"
-                subtitles[lang] = fixUrl(urlList[i])
+                val lang = if (i < langList.size) langList[i] else "Unknown"
+                subtitles[lang] = fixUrl(urlList[i], referer ?: mainUrl) ?: urlList[i]
             }
         }
 
