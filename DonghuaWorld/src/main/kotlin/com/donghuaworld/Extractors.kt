@@ -10,7 +10,7 @@ import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
-class Rumble : ExtractorApi() {
+open class Rumble : ExtractorApi() {
     override val name = "Rumble"
     override val mainUrl = "https://rumble.com"
     override val requiresReferer = false
@@ -80,4 +80,16 @@ class Rumble : ExtractorApi() {
             }
         }
     }
+}
+
+class Donghuaplanet : Rumble() {
+    override val name = "Donghuaplanet"
+    override val mainUrl = "https://player.donghuaplanet.com"
+    override val requiresReferer = true
+}
+
+class PlayerDonghuaworld : Rumble() {
+    override val name = "PlayerDonghuaworld"
+    override val mainUrl = "https://player.donghuaworld.in"
+    override val requiresReferer = true
 }
