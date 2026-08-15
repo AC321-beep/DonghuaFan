@@ -15,39 +15,41 @@ class DonghuaWorldProvider : MainAPI() {
     override var mainUrl = "https://donghuaworld.com"
     override var name = "Donghua World"
     override val hasMainPage = true
-    override var lang = "en"
+    override var lang = "zh"
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
 
+    // ---------- MAIN PAGE CATEGORIES ----------
+    // Based on the site's actual structure (from HTML)
     override val mainPage = mainPageOf(
         "page/1/" to "Recently Updated",
-        "category/comic-recently-updated/page/1/" to "Comic Recently Updated",
-        "category/comic-series/page/1/" to "Comic Series",
-        "category/donghua-recently-updated/page/1/" to "Donghua Recently Updated",
-        "category/donghua-series/page/1/" to "Donghua Series",
-        "category/latest-added/page/1/" to "Latest Added",
+        "category/donghua/page/1/" to "Donghua Series",
+        "category/completed/page/1/" to "Completed",
         "category/popular/page/1/" to "Popular",
-        "category/completed/page/1/" to "Completed"
+        "category/movie/page/1/" to "Movies",
+        "category/comic/page/1/" to "Comic"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl/${request.data}".replace("/page/1/", "/page/$page/")
         val document = app.get(url).document
 
-        val home = document.select("div.listupd > article, div.bsx, div.post-item, div.entry")
+        // Same selectors as Animekhor – works for this theme
+        val home = document.select("div.listupd > article, div.bsx")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
 
         return newHomePageResponse(request.name, home)
     }
 
+    // ---------- SEARCH ----------
     override suspend fun search(query: String): List<SearchResponse> {
         val results = coroutineScope {
             (1..2).map { page ->
                 async {
                     try {
                         val document = app.get("$mainUrl/page/$page/?s=${query.replace(" ", "+")}").document
-                        document.select("div.listupd > article, div.bsx, div.post-item, div.entry")
+                        document.select("div.listupd > article, div.bsx")
                             .mapNotNull { it.toSearchResult() }
                     } catch (e: Exception) {
                         emptyList()
@@ -58,6 +60,7 @@ class DonghuaWorldProvider : MainAPI() {
         return results.distinctBy { it.url }
     }
 
+    // ---------- SEARCH RESULT PARSER ----------
     private fun Element.toSearchResult(): SearchResponse? {
         val linkElement = this.selectFirst("a[href*=/anime/], a[href*=/donghua/], a[href*=/movie/], a[href*=/comic/]") ?: return null
         val title = linkElement.attr("title").ifEmpty { linkElement.text() }.ifEmpty { this.selectFirst(".tt")?.text() } ?: return null
@@ -72,6 +75,7 @@ class DonghuaWorldProvider : MainAPI() {
         return newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = posterUrl }
     }
 
+    // ---------- LOAD (EPISODES / MOVIE) ----------
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
         val title = document.selectFirst("h1.entry-title, h1.title")?.text()?.trim() ?: "Unknown"
@@ -105,6 +109,7 @@ class DonghuaWorldProvider : MainAPI() {
                 val epNum = Regex("""(?:Episode|EP|E)?\s*(\d+(?:\.\d+)?)""", RegexOption.IGNORE_CASE)
                     .find(episodeText)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
 
+                // ✅ Correct usage: newEpisode(url) with block (matches Animekhor)
                 newEpisode(href) {
                     this.name = episodeText.takeIf { it.isNotEmpty() } ?: "Episode $epNum"
                     this.posterUrl = poster
@@ -115,11 +120,11 @@ class DonghuaWorldProvider : MainAPI() {
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
                 this.plot = description
-                // status is omitted – optional field not needed for basic functionality
             }
         }
     }
 
+    // ---------- LOAD LINKS (VIDEO EXTRACTION) ----------
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -128,20 +133,21 @@ class DonghuaWorldProvider : MainAPI() {
     ): Boolean {
         val document = app.get(data).document
 
-        // 1. Server items with data-hash (Base64-encoded iframe)
+        // 1. Primary method: div.server-item a with data-hash (from decompiled code)
         val serverItems = document.select("div.server-item a")
-        Log.i("DonghuaWorld", "Found ${serverItems.size} server items")
+        Log.i("DonghuaWorld", "Found ${serverItems.size} server items with data-hash")
 
-        suspend fun processItem(item: Element) {
-            val base64 = item.attr("data-hash")
+        suspend fun processServerItem(element: Element) {
+            val base64 = element.attr("data-hash")
             if (base64.isNotBlank()) {
                 val decodedHtml = try { String(Base64.decode(base64, Base64.DEFAULT)) } catch (e: Exception) { "" }
                 val regex = Regex("src=[\"']([^\"']+)[\"']", RegexOption.IGNORE_CASE)
-                val match = regex.find(decodedHtml)
-                val iframeUrl = match?.groupValues?.get(1)
+                val matchResult = regex.find(decodedHtml)
+                val iframeUrl = matchResult?.groupValues?.get(1)
                 if (!iframeUrl.isNullOrBlank()) {
                     val finalUrl = fixUrl(iframeUrl)
                     Log.i("DonghuaWorld", "Extracted iframe URL: $finalUrl")
+                    // Only Rumble custom, everything else via loadExtractor
                     if ("rumble.com" in finalUrl) {
                         Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                     } else {
@@ -151,9 +157,9 @@ class DonghuaWorldProvider : MainAPI() {
             }
         }
 
-        serverItems.forEach { processItem(it) }
+        serverItems.forEach { processServerItem(it) }
 
-        // 2. Fallback: dropdown options (like Animekhor)
+        // 2. Fallback: dropdown options with Base64 (like Animekhor)
         if (serverItems.isEmpty()) {
             val serverOptions = document.select(".mobius option, select.mirror option")
             Log.i("DonghuaWorld", "Found ${serverOptions.size} server options")
@@ -177,7 +183,7 @@ class DonghuaWorldProvider : MainAPI() {
             serverOptions.forEach { processOption(it) }
         }
 
-        // 3. Direct iframes
+        // 3. Last resort: direct iframes
         if (serverItems.isEmpty()) {
             document.select("iframe[src]").forEach { iframe ->
                 val src = iframe.attr("abs:src")
@@ -191,7 +197,7 @@ class DonghuaWorldProvider : MainAPI() {
             }
         }
 
-        // 4. Regex fallback
+        // 4. Regex fallback – use loadExtractor
         val pageHtml = document.toString()
         val regex = Regex("""(https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*)""")
         regex.find(pageHtml)?.groupValues?.get(1)?.let { directUrl ->
