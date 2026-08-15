@@ -105,7 +105,7 @@ class DonghuaWorldProvider : MainAPI() {
                 val epNum = Regex("""(?:Episode|EP|E)?\s*(\d+(?:\.\d+)?)""", RegexOption.IGNORE_CASE)
                     .find(episodeText)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
 
-                // ***** CORRECT: newEpisode(url) with block *****
+                // Correct usage: newEpisode(url) with block
                 newEpisode(href) {
                     this.name = episodeText.takeIf { it.isNotEmpty() } ?: "Episode $epNum"
                     this.posterUrl = poster
@@ -116,6 +116,7 @@ class DonghuaWorldProvider : MainAPI() {
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
                 this.plot = description
+                // ✅ status is a valid property – now import ShowStatus
                 this.status = when {
                     document.selectFirst("span:contains(Completed), .status:contains(Complete)") != null -> ShowStatus.Completed
                     document.selectFirst("span:contains(Ongoing), .status:contains(Releasing)") != null -> ShowStatus.Ongoing
@@ -133,9 +134,9 @@ class DonghuaWorldProvider : MainAPI() {
     ): Boolean {
         val document = app.get(data).document
 
-        // 1. Try server items with data-hash (Base64-encoded iframe)
+        // 1. Server items with data-hash (Base64-encoded iframe)
         val serverItems = document.select("div.server-item a")
-        Log.i("DonghuaWorld", "Found ${serverItems.size} server items with data-hash")
+        Log.i("DonghuaWorld", "Found ${serverItems.size} server items")
 
         suspend fun processItem(item: Element) {
             val base64 = item.attr("data-hash")
@@ -147,7 +148,6 @@ class DonghuaWorldProvider : MainAPI() {
                 if (!iframeUrl.isNullOrBlank()) {
                     val finalUrl = fixUrl(iframeUrl)
                     Log.i("DonghuaWorld", "Extracted iframe URL: $finalUrl")
-                    // Only Rumble custom, everything else via loadExtractor
                     if ("rumble.com" in finalUrl) {
                         Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                     } else {
@@ -159,7 +159,7 @@ class DonghuaWorldProvider : MainAPI() {
 
         serverItems.forEach { processItem(it) }
 
-        // 2. Fallback: dropdown options with Base64-encoded value (like Animekhor)
+        // 2. Fallback: dropdown options (like Animekhor)
         if (serverItems.isEmpty()) {
             val serverOptions = document.select(".mobius option, select.mirror option")
             Log.i("DonghuaWorld", "Found ${serverOptions.size} server options")
@@ -171,7 +171,6 @@ class DonghuaWorldProvider : MainAPI() {
                     val iframeSrc = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")
                     if (!iframeSrc.isNullOrBlank()) {
                         val finalUrl = fixUrl(iframeSrc)
-                        Log.i("DonghuaWorld", "Extracted iframe from option: $finalUrl")
                         if ("rumble.com" in finalUrl) {
                             Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                         } else {
@@ -184,7 +183,7 @@ class DonghuaWorldProvider : MainAPI() {
             serverOptions.forEach { processOption(it) }
         }
 
-        // 3. Last resort: direct iframes
+        // 3. Direct iframes
         if (serverItems.isEmpty()) {
             document.select("iframe[src]").forEach { iframe ->
                 val src = iframe.attr("abs:src")
@@ -198,7 +197,7 @@ class DonghuaWorldProvider : MainAPI() {
             }
         }
 
-        // 4. Final regex fallback – use loadExtractor
+        // 4. Regex fallback
         val pageHtml = document.toString()
         val regex = Regex("""(https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*)""")
         regex.find(pageHtml)?.groupValues?.get(1)?.let { directUrl ->
