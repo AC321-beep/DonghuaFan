@@ -3,18 +3,37 @@ package com.donghuaworld
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.fixUrl          // import the top‑level function
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import okhttp3.HttpUrl.Companion.toHttpUrl
 
-// Base class – now abstract, so it doesn't need to implement mainUrl/requiresReferer
 abstract class BaseRumble : ExtractorApi() {
-    // Name is always "Rumble" for all sources
     override val name = "Rumble"
+
+    // Helper to resolve relative URLs
+    private fun resolveUrl(base: String, relative: String): String {
+        return try {
+            val baseUrl = base.toHttpUrl()
+            // If relative starts with http, return as-is; else resolve
+            if (relative.startsWith("http://") || relative.startsWith("https://")) {
+                relative
+            } else {
+                // If relative starts with /, use base's scheme/host
+                if (relative.startsWith("/")) {
+                    baseUrl.newBuilder().encodedPath(relative).build().toString()
+                } else {
+                    // relative path – resolve against base
+                    baseUrl.resolve(relative)?.toString() ?: relative
+                }
+            }
+        } catch (e: Exception) {
+            relative
+        }
+    }
 
     override suspend fun getUrl(
         url: String,
@@ -85,28 +104,27 @@ abstract class BaseRumble : ExtractorApi() {
         val subtitleRegex = Regex("""(?:src|file)\s*[:=]\s*["']([^"']+\.vtt[^"']*)["']""", RegexOption.IGNORE_CASE)
         val subtitleMatches = subtitleRegex.findAll(html)
 
-        // Also try to find subtitle tracks in <track> elements
         val trackRegex = Regex("""<track[^>]+src=["']([^"']+\.vtt[^"']*)["'][^>]*srclang=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
         val trackMatches = trackRegex.findAll(html)
 
-        // Collect all subtitle URLs with language hints
-        val subtitles = mutableMapOf<String, String>() // language -> url
+        val subtitles = mutableMapOf<String, String>()
 
         trackMatches.forEach { match ->
-            val url = match.groupValues[1]
+            val subUrl = match.groupValues[1]
             val lang = match.groupValues[2].takeIf { it.isNotBlank() } ?: "Unknown"
-            // Fix relative URLs using the top‑level fixUrl
-            subtitles[lang] = fixUrl(url, referer ?: mainUrl) ?: url
+            val resolved = resolveUrl(mainUrl, subUrl)
+            subtitles[lang] = resolved
         }
 
         subtitleMatches.forEach { match ->
-            val url = match.groupValues[1]
+            val subUrl = match.groupValues[1]
             val lang = Regex("""srclang=["']([^"']+)["']""").find(html.substring(maxOf(0, match.range.first - 200), match.range.first))
                 ?.groupValues?.get(1) ?: "Unknown"
-            subtitles[lang] = fixUrl(url, referer ?: mainUrl) ?: url
+            val resolved = resolveUrl(mainUrl, subUrl)
+            subtitles[lang] = resolved
         }
 
-        // Also look for subtitle URLs inside JavaScript objects
+        // JavaScript subtitle arrays
         val jsSubRegex = Regex("""subtitles\s*:\s*\[([^\]]+)\]""", RegexOption.IGNORE_CASE)
         val jsSubMatch = jsSubRegex.find(html)
         if (jsSubMatch != null) {
@@ -119,15 +137,15 @@ abstract class BaseRumble : ExtractorApi() {
 
             for (i in urlList.indices) {
                 val lang = if (i < langList.size) langList[i] else "Unknown"
-                subtitles[lang] = fixUrl(urlList[i], referer ?: mainUrl) ?: urlList[i]
+                val resolved = resolveUrl(mainUrl, urlList[i])
+                subtitles[lang] = resolved
             }
         }
 
-        // Add subtitles to callback
-        subtitles.forEach { (lang, url) ->
-            val subFile = SubtitleFile(url, lang)
+        subtitles.forEach { (lang, subUrl) ->
+            val subFile = SubtitleFile(subUrl, lang)
             subtitleCallback.invoke(subFile)
-            Log.d(this.name, "Added subtitle: $lang -> $url")
+            Log.d(this.name, "Added subtitle: $lang -> $subUrl")
         }
 
         if (subtitles.isEmpty()) {
@@ -136,7 +154,6 @@ abstract class BaseRumble : ExtractorApi() {
     }
 }
 
-// ---------- Concrete extractors ----------
 class Rumble : BaseRumble() {
     override val mainUrl = "https://rumble.com"
     override val requiresReferer = false
