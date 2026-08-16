@@ -1,6 +1,5 @@
 package com.donghuaworld
 
-import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorApi
@@ -21,15 +20,12 @@ open class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        Log.d(this.name, "Starting extraction for: $url")
         val html = try {
             app.get(url, referer = referer ?: mainUrl).text
         } catch (e: Exception) {
-            Log.e(this.name, "Failed to fetch embed page: ${e.message}")
             return
         }
 
-        // Extract video URLs (MP4 & M3U8)
         val scrapedUrls = mutableSetOf<String>()
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
@@ -48,10 +44,8 @@ open class Rumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8")) {
-                    // ✅ M3u8Helper automatically extracts subtitles from the HLS manifest
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
                 } else if (cleanUrl.contains(".mp4")) {
-                    // Try to extract quality from surrounding JSON
                     val startIndex = maxOf(0, match.range.first - 150)
                     val precedingText = html.substring(startIndex, match.range.first)
 
@@ -79,32 +73,25 @@ open class Rumble : ExtractorApi() {
                         }
                     )
 
-                    // Fallback: try to find .vtt subtitles in the page for MP4 (rare)
+                    // Fallback: try to find .vtt subtitles in the page for MP4
                     val vttRegex = Regex("""https?://[^\s"']+\.vtt""")
                     vttRegex.findAll(html).forEach { vttMatch ->
                         val vttUrl = vttMatch.value
                         val lang = Regex("""/([a-z]{2})\.vtt""").find(vttUrl)?.groupValues?.get(1) ?: "Unknown"
                         subtitleCallback.invoke(SubtitleFile(vttUrl, lang))
-                        Log.d(this.name, "Added subtitle: $lang -> $vttUrl")
                     }
                 }
             }
         }
-
-        if (scrapedUrls.isEmpty()) {
-            Log.d(this.name, "No video URLs found.")
-        }
     }
 }
 
-// Clone for Donghuaplanet
 class Donghuaplanet : Rumble() {
     override val name = "Rumble"
     override val mainUrl = "https://player.donghuaplanet.com"
     override val requiresReferer = true
 }
 
-// Clone for PlayerDonghuaworld
 class PlayerDonghuaworld : Rumble() {
     override val name = "Rumble"
     override val mainUrl = "https://player.donghuaworld.in"
