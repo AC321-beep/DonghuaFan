@@ -1,7 +1,6 @@
 package com.donghuaworld
 
 import android.util.Base64
-import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
@@ -36,7 +35,6 @@ class DonghuaWorldProvider : MainAPI() {
             val base = "$mainUrl/${request.data}"
             if (base.contains("?")) "$base&page=$page" else "$base?page=$page"
         }
-        Log.i("DonghuaWorld", "Fetching main page: $url")
         val document = app.get(url).document
         val items = document.select("article.bs")
         val home = items.mapNotNull { it.toSearchResult() }.distinctBy { it.url }
@@ -129,9 +127,7 @@ class DonghuaWorldProvider : MainAPI() {
     ): Boolean {
         val document = app.get(data).document
 
-        // Primary: div.server-item a with data-hash
         val serverItems = document.select("div.server-item a")
-        Log.i("DonghuaWorld", "Found ${serverItems.size} server items")
 
         serverItems.forEach { item ->
             val base64 = item.attr("data-hash")
@@ -142,8 +138,6 @@ class DonghuaWorldProvider : MainAPI() {
                 val iframeUrl = match?.groupValues?.get(1)
                 if (!iframeUrl.isNullOrBlank()) {
                     val finalUrl = fixUrl(iframeUrl)
-                    Log.i("DonghuaWorld", "Routing -> $finalUrl")
-                    // Route to custom extractors for Rumble-like players, otherwise use loadExtractor
                     when {
                         "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                         "player.donghuaplanet.com" in finalUrl -> Donghuaplanet().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
@@ -154,7 +148,6 @@ class DonghuaWorldProvider : MainAPI() {
             }
         }
 
-        // Fallback: direct iframes
         if (serverItems.isEmpty()) {
             document.select("iframe[src]").forEach { iframe ->
                 val src = iframe.attr("abs:src")
@@ -169,7 +162,6 @@ class DonghuaWorldProvider : MainAPI() {
             }
         }
 
-        // Fallback: regex for direct video URLs
         val pageHtml = document.toString()
         val regex = Regex("""(https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*)""")
         regex.find(pageHtml)?.groupValues?.get(1)?.let { directUrl ->
