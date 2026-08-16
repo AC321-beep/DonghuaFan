@@ -18,15 +18,12 @@ abstract class BaseRumble : ExtractorApi() {
     private fun resolveUrl(base: String, relative: String): String {
         return try {
             val baseUrl = base.toHttpUrl()
-            // If relative starts with http, return as-is; else resolve
             if (relative.startsWith("http://") || relative.startsWith("https://")) {
                 relative
             } else {
-                // If relative starts with /, use base's scheme/host
                 if (relative.startsWith("/")) {
                     baseUrl.newBuilder().encodedPath(relative).build().toString()
                 } else {
-                    // relative path – resolve against base
                     baseUrl.resolve(relative)?.toString() ?: relative
                 }
             }
@@ -100,60 +97,106 @@ abstract class BaseRumble : ExtractorApi() {
             }
         }
 
-        // ------ 2. Extract subtitles (WebVTT / .vtt) ------
-        val subtitleRegex = Regex("""(?:src|file)\s*[:=]\s*["']([^"']+\.vtt[^"']*)["']""", RegexOption.IGNORE_CASE)
-        val subtitleMatches = subtitleRegex.findAll(html)
+        // ------ 2. Extract subtitles (WebVTT / .vtt) – IMPROVED ------
+        val subtitles = mutableMapOf<String, String>() // language -> url
 
+        // ----- 2.1 Extract from <track> elements -----
         val trackRegex = Regex("""<track[^>]+src=["']([^"']+\.vtt[^"']*)["'][^>]*srclang=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-        val trackMatches = trackRegex.findAll(html)
-
-        val subtitles = mutableMapOf<String, String>()
-
-        trackMatches.forEach { match ->
-            val subUrl = match.groupValues[1]
+        trackRegex.findAll(html).forEach { match ->
+            val url = match.groupValues[1]
             val lang = match.groupValues[2].takeIf { it.isNotBlank() } ?: "Unknown"
-            val resolved = resolveUrl(mainUrl, subUrl)
-            subtitles[lang] = resolved
+            subtitles[lang] = resolveUrl(mainUrl, url)
         }
 
-        subtitleMatches.forEach { match ->
-            val subUrl = match.groupValues[1]
-            val lang = Regex("""srclang=["']([^"']+)["']""").find(html.substring(maxOf(0, match.range.first - 200), match.range.first))
-                ?.groupValues?.get(1) ?: "Unknown"
-            val resolved = resolveUrl(mainUrl, subUrl)
-            subtitles[lang] = resolved
-        }
-
-        // JavaScript subtitle arrays
-        val jsSubRegex = Regex("""subtitles\s*:\s*\[([^\]]+)\]""", RegexOption.IGNORE_CASE)
-        val jsSubMatch = jsSubRegex.find(html)
-        if (jsSubMatch != null) {
-            val subBlock = jsSubMatch.groupValues[1]
-            val subUrls = Regex("""url\s*[:=]\s*["']([^"']+\.vtt[^"']*)["']""", RegexOption.IGNORE_CASE).findAll(subBlock)
-            val subLangs = Regex("""(?:language|label)\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(subBlock)
-
-            val urlList = subUrls.map { it.groupValues[1] }.toList()
-            val langList = subLangs.map { it.groupValues[1] }.toList()
-
-            for (i in urlList.indices) {
-                val lang = if (i < langList.size) langList[i] else "Unknown"
-                val resolved = resolveUrl(mainUrl, urlList[i])
+        // ----- 2.2 Extract from plain `src` or `file` attributes -----
+        val plainRegex = Regex("""(?:src|file)\s*[:=]\s*["']([^"']+\.vtt[^"']*)["']""", RegexOption.IGNORE_CASE)
+        plainRegex.findAll(html).forEach { match ->
+            val url = match.groupValues[1]
+            // Try to find a language label near the match
+            val context = html.substring(maxOf(0, match.range.first - 300), match.range.first + 300)
+            val lang = Regex("""(?:label|lang|language|srclang)\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                .find(context)?.groupValues?.get(1) ?: "Unknown"
+            // Avoid duplicates
+            val resolved = resolveUrl(mainUrl, url)
+            if (!subtitles.values.contains(resolved)) {
                 subtitles[lang] = resolved
             }
         }
 
-        subtitles.forEach { (lang, subUrl) ->
-            val subFile = SubtitleFile(subUrl, lang)
-            subtitleCallback.invoke(subFile)
-            Log.d(this.name, "Added subtitle: $lang -> $subUrl")
+        // ----- 2.3 Extract from JavaScript objects / JSON arrays -----
+        // Look for patterns like: subtitles: [ { src: "url", label: "English" }, ... ]
+        val jsArrayRegex = Regex("""(?:subtitles|subs|captions)\s*:\s*\[([^\]]+)\]""", RegexOption.IGNORE_CASE)
+        jsArrayRegex.findAll(html).forEach { match ->
+            val block = match.groupValues[1]
+            // Try to extract each item in the array
+            val itemRegex = Regex("""\{([^}]+)\}""")
+            itemRegex.findAll(block).forEach { itemMatch ->
+                val item = itemMatch.groupValues[1]
+                val url = Regex("""(?:src|file|url)\s*[:=]\s*["']([^"']+\.vtt[^"']*)["']""", RegexOption.IGNORE_CASE)
+                    .find(item)?.groupValues?.get(1)
+                val label = Regex("""(?:label|lang|language)\s*[:=]\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                    .find(item)?.groupValues?.get(1) ?: "Unknown"
+                if (url != null) {
+                    val resolved = resolveUrl(mainUrl, url)
+                    subtitles[label] = resolved
+                }
+            }
         }
 
+        // ----- 2.4 Extract from inline script variables (e.g., var subtitles = {...}) -----
+        val varRegex = Regex("""(?:var|let|const)\s+(?:subtitles|subs|captions)\s*=\s*({[^;]+})""", RegexOption.IGNORE_CASE)
+        varRegex.findAll(html).forEach { match ->
+            val jsonBlock = match.groupValues[1]
+            // Try to parse as JSON-like object
+            val urlPairs = Regex("""["'](?:src|file|url)["']\s*:\s*["']([^"']+\.vtt[^"']*)["']""", RegexOption.IGNORE_CASE)
+                .findAll(jsonBlock).map { it.groupValues[1] }.toList()
+            val labelPairs = Regex("""["'](?:label|lang|language)["']\s*:\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                .findAll(jsonBlock).map { it.groupValues[1] }.toList()
+
+            for (i in urlPairs.indices) {
+                val url = urlPairs[i]
+                val lang = if (i < labelPairs.size) labelPairs[i] else "Unknown"
+                val resolved = resolveUrl(mainUrl, url)
+                subtitles[lang] = resolved
+            }
+        }
+
+        // ----- 2.5 Fallback: scan the whole page for any .vtt URL and guess language from filename -----
         if (subtitles.isEmpty()) {
+            val vttUrlRegex = Regex("""https?://[^\s"']+\.vtt""")
+            vttUrlRegex.findAll(html).forEach { match ->
+                val url = match.value
+                // Try to guess language from filename: e.g., "en.vtt", "subs_es.vtt"
+                val lang = Regex("""/([a-z]{2})\.vtt""").find(url)?.groupValues?.get(1)
+                    ?: Regex("""_([a-z]{2})\.vtt""").find(url)?.groupValues?.get(1)
+                    ?: "Unknown"
+                val resolved = resolveUrl(mainUrl, url)
+                subtitles[lang] = resolved
+            }
+        }
+
+        // Deduplicate by URL (keep first language)
+        val uniqueSubtitles = mutableMapOf<String, String>()
+        subtitles.forEach { (lang, url) ->
+            if (!uniqueSubtitles.values.contains(url)) {
+                uniqueSubtitles[lang] = url
+            }
+        }
+
+        // Add subtitles to callback
+        uniqueSubtitles.forEach { (lang, url) ->
+            val subFile = SubtitleFile(url, lang)
+            subtitleCallback.invoke(subFile)
+            Log.d(this.name, "Added subtitle: $lang -> $url")
+        }
+
+        if (uniqueSubtitles.isEmpty()) {
             Log.d(this.name, "No subtitles found.")
         }
     }
 }
 
+// ---------- Concrete extractors ----------
 class Rumble : BaseRumble() {
     override val mainUrl = "https://rumble.com"
     override val requiresReferer = false
