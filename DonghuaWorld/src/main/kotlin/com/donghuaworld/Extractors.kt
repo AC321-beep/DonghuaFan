@@ -99,14 +99,14 @@ open class Rumble : ExtractorApi() {
 
 // Clone for Donghuaplanet
 class Donghuaplanet : Rumble() {
-    override val name = "Donghuaplanet"
+    override val name = "Rumble"
     override val mainUrl = "https://player.donghuaplanet.com"
     override val requiresReferer = true
 }
 
 // Clone for PlayerDonghuaworld
 class PlayerDonghuaworld : Rumble() {
-    override val name = "PlayerDonghuaworld"
+    override val name = "Rumble"
     override val mainUrl = "https://player.donghuaworld.in"
     override val requiresReferer = true
 }
