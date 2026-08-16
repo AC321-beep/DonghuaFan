@@ -15,14 +15,12 @@ class DonghuaWorldProvider : MainAPI() {
     override var mainUrl = "https://donghuaworld.com"
     override var name = "Donghua World"
     override val hasMainPage = true
-    override var lang = "zh"
+    override var lang = "en"
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
 
-    // ---------- MAIN PAGE CATEGORIES ----------
-    // Based on actual filter URLs from the site's HTML
     override val mainPage = mainPageOf(
-        "" to "Recently Updated",                       // homepage
+        "" to "Recently Updated",
         "anime/?status=ongoing&order=latest" to "Ongoing",
         "anime/?status=completed&order=update" to "Completed",
         "anime/?type=movie&order=update" to "Movies",
@@ -35,33 +33,25 @@ class DonghuaWorldProvider : MainAPI() {
         val url = if (request.data.isBlank()) {
             mainUrl
         } else {
-            // If the URL contains '?', we need to add &page=; if not, we add ?page=
             val base = "$mainUrl/${request.data}"
             if (base.contains("?")) "$base&page=$page" else "$base?page=$page"
         }
         Log.i("DonghuaWorld", "Fetching main page: $url")
         val document = app.get(url).document
-
-        // Exact selector from HTML: all article.bs (both slider and normal list)
         val items = document.select("article.bs")
-        Log.i("DonghuaWorld", "Found ${items.size} items")
-
         val home = items.mapNotNull { it.toSearchResult() }.distinctBy { it.url }
         return newHomePageResponse(request.name, home)
     }
 
-    // ---------- SEARCH ----------
     override suspend fun search(query: String): List<SearchResponse> {
         val results = coroutineScope {
             (1..2).map { page ->
                 async {
                     try {
                         val url = "$mainUrl/page/$page/?s=${query.replace(" ", "+")}"
-                        Log.i("DonghuaWorld", "Searching: $url")
                         val document = app.get(url).document
                         document.select("article.bs").mapNotNull { it.toSearchResult() }
                     } catch (e: Exception) {
-                        Log.e("DonghuaWorld", "Search error: ${e.message}")
                         emptyList()
                     }
                 }
@@ -71,25 +61,19 @@ class DonghuaWorldProvider : MainAPI() {
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        // Find the anchor inside the card
         val linkElement = this.selectFirst("a[href*=/anime/], a[href*=/donghua/], a[href*=/movie/], a[href*=/comic/]")
-            ?: this.selectFirst("a") // fallback
-            ?: return null
-
+            ?: this.selectFirst("a") ?: return null
         val title = linkElement.attr("title").ifEmpty { linkElement.text() }
             .ifEmpty { this.selectFirst(".tt")?.text() } ?: return null
         val href = fixUrlNull(linkElement.attr("href")) ?: return null
-
         val posterUrl = fixUrlNull(
             this.selectFirst("img")?.let { img ->
                 img.attr("data-src").ifEmpty { img.attr("src") }.ifEmpty { img.attr("data-lazy-src") }
             }
         )
-
         return newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = posterUrl }
     }
 
-    // ---------- LOAD (EPISODES / MOVIE) ----------
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
         val title = document.selectFirst("h1.entry-title, h1.title")?.text()?.trim() ?: "Unknown"
@@ -137,7 +121,6 @@ class DonghuaWorldProvider : MainAPI() {
         }
     }
 
-    // ---------- LOAD LINKS (VIDEO EXTRACTION) ----------
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -146,21 +129,9 @@ class DonghuaWorldProvider : MainAPI() {
     ): Boolean {
         val document = app.get(data).document
 
-        // 1. Primary: div.server-item a with data-hash (from decompiled code)
+        // Primary: div.server-item a with data-hash
         val serverItems = document.select("div.server-item a")
         Log.i("DonghuaWorld", "Found ${serverItems.size} server items")
-
-        suspend fun invokeExtractor(iframeUrl: String, label: String) {
-            val finalUrl = fixUrl(iframeUrl)
-            Log.i("DonghuaWorld", "Routing -> $finalUrl | Label -> $label")
-
-            when {
-                "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "player.donghuaplanet.com" in finalUrl -> Donghuaplanet().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "player.donghuaworld.in" in finalUrl -> PlayerDonghuaworld().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                else -> loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
-            }
-        }
 
         serverItems.forEach { item ->
             val base64 = item.attr("data-hash")
@@ -170,39 +141,35 @@ class DonghuaWorldProvider : MainAPI() {
                 val match = regex.find(decodedHtml)
                 val iframeUrl = match?.groupValues?.get(1)
                 if (!iframeUrl.isNullOrBlank()) {
-                    invokeExtractor(iframeUrl, item.text().trim())
-                }
-            }
-        }
-
-        // 2. Fallback: dropdown options (like Animekhor)
-        if (serverItems.isEmpty()) {
-            val serverOptions = document.select(".mobius option, select.mirror option")
-            Log.i("DonghuaWorld", "Found ${serverOptions.size} server options")
-
-            serverOptions.forEach { option ->
-                val base64 = option.attr("value")
-                if (base64.isNotBlank()) {
-                    val decodedHtml = try { String(Base64.decode(base64, Base64.DEFAULT)) } catch (e: Exception) { "" }
-                    val iframeSrc = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")
-                    if (!iframeSrc.isNullOrBlank()) {
-                        invokeExtractor(iframeSrc, option.text().trim())
+                    val finalUrl = fixUrl(iframeUrl)
+                    Log.i("DonghuaWorld", "Routing -> $finalUrl")
+                    // Route to custom extractors for Rumble-like players, otherwise use loadExtractor
+                    when {
+                        "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                        "player.donghuaplanet.com" in finalUrl -> Donghuaplanet().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                        "player.donghuaworld.in" in finalUrl -> PlayerDonghuaworld().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                        else -> loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
                     }
                 }
             }
         }
 
-        // 3. Last resort: direct iframes
+        // Fallback: direct iframes
         if (serverItems.isEmpty()) {
             document.select("iframe[src]").forEach { iframe ->
                 val src = iframe.attr("abs:src")
                 if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
-                    invokeExtractor(src, "Direct")
+                    when {
+                        "rumble.com" in src -> Rumble().getUrl(src, mainUrl, subtitleCallback, callback)
+                        "player.donghuaplanet.com" in src -> Donghuaplanet().getUrl(src, mainUrl, subtitleCallback, callback)
+                        "player.donghuaworld.in" in src -> PlayerDonghuaworld().getUrl(src, mainUrl, subtitleCallback, callback)
+                        else -> loadExtractor(src, referer = mainUrl, subtitleCallback, callback)
+                    }
                 }
             }
         }
 
-        // 4. Regex fallback
+        // Fallback: regex for direct video URLs
         val pageHtml = document.toString()
         val regex = Regex("""(https?://[^\s"'<>]+\.(?:m3u8|mp4)[^\s"'<>]*)""")
         regex.find(pageHtml)?.groupValues?.get(1)?.let { directUrl ->
