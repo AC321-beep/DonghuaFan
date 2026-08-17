@@ -8,6 +8,7 @@ import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import org.jsoup.Jsoup
 
 open class Rumble : ExtractorApi() {
     override val name = "Rumble"
@@ -26,6 +27,47 @@ open class Rumble : ExtractorApi() {
             return
         }
 
+        // ============================================
+        // 1. IMPROVED SUBTITLE EXTRACTION
+        // ============================================
+        val extractedSubs = mutableSetOf<String>()
+
+        // A. Extract from standard HTML <track> tags
+        try {
+            Jsoup.parse(html).select("track").forEach { track ->
+                val src = track.attr("src")
+                if (src.isNotBlank() && extractedSubs.add(src)) {
+                    val label = track.attr("label").ifEmpty { track.attr("srclang") }.ifEmpty { "Unknown" }
+                    val subUrl = resolveUrl(src)
+                    subtitleCallback.invoke(SubtitleFile(label, subUrl))
+                }
+            }
+        } catch (e: Exception) {
+            // Ignore parse exceptions
+        }
+
+        // B. Extract .vtt or .srt from JSON strings and JS variables
+        val subRegex = Regex("""(?:file|src|url)["']?\s*:\s*(["'])([^"']+\.(?:vtt|srt|ass))(\1)""")
+        subRegex.findAll(html).forEach { subMatch ->
+            val subRaw = subMatch.groupValues[2].replace("\\/", "/") // Unescape JSON slashes
+            if (extractedSubs.add(subRaw)) {
+                val subUrl = resolveUrl(subRaw)
+
+                // Guess Language from Filename
+                val lang = when {
+                    subUrl.contains("eng", true) || subUrl.contains("-en.", true) || subUrl.contains("/en.", true) -> "English"
+                    subUrl.contains("ind", true) || subUrl.contains("-id.", true) || subUrl.contains("/id.", true) -> "Indonesian"
+                    subUrl.contains("ara", true) || subUrl.contains("-ar.", true) || subUrl.contains("/ar.", true) -> "Arabic"
+                    subUrl.contains("spa", true) || subUrl.contains("-es.", true) || subUrl.contains("/es.", true) -> "Spanish"
+                    else -> Regex("""/([a-zA-Z]{2,3})\.(?:vtt|srt|ass)""").find(subUrl)?.groupValues?.get(1)?.uppercase() ?: "Unknown"
+                }
+                subtitleCallback.invoke(SubtitleFile(lang, subUrl))
+            }
+        }
+
+        // ============================================
+        // 2. VIDEO STREAM EXTRACTION
+        // ============================================
         val scrapedUrls = mutableSetOf<String>()
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
@@ -72,16 +114,18 @@ open class Rumble : ExtractorApi() {
                             this.quality = qualityInt
                         }
                     )
-
-                    // Fallback: try to find .vtt subtitles in the page for MP4
-                    val vttRegex = Regex("""https?://[^\s"']+\.vtt""")
-                    vttRegex.findAll(html).forEach { vttMatch ->
-                        val vttUrl = vttMatch.value
-                        val lang = Regex("""/([a-z]{2})\.vtt""").find(vttUrl)?.groupValues?.get(1) ?: "Unknown"
-                        subtitleCallback.invoke(SubtitleFile(vttUrl, lang))
-                    }
                 }
             }
+        }
+    }
+
+    // Helper function to resolve relative paths cleanly
+    private fun resolveUrl(path: String): String {
+        return when {
+            path.startsWith("http") -> path
+            path.startsWith("//") -> "https:$path"
+            path.startsWith("/") -> mainUrl + path
+            else -> "$mainUrl/$path"
         }
     }
 }
