@@ -28,7 +28,7 @@ open class Rumble : ExtractorApi() {
             return
         }
 
-        // Clean up escaped JSON strings so Regex can read it cleanly
+        // Clean up escaped JSON strings so Regex can read them cleanly
         val cleanHtml = html.replace("\\\"", "\"").replace("\\/", "/")
         val extractedSubs = mutableSetOf<String>()
 
@@ -50,10 +50,17 @@ open class Rumble : ExtractorApi() {
             // Ignore JSoup parse errors
         }
 
-        // B. Hunt for .vtt/.srt/.ass embedded in JSON strings or JS Variables (Now respects queries)
-        val subRegex = Regex("""(["'])([^"']*\.(?:vtt|srt|ass)[^"']*)(\1)""", RegexOption.IGNORE_CASE)
+        // B. Hunt for .vtt/.srt/.ass AND extension-less API links embedded in JSON/JS Variables
+        val subRegex = Regex("""(["'])([^"']*(?:\.(?:vtt|srt|ass)|\?lang=|&lang=|/sub/|/subtitle/|/caption/)[^"']*)(\1)""", RegexOption.IGNORE_CASE)
         subRegex.findAll(cleanHtml).forEach { subMatch ->
             val subRaw = subMatch.groupValues[2]
+            
+            // Exclude false positives (media/image/script files)
+            if (subRaw.contains(".mp4") || subRaw.contains(".m3u8") || 
+                subRaw.contains(".jpg") || subRaw.contains(".png") || 
+                subRaw.contains(".js") || subRaw.contains(".css")) {
+                return@forEach
+            }
             
             if (extractedSubs.add(subRaw)) {
                 val subUrl = resolveUrl(subRaw, url)
@@ -163,7 +170,7 @@ open class Rumble : ExtractorApi() {
 
         // 3. Fallback to extracting the language hint from the URL
         // Matches patterns like "/en.vtt", "_id.srt", "-ara.ass", "?lang=es", or "/english.vtt"
-        val urlMatch = Regex("""(?:/|_|-|\?lang=)([a-zA-Z]{2,})(?:\.(?:vtt|srt|ass)|\?|&|$)""")
+        val urlMatch = Regex("""(?:/|_|-|\?lang=|&lang=)([a-zA-Z]{2,})(?:\.(?:vtt|srt|ass)|\?|&|$)""")
             .find(url.lowercase())?.groupValues?.get(1)
 
         if (urlMatch != null) {
@@ -179,7 +186,7 @@ open class Rumble : ExtractorApi() {
             }
         }
 
-        // 4. Force default to English if completely obscure or missing
+        // 4. Force strict default to English if completely obscure or missing
         return "English"
     }
 }
