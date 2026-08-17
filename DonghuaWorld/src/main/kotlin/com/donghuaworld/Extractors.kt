@@ -9,6 +9,7 @@ import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.Jsoup
+import java.util.Locale
 
 open class Rumble : ExtractorApi() {
     override val name = "Rumble"
@@ -32,49 +33,41 @@ open class Rumble : ExtractorApi() {
         val extractedSubs = mutableSetOf<String>()
 
         // ============================================
-        // 1. EXTRACT SUBTITLES (Tracks & JSON Arrays)
+        // 1. EXTRACT SUBTITLES
         // ============================================
         
-        // A. Extract from standard HTML <track> tags
+        // A. Check standard HTML <track> tags
         try {
             Jsoup.parse(cleanHtml).select("track").forEach { track ->
                 val src = track.attr("src")
                 if (src.isNotBlank() && extractedSubs.add(src)) {
-                    val label = track.attr("label").ifEmpty { track.attr("srclang") }.ifEmpty { guessLanguage(src) }
-                    subtitleCallback.invoke(SubtitleFile(label, resolveUrl(src, url)))
+                    val label = track.attr("label").ifEmpty { track.attr("srclang") }
+                    val lang = guessLanguage(label, src)
+                    subtitleCallback.invoke(SubtitleFile(lang, resolveUrl(src, url)))
                 }
             }
         } catch (e: Exception) {
-            // Ignore Jsoup parsing errors
+            // Ignore JSoup parse errors
         }
 
-        // B. Extract scattered JSON/JS array subtitles
-        // Matches any string ending in .vtt, .srt, or .ass
-        val subRegex = Regex("""(["'])([^"']+\.(?:vtt|srt|ass))(\1)""")
+        // B. Hunt for .vtt/.srt/.ass embedded in JSON strings or JS Variables (Now respects queries)
+        val subRegex = Regex("""(["'])([^"']*\.(?:vtt|srt|ass)[^"']*)(\1)""", RegexOption.IGNORE_CASE)
         subRegex.findAll(cleanHtml).forEach { subMatch ->
             val subRaw = subMatch.groupValues[2]
             
             if (extractedSubs.add(subRaw)) {
                 val subUrl = resolveUrl(subRaw, url)
                 
-                // Grab surrounding 150 characters to find the label/language key near the file URL
+                // Grab the surrounding context window to look for the language label securely
                 val matchIndex = subMatch.range.first
-                val start = maxOf(0, matchIndex - 150)
-                val end = minOf(cleanHtml.length, matchIndex + 150)
+                val start = maxOf(0, matchIndex - 200)
+                val end = minOf(cleanHtml.length, matchIndex + 200)
                 val context = cleanHtml.substring(start, end)
                 
-                // Hunt for "label": "English" or "language": "en"
                 val labelMatch = Regex("""(?:label|name|title|language|lang)["']?\s*:\s*(["'])([^"']+)(\1)""", RegexOption.IGNORE_CASE).find(context)
-                var lang = labelMatch?.groupValues?.get(2)?.trim() ?: ""
+                val extractedLabel = labelMatch?.groupValues?.get(2)?.trim() ?: ""
                 
-                // Fallback to our filename language guesser if the label is garbage or missing
-                if (lang.isBlank() || lang.equals("Unknown", true) || lang.length > 20) {
-                    lang = guessLanguage(subUrl)
-                } else if (lang.length <= 3) { 
-                    // Automatically convert shortcodes like "en" or "id" to full names
-                    lang = guessLanguage(".$lang.") 
-                }
-                
+                val lang = guessLanguage(extractedLabel, subUrl)
                 subtitleCallback.invoke(SubtitleFile(lang, subUrl))
             }
         }
@@ -152,27 +145,42 @@ open class Rumble : ExtractorApi() {
         }
     }
 
-    private fun guessLanguage(url: String): String {
-        val lowerUrl = url.lowercase()
-        return when {
-            lowerUrl.contains("eng") || lowerUrl.contains("-en") || lowerUrl.contains("/en") || lowerUrl.contains("_en") -> "English"
-            lowerUrl.contains("ind") || lowerUrl.contains("-id") || lowerUrl.contains("/id") || lowerUrl.contains("_id") -> "Indonesian"
-            lowerUrl.contains("ara") || lowerUrl.contains("-ar") || lowerUrl.contains("/ar") || lowerUrl.contains("_ar") -> "Arabic"
-            lowerUrl.contains("spa") || lowerUrl.contains("-es") || lowerUrl.contains("/es") || lowerUrl.contains("_es") -> "Spanish"
-            lowerUrl.contains("fre") || lowerUrl.contains("fra") || lowerUrl.contains("-fr") || lowerUrl.contains("_fr") -> "French"
-            lowerUrl.contains("ger") || lowerUrl.contains("-de") || lowerUrl.contains("/de") || lowerUrl.contains("_de") -> "German"
-            lowerUrl.contains("ita") || lowerUrl.contains("-it") || lowerUrl.contains("/it") || lowerUrl.contains("_it") -> "Italian"
-            lowerUrl.contains("por") || lowerUrl.contains("-pt") || lowerUrl.contains("/pt") || lowerUrl.contains("_pt") -> "Portuguese"
-            lowerUrl.contains("rus") || lowerUrl.contains("-ru") || lowerUrl.contains("/ru") || lowerUrl.contains("_ru") -> "Russian"
-            lowerUrl.contains("vie") || lowerUrl.contains("-vi") || lowerUrl.contains("/vi") || lowerUrl.contains("_vi") -> "Vietnamese"
-            lowerUrl.contains("tha") || lowerUrl.contains("-th") || lowerUrl.contains("/th") || lowerUrl.contains("_th") -> "Thai"
-            lowerUrl.contains("chi") || lowerUrl.contains("-zh") || lowerUrl.contains("/zh") || lowerUrl.contains("_zh") -> "Chinese"
-            lowerUrl.contains("tur") || lowerUrl.contains("-tr") || lowerUrl.contains("/tr") || lowerUrl.contains("_tr") -> "Turkish"
-            lowerUrl.contains("pol") || lowerUrl.contains("-pl") || lowerUrl.contains("/pl") || lowerUrl.contains("_pl") -> "Polish"
-            lowerUrl.contains("khm") || lowerUrl.contains("-km") || lowerUrl.contains("/km") || lowerUrl.contains("_km") -> "Khmer"
-            lowerUrl.contains("per") || lowerUrl.contains("-fa") || lowerUrl.contains("/fa") || lowerUrl.contains("_fa") -> "Persian"
-            else -> Regex("""/([a-z]{2,3})\.(?:vtt|srt|ass)""").find(lowerUrl)?.groupValues?.get(1)?.uppercase() ?: "Unknown"
+    private fun guessLanguage(label: String, url: String): String {
+        val cleanLabel = label.trim()
+
+        // 1. If the label is already a full word (e.g., "English", "Indonesian"), format and return it.
+        if (cleanLabel.length > 3 && !cleanLabel.equals("unknown", ignoreCase = true)) {
+            return cleanLabel.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
         }
+
+        // 2. If the label is a short code (e.g., "en", "id", "eng"), let the system resolve it dynamically.
+        if (cleanLabel.length in 2..3 && !cleanLabel.equals("unk", ignoreCase = true)) {
+            val displayLang = Locale(cleanLabel).getDisplayLanguage(Locale.ENGLISH)
+            // Locale returns the code itself if it fails to resolve. 
+            // If they don't match, it successfully found the full name!
+            if (displayLang.lowercase() != cleanLabel.lowercase()) return displayLang 
+        }
+
+        // 3. Fallback to extracting the language hint from the URL
+        // Matches patterns like "/en.vtt", "_id.srt", "-ara.ass", "?lang=es", or "/english.vtt"
+        val urlMatch = Regex("""(?:/|_|-|\?lang=)([a-zA-Z]{2,})(?:\.(?:vtt|srt|ass)|\?|&|$)""")
+            .find(url.lowercase())?.groupValues?.get(1)
+
+        if (urlMatch != null) {
+            // If the URL has a full word (e.g., "english", "spanish")
+            if (urlMatch.length > 3) {
+                return urlMatch.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+            }
+            
+            // If the URL has a short code (e.g., "en", "id", "eng"), let the system resolve it
+            val displayLang = Locale(urlMatch).getDisplayLanguage(Locale.ENGLISH)
+            if (displayLang.lowercase() != urlMatch.lowercase() && displayLang.isNotBlank()) {
+                return displayLang
+            }
+        }
+
+        // 4. Force default to English if completely obscure or missing
+        return "English"
     }
 }
 
