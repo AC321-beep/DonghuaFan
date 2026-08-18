@@ -47,8 +47,8 @@ class DonghuaWorldProvider : MainAPI() {
         val items = document.select("article.bs")
         val home = items.mapNotNull { it.toSearchResult() }.distinctBy { it.url }
         
-        // hasNextPage forces Cloudstream to stop loading duplicates if it hits an empty page
-        return newHomePageResponse(request.name, home, hasNextPage = home.isNotEmpty())
+        // FIXED: Using "hasNext" instead of "hasNextPage" to match Cloudstream's native API
+        return newHomePageResponse(request.name, home, hasNext = home.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
