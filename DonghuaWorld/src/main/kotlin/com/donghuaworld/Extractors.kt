@@ -152,41 +152,49 @@ open class Rumble : ExtractorApi() {
         }
     }
 
+    // 100% Dynamic Language Guesser using native java.util.Locale
     private fun guessLanguage(label: String, url: String): String {
         val cleanLabel = label.trim()
 
-        // 1. If the label is already a full word (e.g., "English", "Indonesian"), format and return it.
-        if (cleanLabel.length > 3 && !cleanLabel.equals("unknown", ignoreCase = true)) {
-            return cleanLabel.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+        // Helper function to safely ask the Android/Java system to translate shortcodes
+        fun resolveCode(code: String): String? {
+            if (code.length !in 2..3) return null
+            val display = Locale(code.lowercase()).getDisplayLanguage(Locale.ENGLISH)
+            // If the code is invalid, Locale just returns the code back. 
+            // If they don't match, it means it successfully found the full language name!
+            return if (display.lowercase() != code.lowercase() && display.isNotBlank()) display else null
         }
 
-        // 2. If the label is a short code (e.g., "en", "id", "eng"), let the system resolve it dynamically.
-        if (cleanLabel.length in 2..3 && !cleanLabel.equals("unk", ignoreCase = true)) {
-            val displayLang = Locale(cleanLabel).getDisplayLanguage(Locale.ENGLISH)
-            // Locale returns the code itself if it fails to resolve. 
-            // If they don't match, it successfully found the full name!
-            if (displayLang.lowercase() != cleanLabel.lowercase()) return displayLang 
-        }
-
-        // 3. Fallback to extracting the language hint from the URL
-        // Matches patterns like "/en.vtt", "_id.srt", "-ara.ass", "?lang=es", or "/english.vtt"
-        val urlMatch = Regex("""(?:/|_|-|\?lang=|&lang=)([a-zA-Z]{2,})(?:\.(?:vtt|srt|ass)|\?|&|$)""")
-            .find(url.lowercase())?.groupValues?.get(1)
-
-        if (urlMatch != null) {
-            // If the URL has a full word (e.g., "english", "spanish")
-            if (urlMatch.length > 3) {
-                return urlMatch.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
-            }
+        // 1. Try to resolve the label first
+        if (cleanLabel.isNotBlank() && !cleanLabel.equals("unknown", ignoreCase = true)) {
+            val resolved = resolveCode(cleanLabel)
+            if (resolved != null) return resolved
             
-            // If the URL has a short code (e.g., "en", "id", "eng"), let the system resolve it
-            val displayLang = Locale(urlMatch).getDisplayLanguage(Locale.ENGLISH)
-            if (displayLang.lowercase() != urlMatch.lowercase() && displayLang.isNotBlank()) {
-                return displayLang
+            // If the label is already a full word (e.g., "English", "Spanish"), format and return it
+            if (cleanLabel.length > 3) {
+                return cleanLabel.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
             }
         }
 
-        // 4. Force strict default to English if completely obscure or missing
+        // 2. Strict Check for Short Codes in the URL (e.g., /en.vtt, -id.srt, ?lang=ar)
+        // By requiring non-word boundaries (/, _, -, ?), we stop random hashes from matching.
+        val shortCodeMatch = Regex("""(?:/|_|-|\?lang=|&lang=)([a-zA-Z]{2,3})(?:\.(?:vtt|srt|ass)|\?|&|$)""")
+            .find(url)?.groupValues?.get(1)
+            
+        if (shortCodeMatch != null) {
+            val resolved = resolveCode(shortCodeMatch)
+            if (resolved != null) return resolved
+        }
+
+        // 3. Check for Full Language Words in the URL (e.g., /english.vtt, ?lang=indonesian)
+        val fullWordMatch = Regex("""(?:/|_|-|\?lang=|&lang=)([a-zA-Z]{4,})(?:\.(?:vtt|srt|ass)|\?|&|$)""")
+            .find(url)?.groupValues?.get(1)
+            
+        if (fullWordMatch != null && !fullWordMatch.equals("unknown", ignoreCase = true)) {
+            return fullWordMatch.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+        }
+
+        // 4. Force strict default to English if missing or completely obscure
         return "English"
     }
 }
