@@ -4,7 +4,6 @@ import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -29,16 +28,27 @@ class DonghuaWorldProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        // Fix for WordPress Pagination Duplication
         val url = if (request.data.isBlank()) {
-            mainUrl
+            if (page == 1) mainUrl else "$mainUrl/page/$page/"
         } else {
-            val base = "$mainUrl/${request.data}"
-            if (base.contains("?")) "$base&page=$page" else "$base?page=$page"
+            val basePath = request.data.substringBefore("?")
+            val query = if (request.data.contains("?")) "?" + request.data.substringAfter("?") else ""
+            
+            val cleanBasePath = basePath.trimEnd('/')
+            if (page == 1) {
+                "$mainUrl/$cleanBasePath/$query"
+            } else {
+                "$mainUrl/$cleanBasePath/page/$page/$query" // WordPress format: /anime/page/2/?status=ongoing
+            }
         }
+        
         val document = app.get(url).document
         val items = document.select("article.bs")
         val home = items.mapNotNull { it.toSearchResult() }.distinctBy { it.url }
-        return newHomePageResponse(request.name, home)
+        
+        // hasNextPage forces Cloudstream to stop loading duplicates if it hits an empty page
+        return newHomePageResponse(request.name, home, hasNextPage = home.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
