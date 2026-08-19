@@ -13,7 +13,7 @@ import kotlinx.coroutines.coroutineScope
 
 class AnimekhorProvider : MainAPI() {
     override var mainUrl = "https://animekhor.org"
-    override var name = "Animekhor"
+    override var name = "AnimeKhor"
     override val hasMainPage = true
     override var lang = "zh"
     override val hasDownloadSupport = true
