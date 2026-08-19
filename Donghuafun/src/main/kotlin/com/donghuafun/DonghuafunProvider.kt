@@ -5,6 +5,9 @@ import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import java.net.URLDecoder
 
 class DonghuaFunProvider : MainAPI() {
@@ -17,67 +20,93 @@ class DonghuaFunProvider : MainAPI() {
 
     companion object {
         private const val TAG = "Donghuafun"
-        // Desktop User-Agent to bypass mobile scraper blocks
         private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
 
     private fun detailUrlToId(url: String): String =
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
-      override val mainPage = mainPageOf(
+    override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
         "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Coming Soon"
     )
 
+    // ================================================================
+    // getMainPage - NOW USING PARALLEL FETCHES FOR SPEED
+    // ================================================================
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val isComingSoon = request.name == "Coming Soon"
         val isRecentlyUpdated = request.name == "Recently Updated"
-        var currentPage = page
-        val items = mutableListOf<SearchResponse>()
-        var hasNextPage = true
-        
-        val maxPagesToSearch = if (isComingSoon || isRecentlyUpdated) 5 else 1 
-        var pagesSearched = 0
 
-        while (items.isEmpty() && hasNextPage && pagesSearched < maxPagesToSearch) {
-            val pageUrl = if (currentPage == 1) request.data else request.data.replace(".html", "/page/$currentPage.html")
-            val doc = app.get(pageUrl).document
-            val elements = doc.select("a[href*='/vod/detail/id/']")
-            if (elements.isEmpty()) { hasNextPage = false; break }
-            
-            // Pass both flags so parseShowCards knows how to filter
-            items.addAll(parseShowCards(doc, isComingSoon, isRecentlyUpdated))
-            
-            pagesSearched++
-            if (items.isEmpty()) currentPage++ 
+        // We'll fetch pages 1 to 3 in parallel for a quick, rich response.
+        // You can adjust the number of pages (e.g., 2 or 3) to balance speed & load.
+        val pagesToFetch = 3
+        val baseUrl = request.data
+
+        val allItems = coroutineScope {
+            (1..pagesToFetch).map { p ->
+                async {
+                    try {
+                        val pageUrl = if (p == 1) baseUrl else {
+                            if (baseUrl.contains(".html")) {
+                                baseUrl.replace(".html", "/page/$p.html")
+                            } else {
+                                "$baseUrl/page/$p/"
+                            }
+                        }
+                        val doc = app.get(pageUrl).document
+                        parseShowCards(doc, isComingSoon, isRecentlyUpdated)
+                    } catch (e: Exception) {
+                        emptyList()
+                    }
+                }
+            }.awaitAll().flatten()
         }
-        return newHomePageResponse(request.name, items, hasNextPage)
+
+        // No deduplication – keep all items as they appear.
+        // Check if there is a next page (based on the last fetched page)
+        val lastPageUrl = if (pagesToFetch == 1) baseUrl else {
+            if (baseUrl.contains(".html")) {
+                baseUrl.replace(".html", "/page/${pagesToFetch + 1}.html")
+            } else {
+                "$baseUrl/page/${pagesToFetch + 1}/"
+            }
+        }
+        val hasNext = try {
+            val nextDoc = app.get(lastPageUrl).document
+            nextDoc.select("a.page-next:not(.disabled), a:contains(Next), a:contains(下一页)").isNotEmpty()
+        } catch (e: Exception) {
+            false
+        }
+
+        return newHomePageResponse(request.name, allItems, hasNext)
     }
 
+    // ================================================================
+    // SEARCH – unchanged (already sequential, but we keep it as is)
+    // ================================================================
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
-        // Using the help of the homepage directory to search as the site does not have a proper search function
-        for (page in 1..10) { // Search through the first 10 pages of the directory
+        for (page in 1..10) {
             val pageUrl = if (page == 1) {
                 "$mainUrl/index.php/vod/show/id/20/by/time.html"
             } else {
                 "$mainUrl/index.php/vod/show/id/20/by/time/page/$page.html"
             }
-            
             val doc = try { app.get(pageUrl).document } catch (e: Exception) { null } ?: break
-            val pageResults = parseShowCards(doc) // Defaults to false for both flags
+            val pageResults = parseShowCards(doc)
             if (pageResults.isEmpty()) break
-            
-            // Filter locally based on the search query
             results.addAll(pageResults.filter { it.name.contains(query, ignoreCase = true) })
-            
             val hasNext = doc.select("a.page-next:not(.disabled), a:contains(Next), a:contains(下一页)").isNotEmpty()
             if (!hasNext) break
         }
         return results.distinctBy { it.url }
     }
 
+    // ================================================================
+    // LOAD – unchanged
+    // ================================================================
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url).document
         val showId = detailUrlToId(url)
@@ -104,9 +133,9 @@ class DonghuaFunProvider : MainAPI() {
                 val epName = a.selectFirst("span")?.text()?.trim() ?: a.text().trim()
                 val epNumber = parseEpisodeNumber(epName)
                 val finalNumber = if (epNumber > 0) epNumber else episodeMap.size + 1
-                
+
                 if (!episodeMap.containsKey(finalNumber)) {
-                    episodeMap[finalNumber] = newEpisode(epUrl) { 
+                    episodeMap[finalNumber] = newEpisode(epUrl) {
                         name = epName.ifEmpty { "Episode $finalNumber" }; episode = finalNumber
                     }
                 }
@@ -134,6 +163,9 @@ class DonghuaFunProvider : MainAPI() {
         return Regex("""(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull() ?: -1
     }
 
+    // ================================================================
+    // LOAD LINKS – unchanged (kept your improved subtitle extraction)
+    // ================================================================
     @Suppress("DEPRECATION", "DEPRECATION_ERROR")
     override suspend fun loadLinks(
         data: String,
@@ -146,7 +178,7 @@ class DonghuaFunProvider : MainAPI() {
         val html = try { app.get(detailPageUrl, headers = headers).text } catch (e: Exception) { "" }
         val doc = try { app.get(detailPageUrl, headers = headers).document } catch (e: Exception) { null }
 
-        // --- Dailymotion Logic Intact ---
+        // --- Dailymotion ---
         var dailymotionToken: String? = null
         doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
             val src = iframe.attr("src")
@@ -161,7 +193,7 @@ class DonghuaFunProvider : MainAPI() {
             if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
         }
 
-        // --- Main Player Logic ---
+        // --- Main player ---
         val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
             .find(html)?.groupValues?.get(1) ?: return false
 
@@ -175,18 +207,13 @@ class DonghuaFunProvider : MainAPI() {
             rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
         }
 
-        // ==========================================
-        // --- IMPROVED SUBTITLE EXTRACTION START ---
-        // ==========================================
-
-        // 1. Extract from MacCMS player_aaaa JSON keys
+        // --- Subtitle extraction (unchanged) ---
         val subUrlRaw = Regex(""""(?:subt|vtt|zimu|subtitle|sub)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE)
             .find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
 
         if (subUrlRaw.isNotEmpty()) {
             var decodedSub = subUrlRaw
             try {
-                // Decode according to MacCMS encryption, unless it's already a plain HTTP/relative URL
                 if (encrypt == 1 && !decodedSub.startsWith("http")) {
                     decodedSub = URLDecoder.decode(decodedSub, "UTF-8")
                 } else if (encrypt == 2 && !decodedSub.startsWith("http") && !decodedSub.startsWith("/")) {
@@ -194,14 +221,13 @@ class DonghuaFunProvider : MainAPI() {
                     decodedSub = URLDecoder.decode(decodedSub, "UTF-8")
                 }
             } catch (e: Exception) {
-                decodedSub = subUrlRaw // Fallback to raw string if decoding fails
+                decodedSub = subUrlRaw
             }
             if (decodedSub.isNotBlank()) {
                 subtitleCallback.invoke(SubtitleFile("English", fixUrl(decodedSub)))
             }
         }
 
-        // 2. Extract from standard HTML <track> elements
         doc?.select("track")?.forEach { track ->
             val trackSrc = track.attr("src")
             if (trackSrc.isNotBlank()) {
@@ -210,21 +236,17 @@ class DonghuaFunProvider : MainAPI() {
             }
         }
 
-        // 3. Fallback: Extract from generic player configurations (e.g., DPlayer, ArtPlayer)
         val playerConfigSub = Regex("""subtitle:\s*\{\s*url:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
             .find(html)?.groupValues?.get(1)?.replace("\\/", "/")
         if (!playerConfigSub.isNullOrBlank()) {
             subtitleCallback.invoke(SubtitleFile("English", fixUrl(playerConfigSub)))
         }
 
-        // ========================================
-        // --- IMPROVED SUBTITLE EXTRACTION END ---
-        // ========================================
-
+        // --- Play the video ---
         if (from.equals("dailymotion", ignoreCase = true)) {
             val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
             if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
-        } 
+        }
         else if (rawUrl.isNotEmpty()) {
             if (rawUrl.contains("url=")) {
                 rawUrl = rawUrl.substringAfter("url=")
@@ -239,7 +261,6 @@ class DonghuaFunProvider : MainAPI() {
             )
 
             if (isM3u8) {
-                // Route to our newly created DonghuaFunExtractor by prepending the domain
                 val extractorUrl = if (rawUrl.startsWith("http")) {
                     "https://play.donghuafun.com/m3u8/?url=$rawUrl"
                 } else rawUrl
@@ -248,7 +269,6 @@ class DonghuaFunProvider : MainAPI() {
                     return true
                 }
             } else {
-                // Strict positional mapping fallback
                 callback.invoke(
                     newExtractorLink(
                         this.name,
@@ -267,10 +287,13 @@ class DonghuaFunProvider : MainAPI() {
         return false
     }
 
+    // ================================================================
+    // PARSE SHOW CARDS – identical to original (no dedup logic)
+    // ================================================================
     private fun parseShowCards(doc: Document, isComingSoon: Boolean = false, isRecentlyUpdated: Boolean = false): List<SearchResponse> {
         return doc.select("a[href*='/vod/detail/id/']")
             .distinctBy { it.attr("href") }
-            .filter { a -> 
+            .filter { a ->
                 val parent1 = a.parent()
                 val parent2 = a.parent()?.parent()
                 val parent3 = a.parent()?.parent()?.parent()
@@ -281,15 +304,15 @@ class DonghuaFunProvider : MainAPI() {
                     parent1 != null && parent1.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent1
                     else -> a
                 }
-                
+
                 val cardText = container.text()
                 val keywords = listOf("trailer", "coming soon", "not yet aired", "upcoming", "releasing soon", "0 episode")
                 val containsTrailerKeyword = keywords.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
 
                 when {
-                    isComingSoon -> containsTrailerKeyword       // ONLY show items with trailer keywords
-                    isRecentlyUpdated -> !containsTrailerKeyword // FILTER OUT items with trailer keywords
-                    else -> true                                 // For Most Popular/Search: Keep everything
+                    isComingSoon -> containsTrailerKeyword
+                    isRecentlyUpdated -> !containsTrailerKeyword
+                    else -> true
                 }
             }
             .mapNotNull { a ->
