@@ -11,7 +11,7 @@ import kotlinx.coroutines.coroutineScope
 
 class DonghuaWorldProvider : MainAPI() {
     override var mainUrl = "https://donghuaworld.com"
-    override var name = "Donghua World"
+    override var name = "DonghuaWorld"
     override val hasMainPage = true
     override var lang = "zh"
     override val hasDownloadSupport = false
@@ -28,7 +28,6 @@ class DonghuaWorldProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Fix for WordPress Pagination Duplication
         val url = if (request.data.isBlank()) {
             if (page == 1) mainUrl else "$mainUrl/page/$page/"
         } else {
@@ -39,18 +38,21 @@ class DonghuaWorldProvider : MainAPI() {
             if (page == 1) {
                 "$mainUrl/$cleanBasePath/$query"
             } else {
-                "$mainUrl/$cleanBasePath/page/$page/$query" // WordPress format: /anime/page/2/?status=ongoing
+                "$mainUrl/$cleanBasePath/page/$page/$query" 
             }
         }
         
         val document = app.get(url).document
         
-        // Filter out sidebar widgets and popular sliders that persist across pages and cause duplicates
-        val items = document.select("article.bs").filterNot { element ->
-            val parents = element.parents()
-            parents.hasClass("popularslider") || 
-            parents.attr("id") == "sidebar" || 
-            parents.hasClass("ts-wpop-series-gen")
+        // STRICT FILTER: Checks EVERY ancestor to ensure sidebar and slider items never bleed into the grid
+        val items = document.select("article.bs").filter { element ->
+            element.parents().none { parent ->
+                parent.id() == "sidebar" || 
+                parent.hasClass("popularslider") || 
+                parent.hasClass("widget") || 
+                parent.hasClass("ts-wpop-series-gen") ||
+                parent.tagName() == "aside"
+            }
         }
         
         val home = items.mapNotNull { it.toSearchResult() }.distinctBy { it.url }
@@ -65,7 +67,16 @@ class DonghuaWorldProvider : MainAPI() {
                     try {
                         val url = "$mainUrl/page/$page/?s=${query.replace(" ", "+")}"
                         val document = app.get(url).document
-                        document.select("article.bs").mapNotNull { it.toSearchResult() }
+                        
+                        // Apply the same strict filter to search results to prevent sidebar duplicates
+                        document.select("article.bs").filter { element ->
+                            element.parents().none { parent ->
+                                parent.id() == "sidebar" || 
+                                parent.hasClass("popularslider") || 
+                                parent.hasClass("widget") ||
+                                parent.tagName() == "aside"
+                            }
+                        }.mapNotNull { it.toSearchResult() }
                     } catch (e: Exception) {
                         emptyList()
                     }
