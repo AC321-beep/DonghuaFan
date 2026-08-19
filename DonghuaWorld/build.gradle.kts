@@ -4,6 +4,6 @@ cloudstream {
     status = 1                     // 1 = Working
     tvTypes = listOf("Anime", "Movie", "Comic")
     language = "zh"
-    version = 3
+    version = 4
     iconUrl = "https://www.google.com/s2/favicons?domain=donghuaworld.com&sz=256"
 }
