@@ -11,14 +11,16 @@ import kotlinx.coroutines.coroutineScope
 
 class DonghuaWorldProvider : MainAPI() {
     override var mainUrl = "https://donghuaworld.com"
-    override var name = "Donghua World"
+    override var name = "DonghuaWorld"
     override val hasMainPage = true
     override var lang = "zh"
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
 
     override val mainPage = mainPageOf(
-        "" to "Recently Updated",
+        // FIXED: Pointing to the actual archive instead of the static homepage ("") 
+        // This guarantees WordPress serves Page 2 instead of repeating Page 1 forever.
+        "anime/?order=update" to "Recently Updated",
         "anime/?status=ongoing&order=latest" to "Ongoing",
         "anime/?status=completed&order=update" to "Completed",
         "anime/?type=movie&order=update" to "Movies",
@@ -28,18 +30,16 @@ class DonghuaWorldProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (request.data.isBlank()) {
-            if (page == 1) mainUrl else "$mainUrl/page/$page/"
+        val basePath = request.data.substringBefore("?")
+        val query = if (request.data.contains("?")) "?" + request.data.substringAfter("?") else ""
+        
+        val cleanBasePath = basePath.trimEnd('/')
+        
+        // Builds perfect WordPress pagination URLs (e.g., /anime/page/2/?order=update)
+        val url = if (page == 1) {
+            "$mainUrl/$cleanBasePath/$query"
         } else {
-            val basePath = request.data.substringBefore("?")
-            val query = if (request.data.contains("?")) "?" + request.data.substringAfter("?") else ""
-            
-            val cleanBasePath = basePath.trimEnd('/')
-            if (page == 1) {
-                "$mainUrl/$cleanBasePath/$query"
-            } else {
-                "$mainUrl/$cleanBasePath/page/$page/$query" 
-            }
+            "$mainUrl/$cleanBasePath/page/$page/$query" 
         }
         
         val document = app.get(url).document
