@@ -194,8 +194,12 @@ open class Rumble : ExtractorApi() {
             return fullWordMatch.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
         }
 
-        // 4. Force strict default to English if missing or completely obscure
-        return "English"
+        // 4. Default to the original label if provided, otherwise safely fallback to "Unknown"
+        return if (cleanLabel.isNotBlank()) {
+            cleanLabel.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+        } else {
+            "Unknown"
+        }
     }
 }
 
