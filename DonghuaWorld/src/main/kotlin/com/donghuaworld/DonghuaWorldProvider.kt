@@ -11,7 +11,7 @@ import kotlinx.coroutines.coroutineScope
 
 class DonghuaWorldProvider : MainAPI() {
     override var mainUrl = "https://donghuaworld.com"
-    override var name = "Donghua World"
+    override var name = "DonghuaWorld" 
     override val hasMainPage = true
     override var lang = "zh"
     override val hasDownloadSupport = false
@@ -56,7 +56,7 @@ class DonghuaWorldProvider : MainAPI() {
                 parent.hasClass("popularslider") || 
                 parent.hasClass("widget") || 
                 parent.hasClass("ts-wpop-series-gen") ||
-                parent.hasClass("series-gen") || // <-- THIS FIXES THE RECOMMENDATION DUPLICATES!
+                parent.hasClass("series-gen") || 
                 parent.tagName() == "aside"
             }
         }
