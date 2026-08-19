@@ -65,11 +65,16 @@ open class Rumble : ExtractorApi() {
             if (extractedSubs.add(subRaw)) {
                 val subUrl = resolveUrl(subRaw, url)
                 
-                // Grab the surrounding context window to look for the language label securely
+                // ISOLATE CONTEXT TO PREVENT BLEED: Find immediate { } brackets around the URL
                 val matchIndex = subMatch.range.first
-                val start = maxOf(0, matchIndex - 200)
-                val end = minOf(cleanHtml.length, matchIndex + 200)
-                val context = cleanHtml.substring(start, end)
+                
+                var startBrace = cleanHtml.lastIndexOf('{', matchIndex)
+                if (startBrace == -1 || matchIndex - startBrace > 150) startBrace = maxOf(0, matchIndex - 100)
+                
+                var endBrace = cleanHtml.indexOf('}', matchIndex)
+                if (endBrace == -1 || endBrace - matchIndex > 150) endBrace = minOf(cleanHtml.length, matchIndex + 100)
+                
+                val context = cleanHtml.substring(startBrace, endBrace + 1)
                 
                 val labelMatch = Regex("""(?:label|name|title|language|lang)["']?\s*:\s*(["'])([^"']+)(\1)""", RegexOption.IGNORE_CASE).find(context)
                 val extractedLabel = labelMatch?.groupValues?.get(2)?.trim() ?: ""
@@ -152,51 +157,45 @@ open class Rumble : ExtractorApi() {
         }
     }
 
-    // 100% Dynamic Language Guesser using native java.util.Locale
+    // 100% Dynamic Language Guesser utilizing ONLY native Android/Java APIs
     private fun guessLanguage(label: String, url: String): String {
         val cleanLabel = label.trim()
 
-        // Helper function to safely ask the Android/Java system to translate shortcodes
+        // Helper function to safely ask the OS to translate a shortcode into a full language name
         fun resolveCode(code: String): String? {
             if (code.length !in 2..3) return null
-            val display = Locale(code.lowercase()).getDisplayLanguage(Locale.ENGLISH)
-            // If the code is invalid, Locale just returns the code back. 
-            // If they don't match, it means it successfully found the full language name!
-            return if (display.lowercase() != code.lowercase() && display.isNotBlank()) display else null
+            val display = Locale(code).getDisplayLanguage(Locale.ENGLISH)
+            // If Android successfully maps the code (e.g., "id" -> "Indonesian"), return it.
+            return if (!display.equals(code, ignoreCase = true) && display.isNotBlank()) display else null
         }
 
         // 1. Try to resolve the label first
         if (cleanLabel.isNotBlank() && !cleanLabel.equals("unknown", ignoreCase = true)) {
-            val resolved = resolveCode(cleanLabel)
-            if (resolved != null) return resolved
+            resolveCode(cleanLabel)?.let { return it }
             
-            // If the label is already a full word (e.g., "English", "Spanish"), format and return it
+            // If the label is already a full word (e.g., "English"), just format and return it
             if (cleanLabel.length > 3) {
-                return cleanLabel.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+                return cleanLabel.replaceFirstChar { it.uppercase() }
             }
         }
 
-        // 2. Strict Check for Short Codes in the URL (e.g., /en.vtt, -id.srt, ?lang=ar)
-        // By requiring non-word boundaries (/, _, -, ?), we stop random hashes from matching.
+        // 2. Strict Check for Short Codes in the URL
         val shortCodeMatch = Regex("""(?:/|_|-|\?lang=|&lang=)([a-zA-Z]{2,3})(?:\.(?:vtt|srt|ass)|\?|&|$)""")
             .find(url)?.groupValues?.get(1)
             
-        if (shortCodeMatch != null) {
-            val resolved = resolveCode(shortCodeMatch)
-            if (resolved != null) return resolved
-        }
+        shortCodeMatch?.let { resolveCode(it) }?.let { return it }
 
-        // 3. Check for Full Language Words in the URL (e.g., /english.vtt, ?lang=indonesian)
+        // 3. Check for Full Language Words natively in the URL
         val fullWordMatch = Regex("""(?:/|_|-|\?lang=|&lang=)([a-zA-Z]{4,})(?:\.(?:vtt|srt|ass)|\?|&|$)""")
             .find(url)?.groupValues?.get(1)
             
         if (fullWordMatch != null && !fullWordMatch.equals("unknown", ignoreCase = true)) {
-            return fullWordMatch.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+            return fullWordMatch.replaceFirstChar { it.uppercase() }
         }
 
         // 4. Default to the original label if provided, otherwise safely fallback to "Unknown"
         return if (cleanLabel.isNotBlank()) {
-            cleanLabel.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+            cleanLabel.replaceFirstChar { it.uppercase() }
         } else {
             "Unknown"
         }
