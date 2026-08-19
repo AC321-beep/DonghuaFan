@@ -17,8 +17,9 @@ class DonghuaWorldProvider : MainAPI() {
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
 
+    // FIX: Recently Updated now scrapes the homepage (empty string) to show the same list as the "Latest Release" grid.
     override val mainPage = mainPageOf(
-        "anime/?order=update" to "Recently Updated",
+        "" to "Recently Updated",                    // ← was "anime/?order=update"
         "anime/?status=ongoing&order=latest" to "Ongoing",
         "anime/?status=completed&order=update" to "Completed",
         "anime/?type=movie&order=update" to "Movies",
@@ -61,7 +62,9 @@ class DonghuaWorldProvider : MainAPI() {
             }
         }
         
-        val home = items.mapNotNull { it.toSearchResult() }.distinctBy { it.url }
+        // Deduplicate by canonical slug (last path segment) to remove duplicate entries for the same show
+        val home = items.mapNotNull { it.toSearchResult() }
+                         .distinctBy { getCanonicalSlug(it.url) }
         
         return newHomePageResponse(request.name, home, hasNext = home.isNotEmpty())
     }
@@ -205,5 +208,16 @@ class DonghuaWorldProvider : MainAPI() {
         }
 
         return true
+    }
+
+    // Helper: extracts the show identifier (slug) from a URL.
+    private fun getCanonicalSlug(url: String): String {
+        return try {
+            val path = url.substringAfter("://").substringAfter("/").substringBefore("?")
+            val segments = path.split("/").filter { it.isNotBlank() }
+            segments.lastOrNull() ?: url
+        } catch (_: Exception) {
+            url
+        }
     }
 }
