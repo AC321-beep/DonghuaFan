@@ -11,7 +11,7 @@ import kotlinx.coroutines.coroutineScope
 
 class DonghuaWorldProvider : MainAPI() {
     override var mainUrl = "https://donghuaworld.com"
-    override var name = "DonghuaWorld"
+    override var name = "Donghua World"
     override val hasMainPage = true
     override var lang = "zh"
     override val hasDownloadSupport = false
