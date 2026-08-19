@@ -11,15 +11,13 @@ import kotlinx.coroutines.coroutineScope
 
 class DonghuaWorldProvider : MainAPI() {
     override var mainUrl = "https://donghuaworld.com"
-    override var name = "DonghuaWorld"
+    override var name = "Donghua World"
     override val hasMainPage = true
     override var lang = "zh"
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
 
     override val mainPage = mainPageOf(
-        // FIXED: Pointing to the actual archive instead of the static homepage ("") 
-        // This guarantees WordPress serves Page 2 instead of repeating Page 1 forever.
         "anime/?order=update" to "Recently Updated",
         "anime/?status=ongoing&order=latest" to "Ongoing",
         "anime/?status=completed&order=update" to "Completed",
@@ -32,25 +30,33 @@ class DonghuaWorldProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val basePath = request.data.substringBefore("?")
         val query = if (request.data.contains("?")) "?" + request.data.substringAfter("?") else ""
-        
         val cleanBasePath = basePath.trimEnd('/')
         
-        // Builds perfect WordPress pagination URLs (e.g., /anime/page/2/?order=update)
+        // Builds perfect WordPress pagination URLs and handles empty states safely
         val url = if (page == 1) {
-            "$mainUrl/$cleanBasePath/$query"
+            if (request.data.isBlank()) mainUrl else "$mainUrl/$cleanBasePath/$query"
         } else {
-            "$mainUrl/$cleanBasePath/page/$page/$query" 
+            if (request.data.isBlank()) {
+                "$mainUrl/page/$page/"
+            } else {
+                if (cleanBasePath.isEmpty()) {
+                    "$mainUrl/page/$page/$query"
+                } else {
+                    "$mainUrl/$cleanBasePath/page/$page/$query" 
+                }
+            }
         }
         
         val document = app.get(url).document
         
-        // STRICT FILTER: Checks EVERY ancestor to ensure sidebar and slider items never bleed into the grid
+        // STRICT FILTER: Checks EVERY ancestor to ensure sidebar, sliders, and recommendations never bleed into the grid
         val items = document.select("article.bs").filter { element ->
             element.parents().none { parent ->
                 parent.id() == "sidebar" || 
                 parent.hasClass("popularslider") || 
                 parent.hasClass("widget") || 
                 parent.hasClass("ts-wpop-series-gen") ||
+                parent.hasClass("series-gen") || // <-- THIS FIXES THE RECOMMENDATION DUPLICATES!
                 parent.tagName() == "aside"
             }
         }
@@ -68,12 +74,14 @@ class DonghuaWorldProvider : MainAPI() {
                         val url = "$mainUrl/page/$page/?s=${query.replace(" ", "+")}"
                         val document = app.get(url).document
                         
-                        // Apply the same strict filter to search results to prevent sidebar duplicates
+                        // Apply the exact same strict filter to search results
                         document.select("article.bs").filter { element ->
                             element.parents().none { parent ->
                                 parent.id() == "sidebar" || 
                                 parent.hasClass("popularslider") || 
                                 parent.hasClass("widget") ||
+                                parent.hasClass("ts-wpop-series-gen") ||
+                                parent.hasClass("series-gen") ||
                                 parent.tagName() == "aside"
                             }
                         }.mapNotNull { it.toSearchResult() }
