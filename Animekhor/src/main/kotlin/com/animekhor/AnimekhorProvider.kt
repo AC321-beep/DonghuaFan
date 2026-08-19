@@ -89,15 +89,35 @@ class AnimekhorProvider : MainAPI() {
                 }
             }
 
+            // ========== MODIFIED EPISODE PARSING (added date extraction) ==========
             val episodes = epListElements.mapNotNull { info ->
                 val href = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
                 val episodeText = info.selectFirst(".epl-title")?.text() ?: info.selectFirst("a span")?.text() ?: ""
+                val fullText = info.text() // for date extraction
+
+                // Extract date from full text using the same regex as DonghuaStream
+                val dateMatch = Regex("""([a-zA-Z]+\s+\d{1,2},\s+\d{4})""").find(fullText)?.value?.trim()
+
+                // Build base episode name (same logic as before)
                 val parsedEpisode = if (episodeText.contains("-")) episodeText.substringAfter("-").substringBeforeLast("-").trim() else episodeText.trim()
+                var epName = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText
+
+                // Append date if found
+                if (!dateMatch.isNullOrEmpty()) {
+                    epName = "$epName: $dateMatch"
+                }
+
+                // Attempt to extract episode number from parsedEpisode or episodeText
+                val epNum = Regex("""\d+""").find(parsedEpisode)?.value?.toIntOrNull()
+                    ?: Regex("""\d+""").find(episodeText)?.value?.toIntOrNull()
+
                 newEpisode(href) {
-                    this.name = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText
+                    this.name = epName
                     this.posterUrl = poster
+                    this.episode = epNum // set episode number if available
                 }
             }.distinctBy { it.data }.reversed()
+            // =====================================================================
 
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
