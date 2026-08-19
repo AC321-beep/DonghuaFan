@@ -44,10 +44,17 @@ class DonghuaWorldProvider : MainAPI() {
         }
         
         val document = app.get(url).document
-        val items = document.select("article.bs")
+        
+        // Filter out sidebar widgets and popular sliders that persist across pages and cause duplicates
+        val items = document.select("article.bs").filterNot { element ->
+            val parents = element.parents()
+            parents.hasClass("popularslider") || 
+            parents.attr("id") == "sidebar" || 
+            parents.hasClass("ts-wpop-series-gen")
+        }
+        
         val home = items.mapNotNull { it.toSearchResult() }.distinctBy { it.url }
         
-        // FIXED: Using "hasNext" instead of "hasNextPage" to match Cloudstream's native API
         return newHomePageResponse(request.name, home, hasNext = home.isNotEmpty())
     }
 
