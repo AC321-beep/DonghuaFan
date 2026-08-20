@@ -37,58 +37,71 @@ class DonghuaFunProvider : MainAPI() {
         val isComingSoon = request.name == "Coming Soon"
         val isRecentlyUpdated = request.name == "Recently Updated"
         
-        // Define how many backend pages to bundle per Cloudstream request to avoid empty rows
-        val pagesPerRequest = if (isComingSoon || isRecentlyUpdated) 5 else 1
+        // Define max pages to fetch based on category
+        val maxPagesToSearch = if (isComingSoon || isRecentlyUpdated) 5 else 1 
         
-        // Map Cloudstream's page (1, 2, 3...) to chunks of backend pages (1..5, 6..10, 11..15...)
-        // This prevents duplicate overlap when infinite scrolling
-        val startPage = (page - 1) * pagesPerRequest + 1
-        val backendPages = (startPage until startPage + pagesPerRequest).toList()
+        // Calculate the exact chunk of backend pages to fetch to prevent duplicates on scrolling
+        val startPage = (page - 1) * maxPagesToSearch + 1
+        val endPage = startPage + maxPagesToSearch - 1
+        
+        val items = mutableListOf<SearchResponse>()
+        var hasNextPage = false
 
-        // Fetch homepage sections concurrently for massive speed boost
-        val pageResults = coroutineScope {
-            backendPages.map { p ->
+        // Fetch pages concurrently instead of sequentially for a massive speed boost
+        coroutineScope {
+            (startPage..endPage).map { p ->
                 async {
                     val pageUrl = if (p == 1) request.data else request.data.replace(".html", "/page/$p.html")
-                    try {
-                        val doc = app.get(pageUrl).document
-                        val hasNext = doc.select("a[href*='/vod/detail/id/']").isNotEmpty()
-                        val parsedItems = parseShowCards(doc, isComingSoon, isRecentlyUpdated)
-                        Pair(parsedItems, hasNext)
-                    } catch (e: Exception) {
-                        Pair(emptyList<SearchResponse>(), false)
-                    }
+                    val doc = try { app.get(pageUrl).document } catch (e: Exception) { null }
+                    
+                    if (doc != null) {
+                        val elements = doc.select("a[href*='/vod/detail/id/']")
+                        if (elements.isNotEmpty()) {
+                            hasNextPage = true
+                            parseShowCards(doc, isComingSoon, isRecentlyUpdated)
+                        } else emptyList()
+                    } else emptyList()
                 }
-            }.awaitAll()
+            }.awaitAll().forEach { items.addAll(it) }
         }
 
-        val items = pageResults.flatMap { it.first }.distinctBy { it.url }
-        val hasNextPage = pageResults.any { it.second }
-        
-        return newHomePageResponse(request.name, items, hasNextPage)
+        return newHomePageResponse(request.name, items.distinctBy { it.url }, hasNextPage)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
-        // Restored original sequential search logic to prevent site rate-limiting 
-        // and to respect the site's missing "next" buttons gracefully.
-        for (page in 1..10) { 
-            val pageUrl = if (page == 1) {
-                "$mainUrl/index.php/vod/show/id/20/by/time.html"
-            } else {
-                "$mainUrl/index.php/vod/show/id/20/by/time/page/$page.html"
-            }
-            
-            val doc = try { app.get(pageUrl).document } catch (e: Exception) { null } ?: break
-            val pageResults = parseShowCards(doc) 
-            if (pageResults.isEmpty()) break
-            
-            // Filter locally based on the search query
-            results.addAll(pageResults.filter { it.name.contains(query, ignoreCase = true) })
-            
-            val hasNext = doc.select("a.page-next:not(.disabled), a:contains(Next), a:contains(下一页)").isNotEmpty()
-            if (!hasNext) break
+        
+        // Since the site lacks proper search, we must scrape directories locally.
+        // We now scan BOTH 'time' (newest) and 'hits' (popular) to ensure older shows aren't missed.
+        val categoriesToScan = listOf("time", "hits")
+
+        val pageResults = coroutineScope {
+            categoriesToScan.map { category ->
+                async {
+                    val categoryResults = mutableListOf<SearchResponse>()
+                    for (page in 1..10) { // Scan 10 pages deep per category
+                        val pageUrl = if (page == 1) {
+                            "$mainUrl/index.php/vod/show/id/20/by/$category.html"
+                        } else {
+                            "$mainUrl/index.php/vod/show/id/20/by/$category/page/$page.html"
+                        }
+                        
+                        val doc = try { app.get(pageUrl).document } catch (e: Exception) { null } ?: break
+                        val parsedCards = parseShowCards(doc) // Defaults to false for both flags
+                        if (parsedCards.isEmpty()) break
+                        
+                        // Filter locally based on the search query
+                        categoryResults.addAll(parsedCards.filter { it.name.contains(query, ignoreCase = true) })
+                        
+                        val hasNext = doc.select("a.page-next:not(.disabled), a:contains(Next), a:contains(下一页)").isNotEmpty()
+                        if (!hasNext) break
+                    }
+                    categoryResults
+                }
+            }.awaitAll()
         }
+        
+        results.addAll(pageResults.flatten())
         return results.distinctBy { it.url }
     }
 
@@ -157,8 +170,11 @@ class DonghuaFunProvider : MainAPI() {
     ): Boolean {
         val detailPageUrl = data
         val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to detailPageUrl, "Origin" to mainUrl)
-        val html = try { app.get(detailPageUrl, headers = headers).text } catch (e: Exception) { "" }
-        val doc = try { app.get(detailPageUrl, headers = headers).document } catch (e: Exception) { null }
+        
+        // Single network request implementation to speed up player loading
+        val response = try { app.get(detailPageUrl, headers = headers) } catch (e: Exception) { null }
+        val html = response?.text ?: ""
+        val doc = response?.document
 
         // --- Dailymotion Logic Intact ---
         var dailymotionToken: String? = null
