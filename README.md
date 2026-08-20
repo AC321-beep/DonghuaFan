@@ -11,8 +11,6 @@ As the project is still under active development, it may contain bugs, errors, i
 
 **Acknowledgements**
 
-Special thanks to phisher98 for the reference repositories and examples that guided the development of this extension.
-
 Thanks to the CloudStream community for TestPlugin, documentation, examples, and open-source resources that made this project possible.
 
 **📜 License**
