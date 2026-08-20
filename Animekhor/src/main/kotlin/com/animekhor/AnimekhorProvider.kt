@@ -92,16 +92,20 @@ class AnimekhorProvider : MainAPI() {
                 val href = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
                 val episodeText = info.selectFirst(".epl-title")?.text() ?: info.selectFirst("a span")?.text() ?: ""
                 
-                val dateText = info.selectFirst(".epl-date, .date")?.text()?.trim() 
+                // Broadened the selector just in case it's named slightly differently 
+                val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim() 
                 val parsedEpisode = if (episodeText.contains("-")) episodeText.substringAfter("-").substringBeforeLast("-").trim() else episodeText.trim()
                 
                 newEpisode(href) {
                     this.name = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText
                     this.posterUrl = poster
                     
-                    // Fixed: Changed from assignment to a function call
-                    if (dateText != null && dateText.isNotBlank()) { 
-                        this.addDate(dateText)
+                    if (!dateText.isNullOrBlank()) { 
+                        // 1. Try to properly parse the Date format AnimeKhor uses (Month dd, yyyy)
+                        this.addDate(dateText, format = "MMMM d, yyyy")
+                        
+                        // 2. Failsafe: Guarantee it appears on your screen by setting it as the description
+                        this.description = dateText
                     }
                 }
             }.distinctBy { it.data }.reversed()
