@@ -99,8 +99,9 @@ class AnimekhorProvider : MainAPI() {
                     this.name = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText
                     this.posterUrl = poster
                     
+                    // Fixed: Changed from assignment to a function call
                     if (dateText != null && dateText.isNotBlank()) { 
-                        this.addDate = dateText
+                        this.addDate(dateText)
                     }
                 }
             }.distinctBy { it.data }.reversed()
