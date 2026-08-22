@@ -7,9 +7,9 @@ import org.jsoup.nodes.Element
 
 class AnimexinProvider : MainAPI() {
     override var mainUrl = "https://animexin.dev"
-    override var name = "Animexin"
+    override var name = "AnimeXin"
     override val hasMainPage = true
-    override var lang = "en"
+    override var lang = "zh"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
