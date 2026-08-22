@@ -1,7 +1,6 @@
 package com.kisskh
 
 import com.fasterxml.jackson.annotation.JsonProperty
-import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.mvvm.safeApiCall
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
@@ -127,7 +126,6 @@ class KisskhProvider : MainAPI() {
         val videoKeyUrl = "$kisskhApiBase${loadData.epsId}&version=2.8.10"
         val kkey = app.get(videoKeyUrl, timeout = 10000).parsedSafe<Key>()?.key ?: ""
         if (kkey.isBlank()) {
-            Log.e("Kisskh", "Failed to obtain video kkey")
             return false
         }
 
@@ -170,13 +168,12 @@ class KisskhProvider : MainAPI() {
                     }
                 }
             }
-        } ?: Log.e("Kisskh", "No video sources found")
+        }
 
         // ---- Subtitles (using Google Script key, passed as URL, decrypted in interceptor) ----
         val subKeyUrl = "$kisskhSubBase${loadData.epsId}&version=2.8.10"
         val subtitleKkey = app.get(subKeyUrl, timeout = 10000).parsedSafe<Key>()?.key ?: ""
         if (subtitleKkey.isBlank()) {
-            Log.e("Kisskh", "subtitleKkey is blank - cannot fetch subtitles")
             return true // Not fatal
         }
 
