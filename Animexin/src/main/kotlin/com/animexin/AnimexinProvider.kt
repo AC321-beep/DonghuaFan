@@ -1,8 +1,8 @@
 package com.Animexin
 
-import com.fleeksoft.ksoup.Ksoup
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 
 class AnimexinProvider : MainAPI() {
@@ -101,7 +101,7 @@ class AnimexinProvider : MainAPI() {
             val base64 = server.attr("value")
             if (base64.isNotEmpty()) {
                 val decoded = base64Decode(base64)
-                val doc = Ksoup.parse(decoded)
+                val doc = Jsoup.parse(decoded)
                 
                 val iframeSrc = doc.selectFirst("iframe")?.attr("src") ?: return@amap
                 val url = if (iframeSrc.startsWith("//")) "https:$iframeSrc" else iframeSrc
