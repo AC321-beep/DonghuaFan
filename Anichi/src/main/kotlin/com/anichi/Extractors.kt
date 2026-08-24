@@ -32,7 +32,6 @@ suspend fun invokeInternalSources(
     val url = """${AnichiProvider.apiUrl}?variables={"showId":"$hash","translationType":"$dubStatus","episodeString":"$episode"}&extensions={"persistedQuery":{"version":1,"sha256Hash":"${AnichiProvider.serverHash}"}}"""
     val apiResponse = app.get(url, headers = AnichiProvider.headers).parsedSafe<LinksQuery>()
 
-    // Using amap to parse URLs concurrently in an updated standard context
     apiResponse?.data?.episode?.sourceUrls?.amap { source ->
         safeApiCall {
             val link = fixSourceUrls(source.sourceUrl ?: return@safeApiCall, source.sourceName) ?: return@safeApiCall
@@ -211,9 +210,9 @@ private val embedBlackList = listOf(
 
 fun embedIsBlacklisted(url: String): Boolean = embedBlackList.any { url.contains(it) }
 
-// Mapped return type to com.lagradost.cloudstream3.Episode to avoid conflicts with custom EpisodeDto data class
-fun AvailableEpisodesDetail.getEpisode(lang: String, id: String, malId: Int?): List<com.lagradost.cloudstream3.Episode> {
-    val meta = if (lang == "sub") this.sub else this.dub
+// Note: Extension on MainAPI is required here to access newEpisode
+fun MainAPI.getEpisode(detail: AvailableEpisodesDetail, lang: String, id: String, malId: Int?): List<com.lagradost.cloudstream3.Episode> {
+    val meta = if (lang == "sub") detail.sub else detail.dub
     return meta.map { eps ->
         newEpisode(AnichiLoadData(id, lang, eps, malId).toJson()) {
             this.episode = eps.toIntOrNull()
@@ -274,7 +273,6 @@ data class AvailableEpisodesDetail(@JsonProperty("sub") val sub: List<String>, @
 data class LinksQuery(@JsonProperty("data") val data: LinkData? = LinkData())
 data class LinkData(@JsonProperty("episode") val episode: EpisodeDto? = EpisodeDto())
 data class SourceUrls(@JsonProperty("sourceUrl") val sourceUrl: String? = null, @JsonProperty("priority") val priority: Int? = null, @JsonProperty("sourceName") val sourceName: String? = null, @JsonProperty("type") val type: String? = null, @JsonProperty("className") val className: String? = null, @JsonProperty("streamerId") val streamerId: String? = null)
-// Renamed Custom Episode object to EpisodeDto to prevent collisions with Cloudstream's native Episode Object
 data class EpisodeDto(@JsonProperty("sourceUrls") val sourceUrls: ArrayList<SourceUrls> = arrayListOf())
 data class Sub(@JsonProperty("hour") val hour: Int? = null, @JsonProperty("minute") val minute: Int? = null, @JsonProperty("year") val year: Int? = null, @JsonProperty("month") val month: Int? = null, @JsonProperty("date") val date: Int? = null)
 data class LastEpisodeDate(@JsonProperty("dub") val dub: Sub? = Sub(), @JsonProperty("sub") val sub: Sub? = Sub(), @JsonProperty("raw") val raw: Sub? = Sub())
