@@ -135,7 +135,6 @@ class AnichiProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         val id = url.substringAfterLast("/")
-        // Escaped \$_id to ${'$'}_id so it works within Kotlin's raw string format without variable unresolved errors
         val body = """
         {
             "query": "        query(\n      ${'$'}_id: String!\n    ) {\n      show(\n        _id: ${'$'}_id\n      ) {\n          _id\n          name\n          description\n          thumbnail\n          thumbnails\n          lastEpisodeInfo\n          lastEpisodeDate       \n          type\n          genres\n          score\n          status\n          season\n          altNames  \n          averageScore\n          rating\n          episodeCount\n          episodeDuration\n          broadcastInterval\n          banner\n          airedEnd\n          airedStart \n          studios\n          characters\n          availableEpisodesDetail\n          availableEpisodes\n          prevideos\n          nameOnlyString\n          relatedShows\n          relatedMangas\n          musics\n          isAdult\n          \n          tags\n          countryOfOrigin\n\n          pageStatus{\n            _id\n            notes\n            pageId\n            showId\n            \n              # ranks:[Object]\n    views\n    likesCount\n    commentCount\n    dislikesCount\n    reviewCount\n    userScoreCount\n    userScoreTotalValue\n    userScoreAverValue\n    viewers{\n        firstViewers{\n          viewCount\n          lastWatchedDate\n        user{\n          _id\n          displayName\n          picture\n          # description\n          hideMe\n          # createdAt\n          # badges\n          brief\n        }\n      \n      }\n      recViewers{\n        viewCount\n          lastWatchedDate\n        user{\n          _id\n          displayName\n          picture\n          # description\n          hideMe\n          # createdAt\n          # badges\n          brief\n        }\n      \n      }\n      }\n\n          }\n        }\n      }",
@@ -152,12 +151,13 @@ class AnichiProvider : MainAPI() {
         val poster = showData.thumbnail
         val trackers = getTracker(title, showData.altNames?.firstOrNull(), showData.airedStart?.year, showData.season?.quarter, showData.type)
 
+        // Modified here: Calling getEpisode as an extension of MainAPI
         val episodes = showData.availableEpisodesDetail.let {
             if (it == null) return@let Pair(null, null)
             if (showData.Id == null) return@let Pair(null, null)
             Pair(
-                it.getEpisode("sub", showData.Id, trackers?.idMal),
-                it.getEpisode("dub", showData.Id, trackers?.idMal)
+                getEpisode(it, "sub", showData.Id, trackers?.idMal),
+                getEpisode(it, "dub", showData.Id, trackers?.idMal)
             )
         }
 
