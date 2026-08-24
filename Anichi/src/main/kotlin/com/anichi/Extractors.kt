@@ -63,7 +63,7 @@ suspend fun extractStreamWish(url: String, callback: (ExtractorLink) -> Unit) {
             url = m3u8,
             referer = "https://streamwish.to/",
             quality = Qualities.P1080.value,
-            type = ExtractorLinkType.HLS
+            type = ExtractorLinkType.M3U8 // FIXED
         )
     )
 }
@@ -78,7 +78,7 @@ suspend fun extractFilemoon(url: String, callback: (ExtractorLink) -> Unit) {
             url = packed,
             referer = "https://filemoon.to/",
             quality = Qualities.P1080.value,
-            type = ExtractorLinkType.HLS
+            type = ExtractorLinkType.M3U8 // FIXED
         )
     )
 }
@@ -112,7 +112,7 @@ suspend fun extractOkru(url: String, callback: (ExtractorLink) -> Unit) {
             url = hls,
             referer = url,
             quality = Qualities.P1080.value,
-            type = ExtractorLinkType.HLS
+            type = ExtractorLinkType.M3U8 // FIXED
         )
     )
 }
