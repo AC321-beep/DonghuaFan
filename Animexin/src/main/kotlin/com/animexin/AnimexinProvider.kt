@@ -73,10 +73,21 @@ class AnimexinProvider : MainAPI() {
                 val epText = info.selectFirst("div.epl-num")?.text() ?: ""
                 val epNum = episodeRegex.find(epText)?.groupValues?.get(1)?.toIntOrNull()
 
+                // Broadened the selector just in case it's named slightly differently 
+                val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim() 
+
                 newEpisode(epHref) {
                     this.name = if (epNum != null) "Episode $epNum" else epText
                     this.episode = epNum
                     this.posterUrl = epPoster
+                    
+                    if (!dateText.isNullOrBlank()) { 
+                        // 1. Try to properly parse the Date format AnimeKhor uses (Month dd, yyyy)
+                        this.addDate(dateText, format = "MMMM d, yyyy")
+                        
+                        // 2. Failsafe: Guarantee it appears on your screen by setting it as the description
+                        this.description = dateText
+                    }
                 }
             }.reversed()
 
