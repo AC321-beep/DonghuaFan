@@ -11,5 +11,5 @@ cloudstream {
     status = 1
     tvTypes = listOf("AsianDrama", "Anime")
     language = "en"
-    iconUrl = "https://kisskh.nl/favicon.ico"
+    iconUrl = "https://www.google.com/s2/favicons?domain=kisskh.nl&sz=256"
 }
