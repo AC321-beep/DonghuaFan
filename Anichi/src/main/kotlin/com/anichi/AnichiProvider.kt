@@ -116,7 +116,8 @@ class AnichiProvider : MainAPI() {
                                     url = server.link,
                                     referer = "",
                                     quality = Qualities.P1080.value,
-                                    type = if (server.link.contains(".m3u8")) ExtractorLinkType.HLS else ExtractorLinkType.VIDEO
+                                    // FIXED: Changed HLS to M3U8
+                                    type = if (server.link.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                                 )
                             )
 
@@ -149,7 +150,6 @@ class AnichiProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Sample layout to extract provided data string formatted as "tmdbId,mediaType,season,episode"
         val parts = data.split(",")
         val tmdbId = parts.getOrNull(0) ?: return false
         val mediaType = parts.getOrNull(1) ?: "tv"
