@@ -1,24 +1,47 @@
 package com.anichi
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.LoadResponse.Companion.addActors
+import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTrailer
+import com.lagradost.cloudstream3.syncproviders.SyncIdName
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
-import java.net.URLEncoder
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
+import com.lagradost.nicehttp.RequestBodyTypes
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 
 class AnichiProvider : MainAPI() {
     override var name = "Anichi"
     override var mainUrl = "https://allanimenews.com"
     override var lang = "en"
-    override val hasMainPage = false
+    override val instantLinkLoading = true
+    override val hasQuickSearch = false
+    override val hasMainPage = true
+    override val supportedSyncNames = setOf(SyncIdName.Anilist, SyncIdName.MyAnimeList)
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    companion object {
-        private const val TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
-        private const val API_URL = "https://api.allanime.day/api"
-        private const val MAIPAGESHA_HASH = "a24c500a1b765c68ae1d8dd85174931f661c71369c89b92b88b75a725afc471c"
-        private const val SERVER_HASH = "d405d0edd690624b66baba3068e0edc3ac90f1597d898a1ec8db4e5c43c00fec"
+    private val popularTitle = "Popular"
+    private val animeRecentTitle = "Latest Anime"
+    private val donghuaRecentTitle = "Latest Donghua"
+    private val movieTitle = "Movie"
 
-        val DEFAULT_HEADERS = mapOf(
+    companion object {
+        const val apiUrl = "https://api.allanime.day/api"
+        const val serverUrl = "https://allanimenews.com"
+        const val apiEndPoint = "https://allanimenews.com"
+        const val anilistApi = "https://graphql.anilist.co"
+        const val jikanApi = "https://api.jikan.moe/v4"
+
+        const val mainHash = "e42a4466d984b2c0a2cecae5dd13aa68867f634b16ee0f17b380047d14482406"
+        const val popularHash = "31a117653812a2547fd981632e8c99fa8bf8a75c4ef1a77a1567ef1741a7ab9c"
+        const val slugHash = "bf603205eb2533ca21d0324a11f623854d62ed838a27e1b3fcfb712ab98b03f4"
+        const val detailHash = "bb263f91e5bdd048c1c978f324613aeccdfe2cbc694a419466a31edb58c0cc0b"
+        const val serverHash = "5e7e17cdd0166af5a2d8f43133d9ce3ce9253d1fdb5160a0cfd515564f98d061"
+
+        val headers = mapOf(
             "app-version" to "android_c-247",
             "from-app" to "4DqMXoovyMEkBc7H",
             "platformstr" to "android_c",
@@ -27,120 +50,144 @@ class AnichiProvider : MainAPI() {
         )
     }
 
-    suspend fun getStreams(
-        tmdbId: String,
-        mediaType: String = "tv",
-        season: Int? = null,
-        episode: Int? = null,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        try {
-            val tmdbUrl = "https://api.themoviedb.org/3/$mediaType/$tmdbId?api_key=$TMDB_API_KEY"
-            val tmdbResponse = app.get(tmdbUrl).parsedSafe<TmdbResponse>() ?: return false
-            val title = tmdbResponse.title ?: tmdbResponse.name ?: return false
+    override val mainPage = mainPageOf(
+        """$apiUrl?variables={"search":{"sortBy":"Latest_Update","allowAdult":false,"allowUnknown":false},"limit":26,"page":%d,"translationType":"sub","countryOrigin":"JP"}&extensions={"persistedQuery":{"version":1,"sha256Hash":"$mainHash"}}""" to animeRecentTitle,
+        """$apiUrl?variables={"search":{"sortBy":"Latest_Update","allowAdult":false,"allowUnknown":false},"limit":26,"page":%d,"translationType":"sub","countryOrigin":"CN"}&extensions={"persistedQuery":{"version":1,"sha256Hash":"$mainHash"}}""" to donghuaRecentTitle,
+        """$apiUrl?variables={"type":"anime","size":30,"dateRange":1,"page":%d,"allowAdult":false,"allowUnknown":false}&extensions={"persistedQuery":{"version":1,"sha256Hash":"$popularHash"}}""" to popularTitle,
+        """$apiUrl?variables={"search":{"slug":"movie-anime","format":"anime","tagType":"upcoming","name":"Trending Movies"}}&extensions={"persistedQuery":{"version":1,"sha256Hash":"$slugHash"}}""" to movieTitle
+    )
 
-            val encodedQuery = URLEncoder.encode(title, "UTF-8")
-            val searchVariables = """{"search":{"query":"$encodedQuery"},"limit":26,"page":1,"translationType":"sub","countryOrigin":"ALL"}"""
-            val searchExtensions = """{"persistedQuery":{"version":1,"sha256Hash":"$MAIPAGESHA_HASH"}}"""
-            val searchUrl = "$API_URL?variables=$searchVariables&extensions=$searchExtensions"
+    private fun getStatus(t: String): ShowStatus {
+        return when (t) {
+            "Finished" -> ShowStatus.Completed
+            "Releasing" -> ShowStatus.Ongoing
+            else -> ShowStatus.Completed
+        }
+    }
 
-            val searchResText = app.get(searchUrl, headers = DEFAULT_HEADERS).text
-            if (searchResText.contains("PERSISTED_QUERY_NOT_FOUND")) return false
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val url = request.data.format(page)
+        val res = app.get(url, headers = headers).parsedSafe<AnichiQuery>()?.data
+        val query = res?.shows ?: res?.queryPopular ?: res?.queryListForTag
+        val card = if (request.name == popularTitle) query?.recommendations?.map { it.anyCard } else query?.edges
+        
+        val home = card?.filter {
+            !(it?.availableEpisodes?.raw == 0 && it.availableEpisodes.sub == 0 && it.availableEpisodes.dub == 0)
+        }?.mapNotNull { media ->
+            media?.toSearchResponse()
+        } ?: emptyList()
 
-            val searchRes = tryParseJson<SearchResponse>(searchResText)
-            val edges = searchRes?.data?.shows?.edges ?: emptyList()
-            if (edges.isEmpty()) return false
+        return newHomePageResponse(
+            list = HomePageList(name = request.name, list = home),
+            hasNext = request.name != movieTitle
+        )
+    }
 
-            val best = edges.firstOrNull { edge ->
-                edge.englishName?.contains(title, ignoreCase = true) == true ||
-                edge.name?.contains(title, ignoreCase = true) == true
-            } ?: edges.first()
+    private fun Edges.toSearchResponse(): AnimeSearchResponse? {
+        return newAnimeSearchResponse(
+            name ?: englishName ?: nativeName ?: "",
+            Id ?: return null,
+            fix = false
+        ) {
+            this.posterUrl = thumbnail
+            this.year = airedStart?.year
+            this.otherName = englishName
+            addDub(availableEpisodes?.dub)
+            addSub(availableEpisodes?.sub)
+        }
+    }
 
-            val showId = best.id ?: return false
+    override suspend fun search(query: String): List<SearchResponse>? {
+        val link = """$apiUrl?variables={"search":{"allowAdult":false,"allowUnknown":false,"query":"$query"},"limit":26,"page":1,"translationType":"sub","countryOrigin":"ALL"}&extensions={"persistedQuery":{"version":1,"sha256Hash":"$mainHash"}}"""
+        
+        val res = app.get(link, headers = headers).text.takeUnless { it.contains("PERSISTED_QUERY_NOT_FOUND") }
+            ?: app.get(link, headers = headers).text.takeUnless { it.contains("PERSISTED_QUERY_NOT_FOUND") }
+            ?: return emptyList()
 
-            val epNum = (episode ?: 1).toString()
-            val dubStatus = "sub"
-            val episodeVariables = """{"showId":"$showId","translationType":"$dubStatus","episodeString":"$epNum"}"""
-            val episodeExtensions = """{"persistedQuery":{"version":1,"sha256Hash":"$SERVER_HASH"}}"""
-            val episodeUrl = "$API_URL?variables=$episodeVariables&extensions=$episodeExtensions"
+        val response = parseJson<AnichiQuery>(res)
+        val results = response.data?.shows?.edges?.filter {
+            !(it.availableEpisodes?.raw == 0 && it.availableEpisodes.sub == 0 && it.availableEpisodes.dub == 0)
+        }
 
-            val epText = app.get(episodeUrl, headers = DEFAULT_HEADERS).text
-            if (epText.contains("PERSISTED_QUERY_NOT_FOUND")) return false
-
-            val epRes = tryParseJson<EpisodeResponse>(epText)
-            val sourceUrls = epRes?.data?.episode?.sourceUrls ?: emptyList()
-
-            for (source in sourceUrls.take(8)) {
-                try {
-                    val rawLink = source.sourceUrl ?: continue
-                    var link = rawLink
-
-                    if (source.sourceName == "Ak" || rawLink.contains("/player/vitemb")) {
-                        try {
-                            val b64Payload = rawLink.substringAfter("=")
-                            val decodedString = atob(b64Payload)
-                            val decodedJson = tryParseJson<AkDecodedPayload>(decodedString)
-                            link = decodedJson?.idUrl ?: rawLink
-                        } catch (_: Exception) {
-                            continue
-                        }
-                    } else {
-                        link = rawLink.replace(" ", "%20")
-                    }
-
-                    if (link.startsWith("//")) {
-                        link = "https:$link"
-                    }
-
-                    if (link.startsWith("--")) {
-                        link = decryptHex(link)
-                    }
-
-                    if (link.startsWith("http")) {
-                        loadExtractor(link, subtitleCallback, callback)
-                        continue
-                    }
-
-                    val fixedLink = fixUrlPath(link)
-                    val apiRes = app.get(fixedLink, headers = DEFAULT_HEADERS).parsedSafe<InternalLinksResponse>()
-
-                    apiRes?.links?.forEach { server ->
-                        if (server.hls != false && !server.link.isNullOrEmpty()) {
-                            val sourceLabel = (source.sourceName ?: "SUB").uppercase()
-
-                            callback(
-                                ExtractorLink(
-                                    source = "Anichi - $sourceLabel",
-                                    name = "Anichi $sourceLabel",
-                                    url = server.link,
-                                    referer = "",
-                                    quality = Qualities.P1080.value,
-                                    // FIXED: Changed HLS to M3U8
-                                    type = if (server.link.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                                )
-                            )
-
-                            server.subtitles?.forEach { sub ->
-                                if (!sub.src.isNullOrEmpty()) {
-                                    subtitleCallback(
-                                        SubtitleFile(
-                                            lang = sub.lang ?: "Unknown",
-                                            url = sub.src
-                                        )
-                                    )
-                                }
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                }
+        return results?.map {
+            newAnimeSearchResponse(it.name ?: "", "${it.Id}", fix = false) {
+                this.posterUrl = it.thumbnail
+                this.year = it.airedStart?.year
+                this.otherName = it.englishName
+                addDub(it.availableEpisodes?.dub)
+                addSub(it.availableEpisodes?.sub)
             }
-            return true
-        } catch (e: Exception) {
-            e.printStackTrace()
-            return false
+        }
+    }
+
+    override suspend fun getLoadUrl(name: SyncIdName, id: String): String? {
+        val syncId = id.split("/").last()
+        val malId = if (name == SyncIdName.MyAnimeList) syncId else aniToMal(syncId)
+
+        val media = app.get("$jikanApi/anime/$malId").parsedSafe<JikanResponse>()?.data
+        val link = """$apiUrl?variables={"search":{"allowAdult":false,"allowUnknown":false,"query":"${media?.title}"},"limit":26,"page":1,"translationType":"sub","countryOrigin":"ALL"}&extensions={"persistedQuery":{"version":1,"sha256Hash":"$mainHash"}}"""
+        val res = app.get(link, headers = headers).parsedSafe<AnichiQuery>()?.data?.shows?.edges
+        
+        return res?.find {
+            (it.name.equals(media?.title, true) || it.englishName.equals(media?.title_english, true) || it.nativeName.equals(media?.title_japanese, true)) && it.airedStart?.year == media?.year
+        }?.Id
+    }
+
+    override suspend fun load(url: String): LoadResponse? {
+        val id = url.substringAfterLast("/")
+        val body = """
+        {
+            "query": "        query(\n      \$_id: String!\n    ) {\n      show(\n        _id: \$_id\n      ) {\n          _id\n          name\n          description\n          thumbnail\n          thumbnails\n          lastEpisodeInfo\n          lastEpisodeDate       \n          type\n          genres\n          score\n          status\n          season\n          altNames  \n          averageScore\n          rating\n          episodeCount\n          episodeDuration\n          broadcastInterval\n          banner\n          airedEnd\n          airedStart \n          studios\n          characters\n          availableEpisodesDetail\n          availableEpisodes\n          prevideos\n          nameOnlyString\n          relatedShows\n          relatedMangas\n          musics\n          isAdult\n          \n          tags\n          countryOfOrigin\n\n          pageStatus{\n            _id\n            notes\n            pageId\n            showId\n            \n              # ranks:[Object]\n    views\n    likesCount\n    commentCount\n    dislikesCount\n    reviewCount\n    userScoreCount\n    userScoreTotalValue\n    userScoreAverValue\n    viewers{\n        firstViewers{\n          viewCount\n          lastWatchedDate\n        user{\n          _id\n          displayName\n          picture\n          # description\n          hideMe\n          # createdAt\n          # badges\n          brief\n        }\n      \n      }\n      recViewers{\n        viewCount\n          lastWatchedDate\n        user{\n          _id\n          displayName\n          picture\n          # description\n          hideMe\n          # createdAt\n          # badges\n          brief\n        }\n      \n      }\n      }\n\n          }\n        }\n      }",
+            "extensions": "{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$detailHash\"}}",
+            "variables": "{\"_id\":\"$id\"}"
+        }
+        """.trimIndent().trim().toRequestBody(RequestBodyTypes.JSON.toMediaTypeOrNull())
+
+        val res = app.post(apiUrl, requestBody = body, headers = headers)
+        val showData = res.parsedSafe<Detail>()?.data?.show ?: return null
+
+        val title = showData.name
+        val description = showData.description
+        val poster = showData.thumbnail
+        val trackers = getTracker(title, showData.altNames?.firstOrNull(), showData.airedStart?.year, showData.season?.quarter, showData.type)
+
+        val episodes = showData.availableEpisodesDetail.let {
+            if (it == null) return@let Pair(null, null)
+            if (showData.Id == null) return@let Pair(null, null)
+            Pair(
+                it.getEpisode("sub", showData.Id, trackers?.idMal),
+                it.getEpisode("dub", showData.Id, trackers?.idMal)
+            )
+        }
+
+        val characters = showData.characters?.map {
+            val role = when (it.role) {
+                "Main" -> ActorRole.Main
+                "Supporting" -> ActorRole.Supporting
+                "Background" -> ActorRole.Background
+                else -> null
+            }
+            val name = it.name?.full ?: it.name?.native ?: ""
+            val image = it.image?.large ?: it.image?.medium
+            Pair(Actor(name, image), role)
+        }
+
+        return newAnimeLoadResponse(title ?: "", url, TvType.Anime) {
+            engName = showData.altNames?.firstOrNull()
+            posterUrl = trackers?.coverImage?.extraLarge ?: trackers?.coverImage?.large ?: poster
+            backgroundPosterUrl = trackers?.bannerImage ?: showData.banner
+            rating = showData.averageScore?.times(100)
+            tags = showData.genres
+            year = showData.airedStart?.year
+            duration = showData.episodeDuration?.div(60_000)
+            addTrailer(showData.prevideos.filter { it.isNotBlank() }.map { "https://www.youtube.com/watch?v=$it" })
+            addEpisodes(DubStatus.Subbed, episodes.first)
+            addEpisodes(DubStatus.Dubbed, episodes.second)
+            addActors(characters)
+            showStatus = getStatus(showData.status.toString())
+            addMalId(trackers?.idMal)
+            addAniListId(trackers?.id)
+            plot = description?.replace(Regex("""<(.*?)>"""), "")
         }
     }
 
@@ -150,12 +197,8 @@ class AnichiProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val parts = data.split(",")
-        val tmdbId = parts.getOrNull(0) ?: return false
-        val mediaType = parts.getOrNull(1) ?: "tv"
-        val season = parts.getOrNull(2)?.toIntOrNull()
-        val episode = parts.getOrNull(3)?.toIntOrNull()
-
-        return getStreams(tmdbId, mediaType, season, episode, subtitleCallback, callback)
+        val loadData = parseJson<AnichiLoadData>(data)
+        invokeInternalSources(loadData.hash, loadData.dubStatus, loadData.episode, subtitleCallback, callback)
+        return true
     }
 }
