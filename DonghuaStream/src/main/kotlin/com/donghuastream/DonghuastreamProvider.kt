@@ -282,10 +282,21 @@ open class DonghuastreamProvider : MainAPI() {
                 it.attr("data-src").takeIf { src -> src.isNotBlank() } ?: it.attr("src")
             } ?: ""
             
+            // Broadened the selector just in case it's named slightly differently 
+            val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim() 
+
             newEpisode(href1) {
                 this.name = epName
                 this.episode = episodeNum
                 this.posterUrl = posterr
+                
+                if (!dateText.isNullOrBlank()) { 
+                    // 1. Try to properly parse the Date format AnimeKhor uses (Month dd, yyyy)
+                    this.addDate(dateText, format = "MMMM d, yyyy")
+                    
+                    // 2. Failsafe: Guarantee it appears on your screen by setting it as the description
+                    this.description = dateText
+                }
             }
         }.reversed()
     }
