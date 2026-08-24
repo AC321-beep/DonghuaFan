@@ -32,7 +32,8 @@ suspend fun invokeInternalSources(
     val url = """${AnichiProvider.apiUrl}?variables={"showId":"$hash","translationType":"$dubStatus","episodeString":"$episode"}&extensions={"persistedQuery":{"version":1,"sha256Hash":"${AnichiProvider.serverHash}"}}"""
     val apiResponse = app.get(url, headers = AnichiProvider.headers).parsedSafe<LinksQuery>()
 
-    apiResponse?.data?.episode?.sourceUrls?.apmap { source ->
+    // Using amap to parse URLs concurrently in an updated standard context
+    apiResponse?.data?.episode?.sourceUrls?.amap { source ->
         safeApiCall {
             val link = fixSourceUrls(source.sourceUrl ?: return@safeApiCall, source.sourceName) ?: return@safeApiCall
             
@@ -48,7 +49,16 @@ suspend fun invokeInternalSources(
                         loadExtractor(fixedLink, subtitleCallback, callback)
                     }
                     URI(fixedLink).path.contains(".m3u") -> {
-                        M3u8Helper.generateM3u8("Anichi - $host", fixedLink, AnichiProvider.serverUrl).forEach(callback)
+                        callback(
+                            ExtractorLink(
+                                source = host,
+                                name = "Anichi - $host",
+                                url = fixedLink,
+                                referer = AnichiProvider.serverUrl,
+                                quality = Qualities.Unknown.value,
+                                type = ExtractorLinkType.M3U8
+                            )
+                        )
                     }
                     else -> {
                         callback(
@@ -72,12 +82,30 @@ suspend fun invokeInternalSources(
                     when {
                         source.sourceName?.contains("Default") == true -> {
                             if (server.resolutionStr == "SUB" || server.resolutionStr == "Alt vo_SUB") {
-                                M3u8Helper.generateM3u8("Anichi - $host", server.link, "https://static.crunchyroll.com/").forEach(callback)
+                                callback(
+                                    ExtractorLink(
+                                        source = host,
+                                        name = "Anichi - $host",
+                                        url = server.link,
+                                        referer = "https://static.crunchyroll.com/",
+                                        quality = Qualities.Unknown.value,
+                                        type = ExtractorLinkType.M3U8
+                                    )
+                                )
                             }
                         }
                         server.hls != null && server.hls -> {
                             val referer = "${AnichiProvider.apiEndPoint}/player?uri=" + (if (URI(server.link).host?.isNotEmpty() == true) server.link else AnichiProvider.apiEndPoint + URI(server.link).path)
-                            M3u8Helper.generateM3u8("Anichi - $host", server.link, referer).forEach(callback)
+                            callback(
+                                ExtractorLink(
+                                    source = host,
+                                    name = "Anichi - $host",
+                                    url = server.link,
+                                    referer = referer,
+                                    quality = Qualities.Unknown.value,
+                                    type = ExtractorLinkType.M3U8
+                                )
+                            )
                         }
                         else -> {
                             val referer = "${AnichiProvider.apiEndPoint}/player?uri=" + (if (URI(server.link).host?.isNotEmpty() == true) server.link else AnichiProvider.apiEndPoint + URI(server.link).path)
@@ -111,7 +139,7 @@ private suspend fun invokeGogo(link: String, subtitleCallback: (SubtitleFile) ->
     val iframe = app.get(link)
     val iframeDoc = iframe.document
     
-    // Safely parse inside the Gogo iframe natively (without Hexated's custom GogoHelper dependencies)
+    // Safely parse inside the Gogo iframe natively
     iframeDoc.select(".list-server-items > .linkserver").forEach { element ->
         val status = element.attr("data-status")
         if (status == "1") {
@@ -183,13 +211,13 @@ private val embedBlackList = listOf(
 
 fun embedIsBlacklisted(url: String): Boolean = embedBlackList.any { url.contains(it) }
 
-fun AvailableEpisodesDetail.getEpisode(lang: String, id: String, malId: Int?): List<Episode> {
+// Mapped return type to com.lagradost.cloudstream3.Episode to avoid conflicts with custom EpisodeDto data class
+fun AvailableEpisodesDetail.getEpisode(lang: String, id: String, malId: Int?): List<com.lagradost.cloudstream3.Episode> {
     val meta = if (lang == "sub") this.sub else this.dub
     return meta.map { eps ->
-        Episode(
-            AnichiLoadData(id, lang, eps, malId).toJson(),
-            episode = eps.toIntOrNull()
-        )
+        newEpisode(AnichiLoadData(id, lang, eps, malId).toJson()) {
+            this.episode = eps.toIntOrNull()
+        }
     }.reversed()
 }
 
@@ -244,9 +272,10 @@ data class Detail(@JsonProperty("data") val data: DetailShow)
 data class DetailShow(@JsonProperty("show") val show: Edges)
 data class AvailableEpisodesDetail(@JsonProperty("sub") val sub: List<String>, @JsonProperty("dub") val dub: List<String>, @JsonProperty("raw") val raw: List<String>)
 data class LinksQuery(@JsonProperty("data") val data: LinkData? = LinkData())
-data class LinkData(@JsonProperty("episode") val episode: Episode? = Episode())
+data class LinkData(@JsonProperty("episode") val episode: EpisodeDto? = EpisodeDto())
 data class SourceUrls(@JsonProperty("sourceUrl") val sourceUrl: String? = null, @JsonProperty("priority") val priority: Int? = null, @JsonProperty("sourceName") val sourceName: String? = null, @JsonProperty("type") val type: String? = null, @JsonProperty("className") val className: String? = null, @JsonProperty("streamerId") val streamerId: String? = null)
-data class Episode(@JsonProperty("sourceUrls") val sourceUrls: ArrayList<SourceUrls> = arrayListOf())
+// Renamed Custom Episode object to EpisodeDto to prevent collisions with Cloudstream's native Episode Object
+data class EpisodeDto(@JsonProperty("sourceUrls") val sourceUrls: ArrayList<SourceUrls> = arrayListOf())
 data class Sub(@JsonProperty("hour") val hour: Int? = null, @JsonProperty("minute") val minute: Int? = null, @JsonProperty("year") val year: Int? = null, @JsonProperty("month") val month: Int? = null, @JsonProperty("date") val date: Int? = null)
 data class LastEpisodeDate(@JsonProperty("dub") val dub: Sub? = Sub(), @JsonProperty("sub") val sub: Sub? = Sub(), @JsonProperty("raw") val raw: Sub? = Sub())
 data class AnyCard(@JsonProperty("_id") val Id: String? = null, @JsonProperty("name") val name: String? = null, @JsonProperty("englishName") val englishName: String? = null, @JsonProperty("nativeName") val nativeName: String? = null, @JsonProperty("availableEpisodes") val availableEpisodes: AvailableEpisodes? = null, @JsonProperty("score") val score: Double? = null, @JsonProperty("lastEpisodeDate") val lastEpisodeDate: LastEpisodeDate? = LastEpisodeDate(), @JsonProperty("thumbnail") val thumbnail: String? = null, @JsonProperty("lastChapterDate") val lastChapterDate: String? = null, @JsonProperty("availableChapters") val availableChapters: String? = null, @JsonProperty("__typename") val _typename: String? = null)
