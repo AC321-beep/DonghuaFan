@@ -132,9 +132,21 @@ class DonghuaFunProvider : MainAPI() {
                 val epNumber = parseEpisodeNumber(epName)
                 val finalNumber = if (epNumber > 0) epNumber else episodeMap.size + 1
                 
+                // Broadened the selector just in case it's named slightly differently 
+                val dateText = a.selectFirst(".epl-date, .date, .time")?.text()?.trim() 
+                
                 if (!episodeMap.containsKey(finalNumber)) {
                     episodeMap[finalNumber] = newEpisode(epUrl) { 
-                        name = epName.ifEmpty { "Episode $finalNumber" }; episode = finalNumber
+                        this.name = epName.ifEmpty { "Episode $finalNumber" }
+                        this.episode = finalNumber
+                        
+                        if (!dateText.isNullOrBlank()) { 
+                            // 1. Try to properly parse the Date format AnimeKhor uses (Month dd, yyyy)
+                            this.addDate(dateText, format = "MMMM d, yyyy")
+                            
+                            // 2. Failsafe: Guarantee it appears on your screen by setting it as the description
+                            this.description = dateText
+                        }
                     }
                 }
             }
