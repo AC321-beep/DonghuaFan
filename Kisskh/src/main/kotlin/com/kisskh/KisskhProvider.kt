@@ -24,11 +24,35 @@ import javax.crypto.spec.SecretKeySpec
 import com.kisskh.SubDecryptor
 
 class KisskhProvider : MainAPI() {
-    override var mainUrl = "https://kisskh.nl"
+    // 1. Updated the default fallback domain to the currently active one
+    override var mainUrl = "https://kisskh.co" 
     override var name = "Kisskh"
     override val hasMainPage = true
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.AsianDrama, TvType.Anime)
+
+    // --- DYNAMIC DOMAIN UPDATER ---
+    private var isDomainUpdated = false
+    
+    // 2. Replace this with a link to a raw text file you control (e.g., GitHub or Pastebin)
+    private val configUrl = "https://raw.githubusercontent.com/YourUsername/YourRepo/main/kisskh_domain.txt"
+
+    private suspend fun updateDomain() {
+        if (isDomainUpdated) return
+        try {
+            val fetchedDomain = app.get(configUrl).text.trim()
+            // Ensure the fetched text is actually a URL
+            if (fetchedDomain.startsWith("http")) {
+                mainUrl = fetchedDomain.removeSuffix("/")
+            }
+        } catch (e: Exception) {
+            // Silently fail and use the default mainUrl above if the text file can't be reached
+        } finally {
+            // Ensure this check only runs once per app session to avoid slowing down the provider
+            isDomainUpdated = true 
+        }
+    }
+    // ------------------------------
 
     // Google Script URLs (video and subtitle key generation)
     private val kisskhApiBase = "https://script.google.com/macros/s/AKfycbzn8B31PuDxzaMa9_CQ0VGEDasFqfzI5bXvjaIZH4DM8DNq9q6xj1ALvZNz_JT3jF0suA/exec?id="
@@ -39,18 +63,20 @@ class KisskhProvider : MainAPI() {
         // Decryption keys are in SubDecryptor
     }
 
-   override val mainPage = mainPageOf(
-    "&type=0&sub=0&country=0&status=0&order=2" to "Trending",
-    "&type=0&sub=0&country=1&status=0&order=2" to "Latest Chinese Drama",
-    "&type=0&sub=0&country=2&status=0&order=2" to "Latest Korean Drama",
-    "&type=2&sub=0&country=$philippineCountryCode&status=0&order=2" to "Latest Philippine Movie",
-    "&type=2&sub=0&country=2&status=0&order=2" to "Movie Last Update",
-    "&type=3&sub=0&country=0&status=0&order=2" to "Anime Latest Update",
-    "&type=4&sub=0&country=0&status=0&order=2" to "Hollywood Last Update",
-    "&type=0&sub=0&country=0&status=3&order=2" to "Upcoming"
-)
+    override val mainPage = mainPageOf(
+        "&type=0&sub=0&country=0&status=0&order=2" to "Trending",
+        "&type=0&sub=0&country=1&status=0&order=2" to "Latest Chinese Drama",
+        "&type=0&sub=0&country=2&status=0&order=2" to "Latest Korean Drama",
+        "&type=2&sub=0&country=$philippineCountryCode&status=0&order=2" to "Latest Philippine Movie",
+        "&type=2&sub=0&country=2&status=0&order=2" to "Movie Last Update",
+        "&type=3&sub=0&country=0&status=0&order=2" to "Anime Latest Update",
+        "&type=4&sub=0&country=0&status=0&order=2" to "Hollywood Last Update",
+        "&type=0&sub=0&country=0&status=3&order=2" to "Upcoming"
+    )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        updateDomain() // 3. Dynamically update domain before requesting
+        
         val home = app.get("$mainUrl/api/DramaList/List?page=$page${request.data}")
             .parsedSafe<Responses>()?.data
             ?.mapNotNull { it.toSearchResponse() }
@@ -70,6 +96,8 @@ class KisskhProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        updateDomain() // 3. Dynamically update domain before searching
+        
         val searchResponse = app.get("$mainUrl/api/DramaList/Search?q=$query&type=0", referer = "$mainUrl/").text
         return tryParseJson<ArrayList<Media>>(searchResponse)?.mapNotNull { it.toSearchResponse() }
             ?: throw ErrorLoadingException("Invalid JSON response")
@@ -78,6 +106,8 @@ class KisskhProvider : MainAPI() {
     private fun getTitle(str: String) = str.replace(Regex("[^a-zA-Z0-9]"), "-")
 
     override suspend fun load(url: String): LoadResponse? {
+        updateDomain() // 3. Dynamically update domain before loading details
+        
         val id = url.split("/")
         val res = app.get(
             "$mainUrl/api/DramaList/Drama/${id.last()}?isq=false",
@@ -191,7 +221,7 @@ class KisskhProvider : MainAPI() {
     }
 
     // ----------------------------------------------------------------------
-    // Interceptor to decrypt subtitle .txt files on the fly (same as Turkish provider)
+    // Interceptor to decrypt subtitle .txt files on the fly
     // ----------------------------------------------------------------------
     private val CHUNK_REGEX1 by lazy { Regex("^\\d+$", RegexOption.MULTILINE) }
 
