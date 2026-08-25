@@ -3,9 +3,6 @@ package com.zenstream
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.SubtitleFile
 
-/**
- * Container for data fetched during MALSync requests (for anime)
- */
 data class MalSyncData(
     val title: String?,
     val animepaheUrl: String?,
@@ -17,10 +14,6 @@ data class MalSyncData(
     val animepaheTitle: String?
 )
 
-/**
- * Defines a single provider (extractor source) and its execution logic.
- * The `ZenStreamExtractors` receiver allows direct access to internal scraping functions.
- */
 data class ProviderDef(
     val key: String,
     val displayName: String,
@@ -30,12 +23,7 @@ data class ProviderDef(
     val executeMalSync: (suspend ZenStreamExtractors.(data: MalSyncData, subCb: (SubtitleFile) -> Unit, cb: (ExtractorLink) -> Unit) -> Unit)? = null
 )
 
-/**
- * Registry of all available extractor providers for ZenStream.
- * This mirrors the original CineStream ProviderRegistry but uses ZenStreamExtractors.
- */
 object ZenStreamProviderRegistry {
-
     val builtInProviders = listOf(
         // ── Torrents ──────────────────────────────────────────────
         ProviderDef(
@@ -339,38 +327,37 @@ object ZenStreamProviderRegistry {
             executeMalSync = { data, subCb, cb -> if (data.origin == "imdb") invokeAnimekizz(data.title, data.aniId, data.episode, subCb, cb) }
         ),
         // ── Donghua / Anime-specific sources ─────────────────────
-ProviderDef(
-    key = "zs_animekhor", displayName = "Animekhor",
-    executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Animekhor", "https://animekhor.org", res.title, res.episode, subCb, cb) },
-    executeStandard = { res, subCb, cb -> invokeDonghuaGeneric("Animekhor", "https://animekhor.org", res.title, res.episode, subCb, cb) }
-),
-ProviderDef(
-    key = "zs_donghuastream", displayName = "Donghuastream",
-    executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Donghuastream", "https://donghuastream.com", res.title, res.episode, subCb, cb) }
-),
-ProviderDef(
-    key = "zs_donghuafun", displayName = "Donghuafun",
-    executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Donghuafun", "https://donghuafun.com", res.title, res.episode, subCb, cb) }
-),
-ProviderDef(
-    key = "zs_animexin", displayName = "Animexin",
-    executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Animexin", "https://animexin.vip", res.title, res.episode, subCb, cb) }
-),
-ProviderDef(
-    key = "zs_donghuaworld", displayName = "Donghuaworld",
-    executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Donghuaworld", "https://donghuaworld.com", res.title, res.episode, subCb, cb) }
-),
-ProviderDef(
-    key = "zs_luciferdonghua", displayName = "LuciferDonghua",
-    executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("LuciferDonghua", "https://luciferdonghua.com", res.title, res.episode, subCb, cb) }
-),
-ProviderDef(
-    key = "zs_myanimelive", displayName = "MyAnimeLive",
-    executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("MyAnimeLive", "https://myanimelive.com", res.title, res.episode, subCb, cb) }
-),
+        ProviderDef(
+            key = "zs_animekhor", displayName = "Animekhor",
+            executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Animekhor", "https://animekhor.org", res.title, res.episode, subCb, cb) },
+            executeStandard = { res, subCb, cb -> invokeDonghuaGeneric("Animekhor", "https://animekhor.org", res.title, res.episode, subCb, cb) }
+        ),
+        ProviderDef(
+            key = "zs_donghuastream", displayName = "Donghuastream",
+            executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Donghuastream", "https://donghuastream.com", res.title, res.episode, subCb, cb) }
+        ),
+        ProviderDef(
+            key = "zs_donghuafun", displayName = "Donghuafun",
+            executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Donghuafun", "https://donghuafun.com", res.title, res.episode, subCb, cb) }
+        ),
+        ProviderDef(
+            key = "zs_animexin", displayName = "Animexin",
+            executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Animexin", "https://animexin.vip", res.title, res.episode, subCb, cb) }
+        ),
+        ProviderDef(
+            key = "zs_donghuaworld", displayName = "Donghuaworld",
+            executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Donghuaworld", "https://donghuaworld.com", res.title, res.episode, subCb, cb) }
+        ),
+        ProviderDef(
+            key = "zs_luciferdonghua", displayName = "LuciferDonghua",
+            executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("LuciferDonghua", "https://luciferdonghua.com", res.title, res.episode, subCb, cb) }
+        ),
+        ProviderDef(
+            key = "zs_myanimelive", displayName = "MyAnimeLive",
+            executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("MyAnimeLive", "https://myanimelive.com", res.title, res.episode, subCb, cb) }
+        )
     )
 
-    // Helper properties
     val keys: List<String> get() = builtInProviders.map { it.key }
     val namesMap: Map<String, String> get() = builtInProviders.associate { it.key to it.displayName }
     val torrentKeys: Set<String> get() = builtInProviders.filter { it.isTorrent }.map { it.key }.toSet()
