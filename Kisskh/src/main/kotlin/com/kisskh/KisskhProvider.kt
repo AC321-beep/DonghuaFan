@@ -36,17 +36,13 @@ class KisskhProvider : MainAPI() {
     private var lastDomainCheckTime = 0L
     private val DOMAIN_CHECK_COOLDOWN = 60000L // 1 minute between checks
 
-    // A known URL that will redirect to the current active domain
-    private val redirectSource = "https://kisskh.co"  // or "https://kisskh.com"
+    // A known URL that will redirect to the current active domain (PRIORITY)
+    private val redirectSource = "https://kisskh.co" 
 
-    // Fallback list (rarely used, only if redirect fails)
+    // Fallback list (ONLY used if the redirect above fails entirely)
     private val fallbackDomains = listOf(
-        "https://kisskh.co",
-        "https://kisskh.com",
-        "https://kisskh.org",
-        "https://kisskh.net",
-        "https://kisskh.tv",
-        "https://kisskh.do"   // added as requested
+        "https://kisskh.do",
+        "https://kisskh.co"
     )
 
     // Test if a domain is alive by calling a simple API endpoint
@@ -66,20 +62,23 @@ class KisskhProvider : MainAPI() {
 
         var newDomain: String? = null
 
-        // Step 1: Follow redirects from the known source to get the current domain
+        // Step 1: Follow redirects from the known source to get the current domain (Highest Priority)
         try {
             val response = app.get(redirectSource)
-            val fullUrl = response.request().url.toString() // note: request() is a method
+            
+            // FIX: Use response.url directly from NiceResponse
+            val fullUrl = response.url 
+            
             // Extract base domain (scheme + host) e.g., "https://kisskh.co"
             val domain = fullUrl.split("/").take(3).joinToString("/")
             if (domain.startsWith("http") && testDomain(domain)) {
                 newDomain = domain
             }
         } catch (e: Exception) {
-            // Redirect failed – fallback to the hardcoded list
+            // Redirect failed – proceed to Step 2
         }
 
-        // Step 2: If redirect didn't work, try fallback domains
+        // Step 2: If redirect didn't work, test the fallback domains
         if (newDomain == null) {
             for (domain in fallbackDomains) {
                 if (testDomain(domain)) {
