@@ -8,12 +8,10 @@ import com.lagradost.cloudstream3.plugins.Plugin
 
 @CloudstreamPlugin
 class ZenStreamPlugin : Plugin() {
-
     override fun load(context: Context) {
-        if (getKey<Boolean>(ZenStreamSettings.PROVIDER_ENABLED) ?: true) {
+        if (ZenStreamSettings.isProviderEnabled()) {
             registerMainAPI(ZenStreamProvider())
         }
-
         this.openSettings = { ctx: Context ->
             ZenStreamSettingsDialog.show(ctx) {
                 MainActivity.reloadHomeEvent.invoke(true)
