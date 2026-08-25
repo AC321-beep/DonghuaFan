@@ -337,7 +337,37 @@ object ZenStreamProviderRegistry {
             key = "zs_animekizz", displayName = "Animekizz",
             executeAnime = { res, subCb, cb -> invokeAnimekizz(res.title, res.anilistId, res.episode, subCb, cb) },
             executeMalSync = { data, subCb, cb -> if (data.origin == "imdb") invokeAnimekizz(data.title, data.aniId, data.episode, subCb, cb) }
-        )
+        ),
+        // ── Donghua / Anime-specific sources ─────────────────────
+ProviderDef(
+    key = "zs_animekhor", displayName = "Animekhor",
+    executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Animekhor", "https://animekhor.org", res.title, res.episode, subCb, cb) },
+    executeStandard = { res, subCb, cb -> invokeDonghuaGeneric("Animekhor", "https://animekhor.org", res.title, res.episode, subCb, cb) }
+),
+ProviderDef(
+    key = "zs_donghuastream", displayName = "Donghuastream",
+    executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Donghuastream", "https://donghuastream.com", res.title, res.episode, subCb, cb) }
+),
+ProviderDef(
+    key = "zs_donghuafun", displayName = "Donghuafun",
+    executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Donghuafun", "https://donghuafun.com", res.title, res.episode, subCb, cb) }
+),
+ProviderDef(
+    key = "zs_animexin", displayName = "Animexin",
+    executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Animexin", "https://animexin.vip", res.title, res.episode, subCb, cb) }
+),
+ProviderDef(
+    key = "zs_donghuaworld", displayName = "Donghuaworld",
+    executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Donghuaworld", "https://donghuaworld.com", res.title, res.episode, subCb, cb) }
+),
+ProviderDef(
+    key = "zs_luciferdonghua", displayName = "LuciferDonghua",
+    executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("LuciferDonghua", "https://luciferdonghua.com", res.title, res.episode, subCb, cb) }
+),
+ProviderDef(
+    key = "zs_myanimelive", displayName = "MyAnimeLive",
+    executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("MyAnimeLive", "https://myanimelive.com", res.title, res.episode, subCb, cb) }
+),
     )
 
     // Helper properties
