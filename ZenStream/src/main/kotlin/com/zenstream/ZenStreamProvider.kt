@@ -8,9 +8,6 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.api.Log
-import com.megix.CineStreamExtractors.invokeAllSources
-import com.megix.CineStreamExtractors.invokeAllAnimeSources
-import com.megix.AllLoadLinksData
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -640,10 +637,11 @@ class ZenStreamProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val res = parseJson<AllLoadLinksData>(data)
+        // Use the bridge to existing extractors (or implement your own)
         if (res.isAnime) {
-            invokeAllAnimeSources(res, subtitleCallback, callback)
+            ZenStreamExtractorBridge.invokeAllAnimeSources(res, subtitleCallback, callback)
         } else {
-            invokeAllSources(res, subtitleCallback, callback)
+            ZenStreamExtractorBridge.invokeAllSources(res, subtitleCallback, callback)
         }
         return true
     }
