@@ -11,15 +11,11 @@ import com.lagradost.api.Log
 import com.megix.CineStreamExtractors.invokeAllSources
 import com.megix.CineStreamExtractors.invokeAllAnimeSources
 import com.megix.AllLoadLinksData
-import org.json.JSONObject
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 
-/**
- * ZenStream – Unified provider that merges Cinemeta (CineStream), Simkl (CineSimkl),
- * and TMDB (CineTmdb) into a single, deduplicated catalog and search.
- */
 class ZenStreamProvider : MainAPI() {
     override var mainUrl = "https://cinemeta-catalogs.strem.io"
     override var name = "ZenStream"
@@ -45,8 +41,9 @@ class ZenStreamProvider : MainAPI() {
     private val tmdbKey = BuildConfig.TMDB_KEY
     private val simklClientId = BuildConfig.SIMKL_CLIENT_ID
     private val imageProxy = "https://wsrv.nl/?url="
+    private val maxRetries = 2
 
-    // ---------- Main page categories (merged from all three) ----------
+    // ---------- Main page categories ----------
     override val mainPage = mainPageOf(
         // Cinemeta
         "$cinemeta/top/catalog/movie/top/skip=###" to "Top Movies",
@@ -67,15 +64,13 @@ class ZenStreamProvider : MainAPI() {
     // ---------- Helpers ----------
     private fun getPoster(url: String?) = if (!url.isNullOrBlank()) imageProxy + url else null
     private fun getTmdbImage(path: String?) = if (!path.isNullOrBlank()) "https://image.tmdb.org/t/p/w500$path" else null
-    private fun getOriTmdbImage(path: String?) = if (!path.isNullOrBlank()) "https://image.tmdb.org/t/p/original$path" else null
     private fun getSimklPoster(id: String?) = if (!id.isNullOrBlank()) "${imageProxy}https://simkl.in/posters/${id}_m.webp" else null
 
     private fun getTvType(type: String?): TvType {
-        return when (type) {
+        return when (type?.lowercase()) {
             "movie" -> TvType.Movie
             "anime" -> TvType.Anime
-            "tv" -> TvType.TvSeries
-            "show" -> TvType.TvSeries
+            "tv", "show" -> TvType.TvSeries
             else -> TvType.TvSeries
         }
     }
@@ -88,69 +83,91 @@ class ZenStreamProvider : MainAPI() {
         }
     }
 
+    private suspend fun <T> withRetry(block: suspend () -> T): T? {
+        var attempt = 0
+        while (attempt < maxRetries) {
+            try {
+                return block()
+            } catch (e: Exception) {
+                attempt++
+                if (attempt < maxRetries) {
+                    delay(500L * attempt)
+                    Log.w("ZenStream", "Retry $attempt: ${e.message}")
+                } else {
+                    Log.e("ZenStream", "Failed after $maxRetries attempts", e)
+                }
+            }
+        }
+        return null
+    }
+
     // ---------- Main Page ----------
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = request.data
         val results = mutableListOf<SearchResponse>()
         var hasNext = false
 
-        when {
-            url.contains("cinemeta") || url.contains("kitsu") || url.contains("aiometa") -> {
-                val json = app.get("$url.json").text
-                val home = tryParseJson<CinemetaHome>(json)
-                home?.metas?.forEach { meta ->
-                    val title = meta.aliases?.firstOrNull() ?: meta.name ?: return@forEach
-                    val poster = if (meta.id.startsWith("tt")) imageProxy + "https://images.metahub.space/poster/medium/${meta.id}/img" else getPoster(meta.poster)
-                    val resp = newMovieSearchResponse(title, PassData(meta.id, meta.type).toJson(), getTvType(meta.type)) {
-                        this.posterUrl = poster
-                        this.score = Score.from10(meta.imdbRating)
+        try {
+            when {
+                url.contains("cinemeta") || url.contains("kitsu") || url.contains("aiometa") -> {
+                    val json = withRetry { app.get("$url.json").text } ?: return newHomePageResponse(request.name, emptyList())
+                    val home = tryParseJson<CinemetaHome>(json)
+                    home?.metas?.forEach { meta ->
+                        val title = meta.aliases?.firstOrNull() ?: meta.name ?: return@forEach
+                        val poster = if (meta.id.startsWith("tt")) imageProxy + "https://images.metahub.space/poster/medium/${meta.id}/img" else getPoster(meta.poster)
+                        val resp = newMovieSearchResponse(title, PassData(meta.id, meta.type).toJson(), getTvType(meta.type)) {
+                            this.posterUrl = poster
+                            this.score = Score.from10(meta.imdbRating)
+                        }
+                        results.add(resp)
                     }
-                    results.add(resp)
+                    hasNext = home?.hasMore ?: false
                 }
-                hasNext = home?.hasMore ?: false
-            }
-            url.contains(".json") -> {
-                val json = app.get(simklData + url).text
-                val data = parseJson<Array<SimklResponse>>(json)
-                data.forEach {
-                    val title = it.title ?: return@forEach
-                    val resp = newMovieSearchResponse(title, "${simklApi}${it.url}", getTvType(it.type)) {
-                        this.posterUrl = getSimklPoster(it.poster)
-                        this.score = Score.from10(it.ratings?.imdb?.rating ?: it.ratings?.mal?.rating)
+                url.contains(".json") -> {
+                    val json = withRetry { app.get(simklData + url).text } ?: return newHomePageResponse(request.name, emptyList())
+                    val data = parseJson<Array<SimklResponse>>(json)
+                    data.forEach {
+                        val title = it.title ?: return@forEach
+                        val resp = newMovieSearchResponse(title, "${simklApi}${it.url}", getTvType(it.type)) {
+                            this.posterUrl = getSimklPoster(it.poster)
+                            this.score = Score.from10(it.ratings?.imdb?.rating ?: it.ratings?.mal?.rating)
+                        }
+                        results.add(resp)
                     }
-                    results.add(resp)
+                    hasNext = true
                 }
-                hasNext = true
-            }
-            url.contains("trending") || url.contains("discover") -> {
-                val json = app.get("$tmdbApi/${url}&page=$page").text
-                val data = tryParseJson<TmdbResults>(json)
-                data?.results?.forEach { media ->
-                    val title = media.title ?: media.name ?: return@forEach
-                    val resp = newMovieSearchResponse(title, TmdbData(media.id, media.mediaType ?: "movie").toJson(), getTvType(media.mediaType)) {
-                        this.posterUrl = getTmdbImage(media.posterPath)
-                        this.score = Score.from10(media.voteAverage)
+                url.contains("trending") || url.contains("discover") -> {
+                    val json = withRetry { app.get("$tmdbApi/${url}&page=$page").text } ?: return newHomePageResponse(request.name, emptyList())
+                    val data = tryParseJson<TmdbResults>(json)
+                    data?.results?.forEach { media ->
+                        val title = media.title ?: media.name ?: return@forEach
+                        val resp = newMovieSearchResponse(title, TmdbData(media.id, media.mediaType ?: "movie").toJson(), getTvType(media.mediaType)) {
+                            this.posterUrl = getTmdbImage(media.posterPath)
+                            this.score = Score.from10(media.voteAverage)
+                        }
+                        results.add(resp)
                     }
-                    results.add(resp)
+                    hasNext = true
                 }
-                hasNext = true
-            }
-            else -> {
-                val json = app.get("$simklApi$url&client_id=$simklClientId&page=$page").text
-                val data = parseJson<Array<SimklResponse>>(json)
-                data.forEach {
-                    val title = it.title ?: return@forEach
-                    val resp = newMovieSearchResponse(title, "$simklApi${it.url}", getTvType(it.type)) {
-                        this.posterUrl = getSimklPoster(it.poster)
-                        this.score = Score.from10(it.ratings?.imdb?.rating ?: it.ratings?.mal?.rating)
+                else -> {
+                    val json = withRetry { app.get("$simklApi$url&client_id=$simklClientId&page=$page").text } ?: return newHomePageResponse(request.name, emptyList())
+                    val data = parseJson<Array<SimklResponse>>(json)
+                    data.forEach {
+                        val title = it.title ?: return@forEach
+                        val resp = newMovieSearchResponse(title, "$simklApi${it.url}", getTvType(it.type)) {
+                            this.posterUrl = getSimklPoster(it.poster)
+                            this.score = Score.from10(it.ratings?.imdb?.rating ?: it.ratings?.mal?.rating)
+                        }
+                        results.add(resp)
                     }
-                    results.add(resp)
+                    hasNext = true
                 }
-                hasNext = true
             }
+        } catch (e: Exception) {
+            Log.e("ZenStream", "Error in getMainPage", e)
+            return newHomePageResponse(request.name, emptyList())
         }
 
-        // Deduplicate by IMDB ID (or TMDB ID if IMDB missing)
         val unique = results.distinctBy { resp ->
             val url = resp.url
             when {
@@ -163,7 +180,7 @@ class ZenStreamProvider : MainAPI() {
                     val data = tryParseJson<PassData>(resp.url)
                     data?.id
                 }
-            } ?: resp.name
+            } ?: "${resp.name}${resp.year}"
         }
 
         return newHomePageResponse(
@@ -177,19 +194,19 @@ class ZenStreamProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> = coroutineScope {
         val cinemetaTask = async {
-            runCatching {
+            withRetry {
                 val json = app.get("$cinemeta/catalog/movie/top/search=$query.json").text
                 tryParseJson<CinemetaSearch>(json)?.metas ?: emptyList()
-            }.getOrDefault(emptyList())
+            } ?: emptyList()
         }
         val kitsuTask = async {
-            runCatching {
+            withRetry {
                 val json = app.get("$kitsuUrl/catalog/anime/kitsu-anime-airing/search=$query.json").text
                 tryParseJson<CinemetaSearch>(json)?.metas ?: emptyList()
-            }.getOrDefault(emptyList())
+            } ?: emptyList()
         }
         val simklTask = async {
-            runCatching {
+            withRetry {
                 val json = app.get("$simklApi/search/movie?q=$query&client_id=$simklClientId").text
                 val movies = parseJson<Array<SimklResponse>>(json)
                 movies.mapNotNull {
@@ -199,10 +216,10 @@ class ZenStreamProvider : MainAPI() {
                         this.score = Score.from10(it.ratings?.imdb?.rating ?: it.ratings?.mal?.rating)
                     }
                 }
-            }.getOrDefault(emptyList())
+            } ?: emptyList()
         }
         val tmdbTask = async {
-            runCatching {
+            withRetry {
                 val json = app.get("$tmdbApi/search/multi?api_key=$tmdbKey&query=$query").text
                 val data = tryParseJson<TmdbResults>(json)
                 data?.results?.mapNotNull { media ->
@@ -213,7 +230,7 @@ class ZenStreamProvider : MainAPI() {
                         this.score = Score.from10(media.voteAverage)
                     }
                 } ?: emptyList()
-            }.getOrDefault(emptyList())
+            } ?: emptyList()
         }
 
         val cinemetaMetas = cinemetaTask.await()
@@ -239,7 +256,6 @@ class ZenStreamProvider : MainAPI() {
 
         val all = cinemetaResponses + kitsuResponses + simklResults + tmdbResults
 
-        // Deduplicate by IMDB/TMDB/AniList ID or title+year as fallback
         val unique = all.distinctBy { resp ->
             val url = resp.url
             when {
@@ -261,23 +277,27 @@ class ZenStreamProvider : MainAPI() {
     // ---------- Load Details ----------
     override suspend fun load(url: String): LoadResponse? {
         val data = parseJson<Any?>(url)
-
-        return when {
-            data is PassData -> loadFromCinemeta(data.id, data.type)
-            url.contains("simkl.com") -> loadFromSimkl(url)
-            url.contains("tmdb.org") -> {
-                val d = parseJson<TmdbData>(url)
-                loadFromTmdb(d.id, d.type ?: "movie")
+        return try {
+            when {
+                data is PassData -> loadFromCinemeta(data.id, data.type)
+                url.contains("simkl.com") -> loadFromSimkl(url)
+                url.contains("tmdb.org") -> {
+                    val d = parseJson<TmdbData>(url)
+                    loadFromTmdb(d.id, d.type ?: "movie")
+                }
+                else -> null
             }
-            else -> null
+        } catch (e: Exception) {
+            Log.e("ZenStream", "Error loading details for $url", e)
+            null
         }
     }
 
-    // ---------- Load from Cinemeta (CineStream) ----------
+    // ---------- Load from Cinemeta ----------
     private suspend fun loadFromCinemeta(id: String, type: String): LoadResponse? {
         val tvType = getTvType(type)
         val metaUrl = if (id.contains("kitsu") || id.contains("mal")) "$kitsuUrl/meta/$type/${id.replace(":", "%3A")}.json" else "$cinemeta/meta/$type/$id.json"
-        val json = app.get(metaUrl).text
+        val json = withRetry { app.get(metaUrl).text } ?: return null
         val meta = tryParseJson<CinemetaResponse>(json)?.meta ?: return null
 
         val imdbId = meta.imdb_id
@@ -393,7 +413,7 @@ class ZenStreamProvider : MainAPI() {
     // ---------- Load from Simkl ----------
     private suspend fun loadFromSimkl(url: String): LoadResponse? {
         val (id, type) = getSimklIdAndType(url)
-        val json = app.get("$simklApi/$type/$id?client_id=${BuildConfig.SIMKL_API}&extended=full").text
+        val json = withRetry { app.get("$simklApi/$type/$id?client_id=${BuildConfig.SIMKL_API}&extended=full").text } ?: return null
         val meta = tryParseJson<SimklResponse>(json) ?: return null
 
         val imdbId = meta.ids?.imdb
@@ -452,7 +472,7 @@ class ZenStreamProvider : MainAPI() {
                 addMalId(malId)
             }
         } else {
-            val epsJson = app.get("$simklApi/tv/episodes/$id?client_id=${BuildConfig.SIMKL_API}&extended=full").text
+            val epsJson = withRetry { app.get("$simklApi/tv/episodes/$id?client_id=${BuildConfig.SIMKL_API}&extended=full").text } ?: return null
             val eps = parseJson<Array<SimklEpisode>>(epsJson)
             val episodes = eps.map {
                 val epData = AllLoadLinksData(
@@ -506,7 +526,7 @@ class ZenStreamProvider : MainAPI() {
     private suspend fun loadFromTmdb(id: Int, type: String): LoadResponse? {
         val append = "alternative_titles,credits,external_ids,videos,recommendations,content_ratings,release_dates"
         val url = if (type == "movie") "$tmdbApi/movie/$id?api_key=$tmdbKey&append_to_response=$append" else "$tmdbApi/tv/$id?api_key=$tmdbKey&append_to_response=$append"
-        val json = app.get(url).text
+        val json = withRetry { app.get(url).text } ?: return null
         val meta = tryParseJson<TmdbDetail>(json) ?: return null
 
         val imdbId = meta.external_ids?.imdb_id
@@ -560,7 +580,7 @@ class ZenStreamProvider : MainAPI() {
             val seasons = meta.seasons?.filter { it.seasonNumber != 0 } ?: emptyList()
             val episodes = mutableListOf<Episode>()
             seasons.forEach { season ->
-                val seasonJson = app.get("$tmdbApi/tv/$id/season/${season.seasonNumber}?api_key=$tmdbKey").text
+                val seasonJson = withRetry { app.get("$tmdbApi/tv/$id/season/${season.seasonNumber}?api_key=$tmdbKey").text } ?: return@forEach
                 val seasonData = tryParseJson<TmdbSeason>(seasonJson)
                 seasonData?.episodes?.forEach { ep ->
                     val epData = AllLoadLinksData(
@@ -612,7 +632,7 @@ class ZenStreamProvider : MainAPI() {
         }
     }
 
-    // ---------- Load Links (reuses existing extractors) ----------
+    // ---------- Load Links ----------
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -628,11 +648,10 @@ class ZenStreamProvider : MainAPI() {
         return true
     }
 
-    // ---------- Utility data classes ----------
+    // ---------- Data classes and utilities ----------
     data class PassData(val id: String, val type: String)
     data class TmdbData(val id: Int, val type: String? = null)
 
-    // ---------- Simkl ID extraction ----------
     private fun getSimklIdAndType(url: String): Pair<String, String> {
         val id = url.split('/').find { it.toIntOrNull() != null } ?: ""
         val type = when {
@@ -643,14 +662,13 @@ class ZenStreamProvider : MainAPI() {
         return id to type
     }
 
-    // ---------- External ID resolver (for Kitsu/AniList) ----------
     private suspend fun getExternalId(id: String, source: String): ExternalIds? {
         val url = "https://arm.haglund.dev/api/v2/ids?source=$source&id=$id"
-        val json = app.get(url).text
+        val json = withRetry { app.get(url).text } ?: return null
         return tryParseJson<ExternalIds>(json)
     }
 
-    // ---------- Data classes for parsing ----------
+    // ---------- Parsing data classes ----------
     data class CinemetaHome(val metas: List<CinemetaMeta>, val hasMore: Boolean = true)
     data class CinemetaSearch(val metas: List<CinemetaMeta>)
     data class CinemetaResponse(val meta: CinemetaMeta)
