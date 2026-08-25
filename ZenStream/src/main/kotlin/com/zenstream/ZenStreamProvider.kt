@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.api.Log
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -42,17 +43,14 @@ class ZenStreamProvider : MainAPI() {
 
     // ---------- Main page categories ----------
     override val mainPage = mainPageOf(
-        // Cinemeta
         "$cinemeta/top/catalog/movie/top/skip=###" to "Top Movies",
         "$cinemeta/top/catalog/series/top/skip=###" to "Top Series",
         "$aiometa/catalog/anime/mal.airing/skip=###" to "Top Airing Anime",
         "$kitsuUrl/catalog/anime/kitsu-anime-trending/skip=###" to "Top Anime",
-        // Simkl
         "/discover/trending/movies/today_500.json" to "Trending Movies Today",
         "/discover/trending/tv/today_500.json" to "Trending Shows Today",
         "/discover/trending/anime/today_500.json" to "Trending Anime Today",
         "/discover/trending/month_500.json" to "Trending This Month",
-        // TMDB
         "trending/all/day?api_key=$tmdbKey&region=US" to "TMDB Trending",
         "trending/movie/week?api_key=$tmdbKey&region=US" to "TMDB Popular Movies",
         "trending/tv/week?api_key=$tmdbKey&region=US" to "TMDB Popular TV"
@@ -87,12 +85,8 @@ class ZenStreamProvider : MainAPI() {
                 return block()
             } catch (e: Exception) {
                 attempt++
-                if (attempt < maxRetries) {
-                    delay(500L * attempt)
-                    Log.w("ZenStream", "Retry $attempt: ${e.message}")
-                } else {
-                    Log.e("ZenStream", "Failed after $maxRetries attempts", e)
-                }
+                if (attempt < maxRetries) delay(500L * attempt)
+                else Log.e("ZenStream", "Failed after $maxRetries attempts", e)
             }
         }
         return null
@@ -629,7 +623,7 @@ class ZenStreamProvider : MainAPI() {
         }
     }
 
-    // ---------- Load Links ----------
+    // ---------- Load Links (using registry) ----------
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -637,12 +631,35 @@ class ZenStreamProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val res = parseJson<AllLoadLinksData>(data)
-        // Use the bridge to existing extractors (or implement your own)
-        if (res.isAnime) {
-            ZenStreamExtractorBridge.invokeAllAnimeSources(res, subtitleCallback, callback)
-        } else {
-            ZenStreamExtractorBridge.invokeAllSources(res, subtitleCallback, callback)
+
+        // Get the provider order from settings (or use the default)
+        val order = ZenStreamSettings.getProviderOrder()
+        val tasks = order.mapNotNull { key ->
+            // Check if this provider is enabled in settings
+            if (!ZenStreamSettings.isProviderToggleEnabled(key)) return@mapNotNull null
+
+            // Find the provider definition
+            val def = ZenStreamProviderRegistry.builtInProviders.find { it.key == key }
+                ?: return@mapNotNull null
+
+            // Choose the appropriate execution function based on isAnime
+            val exec = if (res.isAnime) {
+                def.executeAnime ?: def.executeStandard
+            } else {
+                def.executeStandard ?: def.executeAnime
+            }
+
+            if (exec == null) return@mapNotNull null
+
+            // Return a suspend lambda that calls the exec with the receiver being ZenStreamExtractors
+            suspend {
+                exec.invoke(ZenStreamExtractors, res, subtitleCallback, callback)
+            }
         }
+
+        // Run all enabled providers concurrently with limited concurrency
+        ZenStreamExtractors.runLimitedAsync(concurrency = 10, *tasks.toTypedArray())
+
         return true
     }
 
@@ -776,6 +793,5 @@ class ZenStreamProvider : MainAPI() {
         val overview: String?,
         val voteAverage: Double?
     )
-
     data class ExternalIds(val anilist: Int?, val myanimelist: Int?, val kitsu: Int?)
 }
