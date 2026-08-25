@@ -25,7 +25,7 @@ import com.kisskh.SubDecryptor
 
 class KisskhProvider : MainAPI() {
     // Default domain (will be updated automatically)
-    override var mainUrl = "https://kisskh.co" 
+    override var mainUrl = "https://kisskh.co"
     override var name = "Kisskh"
     override val hasMainPage = true
     override val hasDownloadSupport = true
@@ -46,14 +46,14 @@ class KisskhProvider : MainAPI() {
         "https://kisskh.org",
         "https://kisskh.net",
         "https://kisskh.tv",
-        "https://kisskh.do"   // <-- newly added
+        "https://kisskh.do"   // added as requested
     )
 
     // Test if a domain is alive by calling a simple API endpoint
     private suspend fun testDomain(domain: String): Boolean {
         return try {
             val testUrl = "$domain/api/DramaList/List?page=1&type=0&order=2"
-            val response = app.get(testUrl, timeout = 5000)
+            val response = app.get(testUrl)
             response.code == 200 && response.parsedSafe<Responses>()?.data != null
         } catch (e: Exception) {
             false
@@ -68,12 +68,12 @@ class KisskhProvider : MainAPI() {
 
         // Step 1: Follow redirects from the known source to get the current domain
         try {
-            // Perform a GET with redirect following enabled (default in Cloudstream)
-            val response = app.get(redirectSource, timeout = 8000)
-            val finalUrl = response.request.url.toString() // the URL after all redirects
-            val finalDomain = finalUrl.takeWhile { it != '/' }.removeSuffix("/")
-            if (finalDomain.startsWith("http") && testDomain(finalDomain)) {
-                newDomain = finalDomain
+            val response = app.get(redirectSource)
+            val fullUrl = response.request().url.toString() // note: request() is a method
+            // Extract base domain (scheme + host) e.g., "https://kisskh.co"
+            val domain = fullUrl.split("/").take(3).joinToString("/")
+            if (domain.startsWith("http") && testDomain(domain)) {
+                newDomain = domain
             }
         } catch (e: Exception) {
             // Redirect failed – fallback to the hardcoded list
@@ -196,7 +196,7 @@ class KisskhProvider : MainAPI() {
 
         // ---- Video links (using Google Script key) ----
         val videoKeyUrl = "$kisskhApiBase${loadData.epsId}&version=2.8.10"
-        val kkey = app.get(videoKeyUrl, timeout = 10000).parsedSafe<Key>()?.key ?: ""
+        val kkey = app.get(videoKeyUrl).parsedSafe<Key>()?.key ?: ""
         if (kkey.isBlank()) {
             return false
         }
@@ -244,7 +244,7 @@ class KisskhProvider : MainAPI() {
 
         // ---- Subtitles (using Google Script key, passed as URL, decrypted in interceptor) ----
         val subKeyUrl = "$kisskhSubBase${loadData.epsId}&version=2.8.10"
-        val subtitleKkey = app.get(subKeyUrl, timeout = 10000).parsedSafe<Key>()?.key ?: ""
+        val subtitleKkey = app.get(subKeyUrl).parsedSafe<Key>()?.key ?: ""
         if (subtitleKkey.isBlank()) {
             return true // Not fatal
         }
