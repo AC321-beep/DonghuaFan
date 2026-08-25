@@ -24,35 +24,80 @@ import javax.crypto.spec.SecretKeySpec
 import com.kisskh.SubDecryptor
 
 class KisskhProvider : MainAPI() {
-    // 1. Updated the default fallback domain to the currently active one
+    // Default domain (will be updated automatically)
     override var mainUrl = "https://kisskh.co" 
     override var name = "Kisskh"
     override val hasMainPage = true
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.AsianDrama, TvType.Anime)
 
-    // --- DYNAMIC DOMAIN UPDATER ---
+    // --- FULLY AUTOMATIC DOMAIN DISCOVERY ---
     private var isDomainUpdated = false
-    
-    // 2. Replace this with a link to a raw text file you control (e.g., GitHub or Pastebin)
-    private val configUrl = "https://raw.githubusercontent.com/YourUsername/YourRepo/main/kisskh_domain.txt"
+    private var lastDomainCheckTime = 0L
+    private val DOMAIN_CHECK_COOLDOWN = 60000L // 1 minute between checks
 
-    private suspend fun updateDomain() {
-        if (isDomainUpdated) return
-        try {
-            val fetchedDomain = app.get(configUrl).text.trim()
-            // Ensure the fetched text is actually a URL
-            if (fetchedDomain.startsWith("http")) {
-                mainUrl = fetchedDomain.removeSuffix("/")
-            }
+    // A known URL that will redirect to the current active domain
+    private val redirectSource = "https://kisskh.co"  // or "https://kisskh.com"
+
+    // Fallback list (rarely used, only if redirect fails)
+    private val fallbackDomains = listOf(
+        "https://kisskh.co",
+        "https://kisskh.com",
+        "https://kisskh.org",
+        "https://kisskh.net",
+        "https://kisskh.tv",
+        "https://kisskh.do"   // <-- newly added
+    )
+
+    // Test if a domain is alive by calling a simple API endpoint
+    private suspend fun testDomain(domain: String): Boolean {
+        return try {
+            val testUrl = "$domain/api/DramaList/List?page=1&type=0&order=2"
+            val response = app.get(testUrl, timeout = 5000)
+            response.code == 200 && response.parsedSafe<Responses>()?.data != null
         } catch (e: Exception) {
-            // Silently fail and use the default mainUrl above if the text file can't be reached
-        } finally {
-            // Ensure this check only runs once per app session to avoid slowing down the provider
-            isDomainUpdated = true 
+            false
         }
     }
-    // ------------------------------
+
+    private suspend fun updateDomain() {
+        val now = System.currentTimeMillis()
+        if (isDomainUpdated && (now - lastDomainCheckTime < DOMAIN_CHECK_COOLDOWN)) return
+
+        var newDomain: String? = null
+
+        // Step 1: Follow redirects from the known source to get the current domain
+        try {
+            // Perform a GET with redirect following enabled (default in Cloudstream)
+            val response = app.get(redirectSource, timeout = 8000)
+            val finalUrl = response.request.url.toString() // the URL after all redirects
+            val finalDomain = finalUrl.takeWhile { it != '/' }.removeSuffix("/")
+            if (finalDomain.startsWith("http") && testDomain(finalDomain)) {
+                newDomain = finalDomain
+            }
+        } catch (e: Exception) {
+            // Redirect failed – fallback to the hardcoded list
+        }
+
+        // Step 2: If redirect didn't work, try fallback domains
+        if (newDomain == null) {
+            for (domain in fallbackDomains) {
+                if (testDomain(domain)) {
+                    newDomain = domain
+                    break
+                }
+            }
+        }
+
+        // Step 3: Apply the new domain if found
+        if (newDomain != null) {
+            mainUrl = newDomain
+        }
+
+        isDomainUpdated = true
+        lastDomainCheckTime = now
+    }
+    // ----------------------------------------------
 
     // Google Script URLs (video and subtitle key generation)
     private val kisskhApiBase = "https://script.google.com/macros/s/AKfycbzn8B31PuDxzaMa9_CQ0VGEDasFqfzI5bXvjaIZH4DM8DNq9q6xj1ALvZNz_JT3jF0suA/exec?id="
@@ -75,8 +120,7 @@ class KisskhProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        updateDomain() // 3. Dynamically update domain before requesting
-        
+        updateDomain()
         val home = app.get("$mainUrl/api/DramaList/List?page=$page${request.data}")
             .parsedSafe<Responses>()?.data
             ?.mapNotNull { it.toSearchResponse() }
@@ -96,8 +140,7 @@ class KisskhProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        updateDomain() // 3. Dynamically update domain before searching
-        
+        updateDomain()
         val searchResponse = app.get("$mainUrl/api/DramaList/Search?q=$query&type=0", referer = "$mainUrl/").text
         return tryParseJson<ArrayList<Media>>(searchResponse)?.mapNotNull { it.toSearchResponse() }
             ?: throw ErrorLoadingException("Invalid JSON response")
@@ -106,8 +149,7 @@ class KisskhProvider : MainAPI() {
     private fun getTitle(str: String) = str.replace(Regex("[^a-zA-Z0-9]"), "-")
 
     override suspend fun load(url: String): LoadResponse? {
-        updateDomain() // 3. Dynamically update domain before loading details
-        
+        updateDomain()
         val id = url.split("/")
         val res = app.get(
             "$mainUrl/api/DramaList/Drama/${id.last()}?isq=false",
@@ -213,7 +255,6 @@ class KisskhProvider : MainAPI() {
         for (sub in subtitleList) {
             val lang = getLanguage(sub.label ?: continue)
             val srcUrl = sub.src ?: continue
-            // Pass the URL – decryption happens inside getVideoInterceptor
             subtitleCallback.invoke(newSubtitleFile(lang, srcUrl))
         }
 
