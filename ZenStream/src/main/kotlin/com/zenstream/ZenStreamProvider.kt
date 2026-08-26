@@ -1,14 +1,15 @@
 package com.zenstream
 
+import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
-import com.lagradost.api.Log
+import com.lagradost.cloudstream3.utils.SubtitleFile
+import com.lagradost.cloudstream3.utils.ExtractorLink
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -43,17 +44,14 @@ class ZenStreamProvider : MainAPI() {
 
     // ---------- Main page categories ----------
     override val mainPage = mainPageOf(
-        // Cinemeta
         "$cinemeta/top/catalog/movie/top/skip=###" to "Top Movies",
         "$cinemeta/top/catalog/series/top/skip=###" to "Top Series",
         "$aiometa/catalog/anime/mal.airing/skip=###" to "Top Airing Anime",
         "$kitsuUrl/catalog/anime/kitsu-anime-trending/skip=###" to "Top Anime",
-        // Simkl
         "/discover/trending/movies/today_500.json" to "Trending Movies Today",
         "/discover/trending/tv/today_500.json" to "Trending Shows Today",
         "/discover/trending/anime/today_500.json" to "Trending Anime Today",
         "/discover/trending/month_500.json" to "Trending This Month",
-        // TMDB
         "trending/all/day?api_key=$tmdbKey&region=US" to "TMDB Trending",
         "trending/movie/week?api_key=$tmdbKey&region=US" to "TMDB Popular Movies",
         "trending/tv/week?api_key=$tmdbKey&region=US" to "TMDB Popular TV"
@@ -89,7 +87,7 @@ class ZenStreamProvider : MainAPI() {
             } catch (e: Exception) {
                 attempt++
                 if (attempt < maxRetries) delay(500L * attempt)
-                else Log.e("ZenStream", "Failed after $maxRetries attempts", e)
+                else Log.e("ZenStream", "Failed after $maxRetries attempts: ${e.message}")
             }
         }
         return null
@@ -158,7 +156,7 @@ class ZenStreamProvider : MainAPI() {
                 }
             }
         } catch (e: Exception) {
-            Log.e("ZenStream", "Error in getMainPage", e)
+            Log.e("ZenStream", "Error in getMainPage: ${e.message}")
             return newHomePageResponse(request.name, emptyList())
         }
 
@@ -273,22 +271,22 @@ class ZenStreamProvider : MainAPI() {
         val data = tryParseJson<PassData>(url) ?: tryParseJson<TmdbData>(url)
         return try {
             when {
-                data is PassData -> loadFromCinemeta(data.id, data.type)
+                data is PassData -> loadFromCinemeta(data.id, data.type, url)
                 url.contains("simkl.com") -> loadFromSimkl(url)
                 url.contains("tmdb.org") -> {
                     val d = parseJson<TmdbData>(url)
-                    loadFromTmdb(d.id, d.type ?: "movie")
+                    loadFromTmdb(d.id, d.type ?: "movie", url)
                 }
                 else -> null
             }
         } catch (e: Exception) {
-            Log.e("ZenStream", "Error loading details for $url", e)
+            Log.e("ZenStream", "Error loading details for $url: ${e.message}")
             null
         }
     }
 
     // ---------- Load from Cinemeta ----------
-    private suspend fun loadFromCinemeta(id: String, type: String): LoadResponse? {
+    private suspend fun loadFromCinemeta(id: String, type: String, url: String): LoadResponse? {
         val tvType = getTvType(type)
         val metaUrl = if (id.contains("kitsu") || id.contains("mal")) "$kitsuUrl/meta/$type/${id.replace(":", "%3A")}.json" else "$cinemeta/meta/$type/$id.json"
         val json = withRetry { app.get(metaUrl).text } ?: return null
@@ -305,7 +303,7 @@ class ZenStreamProvider : MainAPI() {
         val bg = getPoster(meta.background)
         val logo = getPoster(meta.logo)
         val description = meta.description
-        val genres = meta.genre ?: meta.genres ?: emptyList()
+        val genres = (meta.genre ?: meta.genres ?: emptyList()).mapNotNull { it }
         val imdbRating = meta.imdbRating?.toDoubleOrNull()
         val year = meta.year?.substringBefore("-")?.toIntOrNull() ?: meta.releaseInfo?.toIntOrNull()
 
@@ -420,7 +418,7 @@ class ZenStreamProvider : MainAPI() {
         val poster = getSimklPoster(meta.poster)
         val bg = getPoster(meta.fanart)
         val description = meta.overview
-        val genres = meta.genres ?: emptyList()
+        val genres = meta.genres?.mapNotNull { it } ?: emptyList()
         val rating = meta.ratings?.imdb?.rating ?: meta.ratings?.mal?.rating
         val year = meta.year
         val status = meta.status
@@ -517,10 +515,10 @@ class ZenStreamProvider : MainAPI() {
     }
 
     // ---------- Load from TMDB ----------
-    private suspend fun loadFromTmdb(id: Int, type: String): LoadResponse? {
+    private suspend fun loadFromTmdb(id: Int, type: String, url: String): LoadResponse? {
         val append = "alternative_titles,credits,external_ids,videos,recommendations,content_ratings,release_dates"
-        val url = if (type == "movie") "$tmdbApi/movie/$id?api_key=$tmdbKey&append_to_response=$append" else "$tmdbApi/tv/$id?api_key=$tmdbKey&append_to_response=$append"
-        val json = withRetry { app.get(url).text } ?: return null
+        val tmdbUrl = if (type == "movie") "$tmdbApi/movie/$id?api_key=$tmdbKey&append_to_response=$append" else "$tmdbApi/tv/$id?api_key=$tmdbKey&append_to_response=$append"
+        val json = withRetry { app.get(tmdbUrl).text } ?: return null
         val meta = tryParseJson<TmdbDetail>(json) ?: return null
 
         val imdbId = meta.external_ids?.imdb_id
@@ -529,7 +527,7 @@ class ZenStreamProvider : MainAPI() {
         val poster = getTmdbImage(meta.posterPath)
         val bg = getTmdbImage(meta.backdropPath)
         val description = meta.overview
-        val genres = meta.genres?.map { it.name } ?: emptyList()
+        val genres = meta.genres?.mapNotNull { it.name } ?: emptyList()
         val rating = meta.vote_average?.toDoubleOrNull()
         val year = meta.releaseDate?.substringBefore("-")?.toIntOrNull() ?: meta.firstAirDate?.substringBefore("-")?.toIntOrNull()
         val tvType = if (type == "movie") TvType.Movie else TvType.TvSeries
@@ -634,35 +632,21 @@ class ZenStreamProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val res = parseJson<AllLoadLinksData>(data)
-
-        // Get the provider order from settings (or use the default)
         val order = ZenStreamSettings.getProviderOrder()
         val tasks = order.mapNotNull { key ->
-            // Check if this provider is enabled in settings
             if (!ZenStreamSettings.isProviderToggleEnabled(key)) return@mapNotNull null
-
-            // Find the provider definition
-            val def = ZenStreamProviderRegistry.builtInProviders.find { it.key == key }
-                ?: return@mapNotNull null
-
-            // Choose the appropriate execution function based on isAnime
+            val def = ZenStreamProviderRegistry.builtInProviders.find { it.key == key } ?: return@mapNotNull null
             val exec = if (res.isAnime) {
                 def.executeAnime ?: def.executeStandard
             } else {
                 def.executeStandard ?: def.executeAnime
             }
-
             if (exec == null) return@mapNotNull null
-
-            // Return a suspend lambda that calls the exec with the receiver being ZenStreamExtractors
             suspend {
                 exec.invoke(ZenStreamExtractors, res, subtitleCallback, callback)
             }
         }
-
-        // Run all enabled providers concurrently with limited concurrency
         ZenStreamExtractors.runLimitedAsync(concurrency = 10, *tasks.toTypedArray())
-
         return true
     }
 
