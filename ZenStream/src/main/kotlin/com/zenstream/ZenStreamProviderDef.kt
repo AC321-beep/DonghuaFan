@@ -24,6 +24,7 @@ data class ProviderDef(
 )
 
 object ZenStreamProviderRegistry {
+
     val builtInProviders = listOf(
         // ── Torrents ──────────────────────────────────────────────
         ProviderDef(
@@ -326,7 +327,7 @@ object ZenStreamProviderRegistry {
             executeAnime = { res, subCb, cb -> invokeAnimekizz(res.title, res.anilistId, res.episode, subCb, cb) },
             executeMalSync = { data, subCb, cb -> if (data.origin == "imdb") invokeAnimekizz(data.title, data.aniId, data.episode, subCb, cb) }
         ),
-        // ── Donghua / Anime-specific sources ─────────────────────
+        // ── Donghua Providers ──────────────────────────────────────
         ProviderDef(
             key = "zs_animekhor", displayName = "Animekhor",
             executeAnime = { res, subCb, cb -> invokeDonghuaGeneric("Animekhor", "https://animekhor.org", res.title, res.episode, subCb, cb) },
