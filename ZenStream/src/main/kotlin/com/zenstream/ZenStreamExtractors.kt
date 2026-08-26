@@ -1,6 +1,5 @@
 package com.zenstream
 
-import android.webkit.CookieManager
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
@@ -19,7 +18,6 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.net.URI
-import java.net.URL
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
@@ -35,7 +33,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.supervisorScope
 import kotlin.math.min
 
-// ─── DUMMY BuildConfig (avoids unresolved references) ────────────────
+// ─── DUMMY BuildConfig ────────────────────────────────────────────────
 object BuildConfig {
     const val TMDB_KEY = "dummy_tmdb_key"
     const val SIMKL_CLIENT_ID = "dummy_simkl_client_id"
@@ -48,7 +46,7 @@ object BuildConfig {
     const val NETMIRROR_TOKEN = "dummy_netmirror_token"
 }
 
-// ─── Constants ───────────────────────────────────────────────────────────
+// ─── Constants ──────────────────────────────────────────────────────────
 private const val USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
 private const val CF_BYPASS_USER_AGENT = "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36"
 private const val CF_LOG_TAG = "ZenStreamCloudflare"
@@ -102,8 +100,8 @@ private val vidcoreAPI = "https://vidcore.io"
 private val anikageAPI = "https://anikage.cc"
 private val hdGharTvAPI = "https://hdghartv.cc"
 private val aninekoAPI = "https://anineko.to"
-private val torrentioAPI = "https://torrentio.strem.fun/limit=4"
-private val torrentsdbAPI = "https://torrentsdb.com/eyJsaW1pdCI6IjMiLCJkZWJyaWRvcHRpb25zIjpbIm5vZG93bmxvYWRsaW5rcyJdfQ=="
+internal val torrentioAPI = "https://torrentio.strem.fun/limit=4"
+internal val torrentsdbAPI = "https://torrentsdb.com/eyJsaW1pdCI6IjMiLCJkZWJyaWRvcHRpb25zIjpbIm5vZG93bmxvYWRsaW5rcyJdfQ=="
 
 // ─── Cloudflare helpers ──────────────────────────────────────────────
 private val cfMutexMap = ConcurrentHashMap<String, Mutex>()
@@ -124,7 +122,6 @@ suspend fun cfGet(url: String, headers: Map<String, String> = emptyMap(), allowR
         if (isCloudflarePage(retryResponse)) { cfKiller.savedCookies.clear(); app.get(url, interceptor = cfKiller, allowRedirects = allowRedirects) } else retryResponse
     }
 }
-
 suspend fun cfPost(url: String, headers: Map<String, String> = emptyMap(), data: Map<String, String> = emptyMap(), json: Any? = null, allowRedirects: Boolean = true): NiceResponse {
     val headersWithAgent = headers.toMutableMap().apply { if (!containsKey("User-Agent")) this["User-Agent"] = CF_BYPASS_USER_AGENT }
     val effectiveHeaders = injectWebviewCookies(url, headersWithAgent)
@@ -137,7 +134,6 @@ suspend fun cfPost(url: String, headers: Map<String, String> = emptyMap(), data:
     }
 }
 
-// ─── Main extractor object ──────────────────────────────────────────────
 object ZenStreamExtractors {
 
     suspend fun invokeAllSources(res: AllLoadLinksData, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
@@ -209,7 +205,7 @@ object ZenStreamExtractors {
         tasks.add { invokeAnikoto(res.imdbTitle ?: res.title, res.year, res.episode, subtitleCallback, callback) }
         tasks.add { invokeAnidb(res.imdbTitle ?: res.title, res.year, res.episode, subtitleCallback, callback) }
         tasks.add { invokeReanime(res.anilistId, res.episode, subtitleCallback, callback) }
-        // Donghua providers
+        // Donghua
         tasks.add { invokeDonghuaGeneric("Animekhor", "https://animekhor.org", res.title, res.episode, subtitleCallback, callback) }
         tasks.add { invokeDonghuaGeneric("Donghuastream", "https://donghuastream.com", res.title, res.episode, subtitleCallback, callback) }
         tasks.add { invokeDonghuaGeneric("Donghuafun", "https://donghuafun.com", res.title, res.episode, subtitleCallback, callback) }
@@ -258,13 +254,10 @@ object ZenStreamExtractors {
         runLimitedAsync(concurrency = 10, *tasks.toTypedArray())
     }
 
-    // ─── Individual provider implementations (full bodies from original) ───
-    // All functions are copied verbatim from the original CineStreamExtractors,
-    // with only the package and object name changed.
-
+    // ─── All provider functions (copied from original) ──────────────
     suspend fun invokeShowbox(imdbId: String?, season: Int?, episode: Int?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         if (imdbId == null) return
-        val token = "dummy_token" // replace with Settings.getShowboxToken() if needed
+        val token = "dummy_token"
         val mediaId = searchSuperstream(imdbId) ?: return
         val type = if (season != null) 2 else 1
         val shareKey = getShareKey(mediaId, type) ?: return
@@ -282,9 +275,7 @@ object ZenStreamExtractors {
             val epFile = epList.firstOrNull { f ->
                 if (f.is_dir) false
                 else f.file_name?.lowercase()?.let {
-                    it.contains("e$episodeSlug") ||
-                    it.contains("ep$episodeSlug") ||
-                    it.contains("episode $episode")
+                    it.contains("e$episodeSlug") || it.contains("ep$episodeSlug") || it.contains("episode $episode")
                 } == true
             } ?: epList.firstOrNull { !it.is_dir } ?: return
             getVideoQualities(epFile.fid, shareKey, token)
@@ -1127,12 +1118,12 @@ object ZenStreamExtractors {
                                 "MovieBox [$language]",
                                 dlink,
                             ) {
-                                    this.headers = mapOf(
-                                        "Referer" to "https://fmoviesunblocked.net/",
-                                        "Origin" to "https://fmoviesunblocked.net"
-                                    )
-                                    this.quality = resolution
-                                }
+                                this.headers = mapOf(
+                                    "Referer" to "https://fmoviesunblocked.net/",
+                                    "Origin" to "https://fmoviesunblocked.net"
+                                )
+                                this.quality = resolution
+                            }
                         )
                     }
                 }
@@ -1153,12 +1144,12 @@ object ZenStreamExtractors {
                                 "MovieBox [$language]",
                                 slink,
                             ) {
-                                    this.headers = mapOf(
-                                        "Referer" to "https://fmoviesunblocked.net/",
-                                        "Origin" to "https://fmoviesunblocked.net"
-                                    )
-                                    this.quality = resolution
-                                }
+                                this.headers = mapOf(
+                                    "Referer" to "https://fmoviesunblocked.net/",
+                                    "Origin" to "https://fmoviesunblocked.net"
+                                )
+                                this.quality = resolution
+                            }
                         )
                     }
                 }
@@ -1176,11 +1167,11 @@ object ZenStreamExtractors {
                                 "MovieBox Auto [$language] (DASH)",
                                 dlink,
                             ) {
-                                    this.headers = mapOf(
-                                        "Referer" to "https://fmoviesunblocked.net/",
-                                        "Origin" to "https://fmoviesunblocked.net"
-                                    )
-                                }
+                                this.headers = mapOf(
+                                    "Referer" to "https://fmoviesunblocked.net/",
+                                    "Origin" to "https://fmoviesunblocked.net"
+                                )
+                            }
                         )
                     }
                 }
@@ -1717,7 +1708,6 @@ object ZenStreamExtractors {
     }
 
     suspend fun invokeRogmovies(id: String?, season: Int?, episode: Int?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        // Delegate to VegaMovies with rogmoviesAPI
         invokeVegamovies("RogMovies", id, season, episode, subtitleCallback, callback)
     }
 
@@ -3355,7 +3345,7 @@ object ZenStreamExtractors {
         } catch (e: Exception) { Log.e("DonghuaGeneric", "Error: ${e.message}") }
     }
 
-    // ─── Helpers ──────────────────────────────────────────────────────
+    // ─── Helpers (all) ──────────────────────────────────────────────────
     suspend fun mySubtitleCallback(lang: String?, url: String, subtitleCallback: (SubtitleFile) -> Unit, source: String? = null) {
         subtitleCallback.invoke(newSubtitleFile(lang ?: "Unknown", url))
     }
@@ -3391,10 +3381,7 @@ object ZenStreamExtractors {
         return try { val res = app.head(posterUrl); if (res.code == 200) posterUrl else null } catch (_: Exception) { null }
     }
 
-    suspend fun getTvdbData(tvType: String, imdbId: String? = null): ExtractedMediaData? {
-        // Not used – kept for compatibility
-        return null
-    }
+    suspend fun getTvdbData(tvType: String, imdbId: String? = null): ExtractedMediaData? = null
 
     suspend fun loadSourceNameExtractor(source: String, url: String, referer: String? = null, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit, quality: Int? = null, size: String = "") {
         loadExtractor(url, referer, subtitleCallback) { link ->
@@ -3430,7 +3417,7 @@ object ZenStreamExtractors {
         }
     }
 
-    // ─── Data classes ──────────────────────────────────────────────────
+    // ─── Data classes (all) ────────────────────────────────────────────
     data class ExtractedMediaData(val cast: List<ActorData>?, val poster: String?, val background: String?, val logo: String?)
     data class VideoQuality(val url: String, val quality: String)
     data class FileItem(val fid: Long, val file_name: String?, val is_dir: Boolean)
