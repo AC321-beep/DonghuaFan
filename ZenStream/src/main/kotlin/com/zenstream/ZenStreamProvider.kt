@@ -43,14 +43,17 @@ class ZenStreamProvider : MainAPI() {
 
     // ---------- Main page categories ----------
     override val mainPage = mainPageOf(
+        // Cinemeta
         "$cinemeta/top/catalog/movie/top/skip=###" to "Top Movies",
         "$cinemeta/top/catalog/series/top/skip=###" to "Top Series",
         "$aiometa/catalog/anime/mal.airing/skip=###" to "Top Airing Anime",
         "$kitsuUrl/catalog/anime/kitsu-anime-trending/skip=###" to "Top Anime",
+        // Simkl
         "/discover/trending/movies/today_500.json" to "Trending Movies Today",
         "/discover/trending/tv/today_500.json" to "Trending Shows Today",
         "/discover/trending/anime/today_500.json" to "Trending Anime Today",
         "/discover/trending/month_500.json" to "Trending This Month",
+        // TMDB
         "trending/all/day?api_key=$tmdbKey&region=US" to "TMDB Trending",
         "trending/movie/week?api_key=$tmdbKey&region=US" to "TMDB Popular Movies",
         "trending/tv/week?api_key=$tmdbKey&region=US" to "TMDB Popular TV"
@@ -267,7 +270,7 @@ class ZenStreamProvider : MainAPI() {
 
     // ---------- Load Details ----------
     override suspend fun load(url: String): LoadResponse? {
-        val data = parseJson<Any?>(url)
+        val data = tryParseJson<PassData>(url) ?: tryParseJson<TmdbData>(url)
         return try {
             when {
                 data is PassData -> loadFromCinemeta(data.id, data.type)
@@ -623,7 +626,7 @@ class ZenStreamProvider : MainAPI() {
         }
     }
 
-    // ---------- Load Links (using registry) ----------
+    // ---------- Load Links ----------
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -793,5 +796,6 @@ class ZenStreamProvider : MainAPI() {
         val overview: String?,
         val voteAverage: Double?
     )
+
     data class ExternalIds(val anilist: Int?, val myanimelist: Int?, val kitsu: Int?)
 }
