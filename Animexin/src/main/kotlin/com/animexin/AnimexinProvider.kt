@@ -29,8 +29,32 @@ class AnimexinProvider : MainAPI() {
         "anime/?status=&type=movie&order=update" to "New Movies"
     )
 
-    // ---- Cloudflare‑aware fetch with advanced retry ----
+    // ----- Session warm‑up: fetch homepage first to get cookies -----
+    private var sessionInitialized = false
+
+    private suspend fun warmUpSession() {
+        if (sessionInitialized) return
+        try {
+            val headers = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language" to "en-US,en;q=0.9",
+                "Accept-Encoding" to "gzip, deflate, br",
+                "Connection" to "keep-alive",
+                "Upgrade-Insecure-Requests" to "1"
+            )
+            app.get(mainUrl, headers = headers)
+            sessionInitialized = true
+        } catch (_: Exception) {
+            // ignore – will retry later
+        }
+    }
+
+    // ----- Cloudflare‑aware fetch with advanced retry and session warm‑up -----
     private suspend fun fetchDocumentWithRetry(url: String): Document {
+        // Ensure we have a session cookie
+        warmUpSession()
+
         var attempt = 0
         val maxAttempts = 4
 
@@ -57,14 +81,15 @@ class AnimexinProvider : MainAPI() {
                     "Pragma" to "no-cache",
                     "Sec-Fetch-Dest" to "document",
                     "Sec-Fetch-Mode" to "navigate",
-                    "Sec-Fetch-Site" to "same-origin"
+                    "Sec-Fetch-Site" to "same-origin",
+                    "Sec-Fetch-User" to "?1"
                 )
 
                 val response = app.get(url, headers = headers)
                 val doc = response.document
                 val html = doc.html()
 
-                // Check for Cloudflare challenge
+                // Detect Cloudflare challenge
                 val isChallenge = html.contains("cf-browser-verification") ||
                         html.contains("jschl") ||
                         html.contains("__cf_chl") ||
@@ -75,21 +100,21 @@ class AnimexinProvider : MainAPI() {
 
                 if (isChallenge) {
                     attempt++
-                    val waitMs = (3000 + Random.nextInt(2000)) * attempt // 3‑5s, 5‑7s, etc.
+                    val waitMs = 3000L * attempt + Random.nextLong(1000L, 3000L)  // Long
                     println("Cloudflare challenge detected. Retrying in ${waitMs}ms (attempt $attempt)")
-                    delay(waitMs)
+                    delay(waitMs)  // now accepts Long
+                    warmUpSession()
                     continue
                 }
 
-                // Success
                 return doc
 
             } catch (e: Exception) {
                 attempt++
                 if (attempt < maxAttempts) {
-                    val waitMs = 2000L * attempt + Random.nextInt(1000)
+                    val waitMs = 2000L * attempt + Random.nextLong(500L, 1500L)  // Long
                     println("Request error: ${e.message}. Retrying in ${waitMs}ms (attempt $attempt)")
-                    delay(waitMs)
+                    delay(waitMs)  // Long
                 } else {
                     throw e
                 }
