@@ -44,7 +44,7 @@ class AnimexinProvider : MainAPI() {
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
         )).document
 
-        // Focus on the main content area – avoids sidebars / widgets
+        // Only items inside the main content area
         val container = document.selectFirst(".listupd") ?: document
         val items = container.select(".bs, .bsx, .styleegg, .postbox, .item")
             .asSequence()
@@ -56,12 +56,10 @@ class AnimexinProvider : MainAPI() {
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        // Find the main link – first try inside .bsx, then the element itself
         val aTag = this.selectFirst("a") ?: return null
         val href = fixUrl(aTag.attr("href"))
         if (href.isBlank() || href == mainUrl) return null
 
-        // Try multiple sources for the title
         val title = listOf(
             this.selectFirst(".eggtitle")?.text(),
             this.selectFirst(".tt")?.text(),
@@ -73,7 +71,6 @@ class AnimexinProvider : MainAPI() {
             aTag.text()
         ).firstOrNull { !it.isNullOrBlank() }?.trim() ?: return null
 
-        // Poster – look for img and its attributes
         val img = this.selectFirst("img")
         val poster = fixUrlNull(
             listOf(
@@ -104,12 +101,12 @@ class AnimexinProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
 
-        // Title
+        // --- Title ---
         val title = document.selectFirst("h1.entry-title")?.text()?.trim()
             ?: document.selectFirst(".infox h1")?.text()?.trim()
             ?: "Unknown Title"
 
-        // Poster
+        // --- Poster ---
         val img = document.selectFirst("div.thumb img, div.infox img, .bigcontent img")
         val poster = fixUrlNull(
             listOf(
@@ -120,58 +117,72 @@ class AnimexinProvider : MainAPI() {
             ).firstOrNull { !it.isNullOrBlank() }
         )
 
-        // Description
+        // --- Description ---
         val description = document.selectFirst("div.entry-content, .infox .desc, .bigcontent .desc")?.text()?.trim()
 
-        // Check if it's a movie
+        // --- Detect Movie vs Series ---
         val typeStr = document.selectFirst(".spe, .type")?.text() ?: ""
         val isMovie = typeStr.contains("Movie", ignoreCase = true)
 
+        // --- MOVIE ---
         if (isMovie) {
             val href = document.selectFirst("div.eplister > ul > li a, .eplister li a, .eps a")?.attr("href") ?: ""
             return newMovieLoadResponse(title, url, TvType.Movie, href) {
                 this.posterUrl = poster
                 this.plot = description
             }
-        } else {
-            // Episodes – look for any list with links
-            val episodeElements = document.select("div.eplister li, ul.eplister li, .eplister li, .epslist li, .episodlist li")
-                .asSequence()
-                .filter { it.selectFirst("a") != null }
-                .mapNotNull { info ->
-                    val epHref = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
+        }
 
-                    // Episode poster (optional)
-                    val epImg = info.selectFirst("a img")
-                    val epPoster = listOf(
-                        epImg?.attr("data-lazy-src"),
-                        epImg?.attr("data-src"),
-                        epImg?.attr("src")
-                    ).firstOrNull { !it.isNullOrBlank() }
+        // --- TV SERIES / ANIME ---
+        // Build the episode list
+        val episodeElements = document.select("div.eplister li, ul.eplister li, .eplister li, .epslist li, .episodlist li")
+            .asSequence()
+            .filter { it.selectFirst("a") != null }
 
-                    // Episode number / name
-                    val epText = info.selectFirst(".epl-num, .epl-title, .epnum, .epsname")?.text() ?: ""
-                    val epNum = episodeRegex.find(epText)?.groupValues?.get(1)?.toIntOrNull()
+        val episodes = episodeElements.mapNotNull { info ->
+            val epHref = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
 
-                    val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim()
+            val epImg = info.selectFirst("a img")
+            val epPoster = listOf(
+                epImg?.attr("data-lazy-src"),
+                epImg?.attr("data-src"),
+                epImg?.attr("src")
+            ).firstOrNull { !it.isNullOrBlank() }
 
-                    newEpisode(epHref) {
-                        this.name = if (epNum != null) "Episode $epNum" else epText.ifBlank { "Episode" }
-                        this.episode = epNum
-                        this.posterUrl = epPoster
-                        if (!dateText.isNullOrBlank()) {
-                            this.addDate(dateText, format = "MMMM d, yyyy")
-                            this.description = dateText
-                        }
-                    }
+            val epText = info.selectFirst(".epl-num, .epl-title, .epnum, .epsname")?.text() ?: ""
+            val epNum = episodeRegex.find(epText)?.groupValues?.get(1)?.toIntOrNull()
+
+            val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim()
+
+            newEpisode(epHref) {
+                this.name = if (epNum != null) "Episode $epNum" else epText.ifBlank { "Episode" }
+                this.episode = epNum
+                this.posterUrl = epPoster
+                if (!dateText.isNullOrBlank()) {
+                    this.addDate(dateText, format = "MMMM d, yyyy")
+                    this.description = dateText
                 }
-                .toList()
-                .reversed()  // newest first
-
-            return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
-                this.posterUrl = poster
-                this.plot = description
             }
+        }.toList().reversed() // newest first
+
+        // If no episodes were found, try an alternative fallback: any link inside .eplister
+        val finalEpisodes = if (episodes.isEmpty()) {
+            // fallback: just get all links inside .eplister
+            document.select(".eplister a[href]")
+                .asSequence()
+                .mapNotNull { a ->
+                    val href = a.attr("href")
+                    if (href.isBlank()) null else newEpisode(href) {
+                        this.name = a.text().ifBlank { "Episode" }
+                    }
+                }.toList().reversed()
+        } else {
+            episodes
+        }
+
+        return newTvSeriesLoadResponse(title, url, TvType.Anime, finalEpisodes) {
+            this.posterUrl = poster
+            this.plot = description
         }
     }
 
@@ -207,11 +218,9 @@ class AnimexinProvider : MainAPI() {
                 }
             }.awaitAll()
         }
-
         return true
     }
 
-    // Helper to decode Base64 (if needed)
     private fun base64Decode(str: String): String {
         return try {
             String(Base64.decode(str, Base64.DEFAULT))
