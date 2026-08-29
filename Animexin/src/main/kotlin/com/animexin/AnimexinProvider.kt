@@ -4,10 +4,13 @@ import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlin.random.Random
 
 class AnimexinProvider : MainAPI() {
     override var mainUrl = "https://animexin.dev"
@@ -26,6 +29,76 @@ class AnimexinProvider : MainAPI() {
         "anime/?status=&type=movie&order=update" to "New Movies"
     )
 
+    // ---- Cloudflare‑aware fetch with advanced retry ----
+    private suspend fun fetchDocumentWithRetry(url: String): Document {
+        var attempt = 0
+        val maxAttempts = 4
+
+        val userAgents = listOf(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Linux; Android 11; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Mobile Safari/537.36"
+        )
+
+        val referer = if (url.contains("/anime/")) "$mainUrl/anime/" else mainUrl
+
+        while (attempt < maxAttempts) {
+            try {
+                val headers = mapOf(
+                    "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Accept-Language" to "en-US,en;q=0.9",
+                    "Accept-Encoding" to "gzip, deflate, br",
+                    "Connection" to "keep-alive",
+                    "Upgrade-Insecure-Requests" to "1",
+                    "User-Agent" to userAgents[attempt % userAgents.size],
+                    "Referer" to referer,
+                    "Cache-Control" to "no-cache",
+                    "Pragma" to "no-cache",
+                    "Sec-Fetch-Dest" to "document",
+                    "Sec-Fetch-Mode" to "navigate",
+                    "Sec-Fetch-Site" to "same-origin"
+                )
+
+                val response = app.get(url, headers = headers)
+                val doc = response.document
+                val html = doc.html()
+
+                // Check for Cloudflare challenge
+                val isChallenge = html.contains("cf-browser-verification") ||
+                        html.contains("jschl") ||
+                        html.contains("__cf_chl") ||
+                        html.contains("Ray ID") ||
+                        html.contains("Just a moment") ||
+                        html.contains("Checking your browser") ||
+                        html.contains("Please turn JavaScript on")
+
+                if (isChallenge) {
+                    attempt++
+                    val waitMs = (3000 + Random.nextInt(2000)) * attempt // 3‑5s, 5‑7s, etc.
+                    println("Cloudflare challenge detected. Retrying in ${waitMs}ms (attempt $attempt)")
+                    delay(waitMs)
+                    continue
+                }
+
+                // Success
+                return doc
+
+            } catch (e: Exception) {
+                attempt++
+                if (attempt < maxAttempts) {
+                    val waitMs = 2000L * attempt + Random.nextInt(1000)
+                    println("Request error: ${e.message}. Retrying in ${waitMs}ms (attempt $attempt)")
+                    delay(waitMs)
+                } else {
+                    throw e
+                }
+            }
+        }
+
+        throw Exception("Failed to fetch page after $maxAttempts attempts")
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) {
             "$mainUrl/${request.data}"
@@ -39,12 +112,8 @@ class AnimexinProvider : MainAPI() {
             }
         }
 
-        val document = app.get(url, headers = mapOf(
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
-        )).document
+        val document = fetchDocumentWithRetry(url)
 
-        // Only items inside the main list container
         val items = document.select(".listupd .bs")
             .asSequence()
             .mapNotNull { it.toSearchResult() }
@@ -55,16 +124,12 @@ class AnimexinProvider : MainAPI() {
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        // The <a> tag that holds the link to the show
         val aTag = this.selectFirst("a") ?: return null
         val href = fixUrl(aTag.attr("href"))
         if (href.isBlank() || href == mainUrl) return null
 
-        // ---- Title ----
-        // On listing page, title is inside .tt (and an <h2> inside)
         var title = this.selectFirst(".tt")?.text()?.trim()
         if (title.isNullOrBlank()) {
-            // Fallback: h2, h3, etc.
             title = listOf(
                 this.selectFirst("h2")?.text(),
                 this.selectFirst("h3")?.text(),
@@ -76,14 +141,12 @@ class AnimexinProvider : MainAPI() {
         }
         if (title.isNullOrBlank()) return null
 
-        // ---- Poster ----
         val img = this.selectFirst("img")
         val poster = fixUrlNull(
             listOf(
-                img?.attr("src"),          // primary on listing page
+                img?.attr("src"),
                 img?.attr("data-lazy-src"),
-                img?.attr("data-src"),
-                img?.attr("srcset")        // sometimes used
+                img?.attr("data-src")
             ).firstOrNull { !it.isNullOrBlank() }
         )
 
@@ -94,7 +157,7 @@ class AnimexinProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/?s=$query"
-        val document = app.get(url).document
+        val document = fetchDocumentWithRetry(url)
         return document.select(".listupd .bs")
             .asSequence()
             .mapNotNull { it.toSearchResult() }
@@ -103,14 +166,12 @@ class AnimexinProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val document = app.get(url).document
+        val document = fetchDocumentWithRetry(url)
 
-        // ---- Title ----
         val title = document.selectFirst("h1.entry-title")?.text()?.trim()
             ?: document.selectFirst(".infox h1")?.text()?.trim()
             ?: "Unknown Title"
 
-        // ---- Poster ----
         val img = document.selectFirst("div.thumb img, div.infox img, .bigcontent img")
         val poster = fixUrlNull(
             listOf(
@@ -121,10 +182,8 @@ class AnimexinProvider : MainAPI() {
             ).firstOrNull { !it.isNullOrBlank() }
         )
 
-        // ---- Description ----
         val description = document.selectFirst("div.entry-content, .infox .desc, .bigcontent .desc")?.text()?.trim()
 
-        // ---- Check if Movie ----
         val typeStr = document.selectFirst(".spe, .type")?.text() ?: ""
         val isMovie = typeStr.contains("Movie", ignoreCase = true)
 
@@ -136,7 +195,6 @@ class AnimexinProvider : MainAPI() {
             }
         }
 
-        // ---- TV Series / Anime ----
         val episodeElements = document.select("div.eplister li, ul.eplister li, .eplister li, .epslist li, .episodlist li")
             .asSequence()
             .filter { it.selectFirst("a") != null }
@@ -167,7 +225,6 @@ class AnimexinProvider : MainAPI() {
             }
         }.toList().reversed()
 
-        // Fallback if no episodes found
         val finalEpisodes = if (episodes.isEmpty()) {
             document.select(".eplister a[href]")
                 .asSequence()
@@ -193,7 +250,8 @@ class AnimexinProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data).document
+        val document = fetchDocumentWithRetry(data)
+
         val servers = document.select(".mobius option, select.mirror option, .server option, .player option")
 
         coroutineScope {
