@@ -21,7 +21,7 @@ class AnimexinProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update" to "Latest Release",
-        "anime/?status=ongoing&order=popular" to "Popular",
+        "anime/?status=ongoing&order=popular" to "Popular Today",
         "anime/?" to "Donghua",
         "anime/?status=&type=movie&order=update" to "New Movies"
     )
@@ -44,11 +44,8 @@ class AnimexinProvider : MainAPI() {
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
         )).document
 
-        // Target the main content area
-        val container = document.selectFirst(".listupd") ?: document
-        
-        // Select show items - .bs is the primary container for each show
-        val items = container.select(".bs, .bsx, .styleegg")
+        // Only items inside the main list container
+        val items = document.select(".listupd .bs")
             .asSequence()
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
@@ -58,46 +55,36 @@ class AnimexinProvider : MainAPI() {
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        // Find the main link - usually inside .bsx or directly
-        val linkElement = this.selectFirst("a[href]") ?: return null
-        val href = fixUrl(linkElement.attr("href"))
-        
+        // The <a> tag that holds the link to the show
+        val aTag = this.selectFirst("a") ?: return null
+        val href = fixUrl(aTag.attr("href"))
         if (href.isBlank() || href == mainUrl) return null
 
-        // --- Extract Title ---
-        // Primary: .eggtitle (most reliable on this site)
-        var title = this.selectFirst(".eggtitle")?.text()?.trim()
-        
-        // Fallback: .tt or h2
+        // ---- Title ----
+        // On listing page, title is inside .tt (and an <h2> inside)
+        var title = this.selectFirst(".tt")?.text()?.trim()
         if (title.isNullOrBlank()) {
-            title = this.selectFirst(".tt")?.text()?.trim()
+            // Fallback: h2, h3, etc.
+            title = listOf(
+                this.selectFirst("h2")?.text(),
+                this.selectFirst("h3")?.text(),
+                this.selectFirst("h4")?.text(),
+                this.selectFirst(".title")?.text(),
+                aTag.attr("title"),
+                aTag.text()
+            ).firstOrNull { !it.isNullOrBlank() }?.trim()
         }
-        if (title.isNullOrBlank()) {
-            title = this.selectFirst("h2")?.text()?.trim()
-        }
-        if (title.isNullOrBlank()) {
-            title = this.selectFirst(".title")?.text()?.trim()
-        }
-        // Last resort: link text or title attribute
-        if (title.isNullOrBlank()) {
-            title = linkElement.attr("title").trim()
-        }
-        if (title.isNullOrBlank()) {
-            title = linkElement.text().trim()
-        }
-        
         if (title.isNullOrBlank()) return null
 
-        // --- Extract Poster ---
+        // ---- Poster ----
         val img = this.selectFirst("img")
         val poster = fixUrlNull(
             listOf(
+                img?.attr("src"),          // primary on listing page
                 img?.attr("data-lazy-src"),
                 img?.attr("data-src"),
-                img?.attr("src")
+                img?.attr("srcset")        // sometimes used
             ).firstOrNull { !it.isNullOrBlank() }
-        ) ?: fixUrlNull(
-            this.selectFirst("meta[property=og:image]")?.attr("content")
         )
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
@@ -108,9 +95,7 @@ class AnimexinProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/?s=$query"
         val document = app.get(url).document
-        val container = document.selectFirst(".listupd") ?: document
-        
-        return container.select(".bs, .bsx, .styleegg")
+        return document.select(".listupd .bs")
             .asSequence()
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
@@ -120,12 +105,12 @@ class AnimexinProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
 
-        // --- Title ---
+        // ---- Title ----
         val title = document.selectFirst("h1.entry-title")?.text()?.trim()
             ?: document.selectFirst(".infox h1")?.text()?.trim()
             ?: "Unknown Title"
 
-        // --- Poster ---
+        // ---- Poster ----
         val img = document.selectFirst("div.thumb img, div.infox img, .bigcontent img")
         val poster = fixUrlNull(
             listOf(
@@ -136,10 +121,10 @@ class AnimexinProvider : MainAPI() {
             ).firstOrNull { !it.isNullOrBlank() }
         )
 
-        // --- Description ---
+        // ---- Description ----
         val description = document.selectFirst("div.entry-content, .infox .desc, .bigcontent .desc")?.text()?.trim()
 
-        // --- Check if Movie ---
+        // ---- Check if Movie ----
         val typeStr = document.selectFirst(".spe, .type")?.text() ?: ""
         val isMovie = typeStr.contains("Movie", ignoreCase = true)
 
@@ -151,8 +136,7 @@ class AnimexinProvider : MainAPI() {
             }
         }
 
-        // --- TV Series / Anime ---
-        // Find episode list items
+        // ---- TV Series / Anime ----
         val episodeElements = document.select("div.eplister li, ul.eplister li, .eplister li, .epslist li, .episodlist li")
             .asSequence()
             .filter { it.selectFirst("a") != null }
@@ -160,7 +144,6 @@ class AnimexinProvider : MainAPI() {
         val episodes = episodeElements.mapNotNull { info ->
             val epHref = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
 
-            // Episode poster (if available)
             val epImg = info.selectFirst("a img")
             val epPoster = listOf(
                 epImg?.attr("data-lazy-src"),
@@ -168,7 +151,6 @@ class AnimexinProvider : MainAPI() {
                 epImg?.attr("src")
             ).firstOrNull { !it.isNullOrBlank() }
 
-            // Episode number/name
             val epText = info.selectFirst(".epl-num, .epl-title, .epnum, .epsname")?.text() ?: ""
             val epNum = episodeRegex.find(epText)?.groupValues?.get(1)?.toIntOrNull()
 
@@ -183,9 +165,9 @@ class AnimexinProvider : MainAPI() {
                     this.description = dateText
                 }
             }
-        }.toList().reversed() // Newest first
+        }.toList().reversed()
 
-        // Fallback: if no episodes found, try a simpler selector
+        // Fallback if no episodes found
         val finalEpisodes = if (episodes.isEmpty()) {
             document.select(".eplister a[href]")
                 .asSequence()
