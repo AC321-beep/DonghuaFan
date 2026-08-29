@@ -15,25 +15,48 @@ class AnimexinProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "anime/?status=ongoing&order=update" to "Recently Updated",
-        "anime/?status=ongoing&order&order=popular" to "Popular",
+        "anime/?status=ongoing&order=popular" to "Popular",
         "anime/?" to "Donghua",
-        "anime/?status=&type=movie&page=" to "Movies",
+        "anime/?status=&type=movie" to "Movies",
         "anime/?sub=raw" to "Anime (RAW)"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = "$mainUrl/${request.data}&page=$page"
+        // Corrects pagination routing for standard WordPress themes
+        val url = if (page == 1) {
+            "$mainUrl/${request.data}"
+        } else {
+            val path = request.data.substringBefore("?")
+            val query = request.data.substringAfter("?", "")
+            if (query.isNotEmpty()) {
+                "$mainUrl/${path}page/$page/?$query"
+            } else {
+                "$mainUrl/${path}page/$page/"
+            }
+        }
+
         val document = app.get(url).document
         
-        val home = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
-        return newHomePageResponse(request.name, home, hasNext = true)
+        // Broadened selectors to catch any layout variations (article, div.bs, div.bixbox)
+        val home = document.select("div.listupd article, div.listupd div.bs, div.bixbox div.bs").mapNotNull { it.toSearchResult() }
+        
+        return newHomePageResponse(request.name, home, hasNext = home.isNotEmpty())
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        val aTag = this.selectFirst("div.bsx > a") ?: return null
-        val title = aTag.attr("title")
+        // Target the anchor directly, sidestepping wrapper div changes
+        val aTag = this.selectFirst("a") ?: return null
+        
+        // Grab title from text elements first, fallback to title attribute, fallback to raw text
+        val title = this.selectFirst(".tt, .nt, h2, h3")?.text() 
+            ?: aTag.attr("title").ifEmpty { aTag.text() }
+            
+        if (title.isBlank()) return null
+        
         val href = fixUrl(aTag.attr("href"))
-        val posterUrl = fixUrlNull(aTag.selectFirst("img")?.attr("src"))
+        
+        // Support for lazy-loaded images (data-src)
+        val posterUrl = fixUrlNull(this.selectFirst("img")?.attr("src") ?: this.selectFirst("img")?.attr("data-src"))
         
         return newMovieSearchResponse(title, href, TvType.Movie) {
             this.posterUrl = posterUrl
@@ -43,7 +66,7 @@ class AnimexinProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val url = "$mainUrl/?s=$query"
         val document = app.get(url).document
-        return document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
+        return document.select("div.listupd article, div.listupd div.bs, div.bixbox div.bs").mapNotNull { it.toSearchResult() }
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -66,14 +89,12 @@ class AnimexinProvider : MainAPI() {
         } else {
             val episodeRegex = Regex("""(\d+)""")
             
-            // Map episodes and reverse them so Episode 1 is at the top
             val episodes = document.select("div.eplister > ul > li").mapNotNull { info ->
                 val epHref = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
                 val epPoster = info.selectFirst("a img")?.attr("src") ?: ""
                 val epText = info.selectFirst("div.epl-num")?.text() ?: ""
                 val epNum = episodeRegex.find(epText)?.groupValues?.get(1)?.toIntOrNull()
 
-                // Broadened the selector just in case it's named slightly differently 
                 val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim() 
 
                 newEpisode(epHref) {
@@ -82,10 +103,7 @@ class AnimexinProvider : MainAPI() {
                     this.posterUrl = epPoster
                     
                     if (!dateText.isNullOrBlank()) { 
-                        // 1. Try to properly parse the Date format AnimeKhor uses (Month dd, yyyy)
                         this.addDate(dateText, format = "MMMM d, yyyy")
-                        
-                        // 2. Failsafe: Guarantee it appears on your screen by setting it as the description
                         this.description = dateText
                     }
                 }
@@ -107,7 +125,6 @@ class AnimexinProvider : MainAPI() {
         val document = app.get(data).document
         val servers = document.select(".mobius option")
 
-        // Parse servers concurrently
         servers.amap { server ->
             val base64 = server.attr("value")
             if (base64.isNotEmpty()) {
