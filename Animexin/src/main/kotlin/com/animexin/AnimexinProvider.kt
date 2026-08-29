@@ -1,4 +1,4 @@
-package com.animexin
+package com.Animexin
 
 import android.util.Base64
 import com.lagradost.cloudstream3.*
@@ -17,7 +17,6 @@ class AnimexinProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
-    // Pre-compiled regex saves CPU cycles during load()
     private val episodeRegex = Regex("""(\d+)""")
 
     override val mainPage = mainPageOf(
@@ -45,7 +44,6 @@ class AnimexinProvider : MainAPI() {
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
         )).document
         
-        // Flattened selectors for faster JSoup parsing + Sequences for memory efficiency
         val home = document.select(".bs, .bsx, .styleegg, .postbox, .item, .serieslist li")
             .asSequence()
             .mapNotNull { it.toSearchResult() }
@@ -63,7 +61,6 @@ class AnimexinProvider : MainAPI() {
         
         val img = this.selectFirst("img")
         
-        // 100% null-safe title extraction avoiding `.takeIf` on nullable receivers
         val title = listOf(
             this.selectFirst(".eggtitle, .leftseries h4 a")?.text()?.trim(),
             this.selectFirst(".tt, .nt, .ts5, h2, h3, h4, .title, .entry-title")?.text()?.trim(),
@@ -73,7 +70,6 @@ class AnimexinProvider : MainAPI() {
             aTag.text().trim()
         ).firstOrNull { !it.isNullOrBlank() } ?: "Unknown Title"
         
-        // 100% null-safe image extraction
         val posterUrl = fixUrlNull(
             listOf(
                 img?.attr("data-lazy-src"),
@@ -105,7 +101,6 @@ class AnimexinProvider : MainAPI() {
         
         val img = document.selectFirst("div.thumb img, div.infox img")
         
-        // Null-safe extraction for the main detail poster
         val poster = fixUrlNull(
             listOf(
                 img?.attr("data-lazy-src"),
@@ -134,7 +129,6 @@ class AnimexinProvider : MainAPI() {
                     
                     val epImg = info.selectFirst("a img")
                     
-                    // Null-safe extraction for episode thumbnails
                     val epPoster = listOf(
                         epImg?.attr("data-lazy-src"),
                         epImg?.attr("data-src"),
@@ -176,7 +170,6 @@ class AnimexinProvider : MainAPI() {
         val document = app.get(data).document
         val servers = document.select(".mobius option, select.mirror option, .server option")
 
-        // Improved using explicit coroutine logic for concurrent loading
         coroutineScope {
             servers.map { server ->
                 async {
