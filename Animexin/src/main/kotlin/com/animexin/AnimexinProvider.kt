@@ -1,9 +1,13 @@
-package com.Animexin
+package com.animexin
 
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 
 class AnimexinProvider : MainAPI() {
     override var mainUrl = "https://animexin.dev"
@@ -13,7 +17,9 @@ class AnimexinProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
-    // Aligned strictly with the 'View All' href endpoints found in the HTML source
+    // Pre-compiled regex saves CPU cycles during load()
+    private val episodeRegex = Regex("""(\d+)""")
+
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update" to "Latest Release",
         "anime/?status=ongoing&order=popular" to "Popular Today",
@@ -34,15 +40,17 @@ class AnimexinProvider : MainAPI() {
             }
         }
 
-        // Added standard browser headers to help bypass basic Cloudflare/Anti-bot checks
         val document = app.get(url, headers = mapOf(
             "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
         )).document
         
-        // Aggressive selectors capturing both main grid (.styleegg, .bsx) and sidebar lists (.serieslist li)
-        val elements = document.select("article.bs, article.styleegg, div.listupd .bs, div.listupd .bsx, div.bixbox .bs, div.postbox, .item, .serieslist ul li")
-        val home = elements.mapNotNull { it.toSearchResult() }.distinctBy { it.url }
+        // Flattened selectors for faster JSoup parsing + Sequences for memory efficiency
+        val home = document.select(".bs, .bsx, .styleegg, .postbox, .item, .serieslist li")
+            .asSequence()
+            .mapNotNull { it.toSearchResult() }
+            .distinctBy { it.url }
+            .toList()
         
         return newHomePageResponse(request.name, home, hasNext = home.isNotEmpty())
     }
@@ -53,25 +61,28 @@ class AnimexinProvider : MainAPI() {
         
         if (href.isBlank() || href == mainUrl) return null
         
-        // Cascading title extraction favoring clean names from the latest HTML structure
-        val title = this.selectFirst(".eggtitle, .leftseries h4 a")?.text()?.trim() 
-            ?: this.selectFirst(".tt, .nt, .ts5, h2, h3, h4, .title, .entry-title")?.text()?.trim() 
-            ?: this.selectFirst("img")?.attr("title").takeIf { it.isNotBlank() }
-            ?: this.selectFirst("img")?.attr("alt").takeIf { it.isNotBlank() }
-            ?: aTag.attr("title").takeIf { it.isNotBlank() }
-            ?: aTag.text().trim()
-            
-        val finalTitle = title.ifBlank { "Unknown Title" }
-        
         val img = this.selectFirst("img")
-        // Bypassing base64 lazy-load placeholders
+        
+        // 100% null-safe title extraction avoiding `.takeIf` on nullable receivers
+        val title = listOf(
+            this.selectFirst(".eggtitle, .leftseries h4 a")?.text()?.trim(),
+            this.selectFirst(".tt, .nt, .ts5, h2, h3, h4, .title, .entry-title")?.text()?.trim(),
+            img?.attr("title")?.trim(),
+            img?.attr("alt")?.trim(),
+            aTag.attr("title").trim(),
+            aTag.text().trim()
+        ).firstOrNull { !it.isNullOrBlank() } ?: "Unknown Title"
+        
+        // 100% null-safe image extraction
         val posterUrl = fixUrlNull(
-            img?.attr("data-lazy-src")?.takeIf { it.isNotBlank() }
-                ?: img?.attr("data-src")?.takeIf { it.isNotBlank() }
-                ?: img?.attr("src")?.takeIf { it.isNotBlank() }
+            listOf(
+                img?.attr("data-lazy-src"),
+                img?.attr("data-src"),
+                img?.attr("src")
+            ).firstOrNull { !it.isNullOrBlank() }
         )
         
-        return newAnimeSearchResponse(finalTitle, href, TvType.Anime) {
+        return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = posterUrl
         }
     }
@@ -80,9 +91,11 @@ class AnimexinProvider : MainAPI() {
         val url = "$mainUrl/?s=$query"
         val document = app.get(url).document
         
-        return document.select("article.bs, article.styleegg, div.listupd .bs, div.listupd .bsx, div.bixbox .bs, div.postbox, .item, .serieslist ul li")
+        return document.select(".bs, .bsx, .styleegg, .postbox, .item, .serieslist li")
+            .asSequence()
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
+            .toList()
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -91,11 +104,15 @@ class AnimexinProvider : MainAPI() {
         val title = document.selectFirst("h1.entry-title")?.text()?.trim() ?: "Unknown Title"
         
         val img = document.selectFirst("div.thumb img, div.infox img")
+        
+        // Null-safe extraction for the main detail poster
         val poster = fixUrlNull(
-            img?.attr("data-lazy-src")?.takeIf { it.isNotBlank() }
-                ?: img?.attr("data-src")?.takeIf { it.isNotBlank() }
-                ?: img?.attr("src")?.takeIf { it.isNotBlank() }
-                ?: document.selectFirst("meta[property=og:image]")?.attr("content")?.trim()
+            listOf(
+                img?.attr("data-lazy-src"),
+                img?.attr("data-src"),
+                img?.attr("src"),
+                document.selectFirst("meta[property=og:image]")?.attr("content")?.trim()
+            ).firstOrNull { !it.isNullOrBlank() }
         )
         
         val description = document.selectFirst("div.entry-content")?.text()?.trim()
@@ -110,32 +127,38 @@ class AnimexinProvider : MainAPI() {
                 this.plot = description
             }
         } else {
-            val episodeRegex = Regex("""(\d+)""")
-            
-            val episodes = document.select("div.eplister li, ul.eplister li, .eplister li").mapNotNull { info ->
-                val epHref = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
-                
-                val epImg = info.selectFirst("a img")
-                val epPoster = epImg?.attr("data-lazy-src")?.takeIf { it.isNotBlank() }
-                    ?: epImg?.attr("data-src")?.takeIf { it.isNotBlank() }
-                    ?: epImg?.attr("src")?.takeIf { it.isNotBlank() } ?: ""
+            val episodes = document.select("div.eplister li, ul.eplister li, .eplister li")
+                .asSequence()
+                .mapNotNull { info ->
+                    val epHref = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
                     
-                val epText = info.selectFirst("div.epl-num, .epl-num, .epl-title")?.text() ?: ""
-                val epNum = episodeRegex.find(epText)?.groupValues?.get(1)?.toIntOrNull()
-
-                val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim() 
-
-                newEpisode(epHref) {
-                    this.name = if (epNum != null) "Episode $epNum" else epText
-                    this.episode = epNum
-                    this.posterUrl = epPoster
+                    val epImg = info.selectFirst("a img")
                     
-                    if (!dateText.isNullOrBlank()) { 
-                        this.addDate(dateText, format = "MMMM d, yyyy")
-                        this.description = dateText
+                    // Null-safe extraction for episode thumbnails
+                    val epPoster = listOf(
+                        epImg?.attr("data-lazy-src"),
+                        epImg?.attr("data-src"),
+                        epImg?.attr("src")
+                    ).firstOrNull { !it.isNullOrBlank() } ?: ""
+                        
+                    val epText = info.selectFirst("div.epl-num, .epl-num, .epl-title")?.text() ?: ""
+                    val epNum = episodeRegex.find(epText)?.groupValues?.get(1)?.toIntOrNull()
+
+                    val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim() 
+
+                    newEpisode(epHref) {
+                        this.name = if (epNum != null) "Episode $epNum" else epText
+                        this.episode = epNum
+                        this.posterUrl = epPoster
+                        
+                        if (!dateText.isNullOrBlank()) { 
+                            this.addDate(dateText, format = "MMMM d, yyyy")
+                            this.description = dateText
+                        }
                     }
                 }
-            }.reversed()
+                .toList()
+                .reversed()
 
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
@@ -153,24 +176,29 @@ class AnimexinProvider : MainAPI() {
         val document = app.get(data).document
         val servers = document.select(".mobius option, select.mirror option, .server option")
 
-        servers.amap { server ->
-            val value = server.attr("value")
-            if (value.isNotEmpty()) {
-                val decoded = try { base64Decode(value) } catch (e: Exception) { value }
-                
-                val iframeSrc = if (decoded.contains("<iframe")) {
-                    Jsoup.parse(decoded).selectFirst("iframe")?.attr("src")
-                } else if (decoded.startsWith("http")) {
-                    decoded
-                } else {
-                    null
+        // Improved using explicit coroutine logic for concurrent loading
+        coroutineScope {
+            servers.map { server ->
+                async {
+                    val value = server.attr("value")
+                    if (value.isNotEmpty()) {
+                        val decoded = try { base64Decode(value) } catch (e: Exception) { value }
+                        
+                        val iframeSrc = if (decoded.contains("<iframe")) {
+                            Jsoup.parse(decoded).selectFirst("iframe")?.attr("src")
+                        } else if (decoded.startsWith("http")) {
+                            decoded
+                        } else {
+                            null
+                        }
+                        
+                        if (iframeSrc != null) {
+                            val url = if (iframeSrc.startsWith("//")) "https:$iframeSrc" else iframeSrc
+                            loadExtractor(url, subtitleCallback, callback)
+                        }
+                    }
                 }
-                
-                if (iframeSrc != null) {
-                    val url = if (iframeSrc.startsWith("//")) "https:$iframeSrc" else iframeSrc
-                    loadExtractor(url, subtitleCallback, callback)
-                }
-            }
+            }.awaitAll()
         }
         
         return true
