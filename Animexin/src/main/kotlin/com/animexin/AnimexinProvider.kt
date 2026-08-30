@@ -3,8 +3,8 @@ package com.Animexin
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import org.jsoup.Jsoup
-import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -18,7 +18,9 @@ class AnimexinProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
-    // No class-level CloudflareKiller variables here to prevent the background thread crash!
+    // THE FIX: "by lazy" ensures the WebView is initialized safely on a background thread 
+    // only when the first network request is made, preventing the black screen crash.
+    private val cfKiller by lazy { CloudflareKiller() }
 
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update" to "Recently Updated",
@@ -28,18 +30,6 @@ class AnimexinProvider : MainAPI() {
         "anime/?status=&sub=raw&order=update" to "Anime (RAW)"
     )
 
-    // Actively detect the Turnstile screen from your screenshot.
-    private fun checkCloudflare(doc: Document) {
-        val title = doc.title()
-        if (title.contains("Just a moment", ignoreCase = true) || 
-            title.contains("Security verification", ignoreCase = true) ||
-            doc.select("div.cf-turnstile").isNotEmpty()) {
-            
-            // This error forces Cloudstream to show the "Open in WebView" (Globe Icon) button.
-            throw Error("Cloudflare blocked the request. Tap the Globe icon above to verify.")
-        }
-    }
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) {
             "$mainUrl/${request.data}"
@@ -48,8 +38,8 @@ class AnimexinProvider : MainAPI() {
             "$mainUrl/anime/?page=$page&$query"
         }
 
-        val document = app.get(url).document
-        checkCloudflare(document)
+        // The cfKiller interceptor will automatically solve Turnstile silently in the app
+        val document = app.get(url, interceptor = cfKiller).document
 
         val items = document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
             .mapNotNull { it.toSearchResult() }
@@ -93,22 +83,18 @@ class AnimexinProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val document = app.get("$mainUrl/?s=$query").document
-        checkCloudflare(document)
-
+        val document = app.get("$mainUrl/?s=$query", interceptor = cfKiller).document
         return document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        var doc = app.get(url).document
-        checkCloudflare(doc)
+        var doc = app.get(url, interceptor = cfKiller).document
 
         val seriesBreadcrumb = doc.selectFirst(".ts-breadcrumb li:nth-last-child(2) a, .allc a")?.attr("href")
         if (!seriesBreadcrumb.isNullOrBlank() && seriesBreadcrumb != url && seriesBreadcrumb.contains("/anime/")) {
-            doc = app.get(seriesBreadcrumb).document
-            checkCloudflare(doc)
+            doc = app.get(seriesBreadcrumb, interceptor = cfKiller).document
         }
 
         val title = doc.selectFirst("h1.entry-title, .infox h1")?.text()?.trim() ?: "Unknown Title"
@@ -171,8 +157,7 @@ class AnimexinProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data).document
-        checkCloudflare(document)
+        val document = app.get(data, interceptor = cfKiller).document
         
         val servers = document.select(".mobius option, select.mirror option, .server option, .player option")
 
