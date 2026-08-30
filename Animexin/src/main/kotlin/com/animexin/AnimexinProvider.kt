@@ -1,15 +1,183 @@
 package com.Animexin
 
+import android.annotation.SuppressLint
+import android.app.Dialog
+import android.graphics.Color
+import android.net.http.SslError
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.SslErrorHandler
+import android.webkit.WebChromeClient
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
+import com.google.android.material.bottomsheet.BottomSheetBehavior
+import com.google.android.material.bottomsheet.BottomSheetDialog
+import com.google.android.material.bottomsheet.BottomSheetDialogFragment
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.network.CloudflareKiller
-import org.jsoup.Jsoup
-import org.jsoup.nodes.Element
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.suspendCancellableCoroutine
+import okhttp3.Interceptor
+import okhttp3.Response
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import kotlin.coroutines.resume
 
+// --- Global State to Synchronize WebView and OkHttp Fingerprints ---
+object CFState {
+    var userAgent: String = ""
+}
+
+// --- The Core Cloudflare Interceptor ---
+class CFInterceptor : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val original = chain.request()
+        val builder = original.newBuilder()
+
+        // 1. Synchronize User-Agent with WebView
+        val defaultUa = try { WebSettings.getDefaultUserAgent(CommonActivity.activity) } catch(e: Exception) { "Mozilla/5.0" }
+        val ua = CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa
+        builder.header("User-Agent", ua)
+
+        // 2. CRITICAL: Prevent Android from leaking app package name to Cloudflare WAF
+        builder.removeHeader("X-Requested-With")
+
+        // 3. Dynamically inject the clearance cookies solved by the WebView Dialog
+        val cookies = CookieManager.getInstance().getCookie(original.url.toString())
+        if (!cookies.isNullOrEmpty()) {
+            builder.header("Cookie", cookies)
+        }
+
+        builder.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        builder.header("Accept-Language", "en-US,en;q=0.5")
+        builder.header("Connection", "keep-alive")
+        builder.header("Upgrade-Insecure-Requests", "1")
+        builder.header("Sec-Fetch-Dest", "document")
+        builder.header("Sec-Fetch-Mode", "navigate")
+        builder.header("Sec-Fetch-Site", "same-origin")
+
+        return chain.proceed(builder.build())
+    }
+}
+
+// --- The Main Thread UI Solver Dialog ---
+class CFDialog(private val url: String, private val onResult: (Boolean) -> Unit) : BottomSheetDialogFragment() {
+    private var isResolved = false
+
+    override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
+        val dialog = super.onCreateDialog(savedInstanceState) as BottomSheetDialog
+        dialog.behavior.state = BottomSheetBehavior.STATE_EXPANDED
+        dialog.behavior.skipCollapsed = true
+        return dialog
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
+        val context = requireContext()
+        val layout = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#1A1A1A"))
+        }
+
+        val header = TextView(context).apply {
+            text = "Solving Cloudflare Anti-Bot... Please Wait"
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            setPadding(32, 32, 32, 32)
+        }
+        layout.addView(header)
+
+        val progressBar = ProgressBar(context, null, android.R.attr.progressBarStyleHorizontal).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 10)
+        }
+        layout.addView(progressBar)
+
+        val webView = WebView(context).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                databaseEnabled = true
+                useWideViewPort = true
+                loadWithOverviewMode = true
+                cacheMode = WebSettings.LOAD_DEFAULT
+                mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            }
+
+            // CRITICAL: Turnstile requires 3rd-party cookies to write clearance tokens
+            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
+            if (CFState.userAgent.isBlank()) {
+                CFState.userAgent = settings.userAgentString
+            } else {
+                settings.userAgentString = CFState.userAgent
+            }
+
+            webChromeClient = object : WebChromeClient() {
+                override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                    progressBar.progress = newProgress
+                    progressBar.visibility = if (newProgress == 100) View.GONE else View.VISIBLE
+                    checkSuccess(view)
+                }
+            }
+
+            webViewClient = object : WebViewClient() {
+                @SuppressLint("WebViewClientOnReceivedSslError")
+                override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                    handler?.proceed()
+                }
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    checkSuccess(view)
+                }
+            }
+        }
+        layout.addView(webView)
+        webView.loadUrl(url)
+        return layout
+    }
+
+    private fun checkSuccess(view: WebView?) {
+        if (isResolved) return
+        val currentUrl = view?.url ?: return
+        val title = view.title?.lowercase() ?: ""
+        val cookies = CookieManager.getInstance().getCookie(currentUrl) ?: ""
+
+        val isChallenge = listOf("just a moment", "attention required", "security verification", "cloudflare").any { title.contains(it) }
+
+        // If Turnstile is solved, force sync cookies to disk, invoke callback, and dismiss dialog
+        if (!isChallenge && cookies.contains("cf_clearance")) {
+            isResolved = true
+            CookieManager.getInstance().flush()
+            onResult(true)
+            Handler(Looper.getMainLooper()).postDelayed({
+                try { dismissAllowingStateLoss() } catch (e: Exception) {}
+            }, 1000)
+        }
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        if (!isResolved) {
+            isResolved = true
+            onResult(false)
+        }
+    }
+}
+
+// --- The Main Provider ---
 class AnimexinProvider : MainAPI() {
     override var mainUrl = "https://animexin.dev"
     override var name = "AnimeXin"
@@ -18,9 +186,9 @@ class AnimexinProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
-    // THE FIX: "by lazy" ensures the WebView is initialized safely on a background thread 
-    // only when the first network request is made, preventing the black screen crash.
-    private val cfKiller by lazy { CloudflareKiller() }
+    // Build the custom session with our Interceptor
+    private val cfClient = app.baseClient.newBuilder().addInterceptor(CFInterceptor()).build()
+    private val session = Requests(client = cfClient)
 
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update" to "Recently Updated",
@@ -30,18 +198,53 @@ class AnimexinProvider : MainAPI() {
         "anime/?status=&sub=raw&order=update" to "Anime (RAW)"
     )
 
+    // This safely suspends the background scraping coroutine, launches the WebView on the UI thread,
+    // waits for the challenge to be solved, and then resumes the background scraper.
+    private suspend fun resolveCloudflare(url: String): Boolean = suspendCancellableCoroutine { cont ->
+        var resumed = false
+        CommonActivity.activity?.runOnUiThread {
+            val dialog = CFDialog(url) { success ->
+                if (!resumed) {
+                    resumed = true
+                    cont.resume(success)
+                }
+            }
+            dialog.show(CommonActivity.activity!!.supportFragmentManager, "cf_bypass")
+        }
+    }
+
+    // A unified fetcher that automatically handles Turnstile interceptions
+    private suspend fun getSafeDocument(url: String): Document {
+        var response = session.get(url)
+        var doc = response.document
+        val title = doc.title().lowercase()
+        
+        val isChallenge = listOf("just a moment", "security verification", "attention required").any { title.contains(it) } || doc.select("div.cf-turnstile").isNotEmpty()
+        
+        if (isChallenge || response.code in listOf(403, 503)) {
+            val success = resolveCloudflare(url)
+            if (success) {
+                response = session.get(url) // Automatically retry the request after solving
+                doc = response.document
+            } else {
+                throw Error("Cloudflare bypass was cancelled or failed.")
+            }
+        }
+        return doc
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) {
             "$mainUrl/${request.data}"
         } else {
+            // Correct exact pagination structure extracted from 'latest release page.txt'
             val query = request.data.substringAfter("?", "")
-            "$mainUrl/anime/?page=$page&$query"
+            if (query.isNotEmpty()) "$mainUrl/anime/?page=$page&$query" else "$mainUrl/anime/page/$page/"
         }
 
-        // The cfKiller interceptor will automatically solve Turnstile silently in the app
-        val document = app.get(url, interceptor = cfKiller).document
+        val document = getSafeDocument(url)
 
-        val items = document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
+        val items = document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx, .postbody article.bs")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
 
@@ -76,25 +279,25 @@ class AnimexinProvider : MainAPI() {
             if (epNum != null) {
                 this.addSub(epNum)
             }
-            if (href.contains("movie", ignoreCase = true) || type.equals("Movie", ignoreCase = true)) {
+            if (href.contains("movie", true) || type.equals("Movie", true)) {
                 this.type = TvType.Movie
             }
         }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val document = app.get("$mainUrl/?s=$query", interceptor = cfKiller).document
+        val document = getSafeDocument("$mainUrl/?s=$query")
         return document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        var doc = app.get(url, interceptor = cfKiller).document
+        var doc = getSafeDocument(url)
 
         val seriesBreadcrumb = doc.selectFirst(".ts-breadcrumb li:nth-last-child(2) a, .allc a")?.attr("href")
         if (!seriesBreadcrumb.isNullOrBlank() && seriesBreadcrumb != url && seriesBreadcrumb.contains("/anime/")) {
-            doc = app.get(seriesBreadcrumb, interceptor = cfKiller).document
+            doc = getSafeDocument(seriesBreadcrumb)
         }
 
         val title = doc.selectFirst("h1.entry-title, .infox h1")?.text()?.trim() ?: "Unknown Title"
@@ -157,7 +360,7 @@ class AnimexinProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data, interceptor = cfKiller).document
+        val document = getSafeDocument(data)
         
         val servers = document.select(".mobius option, select.mirror option, .server option, .player option")
 
