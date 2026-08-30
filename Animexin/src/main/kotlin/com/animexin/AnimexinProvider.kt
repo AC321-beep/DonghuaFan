@@ -17,6 +17,7 @@ class AnimexinProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
+    // Accurate mapping based on the filters form in 'latest release page.txt'
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update" to "Recently Updated",
         "anime/?status=&type=&order=popular" to "Popular",
@@ -25,37 +26,21 @@ class AnimexinProvider : MainAPI() {
         "anime/?status=&sub=raw&order=update" to "Anime (RAW)"
     )
 
-    private var sessionInitialized = false
-
-    // Cloudflare Warm-up: Hitting the root domain safely acquires the cf_clearance cookie
-    // via Cloudstream's native WebView before hitting complex archive queries.
-    private suspend fun initSession() {
-        if (!sessionInitialized) {
-            app.get(mainUrl)
-            sessionInitialized = true
-        }
-    }
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        initSession()
-        
-        val path = request.data.substringBefore("?")
-        val query = request.data.substringAfter("?", "")
-        
         val url = if (page == 1) {
             "$mainUrl/${request.data}"
         } else {
-            if (query.isNotEmpty()) {
-                "$mainUrl/${path}page/$page/?$query"
-            } else {
-                "$mainUrl/${path}page/$page/"
-            }
+            // Deep Dive Fix: Using exact pagination structure found in 'latest release page.txt'
+            // href="?page=2&status=&type=&order=update"
+            val query = request.data.substringAfter("?", "")
+            "$mainUrl/anime/?page=$page&$query"
         }
 
-        // Rely purely on default headers to prevent Cloudflare fingerprint mismatches
+        // Bare request allows Cloudstream's native CF interceptor/WebView to sync fingerprints perfectly.
         val document = app.get(url).document
 
-        val items = document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx, .postbody article.bs")
+        // Captures standard .bs cards and .bs.styleegg cards
+        val items = document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
 
@@ -67,6 +52,8 @@ class AnimexinProvider : MainAPI() {
         val href = fixUrlNull(aTag.attr("href")) ?: return null
         if (href == mainUrl || href.isBlank()) return null
 
+        // Deep Dive Fix: Targets .eggtitle from 'animexin.txt' Latest Releases, 
+        // fallback to .ownText() for standard cards in 'latest release page.txt'
         val title = this.selectFirst(".egghead .eggtitle")?.text()?.trim()
             ?: this.selectFirst(".tt")?.ownText()?.trim()?.takeIf { it.isNotBlank() }
             ?: this.selectFirst(".tt h2, .tt h3, .tt h4")?.text()?.trim()
@@ -81,6 +68,7 @@ class AnimexinProvider : MainAPI() {
                 ?: it.attr("src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
         }?.let { fixUrlNull(it) }
 
+        // Deep Dive Fix: Targets .eggepisode from 'animexin.txt' .styleegg cards
         val epText = this.selectFirst(".eggmeta .eggepisode, .bt .epx, .epx")?.text()?.trim()
         val epNum = epText?.let { Regex("""\d+""").find(it)?.value?.toIntOrNull() }
         val type = this.selectFirst(".typez, .eggtype")?.text()?.trim()
@@ -97,7 +85,6 @@ class AnimexinProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        initSession()
         val document = app.get("$mainUrl/?s=$query").document
         return document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
             .mapNotNull { it.toSearchResult() }
@@ -105,9 +92,9 @@ class AnimexinProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        initSession()
         var doc = app.get(url).document
 
+        // Redirect episode URLs back to the main series page if accessed via homepage
         val seriesBreadcrumb = doc.selectFirst(".ts-breadcrumb li:nth-last-child(2) a, .allc a")?.attr("href")
         if (!seriesBreadcrumb.isNullOrBlank() && seriesBreadcrumb != url && seriesBreadcrumb.contains("/anime/")) {
             doc = app.get(seriesBreadcrumb).document
@@ -173,7 +160,6 @@ class AnimexinProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        initSession()
         val document = app.get(data).document
         val servers = document.select(".mobius option, select.mirror option, .server option, .player option")
 
