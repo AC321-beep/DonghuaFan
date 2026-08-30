@@ -3,6 +3,7 @@ package com.Animexin
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.network.CloudflareKiller // Cloudstream's native Turnstile solver
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import kotlinx.coroutines.async
@@ -17,6 +18,9 @@ class AnimexinProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
+    // Instantiate the Cloudflare bypass interceptor
+    private val cfKiller = CloudflareKiller()
+
     // Accurate mapping based on the filters form in 'latest release page.txt'
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update" to "Recently Updated",
@@ -30,14 +34,13 @@ class AnimexinProvider : MainAPI() {
         val url = if (page == 1) {
             "$mainUrl/${request.data}"
         } else {
-            // Deep Dive Fix: Using exact pagination structure found in 'latest release page.txt'
-            // href="?page=2&status=&type=&order=update"
+            // Extracted exact pagination structure from the HTML
             val query = request.data.substringAfter("?", "")
             "$mainUrl/anime/?page=$page&$query"
         }
 
-        // Bare request allows Cloudstream's native CF interceptor/WebView to sync fingerprints perfectly.
-        val document = app.get(url).document
+        // Apply the cfKiller interceptor to automatically solve the JS challenge
+        val document = app.get(url, interceptor = cfKiller).document
 
         // Captures standard .bs cards and .bs.styleegg cards
         val items = document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
@@ -52,8 +55,7 @@ class AnimexinProvider : MainAPI() {
         val href = fixUrlNull(aTag.attr("href")) ?: return null
         if (href == mainUrl || href.isBlank()) return null
 
-        // Deep Dive Fix: Targets .eggtitle from 'animexin.txt' Latest Releases, 
-        // fallback to .ownText() for standard cards in 'latest release page.txt'
+        // Targets .eggtitle from Latest Releases, fallback to .ownText() for standard cards
         val title = this.selectFirst(".egghead .eggtitle")?.text()?.trim()
             ?: this.selectFirst(".tt")?.ownText()?.trim()?.takeIf { it.isNotBlank() }
             ?: this.selectFirst(".tt h2, .tt h3, .tt h4")?.text()?.trim()
@@ -68,7 +70,7 @@ class AnimexinProvider : MainAPI() {
                 ?: it.attr("src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
         }?.let { fixUrlNull(it) }
 
-        // Deep Dive Fix: Targets .eggepisode from 'animexin.txt' .styleegg cards
+        // Targets .eggepisode from .styleegg cards and standard .epx cards
         val epText = this.selectFirst(".eggmeta .eggepisode, .bt .epx, .epx")?.text()?.trim()
         val epNum = epText?.let { Regex("""\d+""").find(it)?.value?.toIntOrNull() }
         val type = this.selectFirst(".typez, .eggtype")?.text()?.trim()
@@ -85,19 +87,19 @@ class AnimexinProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val document = app.get("$mainUrl/?s=$query").document
+        val document = app.get("$mainUrl/?s=$query", interceptor = cfKiller).document
         return document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        var doc = app.get(url).document
+        var doc = app.get(url, interceptor = cfKiller).document
 
         // Redirect episode URLs back to the main series page if accessed via homepage
         val seriesBreadcrumb = doc.selectFirst(".ts-breadcrumb li:nth-last-child(2) a, .allc a")?.attr("href")
         if (!seriesBreadcrumb.isNullOrBlank() && seriesBreadcrumb != url && seriesBreadcrumb.contains("/anime/")) {
-            doc = app.get(seriesBreadcrumb).document
+            doc = app.get(seriesBreadcrumb, interceptor = cfKiller).document
         }
 
         val title = doc.selectFirst("h1.entry-title, .infox h1")?.text()?.trim() ?: "Unknown Title"
@@ -160,7 +162,7 @@ class AnimexinProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data).document
+        val document = app.get(data, interceptor = cfKiller).document
         val servers = document.select(".mobius option, select.mirror option, .server option, .player option")
 
         coroutineScope {
@@ -176,8 +178,8 @@ class AnimexinProvider : MainAPI() {
                         } else null
 
                         if (!iframeSrc.isNullOrBlank()) {
-                            val url = fixUrl(iframeSrc)
-                            loadExtractor(url, subtitleCallback, callback)
+                            val targetUrl = fixUrl(iframeSrc)
+                            loadExtractor(targetUrl, subtitleCallback, callback)
                         }
                     }
                 }
