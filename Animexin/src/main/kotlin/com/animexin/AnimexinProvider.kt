@@ -1,11 +1,10 @@
 package com.Animexin
 
 import android.util.Base64
-import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.network.CloudflareKiller // Cloudstream's native equivalent to ElectronSolverr
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -19,9 +18,6 @@ class AnimexinProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
-    // Instantiating the WebView JS solver to bypass Turnstile
-    private val cfKiller = CloudflareKiller()
-
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update" to "Recently Updated",
         "anime/?status=&type=&order=popular" to "Popular",
@@ -29,6 +25,17 @@ class AnimexinProvider : MainAPI() {
         "anime/?status=&type=movie&order=update" to "Movies",
         "anime/?status=&sub=raw&order=update" to "Anime (RAW)"
     )
+
+    // Detects Turnstile. Throwing an Exception forces Cloudstream to display 
+    // the Error UI with the "Open in Browser" button instead of a blank list.
+    private fun checkCloudflare(doc: Document) {
+        val title = doc.title()
+        if (title.contains("Just a moment", ignoreCase = true) || 
+            title.contains("Attention Required", ignoreCase = true) ||
+            doc.select("div.cf-turnstile").isNotEmpty()) {
+            throw Error("Cloudflare Turnstile detected. Please open in WebView to verify.")
+        }
+    }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page == 1) {
@@ -38,10 +45,10 @@ class AnimexinProvider : MainAPI() {
             "$mainUrl/anime/?page=$page&$query"
         }
 
-        // We pass the CloudflareKiller interceptor.
-        // We strictly DO NOT override the User-Agent here to ensure the Android TLS fingerprint 
-        // perfectly matches the OkHttp signature, bypassing CF's WAF anomalies.
-        val document = app.get(url, interceptor = cfKiller).document
+        // Rely purely on Cloudstream's default client. If you solved the captcha in the 
+        // fallback WebView, the client automatically applies the synced cf_clearance cookies.
+        val document = app.get(url).document
+        checkCloudflare(document)
 
         val items = document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
             .mapNotNull { it.toSearchResult() }
@@ -85,18 +92,21 @@ class AnimexinProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val document = app.get("$mainUrl/?s=$query", interceptor = cfKiller).document
+        val document = app.get("$mainUrl/?s=$query").document
+        checkCloudflare(document)
         return document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        var doc = app.get(url, interceptor = cfKiller).document
+        var doc = app.get(url).document
+        checkCloudflare(doc)
 
         val seriesBreadcrumb = doc.selectFirst(".ts-breadcrumb li:nth-last-child(2) a, .allc a")?.attr("href")
         if (!seriesBreadcrumb.isNullOrBlank() && seriesBreadcrumb != url && seriesBreadcrumb.contains("/anime/")) {
-            doc = app.get(seriesBreadcrumb, interceptor = cfKiller).document
+            doc = app.get(seriesBreadcrumb).document
+            checkCloudflare(doc)
         }
 
         val title = doc.selectFirst("h1.entry-title, .infox h1")?.text()?.trim() ?: "Unknown Title"
@@ -159,7 +169,9 @@ class AnimexinProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data, interceptor = cfKiller).document
+        val document = app.get(data).document
+        checkCloudflare(document)
+        
         val servers = document.select(".mobius option, select.mirror option, .server option, .player option")
 
         coroutineScope {
@@ -175,8 +187,8 @@ class AnimexinProvider : MainAPI() {
                         } else null
 
                         if (!iframeSrc.isNullOrBlank()) {
-                            val url = fixUrl(iframeSrc)
-                            loadExtractor(url, subtitleCallback, callback)
+                            val targetUrl = fixUrl(iframeSrc)
+                            loadExtractor(targetUrl, subtitleCallback, callback)
                         }
                     }
                 }
