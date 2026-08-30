@@ -37,7 +37,9 @@ class Vtbe : ExtractorApi() {
         
         // Unpack and extract the .m3u8 file
         val unpacked = JsUnpacker(script).unpack() ?: return null
-        val match = Regex("""sources:\[\{file:"(.*?)"""").find(unpacked)
+        
+        // Improved Regex: Handles optional spaces and both single/double quotes
+        val match = Regex("""sources:\s*\[\s*\{\s*file:\s*['"](.*?)['"]""").find(unpacked)
         val link = match?.groupValues?.get(1) ?: return null
 
         return listOf(
@@ -45,7 +47,7 @@ class Vtbe : ExtractorApi() {
                 source = name,
                 name = name,
                 url = link,
-                referer = referer ?: "",
+                referer = referer ?: mainUrl,
                 quality = Qualities.Unknown.value,
                 type = ExtractorLinkType.M3U8
             )
