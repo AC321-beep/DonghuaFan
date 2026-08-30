@@ -5,6 +5,9 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 
 class AnimexinProvider : MainAPI() {
     override var mainUrl = "https://animexin.dev"
@@ -35,7 +38,6 @@ class AnimexinProvider : MainAPI() {
             }
         }
 
-        // Rely purely on app.get() so Cloudstream's native Cloudflare WebView solver functions correctly.
         val document = app.get(url).document
 
         val items = document.select(".listupd article.bs, .listupd .bs, .listupd .bsx")
@@ -50,10 +52,9 @@ class AnimexinProvider : MainAPI() {
         val href = fixUrlNull(aTag.attr("href")) ?: return null
         if (href == mainUrl) return null
 
-        // Target the inner heading directly to prevent grabbing duplicated text from the parent .tt element
         val title = this.selectFirst(".tt h2, .tt h3, .tt h4")?.text()?.trim()
             ?: this.selectFirst(".tt")?.text()?.trim()
-            ?: aTag.attr("title").takeIf { it.isNotBlank() }
+            ?: aTag.attr("title").takeIf { !it.isNullOrBlank() }
             ?: aTag.text().trim()
 
         if (title.isBlank()) return null
@@ -71,8 +72,9 @@ class AnimexinProvider : MainAPI() {
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = poster
+            // Fix 1: Removed the second string argument
             if (epNum != null) {
-                this.addSub(epNum, "Episode")
+                this.addSub(epNum)
             }
             if (href.contains("movie", true) || type.equals("Movie", true)) {
                 this.type = TvType.Movie
@@ -153,22 +155,26 @@ class AnimexinProvider : MainAPI() {
         val document = app.get(data).document
         val servers = document.select(".mobius option, select.mirror option, .server option, .player option")
 
-        // Uses Cloudstream's native parallel mapping (apmap) for efficient fetching
-        servers.apmap { server ->
-            val value = server.attr("value")
-            if (value.isNotBlank()) {
-                val decoded = try { base64Decode(value) } catch (e: Exception) { value }
-                val iframeSrc = if (decoded.contains("<iframe")) {
-                    Jsoup.parse(decoded).selectFirst("iframe")?.attr("src")
-                } else if (decoded.startsWith("http")) {
-                    decoded
-                } else null
+        // Fix 2: Reverted to standard coroutines to execute requests concurrently without blocking the thread
+        coroutineScope {
+            servers.map { server ->
+                async {
+                    val value = server.attr("value")
+                    if (value.isNotBlank()) {
+                        val decoded = try { base64Decode(value) } catch (e: Exception) { value }
+                        val iframeSrc = if (decoded.contains("<iframe")) {
+                            Jsoup.parse(decoded).selectFirst("iframe")?.attr("src")
+                        } else if (decoded.startsWith("http")) {
+                            decoded
+                        } else null
 
-                if (iframeSrc != null) {
-                    val url = fixUrl(iframeSrc)
-                    loadExtractor(url, subtitleCallback, callback)
+                        if (iframeSrc != null) {
+                            val url = fixUrl(iframeSrc)
+                            loadExtractor(url, subtitleCallback, callback)
+                        }
+                    }
                 }
-            }
+            }.awaitAll()
         }
         return true
     }
