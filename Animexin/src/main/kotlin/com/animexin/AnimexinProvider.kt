@@ -1,9 +1,10 @@
 package com.Animexin
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.network.CloudflareKiller // Cloudstream's native Turnstile solver
+import com.lagradost.cloudstream3.network.CloudflareKiller // Cloudstream's native equivalent to ElectronSolverr
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import kotlinx.coroutines.async
@@ -18,10 +19,9 @@ class AnimexinProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
-    // Instantiate the Cloudflare bypass interceptor
+    // Instantiating the WebView JS solver to bypass Turnstile
     private val cfKiller = CloudflareKiller()
 
-    // Accurate mapping based on the filters form in 'latest release page.txt'
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update" to "Recently Updated",
         "anime/?status=&type=&order=popular" to "Popular",
@@ -34,15 +34,15 @@ class AnimexinProvider : MainAPI() {
         val url = if (page == 1) {
             "$mainUrl/${request.data}"
         } else {
-            // Extracted exact pagination structure from the HTML
             val query = request.data.substringAfter("?", "")
             "$mainUrl/anime/?page=$page&$query"
         }
 
-        // Apply the cfKiller interceptor to automatically solve the JS challenge
+        // We pass the CloudflareKiller interceptor.
+        // We strictly DO NOT override the User-Agent here to ensure the Android TLS fingerprint 
+        // perfectly matches the OkHttp signature, bypassing CF's WAF anomalies.
         val document = app.get(url, interceptor = cfKiller).document
 
-        // Captures standard .bs cards and .bs.styleegg cards
         val items = document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
@@ -55,7 +55,6 @@ class AnimexinProvider : MainAPI() {
         val href = fixUrlNull(aTag.attr("href")) ?: return null
         if (href == mainUrl || href.isBlank()) return null
 
-        // Targets .eggtitle from Latest Releases, fallback to .ownText() for standard cards
         val title = this.selectFirst(".egghead .eggtitle")?.text()?.trim()
             ?: this.selectFirst(".tt")?.ownText()?.trim()?.takeIf { it.isNotBlank() }
             ?: this.selectFirst(".tt h2, .tt h3, .tt h4")?.text()?.trim()
@@ -70,7 +69,6 @@ class AnimexinProvider : MainAPI() {
                 ?: it.attr("src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
         }?.let { fixUrlNull(it) }
 
-        // Targets .eggepisode from .styleegg cards and standard .epx cards
         val epText = this.selectFirst(".eggmeta .eggepisode, .bt .epx, .epx")?.text()?.trim()
         val epNum = epText?.let { Regex("""\d+""").find(it)?.value?.toIntOrNull() }
         val type = this.selectFirst(".typez, .eggtype")?.text()?.trim()
@@ -80,7 +78,7 @@ class AnimexinProvider : MainAPI() {
             if (epNum != null) {
                 this.addSub(epNum)
             }
-            if (href.contains("movie", true) || type.equals("Movie", true)) {
+            if (href.contains("movie", ignoreCase = true) || type.equals("Movie", ignoreCase = true)) {
                 this.type = TvType.Movie
             }
         }
@@ -96,7 +94,6 @@ class AnimexinProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         var doc = app.get(url, interceptor = cfKiller).document
 
-        // Redirect episode URLs back to the main series page if accessed via homepage
         val seriesBreadcrumb = doc.selectFirst(".ts-breadcrumb li:nth-last-child(2) a, .allc a")?.attr("href")
         if (!seriesBreadcrumb.isNullOrBlank() && seriesBreadcrumb != url && seriesBreadcrumb.contains("/anime/")) {
             doc = app.get(seriesBreadcrumb, interceptor = cfKiller).document
@@ -113,7 +110,7 @@ class AnimexinProvider : MainAPI() {
 
         val description = doc.selectFirst("div.entry-content, .infox .desc, .bigcontent .desc")?.text()?.trim()
 
-        val isMovie = doc.selectFirst(".spe, .type")?.text()?.contains("Movie", true) == true
+        val isMovie = doc.selectFirst(".spe, .type")?.text()?.contains("Movie", ignoreCase = true) == true
 
         if (isMovie) {
             val href = doc.selectFirst("div.eplister > ul > li a, .eplister li a, .eps a")?.attr("href") ?: url
@@ -178,8 +175,8 @@ class AnimexinProvider : MainAPI() {
                         } else null
 
                         if (!iframeSrc.isNullOrBlank()) {
-                            val targetUrl = fixUrl(iframeSrc)
-                            loadExtractor(targetUrl, subtitleCallback, callback)
+                            val url = fixUrl(iframeSrc)
+                            loadExtractor(url, subtitleCallback, callback)
                         }
                     }
                 }
