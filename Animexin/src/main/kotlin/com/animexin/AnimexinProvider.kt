@@ -18,6 +18,8 @@ class AnimexinProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
+    // No class-level CloudflareKiller variables here to prevent the background thread crash!
+
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update" to "Recently Updated",
         "anime/?status=&type=&order=popular" to "Popular",
@@ -26,14 +28,15 @@ class AnimexinProvider : MainAPI() {
         "anime/?status=&sub=raw&order=update" to "Anime (RAW)"
     )
 
-    // Detects Turnstile. Throwing an Exception forces Cloudstream to display 
-    // the Error UI with the "Open in Browser" button instead of a blank list.
+    // Actively detect the Turnstile screen from your screenshot.
     private fun checkCloudflare(doc: Document) {
         val title = doc.title()
         if (title.contains("Just a moment", ignoreCase = true) || 
-            title.contains("Attention Required", ignoreCase = true) ||
+            title.contains("Security verification", ignoreCase = true) ||
             doc.select("div.cf-turnstile").isNotEmpty()) {
-            throw Error("Cloudflare Turnstile detected. Please open in WebView to verify.")
+            
+            // This error forces Cloudstream to show the "Open in WebView" (Globe Icon) button.
+            throw Error("Cloudflare blocked the request. Tap the Globe icon above to verify.")
         }
     }
 
@@ -45,8 +48,6 @@ class AnimexinProvider : MainAPI() {
             "$mainUrl/anime/?page=$page&$query"
         }
 
-        // Rely purely on Cloudstream's default client. If you solved the captcha in the 
-        // fallback WebView, the client automatically applies the synced cf_clearance cookies.
         val document = app.get(url).document
         checkCloudflare(document)
 
@@ -94,6 +95,7 @@ class AnimexinProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val document = app.get("$mainUrl/?s=$query").document
         checkCloudflare(document)
+
         return document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
