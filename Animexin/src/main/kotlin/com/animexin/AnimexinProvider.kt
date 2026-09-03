@@ -1,6 +1,7 @@
 package com.Animexin
 
 import android.util.Base64
+import android.webkit.CookieManager
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.async
@@ -20,6 +21,7 @@ class AnimexinProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
+    // Strictly using the class-based Interceptor pattern
     private val cfInterceptor = CFInterceptor()
 
     override val mainPage = mainPageOf(
@@ -30,6 +32,7 @@ class AnimexinProvider : MainAPI() {
         "anime/?status=&sub=raw&order=update" to "Anime (RAW)"
     )
 
+    // Strictly using the class-based CFDialog with the (Boolean) -> Unit callback
     private suspend fun resolveCloudflare(url: String): Boolean = suspendCancellableCoroutine { cont ->
         var resumed = false
         CommonActivity.activity?.runOnUiThread {
@@ -53,7 +56,7 @@ class AnimexinProvider : MainAPI() {
         var doc = response.document
         val title = doc.title().lowercase()
         
-        val isChallenge = listOf("just a moment", "security verification", "attention required").any { title.contains(it) } || doc.select("div.cf-turnstile").isNotEmpty()
+        val isChallenge = listOf("just a moment", "security verification", "attention required", "cloudflare").any { title.contains(it) } || doc.select("div.cf-turnstile").isNotEmpty()
         
         if (isChallenge || response.code in listOf(403, 503)) {
             val success = resolveCloudflare(url)
@@ -96,19 +99,33 @@ class AnimexinProvider : MainAPI() {
 
         if (title.isBlank()) return null
 
+        // WordPress lazy-loaded & noscript image extraction
         val img = this.selectFirst("img")
-        val poster = img?.let { 
+        var poster = img?.let { 
             it.attr("data-lazy-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                 ?: it.attr("data-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                 ?: it.attr("src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
-        }?.let { fixUrlNull(it) }
+        }
+        if (poster.isNullOrBlank()) {
+            poster = this.selectFirst("noscript img")?.attr("src")
+        }
 
         val epText = this.selectFirst(".eggmeta .eggepisode, .bt .epx, .epx")?.text()?.trim()
         val epNum = epText?.let { Regex("""\d+""").find(it)?.value?.toIntOrNull() }
         val type = this.selectFirst(".typez, .eggtype")?.text()?.trim()
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
-            this.posterUrl = poster
+            this.posterUrl = fixUrlNull(poster)
+            
+            // BLANK POSTER FIX: Inject Cloudflare clearance cookies and synchronized User-Agent into Coil
+            val posterCookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
+            this.posterHeaders = mapOf(
+                "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                "Referer" to "$mainUrl/",
+                "Cookie" to posterCookies,
+                "User-Agent" to CFState.userAgent
+            ).filterValues { it.isNotBlank() }
+
             if (epNum != null) {
                 this.addSub(epNum)
             }
@@ -136,11 +153,14 @@ class AnimexinProvider : MainAPI() {
         val title = doc.selectFirst("h1.entry-title, .infox h1")?.text()?.trim() ?: "Unknown Title"
         
         val img = doc.selectFirst("div.thumb img, div.infox img, .bigcontent img")
-        val poster = img?.let { 
+        var poster = img?.let { 
             it.attr("data-lazy-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                 ?: it.attr("data-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                 ?: it.attr("src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
-        }?.let { fixUrlNull(it) } ?: doc.selectFirst("meta[property=og:image]")?.attr("content")
+        }
+        if (poster.isNullOrBlank()) {
+             poster = doc.selectFirst("noscript img")?.attr("src") ?: doc.selectFirst("meta[property=og:image]")?.attr("content")
+        }
 
         val description = doc.selectFirst("div.entry-content, .infox .desc, .bigcontent .desc")?.text()?.trim()
 
@@ -149,8 +169,17 @@ class AnimexinProvider : MainAPI() {
         if (isMovie) {
             val href = doc.selectFirst("div.eplister > ul > li a, .eplister li a, .eps a")?.attr("href") ?: url
             return newMovieLoadResponse(title, url, TvType.Movie, href) {
-                this.posterUrl = poster
+                this.posterUrl = fixUrlNull(poster)
                 this.plot = description
+                
+                // BLANK POSTER FIX: Ensure the main movie load page poster uses the CF headers
+                val posterCookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
+                this.posterHeaders = mapOf(
+                    "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                    "Referer" to "$mainUrl/",
+                    "Cookie" to posterCookies,
+                    "User-Agent" to CFState.userAgent
+                ).filterValues { it.isNotBlank() }
             }
         }
 
@@ -160,11 +189,12 @@ class AnimexinProvider : MainAPI() {
                 val epHref = fixUrlNull(a.attr("href")) ?: return@mapNotNull null
 
                 val epImg = info.selectFirst("a img")
-                val epPoster = epImg?.let { 
+                var epPoster = epImg?.let { 
                     it.attr("data-lazy-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                         ?: it.attr("data-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                         ?: it.attr("src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
-                }?.let { fixUrlNull(it) }
+                }
+                if (epPoster.isNullOrBlank()) epPoster = info.selectFirst("noscript img")?.attr("src")
 
                 val epText = info.selectFirst(".epl-num, .epl-title, .epnum, .epsname")?.text()?.trim() ?: ""
                 val epNum = Regex("""\d+""").find(epText)?.value?.toIntOrNull()
@@ -173,7 +203,7 @@ class AnimexinProvider : MainAPI() {
                 newEpisode(epHref) {
                     this.name = if (epNum != null) "Episode $epNum" else epText.ifBlank { a.text().trim() }
                     this.episode = epNum
-                    this.posterUrl = epPoster
+                    this.posterUrl = fixUrlNull(epPoster)
                     if (!dateText.isNullOrBlank()) {
                         this.addDate(dateText, format = "MMMM d, yyyy")
                         this.description = dateText
@@ -182,8 +212,17 @@ class AnimexinProvider : MainAPI() {
             }.reversed()
 
         return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
-            this.posterUrl = poster
+            this.posterUrl = fixUrlNull(poster)
             this.plot = description
+            
+            // BLANK POSTER FIX: Ensure the main TV load page poster uses the CF headers
+            val posterCookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
+            this.posterHeaders = mapOf(
+                "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                "Referer" to "$mainUrl/",
+                "Cookie" to posterCookies,
+                "User-Agent" to CFState.userAgent
+            ).filterValues { it.isNotBlank() }
         }
     }
 
