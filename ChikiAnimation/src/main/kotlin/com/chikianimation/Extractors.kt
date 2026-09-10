@@ -14,6 +14,19 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.abs
 
+// ═════════════════════════════════════════════════════════════════════
+// GalaxyDonghua — extractor for galaxydonghua.xyz
+//
+// The site wraps its player in a Packr/AAencode-obfuscated blob that
+// holds 5 literal tokens (pd, ps, qsx, kaken, apx). Those tokens build
+// an API config URL whose payload is AES-256-CBC encrypted with a
+// PBKDF2-SHA256 secret (10000 iterations, 48-byte derived key).
+// Decrypting yields JSON with a `sources` array (mirrors) and
+// `tracks` array (subtitles).
+//
+// Cloudstream auto-discovers this class — no manual registration
+// needed. loadExtractor() will route any galaxydonghua.xyz URL here.
+// ═════════════════════════════════════════════════════════════════════
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
     override var mainUrl = GX
@@ -26,6 +39,9 @@ class GalaxyDonghua : ExtractorApi() {
                 "Chrome/120.0.0.0 Safari/537.36"
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // MAIN ENTRY
+    // ────────────────────────────────────────────────────────────────
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -72,12 +88,18 @@ class GalaxyDonghua : ExtractorApi() {
             .replace("{apx}", tokens.apx)
 
         // 6) POST to the API
-        val apiBody = """{"pd":"${tokens.pd}","ps":"${tokens.ps}","qsx":"${tokens.qsx}","kaken":"${tokens.kaken}","apx":"${tokens.apx}"}"""
+        // Cloudstream's app.post() takes a Map (form data), not raw JSON.
         val apiRes = try {
             app.post(
                 fixedApi,
-                headers = headers + mapOf("Content-Type" to "application/json"),
-                data = apiBody
+                headers = headers,
+                data = mapOf(
+                    "pd" to tokens.pd,
+                    "ps" to tokens.ps,
+                    "qsx" to tokens.qsx,
+                    "kaken" to tokens.kaken,
+                    "apx" to tokens.apx
+                )
             ).text
         } catch (e: Exception) { return }
 
