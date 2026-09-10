@@ -3,6 +3,8 @@ package com.chikianimation
 import android.util.Base64
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.extractors.Filesim
+import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -15,17 +17,98 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.math.abs
 
 // ═════════════════════════════════════════════════════════════════════
-// GalaxyDonghua — extractor for galaxydonghua.xyz
-//
-// The site wraps its player in a Packr/AAencode-obfuscated blob that
-// holds 5 literal tokens (pd, ps, qsx, kaken, apx). Those tokens build
-// an API config URL whose payload is AES-256-CBC encrypted with a
-// PBKDF2-SHA256 secret (10000 iterations, 48-byte derived key).
-// Decrypting yields JSON with a `sources` array (mirrors) and
-// `tracks` array (subtitles).
-//
-// Cloudstream auto-discovers this class — no manual registration
-// needed. loadExtractor() will route any galaxydonghua.xyz URL here.
+// Ghbrisk — StreamWish mirror used by chikianimation.com
+// Extends Filesim so loadExtractor routes ghbrisk.com here.
+// ═════════════════════════════════════════════════════════════════════
+class Ghbrisk : Filesim() {
+    override var name = "Streamwish"
+    override var mainUrl = "https://ghbrisk.com"
+    override val requiresReferer = true
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Dailymotion — explicit handler
+// ═════════════════════════════════════════════════════════════════════
+class Dailymotion : ExtractorApi() {
+    override var name = "Dailymotion"
+    override var mainUrl = "https://www.dailymotion.com"
+    override val requiresReferer = false
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val id = Regex("""(?:dailymotion\.com/(?:embed/)?video/|dai\.ly/)([a-zA-Z0-9]+)""")
+            .find(url)?.groupValues?.get(1)
+            ?: return
+
+        val embedReferer = "https://www.dailymotion.com/embed/video/$id"
+        val metaUrl = "https://www.dailymotion.com/player/metadata/video/$id"
+
+        val response = try {
+            app.get(
+                metaUrl,
+                headers = mapOf(
+                    "User-Agent" to UA,
+                    "Referer" to embedReferer,
+                    "Origin" to "https://www.dailymotion.com"
+                )
+            ).text
+        } catch (e: Exception) { return }
+
+        Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""")
+            .findAll(response)
+            .forEach { m ->
+                val m3u8 = m.groupValues[1].replace("\\/", "/")
+                callback.invoke(
+                    newExtractorLink(
+                        source = this.name,
+                        name = "Dailymotion",
+                        url = m3u8,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = "https://www.dailymotion.com/"
+                        this.quality = qualityOf(m3u8)
+                        this.headers = mapOf(
+                            "User-Agent" to UA,
+                            "Referer" to "https://www.dailymotion.com/"
+                        )
+                    }
+                )
+            }
+
+        Regex(""""url"\s*:\s*"([^"]+\.(?:vtt|srt)[^"]*)"[^{}]*?"language"\s*:\s*"([^"]*)"""")
+            .findAll(response)
+            .forEach { m ->
+                subtitleCallback.invoke(
+                    newSubtitleFile(
+                        lang = m.groupValues[2].ifBlank { "Sub" },
+                        url = m.groupValues[1].replace("\\/", "/")
+                    )
+                )
+            }
+    }
+
+    private fun qualityOf(u: String): Int = when {
+        u.contains("1080") -> 1080
+        u.contains("720")  -> 720
+        u.contains("480")  -> 480
+        u.contains("380")  -> 380
+        u.contains("240")  -> 240
+        else               -> 0
+    }
+
+    companion object {
+        const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/120.0.0.0 Safari/537.36"
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// GalaxyDonghua — AAencode/Packr obfuscated player
 // ═════════════════════════════════════════════════════════════════════
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
@@ -39,9 +122,6 @@ class GalaxyDonghua : ExtractorApi() {
                 "Chrome/120.0.0.0 Safari/537.36"
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // MAIN ENTRY
-    // ────────────────────────────────────────────────────────────────
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -54,30 +134,19 @@ class GalaxyDonghua : ExtractorApi() {
             "Accept" to "*/*"
         )
 
-        // 1) Fetch the embed page that carries the obfuscated tokens
-        val page = try {
-            app.get(url, headers = headers).text
-        } catch (e: Exception) { return }
-
-        // 2) Decode the AAencode/Packr payload → 5 tokens
+        val page = try { app.get(url, headers = headers).text } catch (e: Exception) { return }
         val tokens = decodeGdTokens(page) ?: return
 
         val gxBase = embedHost(url)
         val apiConfigBase = "$gxBase/wp-json/gd/v1/config"
+        val configRes = try { app.get(apiConfigBase, headers = headers).text }
+            catch (e: Exception) { return }
 
-        // 3) Fetch the encrypted config
-        val configRes = try {
-            app.get(apiConfigBase, headers = headers).text
-        } catch (e: Exception) { return }
-
-        // 4) Decrypt config — `kaken` is the most likely AES password
-        //    (Japanese romaji for "key"). The others are fallbacks.
         val configPlain = dcx(configRes.trim(), tokens.kaken)
             ?: dcx(configRes.trim(), tokens.apx)
             ?: return
 
-        // 5) Extract the API URL template from the config JSON
-        val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)""")
+        val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""")
             .find(configPlain)?.groupValues?.get(1) ?: return
 
         val fixedApi = apiUrlTemplate
@@ -87,29 +156,23 @@ class GalaxyDonghua : ExtractorApi() {
             .replace("{kaken}", tokens.kaken)
             .replace("{apx}", tokens.apx)
 
-        // 6) POST to the API
-        // Cloudstream's app.post() takes a Map (form data), not raw JSON.
         val apiRes = try {
             app.post(
                 fixedApi,
                 headers = headers,
                 data = mapOf(
-                    "pd" to tokens.pd,
-                    "ps" to tokens.ps,
-                    "qsx" to tokens.qsx,
-                    "kaken" to tokens.kaken,
+                    "pd" to tokens.pd, "ps" to tokens.ps,
+                    "qsx" to tokens.qsx, "kaken" to tokens.kaken,
                     "apx" to tokens.apx
                 )
             ).text
         } catch (e: Exception) { return }
 
-        // 7) Decrypt the API payload
         val apiPlain = dcx(apiRes.trim(), tokens.kaken)
             ?: dcx(apiRes.trim(), tokens.apx)
             ?: return
 
-        // 8) Extract baseURL and sources
-        val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)""")
+        val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""")
             .find(apiPlain)?.groupValues?.get(1) ?: gxBase
 
         val playbackHeaders = mapOf(
@@ -118,78 +181,50 @@ class GalaxyDonghua : ExtractorApi() {
             "Origin" to gxBase
         )
 
-        // Match { "file": "…", "label": "…", "type": "…" } objects
-        val srcRegex = Regex(
-            """"file"\s*:\s*"([^"]+)"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?(?:[^{}]*?"type"\s*:\s*"([^"]*)")?"""
-        )
-        var linkFound = false
-        srcRegex.findAll(apiPlain).forEach { m ->
-            val rawFile = m.groupValues[1]
-            val label = m.groupValues[2].ifBlank { "Auto" }
-            val type = m.groupValues[3]
+        Regex(""""file"\s*:\s*"([^"]+)"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?(?:[^{}]*?"type"\s*:\s*"([^"]*)")?""")
+            .findAll(apiPlain)
+            .forEach { m ->
+                val streamUrl = fixStreamUrl(m.groupValues[1], baseURL) ?: return@forEach
+                val label = m.groupValues[2].ifBlank { "Auto" }
+                val type = m.groupValues[3]
+                val isM3u8 = streamUrl.contains(".m3u8") ||
+                        type.contains("hls", true) ||
+                        type.contains("m3u8", true)
 
-            val streamUrl = fixStreamUrl(rawFile, baseURL) ?: return@forEach
-            val isM3u8 = streamUrl.contains(".m3u8") ||
-                    type.contains("hls", true) ||
-                    type.contains("m3u8", true)
+                callback.invoke(
+                    newExtractorLink(
+                        source = this.name,
+                        name = "${this.name} – $label",
+                        url = streamUrl,
+                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = gxBase
+                        this.quality = label.filter { it.isDigit() }.toIntOrNull() ?: 0
+                        this.headers = playbackHeaders
+                    }
+                )
+            }
 
-            callback.invoke(
-                newExtractorLink(
-                    source = this.name,
-                    name = "${this.name} – $label",
-                    url = streamUrl,
-                    type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = gxBase
-                    this.quality = qualityFromLabel(label)
-                    this.headers = playbackHeaders
-                }
-            )
-            linkFound = true
-        }
-
-        // 9) Subtitle tracks (VTT / SRT)
         Regex(""""file"\s*:\s*"([^"]+\.(?:vtt|srt))"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?""")
             .findAll(apiPlain)
             .forEach { m ->
                 subtitleCallback.invoke(
-                    SubtitleFile(
-                        m.groupValues[2].ifBlank { "Sub" },
-                        fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
+                    newSubtitleFile(
+                        lang = m.groupValues[2].ifBlank { "Sub" },
+                        url = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
                     )
                 )
             }
-
-        if (!linkFound) return
     }
-
-    private fun qualityFromLabel(label: String): Int {
-        val digits = label.filter { it.isDigit() }
-        return digits.toIntOrNull() ?: when {
-            label.contains("1080", true) -> 1080
-            label.contains("720", true) -> 720
-            label.contains("480", true) -> 480
-            label.contains("360", true) -> 360
-            else -> 0
-        }
-    }
-
-    // ═════════════════════════════════════════════════════════════════
-    // INTERNAL HELPERS
-    // ═════════════════════════════════════════════════════════════════
 
     private data class GdTokens(
-        val pd: String,
-        val ps: String,
-        val qsx: String,
-        val kaken: String,
-        val apx: String
+        val pd: String, val ps: String, val qsx: String,
+        val kaken: String, val apx: String
     )
 
     private fun decodeGdTokens(page: String): GdTokens? {
         val startMatch = Regex("""ﾟωﾟﾉ\s*=""").find(page) ?: return null
         val jStart = startMatch.range.first
-
         val endMatch = Regex("""\)\s*\(\s*ﾟΘﾟ\s*\)\s*\)\s*\(\s*'_'\s*\)""")
             .find(page, jStart) ?: return null
         val jEnd = endMatch.range.last + 1
@@ -218,22 +253,17 @@ class GalaxyDonghua : ExtractorApi() {
                 val raw = if (t.startsWith("-")) {
                     val n = evalArithmetic(t.substring(1)) ?: return null
                     -n
-                } else {
-                    evalArithmetic(t.trimStart('+')) ?: return null
-                }
+                } else evalArithmetic(t.trimStart('+')) ?: return null
                 val v = abs(raw)
                 if (v > 7) return null
                 digits.append(v)
             }
-            if (digits.isNotEmpty()) {
-                sb.append(digits.toString().toInt(8).toChar())
-            }
+            if (digits.isNotEmpty()) sb.append(digits.toString().toInt(8).toChar())
         }
 
         val packrCall = sb.toString()
         val pStart = packrCall.indexOf("}('")
         if (pStart < 0) return null
-
         val packedStart = pStart + 3
         val packedEnd = packrCall.indexOf("',", packedStart)
         if (packedEnd < 0) return null
@@ -250,9 +280,7 @@ class GalaxyDonghua : ExtractorApi() {
         val dictEnd = packrCall.indexOf("'.split", dictStart)
         if (dictEnd < 0) return null
 
-        val dictStr = packrCall.substring(dictStart, dictEnd)
-        val dict = dictStr.split("|")
-
+        val dict = packrCall.substring(dictStart, dictEnd).split("|")
         var code = packed
         for (idx in (a - 1) downTo 0) {
             val k = dict.getOrNull(idx)
@@ -262,8 +290,7 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        fun grab(re: Regex): String? =
-            re.find(code)?.groupValues?.getOrNull(1)?.trim()
+        fun grab(re: Regex) = re.find(code)?.groupValues?.getOrNull(1)?.trim()
 
         val pd = grab(Regex("""(?:window\.)?pd=["']([^"']+)["']""")) ?: return null
         val ps = grab(Regex("""(?:window\.)?ps=["']([^"']+)["']""")) ?: return null
@@ -271,22 +298,18 @@ class GalaxyDonghua : ExtractorApi() {
         val kaken = grab(Regex("""(?:window\.)?kaken=["']([^"']+)["']""")) ?: return null
         val apx = grab(Regex("""(?:window\.)?apx=["']([^"']+)["']""")) ?: return null
 
-        if (pd.isBlank() || ps.isBlank() || qsx.isBlank() ||
-            kaken.isBlank() || apx.isBlank()
-        ) return null
-
+        if (listOf(pd, ps, qsx, kaken, apx).any { it.isBlank() }) return null
         return GdTokens(pd, ps, qsx, kaken, apx)
     }
 
     private fun stripConstants(s: String): String {
-        val repl = listOf(
+        var t = s
+        for ((k, v) in listOf(
             "(c^_^o)" to "0", "(o^_^o)" to "3",
             "(ﾟΘﾟ)" to "1", "(ﾟｰﾟ)" to "4",
             "c^_^o" to "0", "o^_^o" to "3",
             "ﾟΘﾟ" to "1", "ﾟｰﾟ" to "4"
-        )
-        var t = s
-        for ((k, v) in repl) t = t.replace(k, v)
+        )) t = t.replace(k, v)
         return t
     }
 
@@ -362,8 +385,7 @@ class GalaxyDonghua : ExtractorApi() {
     private fun packrBase36(c: Int, a: Int): String {
         val prefix = if (c < a) "" else packrBase36(c / a, a)
         val rem = c % a
-        val suffix = if (rem > 35) (rem + 29).toChar().toString()
-                     else rem.toString(36)
+        val suffix = if (rem > 35) (rem + 29).toChar().toString() else rem.toString(36)
         return prefix + suffix
     }
 
@@ -389,7 +411,7 @@ class GalaxyDonghua : ExtractorApi() {
         for (block in 1..blocks) {
             val u = ByteArray(salt.size + 4)
             System.arraycopy(salt, 0, u, 0, salt.size)
-            u[salt.size]     = (block ushr 24).toByte()
+            u[salt.size] = (block ushr 24).toByte()
             u[salt.size + 1] = (block ushr 16).toByte()
             u[salt.size + 2] = (block ushr 8).toByte()
             u[salt.size + 3] = block.toByte()
@@ -421,15 +443,10 @@ class GalaxyDonghua : ExtractorApi() {
         if (u.isBlank()) return null
         if (u.startsWith("http://") || u.startsWith("https://")) return u
         if (u.startsWith("//")) return "https:$u"
-
-        val host = try {
-            val uri = URI(base); "${uri.scheme}://${uri.host}"
-        } catch (e: Exception) { null }
-
-        return if (u.startsWith("/"))
-            (host ?: base.trimEnd('/')) + u
-        else
-            (host ?: base.trimEnd('/')) + "/" + u
+        val host = try { val uri = URI(base); "${uri.scheme}://${uri.host}" }
+            catch (e: Exception) { null }
+        return if (u.startsWith("/")) (host ?: base.trimEnd('/')) + u
+        else (host ?: base.trimEnd('/')) + "/" + u
     }
 
     private fun embedHost(url: String): String = try {
