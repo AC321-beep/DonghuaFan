@@ -19,20 +19,15 @@ class ChikiAnimationProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
 
-    // ─────────────────────────────────────────────────────────────────
-    // CATEGORIES
-    // AI Anime uses the verified genre endpoint /genres/ai-generated/
-    // Comic slug still needs live verification — see notes at bottom.
-    // ─────────────────────────────────────────────────────────────────
     override val mainPage = mainPageOf(
-        "anime/?status=&type=&order=update"      to "Recently Updated",
-        "anime/?status=&type=movie&order=update" to "Movies",
-        "anime/?status=&type=comic&order=update" to "Comic",
-        "anime/?status=&type=ona&order=update"   to "Donghua (ONA)",
-        "genres/ai-generated/"                   to "AI Anime",
-        "anime/?status=completed&order=update"   to "Completed",
-        "anime/?status=&type=&order=popular"     to "Popular",
-        "anime/?status=&type=&order=title"       to "A–Z"
+        "anime/?status=&type=&order=update"          to "Recently Updated",
+        "anime/?status=&type=&order=popular"         to "Popular",
+        "anime/?status=&type=&order=latest"          to "Latest Added",
+        "anime/?status=ongoing&type=&order=update"   to "Ongoing",
+        "anime/?status=completed&type=&order=update" to "Completed",
+        "anime/?status=&type=movie&order=update"     to "Movies",
+        "anime/?status=&type=ona&order=update"       to "Donghua (ONA)",
+        "genres/ai-generated/"                       to "AI Anime"
     )
 
     private val headers = mapOf(
@@ -44,10 +39,7 @@ class ChikiAnimationProvider : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    // ═════════════════════════════════════════════════════════════════
-    // MAIN PAGE
-    // ═════════════════════════════════════════════════════════════════
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+       override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = buildPageUrl(request.data, page)
         println("ChikiAnimation: loading ${request.name} → $url")
 
@@ -67,10 +59,8 @@ class ChikiAnimationProvider : MainAPI() {
         return newHomePageResponse(request.name, items, items.isNotEmpty())
     }
 
-    // WordPress uses ?paged=N for query archives and /page/N/ for path pages.
     private fun buildPageUrl(base: String, page: Int): String {
         if (page <= 1) return "$mainUrl/$base"
-
         return when {
             !base.contains("?") -> {
                 val trimmed = base.trimEnd('/')
@@ -80,10 +70,7 @@ class ChikiAnimationProvider : MainAPI() {
         }
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // CARD PARSER
-    // ═════════════════════════════════════════════════════════════════
-    private fun Element.toSearchResult(): SearchResponse? {
+       private fun Element.toSearchResult(): SearchResponse? {
         val anchor = selectFirst("div.bsx > a[href]")
             ?: selectFirst("a[itemprop=url]")
             ?: selectFirst("h2 a[href]")
@@ -121,10 +108,7 @@ class ChikiAnimationProvider : MainAPI() {
         }
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // SEARCH
-    // ═════════════════════════════════════════════════════════════════
-    override suspend fun search(query: String): List<SearchResponse> {
+       override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
         val encoded = query.trim()
 
@@ -149,10 +133,7 @@ class ChikiAnimationProvider : MainAPI() {
         return results.distinctBy { it.url }
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // LOAD
-    // ═════════════════════════════════════════════════════════════════
-    override suspend fun load(url: String): LoadResponse? {
+        override suspend fun load(url: String): LoadResponse? {
         val document = try {
             app.get(url, headers = headers).document
         } catch (e: Exception) {
@@ -187,8 +168,7 @@ class ChikiAnimationProvider : MainAPI() {
 
         val isMovie = typeText.contains("movie", ignoreCase = true)
 
-        // ── MOVIE ────────────────────────────────────────────────────
-        if (isMovie) {
+            if (isMovie) {
             val watchHref = document
                 .selectFirst(".eplister li > a[href], .episodelist li > a[href]")
                 ?.attr("href")?.trim()
@@ -201,8 +181,7 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // ── SERIES ───────────────────────────────────────────────────
-        var epListElements = document.select(".episodelist li, .eplister li")
+          var epListElements = document.select(".episodelist li, .eplister li")
 
         if (epListElements.isEmpty()) {
             val epPage = document
@@ -256,9 +235,6 @@ class ChikiAnimationProvider : MainAPI() {
         }
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    // LOAD LINKS — layered extraction
-    // ═════════════════════════════════════════════════════════════════
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -274,47 +250,53 @@ class ChikiAnimationProvider : MainAPI() {
 
         var found = false
 
-        suspend fun invokeExtractor(rawUrl: String) {
-            val finalUrl = try { fixUrl(rawUrl) } catch (e: Exception) {
-                println("ChikiAnimation: fixUrl failed for $rawUrl")
-                return
-            }
-            if (!finalUrl.startsWith("http")) {
-                println("ChikiAnimation: non-http URL skipped — $finalUrl")
-                return
-            }
+        suspend fun handleUrl(rawUrl: String, ref: String) {
+            val cleanUrl = try { fixUrl(rawUrl) } catch (e: Exception) { return }
+            if (!cleanUrl.startsWith("http")) return
 
-            if (finalUrl.contains("youtube", true) ||
-                finalUrl.contains("disqus", true) ||
-                finalUrl.contains("googlesyndication", true) ||
-                finalUrl.contains("doubleclick", true) ||
-                (finalUrl.contains("google", true) && finalUrl.contains("ads", true))
+            if (cleanUrl.contains("youtube", true) ||
+                cleanUrl.contains("disqus", true) ||
+                cleanUrl.contains("googlesyndication", true) ||
+                cleanUrl.contains("doubleclick", true)
             ) return
 
             try {
-                println("ChikiAnimation: dispatching → $finalUrl")
-                val ok = loadExtractor(finalUrl, referer = data, subtitleCallback, callback)
-                if (ok) {
+                println("ChikiAnimation: handleUrl → $cleanUrl (ref=$ref)")
+
+                // Dailymotion branch
+                val dmMatch = Regex(
+                    """(?:dailymotion\.com/(?:embed/)?video/|dai\.ly/)([a-zA-Z0-9]+)"""
+                ).find(cleanUrl)
+                if (dmMatch != null) {
+                    val videoId = dmMatch.groupValues[1]
+                    Dailymotion().getUrl(
+                        "https://www.dailymotion.com/embed/video/$videoId",
+                        ref, subtitleCallback, callback
+                    )
                     found = true
-                } else {
-                    val ok2 = loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
-                    if (ok2) found = true
+                    return
                 }
+
+                // Ghbrisk (StreamWish mirror)
+                if (cleanUrl.contains("ghbrisk.com", true)) {
+                    Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                    found = true
+                    return
+                }
+
+                // Everything else → core registry
+                val ok = loadExtractor(cleanUrl, referer = ref, subtitleCallback, callback)
+                if (ok) found = true
             } catch (e: Exception) {
-                println("ChikiAnimation: extractor threw for $finalUrl — ${e.message}")
+                println("ChikiAnimation: extractor threw for $cleanUrl — ${e.message}")
             }
         }
 
         // ─── Layer 1: mirror dropdown ────────────────────────────────
-        val mirrorSelector = listOf(
-            "select.mirror option",
-            ".mobius option",
-            "select#mirror option",
-            "select[name=mirror] option"
-        ).joinToString(",")
-
-        val mirrorOptions = document.select(mirrorSelector)
-        println("ChikiAnimation: found ${mirrorOptions.size} mirror options")
+        val mirrorOptions = document.select(
+            "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
+        )
+        println("ChikiAnimation: ${mirrorOptions.size} mirror options")
 
         coroutineScope {
             mirrorOptions.map { option ->
@@ -323,7 +305,7 @@ class ChikiAnimationProvider : MainAPI() {
                     if (value.isBlank()) return@async
 
                     if (value.startsWith("http") || value.startsWith("//")) {
-                        invokeExtractor(value)
+                        handleUrl(value, data)
                         return@async
                     }
 
@@ -334,7 +316,6 @@ class ChikiAnimationProvider : MainAPI() {
                             String(Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP))
                         } catch (e2: Exception) { null }
                     }
-
                     if (decoded.isNullOrBlank()) return@async
 
                     try {
@@ -344,18 +325,18 @@ class ChikiAnimationProvider : MainAPI() {
                                     iframe.attr("data-litespeed-src")
                                 }
                             }
-                            if (src.isNotBlank()) invokeExtractor(src)
+                            if (src.isNotBlank()) handleUrl(src, data)
                         }
                     } catch (e: Exception) { }
 
                     Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { m ->
-                        invokeExtractor(m.value)
+                        handleUrl(m.value, data)
                     }
                 }
             }.awaitAll()
         }
 
-        // ─── Layer 2: direct iframes ─────────────────────────────────
+        // ─── Layer 2: iframes ────────────────────────────────────────
         if (!found) {
             document.select("iframe").forEach { iframe ->
                 val src = iframe.attr("src").ifBlank {
@@ -363,7 +344,7 @@ class ChikiAnimationProvider : MainAPI() {
                         iframe.attr("data-litespeed-src")
                     }
                 }
-                if (src.isNotBlank()) invokeExtractor(src)
+                if (src.isNotBlank()) handleUrl(src, data)
             }
         }
 
@@ -373,8 +354,7 @@ class ChikiAnimationProvider : MainAPI() {
                 val body = script.data()
 
                 Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
-                    .findAll(body)
-                    .forEach { m -> invokeExtractor(m.value) }
+                    .findAll(body).forEach { m -> handleUrl(m.value, data) }
 
                 Regex("""['"]([A-Za-z0-9+/=_-]{60,})['"]""").findAll(body).forEach { m ->
                     val blob = m.groupValues[1]
@@ -386,28 +366,17 @@ class ChikiAnimationProvider : MainAPI() {
                         } catch (e2: Exception) { null }
                     }
                     if (decoded.isNullOrBlank()) return@forEach
-                    if (!decoded.contains("http") && !decoded.contains("iframe")) return@forEach
 
                     try {
                         Jsoup.parse(decoded).select("iframe").forEach { iframe ->
                             val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
-                            if (src.isNotBlank()) invokeExtractor(src)
+                            if (src.isNotBlank()) handleUrl(src, data)
                         }
                     } catch (e: Exception) { }
 
                     Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { mm ->
-                        invokeExtractor(mm.value)
+                        handleUrl(mm.value, data)
                     }
-                }
-            }
-        }
-
-        // ─── Layer 4: data-* attributes ──────────────────────────────
-        if (!found) {
-            document.select("[data-embed],[data-src],[data-video],[data-url]").forEach { el ->
-                listOf("data-embed", "data-src", "data-video", "data-url").forEach { attr ->
-                    val u = el.attr(attr).trim()
-                    if (u.startsWith("http") || u.startsWith("//")) invokeExtractor(u)
                 }
             }
         }
