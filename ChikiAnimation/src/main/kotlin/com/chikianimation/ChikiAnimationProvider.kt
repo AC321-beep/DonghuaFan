@@ -12,9 +12,6 @@ import kotlinx.coroutines.coroutineScope
 
 class ChikiAnimationProvider : MainAPI() {
 
-    // ─────────────────────────────────────────────────────────────────
-    // IDENTITY
-    // ─────────────────────────────────────────────────────────────────
     override var mainUrl = "https://chikianimation.com"
     override var name = "ChikiAnimation"
     override val hasMainPage = true
@@ -22,9 +19,6 @@ class ChikiAnimationProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
 
-    // ─────────────────────────────────────────────────────────────────
-    // CATEGORIES
-    // ─────────────────────────────────────────────────────────────────
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update"      to "Recently Updated",
         "anime/?status=&type=movie&order=update" to "Movies",
@@ -36,9 +30,6 @@ class ChikiAnimationProvider : MainAPI() {
         "anime/?status=&type=&order=title"       to "A–Z"
     )
 
-    // ─────────────────────────────────────────────────────────────────
-    // HEADERS
-    // ─────────────────────────────────────────────────────────────────
     private val headers = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) " +
@@ -252,7 +243,11 @@ class ChikiAnimationProvider : MainAPI() {
     }
 
     // ═════════════════════════════════════════════════════════════════
-    // LOAD LINKS
+    // LOAD LINKS — core-only extraction.
+    // Every host (VidHide, Filelions, StreamWish, Rumble, Emturbovid,
+    // Bysekoze, Embedwish, Swhoi, Upns, P2P, and the GalaxyDonghua
+    // extractor in Extractors.kt) is resolved automatically by
+    // Cloudstream's built-in ExtractorApi registry via loadExtractor().
     // ═════════════════════════════════════════════════════════════════
     override suspend fun loadLinks(
         data: String,
@@ -277,26 +272,17 @@ class ChikiAnimationProvider : MainAPI() {
             ) return
 
             try {
-                when {
-                    "p2pstream.vip" in finalUrl -> P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "upns.live" in finalUrl -> UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "bysekoze.com" in finalUrl -> Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "embedwish" in finalUrl -> Embedwish().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "filelions" in finalUrl -> Filelions().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "swhoi" in finalUrl -> Swhoi().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "vidhide" in finalUrl -> VidHidePro5().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    else -> loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
-                }
+                loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
                 found = true
             } catch (e: Exception) {
-                // Swallow — one broken mirror shouldn't kill the request
+                // one broken mirror shouldn't kill the request
             }
         }
 
-        // 1. Base64 mirror dropdown
-        val mirrors = document.select("select.mirror option, .mobius option, select#mirror option")
+        // 1) base64-encoded mirror dropdown
+        val mirrors = document.select(
+            "select.mirror option, .mobius option, select#mirror option"
+        )
         coroutineScope {
             mirrors.map { option ->
                 async {
@@ -307,7 +293,10 @@ class ChikiAnimationProvider : MainAPI() {
                         String(Base64.decode(value, Base64.DEFAULT))
                     } catch (e: Exception) { return@async }
 
-                    val decodedDoc = try { Jsoup.parse(decoded) } catch (e: Exception) { return@async }
+                    val decodedDoc = try {
+                        Jsoup.parse(decoded)
+                    } catch (e: Exception) { return@async }
+
                     decodedDoc.select("iframe[src]").forEach { iframe ->
                         invokeExtractor(iframe.attr("src"))
                     }
@@ -321,12 +310,12 @@ class ChikiAnimationProvider : MainAPI() {
             }.awaitAll()
         }
 
-        // 2. Direct iframes
+        // 2) direct iframes
         document.select("iframe[src]").forEach { iframe ->
             invokeExtractor(iframe.attr("src"))
         }
 
-        // 3. Inline script fallback
+        // 3) inline script fallback
         document.select("script").forEach { script ->
             val body = script.data()
             Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
