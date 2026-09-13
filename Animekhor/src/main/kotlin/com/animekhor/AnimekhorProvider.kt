@@ -126,31 +126,24 @@ class AnimekhorProvider : MainAPI() {
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl.trim()
             
-            // Normalize protocol
             if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
             if (!finalUrl.startsWith("http")) finalUrl = "https://$finalUrl"
 
-            // Normalize ok.ru before routing
             if (finalUrl.contains("ok.ru") || finalUrl.contains("odnoklassniki.ru")) {
                 val okId = Regex("""/video(?:embed)?/(\d+)""").find(finalUrl)?.groupValues?.get(1) ?: finalUrl.substringAfterLast("/")
                 finalUrl = "https://ok.ru/videoembed/$okId"
             }
 
-            // Deduplicate Extractors to prevent infinite loops
             if (!extractedUrls.add(finalUrl)) return
 
-            // ==========================================================
-            // STEP 1: ALWAYS ATTEMPT NATIVE CLOUDSTREAM CORE EXTRACTOR
-            // ==========================================================
+            // Native Cloudstream execution
             try {
                 loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
             } catch (e: Exception) {
                 Log.e("AnimeKhor", "Native extraction failed for $finalUrl: ${e.message}")
             }
 
-            // ==========================================================
-            // STEP 2: RUN CUSTOM EXTRACTORS (AS FALLBACK & SUPPLEMENT)
-            // ==========================================================
+            // Custom Fallback execution
             try {
                 when {
                     "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> OkRuCustom().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
@@ -170,7 +163,7 @@ class AnimekhorProvider : MainAPI() {
             }
         }
 
-        // DOM Parsing (Handles Base64, Raw URL, and Raw HTML)
+        // STRATEGY 1: Base64 and HTML parsing from selectors
         val serverElements = document.select(".mobius option, select.mirror option, .server-list li a[data-embed], .server-list li a[data-em]")
         coroutineScope {
             serverElements.map { server ->
@@ -201,7 +194,7 @@ class AnimekhorProvider : MainAPI() {
             }.awaitAll()
         }
 
-        // AJAX Interception (Handles JSON responses)
+        // STRATEGY 2: AJAX Interception with pure Regex (Fixes AbyssPlayer missing links)
         val ajaxElements = document.select("ul#episode-nav li[data-post], .mobius li[data-post], .server-list li[data-post]")
         if (ajaxElements.isNotEmpty()) {
             val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
@@ -222,21 +215,19 @@ class AnimekhorProvider : MainAPI() {
                             val headers = mapOf("X-Requested-With" to "XMLHttpRequest")
                             val response = try { app.post(ajaxUrl, data = form, referer = data, headers = headers).text } catch(e: Exception) { "" }
                             
-                            val iframeSrc = if (response.contains("embed_url")) {
-                                val embedUrl = Regex(""""embed_url"\s*:\s*"([^"]+)"""").find(response)?.groupValues?.get(1)?.replace("\\", "")
-                                Jsoup.parse(embedUrl ?: "").selectFirst("iframe")?.attr("src") ?: embedUrl
-                            } else {
-                                Jsoup.parse(response).selectFirst("iframe")?.attr("src") ?: Regex("""src=["'](.*?)["']""").find(response)?.groupValues?.get(1)
+                            // Aggressive regex to pull URLs like "https:\/\/abyssplayer.com\/caZjqQVVn" out of JSON payloads
+                            val rawExtractedUrl = Regex("""https?:[\\/]+[^"'\s\\]+""").find(response)?.value
+                            if (rawExtractedUrl != null) {
+                                val cleanIframeSrc = rawExtractedUrl.replace("\\/", "/")
+                                invokeExtractor(cleanIframeSrc, element.text().trim())
                             }
-                                
-                            if (!iframeSrc.isNullOrBlank()) invokeExtractor(iframeSrc, element.text().trim())
                         }
                     }
                 }.awaitAll()
             }
         }
 
-        // Fallback: Grab any raw iframes already rendered in the DOM
+        // STRATEGY 3: Fallback - grab raw iframes directly embedded in the DOM
         document.select("#embed_holder iframe, .playerx iframe, .video-content iframe").forEach { iframe ->
             val src = iframe.attr("src")
             if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
