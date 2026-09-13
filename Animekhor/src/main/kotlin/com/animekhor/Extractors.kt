@@ -12,28 +12,17 @@ import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
-import org.jsoup.parser.Parser
 import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-private suspend fun manualJsUnpackExtraction(
-    url: String,
-    name: String,
-    headers: Map<String, String>,
-    callback: (ExtractorLink) -> Unit
-) {
+private suspend fun manualJsUnpackExtraction(url: String, name: String, headers: Map<String, String>, callback: (ExtractorLink) -> Unit) {
     val safeHeaders = headers.toMutableMap()
-    if (!safeHeaders.containsKey("User-Agent")) {
-        safeHeaders["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
-    }
-
+    if (!safeHeaders.containsKey("User-Agent")) safeHeaders["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
     val response = try { app.get(url, headers = safeHeaders).text } catch (e: Exception) { return }
-    
     val packedScript = Regex("""eval\(\s*function\s*\(p,a,c,k,e,[a-zA-Z0-9_]\).*?split\('\|'\).*?\)""").find(response)?.value
     val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
-
     val m3u8Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
     val m3u8 = m3u8Regex.find(unpacked)?.groupValues?.get(1) ?: Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(unpacked)?.groupValues?.get(1)
 
@@ -43,7 +32,6 @@ private suspend fun manualJsUnpackExtraction(
     } else {
         val mp4Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.(?:mp4|mkv)[^"']*)["']""", RegexOption.IGNORE_CASE)
         val mp4 = mp4Regex.find(unpacked)?.groupValues?.get(1) ?: Regex("""(https?://[^"']+\.(?:mp4|mkv)[^"']*)""").find(unpacked)?.groupValues?.get(1)
-            
         if (mp4 != null) {
             val cleanMp4 = mp4.replace("\\/", "/")
             callback.invoke(newExtractorLink(name = name, source = name, url = cleanMp4, type = INFER_TYPE) { this.referer = url })
@@ -57,32 +45,34 @@ class OkRuCustom : ExtractorApi() {
     override val requiresReferer = false
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        // ---> TRACER INJECTION <---
-        Log.d("OkRuTracer", "OkRuCustom triggered for URL: $url")
-        
         try {
-            val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            val document = app.get(url, headers = headers).document
-            
-            val dataOptionsAttr = document.selectFirst("div[data-options]")?.attr("data-options") ?: return
-            val jsonStr = Parser.unescapeEntities(dataOptionsAttr, true)
+            val id = Regex("""/video(?:embed)?/(\d+)""").find(url)?.groupValues?.get(1) ?: url.substringAfterLast("/").substringBefore("?")
+            if (id.isBlank()) {
+                Log.e("OkRuCustom", "Failed to parse Video ID from URL: $url")
+                return
+            }
+
+            // Direct API Bypass - Avoids slow HTML parsing and restriction blocks
+            val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id"
+            val jsonStr = app.post(apiUrl).text
+
+            if (!jsonStr.startsWith("{")) {
+                Log.e("OkRuCustom", "Backend API returned non-JSON string. Layout may have changed.")
+                return
+            }
+
             val json = JSONObject(jsonStr)
-
             val hlsUrl = json.optString("hlsManifestUrl")
-            val dashUrl = json.optString("dashManifestUrl")
-            val videos = json.optJSONArray("videos")
-            
-            // ---> TRACER INJECTION <---
-            Log.d("OkRuTracer", "Parsed JSON successfully. Found HLS: ${hlsUrl.isNotBlank()}, Found DASH: ${dashUrl.isNotBlank()}, MP4 arrays: ${videos?.length() ?: 0}")
-
             if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
-                M3u8Helper.generateM3u8(name, hlsUrl, url).forEach(callback)
+                M3u8Helper.generateM3u8(name, hlsUrl.replace("\\u0026", "&").replace("\\/", "/"), url).forEach(callback)
             }
 
+            val dashUrl = json.optString("dashManifestUrl")
             if (dashUrl.isNotBlank() && !dashUrl.contains("usr_login")) {
-                callback(newExtractorLink(name = name, source = "$name DASH", url = dashUrl, type = com.lagradost.cloudstream3.utils.ExtractorLinkType.DASH) { this.referer = "https://ok.ru/" })
+                callback(newExtractorLink(name = name, source = "$name DASH", url = dashUrl.replace("\\u0026", "&").replace("\\/", "/"), type = com.lagradost.cloudstream3.utils.ExtractorLinkType.DASH) { this.referer = "https://ok.ru/" })
             }
 
+            val videos = json.optJSONArray("videos")
             if (videos != null) {
                 for (i in 0 until videos.length()) {
                     val video = videos.getJSONObject(i)
@@ -101,14 +91,16 @@ class OkRuCustom : ExtractorApi() {
                         else -> Qualities.Unknown.value
                     }
                     
-                    callback(newExtractorLink(name = this.name, source = "${this.name} $qName", url = vidUrl, type = INFER_TYPE) {
+                    callback(newExtractorLink(name = this.name, source = "${this.name} $qName", url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"), type = INFER_TYPE) {
                         this.referer = "https://ok.ru/"
                         this.quality = qualityValue
                     })
                 }
+            } else {
+                Log.e("OkRuCustom", "Videos array was null. API response missing streams.")
             }
         } catch (e: Exception) {
-            Log.e("OkRuTracer", "OkRu extraction crashed: ${e.message}")
+            Log.e("OkRuCustom", "Extraction crashed: ${e.message}")
         }
     }
 }
@@ -119,21 +111,19 @@ class AbyssPlayer : ExtractorApi() {
     override val requiresReferer = true
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        // ---> TRACER INJECTION <---
-        Log.d("AbyssTracer", "AbyssPlayer triggered for URL: $url")
-        
-        val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36", "Referer" to (referer ?: mainUrl))
-        val response = try { app.get(url, headers = headers).text } catch (e: Exception) { return }
-
         try {
-            val encodedDataMatch = Regex("""const\s+datas\s*=\s*["']([^"']+)["']""").find(response)
+            val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36", "Referer" to (referer ?: mainUrl))
+            val response = app.get(url, headers = headers).text
+
+            // Broadened regex to capture datas regardless of var/let/const
+            val encodedDataMatch = Regex("""datas\s*=\s*["']([^"']+)["']""").find(response)
+            if (encodedDataMatch == null) {
+                Log.e("AbyssPlayer", "Failed to find 'datas' AES payload in HTML.")
+                return
+            }
             
-            // ---> TRACER INJECTION <---
-            Log.d("AbyssTracer", "AES Payload Match Found: ${encodedDataMatch != null}")
-            
-            val encodedData = encodedDataMatch?.groupValues?.get(1) ?: return
-            
-            val decodedJsonBytes = Base64.decode(encodedData, Base64.NO_WRAP)
+            val encodedData = encodedDataMatch.groupValues[1]
+            val decodedJsonBytes = Base64.decode(encodedData, Base64.DEFAULT)
             val decodedJsonString = String(decodedJsonBytes, Charsets.ISO_8859_1) 
             val data = JSONObject(decodedJsonString)
             
@@ -157,18 +147,17 @@ class AbyssPlayer : ExtractorApi() {
 
             val videoUrl = metaData.optString("url").ifBlank { metaData.optString("file") }.replace("\\/", "/")
             
-            // ---> TRACER INJECTION <---
-            Log.d("AbyssTracer", "Successfully decrypted URL: $videoUrl")
-            
             if (videoUrl.isNotBlank()) {
                 if (videoUrl.contains(".m3u8") || metaData.optString("type").contains("hls", true)) {
                     M3u8Helper.generateM3u8(name, videoUrl, url, headers = headers).forEach(callback)
                 } else {
                     callback(newExtractorLink(name = name, source = name, url = videoUrl, type = INFER_TYPE) { this.referer = url })
                 }
+            } else {
+                Log.e("AbyssPlayer", "Decryption succeeded, but returned video URL was empty.")
             }
         } catch (e: Exception) {
-            Log.e("AbyssTracer", "AES Decryption crashed: ${e.message}")
+            Log.e("AbyssPlayer", "AES Decryption crashed: ${e.message}")
         }
     }
 }
