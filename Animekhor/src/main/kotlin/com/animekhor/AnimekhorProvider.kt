@@ -135,33 +135,41 @@ class AnimekhorProvider : MainAPI() {
                 finalUrl = "https://ok.ru/videoembed/$okId"
             }
 
-            // Deduplicate Extractors 
+            // Deduplicate Extractors to prevent infinite loops
             if (!extractedUrls.add(finalUrl)) return
 
-            when {
-                // Route to our Custom Ok.ru extractor
-                "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> OkRuCustom().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                
-                // Custom Built Extractors
-                "p2pstream" in finalUrl -> P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "upns.live" in finalUrl -> UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "bysekoze.com" in finalUrl -> Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "abyssplayer.com" in finalUrl -> AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                
-                // Wish/Hide Clones
-                "embedwish" in finalUrl -> Embedwish().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "filelions" in finalUrl -> Filelions().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "swhoi" in finalUrl -> Swhoi().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                "vidhide" in finalUrl -> VidHidePro5().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                
-                // Pass everything else to Native Cloudstream Core (Dailymotion, Dood, etc.)
-                else -> loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
+            // ==========================================================
+            // STEP 1: ALWAYS ATTEMPT NATIVE CLOUDSTREAM CORE EXTRACTOR
+            // ==========================================================
+            try {
+                loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
+            } catch (e: Exception) {
+                Log.e("AnimeKhor", "Native extraction failed for $finalUrl: ${e.message}")
+            }
+
+            // ==========================================================
+            // STEP 2: RUN CUSTOM EXTRACTORS (AS FALLBACK & SUPPLEMENT)
+            // ==========================================================
+            try {
+                when {
+                    "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> OkRuCustom().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                    "p2pstream" in finalUrl -> P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                    "upns.live" in finalUrl -> UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                    "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                    "bysekoze.com" in finalUrl -> Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                    "abyssplayer.com" in finalUrl -> AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                    "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                    "embedwish" in finalUrl -> Embedwish().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                    "filelions" in finalUrl -> Filelions().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                    "swhoi" in finalUrl -> Swhoi().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                    "vidhide" in finalUrl -> VidHidePro5().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                }
+            } catch (e: Exception) {
+                Log.e("AnimeKhor", "Custom extraction failed for $finalUrl: ${e.message}")
             }
         }
 
-        // STRATEGY 1: Intelligent DOM Parsing (Handles Base64, Raw URL, and Raw HTML)
+        // DOM Parsing (Handles Base64, Raw URL, and Raw HTML)
         val serverElements = document.select(".mobius option, select.mirror option, .server-list li a[data-embed], .server-list li a[data-em]")
         coroutineScope {
             serverElements.map { server ->
@@ -174,13 +182,10 @@ class AnimekhorProvider : MainAPI() {
                         var iframeSrc = ""
                         
                         if (rawData.startsWith("http") || rawData.startsWith("//")) {
-                            // It's a raw URL
                             iframeSrc = rawData
                         } else if (rawData.startsWith("<iframe", ignoreCase = true)) {
-                            // It's raw HTML
                             iframeSrc = Jsoup.parse(rawData).selectFirst("iframe")?.attr("src") ?: ""
                         } else {
-                            // It's Base64
                             try {
                                 val decoded = String(Base64.decode(rawData, Base64.DEFAULT))
                                 iframeSrc = if (decoded.contains("<iframe", ignoreCase = true)) {
@@ -195,7 +200,7 @@ class AnimekhorProvider : MainAPI() {
             }.awaitAll()
         }
 
-        // STRATEGY 2: AJAX Interception (Handles JSON responses)
+        // AJAX Interception (Handles JSON responses)
         val ajaxElements = document.select("ul#episode-nav li[data-post], .mobius li[data-post], .server-list li[data-post]")
         if (ajaxElements.isNotEmpty()) {
             val ajaxUrl = "$mainUrl/wp-admin/admin-ajax.php"
@@ -230,7 +235,7 @@ class AnimekhorProvider : MainAPI() {
             }
         }
 
-        // STRATEGY 3: Fallback - grab raw iframes floating in the DOM
+        // Fallback: Grab any raw iframes already rendered in the DOM
         document.select("#embed_holder iframe, .playerx iframe, .video-content iframe").forEach { iframe ->
             val src = iframe.attr("src")
             if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
