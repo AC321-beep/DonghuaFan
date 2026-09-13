@@ -31,8 +31,8 @@ private suspend fun manualJsUnpackExtraction(
 
     val response = try { app.get(url, headers = safeHeaders).text } catch (e: Exception) { return }
     
-    // 1. Try unpacking standard eval scripts
-    val packedScript = Regex("""eval\(function\(p,a,c,k,e,d\).*?split\('\|'\).*?\)""").find(response)?.value
+    // 1. Try unpacking standard eval scripts (Loosened Regex to catch more variations)
+    val packedScript = Regex("""eval\(\s*function\s*\(p,a,c,k,e,[a-zA-Z0-9_]\).*?split\('\|'\).*?\)""").find(response)?.value
     val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
 
     // 2. Broad Regex to catch file:, src:, source:, or just raw links in the DOM
@@ -49,9 +49,9 @@ private suspend fun manualJsUnpackExtraction(
         ).forEach(callback)
     } else {
         // Fallback for raw mp4 files if m3u8 is not found
-        val mp4Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.mp4[^"']*)["']""", RegexOption.IGNORE_CASE)
+        val mp4Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.(?:mp4|mkv)[^"']*)["']""", RegexOption.IGNORE_CASE)
         val mp4 = mp4Regex.find(unpacked)?.groupValues?.get(1)
-            ?: Regex("""(https?://[^"']+\.mp4[^"']*)""").find(unpacked)?.groupValues?.get(1)
+            ?: Regex("""(https?://[^"']+\.(?:mp4|mkv)[^"']*)""").find(unpacked)?.groupValues?.get(1)
             
         if (mp4 != null) {
             callback.invoke(
@@ -77,7 +77,8 @@ class Embedwish : StreamWishExtractor() {
     override var mainUrl = "https://embedwish.com"
 }
 
-class Filelions : VidhideExtractor() {
+// FIX: Filelions is a StreamWish clone, not a Vidhide clone
+class Filelions : StreamWishExtractor() {
     override var name = "Filelions"
     override var mainUrl = "https://filelions.live"
 }
@@ -95,7 +96,7 @@ class VidHidePro5 : VidHidePro() {
 }
 
 // ============================================================================
-// DIRECT CUSTOM EXTRACTORS (No try/catch traps. Direct execution only.)
+// DIRECT CUSTOM EXTRACTORS
 // ============================================================================
 
 class P2pstream : ExtractorApi() {
@@ -165,7 +166,7 @@ class AbyssPlayer : ExtractorApi() {
 }
 
 // ============================================================================
-// EMTURBOVID (VERBATIM - DO NOT ALTER)
+// EMTURBOVID
 // ============================================================================
 
 class Emturbovid : ExtractorApi() {
@@ -189,7 +190,7 @@ class Emturbovid : ExtractorApi() {
 }
 
 // ============================================================================
-// RUMBLE (VERBATIM - DO NOT ALTER)
+// RUMBLE
 // ============================================================================
 
 class Rumble : ExtractorApi() {
@@ -213,7 +214,6 @@ class Rumble : ExtractorApi() {
 
         val scrapedUrls = mutableSetOf<String>()
 
-        // 1. Unified Regex: Captures both standard and JSON-escaped URLs safely
         val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
         val matches = urlRegex.findAll(html)
 
@@ -221,7 +221,6 @@ class Rumble : ExtractorApi() {
             val rawUrl = match.value
             val cleanUrl = rawUrl.replace("\\/", "/")
 
-            // 2. The Quarantine Filter: Skips UI/tracker assets so ExoPlayer doesn't crash
             if (cleanUrl.contains("/assets/", ignoreCase = true) ||
                 cleanUrl.contains("loop", ignoreCase = true) ||
                 cleanUrl.contains("preview", ignoreCase = true) ||
@@ -232,11 +231,8 @@ class Rumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8")) {
-                    // M3u8Helper automatically handles HLS playlists in modern Cloudstream
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
-                    
                 } else if (cleanUrl.contains(".mp4")) {
-                    // 3. Smart Quality Locator: Reads raw HTML before the URL
                     val startIndex = Math.max(0, match.range.first - 150)
                     val precedingText = html.substring(startIndex, match.range.first)
 
@@ -252,7 +248,6 @@ class Rumble : ExtractorApi() {
                         qualityInt = qStr.toIntOrNull() ?: Qualities.Unknown.value
                     }
 
-                    // 4. The Fix: Using the newExtractorLink builder and lambda block
                     callback(
                         newExtractorLink(
                             name = name,
