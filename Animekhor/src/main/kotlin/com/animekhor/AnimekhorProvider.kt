@@ -47,7 +47,6 @@ class AnimekhorProvider : MainAPI() {
         
         return newMovieSearchResponse(title, href, TvType.Movie) { 
             this.posterUrl = posterUrl
-            this.posterHeaders = mapOf("Referer" to mainUrl)
         }
     }
 
@@ -78,7 +77,7 @@ class AnimekhorProvider : MainAPI() {
             return newMovieLoadResponse(title, url, TvType.Movie, href) {
                 this.posterUrl = poster
                 this.plot = description
-                this.posterHeaders = mapOf("Referer" to mainUrl)
+                this.posterHeaders = mapOf("Referer" to mainUrl) // Supported in LoadResponse
             }
         } else {
             var epListElements = document.select(".episodelist li, .eplister li")
@@ -99,7 +98,6 @@ class AnimekhorProvider : MainAPI() {
                 newEpisode(href) {
                     this.name = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText
                     this.posterUrl = poster
-                    this.posterHeaders = mapOf("Referer" to mainUrl)
                     if (!dateText.isNullOrBlank()) { 
                         this.addDate(dateText, format = "MMMM d, yyyy")
                         this.description = dateText
@@ -110,7 +108,7 @@ class AnimekhorProvider : MainAPI() {
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
                 this.plot = description
-                this.posterHeaders = mapOf("Referer" to mainUrl)
+                this.posterHeaders = mapOf("Referer" to mainUrl) // Supported in LoadResponse
             }
         }
     }
@@ -159,7 +157,7 @@ class AnimekhorProvider : MainAPI() {
         val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|abyssplayer\.com|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com)[^"'\s<>]+""")
         globalUrlRegex.findAll(rawHtml).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
-            invokeExtractor(cleanUrl, "Raw HTML Scan")
+            invokeExtractor(cleanUrl, "Raw Scan")
         }
 
         // STRATEGY 2: BASE64 AND SELECTOR PARSING
