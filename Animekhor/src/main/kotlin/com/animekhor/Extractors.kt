@@ -1,7 +1,7 @@
 package com.animekhor
 
 import android.util.Base64
-import com.lagradost.api.Log
+import android.util.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
@@ -30,11 +30,9 @@ private suspend fun manualJsUnpackExtraction(
 
     val response = try { app.get(url, headers = safeHeaders).text } catch (e: Exception) { return }
     
-    // 1. Try unpacking standard eval scripts
     val packedScript = Regex("""eval\(\s*function\s*\(p,a,c,k,e,[a-zA-Z0-9_]\).*?split\('\|'\).*?\)""").find(response)?.value
     val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
 
-    // 2. Broad Regex to catch file:, src:, source:, or raw links in the DOM (m3u8)
     val m3u8Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
     val m3u8 = m3u8Regex.find(unpacked)?.groupValues?.get(1) 
         ?: Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(unpacked)?.groupValues?.get(1)
@@ -48,7 +46,6 @@ private suspend fun manualJsUnpackExtraction(
             headers = safeHeaders
         ).forEach(callback)
     } else {
-        // Fallback for raw mp4/mkv files
         val mp4Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.(?:mp4|mkv)[^"']*)["']""", RegexOption.IGNORE_CASE)
         val mp4 = mp4Regex.find(unpacked)?.groupValues?.get(1)
             ?: Regex("""(https?://[^"']+\.(?:mp4|mkv)[^"']*)""").find(unpacked)?.groupValues?.get(1)
@@ -70,7 +67,7 @@ private suspend fun manualJsUnpackExtraction(
 }
 
 // ============================================================================
-// CUSTOM OK.RU EXTRACTOR (Fixes Error 2004 & Restores 1080p/720p)
+// CUSTOM OK.RU EXTRACTOR (Fixes Error 2004 & Avoids Restricted Links)
 // ============================================================================
 class OkRuCustom : ExtractorApi() {
     override val name = "OkRu Custom"
@@ -81,32 +78,18 @@ class OkRuCustom : ExtractorApi() {
         try {
             val html = app.get(url).text
             
-            // Extract the embedded JSON string inside data-options
-            val dataOptionsStr = Regex("""data-options=(?:"|')(\{(?:.*?|\\+.)\})(?:"|')""").find(html)?.groupValues?.get(1)
-                ?.replace("&quot;", "\"")
-                ?: Regex("""data-options\s*=\s*'(\{.*?\})'""").find(html)?.groupValues?.get(1)
-                ?: return
+            // 1. Aggressive regex to find HLS/DASH links anywhere in the ok.ru source code
+            val hlsUrlRaw = Regex("""(?:\\"|")hlsManifestUrl(?:\\"|")\s*:\s*(?:\\"|")([^"\\]+)(?:\\"|")""").find(html)?.groupValues?.get(1)
+            val dashUrlRaw = Regex("""(?:\\"|")dashManifestUrl(?:\\"|")\s*:\s*(?:\\"|")([^"\\]+)(?:\\"|")""").find(html)?.groupValues?.get(1)
 
-            // STRATEGY A: Extract HLS Manifest. OK.ru delivers HD video via HLS/DASH, not MP4.
-            val hlsMatch = Regex("""(?:\\"|")hlsManifestUrl(?:\\"|")\s*:\s*(?:\\"|")([^"\\]+)(?:\\"|")""").find(dataOptionsStr)
-            if (hlsMatch != null) {
-                val hlsUrl = hlsMatch.groupValues[1]
-                    .replace("\\u0026", "&")
-                    .replace("&amp;", "&")
-                    .replace("\\/", "/")
-                
+            if (hlsUrlRaw != null && !hlsUrlRaw.contains("usr_login")) {
+                val hlsUrl = hlsUrlRaw.replace("\\u0026", "&").replace("&amp;", "&").replace("\\/", "/")
                 M3u8Helper.generateM3u8(name, hlsUrl, url).forEach(callback)
                 return 
             }
 
-            // STRATEGY B: Extract DASH Manifest
-            val dashMatch = Regex("""(?:\\"|")dashManifestUrl(?:\\"|")\s*:\s*(?:\\"|")([^"\\]+)(?:\\"|")""").find(dataOptionsStr)
-            if (dashMatch != null) {
-                val dashUrl = dashMatch.groupValues[1]
-                    .replace("\\u0026", "&")
-                    .replace("&amp;", "&")
-                    .replace("\\/", "/")
-                
+            if (dashUrlRaw != null && !dashUrlRaw.contains("usr_login")) {
+                val dashUrl = dashUrlRaw.replace("\\u0026", "&").replace("&amp;", "&").replace("\\/", "/")
                 callback(
                     newExtractorLink(
                         name = name,
@@ -120,17 +103,15 @@ class OkRuCustom : ExtractorApi() {
                 return 
             }
 
-            // STRATEGY C: Fallback to individual MP4s
+            // 2. Fallback to raw MP4 arrays if HLS/DASH manifests are missing
             val videoRegex = Regex("""(?:\\"|")name(?:\\"|")\s*:\s*(?:\\"|")([^"\\]+)(?:\\"|").*?(?:\\"|")url(?:\\"|")\s*:\s*(?:\\"|")([^"\\]+)(?:\\"|")""")
-            val matches = videoRegex.findAll(dataOptionsStr)
-            
-            matches.forEach { match ->
+            videoRegex.findAll(html).forEach { match ->
                 val qName = match.groupValues[1]
-                val vidUrl = match.groupValues[2]
-                    .replace("\\u0026", "&")
-                    .replace("&amp;", "&")
-                    .replace("\\/", "/") 
+                val vidUrl = match.groupValues[2].replace("\\u0026", "&").replace("&amp;", "&").replace("\\/", "/") 
                 
+                // Block restricted login links from crashing ExoPlayer (Error 2004)
+                if (vidUrl.contains("usr_login")) return@forEach
+
                 val qualityValue = when (qName) {
                     "mobile" -> Qualities.P144.value
                     "lowest" -> Qualities.P240.value
@@ -143,8 +124,8 @@ class OkRuCustom : ExtractorApi() {
                 
                 callback(
                     newExtractorLink(
-                        name = name,
-                        source = "$name $qName",
+                        name = this@OkRuCustom.name,
+                        source = "${this@OkRuCustom.name} $qName",
                         url = vidUrl,
                         type = INFER_TYPE
                     ) {
@@ -160,7 +141,7 @@ class OkRuCustom : ExtractorApi() {
 }
 
 // ============================================================================
-// ADVANCED ABYSS PLAYER EXTRACTOR (Bypasses layered obfuscation)
+// ADVANCED ABYSS PLAYER EXTRACTOR
 // ============================================================================
 class AbyssPlayer : ExtractorApi() {
     override var name = "AbyssPlayer"
@@ -180,11 +161,9 @@ class AbyssPlayer : ExtractorApi() {
         
         val response = try { app.get(url, headers = headers).text } catch (e: Exception) { return }
 
-        // Abyss relies on layered JS obfuscation. Unpack it first.
         val packedScript = Regex("""eval\(\s*function\s*\(p,a,c,k,e,[a-zA-Z0-9_]\).*?split\('\|'\).*?\)""").find(response)?.value
         val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
 
-        // Abyss stores the final sources in a JSON structure like: sources: [{"file":"https:..."}]
         val fileRegex = Regex("""(?:file|src|url)\s*[:=]\s*["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""", RegexOption.IGNORE_CASE)
         val matches = fileRegex.findAll(unpacked).toList()
 
@@ -209,7 +188,6 @@ class AbyssPlayer : ExtractorApi() {
                 }
             }
         } else {
-            // Alternative Abyss extraction: Sometimes the source is embedded in a base64 JSON string.
             val jsonConfigRegex = Regex("""JSON\.parse\(['"]([A-Za-z0-9+/=]+)['"]\)""")
             val jsonMatch = jsonConfigRegex.find(unpacked)
             
@@ -236,7 +214,7 @@ class AbyssPlayer : ExtractorApi() {
                         }
                     }
                 } catch (e: Exception) {
-                    Log.e("Abyss", "Failed to parse inner config base64")
+                    Log.e("AbyssPlayer", "Failed to parse inner config base64")
                 }
             }
         }
