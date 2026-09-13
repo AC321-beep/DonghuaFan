@@ -45,7 +45,10 @@ class AnimekhorProvider : MainAPI() {
             this.selectFirst("img")?.let { img -> img.attr("data-src").ifEmpty { img.attr("src") }.ifEmpty { img.attr("data-lazy-src") } }
         )
         
-        return newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = posterUrl }
+        return newMovieSearchResponse(title, href, TvType.Movie) { 
+            this.posterUrl = posterUrl
+            this.posterHeaders = mapOf("Referer" to mainUrl)
+        }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -75,6 +78,7 @@ class AnimekhorProvider : MainAPI() {
             return newMovieLoadResponse(title, url, TvType.Movie, href) {
                 this.posterUrl = poster
                 this.plot = description
+                this.posterHeaders = mapOf("Referer" to mainUrl)
             }
         } else {
             var epListElements = document.select(".episodelist li, .eplister li")
@@ -95,6 +99,7 @@ class AnimekhorProvider : MainAPI() {
                 newEpisode(href) {
                     this.name = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText
                     this.posterUrl = poster
+                    this.posterHeaders = mapOf("Referer" to mainUrl)
                     if (!dateText.isNullOrBlank()) { 
                         this.addDate(dateText, format = "MMMM d, yyyy")
                         this.description = dateText
@@ -105,6 +110,7 @@ class AnimekhorProvider : MainAPI() {
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
                 this.plot = description
+                this.posterHeaders = mapOf("Referer" to mainUrl)
             }
         }
     }
@@ -130,6 +136,9 @@ class AnimekhorProvider : MainAPI() {
 
             if (!extractedUrls.add(finalUrl)) return
 
+            // ---> TRACER INJECTION <---
+            Log.d("AnimeKhorTracer", "Provider routing URL to extractors: $finalUrl | Label: $label")
+
             try { loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback) } catch (e: Exception) { Log.e("AnimeKhor", "Native extraction failed: ${e.message}") }
 
             try {
@@ -147,10 +156,10 @@ class AnimekhorProvider : MainAPI() {
 
         // STRATEGY 1: NUCLEAR RAW HTML SCAN
         val rawHtml = document.html()
-        val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|abyssplayer\.com|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com|embedwish\.com|filelions\.live|swhoi\.com|vidhidevip\.com)[^"'\s<>]+""")
+        val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|abyssplayer\.com|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com)[^"'\s<>]+""")
         globalUrlRegex.findAll(rawHtml).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
-            invokeExtractor(cleanUrl, "Raw Source")
+            invokeExtractor(cleanUrl, "Raw HTML Scan")
         }
 
         // STRATEGY 2: BASE64 AND SELECTOR PARSING
@@ -214,6 +223,7 @@ class AnimekhorProvider : MainAPI() {
             }
         }
 
+        Log.d("AnimeKhorTracer", "Total unique URLs sent to extractors: ${extractedUrls.size}")
         return true
     }
 }
