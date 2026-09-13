@@ -40,7 +40,7 @@ private suspend fun manualJsUnpackExtraction(
         ?: Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(unpacked)?.groupValues?.get(1)
 
     if (m3u8 != null) {
-        val cleanM3u8 = m3u8.replace("\\/", "/") // Fix escaped JSON slashes
+        val cleanM3u8 = m3u8.replace("\\/", "/")
         M3u8Helper.generateM3u8(
             source = name,
             streamUrl = cleanM3u8,
@@ -70,10 +70,10 @@ private suspend fun manualJsUnpackExtraction(
 }
 
 // ============================================================================
-// CUSTOM OK.RU EXTRACTOR (Bypasses Native Cloudstream Bugs)
+// CUSTOM OK.RU EXTRACTOR (Fixes Error 2004 & Restores 1080p/720p)
 // ============================================================================
 class OkRuCustom : ExtractorApi() {
-    override val name = "OkRu"
+    override val name = "OkRu Custom"
     override val mainUrl = "https://ok.ru"
     override val requiresReferer = false
 
@@ -83,19 +83,53 @@ class OkRuCustom : ExtractorApi() {
             
             // Extract the embedded JSON string inside data-options
             val dataOptionsStr = Regex("""data-options=(?:"|')(\{(?:.*?|\\+.)\})(?:"|')""").find(html)?.groupValues?.get(1)
+                ?.replace("&quot;", "\"")
                 ?: Regex("""data-options\s*=\s*'(\{.*?\})'""").find(html)?.groupValues?.get(1)
                 ?: return
 
-            // Decode HTML entities
-            val cleanData = dataOptionsStr.replace("&quot;", "\"")
-            
-            // Regex to safely parse out the "videos" array
+            // STRATEGY A: Extract HLS Manifest. OK.ru delivers HD video via HLS/DASH, not MP4.
+            val hlsMatch = Regex("""(?:\\"|")hlsManifestUrl(?:\\"|")\s*:\s*(?:\\"|")([^"\\]+)(?:\\"|")""").find(dataOptionsStr)
+            if (hlsMatch != null) {
+                val hlsUrl = hlsMatch.groupValues[1]
+                    .replace("\\u0026", "&")
+                    .replace("&amp;", "&")
+                    .replace("\\/", "/")
+                
+                M3u8Helper.generateM3u8(name, hlsUrl, url).forEach(callback)
+                return 
+            }
+
+            // STRATEGY B: Extract DASH Manifest
+            val dashMatch = Regex("""(?:\\"|")dashManifestUrl(?:\\"|")\s*:\s*(?:\\"|")([^"\\]+)(?:\\"|")""").find(dataOptionsStr)
+            if (dashMatch != null) {
+                val dashUrl = dashMatch.groupValues[1]
+                    .replace("\\u0026", "&")
+                    .replace("&amp;", "&")
+                    .replace("\\/", "/")
+                
+                callback(
+                    newExtractorLink(
+                        name = name,
+                        source = "$name DASH",
+                        url = dashUrl,
+                        type = com.lagradost.cloudstream3.utils.ExtractorLinkType.DASH
+                    ) {
+                        this.referer = "https://ok.ru/"
+                    }
+                )
+                return 
+            }
+
+            // STRATEGY C: Fallback to individual MP4s
             val videoRegex = Regex("""(?:\\"|")name(?:\\"|")\s*:\s*(?:\\"|")([^"\\]+)(?:\\"|").*?(?:\\"|")url(?:\\"|")\s*:\s*(?:\\"|")([^"\\]+)(?:\\"|")""")
-            val matches = videoRegex.findAll(cleanData)
+            val matches = videoRegex.findAll(dataOptionsStr)
             
             matches.forEach { match ->
                 val qName = match.groupValues[1]
-                val vidUrl = match.groupValues[2].replace("\\u0026", "&")
+                val vidUrl = match.groupValues[2]
+                    .replace("\\u0026", "&")
+                    .replace("&amp;", "&")
+                    .replace("\\/", "/") 
                 
                 val qualityValue = when (qName) {
                     "mobile" -> Qualities.P144.value
@@ -107,11 +141,10 @@ class OkRuCustom : ExtractorApi() {
                     else -> Qualities.Unknown.value
                 }
                 
-                // FIX: Used newExtractorLink instead of deprecated ExtractorLink constructor
                 callback(
                     newExtractorLink(
-                        name = this.name,
-                        source = "${this.name} $qName",
+                        name = name,
+                        source = "$name $qName",
                         url = vidUrl,
                         type = INFER_TYPE
                     ) {
@@ -122,6 +155,90 @@ class OkRuCustom : ExtractorApi() {
             }
         } catch (e: Exception) {
             Log.e("OkRuCustom", "OkRu extraction failed: ${e.message}")
+        }
+    }
+}
+
+// ============================================================================
+// ADVANCED ABYSS PLAYER EXTRACTOR (Bypasses layered obfuscation)
+// ============================================================================
+class AbyssPlayer : ExtractorApi() {
+    override var name = "AbyssPlayer"
+    override var mainUrl = "https://abyssplayer.com"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val headers = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+            "Referer" to (referer ?: mainUrl)
+        )
+        
+        val response = try { app.get(url, headers = headers).text } catch (e: Exception) { return }
+
+        // Abyss relies on layered JS obfuscation. Unpack it first.
+        val packedScript = Regex("""eval\(\s*function\s*\(p,a,c,k,e,[a-zA-Z0-9_]\).*?split\('\|'\).*?\)""").find(response)?.value
+        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
+
+        // Abyss stores the final sources in a JSON structure like: sources: [{"file":"https:..."}]
+        val fileRegex = Regex("""(?:file|src|url)\s*[:=]\s*["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""", RegexOption.IGNORE_CASE)
+        val matches = fileRegex.findAll(unpacked).toList()
+
+        if (matches.isNotEmpty()) {
+            matches.forEach { match ->
+                val videoUrl = match.groupValues[1].replace("\\/", "/")
+                
+                if (videoUrl.contains(".m3u8")) {
+                    M3u8Helper.generateM3u8(name, videoUrl, url, headers = headers).forEach(callback)
+                } else {
+                    callback(
+                        newExtractorLink(
+                            name = name,
+                            source = name,
+                            url = videoUrl,
+                            type = INFER_TYPE
+                        ) {
+                            this.referer = url
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                }
+            }
+        } else {
+            // Alternative Abyss extraction: Sometimes the source is embedded in a base64 JSON string.
+            val jsonConfigRegex = Regex("""JSON\.parse\(['"]([A-Za-z0-9+/=]+)['"]\)""")
+            val jsonMatch = jsonConfigRegex.find(unpacked)
+            
+            if (jsonMatch != null) {
+                try {
+                    val decodedJson = String(android.util.Base64.decode(jsonMatch.groupValues[1], android.util.Base64.DEFAULT))
+                    fileRegex.findAll(decodedJson).forEach { match ->
+                        val videoUrl = match.groupValues[1].replace("\\/", "/")
+                        
+                        if (videoUrl.contains(".m3u8")) {
+                            M3u8Helper.generateM3u8(name, videoUrl, url, headers = headers).forEach(callback)
+                        } else {
+                            callback(
+                                newExtractorLink(
+                                    name = name,
+                                    source = name,
+                                    url = videoUrl,
+                                    type = INFER_TYPE
+                                ) {
+                                    this.referer = url
+                                    this.quality = Qualities.Unknown.value
+                                }
+                            )
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("Abyss", "Failed to parse inner config base64")
+                }
+            }
         }
     }
 }
@@ -188,84 +305,6 @@ class Bysekoze : ExtractorApi() {
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val headers = mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/")
         manualJsUnpackExtraction(url, name, headers, callback)
-    }
-}
-
-class AbyssPlayer : ExtractorApi() {
-    override var name = "AbyssPlayer"
-    override var mainUrl = "https://abyssplayer.com"
-    override val requiresReferer = true
-
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val headers = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-            "Referer" to (referer ?: mainUrl)
-        )
-        
-        val response = try { app.get(url, headers = headers).text } catch (e: Exception) { return }
-
-        val packedScript = Regex("""eval\(\s*function\s*\(p,a,c,k,e,[a-zA-Z0-9_]\).*?split\('\|'\).*?\)""").find(response)?.value
-        val unpacked = if (packedScript != null) JsUnpacker(packedScript).unpack() ?: response else response
-
-        val fileRegex = Regex("""(?:file|src|url)\s*[:=]\s*["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""", RegexOption.IGNORE_CASE)
-        val matches = fileRegex.findAll(unpacked).toList()
-
-        if (matches.isNotEmpty()) {
-            matches.forEach { match ->
-                val videoUrl = match.groupValues[1].replace("\\/", "/")
-                
-                if (videoUrl.contains(".m3u8")) {
-                    M3u8Helper.generateM3u8(name, videoUrl, url, headers = headers).forEach(callback)
-                } else {
-                    callback(
-                        newExtractorLink(
-                            name = name,
-                            source = name,
-                            url = videoUrl,
-                            type = INFER_TYPE
-                        ) {
-                            this.referer = url
-                        }
-                    )
-                }
-            }
-        } else {
-            val jsonConfigRegex = Regex("""JSON\.parse\(['"](.*?)['"]\)""")
-            val jsonMatch = jsonConfigRegex.find(unpacked)
-            
-            if (jsonMatch != null) {
-                try {
-                    val decodedJson = String(android.util.Base64.decode(jsonMatch.groupValues[1], android.util.Base64.DEFAULT))
-                    fileRegex.findAll(decodedJson).forEach { match ->
-                        val videoUrl = match.groupValues[1].replace("\\/", "/")
-                        
-                        if (videoUrl.contains(".m3u8")) {
-                            M3u8Helper.generateM3u8(name, videoUrl, url, headers = headers).forEach(callback)
-                        } else {
-                            // FIX: Used proper newExtractorLink builder
-                            callback(
-                                newExtractorLink(
-                                    name = name,
-                                    source = name,
-                                    url = videoUrl,
-                                    type = INFER_TYPE
-                                ) {
-                                    this.referer = url
-                                    this.quality = Qualities.Unknown.value
-                                }
-                            )
-                        }
-                    }
-                } catch (e: Exception) {
-                    Log.e("Abyss", "Failed to parse inner config base64")
-                }
-            }
-        }
     }
 }
 
