@@ -115,8 +115,7 @@ class AnimekhorProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data).document
-        val extractedUrls = mutableSetOf<String>()
-
+        val extractedUrls = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl.trim()
             
