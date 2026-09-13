@@ -115,7 +115,6 @@ class AbyssPlayer : ExtractorApi() {
             val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36", "Referer" to (referer ?: mainUrl))
             val response = app.get(url, headers = headers).text
 
-            // Broadened regex to capture datas regardless of var/let/const
             val encodedDataMatch = Regex("""datas\s*=\s*["']([^"']+)["']""").find(response)
             if (encodedDataMatch == null) {
                 Log.e("AbyssPlayer", "Failed to find 'datas' AES payload in HTML.")
@@ -145,7 +144,18 @@ class AbyssPlayer : ExtractorApi() {
             val decryptedBytes = cipher.doFinal(encryptedMediaBytes)
             val metaData = JSONObject(String(decryptedBytes, Charsets.UTF_8))
 
-            val videoUrl = metaData.optString("url").ifBlank { metaData.optString("file") }.replace("\\/", "/")
+            // FIX: Check top-level URL, then fallback to nested 'sources' array
+            var videoUrl = metaData.optString("url").ifBlank { metaData.optString("file") }
+            
+            if (videoUrl.isBlank() && metaData.has("sources")) {
+                val sources = metaData.optJSONArray("sources")
+                if (sources != null && sources.length() > 0) {
+                    val firstSource = sources.getJSONObject(0)
+                    videoUrl = firstSource.optString("file").ifBlank { firstSource.optString("url") }
+                }
+            }
+
+            videoUrl = videoUrl.replace("\\/", "/")
             
             if (videoUrl.isNotBlank()) {
                 if (videoUrl.contains(".m3u8") || metaData.optString("type").contains("hls", true)) {
@@ -154,7 +164,7 @@ class AbyssPlayer : ExtractorApi() {
                     callback(newExtractorLink(name = name, source = name, url = videoUrl, type = INFER_TYPE) { this.referer = url })
                 }
             } else {
-                Log.e("AbyssPlayer", "Decryption succeeded, but returned video URL was empty.")
+                Log.e("AbyssPlayer", "Decryption succeeded, but returned video URL was empty. JSON Dump: $metaData")
             }
         } catch (e: Exception) {
             Log.e("AbyssPlayer", "AES Decryption crashed: ${e.message}")
