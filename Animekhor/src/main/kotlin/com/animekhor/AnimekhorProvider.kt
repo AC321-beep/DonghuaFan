@@ -92,7 +92,6 @@ class AnimekhorProvider : MainAPI() {
                 val href = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
                 val episodeText = info.selectFirst(".epl-title")?.text() ?: info.selectFirst("a span")?.text() ?: ""
                 
-                // Broadened the selector just in case it's named slightly differently 
                 val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim() 
                 val parsedEpisode = if (episodeText.contains("-")) episodeText.substringAfter("-").substringBeforeLast("-").trim() else episodeText.trim()
                 
@@ -101,10 +100,7 @@ class AnimekhorProvider : MainAPI() {
                     this.posterUrl = poster
                     
                     if (!dateText.isNullOrBlank()) { 
-                        // 1. Try to properly parse the Date format AnimeKhor uses (Month dd, yyyy)
                         this.addDate(dateText, format = "MMMM d, yyyy")
-                        
-                        // 2. Failsafe: Guarantee it appears on your screen by setting it as the description
                         this.description = dateText
                     }
                 }
@@ -125,18 +121,28 @@ class AnimekhorProvider : MainAPI() {
     ): Boolean {
         val document = app.get(data).document
         val servers = document.select(".mobius option, select.mirror option")
+        val extractedUrls = mutableSetOf<String>()
 
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
-            val finalUrl = fixUrl(iframeUrl)
+            var finalUrl = fixUrlNull(iframeUrl)?.trim() ?: return
+            
+            // Fix ok.ru missing schemes which cause the native ok.ru extractor to fail
+            if (finalUrl.startsWith("//ok.ru") || finalUrl.startsWith("//odnoklassniki.ru")) {
+                finalUrl = "https:$finalUrl"
+            } else if (finalUrl.startsWith("ok.ru")) {
+                finalUrl = "https://$finalUrl"
+            }
+
+            // Deduplicate Extractors 
+            if (!extractedUrls.add(finalUrl)) return
 
             when {
                 // Proxy & Malformed Hash domains
-                "p2pstream.vip" in finalUrl -> P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "p2pstream" in finalUrl -> P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "upns.live" in finalUrl -> UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                
-                // Strict Header & Custom Extractors
                 "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "bysekoze.com" in finalUrl -> Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                "abyssplayer.com" in finalUrl -> AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, callback) // FIX: Restored Missing AbyssPlayer Call
                 "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 
                 // VidHide & StreamWish Clones
@@ -145,7 +151,8 @@ class AnimekhorProvider : MainAPI() {
                 "swhoi" in finalUrl -> Swhoi().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 "vidhide" in finalUrl -> VidHidePro5().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 
-                // Fallback to Cloudstream Core (Handles AbyssPlayer, ok.ru, Listeamed, etc.)
+                // Native Cloudstream Core Fallbacks
+                "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> loadExtractor(finalUrl, mainUrl, subtitleCallback, callback)
                 else -> loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
             }
         }
@@ -155,8 +162,20 @@ class AnimekhorProvider : MainAPI() {
                 async {
                     val base64 = server.attr("value")
                     if (base64.isNotBlank()) {
-                        val decodedHtml = try { String(Base64.decode(base64, Base64.DEFAULT)) } catch (e: Exception) { "" }
-                        val iframeSrc = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")
+                        // FIX: Detect if the source is already raw HTML preventing the Base64 decode from zeroing out
+                        var decodedHtml = base64
+                        if (base64.matches(Regex("^[A-Za-z0-9+/=]+$")) && !base64.contains("<")) {
+                            try {
+                                decodedHtml = String(Base64.decode(base64, Base64.DEFAULT))
+                            } catch (e: Exception) {}
+                        }
+                        
+                        val iframeSrc = if (decodedHtml.contains("<iframe", ignoreCase = true)) {
+                            Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")
+                        } else {
+                            decodedHtml
+                        }
+                        
                         if (!iframeSrc.isNullOrBlank()) {
                             invokeExtractor(iframeSrc, server.text().trim())
                         }
@@ -165,13 +184,11 @@ class AnimekhorProvider : MainAPI() {
             }.awaitAll()
         }
 
-        // Fallback: if no dropdown options found, try any iframe on the page
-        if (servers.isEmpty()) {
-            document.select("iframe").forEach { iframe ->
-                val src = iframe.attr("src")
-                if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
-                    invokeExtractor(src, "Server")
-                }
+        // Failsafe: aggressively check for stray iframes not in the dropdown selector 
+        document.select("iframe").forEach { iframe ->
+            val src = iframe.attr("src")
+            if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
+                invokeExtractor(src, "Direct Server")
             }
         }
 
