@@ -5,7 +5,6 @@ import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
-import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import kotlinx.coroutines.async
@@ -45,9 +44,7 @@ class AnimekhorProvider : MainAPI() {
             this.selectFirst("img")?.let { img -> img.attr("data-src").ifEmpty { img.attr("src") }.ifEmpty { img.attr("data-lazy-src") } }
         )
         
-        return newMovieSearchResponse(title, href, TvType.Movie) { 
-            this.posterUrl = posterUrl
-        }
+        return newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = posterUrl }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -77,7 +74,6 @@ class AnimekhorProvider : MainAPI() {
             return newMovieLoadResponse(title, url, TvType.Movie, href) {
                 this.posterUrl = poster
                 this.plot = description
-                this.posterHeaders = mapOf("Referer" to mainUrl) // Supported in LoadResponse
             }
         } else {
             var epListElements = document.select(".episodelist li, .eplister li")
@@ -108,7 +104,6 @@ class AnimekhorProvider : MainAPI() {
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
                 this.plot = description
-                this.posterHeaders = mapOf("Referer" to mainUrl) // Supported in LoadResponse
             }
         }
     }
@@ -124,8 +119,15 @@ class AnimekhorProvider : MainAPI() {
 
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl.trim()
-            if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
-            if (!finalUrl.startsWith("http")) finalUrl = "https://$finalUrl"
+            
+            // Fix URL formatting to prevent UnknownHostExceptions
+            if (finalUrl.startsWith("//")) {
+                finalUrl = "https:$finalUrl"
+            } else if (finalUrl.startsWith("/")) {
+                finalUrl = "https://ok.ru$finalUrl"
+            } else if (!finalUrl.startsWith("http")) {
+                finalUrl = "https://$finalUrl"
+            }
 
             if (finalUrl.contains("ok.ru") || finalUrl.contains("odnoklassniki.ru")) {
                 val okId = Regex("""/video(?:embed)?/(\d+)""").find(finalUrl)?.groupValues?.get(1) ?: finalUrl.substringAfterLast("/")
@@ -133,9 +135,6 @@ class AnimekhorProvider : MainAPI() {
             }
 
             if (!extractedUrls.add(finalUrl)) return
-
-            // ---> TRACER INJECTION <---
-            Log.d("AnimeKhorTracer", "Provider routing URL to extractors: $finalUrl | Label: $label")
 
             try { loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback) } catch (e: Exception) { Log.e("AnimeKhor", "Native extraction failed: ${e.message}") }
 
@@ -157,7 +156,7 @@ class AnimekhorProvider : MainAPI() {
         val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|abyssplayer\.com|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com)[^"'\s<>]+""")
         globalUrlRegex.findAll(rawHtml).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
-            invokeExtractor(cleanUrl, "Raw Scan")
+            invokeExtractor(cleanUrl, "Raw Source")
         }
 
         // STRATEGY 2: BASE64 AND SELECTOR PARSING
@@ -174,9 +173,11 @@ class AnimekhorProvider : MainAPI() {
                             iframeSrc = Jsoup.parse(rawData).selectFirst("iframe")?.attr("src") ?: ""
                         } else {
                             try {
-                                val decoded = String(Base64.decode(rawData, Base64.NO_WRAP))
+                                val decoded = String(Base64.decode(rawData, Base64.DEFAULT))
                                 iframeSrc = if (decoded.contains("<iframe", ignoreCase = true)) Jsoup.parse(decoded).selectFirst("iframe")?.attr("src") ?: decoded else decoded
-                            } catch (e: Exception) {}
+                            } catch (e: Exception) {
+                                Log.e("AnimeKhor", "Base64 decode failed for: $rawData")
+                            }
                         }
                         if (iframeSrc.isNotBlank()) invokeExtractor(iframeSrc, server.text().trim())
                     }
@@ -184,36 +185,7 @@ class AnimekhorProvider : MainAPI() {
             }.awaitAll()
         }
 
-        // STRATEGY 3: STRICT AJAX INTERCEPTION
-        val ajaxElements = document.select("ul#episode-nav li[data-post], .mobius li[data-post], .server-list li[data-post]")
-        if (ajaxElements.isNotEmpty()) {
-            coroutineScope {
-                ajaxElements.map { element ->
-                    async {
-                        val postId = element.attr("data-post")
-                        val nume = element.attr("data-nume")
-                        if (postId.isNotBlank() && nume.isNotBlank()) {
-                            val form = mapOf("action" to "player_ajax", "post" to postId, "nume" to nume, "type" to element.attr("data-type"))
-                            val response = try { app.post("$mainUrl/wp-admin/admin-ajax.php", data = form, referer = data, headers = mapOf("X-Requested-With" to "XMLHttpRequest")).text } catch(e: Exception) { "" }
-                            
-                            val embedUrl = try {
-                                JSONObject(response).optString("embed_url").ifBlank { response }
-                            } catch (e: Exception) {
-                                response
-                            }
-                            
-                            val iframeSrc = Jsoup.parse(embedUrl).selectFirst("iframe")?.attr("src") 
-                                ?: Regex("""src=["'](.*?)["']""").find(embedUrl)?.groupValues?.get(1) 
-                                ?: Regex("""(https?://[^"'\s]+)""").find(embedUrl)?.groupValues?.get(1)
-                                
-                            if (!iframeSrc.isNullOrBlank()) invokeExtractor(iframeSrc, element.text().trim())
-                        }
-                    }
-                }.awaitAll()
-            }
-        }
-
-        // STRATEGY 4: RAW DOM IFRAMES
+        // STRATEGY 3: RAW DOM IFRAMES
         document.select("#embed_holder iframe, .playerx iframe, .video-content iframe").forEach { iframe ->
             val src = iframe.attr("src")
             if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
@@ -221,7 +193,6 @@ class AnimekhorProvider : MainAPI() {
             }
         }
 
-        Log.d("AnimeKhorTracer", "Total unique URLs sent to extractors: ${extractedUrls.size}")
         return true
     }
 }
