@@ -112,7 +112,10 @@ class AbyssPlayer : ExtractorApi() {
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
-            val headers = mapOf("User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36", "Referer" to (referer ?: mainUrl))
+            val headers = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+                "Referer" to (referer ?: mainUrl)
+            )
             val response = app.get(url, headers = headers).text
 
             val encodedDataMatch = Regex("""datas\s*=\s*["']([^"']+)["']""").find(response)
@@ -159,7 +162,6 @@ class AbyssPlayer : ExtractorApi() {
                 }
             }
 
-            // Fallback to top-level if mp4 object wasn't used
             if (videoUrl.isBlank()) {
                 videoUrl = metaData.optString("url").ifBlank { metaData.optString("file") }
             }
@@ -170,10 +172,15 @@ class AbyssPlayer : ExtractorApi() {
                 if (videoUrl.contains(".m3u8") || metaData.optString("type").contains("hls", true)) {
                     M3u8Helper.generateM3u8(name, videoUrl, url, headers = headers).forEach(callback)
                 } else {
-                    callback(newExtractorLink(name = name, source = name, url = videoUrl, type = INFER_TYPE) { this.referer = url })
+                    callback(
+                        newExtractorLink(name = name, source = name, url = videoUrl, type = INFER_TYPE) {
+                            this.referer = url
+                            this.headers = headers // <--- Added headers here
+                        }
+                    )
                 }
             } else {
-                Log.e("AbyssPlayer", "Decryption succeeded, but no valid video URL found in fristDatas/sources. JSON: $metaData")
+                Log.e("AbyssPlayer", "Decryption succeeded, but no valid video URL found.")
             }
         } catch (e: Exception) {
             Log.e("AbyssPlayer", "AES Decryption crashed: ${e.message}")
