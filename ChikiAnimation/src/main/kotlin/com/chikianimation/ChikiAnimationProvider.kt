@@ -266,74 +266,47 @@ class ChikiAnimationProvider : MainAPI() {
             return false
         }
 
-        var found = false
-
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
-            var finalUrl = try { fixUrl(iframeUrl) } catch (e: Exception) { return }
-            var extReferer = iframeUrl 
+            var finalUrl = iframeUrl
+            if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
 
-            if (!finalUrl.startsWith("http")) return
+            if (!finalUrl.startsWith("http", ignoreCase = true)) return
             if (finalUrl.contains("youtube", true) || finalUrl.contains("disqus", true) || finalUrl.contains("googlesyndication", true)) return
 
-            // Native Dailymotion Bypass
+            var extReferer = finalUrl 
+
+            // Standardize Dailymotion links and force 'data' as referer to bypass Geo-restrictions
             if (finalUrl.contains("dailymotion", ignoreCase = true) || finalUrl.contains("dai.ly", ignoreCase = true)) {
                 val videoIdMatch = Regex("""(?:dailymotion\.com/(?:embed/)?video/|geo\.dailymotion\.com/(?:player/[^/]+/video/|player\.html\?video=)|dai\.ly/)([a-zA-Z0-9_-]+)""").find(finalUrl)
                 if (videoIdMatch != null) {
                     finalUrl = "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
-                    extReferer = mainUrl
+                    extReferer = data 
                 }
             }
 
             when {
                 "ghbrisk.com" in finalUrl -> {
                     Ghbrisk().getUrl(finalUrl, extReferer, subtitleCallback, callback)
-                    found = true
                 }
                 "galaxydonghua" in finalUrl -> {
                     GalaxyDonghua().getUrl(finalUrl, extReferer, subtitleCallback, callback)
-                    found = true
                 }
                 finalUrl.endsWith(".mp4") -> {
-                    callback(
-                        newExtractorLink(label, label, finalUrl, INFER_TYPE) {
+                    callback.invoke(
+                        newExtractorLink(
+                            source = label,
+                            name = label,
+                            url = finalUrl,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
                             this.referer = mainUrl
-                            this.quality = getQualityFromName(label)
+                            this.quality = Qualities.Unknown.value
                         }
                     )
-                    found = true
                 }
                 else -> {
-                    // Passes the rebuilt finalUrl and overridden extReferer directly into CloudStream's inbuilt extractors
-                    if (loadExtractor(finalUrl, referer = extReferer, subtitleCallback, callback)) {
-                        found = true
-                    } else {
-                        try {
-                            val html = app.get(finalUrl, headers = mapOf("Referer" to extReferer)).text
-                            val streamRegex = Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)[^\s"'<>\\]*)""")
-                            
-                            streamRegex.findAll(html).forEach { m ->
-                                val fileUrl = m.groupValues[1].replace("\\/", "/")
-                                if (fileUrl.contains(".m3u8", ignoreCase = true)) {
-                                    M3u8Helper.generateM3u8(label, fileUrl, finalUrl).forEach { callback.invoke(it) }
-                                    found = true
-                                } else if (fileUrl.contains(".mp4", ignoreCase = true)) {
-                                    // FIXED: Deprecated ExtractorLink constructor replaced with newExtractorLink
-                                    callback.invoke(
-                                        newExtractorLink(
-                                            source = label,
-                                            name = label,
-                                            url = fileUrl,
-                                            type = ExtractorLinkType.VIDEO
-                                        ) {
-                                            this.referer = finalUrl
-                                            this.quality = Qualities.Unknown.value
-                                        }
-                                    )
-                                    found = true
-                                }
-                            }
-                        } catch (e: Exception) { }
-                    }
+                    // Send directly to CloudStream's standard extractor engine
+                    loadExtractor(finalUrl, referer = extReferer, subtitleCallback, callback)
                 }
             }
         }
@@ -344,45 +317,44 @@ class ChikiAnimationProvider : MainAPI() {
 
         val options = document.select("select.mirror option, .mobius option, select#mirror option, select[name=mirror] option, option[data-index]")
         
-        coroutineScope {
-            options.map { option ->
-                async {
-                    val base64 = option.attr("value").trim()
-                    if (base64.isBlank()) return@async
-                    val label = option.text().trim()
+        if (options.isNotEmpty()) {
+            coroutineScope {
+                options.map { option ->
+                    async {
+                        val base64 = option.attr("value").trim()
+                        if (base64.isBlank()) return@async
+                        val label = option.text().trim()
 
-                    if (base64.startsWith("http") || base64.startsWith("//")) {
-                        invokeExtractor(base64, label)
-                        return@async
-                    }
-
-                    val decodedHtml = try {
-                        String(Base64.decode(base64, Base64.DEFAULT))
-                    } catch (e: Exception) {
-                        try { String(Base64.decode(base64, Base64.URL_SAFE or Base64.NO_WRAP)) } catch (e2: Exception) { null }
-                    }
-                    if (decodedHtml.isNullOrBlank()) return@async
-
-                    try {
-                        Jsoup.parse(decodedHtml).select("iframe").forEach { iframe ->
-                            val src = getIframeSrc(iframe)
-                            if (src.isNotBlank()) invokeExtractor(src, label)
+                        if (base64.startsWith("http") || base64.startsWith("//")) {
+                            invokeExtractor(base64, label)
+                            return@async
                         }
-                    } catch (e: Exception) { }
 
-                    Regex("""https?://[^\s"'<>\\)]+""").findAll(decodedHtml).forEach { m -> invokeExtractor(m.value, label) }
-                }
-            }.awaitAll()
-        }
+                        val decodedHtml = try {
+                            String(Base64.decode(base64, Base64.DEFAULT))
+                        } catch (e: Exception) {
+                            try { String(Base64.decode(base64, Base64.URL_SAFE or Base64.NO_WRAP)) } catch (e2: Exception) { null }
+                        }
+                        if (decodedHtml.isNullOrBlank()) return@async
 
-        if (options.isEmpty() || !found) {
+                        try {
+                            Jsoup.parse(decodedHtml).select("iframe").forEach { iframe ->
+                                val src = getIframeSrc(iframe)
+                                if (src.isNotBlank()) invokeExtractor(src, label)
+                            }
+                        } catch (e: Exception) { }
+
+                        Regex("""https?://[^\s"'<>\\)]+""").findAll(decodedHtml).forEach { m -> invokeExtractor(m.value, label) }
+                    }
+                }.awaitAll()
+            }
+        } else {
+            // Backup handling for embedded iframes outside a dropdown
             document.select("iframe").forEach { iframe ->
                 val src = getIframeSrc(iframe)
                 if (src.isNotBlank()) invokeExtractor(src, "Server")
             }
-        }
 
-        if (!found) {
             document.select("script").forEach { script ->
                 val body = script.data()
 
@@ -401,6 +373,6 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        return found
+        return true
     }
 }
