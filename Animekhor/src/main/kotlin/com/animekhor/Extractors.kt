@@ -112,10 +112,15 @@ class AbyssPlayer : ExtractorApi() {
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
+            // FIX: We MUST spoof an iOS User-Agent. This forces the Abyss backend to 
+            // disable MSE chunking (.fd files) and return a native HLS (.m3u8) stream instead.
+            val iosUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+            
             val headers = mapOf(
-                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+                "User-Agent" to iosUserAgent,
                 "Referer" to (referer ?: mainUrl)
             )
+            
             val response = app.get(url, headers = headers).text
 
             val encodedDataMatch = Regex("""datas\s*=\s*["']([^"']+)["']""").find(response)
@@ -147,47 +152,39 @@ class AbyssPlayer : ExtractorApi() {
             val decryptedBytes = cipher.doFinal(encryptedMediaBytes)
             val metaData = JSONObject(String(decryptedBytes, Charsets.UTF_8))
 
-            var videoUrl = ""
-            val mp4Obj = metaData.optJSONObject("mp4")
-            if (mp4Obj != null) {
-                val fristDatas = mp4Obj.optJSONArray("fristDatas")
-                if (fristDatas != null && fristDatas.length() > 0) {
-                    videoUrl = fristDatas.getJSONObject(0).optString("url")
-                }
-                if (videoUrl.isBlank()) {
-                    val sources = mp4Obj.optJSONArray("sources")
-                    if (sources != null && sources.length() > 0) {
-                        videoUrl = sources.getJSONObject(0).optString("url")
-                    }
-                }
+            // The iOS response usually places the m3u8 in an 'hls' property.
+            var videoUrl = metaData.optString("hls").ifBlank { 
+                metaData.optString("url").ifBlank { 
+                    metaData.optString("file") 
+                } 
             }
 
-            if (videoUrl.isBlank()) {
-                videoUrl = metaData.optString("url").ifBlank { metaData.optString("file") }
+            // Fallback nested search
+            if (videoUrl.isBlank() && metaData.has("sources")) {
+                val sources = metaData.optJSONArray("sources")
+                if (sources != null && sources.length() > 0) {
+                    val firstSource = sources.getJSONObject(0)
+                    videoUrl = firstSource.optString("file").ifBlank { firstSource.optString("url") }
+                }
             }
 
             videoUrl = videoUrl.replace("\\/", "/")
             
             if (videoUrl.isNotBlank()) {
-    val cleanUrl = videoUrl.replace("\\/", "/")
-    if (cleanUrl.contains(".m3u8") || metaData.optString("type").contains("hls", true)) {
-        M3u8Helper.generateM3u8(name, cleanUrl, url, headers = headers).forEach(callback)
-    } else {
-        callback(
-            newExtractorLink(
-                name = name,
-                source = name,
-                url = cleanUrl,
-                type = com.lagradost.cloudstream3.utils.ExtractorLinkType.VIDEO
-            ) {
-                this.referer = "https://abyssplayer.com/"
-                this.headers = headers
-                // Force ExoPlayer to treat raw .fd chunks as progressive stream
-            }
-        )
-    }
+                if (videoUrl.contains(".m3u8") || metaData.optString("type").contains("hls", true)) {
+                    M3u8Helper.generateM3u8(name, videoUrl, url, headers = headers).forEach(callback)
+                } else if (videoUrl.endsWith(".fd")) {
+                    Log.e("AbyssPlayer", "iOS Spoof failed. Server still returned unplayable .fd chunks.")
+                } else {
+                    callback(
+                        newExtractorLink(name = name, source = name, url = videoUrl, type = INFER_TYPE) {
+                            this.referer = url
+                            this.headers = headers
+                        }
+                    )
+                }
             } else {
-                Log.e("AbyssPlayer", "Decryption succeeded, but no valid video URL found.")
+                Log.e("AbyssPlayer", "Decryption succeeded, but no valid video URL found. JSON Dump: $metaData")
             }
         } catch (e: Exception) {
             Log.e("AbyssPlayer", "AES Decryption crashed: ${e.message}")
