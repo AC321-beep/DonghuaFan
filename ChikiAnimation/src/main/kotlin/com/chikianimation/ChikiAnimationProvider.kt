@@ -275,12 +275,12 @@ class ChikiAnimationProvider : MainAPI() {
 
             var extReferer = finalUrl 
 
-            // Standardize Dailymotion links and force 'data' as referer to bypass Geo-restrictions
+            // Standardize Dailymotion links and force 'mainUrl' as referer to bypass Geo-restrictions
             if (finalUrl.contains("dailymotion", ignoreCase = true) || finalUrl.contains("dai.ly", ignoreCase = true)) {
                 val videoIdMatch = Regex("""(?:dailymotion\.com/(?:embed/)?video/|geo\.dailymotion\.com/(?:player/[^/]+/video/|player\.html\?video=)|dai\.ly/)([a-zA-Z0-9_-]+)""").find(finalUrl)
                 if (videoIdMatch != null) {
                     finalUrl = "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
-                    extReferer = data 
+                    extReferer = mainUrl 
                 }
             }
 
