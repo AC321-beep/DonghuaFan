@@ -4,7 +4,6 @@ import android.util.Base64
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.Filesim
-import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -120,17 +119,6 @@ class GalaxyDonghua : ExtractorApi() {
                         this.quality = label.filter { it.isDigit() }.toIntOrNull() ?: 0
                         this.headers = playbackHeaders
                     }
-                )
-            }
-
-        Regex(""""file"\s*:\s*"([^"]+\.(?:vtt|srt))"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?""")
-            .findAll(apiPlain)
-            .forEach { m ->
-                subtitleCallback.invoke(
-                    newSubtitleFile(
-                        lang = m.groupValues[2].ifBlank { "Sub" },
-                        url = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
-                    )
                 )
             }
     }
