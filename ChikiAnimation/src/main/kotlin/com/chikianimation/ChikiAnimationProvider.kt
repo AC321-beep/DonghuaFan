@@ -251,8 +251,21 @@ class ChikiAnimationProvider : MainAPI() {
             ) return
 
             try {
+                // Route Dailymotion to custom extractor
+                if (cleanUrl.contains("dailymotion", true) || cleanUrl.contains("dai.ly", true)) {
+                    Dailymotion().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                    found = true
+                    return
+                }
+
                 if (cleanUrl.contains("ghbrisk.com", true)) {
                     Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                    found = true
+                    return
+                }
+
+                if (cleanUrl.contains("galaxydonghua", true)) {
+                    GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true
                     return
                 }
