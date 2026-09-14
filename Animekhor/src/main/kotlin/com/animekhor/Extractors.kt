@@ -27,7 +27,7 @@ private suspend fun manualJsUnpackExtraction(url: String, name: String, headers:
     val m3u8 = m3u8Regex.find(unpacked)?.groupValues?.get(1) ?: Regex("""(https?://[^"']+\.m3u8[^"']*)""").find(unpacked)?.groupValues?.get(1)
 
     if (m3u8 != null) {
-        val cleanM3u8 = m3u8.replace("\\/", "/") 
+        val cleanM3u8 = m3u8.replace("\\/", "/")
         M3u8Helper.generateM3u8(name, cleanM3u8, url, headers = safeHeaders).forEach(callback)
     } else {
         val mp4Regex = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.(?:mp4|mkv)[^"']*)["']""", RegexOption.IGNORE_CASE)
@@ -78,9 +78,9 @@ class OkRuCustom : ExtractorApi() {
                     val video = videos.getJSONObject(i)
                     val qName = video.optString("name")
                     val vidUrl = video.optString("url")
-                    
+
                     if (vidUrl.isBlank() || vidUrl.contains("usr_login")) continue
-                    
+
                     val qualityValue = when (qName) {
                         "mobile" -> Qualities.P144.value
                         "lowest" -> Qualities.P240.value
@@ -90,7 +90,7 @@ class OkRuCustom : ExtractorApi() {
                         "full" -> Qualities.P1080.value
                         else -> Qualities.Unknown.value
                     }
-                    
+
                     callback(newExtractorLink(name = this.name, source = "${this.name} $qName", url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"), type = INFER_TYPE) {
                         this.referer = "https://ok.ru/"
                         this.quality = qualityValue
@@ -117,21 +117,29 @@ class AbyssPlayer : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         try {
-            val ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) " +
-                    "AppleWebKit/605.1.15 (KHTML, like Gecko) " +
-                    "Version/16.6 Mobile/15E148 Safari/604.1"
+            val iosUserAgent =
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) " +
+                        "AppleWebKit/605.1.15 (KHTML, like Gecko) " +
+                        "Version/16.6 Mobile/15E148 Safari/604.1"
 
             val html = app.get(
                 url,
-                headers = mapOf("User-Agent" to ua, "Referer" to (referer ?: "$mainUrl/"))
+                headers = mapOf(
+                    "User-Agent" to iosUserAgent,
+                    "Referer" to (referer ?: "$mainUrl/")
+                )
             ).text
 
             val encodedData = Regex("""datas\s*=\s*["']([^"']+)["']""")
-                .find(html)?.groupValues?.get(1) ?: return
+                .find(html)?.groupValues?.get(1) ?: run {
+                Log.e("AbyssPlayerDebug", "No datas payload")
+                return
+            }
 
             val root = JSONObject(
                 String(Base64.decode(encodedData, Base64.DEFAULT), Charsets.ISO_8859_1)
             )
+
             val userId = root.optString("user_id")
             val slug = root.optString("slug")
             val md5Id = root.optString("md5_id")
@@ -141,129 +149,127 @@ class AbyssPlayer : ExtractorApi() {
                 .digest("$userId:$slug:$md5Id".toByteArray(Charsets.UTF_8))
                 .joinToString("") { "%02x".format(it) }
 
+            Log.e("AbyssPlayerDebug", "md5Hex = $md5Hex")
+
+            val keyBytes = md5Hex.toByteArray(Charsets.UTF_8)
+            val ivBytes = keyBytes.copyOfRange(0, 16)
+
             val cipher = Cipher.getInstance("AES/CTR/NoPadding")
             cipher.init(
                 Cipher.DECRYPT_MODE,
-                SecretKeySpec(md5Hex.toByteArray(), "AES"),
-                IvParameterSpec(md5Hex.toByteArray().copyOfRange(0, 16))
+                SecretKeySpec(keyBytes, "AES"),
+                IvParameterSpec(ivBytes)
             )
             val metaData = JSONObject(
                 String(cipher.doFinal(mediaStr.toByteArray(Charsets.ISO_8859_1)), Charsets.UTF_8)
             )
-            val mp4 = metaData.optJSONObject("mp4") ?: return
-            val sources = mp4.optJSONArray("sources") ?: return
-            val fristDatas = mp4.optJSONArray("fristDatas")
 
-            val headers = mapOf(
-                "User-Agent" to ua,
+            val mp4 = metaData.optJSONObject("mp4") ?: return
+            val fristDatas = mp4.optJSONArray("fristDatas") ?: run {
+                Log.e("AbyssPlayerDebug", "No fristDatas")
+                return
+            }
+
+            val streamHeaders = mapOf(
+                "User-Agent" to iosUserAgent,
                 "Referer" to url,
                 "Origin" to mainUrl
             )
 
-            // Config subtitles
-            root.optJSONObject("config")?.optJSONArray("subtitles")?.let { subs ->
-                for (i in 0 until subs.length()) {
-                    val s = subs.optJSONObject(i) ?: continue
-                    val lang = s.optString("lang").ifBlank { "Subtitle" }
-                    val subSlug = s.optString("slug")
-                    if (subSlug.isNotBlank()) {
-                        subtitleCallback(SubtitleFile(lang, "$mainUrl/subtitle/$subSlug"))
-                    }
-                }
+            // Decrypt the first .fd chunk with the same AES key.
+            val fdUrl = fristDatas.optJSONObject(0)
+                ?.optString("url")
+                ?.replace("\\/", "/")
+                .orEmpty()
+
+            if (fdUrl.isBlank()) {
+                Log.e("AbyssPlayerDebug", "No fdUrl")
+                return
             }
 
-            if (fristDatas == null) return
-
-            // Map by (res_id, size)
-            data class Fd(val url: String, val resId: Int, val size: Long)
-            val fdList = mutableListOf<Fd>()
-            for (i in 0 until fristDatas.length()) {
-                val fd = fristDatas.optJSONObject(i) ?: continue
-                fdList.add(
-                    Fd(
-                        fd.optString("url").replace("\\/", "/"),
-                        fd.optInt("res_id", -1),
-                        fd.optLong("size", -1L)
-                    )
+            // Grab the first 64 KB (enough to see container header)
+            val probe = try {
+                app.get(
+                    fdUrl,
+                    headers = streamHeaders + mapOf("Range" to "bytes=0-65535")
                 )
+            } catch (e: Exception) {
+                Log.e("AbyssPlayerDebug", "FD open failed: ${e.message}")
+                return
             }
 
-            var emitted = 0
-            for (i in 0 until sources.length()) {
-                val src = sources.optJSONObject(i) ?: continue
-                val resId = src.optInt("res_id", -1)
-                val size = src.optLong("size", -1L)
-                val label = src.optString("label").ifBlank { "Unknown" }
-                val codec = src.optString("codec")
+            val encrypted = probe.body?.bytes() ?: ByteArray(0)
+            Log.e("AbyssPlayerDebug", "FD raw size=${encrypted.size} code=${probe.code}")
 
-                val match = fdList.firstOrNull { it.resId == resId && it.size == size } ?: continue
-
-                // Try to derive an HLS URL on the fristData host before falling back
-                val fdHost = match.url.substringAfter("://").substringBefore("/")
-                val fdPath = match.url.substringAfter("://$fdHost/")
-                val baseName = fdPath.substringBeforeLast(".")
-                val dirPath = fdPath.substringBeforeLast("/")
-
-                val hlsCandidates = listOf(
-                    "https://$fdHost/$baseName.m3u8",
-                    "https://$fdHost/$dirPath/master.m3u8",
-                    "https://$fdHost/$dirPath/index.m3u8",
-                    "https://$fdHost/$dirPath/playlist.m3u8",
-                )
-
-                var foundHls = false
-                for (hls in hlsCandidates) {
-                    try {
-                        val r = app.get(hls, headers = headers)
-                        if (r.code in 200..299) {
-                            val body = r.text.take(64)
-                            if (body.contains("#EXTM3U")) {
-                                M3u8Helper.generateM3u8(name, hls, url, headers = headers)
-                                    .forEach(callback)
-                                Log.e("AbyssPlayer", "HLS OK: $hls")
-                                foundHls = true
-                                break
-                            }
-                        }
-                    } catch (_: Exception) {
-                    }
-                }
-                if (foundHls) {
-                    emitted++
-                    continue
-                }
-
-                // Fallback: emit the encrypted .fd URL as VIDEO.
-                // Note: this will not play without external decryption.
-                val quality = label.replace(Regex("""[^0-9]"""), "").toIntOrNull()
-                    ?: Qualities.Unknown.value
-                val srcLabel = buildString {
-                    append(label)
-                    if (codec.isNotBlank() && codec != "h264") append(" $codec")
-                }
-                Log.e("AbyssPlayer", "Falling back to .fd for $srcLabel (encrypted)")
-
-                callback(
-                    newExtractorLink(
-                        name = this.name,
-                        source = "${this.name} $srcLabel",
-                        url = match.url,
-                        type = com.lagradost.cloudstream3.utils.ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = url
-                        this.headers = headers
-                        this.quality = quality
-                    }
-                )
-                emitted++
+            // Try decrypting with IV = first 16 bytes of md5Hex
+            val c1 = Cipher.getInstance("AES/CTR/NoPadding")
+            c1.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(keyBytes, "AES"),
+                IvParameterSpec(ivBytes)
+            )
+            val dec1 = try { c1.doFinal(encrypted) } catch (e: Exception) {
+                Log.e("AbyssPlayerDebug", "Decrypt[md5 IV] failed: ${e.message}")
+                ByteArray(0)
             }
 
-            Log.e("AbyssPlayer", "Emitted $emitted link(s)")
+            dumpBytes("DEC1_md5IV", dec1)
+
+            // Try decrypting with zero IV, in case key was used differently
+            val c2 = Cipher.getInstance("AES/CTR/NoPadding")
+            c2.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(keyBytes, "AES"),
+                IvParameterSpec(ByteArray(16))
+            )
+            val dec2 = try { c2.doFinal(encrypted) } catch (e: Exception) {
+                Log.e("AbyssPlayerDebug", "Decrypt[zero IV] failed: ${e.message}")
+                ByteArray(0)
+            }
+
+            dumpBytes("DEC2_zeroIV", dec2)
+
+            // Try AES-ECB (some CDNs use it on chunk boundaries)
+            val c3 = Cipher.getInstance("AES/ECB/NoPadding")
+            c3.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"))
+            val dec3 = try { c3.doFinal(encrypted.copyOf(encrypted.size - encrypted.size % 16)) }
+            catch (e: Exception) { ByteArray(0) }
+            dumpBytes("DEC3_ECB", dec3)
+
+            Log.e("AbyssPlayerDebug", "Debug pass complete")
         } catch (e: Exception) {
-            Log.e("AbyssPlayer", "Extraction failed: ${e.message}", e)
+            Log.e("AbyssPlayerDebug", "Failed: ${e.message}", e)
         }
     }
+
+    private fun dumpBytes(tag: String, bytes: ByteArray) {
+        if (bytes.isEmpty()) {
+            Log.e("AbyssPlayerDebug", "$tag: empty")
+            return
+        }
+        val head = bytes.take(32)
+        val hex = head.joinToString("") { "%02x".format(it) }
+        val ascii = head.map { if (it.toInt() in 32..126) it.toInt().toChar() else '.' }.joinToString("")
+
+        // Look for known signatures
+        val sig = when {
+            head.size >= 8 && head[4].toInt() == 0x66 && head[5].toInt() == 0x74 &&
+                    head[6].toInt() == 0x79 && head[7].toInt() == 0x70 -> "MP4/ftyp"
+            head.size >= 4 && head[0].toInt() == 0x1A && head[1].toInt() == 0x45 &&
+                    head[2].toInt() == 0xDF && head[3].toInt() == 0xA3 -> "MKV/EBML"
+            head.size >= 4 && head[0].toInt() == 0x47 -> "MPEG-TS"
+            head.size >= 4 && head[0].toInt() == 0x00 && head[1].toInt() == 0x00 &&
+                    head[2].toInt() == 0x00 && (head[3].toInt() and 0xFF) < 0x40 -> "MP4 (box)"
+            ascii.startsWith("#EXT") -> "HLS m3u8"
+            else -> "unknown"
+        }
+
+        Log.e("AbyssPlayerDebug", "$tag: $sig")
+        Log.e("AbyssPlayerDebug", "$tag hex=$hex")
+        Log.e("AbyssPlayerDebug", "$tag ascii=$ascii")
+    }
 }
+
 class P2pstream : ExtractorApi() {
     override var name = "P2pstream"
     override var mainUrl = "https://animekhor.p2pstream.vip"
@@ -321,7 +327,7 @@ class Rumble : ExtractorApi() {
                     val precedingText = html.substring(Math.max(0, match.range.first - 150), match.range.first)
                     val qMatch = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""").findAll(precedingText).lastOrNull() ?: Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""").findAll(precedingText).lastOrNull()
                     val qualityInt = qMatch?.groupValues?.get(1)?.toIntOrNull() ?: Qualities.Unknown.value
-                    
+
                     callback(
                         newExtractorLink(name = name, source = if (qualityInt != Qualities.Unknown.value) "$name ${qualityInt}p" else name, url = cleanUrl, type = INFER_TYPE) {
                             this.referer = url
