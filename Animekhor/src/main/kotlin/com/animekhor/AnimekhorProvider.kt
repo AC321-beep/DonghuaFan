@@ -1,7 +1,6 @@
 package com.animekhor
 
 import android.util.Base64
-import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
@@ -10,6 +9,7 @@ import org.jsoup.nodes.Element
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import java.util.concurrent.ConcurrentHashMap
 
 class AnimekhorProvider : MainAPI() {
     override var mainUrl = "https://animekhor.org"
@@ -115,11 +115,11 @@ class AnimekhorProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data).document
-        val extractedUrls = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        val extractedUrls = ConcurrentHashMap.newKeySet<String>()
+
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl.trim()
             
-            // Fix URL formatting to prevent UnknownHostExceptions
             if (finalUrl.startsWith("//")) {
                 finalUrl = "https:$finalUrl"
             } else if (finalUrl.startsWith("/")) {
@@ -135,7 +135,11 @@ class AnimekhorProvider : MainAPI() {
 
             if (!extractedUrls.add(finalUrl)) return
 
-            try { loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback) } catch (e: Exception) { Log.e("AnimeKhor", "Native extraction failed: ${e.message}") }
+            try { 
+                loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback) 
+            } catch (e: Exception) { 
+                // Fails silently
+            }
 
             try {
                 when {
@@ -144,21 +148,20 @@ class AnimekhorProvider : MainAPI() {
                     "upns.live" in finalUrl -> UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                     "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                     "bysekoze.com" in finalUrl -> Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "abyssplayer.com" in finalUrl -> AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                     "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 }
-            } catch (e: Exception) { Log.e("AnimeKhor", "Custom extraction failed: ${e.message}") }
+            } catch (e: Exception) { 
+                // Fails silently
+            }
         }
 
-        // STRATEGY 1: NUCLEAR RAW HTML SCAN
         val rawHtml = document.html()
-        val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|abyssplayer\.com|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com)[^"'\s<>]+""")
+        val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com)[^"'\s<>]+""")
         globalUrlRegex.findAll(rawHtml).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
             invokeExtractor(cleanUrl, "Raw Source")
         }
 
-        // STRATEGY 2: BASE64 AND SELECTOR PARSING
         val serverElements = document.select(".mobius option, select.mirror option, .server-list li a[data-embed], .server-list li a[data-em]")
         coroutineScope {
             serverElements.map { server ->
@@ -175,7 +178,7 @@ class AnimekhorProvider : MainAPI() {
                                 val decoded = String(Base64.decode(rawData, Base64.DEFAULT))
                                 iframeSrc = if (decoded.contains("<iframe", ignoreCase = true)) Jsoup.parse(decoded).selectFirst("iframe")?.attr("src") ?: decoded else decoded
                             } catch (e: Exception) {
-                                Log.e("AnimeKhor", "Base64 decode failed for: $rawData")
+                                // Fails silently
                             }
                         }
                         if (iframeSrc.isNotBlank()) invokeExtractor(iframeSrc, server.text().trim())
@@ -184,7 +187,6 @@ class AnimekhorProvider : MainAPI() {
             }.awaitAll()
         }
 
-        // STRATEGY 3: RAW DOM IFRAMES
         document.select("#embed_holder iframe, .playerx iframe, .video-content iframe").forEach { iframe ->
             val src = iframe.attr("src")
             if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
