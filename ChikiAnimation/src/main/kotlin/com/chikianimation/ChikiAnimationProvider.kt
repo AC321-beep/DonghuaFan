@@ -2,6 +2,7 @@ package com.chikianimation
 
 import android.util.Base64
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.Jsoup
@@ -36,12 +37,15 @@ class ChikiAnimationProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
+    // Interceptor to actively solve Cloudflare Turnstile/JS challenges via invisible WebView
+    private val cfInterceptor = WebViewResolver(Regex("""challenge-platform|cloudflare"""))
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = buildPageUrl(request.data, page)
         println("ChikiAnimation: loading ${request.name} → $url")
 
         val items = try {
-            val document = app.get(url, headers = defaultHeaders).document
+            val document = app.get(url, headers = defaultHeaders, interceptor = cfInterceptor).document
             val list = document
                 .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
                 .mapNotNull { it.toSearchResult() }
@@ -50,6 +54,7 @@ class ChikiAnimationProvider : MainAPI() {
             list
         } catch (e: Exception) {
             println("ChikiAnimation: ${request.name} failed — ${e.message}")
+            e.printStackTrace() // Prints full HTTP/Socket error to Logcat for debugging
             emptyList()
         }
 
@@ -118,10 +123,12 @@ class ChikiAnimationProvider : MainAPI() {
                         else
                             "$mainUrl/page/$page/?s=$encoded"
 
-                        app.get(url, headers = defaultHeaders).document
+                        app.get(url, headers = defaultHeaders, interceptor = cfInterceptor).document
                             .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
                             .mapNotNull { it.toSearchResult() }
                     } catch (e: Exception) {
+                        println("ChikiAnimation: Search failed for page $page — ${e.message}")
+                        e.printStackTrace()
                         emptyList()
                     }
                 }
@@ -132,8 +139,10 @@ class ChikiAnimationProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         val document = try {
-            app.get(url, headers = defaultHeaders).document
+            app.get(url, headers = defaultHeaders, interceptor = cfInterceptor).document
         } catch (e: Exception) {
+            println("ChikiAnimation: Load failed for $url — ${e.message}")
+            e.printStackTrace()
             return null
         }
 
@@ -186,9 +195,11 @@ class ChikiAnimationProvider : MainAPI() {
                 ?.attr("href")?.trim()
             if (!epPage.isNullOrBlank()) {
                 epListElements = try {
-                    app.get(fixUrl(epPage), headers = defaultHeaders).document
+                    app.get(fixUrl(epPage), headers = defaultHeaders, interceptor = cfInterceptor).document
                         .select(".episodelist li, .eplister li")
                 } catch (e: Exception) {
+                    println("ChikiAnimation: Episode page load failed — ${e.message}")
+                    e.printStackTrace()
                     org.jsoup.select.Elements()
                 }
             }
@@ -239,9 +250,10 @@ class ChikiAnimationProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = try {
-            app.get(data, headers = defaultHeaders).document
+            app.get(data, headers = defaultHeaders, interceptor = cfInterceptor).document
         } catch (e: Exception) {
-            println("ChikiAnimation: failed to fetch $data — ${e.message}")
+            println("ChikiAnimation: loadLinks failed to fetch $data — ${e.message}")
+            e.printStackTrace()
             return false
         }
 
