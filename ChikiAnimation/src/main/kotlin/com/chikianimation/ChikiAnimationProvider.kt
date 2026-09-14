@@ -294,15 +294,22 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
+        // 1. Scan all direct iframes on the page immediately
+        document.select("iframe").forEach { iframe ->
+            val src = getIframeSrc(iframe)
+            if (src.isNotBlank()) handleUrl(src, data)
+        }
+
+        // 2. Scan expanded mirror dropdown elements
         val mirrorOptions = document.select(
-            "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option, option[data-index]"
+            "select option, .mirror option, .mobius option, select#mirror option, select[name=mirror] option, option[data-index], div.server, ul.epserver li"
         )
-        Log.d("ChikiDebug", "Found mirror dropdown options count: ${mirrorOptions.size}")
+        Log.d("ChikiDebug", "Found mirror options/servers count: ${mirrorOptions.size}")
 
         coroutineScope {
             mirrorOptions.map { option ->
                 async {
-                    val value = option.attr("value").trim()
+                    val value = option.attr("value").ifBlank { option.attr("data-value") }.trim()
                     if (value.isBlank()) return@async
                     val label = option.text().trim()
                     Log.d("ChikiDebug", "Processing mirror option label: '$label', value snippet: ${value.take(30)}")
@@ -335,15 +342,7 @@ class ChikiAnimationProvider : MainAPI() {
             }.awaitAll()
         }
 
-        if (mirrorOptions.isEmpty() || !found) {
-            val directIframes = document.select("iframe")
-            Log.d("ChikiDebug", "Scanning direct iframes count: ${directIframes.size}")
-            directIframes.forEach { iframe ->
-                val src = getIframeSrc(iframe)
-                if (src.isNotBlank()) handleUrl(src, data)
-            }
-        }
-
+        // 3. Scan script tags for embedded links or base64 blobs
         if (!found) {
             Log.d("ChikiDebug", "Scanning script tags for fallback links.")
             document.select("script").forEach { script ->
