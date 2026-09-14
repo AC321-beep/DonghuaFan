@@ -2,7 +2,6 @@ package com.chikianimation
 
 import android.util.Base64
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.Jsoup
@@ -16,7 +15,7 @@ class ChikiAnimationProvider : MainAPI() {
     override var mainUrl = "https://chikianimation.com"
     override var name = "ChikiAnimation"
     override val hasMainPage = true
-    override var lang = "en"
+    override var lang = "zh"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
 
@@ -24,11 +23,11 @@ class ChikiAnimationProvider : MainAPI() {
         "anime/?status=&type=&order=update"          to "Recently Updated",
         "anime/?status=&type=&order=popular"         to "Popular",
         "anime/?status=&type=&order=latest"          to "Latest Added",
+        "anime/?status=&type=ai+animes&order=update" to "AI Anime",
         "anime/?status=ongoing&type=&order=update"   to "Ongoing",
         "anime/?status=completed&type=&order=update" to "Completed",
         "anime/?status=&type=movie&order=update"     to "Movies",
-        "anime/?status=&type=ona&order=update"       to "Donghua (ONA)",
-        "anime/?status=&type=ai+animes&order=update" to "AI Anime"
+        "anime/?status=&type=ona&order=update"       to "Donghua (ONA)"
     )
 
     private val defaultHeaders = mapOf(
@@ -37,15 +36,12 @@ class ChikiAnimationProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
-    // Interceptor to handle JavaScript and Cloudflare challenges automatically
-    private val cfInterceptor = WebViewResolver(Regex("""challenge-platform|cloudflare"""))
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = buildPageUrl(request.data, page)
         println("ChikiAnimation: loading ${request.name} → $url")
 
         val items = try {
-            val document = app.get(url, headers = defaultHeaders, interceptor = cfInterceptor).document
+            val document = app.get(url, headers = defaultHeaders).document
             val list = document
                 .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
                 .mapNotNull { it.toSearchResult() }
@@ -123,7 +119,7 @@ class ChikiAnimationProvider : MainAPI() {
                         else
                             "$mainUrl/page/$page/?s=$encoded"
 
-                        app.get(url, headers = defaultHeaders, interceptor = cfInterceptor).document
+                        app.get(url, headers = defaultHeaders).document
                             .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
                             .mapNotNull { it.toSearchResult() }
                     } catch (e: Exception) {
@@ -138,7 +134,7 @@ class ChikiAnimationProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         val document = try {
-            app.get(url, headers = defaultHeaders, interceptor = cfInterceptor).document
+            app.get(url, headers = defaultHeaders).document
         } catch (e: Exception) {
             e.printStackTrace()
             return null
@@ -193,7 +189,7 @@ class ChikiAnimationProvider : MainAPI() {
                 ?.attr("href")?.trim()
             if (!epPage.isNullOrBlank()) {
                 epListElements = try {
-                    app.get(fixUrl(epPage), headers = defaultHeaders, interceptor = cfInterceptor).document
+                    app.get(fixUrl(epPage), headers = defaultHeaders).document
                         .select(".episodelist li, .eplister li")
                 } catch (e: Exception) {
                     e.printStackTrace()
@@ -247,7 +243,7 @@ class ChikiAnimationProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = try {
-            app.get(data, headers = defaultHeaders, interceptor = cfInterceptor).document
+            app.get(data, headers = defaultHeaders).document
         } catch (e: Exception) {
             println("ChikiAnimation: failed to fetch $data — ${e.message}")
             e.printStackTrace()
