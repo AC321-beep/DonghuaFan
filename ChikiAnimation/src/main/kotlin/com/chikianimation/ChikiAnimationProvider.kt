@@ -275,7 +275,6 @@ class ChikiAnimationProvider : MainAPI() {
             if (!finalUrl.startsWith("http")) return
             if (finalUrl.contains("youtube", true) || finalUrl.contains("disqus", true) || finalUrl.contains("googlesyndication", true)) return
 
-            // Standardize Dailymotion links and force 'data' as referer to bypass Geo-restrictions
             if (finalUrl.contains("dailymotion", ignoreCase = true) || finalUrl.contains("dai.ly", ignoreCase = true)) {
                 val videoIdMatch = Regex("""(?:dailymotion\.com/(?:embed/)?video/|geo\.dailymotion\.com/(?:player/[^/]+/video/|player\.html\?video=)|dai\.ly/)([a-zA-Z0-9_-]+)""").find(finalUrl)
                 if (videoIdMatch != null) {
@@ -287,11 +286,11 @@ class ChikiAnimationProvider : MainAPI() {
             when {
                 "ghbrisk.com" in finalUrl -> {
                     Ghbrisk().getUrl(finalUrl, extReferer, subtitleCallback, callback)
-                    found = true // FIX: Tracks success
+                    found = true
                 }
                 "galaxydonghua" in finalUrl -> {
                     GalaxyDonghua().getUrl(finalUrl, extReferer, subtitleCallback, callback)
-                    found = true // FIX: Tracks success
+                    found = true
                 }
                 finalUrl.endsWith(".mp4") -> {
                     callback.invoke(
@@ -305,10 +304,9 @@ class ChikiAnimationProvider : MainAPI() {
                             this.quality = Qualities.Unknown.value
                         }
                     )
-                    found = true // FIX: Tracks success
+                    found = true
                 }
                 else -> {
-                    // Send directly to CloudStream's standard extractor engine (Native Dailymotion falls here)
                     if (loadExtractor(finalUrl, referer = extReferer, subtitleCallback, callback)) {
                         found = true
                     }
@@ -379,6 +377,6 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        return found // FIX: Correct return tracks actual successful callback execution
+        return found
     }
 }
