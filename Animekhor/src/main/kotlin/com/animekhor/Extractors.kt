@@ -167,7 +167,7 @@ class AbyssPlayer : ExtractorApi() {
                         var matchingDomain = ""
                         for (j in 0 until domains.length()) {
                             val d = domains.getString(j)
-                            if (d.startsWith(sub)) {
+                            if (d.startsWith(sub) || d.contains(sub)) {
                                 matchingDomain = d
                                 break
                             }
@@ -176,21 +176,19 @@ class AbyssPlayer : ExtractorApi() {
                         if (matchingDomain.isNotBlank() && sub.isNotBlank()) {
                             val qualityValue = label.replace("p", "").toIntOrNull() ?: Qualities.Unknown.value
                             
-                            // Reconstruct the hidden .m3u8 playlist links Abyss uses internally
-                            val m1 = "https://$matchingDomain/video/$sub.m3u8"
-                            val m2 = "https://$matchingDomain/$sub.m3u8"
+                            // Blind-fire all known Abyss/Hydrax M3U8 directory structures directly to the player
+                            val m3u8Paths = listOf(
+                                "https://$matchingDomain/$sub/v.m3u8",
+                                "https://$matchingDomain/$sub/index.m3u8",
+                                "https://$matchingDomain/$sub.m3u8"
+                            )
                             
-                            // Ping the reconstructed URLs to see which one Abyss is currently routing
-                            val aliveUrl = if (try { app.get(m1, headers = headers).code == 200 } catch (e: Exception) { false }) m1 
-                                           else if (try { app.get(m2, headers = headers).code == 200 } catch (e: Exception) { false }) m2 
-                                           else ""
-                            
-                            if (aliveUrl.isNotBlank()) {
+                            m3u8Paths.forEachIndexed { index, m3u8Url ->
                                 callback(
                                     newExtractorLink(
                                         name = this.name,
-                                        source = "${this.name} $label",
-                                        url = aliveUrl,
+                                        source = "${this.name} $label (v${index + 1})",
+                                        url = m3u8Url,
                                         type = com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8
                                     ) {
                                         this.referer = url
@@ -198,10 +196,24 @@ class AbyssPlayer : ExtractorApi() {
                                         this.quality = qualityValue
                                     }
                                 )
-                                foundLinks = true
                             }
+                            foundLinks = true
                         }
                     }
+                }
+            }
+
+            // Fallback: If domain arrays are missing, check standard URLs
+            if (!foundLinks) {
+                val videoUrl = metaData.optString("hls").ifBlank { metaData.optString("url") }.ifBlank { metaData.optString("file") }.replace("\\/", "/")
+                if (videoUrl.isNotBlank() && !videoUrl.endsWith(".fd")) {
+                    callback(
+                        newExtractorLink(name = name, source = name, url = videoUrl, type = com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8) {
+                            this.referer = url
+                            this.headers = headers
+                        }
+                    )
+                    foundLinks = true
                 }
             }
 
