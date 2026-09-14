@@ -117,6 +117,8 @@ class AbyssPlayer : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         try {
+            Log.e("AbyssPlayerDebug", ">>> getUrl CALLED with url=$url referer=$referer")
+
             val iosUserAgent =
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) " +
                         "AppleWebKit/605.1.15 (KHTML, like Gecko) " +
@@ -130,7 +132,7 @@ class AbyssPlayer : ExtractorApi() {
                 )
             ).text
 
-            Log.d("AbyssPlayerDebug", "HTML length = ${html.length}")
+            Log.e("AbyssPlayerDebug", "HTML length = ${html.length}")
 
             val encodedData = Regex("""datas\s*=\s*["']([^"']+)["']""")
                 .find(html)
@@ -141,14 +143,14 @@ class AbyssPlayer : ExtractorApi() {
                     return
                 }
 
-            Log.d("AbyssPlayerDebug", "encodedData length = ${encodedData.length}")
+            Log.e("AbyssPlayerDebug", "encodedData length = ${encodedData.length}")
 
             val decodedJsonString = String(
                 Base64.decode(encodedData, Base64.DEFAULT),
                 Charsets.ISO_8859_1
             )
 
-            Log.d("AbyssPlayerDebug", "decoded root JSON = $decodedJsonString")
+            Log.e("AbyssPlayerDebug", "decoded root JSON = $decodedJsonString")
 
             val root = JSONObject(decodedJsonString)
 
@@ -157,7 +159,7 @@ class AbyssPlayer : ExtractorApi() {
             val md5Id = root.optString("md5_id")
             val mediaStr = root.optString("media")
 
-            Log.d("AbyssPlayerDebug", "userId=$userId slug=$slug md5Id=$md5Id mediaLen=${mediaStr.length}")
+            Log.e("AbyssPlayerDebug", "userId=$userId slug=$slug md5Id=$md5Id mediaLen=${mediaStr.length}")
 
             if (userId.isBlank() || slug.isBlank() || md5Id.isBlank() || mediaStr.isBlank()) {
                 Log.e("AbyssPlayerDebug", "Missing required JSON fields")
@@ -168,7 +170,7 @@ class AbyssPlayer : ExtractorApi() {
                 .digest("$userId:$slug:$md5Id".toByteArray(Charsets.UTF_8))
                 .joinToString("") { "%02x".format(it) }
 
-            Log.d("AbyssPlayerDebug", "md5Hex = $md5Hex")
+            Log.e("AbyssPlayerDebug", "md5Hex = $md5Hex")
 
             val keyBytes = md5Hex.toByteArray(Charsets.UTF_8)
             val ivBytes = keyBytes.copyOfRange(0, 16)
@@ -185,7 +187,7 @@ class AbyssPlayer : ExtractorApi() {
                 Charsets.UTF_8
             )
 
-            Log.d("AbyssPlayerDebug", "metaData = $decryptedString")
+            Log.e("AbyssPlayerDebug", "metaData = $decryptedString")
 
             val metaData = JSONObject(decryptedString)
 
@@ -201,13 +203,13 @@ class AbyssPlayer : ExtractorApi() {
             val sources = mp4?.optJSONArray("sources")
             val domains = mp4?.optJSONArray("domains")
 
-            Log.d("AbyssPlayerDebug", "sources=${sources?.length()} domains=${domains?.length()}")
+            Log.e("AbyssPlayerDebug", "sources=${sources?.length()} domains=${domains?.length()}")
 
             if (sources != null && domains != null) {
                 for (i in 0 until sources.length()) {
                     val source = sources.optJSONObject(i) ?: continue
 
-                    Log.d("AbyssPlayerDebug", "source[$i] = $source")
+                    Log.e("AbyssPlayerDebug", "source[$i] = $source")
 
                     val sub = source.optString("sub")
                     if (sub.isBlank()) continue
@@ -217,7 +219,7 @@ class AbyssPlayer : ExtractorApi() {
                     val domain = domains.optString(domainIndex)
                         .ifBlank { domains.optString(0) }
 
-                    Log.d("AbyssPlayerDebug", "sub=$sub label=$label domainIndex=$domainIndex domain=$domain")
+                    Log.e("AbyssPlayerDebug", "sub=$sub label=$label domainIndex=$domainIndex domain=$domain")
 
                     if (domain.isBlank()) continue
 
@@ -234,7 +236,7 @@ class AbyssPlayer : ExtractorApi() {
                         .filter { it.isNotBlank() }
                         .distinct()
 
-                    Log.d("AbyssPlayerDebug", "candidates = $candidates")
+                    Log.e("AbyssPlayerDebug", "candidates = $candidates")
 
                     for (file in candidates) {
                         val finalUrl = if (file.startsWith("http", true)) {
@@ -246,7 +248,7 @@ class AbyssPlayer : ExtractorApi() {
                         try {
                             val response = app.get(finalUrl, headers = streamHeaders)
                             val code = response.code
-                            Log.d("AbyssPlayerDebug", "TRY $finalUrl -> $code")
+                            Log.e("AbyssPlayerDebug", "TRY $finalUrl -> $code")
 
                             if (code !in 200..299) continue
 
@@ -268,11 +270,11 @@ class AbyssPlayer : ExtractorApi() {
                                 }
                             )
 
-                            Log.d("AbyssPlayerDebug", "WORKING URL = $finalUrl")
+                            Log.e("AbyssPlayerDebug", "WORKING URL = $finalUrl")
                             found = true
                             break
                         } catch (e: Exception) {
-                            Log.d("AbyssPlayerDebug", "TRY $finalUrl -> EX ${e.message}")
+                            Log.e("AbyssPlayerDebug", "TRY $finalUrl -> EX ${e.message}")
                         }
                     }
 
@@ -286,7 +288,7 @@ class AbyssPlayer : ExtractorApi() {
                     .ifBlank { metaData.optString("file") }
                     .replace("\\/", "/")
 
-                Log.d("AbyssPlayerDebug", "fallback = $fallback")
+                Log.e("AbyssPlayerDebug", "fallback = $fallback")
 
                 if (fallback.isNotBlank() && !fallback.endsWith(".fd")) {
                     callback(
