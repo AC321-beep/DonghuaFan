@@ -30,13 +30,10 @@ class ChikiAnimationProvider : MainAPI() {
         "anime/?status=&type=ai+animes&order=update" to "AI Anime"
     )
 
-    private val headers = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-                "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                "Chrome/122.0.0.0 Safari/537.36",
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language" to "en-US,en;q=0.9",
-        "Referer" to "$mainUrl/"
+    private val defaultHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Referer" to mainUrl,
+        "Origin" to mainUrl
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -44,7 +41,7 @@ class ChikiAnimationProvider : MainAPI() {
         println("ChikiAnimation: loading ${request.name} → $url")
 
         val items = try {
-            val document = app.get(url, headers = headers).document
+            val document = app.get(url, headers = defaultHeaders).document
             val list = document
                 .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
                 .mapNotNull { it.toSearchResult() }
@@ -121,7 +118,7 @@ class ChikiAnimationProvider : MainAPI() {
                         else
                             "$mainUrl/page/$page/?s=$encoded"
 
-                        app.get(url, headers = headers).document
+                        app.get(url, headers = defaultHeaders).document
                             .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
                             .mapNotNull { it.toSearchResult() }
                     } catch (e: Exception) {
@@ -135,7 +132,7 @@ class ChikiAnimationProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         val document = try {
-            app.get(url, headers = headers).document
+            app.get(url, headers = defaultHeaders).document
         } catch (e: Exception) {
             return null
         }
@@ -189,7 +186,7 @@ class ChikiAnimationProvider : MainAPI() {
                 ?.attr("href")?.trim()
             if (!epPage.isNullOrBlank()) {
                 epListElements = try {
-                    app.get(fixUrl(epPage), headers = headers).document
+                    app.get(fixUrl(epPage), headers = defaultHeaders).document
                         .select(".episodelist li, .eplister li")
                 } catch (e: Exception) {
                     org.jsoup.select.Elements()
@@ -242,7 +239,7 @@ class ChikiAnimationProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = try {
-            app.get(data, headers = headers).document
+            app.get(data, headers = defaultHeaders).document
         } catch (e: Exception) {
             println("ChikiAnimation: failed to fetch $data — ${e.message}")
             return false
@@ -263,7 +260,6 @@ class ChikiAnimationProvider : MainAPI() {
             try {
                 println("ChikiAnimation: handleUrl → $cleanUrl (ref=$ref)")
 
-                // Dailymotion branch
                 val dmMatch = Regex(
                     """(?:dailymotion\.com/(?:embed/)?video/|dai\.ly/)([a-zA-Z0-9]+)"""
                 ).find(cleanUrl)
@@ -277,14 +273,12 @@ class ChikiAnimationProvider : MainAPI() {
                     return
                 }
 
-                // Ghbrisk (StreamWish mirror)
                 if (cleanUrl.contains("ghbrisk.com", true)) {
                     Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true
                     return
                 }
 
-                // Everything else → core registry
                 val ok = loadExtractor(cleanUrl, referer = ref, subtitleCallback, callback)
                 if (ok) found = true
             } catch (e: Exception) {
@@ -292,7 +286,6 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // Layer 1: mirror dropdown
         val mirrorOptions = document.select(
             "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
         )
@@ -336,7 +329,6 @@ class ChikiAnimationProvider : MainAPI() {
             }.awaitAll()
         }
 
-        // Layer 2: iframes
         if (!found) {
             document.select("iframe").forEach { iframe ->
                 val src = iframe.attr("src").ifBlank {
@@ -348,7 +340,6 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // Layer 3: script scan
         if (!found) {
             document.select("script").forEach { script ->
                 val body = script.data()
