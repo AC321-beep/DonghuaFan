@@ -117,8 +117,6 @@ class AbyssPlayer : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         try {
-            Log.e("AbyssPlayerDebug", ">>> getUrl CALLED with url=$url referer=$referer")
-
             val iosUserAgent =
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) " +
                         "AppleWebKit/605.1.15 (KHTML, like Gecko) " +
@@ -132,14 +130,12 @@ class AbyssPlayer : ExtractorApi() {
                 )
             ).text
 
-            Log.e("AbyssPlayerDebug", "HTML length = ${html.length}")
-
             val encodedData = Regex("""datas\s*=\s*["']([^"']+)["']""")
                 .find(html)
                 ?.groupValues
                 ?.get(1)
                 ?: run {
-                    Log.e("AbyssPlayerDebug", "Failed to find 'datas' payload")
+                    Log.e("AbyssPlayer", "No 'datas' payload found")
                     return
                 }
 
@@ -153,7 +149,7 @@ class AbyssPlayer : ExtractorApi() {
             val mediaStr = root.optString("media")
 
             if (userId.isBlank() || slug.isBlank() || md5Id.isBlank() || mediaStr.isBlank()) {
-                Log.e("AbyssPlayerDebug", "Missing required JSON fields")
+                Log.e("AbyssPlayer", "Missing required JSON fields")
                 return
             }
 
@@ -171,22 +167,29 @@ class AbyssPlayer : ExtractorApi() {
                 IvParameterSpec(ivBytes)
             )
 
-            val decryptedString = String(
-                cipher.doFinal(mediaStr.toByteArray(Charsets.ISO_8859_1)),
-                Charsets.UTF_8
+            val metaData = JSONObject(
+                String(
+                    cipher.doFinal(mediaStr.toByteArray(Charsets.ISO_8859_1)),
+                    Charsets.UTF_8
+                )
             )
 
-            Log.e("AbyssPlayerDebug", "metaData = $decryptedString")
-
-            val metaData = JSONObject(decryptedString)
-            val mp4 = metaData.optJSONObject("mp4")
-            val sources = mp4?.optJSONArray("sources")
-            val domains = mp4?.optJSONArray("domains")
-            val fristDatas = mp4?.optJSONArray("fristDatas")
-
-            if (sources == null) {
-                Log.e("AbyssPlayerDebug", "No sources in metaData")
-                return
+            // --- Subtitles ---
+            try {
+                val subsArr = root.optJSONObject("config")?.optJSONArray("subtitles")
+                if (subsArr != null) {
+                    for (i in 0 until subsArr.length()) {
+                        val s = subsArr.optJSONObject(i) ?: continue
+                        val lang = s.optString("lang").ifBlank { "Subtitle" }
+                        val sSlug = s.optString("slug")
+                        if (sSlug.isNotBlank()) {
+                            // Abyss serves subtitle content at /subtitle/{slug}
+                            val subUrl = "https://abyssplayer.com/subtitle/$sSlug"
+                            subtitleCallback(SubtitleFile(lang, subUrl))
+                        }
+                    }
+                }
+            } catch (_: Exception) {
             }
 
             val streamHeaders = mapOf(
@@ -195,143 +198,101 @@ class AbyssPlayer : ExtractorApi() {
                 "Origin" to mainUrl
             )
 
-            for (i in 0 until sources.length()) {
-                val source = sources.optJSONObject(i) ?: continue
-                val sub = source.optString("sub")
-                if (sub.isBlank()) continue
+            val mp4 = metaData.optJSONObject("mp4") ?: run {
+                Log.e("AbyssPlayer", "No 'mp4' object in metaData")
+                return
+            }
+            val sources = mp4.optJSONArray("sources") ?: run {
+                Log.e("AbyssPlayer", "No 'sources' array in metaData")
+                return
+            }
+            val fristDatas = mp4.optJSONArray("fristDatas")
 
-                val label = source.optString("label")
-                val resId = source.optInt("res_id", 0)
-                val size = source.optLong("size", 0L)
-
-                // Resolve domain: match by sub prefix, NOT by index.
-                var domain = ""
-                if (domains != null) {
-                    for (j in 0 until domains.length()) {
-                        val d = domains.optString(j)
-                        if (d == sub || d.startsWith("$sub.") || d.contains(sub)) {
-                            domain = d
-                            break
-                        }
-                    }
-                    if (domain.isBlank()) domain = domains.optString(i)
-                }
-                if (domain.isBlank()) domain = "$sub.sssrr.org"
-
-                Log.e("AbyssPlayerDebug", "=== source[$i] sub=$sub label=$label resId=$resId size=$size domain=$domain ===")
-
-                val candidates = mutableListOf<String>()
-
-                // 1. Direct fields, if the API ever includes them
-                val srcFile = source.optString("file")
-                if (srcFile.isNotBlank()) candidates.add(srcFile.replace("\\/", "/"))
-                val srcUrl = source.optString("url")
-                if (srcUrl.isNotBlank()) candidates.add(srcUrl.replace("\\/", "/"))
-
-                // 2. Basic guess patterns on the source's own domain
-                val basicPaths = listOf(
-                    "$sub.m3u8",
-                    "$sub/index.m3u8",
-                    "$sub/master.m3u8",
-                    "$sub/playlist.m3u8",
-                    "$sub/hls.m3u8",
-                    "$sub/index-f1-v1-a1.m3u8",
-                    "hls/$sub.m3u8",
-                    "hls/$sub/index.m3u8",
-                    "hls/$sub/master.m3u8",
-                    "hls/$sub/index-f1-v1-a1.m3u8",
-                    "vod/$sub.m3u8",
-                    "vod/$sub/index.m3u8",
-                    "vod/$sub/master.m3u8",
-                    "master.m3u8",
-                    "index.m3u8",
-                    "playlist.m3u8",
-                    "hls.m3u8"
-                )
-                for (p in basicPaths) candidates.add("https://$domain/$p")
-
-                // 3. fristDatas-based: match by res_id + size
-                var matchedFrist = ""
-                if (fristDatas != null) {
-                    for (j in 0 until fristDatas.length()) {
-                        val fd = fristDatas.optJSONObject(j) ?: continue
-                        if (fd.optInt("res_id", -1) == resId && fd.optLong("size", -1L) == size) {
-                            matchedFrist = fd.optString("url")
-                            break
-                        }
-                    }
-                }
-
-                if (matchedFrist.isNotBlank()) {
-                    Log.e("AbyssPlayerDebug", "fristData match for $sub = $matchedFrist")
-                    val clean = matchedFrist.replace("\\/", "/")
-
-                    // Same base, swap extension
-                    val base = clean.substringBeforeLast(".")
-                    candidates.add("$base.m3u8")
-                    candidates.add("$base.mp4")
-                    candidates.add("$base.txt")
-                    candidates.add(clean) // try .fd as-is too
-
-                    // Same directory, common playlist names
-                    val dir = clean.substringBeforeLast("/")
-                    candidates.add("$dir/master.m3u8")
-                    candidates.add("$dir/index.m3u8")
-                    candidates.add("$dir/playlist.m3u8")
-                    candidates.add("$dir/index-f1-v1-a1.m3u8")
-
-                    // One directory up
-                    val up1 = dir.substringBeforeLast("/", "")
-                    if (up1.isNotBlank()) {
-                        candidates.add("$up1/master.m3u8")
-                        candidates.add("$up1/index.m3u8")
-                        candidates.add("$up1/playlist.m3u8")
-                    }
-                }
-
-                for (candidateUrl in candidates.distinct()) {
-                    try {
-                        val response = app.get(candidateUrl, headers = streamHeaders)
-                        val code = response.code
-                        Log.e("AbyssPlayerDebug", "TRY $candidateUrl -> $code")
-                        if (code !in 200..299) continue
-
-                        val body = try { response.text } catch (_: Exception) { "" }
-                        val isPlaylist = body.contains("#EXTM3U") || body.contains("#EXT-X-")
-                        val isM3u8 = candidateUrl.contains(".m3u8")
-
-                        if (isM3u8 && !isPlaylist) {
-                            Log.e("AbyssPlayerDebug", "  -> $code but not a playlist. body[0:150] = ${body.take(150)}")
-                            continue
-                        }
-
-                        val quality = label.replace(Regex("""[^0-9]"""), "")
-                            .toIntOrNull() ?: Qualities.Unknown.value
-
-                        callback(
-                            newExtractorLink(
-                                name = this.name,
-                                source = "${this.name} $label",
-                                url = candidateUrl,
-                                type = com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = url
-                                this.headers = streamHeaders
-                                this.quality = quality
-                            }
-                        )
-
-                        Log.e("AbyssPlayerDebug", "WORKING URL = $candidateUrl")
-                        return
-                    } catch (e: Exception) {
-                        Log.e("AbyssPlayerDebug", "TRY $candidateUrl -> EX ${e.message}")
+            // Build lookup: (res_id, size) -> direct URL
+            val directByKey = mutableMapOf<String, String>()
+            if (fristDatas != null) {
+                for (i in 0 until fristDatas.length()) {
+                    val fd = fristDatas.optJSONObject(i) ?: continue
+                    val resId = fd.optInt("res_id", -1)
+                    val size = fd.optLong("size", -1L)
+                    val directUrl = fd.optString("url")
+                        .replace("\\/", "/")
+                    if (resId >= 0 && size > 0 && directUrl.startsWith("http")) {
+                        directByKey["$resId:$size"] = directUrl
                     }
                 }
             }
 
-            Log.e("AbyssPlayerDebug", "No working URL found for any source")
+            Log.e("AbyssPlayer", "sources=${sources.length()} fristDatas=${fristDatas?.length() ?: 0}")
+
+            if (directByKey.isEmpty()) {
+                Log.e("AbyssPlayer", "No usable fristDatas entries")
+                return
+            }
+
+            var emitted = 0
+            for (i in 0 until sources.length()) {
+                val src = sources.optJSONObject(i) ?: continue
+                val resId = src.optInt("res_id", -1)
+                val size = src.optLong("size", -1L)
+                val label = src.optString("label").ifBlank { "Unknown" }
+                val codec = src.optString("codec")
+
+                val directUrl = directByKey["$resId:$size"] ?: continue
+
+                val quality = label.replace(Regex("""[^0-9]"""), "")
+                    .toIntOrNull() ?: Qualities.Unknown.value
+
+                // Sniff content type: is the .fd an HLS manifest or a direct file?
+                val probe = try {
+                    app.get(directUrl, headers = streamHeaders)
+                } catch (e: Exception) {
+                    Log.e("AbyssPlayer", "Probe failed for $directUrl: ${e.message}")
+                    continue
+                }
+
+                if (probe.code !in 200..299) {
+                    Log.e("AbyssPlayer", "Probe $directUrl -> ${probe.code}")
+                    continue
+                }
+
+                val snippet = try { probe.text.take(2048) } catch (_: Exception) { "" }
+                val isHls = snippet.contains("#EXTM3U") || snippet.contains("#EXT-X-STREAM-INF")
+
+                val srcLabel = buildString {
+                    append(label)
+                    if (codec.isNotBlank() && codec != "h264") append(" $codec")
+                }
+
+                if (isHls) {
+                    Log.e("AbyssPlayer", "HLS detected at $directUrl")
+                    M3u8Helper.generateM3u8(
+                        name,
+                        directUrl,
+                        url,
+                        headers = streamHeaders
+                    ).forEach(callback)
+                } else {
+                    Log.e("AbyssPlayer", "Direct file at $directUrl (${snippet.length} bytes sniffed)")
+                    callback(
+                        newExtractorLink(
+                            name = this.name,
+                            source = "${this.name} $srcLabel",
+                            url = directUrl,
+                            type = com.lagradost.cloudstream3.utils.ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = url
+                            this.headers = streamHeaders
+                            this.quality = quality
+                        }
+                    )
+                }
+                emitted++
+            }
+
+            Log.e("AbyssPlayer", "Emitted $emitted link(s)")
         } catch (e: Exception) {
-            Log.e("AbyssPlayerDebug", "AES Decryption crashed: ${e.message}", e)
+            Log.e("AbyssPlayer", "Extraction failed: ${e.message}", e)
         }
     }
 }
