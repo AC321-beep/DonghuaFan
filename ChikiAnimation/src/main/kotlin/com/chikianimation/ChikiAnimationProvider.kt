@@ -68,7 +68,7 @@ class ChikiAnimationProvider : MainAPI() {
             ?: this.selectFirst("a[href]") 
             ?: return null
 
-        val href = fixUrlNull(anchor.attr("href")) ?: return null
+        val href = fixUrlNull(aTag.attr("href")) ?: return null
         if (href.isBlank() || href.contains("/genres/") || href.contains("/bookmark") ||
             href.contains("/privacy") || href.contains("/contact") || href.contains("/dmca")
         ) return null
@@ -275,7 +275,7 @@ class ChikiAnimationProvider : MainAPI() {
             if (!finalUrl.startsWith("http")) return
             if (finalUrl.contains("youtube", true) || finalUrl.contains("disqus", true) || finalUrl.contains("googlesyndication", true)) return
 
-            // Native Dailymotion Bypass (Identical to your sample code)
+            // Native Dailymotion Bypass
             if (finalUrl.contains("dailymotion", ignoreCase = true) || finalUrl.contains("dai.ly", ignoreCase = true)) {
                 val videoIdMatch = Regex("""(?:dailymotion\.com/(?:embed/)?video/|geo\.dailymotion\.com/(?:player/[^/]+/video/|player\.html\?video=)|dai\.ly/)([a-zA-Z0-9_-]+)""").find(finalUrl)
                 if (videoIdMatch != null) {
@@ -317,8 +317,17 @@ class ChikiAnimationProvider : MainAPI() {
                                     M3u8Helper.generateM3u8(label, fileUrl, finalUrl).forEach { callback.invoke(it) }
                                     found = true
                                 } else if (fileUrl.contains(".mp4", ignoreCase = true)) {
+                                    // FIXED: Deprecated ExtractorLink constructor replaced with newExtractorLink
                                     callback.invoke(
-                                        ExtractorLink(label, label, fileUrl, finalUrl, Qualities.Unknown.value, ExtractorLinkType.VIDEO)
+                                        newExtractorLink(
+                                            source = label,
+                                            name = label,
+                                            url = fileUrl,
+                                            type = ExtractorLinkType.VIDEO
+                                        ) {
+                                            this.referer = finalUrl
+                                            this.quality = Qualities.Unknown.value
+                                        }
                                     )
                                     found = true
                                 }
