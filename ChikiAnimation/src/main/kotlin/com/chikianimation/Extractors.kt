@@ -4,6 +4,7 @@ import android.util.Base64
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.Filesim
+import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -15,18 +16,12 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.abs
 
-// ═════════════════════════════════════════════════════════════════════
-// Ghbrisk — StreamWish mirror used by chikianimation.com
-// ═════════════════════════════════════════════════════════════════════
 class Ghbrisk : Filesim() {
     override var name = "Streamwish"
     override var mainUrl = "https://ghbrisk.com"
     override val requiresReferer = true
 }
 
-// ═════════════════════════════════════════════════════════════════════
-// GalaxyDonghua — AAencode/Packr obfuscated player
-// ═════════════════════════════════════════════════════════════════════
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
     override var mainUrl = GX
@@ -119,6 +114,17 @@ class GalaxyDonghua : ExtractorApi() {
                         this.quality = label.filter { it.isDigit() }.toIntOrNull() ?: 0
                         this.headers = playbackHeaders
                     }
+                )
+            }
+
+        Regex(""""file"\s*:\s*"([^"]+\.(?:vtt|srt))"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?""")
+            .findAll(apiPlain)
+            .forEach { m ->
+                subtitleCallback.invoke(
+                    newSubtitleFile(
+                        lang = m.groupValues[2].ifBlank { "Sub" },
+                        url = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
+                    )
                 )
             }
     }
