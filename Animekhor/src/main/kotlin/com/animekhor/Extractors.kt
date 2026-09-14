@@ -110,115 +110,174 @@ class AbyssPlayer : ExtractorApi() {
     override var mainUrl = "https://abyssplayer.com"
     override val requiresReferer = true
 
-    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
         try {
-            // Spoof iOS to force Abyss into returning standard domains over .fd chunks
-            val iosUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-            
-            val headers = mapOf(
-                "User-Agent" to iosUserAgent,
-                "Referer" to (referer ?: mainUrl)
-            )
-            
-            val response = app.get(url, headers = headers).text
+            val iosUserAgent =
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) " +
+                        "AppleWebKit/605.1.15 (KHTML, like Gecko) " +
+                        "Version/16.6 Mobile/15E148 Safari/604.1"
 
-            val encodedDataMatch = Regex("""datas\s*=\s*["']([^"']+)["']""").find(response)
-            if (encodedDataMatch == null) {
-                Log.e("AbyssPlayer", "Failed to find 'datas' AES payload in HTML.")
+            val html = app.get(
+                url,
+                headers = mapOf(
+                    "User-Agent" to iosUserAgent,
+                    "Referer" to (referer ?: "$mainUrl/")
+                )
+            ).text
+
+            val encodedData = Regex("""datas\s*=\s*["']([^"']+)["']""")
+                .find(html)
+                ?.groupValues
+                ?.get(1)
+                ?: run {
+                    Log.e("AbyssPlayer", "Failed to find 'datas' payload")
+                    return
+                }
+
+            val root = JSONObject(
+                String(
+                    Base64.decode(encodedData, Base64.DEFAULT),
+                    Charsets.ISO_8859_1
+                )
+            )
+
+            val userId = root.optString("user_id")
+            val slug = root.optString("slug")
+            val md5Id = root.optString("md5_id")
+            val mediaStr = root.optString("media")
+
+            if (userId.isBlank() || slug.isBlank() || md5Id.isBlank() || mediaStr.isBlank()) {
+                Log.e("AbyssPlayer", "Missing required JSON fields")
                 return
             }
-            
-            val encodedData = encodedDataMatch.groupValues[1]
-            val decodedJsonBytes = Base64.decode(encodedData, Base64.DEFAULT)
-            val decodedJsonString = String(decodedJsonBytes, Charsets.ISO_8859_1) 
-            val data = JSONObject(decodedJsonString)
-            
-            val userId = data.optString("user_id")
-            val slug = data.optString("slug")
-            val md5Id = data.optString("md5_id")
-            val mediaStr = data.optString("media")
 
-            val seed = "$userId:$slug:$md5Id"
-            val md5Hex = MessageDigest.getInstance("MD5").digest(seed.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+            val md5Hex = MessageDigest.getInstance("MD5")
+                .digest("$userId:$slug:$md5Id".toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it) }
 
             val keyBytes = md5Hex.toByteArray(Charsets.UTF_8)
             val ivBytes = keyBytes.copyOfRange(0, 16)
-            val encryptedMediaBytes = mediaStr.toByteArray(Charsets.ISO_8859_1)
 
             val cipher = Cipher.getInstance("AES/CTR/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(keyBytes, "AES"), IvParameterSpec(ivBytes))
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(keyBytes, "AES"),
+                IvParameterSpec(ivBytes)
+            )
 
-            val decryptedBytes = cipher.doFinal(encryptedMediaBytes)
-            val metaData = JSONObject(String(decryptedBytes, Charsets.UTF_8))
+            val metaData = JSONObject(
+                String(
+                    cipher.doFinal(mediaStr.toByteArray(Charsets.ISO_8859_1)),
+                    Charsets.UTF_8
+                )
+            )
 
-            var foundLinks = false
-            val mp4Obj = metaData.optJSONObject("mp4")
-            
-            if (mp4Obj != null) {
-                val sources = mp4Obj.optJSONArray("sources")
-                val domains = mp4Obj.optJSONArray("domains")
-                
-                if (sources != null && domains != null) {
-                    for (i in 0 until sources.length()) {
-                        val sourceObj = sources.getJSONObject(i)
-                        val sub = sourceObj.optString("sub")
-                        val label = sourceObj.optString("label")
-                        
-                        var matchingDomain = ""
-                        for (j in 0 until domains.length()) {
-                            val d = domains.getString(j)
-                            if (d.startsWith(sub) || d.contains(sub)) {
-                                matchingDomain = d
-                                break
-                            }
+            val streamHeaders = mapOf(
+                "User-Agent" to iosUserAgent,
+                "Referer" to url,
+                "Origin" to mainUrl
+            )
+
+            var found = false
+
+            val mp4 = metaData.optJSONObject("mp4")
+            val sources = mp4?.optJSONArray("sources")
+            val domains = mp4?.optJSONArray("domains")
+
+            if (sources != null && domains != null) {
+                for (i in 0 until sources.length()) {
+                    val source = sources.optJSONObject(i) ?: continue
+
+                    val sub = source.optString("sub")
+                    if (sub.isBlank()) continue
+
+                    val label = source.optString("label")
+
+                    // IMPORTANT: use the domain index from the source object.
+                    val domainIndex = source.optInt("domain", 0)
+                    val domain = domains.optString(domainIndex)
+                        .ifBlank { domains.optString(0) }
+
+                    if (domain.isBlank()) continue
+
+                    // Prefer the real file name from decrypted JSON.
+                    // Abyss/Hydrax usually uses master.m3u8 if file is absent.
+                    val candidates = listOf(
+                        source.optString("file"),
+                        source.optString("url"),
+                        "master.m3u8",
+                        "index.m3u8",
+                        "v.m3u8"
+                    )
+                        .map { it.replace("\\/", "/").trimStart('/') }
+                        .filter { it.isNotBlank() }
+                        .distinct()
+
+                    for (file in candidates) {
+                        val finalUrl = if (file.startsWith("http", true)) {
+                            file
+                        } else {
+                            "https://$domain/$sub/$file"
                         }
-                        
-                        if (matchingDomain.isNotBlank() && sub.isNotBlank()) {
-                            val qualityValue = label.replace("p", "").toIntOrNull() ?: Qualities.Unknown.value
-                            
-                            // Blind-fire all known Abyss/Hydrax M3U8 directory structures directly to the player
-                            val m3u8Paths = listOf(
-                                "https://$matchingDomain/$sub/v.m3u8",
-                                "https://$matchingDomain/$sub/index.m3u8",
-                                "https://$matchingDomain/$sub.m3u8"
+
+                        try {
+                            val code = app.get(finalUrl, headers = streamHeaders).code
+                            if (code !in 200..299) continue
+
+                            val quality = label
+                                .replace(Regex("""[^0-9]"""), "")
+                                .toIntOrNull()
+                                ?: Qualities.Unknown.value
+
+                            callback(
+                                newExtractorLink(
+                                    name = this.name,
+                                    source = "${this.name} $label",
+                                    url = finalUrl,
+                                    type = com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8
+                                ) {
+                                    this.referer = url
+                                    this.headers = streamHeaders
+                                    this.quality = quality
+                                }
                             )
-                            
-                            m3u8Paths.forEachIndexed { index, m3u8Url ->
-                                callback(
-                                    newExtractorLink(
-                                        name = this.name,
-                                        source = "${this.name} $label (v${index + 1})",
-                                        url = m3u8Url,
-                                        type = com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8
-                                    ) {
-                                        this.referer = url
-                                        this.headers = headers
-                                        this.quality = qualityValue
-                                    }
-                                )
-                            }
-                            foundLinks = true
+
+                            found = true
+                            break
+                        } catch (_: Exception) {
+                            // Try next candidate
                         }
                     }
+
+                    if (found) break
                 }
             }
 
-            // Fallback: If domain arrays are missing, check standard URLs
-            if (!foundLinks) {
-                val videoUrl = metaData.optString("hls").ifBlank { metaData.optString("url") }.ifBlank { metaData.optString("file") }.replace("\\/", "/")
-                if (videoUrl.isNotBlank() && !videoUrl.endsWith(".fd")) {
+            // Fallback if mp4/domains/sources are missing
+            if (!found) {
+                val fallback = metaData.optString("hls")
+                    .ifBlank { metaData.optString("url") }
+                    .ifBlank { metaData.optString("file") }
+                    .replace("\\/", "/")
+
+                if (fallback.isNotBlank() && !fallback.endsWith(".fd")) {
                     callback(
-                        newExtractorLink(name = name, source = name, url = videoUrl, type = com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8) {
+                        newExtractorLink(
+                            name = name,
+                            source = name,
+                            url = fallback,
+                            type = com.lagradost.cloudstream3.utils.ExtractorLinkType.M3U8
+                        ) {
                             this.referer = url
-                            this.headers = headers
+                            this.headers = streamHeaders
                         }
                     )
-                    foundLinks = true
                 }
-            }
-
-            if (!foundLinks) {
-                Log.e("AbyssPlayer", "Failed to reconstruct M3U8 from domains. JSON Dump: $metaData")
             }
         } catch (e: Exception) {
             Log.e("AbyssPlayer", "AES Decryption crashed: ${e.message}")
