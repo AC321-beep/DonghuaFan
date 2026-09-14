@@ -169,16 +169,23 @@ class AbyssPlayer : ExtractorApi() {
             videoUrl = videoUrl.replace("\\/", "/")
             
             if (videoUrl.isNotBlank()) {
-                if (videoUrl.contains(".m3u8") || metaData.optString("type").contains("hls", true)) {
-                    M3u8Helper.generateM3u8(name, videoUrl, url, headers = headers).forEach(callback)
-                } else {
-                    callback(
-                        newExtractorLink(name = name, source = name, url = videoUrl, type = INFER_TYPE) {
-                            this.referer = url
-                            this.headers = headers // <--- Added headers here
-                        }
-                    )
-                }
+    val cleanUrl = videoUrl.replace("\\/", "/")
+    if (cleanUrl.contains(".m3u8") || metaData.optString("type").contains("hls", true)) {
+        M3u8Helper.generateM3u8(name, cleanUrl, url, headers = headers).forEach(callback)
+    } else {
+        callback(
+            newExtractorLink(
+                name = name,
+                source = name,
+                url = cleanUrl,
+                type = com.lagradost.cloudstream3.utils.ExtractorLinkType.VIDEO
+            ) {
+                this.referer = "https://abyssplayer.com/"
+                this.headers = headers
+                // Force ExoPlayer to treat raw .fd chunks as progressive stream
+            }
+        )
+    }
             } else {
                 Log.e("AbyssPlayer", "Decryption succeeded, but no valid video URL found.")
             }
