@@ -18,93 +18,11 @@ import kotlin.math.abs
 
 // ═════════════════════════════════════════════════════════════════════
 // Ghbrisk — StreamWish mirror used by chikianimation.com
-// Extends Filesim so loadExtractor routes ghbrisk.com here.
 // ═════════════════════════════════════════════════════════════════════
 class Ghbrisk : Filesim() {
     override var name = "Streamwish"
     override var mainUrl = "https://ghbrisk.com"
     override val requiresReferer = true
-}
-
-// ═════════════════════════════════════════════════════════════════════
-// Dailymotion — explicit handler
-// ═════════════════════════════════════════════════════════════════════
-class Dailymotion : ExtractorApi() {
-    override var name = "Dailymotion"
-    override var mainUrl = "https://www.dailymotion.com"
-    override val requiresReferer = false
-
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val id = Regex("""(?:dailymotion\.com/(?:embed/)?video/|dai\.ly/)([a-zA-Z0-9]+)""")
-            .find(url)?.groupValues?.get(1)
-            ?: return
-
-        val embedReferer = "https://www.dailymotion.com/embed/video/$id"
-        val metaUrl = "https://www.dailymotion.com/player/metadata/video/$id"
-
-        val response = try {
-            app.get(
-                metaUrl,
-                headers = mapOf(
-                    "User-Agent" to UA,
-                    "Referer" to embedReferer,
-                    "Origin" to "https://www.dailymotion.com"
-                )
-            ).text
-        } catch (e: Exception) { return }
-
-        Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""")
-            .findAll(response)
-            .forEach { m ->
-                val m3u8 = m.groupValues[1].replace("\\/", "/")
-                callback.invoke(
-                    newExtractorLink(
-                        source = this.name,
-                        name = "Dailymotion",
-                        url = m3u8,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = "https://www.dailymotion.com/"
-                        this.quality = qualityOf(m3u8)
-                        this.headers = mapOf(
-                            "User-Agent" to UA,
-                            "Referer" to "https://www.dailymotion.com/"
-                        )
-                    }
-                )
-            }
-
-        Regex(""""url"\s*:\s*"([^"]+\.(?:vtt|srt)[^"]*)"[^{}]*?"language"\s*:\s*"([^"]*)"""")
-            .findAll(response)
-            .forEach { m ->
-                subtitleCallback.invoke(
-                    newSubtitleFile(
-                        lang = m.groupValues[2].ifBlank { "Sub" },
-                        url = m.groupValues[1].replace("\\/", "/")
-                    )
-                )
-            }
-    }
-
-    private fun qualityOf(u: String): Int = when {
-        u.contains("1080") -> 1080
-        u.contains("720")  -> 720
-        u.contains("480")  -> 480
-        u.contains("380")  -> 380
-        u.contains("240")  -> 240
-        else               -> 0
-    }
-
-    companion object {
-        const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-                "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                "Chrome/120.0.0.0 Safari/537.36"
-    }
 }
 
 // ═════════════════════════════════════════════════════════════════════
