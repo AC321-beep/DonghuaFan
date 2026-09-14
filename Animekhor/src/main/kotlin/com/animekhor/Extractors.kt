@@ -210,8 +210,8 @@ class AbyssPlayer : ExtractorApi() {
                             val bytes = probe.body?.bytes() ?: ByteArray(0)
                             Log.e("AbyssPlayerDebug", "FD_PROBE bodySize=${bytes.size}")
                             val hex = bytes.take(64).joinToString("") { "%02x".format(it) }
-                            val ascii = bytes.take(64)
-                                .map { if (it in 32..126) it.toChar() else '.' }
+                                val ascii = bytes.take(64)
+                                .map { if (it.toInt() in 32..126) it.toInt().toChar() else '.' }
                                 .joinToString("")
                             Log.e("AbyssPlayerDebug", "FD_PROBE hex=$hex")
                             Log.e("AbyssPlayerDebug", "FD_PROBE ascii=$ascii")
