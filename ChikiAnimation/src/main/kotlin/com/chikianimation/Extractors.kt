@@ -1,6 +1,7 @@
 package com.chikianimation
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.Filesim
@@ -34,8 +35,15 @@ class Dailymotion : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        Log.d("ChikiDebug", "Dailymotion extractor invoked with URL: $url")
         val id = Regex("""(?:dailymotion\.com/(?:embed/)?video/|geo\.dailymotion\.com/(?:player/[^/]+/video/|player\.html\?video=)|dai\.ly/)([a-zA-Z0-9_-]+)""")
-            .find(url)?.groupValues?.get(1) ?: return
+            .find(url)?.groupValues?.get(1)
+            
+        if (id == null) {
+            Log.d("ChikiDebug", "Dailymotion failed to match video ID from URL: $url")
+            return
+        }
+        Log.d("ChikiDebug", "Extracted Dailymotion video ID: $id")
 
         val metaUrl = "https://www.dailymotion.com/player/metadata/video/$id"
         val headers = mapOf("Referer" to (referer ?: mainUrl))
@@ -43,6 +51,7 @@ class Dailymotion : ExtractorApi() {
         val response = try {
             app.get(metaUrl, headers = headers).text
         } catch (e: Exception) {
+            Log.d("ChikiDebug", "Dailymotion metadata fetch failed, trying embed fallback: ${e.message}")
             app.get("https://www.dailymotion.com/embed/video/$id", headers = headers).text
         }
 
@@ -50,7 +59,12 @@ class Dailymotion : ExtractorApi() {
             .find(response)?.groupValues?.get(1)?.replace("\\/", "/")
             ?: Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""")
             .find(response)?.groupValues?.get(1)?.replace("\\/", "/")
-            ?: return
+
+        if (m3u8Url == null) {
+            Log.d("ChikiDebug", "Dailymotion failed to locate m3u8 stream URL in response metadata.")
+            return
+        }
+        Log.d("ChikiDebug", "Dailymotion found m3u8 URL: $m3u8Url")
 
         M3u8Helper.generateM3u8(
             this.name,
@@ -90,26 +104,51 @@ class GalaxyDonghua : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        Log.d("ChikiDebug", "GalaxyDonghua extractor invoked with URL: $url")
         val headers = mapOf(
             "User-Agent" to UA,
             "Referer" to (referer ?: GX),
             "Accept" to "*/*"
         )
 
-        val page = try { app.get(url, headers = headers).text } catch (e: Exception) { return }
-        val tokens = decodeGdTokens(page) ?: return
+        val page = try {
+            app.get(url, headers = headers).text
+        } catch (e: Exception) {
+            Log.d("ChikiDebug", "GalaxyDonghua failed to fetch player page: ${e.message}")
+            return
+        }
+
+        val tokens = decodeGdTokens(page)
+        if (tokens == null) {
+            Log.d("ChikiDebug", "GalaxyDonghua failed to decode obfuscated tokens from page script.")
+            return
+        }
+        Log.d("ChikiDebug", "GalaxyDonghua successfully decoded tokens.")
 
         val gxBase = embedHost(url)
         val apiConfigBase = "$gxBase/wp-json/gd/v1/config"
-        val configRes = try { app.get(apiConfigBase, headers = headers).text }
-            catch (e: Exception) { return }
+        val configRes = try {
+            app.get(apiConfigBase, headers = headers).text
+        } catch (e: Exception) {
+            Log.d("ChikiDebug", "GalaxyDonghua failed to fetch config JSON: ${e.message}")
+            return
+        }
 
         val configPlain = dcx(configRes.trim(), tokens.kaken)
             ?: dcx(configRes.trim(), tokens.apx)
-            ?: return
+
+        if (configPlain == null) {
+            Log.d("ChikiDebug", "GalaxyDonghua failed to decrypt config payload.")
+            return
+        }
 
         val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""")
-            .find(configPlain)?.groupValues?.get(1) ?: return
+            .find(configPlain)?.groupValues?.get(1)
+            
+        if (apiUrlTemplate == null) {
+            Log.d("ChikiDebug", "GalaxyDonghua failed to find API URL template in decrypted config.")
+            return
+        }
 
         val fixedApi = apiUrlTemplate
             .replace("{pd}", tokens.pd)
@@ -128,11 +167,18 @@ class GalaxyDonghua : ExtractorApi() {
                     "apx" to tokens.apx
                 )
             ).text
-        } catch (e: Exception) { return }
+        } catch (e: Exception) {
+            Log.d("ChikiDebug", "GalaxyDonghua failed to post to API endpoint: ${e.message}")
+            return
+        }
 
         val apiPlain = dcx(apiRes.trim(), tokens.kaken)
             ?: dcx(apiRes.trim(), tokens.apx)
-            ?: return
+
+        if (apiPlain == null) {
+            Log.d("ChikiDebug", "GalaxyDonghua failed to decrypt final stream API response.")
+            return
+        }
 
         val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""")
             .find(apiPlain)?.groupValues?.get(1) ?: gxBase
@@ -143,6 +189,7 @@ class GalaxyDonghua : ExtractorApi() {
             "Origin" to gxBase
         )
 
+        var foundStreams = false
         Regex(""""file"\s*:\s*"([^"]+)"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?(?:[^{}]*?"type"\s*:\s*"([^"]*)")?""")
             .findAll(apiPlain)
             .forEach { m ->
@@ -152,6 +199,9 @@ class GalaxyDonghua : ExtractorApi() {
                 val isM3u8 = streamUrl.contains(".m3u8") ||
                         type.contains("hls", true) ||
                         type.contains("m3u8", true)
+
+                Log.d("ChikiDebug", "GalaxyDonghua extracted stream -> label: $label, url: $streamUrl")
+                foundStreams = true
 
                 callback.invoke(
                     newExtractorLink(
@@ -166,6 +216,10 @@ class GalaxyDonghua : ExtractorApi() {
                     }
                 )
             }
+
+        if (!foundStreams) {
+            Log.d("ChikiDebug", "GalaxyDonghua completed execution but found 0 stream links in decrypted response.")
+        }
 
         Regex(""""file"\s*:\s*"([^"]+\.(?:vtt|srt))"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?""")
             .findAll(apiPlain)
