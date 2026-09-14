@@ -27,7 +27,7 @@ class ChikiAnimationProvider : MainAPI() {
         "anime/?status=completed&type=&order=update" to "Completed",
         "anime/?status=&type=movie&order=update"     to "Movies",
         "anime/?status=&type=ona&order=update"       to "Donghua (ONA)",
-        "genres/ai-generated/"                       to "AI Anime"
+        "anime/?status=&type=ai+animes&order=update" to "AI Anime"
     )
 
     private val headers = mapOf(
@@ -39,7 +39,7 @@ class ChikiAnimationProvider : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-       override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = buildPageUrl(request.data, page)
         println("ChikiAnimation: loading ${request.name} → $url")
 
@@ -66,11 +66,11 @@ class ChikiAnimationProvider : MainAPI() {
                 val trimmed = base.trimEnd('/')
                 "$mainUrl/$trimmed/page/$page/"
             }
-            else -> "$mainUrl/$base&paged=$page"
+            else -> "$mainUrl/$base&page=$page"
         }
     }
 
-       private fun Element.toSearchResult(): SearchResponse? {
+    private fun Element.toSearchResult(): SearchResponse? {
         val anchor = selectFirst("div.bsx > a[href]")
             ?: selectFirst("a[itemprop=url]")
             ?: selectFirst("h2 a[href]")
@@ -108,7 +108,7 @@ class ChikiAnimationProvider : MainAPI() {
         }
     }
 
-       override suspend fun search(query: String): List<SearchResponse> {
+    override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
         val encoded = query.trim()
 
@@ -133,7 +133,7 @@ class ChikiAnimationProvider : MainAPI() {
         return results.distinctBy { it.url }
     }
 
-        override suspend fun load(url: String): LoadResponse? {
+    override suspend fun load(url: String): LoadResponse? {
         val document = try {
             app.get(url, headers = headers).document
         } catch (e: Exception) {
@@ -168,7 +168,7 @@ class ChikiAnimationProvider : MainAPI() {
 
         val isMovie = typeText.contains("movie", ignoreCase = true)
 
-            if (isMovie) {
+        if (isMovie) {
             val watchHref = document
                 .selectFirst(".eplister li > a[href], .episodelist li > a[href]")
                 ?.attr("href")?.trim()
@@ -181,7 +181,7 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-          var epListElements = document.select(".episodelist li, .eplister li")
+        var epListElements = document.select(".episodelist li, .eplister li")
 
         if (epListElements.isEmpty()) {
             val epPage = document
@@ -292,7 +292,7 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // ─── Layer 1: mirror dropdown ────────────────────────────────
+        // Layer 1: mirror dropdown
         val mirrorOptions = document.select(
             "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
         )
@@ -336,7 +336,7 @@ class ChikiAnimationProvider : MainAPI() {
             }.awaitAll()
         }
 
-        // ─── Layer 2: iframes ────────────────────────────────────────
+        // Layer 2: iframes
         if (!found) {
             document.select("iframe").forEach { iframe ->
                 val src = iframe.attr("src").ifBlank {
@@ -348,7 +348,7 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // ─── Layer 3: script scan ────────────────────────────────────
+        // Layer 3: script scan
         if (!found) {
             document.select("script").forEach { script ->
                 val body = script.data()
