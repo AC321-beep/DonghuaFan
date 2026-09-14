@@ -264,6 +264,25 @@ class AbyssPlayer : ExtractorApi() {
         }
     }
 }
+class P2pstream : ExtractorApi() {
+    override var name = "P2pstream"
+    override var mainUrl = "https://animekhor.p2pstream.vip"
+    override val requiresReferer = true
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        val fixedUrl = url.replace("/#", "/e/")
+        manualJsUnpackExtraction(fixedUrl, name, mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/"), callback)
+    }
+}
+
+class UpnsLive : ExtractorApi() {
+    override var name = "CloudPlayer"
+    override var mainUrl = "https://animekhor.upns.live"
+    override val requiresReferer = true
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        val fixedUrl = url.replace("/#", "/e/")
+        manualJsUnpackExtraction(fixedUrl, name, mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/"), callback)
+    }
+}
 
 class Bysekoze : ExtractorApi() {
     override var name = "VGPlayer"
