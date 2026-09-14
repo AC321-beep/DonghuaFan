@@ -117,37 +117,21 @@ class AbyssPlayer : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         try {
-            val iosUserAgent =
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) " +
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) " +
-                "Version/16.6 Mobile/15E148 Safari/604.1"
+            val ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) " +
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) " +
+                    "Version/16.6 Mobile/15E148 Safari/604.1"
 
             val html = app.get(
                 url,
-                headers = mapOf(
-                    "User-Agent" to iosUserAgent,
-                    "Referer" to (referer ?: "$mainUrl/")
-                )
+                headers = mapOf("User-Agent" to ua, "Referer" to (referer ?: "$mainUrl/"))
             ).text
 
-            // ---------- DUMP 1: full HTML in 3.5K chunks ----------
-            Log.e("AbyssPlayerDebug", "HTML_DUMP_BEGIN")
-            html.chunked(3500).forEachIndexed { i, chunk ->
-                Log.e("AbyssPlayerDebug", "HTML[$i] >>> $chunk")
-            }
-            Log.e("AbyssPlayerDebug", "HTML_DUMP_END")
-            // -------------------------------------------------------
-
             val encodedData = Regex("""datas\s*=\s*["']([^"']+)["']""")
-                .find(html)?.groupValues?.get(1) ?: run {
-                    Log.e("AbyssPlayerDebug", "No datas payload")
-                    return
-                }
+                .find(html)?.groupValues?.get(1) ?: return
 
             val root = JSONObject(
                 String(Base64.decode(encodedData, Base64.DEFAULT), Charsets.ISO_8859_1)
             )
-
             val userId = root.optString("user_id")
             val slug = root.optString("slug")
             val md5Id = root.optString("md5_id")
@@ -160,129 +144,124 @@ class AbyssPlayer : ExtractorApi() {
             val cipher = Cipher.getInstance("AES/CTR/NoPadding")
             cipher.init(
                 Cipher.DECRYPT_MODE,
-                SecretKeySpec(md5Hex.toByteArray(Charsets.UTF_8), "AES"),
-                IvParameterSpec(md5Hex.toByteArray(Charsets.UTF_8).copyOfRange(0, 16))
+                SecretKeySpec(md5Hex.toByteArray(), "AES"),
+                IvParameterSpec(md5Hex.toByteArray().copyOfRange(0, 16))
             )
             val metaData = JSONObject(
                 String(cipher.doFinal(mediaStr.toByteArray(Charsets.ISO_8859_1)), Charsets.UTF_8)
             )
-
             val mp4 = metaData.optJSONObject("mp4") ?: return
             val sources = mp4.optJSONArray("sources") ?: return
-            val domains = mp4.optJSONArray("domains")
             val fristDatas = mp4.optJSONArray("fristDatas")
 
-            val streamHeaders = mapOf(
-                "User-Agent" to iosUserAgent,
+            val headers = mapOf(
+                "User-Agent" to ua,
                 "Referer" to url,
                 "Origin" to mainUrl
             )
 
-            // ---------- DUMP 2: fd response headers + first bytes ----------
-            if (fristDatas != null && fristDatas.length() > 0) {
-                val fdUrl = fristDatas.optJSONObject(0)
-                    ?.optString("url")
-                    ?.replace("\\/", "/")
-                    .orEmpty()
-
-                if (fdUrl.isNotBlank()) {
-                    val probe = try {
-                        app.get(
-                            fdUrl,
-                            headers = streamHeaders + mapOf("Range" to "bytes=0-4095")
-                        )
-                    } catch (e: Exception) {
-                        Log.e("AbyssPlayerDebug", "FD_PROBE open failed: ${e.message}")
-                        null
-                    }
-
-                    if (probe != null) {
-                        Log.e("AbyssPlayerDebug", "FD_PROBE url=$fdUrl")
-                        Log.e("AbyssPlayerDebug", "FD_PROBE code=${probe.code}")
-                        Log.e("AbyssPlayerDebug", "FD_PROBE content-type=${probe.headers["Content-Type"]}")
-                        Log.e("AbyssPlayerDebug", "FD_PROBE content-length=${probe.headers["Content-Length"]}")
-                        Log.e("AbyssPlayerDebug", "FD_PROBE content-range=${probe.headers["Content-Range"]}")
-                        Log.e("AbyssPlayerDebug", "FD_PROBE content-encoding=${probe.headers["Content-Encoding"]}")
-                        Log.e("AbyssPlayerDebug", "FD_PROBE accept-ranges=${probe.headers["Accept-Ranges"]}")
-                        Log.e("AbyssPlayerDebug", "FD_PROBE location=${probe.headers["Location"]}")
-
-                        try {
-                            val bytes = probe.body?.bytes() ?: ByteArray(0)
-                            Log.e("AbyssPlayerDebug", "FD_PROBE bodySize=${bytes.size}")
-                            val hex = bytes.take(64).joinToString("") { "%02x".format(it) }
-                                val ascii = bytes.take(64)
-                                .map { if (it.toInt() in 32..126) it.toInt().toChar() else '.' }
-                                .joinToString("")
-                            Log.e("AbyssPlayerDebug", "FD_PROBE hex=$hex")
-                            Log.e("AbyssPlayerDebug", "FD_PROBE ascii=$ascii")
-                        } catch (e: Exception) {
-                            Log.e("AbyssPlayerDebug", "FD_PROBE body read failed: ${e.message}")
-                        }
+            // Config subtitles
+            root.optJSONObject("config")?.optJSONArray("subtitles")?.let { subs ->
+                for (i in 0 until subs.length()) {
+                    val s = subs.optJSONObject(i) ?: continue
+                    val lang = s.optString("lang").ifBlank { "Subtitle" }
+                    val subSlug = s.optString("slug")
+                    if (subSlug.isNotBlank()) {
+                        subtitleCallback(SubtitleFile(lang, "$mainUrl/subtitle/$subSlug"))
                     }
                 }
             }
 
-            // ---------- DUMP 3: HLS path probes with different referers ----------
-            if (sources.length() > 0) {
-                val src = sources.optJSONObject(0)
-                val sub = src?.optString("sub").orEmpty()
-                val domain = if (domains != null && domains.length() > 0)
-                    domains.optString(0) else "$sub.sssrr.org"
+            if (fristDatas == null) return
 
-                val testPaths = listOf(
-                    "https://$domain/hls/$sub/index-f1-v1-a1.m3u8",
-                    "https://$domain/hls/$sub/index.m3u8",
-                    "https://$domain/hls/$sub/master.m3u8",
-                    "https://$domain/hls/$sub.m3u8",
-                    "https://$domain/$sub/index-f1-v1-a1.m3u8",
+            // Map by (res_id, size)
+            data class Fd(val url: String, val resId: Int, val size: Long)
+            val fdList = mutableListOf<Fd>()
+            for (i in 0 until fristDatas.length()) {
+                val fd = fristDatas.optJSONObject(i) ?: continue
+                fdList.add(
+                    Fd(
+                        fd.optString("url").replace("\\/", "/"),
+                        fd.optInt("res_id", -1),
+                        fd.optLong("size", -1L)
+                    )
                 )
-                val testReferers = listOf(
-                    url,
-                    "$mainUrl/",
-                    "https://$domain/",
-                    referer ?: "",
-                ).filter { it.isNotBlank() }.distinct()
-
-                for (path in testPaths) {
-                    for (ref in testReferers) {
-                        val h = mapOf(
-                            "User-Agent" to iosUserAgent,
-                            "Referer" to ref,
-                            "Origin" to mainUrl,
-                        )
-                        try {
-                            val r = app.get(path, headers = h)
-                            Log.e("AbyssPlayerDebug", "HLS_PROBE $path ref=$ref -> ${r.code}")
-                        } catch (e: Exception) {
-                            Log.e("AbyssPlayerDebug", "HLS_PROBE $path ref=$ref -> EX ${e.message}")
-                        }
-                    }
-                }
             }
 
-            Log.e("AbyssPlayerDebug", "Debug pass complete, no links emitted")
-        } catch (e: Exception) {
-            Log.e("AbyssPlayerDebug", "Failed: ${e.message}", e)
-        }
-    }
-}
-class P2pstream : ExtractorApi() {
-    override var name = "P2pstream"
-    override var mainUrl = "https://animekhor.p2pstream.vip"
-    override val requiresReferer = true
-    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        val fixedUrl = url.replace("/#", "/e/")
-        manualJsUnpackExtraction(fixedUrl, name, mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/"), callback)
-    }
-}
+            var emitted = 0
+            for (i in 0 until sources.length()) {
+                val src = sources.optJSONObject(i) ?: continue
+                val resId = src.optInt("res_id", -1)
+                val size = src.optLong("size", -1L)
+                val label = src.optString("label").ifBlank { "Unknown" }
+                val codec = src.optString("codec")
 
-class UpnsLive : ExtractorApi() {
-    override var name = "CloudPlayer"
-    override var mainUrl = "https://animekhor.upns.live"
-    override val requiresReferer = true
-    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        val fixedUrl = url.replace("/#", "/e/")
-        manualJsUnpackExtraction(fixedUrl, name, mapOf("Origin" to mainUrl, "Referer" to "$mainUrl/"), callback)
+                val match = fdList.firstOrNull { it.resId == resId && it.size == size } ?: continue
+
+                // Try to derive an HLS URL on the fristData host before falling back
+                val fdHost = match.url.substringAfter("://").substringBefore("/")
+                val fdPath = match.url.substringAfter("://$fdHost/")
+                val baseName = fdPath.substringBeforeLast(".")
+                val dirPath = fdPath.substringBeforeLast("/")
+
+                val hlsCandidates = listOf(
+                    "https://$fdHost/$baseName.m3u8",
+                    "https://$fdHost/$dirPath/master.m3u8",
+                    "https://$fdHost/$dirPath/index.m3u8",
+                    "https://$fdHost/$dirPath/playlist.m3u8",
+                )
+
+                var foundHls = false
+                for (hls in hlsCandidates) {
+                    try {
+                        val r = app.get(hls, headers = headers)
+                        if (r.code in 200..299) {
+                            val body = r.text.take(64)
+                            if (body.contains("#EXTM3U")) {
+                                M3u8Helper.generateM3u8(name, hls, url, headers = headers)
+                                    .forEach(callback)
+                                Log.e("AbyssPlayer", "HLS OK: $hls")
+                                foundHls = true
+                                break
+                            }
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+                if (foundHls) {
+                    emitted++
+                    continue
+                }
+
+                // Fallback: emit the encrypted .fd URL as VIDEO.
+                // Note: this will not play without external decryption.
+                val quality = label.replace(Regex("""[^0-9]"""), "").toIntOrNull()
+                    ?: Qualities.Unknown.value
+                val srcLabel = buildString {
+                    append(label)
+                    if (codec.isNotBlank() && codec != "h264") append(" $codec")
+                }
+                Log.e("AbyssPlayer", "Falling back to .fd for $srcLabel (encrypted)")
+
+                callback(
+                    newExtractorLink(
+                        name = this.name,
+                        source = "${this.name} $srcLabel",
+                        url = match.url,
+                        type = com.lagradost.cloudstream3.utils.ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = url
+                        this.headers = headers
+                        this.quality = quality
+                    }
+                )
+                emitted++
+            }
+
+            Log.e("AbyssPlayer", "Emitted $emitted link(s)")
+        } catch (e: Exception) {
+            Log.e("AbyssPlayer", "Extraction failed: ${e.message}", e)
+        }
     }
 }
 
