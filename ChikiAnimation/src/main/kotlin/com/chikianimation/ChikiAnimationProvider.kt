@@ -62,29 +62,36 @@ class ChikiAnimationProvider : MainAPI() {
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        val aTag = this.selectFirst("div.bsx > a[href]") 
-            ?: this.selectFirst("a[itemprop=url]") 
-            ?: this.selectFirst("h2 a[href]") 
-            ?: this.selectFirst("a[href]") 
+        val anchor = selectFirst("div.bsx > a[href]")
+            ?: selectFirst("a[itemprop=url]")
+            ?: selectFirst("h2 a[href]")
+            ?: selectFirst("a[href]")
             ?: return null
 
-        val href = fixUrlNull(aTag.attr("href")) ?: return null
-        if (href.isBlank() || href.contains("/genres/") || href.contains("/bookmark") ||
-            href.contains("/privacy") || href.contains("/contact") || href.contains("/dmca")
+        val href = fixUrlNull(anchor.attr("href")) ?: return null
+        if (href.isBlank()) return null
+
+        if (href.contains("/genres/") ||
+            href.contains("/bookmark") ||
+            href.contains("/privacy") ||
+            href.contains("/contact") ||
+            href.contains("/dmca")
         ) return null
 
-        var title = aTag.attr("title").trim()
-        if (title.isBlank()) title = this.select(".tt, .tt h2, h2, h3, h4").text().trim()
-        if (title.isBlank()) title = aTag.text().trim()
-        if (title.isBlank()) return null
+        val title = selectFirst("div.tt")?.ownText()?.trim()?.takeIf { it.isNotBlank() }
+            ?: selectFirst("div.tt h2")?.text()?.trim()?.takeIf { it.isNotBlank() }
+            ?: anchor.attr("title").trim().takeIf { it.isNotBlank() }
+            ?: anchor.text().trim().takeIf { it.isNotBlank() }
+            ?: return null
 
         val posterUrl = fixUrlNull(
-            this.selectFirst("img.ts-post-image")?.let { img ->
+            selectFirst("img.ts-post-image")?.let { img ->
                 img.attr("data-src").ifEmpty { img.attr("src") }
                     .ifEmpty { img.attr("data-lazy-src") }
                     .ifEmpty { img.attr("data-original") }
-            } ?: this.selectFirst("div.limit img")?.attr("src")
-              ?: this.selectFirst("img")?.attr("src")
+            }
+                ?: selectFirst("div.limit img")?.attr("src")
+                ?: selectFirst("img")?.attr("src")
         )
 
         return newAnimeSearchResponse(title, href) {
@@ -93,39 +100,28 @@ class ChikiAnimationProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val searchResponse = mutableListOf<SearchResponse>()
+        if (query.isBlank()) return emptyList()
         val encoded = query.trim()
-        if (encoded.isBlank()) return emptyList()
 
-        for (i in 1..3) {
-            try {
-                val url = if (i == 1) "$mainUrl/?s=$encoded" else "$mainUrl/page/$i/?s=$encoded"
-                val document = app.get(url, headers = defaultHeaders).document
-                val results = document.select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
-                    .mapNotNull { it.toSearchResult() }
-                
-                if (!searchResponse.containsAll(results)) {
-                    searchResponse.addAll(results)
-                } else {
-                    break
+        val results = coroutineScope {
+            (1..2).map { page ->
+                async {
+                    try {
+                        val url = if (page == 1)
+                            "$mainUrl/?s=$encoded"
+                        else
+                            "$mainUrl/page/$page/?s=$encoded"
+
+                        app.get(url, headers = defaultHeaders).document
+                            .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
+                            .mapNotNull { it.toSearchResult() }
+                    } catch (e: Exception) {
+                        emptyList()
+                    }
                 }
-                if (results.isEmpty()) break
-            } catch (e: Exception) {
-                break
-            }
+            }.awaitAll().flatten()
         }
-        return searchResponse.distinctBy { it.url }
-    }
-
-    private fun getEpisodesElements(document: org.jsoup.nodes.Document): org.jsoup.select.Elements {
-        var eps = document.select("table tbody tr:not(:has(th)), div.episodelist ul li, div.eplister ul li, ul.eplister li, .ep_list li, .episodelist li, .eplister li, #episodelist li, .lsteps li, .list1 li")
-        if (eps.isEmpty()) {
-            eps = document.select("div.episodelist a[href], div.eplister a[href], .ep_list a[href], .episodelist a[href], .eplister a[href], #episodelist a[href], .lsteps a[href], .list1 a[href]")
-        }
-        if (eps.isEmpty()) {
-            eps = document.select("div.listupd article, div.bixbox article, div.related article")
-        }
-        return eps
+        return results.distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse? {
@@ -135,123 +131,99 @@ class ChikiAnimationProvider : MainAPI() {
             return null
         }
 
-        val titleRaw = document.selectFirst("h1.entry-title")?.text()?.trim()
+        val title = document.selectFirst("h1.entry-title")?.text()?.trim()
             ?: document.selectFirst("h1")?.text()?.trim()
             ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
             ?: return null
-            
-        val title = titleRaw.substringBefore(" Episode").substringBefore(" Movie").trim()
 
-        var poster = document.selectFirst("div.ime > img")?.attr("data-src") ?: ""
-        if (poster.isEmpty()) poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim() ?: ""
-        if (poster.isEmpty()) poster = document.selectFirst("div.thumb img.wp-post-image")?.attr("src")?.trim() ?: ""
-
-        val description = document.selectFirst("div.entry-content[itemprop=description]")?.text()?.trim()
-            ?: document.selectFirst("div.entry-content")?.text()?.trim()
+        val poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim()
+            ?: document.selectFirst("div.thumb img.wp-post-image")?.attr("src")?.trim()
+            ?: document.selectFirst("div.thumb img")?.attr("src")?.trim()
+            ?: document.selectFirst("img.wp-post-image")?.attr("src")?.trim()
             ?: ""
+
+        val description = document
+            .selectFirst("div.entry-content[itemprop=description]")?.text()?.trim()
+            ?: document.selectFirst("div.entry-content")?.text()?.trim()
+            ?: document.selectFirst("div[itemprop=description]")?.text()?.trim()
 
         val genres = document.select("div.genxed a, span.genxed a, .spe .genxed a")
             .map { it.text().trim() }
             .filter { it.isNotBlank() }
             .distinct()
 
-        val typeText = (document.selectFirst("div.typez, .spe, .infox .spe, div.anime-info .type")?.text()?.lowercase() ?: "") + " " + title.lowercase()
-        val tvtag = if (typeText.contains("movie", ignoreCase = true)) TvType.Movie else TvType.TvSeries
+        val typeText = (
+                document.selectFirst("div.typez, .spe, .infox .spe, div.anime-info .type")
+                    ?.text()?.lowercase() ?: ""
+                ) + " " + title.lowercase()
 
-        var epElements = getEpisodesElements(document)
-        
-        if (epElements.isEmpty()) {
-            val epPage = document.selectFirst(".episodelist li > a[href], .eplister li > a[href]")?.attr("href")?.trim()
+        val isMovie = typeText.contains("movie", ignoreCase = true)
+
+        if (isMovie) {
+            val watchHref = document
+                .selectFirst(".eplister li > a[href], .episodelist li > a[href]")
+                ?.attr("href")?.trim()
+                ?: url
+
+            return newMovieLoadResponse(title, url, TvType.Movie, watchHref) {
+                this.posterUrl = poster
+                this.plot = description
+                this.tags = genres
+            }
+        }
+
+        var epListElements = document.select(".episodelist li, .eplister li")
+
+        if (epListElements.isEmpty()) {
+            val epPage = document
+                .selectFirst(".episodelist li > a[href], .eplister li > a[href]")
+                ?.attr("href")?.trim()
             if (!epPage.isNullOrBlank()) {
-                epElements = try {
-                    getEpisodesElements(app.get(fixUrl(epPage), headers = defaultHeaders).document)
+                epListElements = try {
+                    app.get(fixUrl(epPage), headers = defaultHeaders).document
+                        .select(".episodelist li, .eplister li")
                 } catch (e: Exception) {
                     org.jsoup.select.Elements()
                 }
             }
         }
 
-        return if (tvtag == TvType.TvSeries || epElements.size > 1) {
-            val episodes = parseEpisodes(epElements, poster)
-            newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
+        val episodes = epListElements.mapNotNull { info ->
+            val href = info.selectFirst("a[href]")?.attr("href")?.trim()
+                ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+
+            val rawTitle = info.selectFirst(".epl-title")?.text()?.trim()
+                ?: info.selectFirst("a span")?.text()?.trim()
+                ?: info.selectFirst("a")?.text()?.trim()
+                ?: ""
+
+            val dateText = info.selectFirst(".epl-date, .date, .time")
+                ?.text()?.trim()?.takeIf { it.isNotBlank() }
+
+            val epNum = Regex("""(?i)(\d+(?:\.\d+)?)""")
+                .find(rawTitle)?.groupValues?.get(1)?.toFloatOrNull()
+
+            val cleanName = rawTitle
+                .replace(Regex("""(?i)^\s*Episode\s*"""), "")
+                .trim()
+                .ifBlank { rawTitle.ifBlank { "Episode" } }
+
+            newEpisode(fixUrl(href)) {
+                this.name = cleanName
                 this.posterUrl = poster
-                this.plot = description
-                this.tags = genres
-            }
-        } else {
-            val href = epElements.firstOrNull()?.selectFirst("a[href]")?.attr("href") ?: url
-            newMovieLoadResponse(title, url, TvType.Movie, href) {
-                this.posterUrl = poster
-                this.plot = description
-                this.tags = genres
-            }
-        }
-    }
-
-    private fun parseEpisodes(epElements: org.jsoup.select.Elements, fallbackPoster: String): List<Episode> {
-        return epElements.mapNotNull { info ->
-            val aTag = info.selectFirst("a[href]") ?: info.takeIf { it.tagName() == "a" && it.hasAttr("href") }
-            val href1 = aTag?.attr("href") ?: return@mapNotNull null
-            
-            var rawTitle = info.selectFirst(".epl-title, .ep-title, .title, h2, h3")?.text()?.trim() ?: ""
-            if (rawTitle.isEmpty()) rawTitle = aTag.text().trim() 
-            if (rawTitle.isEmpty()) rawTitle = info.text().trim()
-            
-            var episodeNum: Int? = null
-            var epName: String
-            
-            val fullText = info.text()
-            val dateMatch = Regex("""([a-zA-Z]+\s+\d{1,2},\s+\d{4})""").find(fullText)?.value?.trim()
-            val isFullMovie = rawTitle.contains("Full Movie", ignoreCase = true) || 
-                              rawTitle.contains("Eps Full", ignoreCase = true) ||
-                              Regex("""(?i)\bfull\b""").containsMatchIn(rawTitle)
-
-            val trueEpMatch = Regex("""(?i)(?:Ep|Eps|Episode|Ep\.|Part|SP|Special)\s*(\d+(?:\s*[-~]\s*\d+)?)""").findAll(rawTitle).firstOrNull()
-            val matchStr = trueEpMatch?.groupValues?.get(1)?.trim()
-            
-            if (isFullMovie && matchStr == null) {
-                episodeNum = 0 
-                epName = if (dateMatch != null) "Full Movie: $dateMatch" else "Full Movie"
-            } else if (matchStr != null) {
-                episodeNum = Regex("""\d+""").find(matchStr)?.value?.toIntOrNull()
-                epName = if (dateMatch != null) "Episode $matchStr: $dateMatch" else "Episode $matchStr"
-            } else {
-                val rangeMatch = Regex("""\b(\d+[-~]\d+)\b""").find(rawTitle)
-                if (rangeMatch != null) {
-                    val rawRange = rangeMatch.groupValues[1]
-                    episodeNum = Regex("""\d+""").find(rawRange)?.value?.toIntOrNull()
-                    epName = if (dateMatch != null) "Episode $rawRange: $dateMatch" else "Episode $rawRange"
-                } else {
-                    val numbers = Regex("""\d+""").findAll(rawTitle).map { it.value }.toList()
-                    episodeNum = numbers.lastOrNull { num ->
-                        num != "4" && num != "1080" && num != "720" && num != "2160" && !(num.length == 4 && num.startsWith("20"))
-                    }?.toIntOrNull()
-
-                    epName = if (episodeNum != null) {
-                        if (dateMatch != null) "Episode $episodeNum: $dateMatch" else "Episode $episodeNum"
-                    } else {
-                        if (dateMatch != null) "Episode: $dateMatch" else "Episode"
-                    }
-                }
-            }
-            
-            val posterr = info.selectFirst("img")?.let { 
-                it.attr("data-src").takeIf { src -> src.isNotBlank() } ?: it.attr("src")
-            } ?: fallbackPoster
-            
-            val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim() 
-
-            newEpisode(href1) {
-                this.name = epName
-                this.episode = episodeNum
-                this.posterUrl = posterr
-                
-                if (!dateText.isNullOrBlank()) { 
+                if (epNum != null) this.episode = epNum.toInt()
+                if (dateText != null) {
                     this.addDate(dateText, format = "MMMM d, yyyy")
                     this.description = dateText
                 }
             }
-        }.reversed()
+        }.distinctBy { it.data }.reversed()
+
+        return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
+            this.posterUrl = poster
+            this.plot = description
+            this.tags = genres
+        }
     }
 
     override suspend fun loadLinks(
@@ -268,93 +240,118 @@ class ChikiAnimationProvider : MainAPI() {
 
         var found = false
 
-        suspend fun invokeExtractor(iframeUrl: String, label: String) {
-            var finalUrl = try { fixUrl(iframeUrl) } catch (e: Exception) { return }
-            var extReferer = iframeUrl 
+        suspend fun handleUrl(rawUrl: String, ref: String) {
+            val cleanUrl = try { fixUrl(rawUrl) } catch (e: Exception) { return }
+            if (!cleanUrl.startsWith("http")) return
 
-            if (!finalUrl.startsWith("http")) return
-            if (finalUrl.contains("youtube", true) || finalUrl.contains("disqus", true) || finalUrl.contains("googlesyndication", true)) return
+            if (cleanUrl.contains("youtube", true) ||
+                cleanUrl.contains("disqus", true) ||
+                cleanUrl.contains("googlesyndication", true) ||
+                cleanUrl.contains("doubleclick", true)
+            ) return
 
-            if (finalUrl.contains("dailymotion", ignoreCase = true) || finalUrl.contains("dai.ly", ignoreCase = true)) {
-                val videoIdMatch = Regex("""(?:dailymotion\.com/(?:embed/)?video/|geo\.dailymotion\.com/(?:player/[^/]+/video/|player\.html\?video=)|dai\.ly/)([a-zA-Z0-9_-]+)""").find(finalUrl)
-                if (videoIdMatch != null) {
-                    finalUrl = "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
-                    extReferer = data 
+            try {
+                if (cleanUrl.contains("ghbrisk.com", true)) {
+                    Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                    found = true
+                    return
                 }
-            }
 
-            when {
-                "ghbrisk.com" in finalUrl -> {
-                    Ghbrisk().getUrl(finalUrl, extReferer, subtitleCallback, callback)
+                val ok = loadExtractor(cleanUrl, referer = ref, subtitleCallback, callback)
+                if (ok) {
                     found = true
+                    return
                 }
-                "galaxydonghua" in finalUrl -> {
-                    GalaxyDonghua().getUrl(finalUrl, extReferer, subtitleCallback, callback)
-                    found = true
-                }
-                finalUrl.endsWith(".mp4") -> {
-                    callback.invoke(
-                        newExtractorLink(
-                            source = label,
-                            name = label,
-                            url = finalUrl,
-                            type = ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = mainUrl
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    found = true
-                }
-                else -> {
-                    if (loadExtractor(finalUrl, referer = extReferer, subtitleCallback, callback)) {
-                        found = true
+
+                val html = app.get(cleanUrl, headers = mapOf("Referer" to ref)).text
+                val streamRegex = Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)[^\s"'<>\\]*)""")
+                var foundGeneric = false
+
+                streamRegex.findAll(html).forEach { m ->
+                    val fileUrl = m.groupValues[1].replace("\\/", "/")
+                    if (fileUrl.contains(".m3u8", ignoreCase = true)) {
+                        M3u8Helper.generateM3u8("Generic HLS", fileUrl, cleanUrl).forEach { callback.invoke(it) }
+                        foundGeneric = true
+                    } else if (fileUrl.contains(".mp4", ignoreCase = true)) {
+                        callback.invoke(
+                            newExtractorLink(
+                                source = "Generic MP4",
+                                name = "Generic MP4",
+                                url = fileUrl,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = cleanUrl
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        foundGeneric = true
                     }
                 }
-            }
+
+                if (!foundGeneric) {
+                    val iframeNode = Jsoup.parse(html).selectFirst("iframe")
+                    val nestedIframe = iframeNode?.let { it.attr("src").ifBlank { it.attr("data-src").ifBlank { it.attr("data-litespeed-src") } } }
+                    if (!nestedIframe.isNullOrBlank() && nestedIframe.startsWith("http")) {
+                        if (loadExtractor(nestedIframe, cleanUrl, subtitleCallback, callback)) {
+                            foundGeneric = true
+                        }
+                    }
+                }
+                if (foundGeneric) found = true
+
+            } catch (e: Exception) { }
         }
 
         fun getIframeSrc(iframe: Element): String {
-            return iframe.attr("src").ifBlank { iframe.attr("data-src").ifBlank { iframe.attr("data-litespeed-src") } }
+            return iframe.attr("src").ifBlank {
+                iframe.attr("data-src").ifBlank {
+                    iframe.attr("data-litespeed-src")
+                }
+            }
         }
 
-        val options = document.select("select.mirror option, .mobius option, select#mirror option, select[name=mirror] option, option[data-index]")
-        
-        coroutineScope {
-            options.map { option ->
-                async {
-                    val base64 = option.attr("value").trim()
-                    if (base64.isBlank()) return@async
-                    val label = option.text().trim()
+        val mirrorOptions = document.select(
+            "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
+        )
 
-                    if (base64.startsWith("http") || base64.startsWith("//")) {
-                        invokeExtractor(base64, label)
+        coroutineScope {
+            mirrorOptions.map { option ->
+                async {
+                    val value = option.attr("value").trim()
+                    if (value.isBlank()) return@async
+
+                    if (value.startsWith("http") || value.startsWith("//")) {
+                        handleUrl(value, data)
                         return@async
                     }
 
-                    val decodedHtml = try {
-                        String(Base64.decode(base64, Base64.DEFAULT))
+                    val decoded: String? = try {
+                        String(Base64.decode(value, Base64.DEFAULT))
                     } catch (e: Exception) {
-                        try { String(Base64.decode(base64, Base64.URL_SAFE or Base64.NO_WRAP)) } catch (e2: Exception) { null }
+                        try {
+                            String(Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP))
+                        } catch (e2: Exception) { null }
                     }
-                    if (decodedHtml.isNullOrBlank()) return@async
+                    if (decoded.isNullOrBlank()) return@async
 
                     try {
-                        Jsoup.parse(decodedHtml).select("iframe").forEach { iframe ->
+                        Jsoup.parse(decoded).select("iframe").forEach { iframe ->
                             val src = getIframeSrc(iframe)
-                            if (src.isNotBlank()) invokeExtractor(src, label)
+                            if (src.isNotBlank()) handleUrl(src, data)
                         }
                     } catch (e: Exception) { }
 
-                    Regex("""https?://[^\s"'<>\\)]+""").findAll(decodedHtml).forEach { m -> invokeExtractor(m.value, label) }
+                    Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { m ->
+                        handleUrl(m.value, data)
+                    }
                 }
             }.awaitAll()
         }
 
-        if (options.isEmpty() || !found) {
+        if (!found) {
             document.select("iframe").forEach { iframe ->
                 val src = getIframeSrc(iframe)
-                if (src.isNotBlank()) invokeExtractor(src, "Server")
+                if (src.isNotBlank()) handleUrl(src, data)
             }
         }
 
@@ -362,17 +359,30 @@ class ChikiAnimationProvider : MainAPI() {
             document.select("script").forEach { script ->
                 val body = script.data()
 
-                Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""").findAll(body).forEach { m -> invokeExtractor(m.value, "Server") }
+                Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
+                    .findAll(body).forEach { m -> handleUrl(m.value, data) }
 
                 Regex("""['"]([A-Za-z0-9+/=_-]{60,})['"]""").findAll(body).forEach { m ->
                     val blob = m.groupValues[1]
-                    val decoded = try { String(Base64.decode(blob, Base64.DEFAULT)) } catch (e: Exception) { null } ?: return@forEach
+                    val decoded: String? = try {
+                        String(Base64.decode(blob, Base64.DEFAULT))
+                    } catch (e: Exception) {
+                        try {
+                            String(Base64.decode(blob, Base64.URL_SAFE or Base64.NO_WRAP))
+                        } catch (e2: Exception) { null }
+                    }
+                    if (decoded.isNullOrBlank()) return@forEach
+
                     try {
                         Jsoup.parse(decoded).select("iframe").forEach { iframe ->
                             val src = getIframeSrc(iframe)
-                            if (src.isNotBlank()) invokeExtractor(src, "Server")
+                            if (src.isNotBlank()) handleUrl(src, data)
                         }
                     } catch (e: Exception) { }
+
+                    Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { mm ->
+                        handleUrl(mm.value, data)
+                    }
                 }
             }
         }
