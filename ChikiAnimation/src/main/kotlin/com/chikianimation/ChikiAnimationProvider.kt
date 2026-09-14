@@ -37,7 +37,7 @@ class ChikiAnimationProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
-    // Interceptor to actively solve Cloudflare Turnstile/JS challenges via invisible WebView
+    // Interceptor to handle JavaScript and Cloudflare challenges automatically
     private val cfInterceptor = WebViewResolver(Regex("""challenge-platform|cloudflare"""))
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -54,7 +54,7 @@ class ChikiAnimationProvider : MainAPI() {
             list
         } catch (e: Exception) {
             println("ChikiAnimation: ${request.name} failed — ${e.message}")
-            e.printStackTrace() // Prints full HTTP/Socket error to Logcat for debugging
+            e.printStackTrace()
             emptyList()
         }
 
@@ -127,7 +127,6 @@ class ChikiAnimationProvider : MainAPI() {
                             .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
                             .mapNotNull { it.toSearchResult() }
                     } catch (e: Exception) {
-                        println("ChikiAnimation: Search failed for page $page — ${e.message}")
                         e.printStackTrace()
                         emptyList()
                     }
@@ -141,7 +140,6 @@ class ChikiAnimationProvider : MainAPI() {
         val document = try {
             app.get(url, headers = defaultHeaders, interceptor = cfInterceptor).document
         } catch (e: Exception) {
-            println("ChikiAnimation: Load failed for $url — ${e.message}")
             e.printStackTrace()
             return null
         }
@@ -198,7 +196,6 @@ class ChikiAnimationProvider : MainAPI() {
                     app.get(fixUrl(epPage), headers = defaultHeaders, interceptor = cfInterceptor).document
                         .select(".episodelist li, .eplister li")
                 } catch (e: Exception) {
-                    println("ChikiAnimation: Episode page load failed — ${e.message}")
                     e.printStackTrace()
                     org.jsoup.select.Elements()
                 }
@@ -252,7 +249,7 @@ class ChikiAnimationProvider : MainAPI() {
         val document = try {
             app.get(data, headers = defaultHeaders, interceptor = cfInterceptor).document
         } catch (e: Exception) {
-            println("ChikiAnimation: loadLinks failed to fetch $data — ${e.message}")
+            println("ChikiAnimation: failed to fetch $data — ${e.message}")
             e.printStackTrace()
             return false
         }
