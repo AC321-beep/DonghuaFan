@@ -8,6 +8,7 @@ import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import java.net.URI
 import javax.crypto.Cipher
@@ -20,6 +21,55 @@ class Ghbrisk : Filesim() {
     override var name = "Streamwish"
     override var mainUrl = "https://ghbrisk.com"
     override val requiresReferer = true
+}
+
+class Dailymotion : ExtractorApi() {
+    override var name = "Dailymotion"
+    override var mainUrl = "https://www.dailymotion.com"
+    override val requiresReferer = false
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val id = Regex("""(?:dailymotion\.com/(?:embed/)?video/|geo\.dailymotion\.com/(?:player/[^/]+/video/|player\.html\?video=)|dai\.ly/)([a-zA-Z0-9_-]+)""")
+            .find(url)?.groupValues?.get(1) ?: return
+
+        val metaUrl = "https://www.dailymotion.com/player/metadata/video/$id"
+        val headers = mapOf("Referer" to (referer ?: mainUrl))
+
+        val response = try {
+            app.get(metaUrl, headers = headers).text
+        } catch (e: Exception) {
+            app.get("https://www.dailymotion.com/embed/video/$id", headers = headers).text
+        }
+
+        val m3u8Url = Regex(""""type"\s*:\s*"application/x-mpegURL"\s*,\s*"url"\s*:\s*"([^"]+)"""")
+            .find(response)?.groupValues?.get(1)?.replace("\\/", "/")
+            ?: Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""")
+            .find(response)?.groupValues?.get(1)?.replace("\\/", "/")
+            ?: return
+
+        M3u8Helper.generateM3u8(
+            this.name,
+            m3u8Url,
+            "https://www.dailymotion.com/",
+            headers = mapOf("Referer" to "https://www.dailymotion.com/")
+        ).forEach { callback.invoke(it) }
+
+        Regex(""""url"\s*:\s*"([^"]+\.(?:vtt|srt)[^"]*)"[^{}]*?"language"\s*:\s*"([^"]*)"""")
+            .findAll(response)
+            .forEach { m ->
+                subtitleCallback.invoke(
+                    newSubtitleFile(
+                        lang = m.groupValues[2].ifBlank { "Sub" },
+                        url = m.groupValues[1].replace("\\/", "/")
+                    )
+                )
+            }
+    }
 }
 
 class GalaxyDonghua : ExtractorApi() {
