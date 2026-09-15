@@ -8,9 +8,6 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 
 class ChikiAnimationProvider : MainAPI() {
 
@@ -51,6 +48,9 @@ class ChikiAnimationProvider : MainAPI() {
         "schema.org", "w3.org", "dmcdn.net"
     )
 
+    // =========================================================================
+    // DEBUG HELPERS
+    // =========================================================================
     private fun dbg(tag: String, msg: String) = Log.e("ChikiDbg", "[$tag] $msg")
     private fun dbgSection(tag: String) = Log.e("ChikiDbg", "════════ SECTION: $tag ════════")
 
@@ -159,24 +159,23 @@ class ChikiAnimationProvider : MainAPI() {
         if (query.isBlank()) return emptyList()
         val encoded = query.trim().replace(" ", "+")
 
-        val results = coroutineScope {
-            (1..3).map { page ->
-                async {
-                    try {
-                        val url = if (page == 1) "$mainUrl/?s=$encoded"
-                                  else "$mainUrl/page/$page/?s=$encoded"
-                        app.get(url, headers = defaultHeaders).document
-                            .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
-                            .mapNotNull { it.toSearchResult() }
-                    } catch (e: Exception) { emptyList() }
-                }
-            }.awaitAll().flatten()
+        val results = mutableListOf<SearchResponse>()
+        // Sequential — keeps request window short
+        for (page in 1..3) {
+            try {
+                val url = if (page == 1) "$mainUrl/?s=$encoded"
+                          else "$mainUrl/page/$page/?s=$encoded"
+                app.get(url, headers = defaultHeaders).document
+                    .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
+                    .mapNotNull { it.toSearchResult() }
+                    .forEach { results.add(it) }
+            } catch (e: Exception) { }
         }
         return results.distinctBy { it.url }
     }
 
     // =========================================================================
-    // LOAD — WITH SEASON-AWARE EPISODE PARSING
+    // LOAD — SEASON-AWARE EPISODE PARSING
     // =========================================================================
     override suspend fun load(url: String): LoadResponse? {
         dbgSection("load")
@@ -216,7 +215,6 @@ class ChikiAnimationProvider : MainAPI() {
                 ) + " " + title.lowercase()
 
         val isMovie = typeText.contains("movie", ignoreCase = true)
-
         dbg("load", "title='$title' isMovie=$isMovie")
 
         if (isMovie) {
@@ -254,7 +252,6 @@ class ChikiAnimationProvider : MainAPI() {
             val href = info.selectFirst("a[href]")?.attr("href")?.trim()
                 ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
 
-            // Full title from <h3>
             val fullTitle = info.selectFirst(".playinfo h3")?.text()?.trim()
                 ?: info.selectFirst(".epl-title")?.text()?.trim()
                 ?: info.selectFirst("td.ep-title")?.text()?.trim()
@@ -263,26 +260,25 @@ class ChikiAnimationProvider : MainAPI() {
                 ?: info.selectFirst("a")?.text()?.trim()
                 ?: ""
 
-            // Structured metadata from <span>: "Eps S4-419 to 422 - ... - date"
             val metaSpan = info.selectFirst(".playinfo span")?.text()?.trim()
                 ?: info.selectFirst(".epl-date, .date, .time, td.date")?.text()?.trim()
                 ?: ""
 
-            val (season, epStart, epEnd) = parseSeasonEpisode(metaSpan, fullTitle)
+            val meta = parseSeasonEpisode(metaSpan, fullTitle, href)
             val dateText = extractDate(metaSpan)
-
-            val displayName = buildShortEpisodeName(season, epStart, epEnd, fullTitle)
+            val displayName = buildShortEpisodeName(meta.start, meta.end, fullTitle)
 
             dbg(
                 "load.ep",
-                "✓ S=$season E=$epStart..${epEnd ?: "-"} name='$displayName'"
+                "✓ S=${meta.season} E=${meta.start}..${meta.end ?: "-"} name='$displayName'"
             )
 
             newEpisode(fixUrl(href)) {
                 this.name = displayName
                 this.posterUrl = poster
-                if (season != null) this.season = season
-                if (epStart != null) this.episode = epStart
+                // Never null — CloudStream groups by season
+                this.season = meta.season ?: 1
+                this.episode = meta.start ?: 1
                 if (dateText != null) {
                     this.addDate(dateText, format = "MMMM d, yyyy")
                     this.description = dateText
@@ -290,7 +286,6 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }.distinctBy { it.data }
 
-        // Sort by season then episode number
         val sortedEpisodes = episodes.sortedWith(
             compareBy(
                 { it.season ?: Int.MAX_VALUE },
@@ -300,8 +295,8 @@ class ChikiAnimationProvider : MainAPI() {
 
         dbg(
             "load",
-            "→ returning ${sortedEpisodes.size} episodes " +
-                    "(seasons: ${sortedEpisodes.mapNotNull { it.season }.distinct().sorted()})"
+            "→ returning ${sortedEpisodes.size} episodes across seasons " +
+                    sortedEpisodes.mapNotNull { it.season }.distinct().sorted()
         )
 
         return newTvSeriesLoadResponse(title, url, TvType.Anime, sortedEpisodes) {
@@ -311,37 +306,34 @@ class ChikiAnimationProvider : MainAPI() {
         }
     }
 
-    /**
-     * Extracts (season, episodeStart, episodeEnd) from the metadata span and title.
-     *
-     * Span patterns handled:
-     *   "Eps S4-419 to 422 - ..."        → (4, 419, 422)
-     *   "Eps S4-419 - ..."                → (4, 419, null)
-     *   "Eps S1-(01-30) - ..."            → (1, 1, 30)
-     *   "Eps S3-80 - ..."                 → (3, 80, null)
-     *   "Eps 79 - ..."                    → (from title, 79, null)
-     *   "Eps 51-60 - ..."                 → (from title, 51, 60)
-     *
-     * Title fallback:
-     *   "... Season 4 Episode 419 to 422 ..."  → season = 4, ep = 419
-     */
     private data class EpisodeMeta(val season: Int?, val start: Int?, val end: Int?)
 
-    private fun parseSeasonEpisode(metaSpan: String, fullTitle: String): EpisodeMeta {
+    /**
+     * Parses (season, start, end) with cascading fallbacks:
+     *   1. Meta span ("Eps S4-419 to 422 - ...")
+     *   2. Title ("... Season 4 Episode 419 to 422 ...")
+     *   3. URL slug (".../season-4-episode-419-to-422-...")
+     */
+    private fun parseSeasonEpisode(
+        metaSpan: String,
+        fullTitle: String,
+        pageUrl: String
+    ): EpisodeMeta {
         var season: Int? = null
         var start: Int? = null
         var end: Int? = null
 
-        // Pattern 1: "Eps S4-419 to 422" or "Eps S1-(01-30)" or "Eps S3-80"
-        val withSeason = Regex("""Eps\s+S(\d+)\s*[-–]?\s*\(?\s*(\d+)(?:\s*(?:to|-)\s*(\d+))?""")
-            .find(metaSpan)
+        // 1. Meta span with S-prefix
+        val withSeason = Regex(
+            """Eps\s+S(\d+)\s*[-–]?\s*\(?\s*(\d+)(?:\s*(?:to|[-–])\s*(\d+))?"""
+        ).find(metaSpan)
         if (withSeason != null) {
             season = withSeason.groupValues[1].toIntOrNull()
             start = withSeason.groupValues[2].toIntOrNull()
             end = withSeason.groupValues[3].toIntOrNull()
         } else {
-            // Pattern 2: "Eps 79" or "Eps 51-60" or "Eps 01-30"
-            val noSeason = Regex("""Eps\s+(\d+)(?:\s*(?:to|-)\s*(\d+))?""")
+            // 2. Meta span without S-prefix
+            val noSeason = Regex("""Eps\s+(\d+)(?:\s*(?:to|[-–])\s*(\d+))?""")
                 .find(metaSpan)
             if (noSeason != null) {
                 start = noSeason.groupValues[1].toIntOrNull()
@@ -349,24 +341,44 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // Fallback: season from title
+        // 3. Season from title
         if (season == null) {
-            val sFromTitle = Regex("""(?i)Season\s*(\d+)""").find(fullTitle)
-            season = sFromTitle?.groupValues?.get(1)?.toIntOrNull()
+            season = Regex("""(?i)Season\s*(\d+)""").find(fullTitle)
+                ?.groupValues?.get(1)?.toIntOrNull()
         }
 
-        // Fallback: episode from title if still missing
-        if (start == null) {
-            val eFromTitle = Regex("""(?i)Episode\s+(\d+)""").find(fullTitle)
-            start = eFromTitle?.groupValues?.get(1)?.toIntOrNull()
+        // 4. Season from URL slug
+        if (season == null) {
+            season = Regex("""season-(\d+)""").find(pageUrl)
+                ?.groupValues?.get(1)?.toIntOrNull()
         }
+
+        // 5. Episode from title
+        if (start == null) {
+            val epFromTitle = Regex(
+                """(?i)Episode\s+(\d+)(?:\s*(?:to|[-–])\s*(\d+))?"""
+            ).find(fullTitle)
+            if (epFromTitle != null) {
+                start = epFromTitle.groupValues[1].toIntOrNull()
+                end = epFromTitle.groupValues[2].toIntOrNull()
+            }
+        }
+
+        // 6. Episode from URL slug
+        if (start == null) {
+            val epFromUrl = Regex("""episode-(\d+)(?:-to-(\d+))?""").find(pageUrl)
+            if (epFromUrl != null) {
+                start = epFromUrl.groupValues[1].toIntOrNull()
+                end = epFromUrl.groupValues[2].toIntOrNull()
+            }
+        }
+
+        // 7. "Season N" with no episode → treat as Episode 1
+        if (season != null && start == null) start = 1
 
         return EpisodeMeta(season, start, end)
     }
 
-    /**
-     * Pulls the release date out of the trailing " - Month d, yyyy" portion of the metadata span.
-     */
     private fun extractDate(metaSpan: String): String? {
         val dateRegex = Regex(
             """(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}"""
@@ -375,31 +387,23 @@ class ChikiAnimationProvider : MainAPI() {
     }
 
     /**
-     * Builds a short, readable episode name for the CloudStream list.
-     *   S4 · E419-422  → "S4 · E419-422"
-     *   S1 · E1-30     → "S1 · E1-30"
-     *   S3 · E80       → "S3 · E80"
+     * Descriptive name only — CloudStream prepends "S{n}:E{m}" automatically.
+     *   (419, 422)  → "Episodes 419-422"
+     *   (80, null)  → "Episode 80"
+     *   (1, 30)     → "Episodes 1-30"
      */
     private fun buildShortEpisodeName(
-        season: Int?,
         start: Int?,
         end: Int?,
         fullTitle: String
-    ): String {
-        val seasonPrefix = if (season != null) "S$season · " else ""
-
-        return when {
-            start != null && end != null && end != start ->
-                "${seasonPrefix}E$start-$end"
-            start != null ->
-                "${seasonPrefix}E$start"
-            else ->
-                fullTitle.take(60).ifBlank { "Episode" }
-        }
+    ): String = when {
+        start != null && end != null && end != start -> "Episodes $start-$end"
+        start != null -> "Episode $start"
+        else -> fullTitle.take(60).ifBlank { "Episode" }
     }
 
     // =========================================================================
-    // LOAD LINKS (unchanged from prior working version)
+    // LOAD LINKS — SEQUENTIAL MIRROR PROCESSING (critical for GX tokens)
     // =========================================================================
     override suspend fun loadLinks(
         data: String,
@@ -427,24 +431,29 @@ class ChikiAnimationProvider : MainAPI() {
 
             try {
                 if (cleanUrl.contains("ghbrisk.com", true)) {
+                    dbg("handleUrl", "✔ ROUTE Ghbrisk")
                     Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true; return
                 }
                 if (cleanUrl.contains("dailymotion.com", true) ||
                     cleanUrl.contains("dai.ly", true)) {
+                    dbg("handleUrl", "✔ ROUTE Dailymotion")
                     DailymotionExtractor().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true; return
                 }
                 if (cleanUrl.contains("galaxydonghua.xyz", true)) {
+                    dbg("handleUrl", "✔ ROUTE GalaxyDonghua")
                     GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true; return
                 }
                 if (cleanUrl.contains("drive.google.com", true) ||
                     cleanUrl.contains("docs.google.com", true)) {
+                    dbg("handleUrl", "✔ ROUTE GoogleDrive")
                     GoogleDriveExtractor().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true; return
                 }
                 if (loadExtractor(cleanUrl, referer = ref, subtitleCallback, callback)) {
+                    dbg("handleUrl", "✔ loadExtractor TRUE")
                     found = true; return
                 }
 
@@ -478,7 +487,9 @@ class ChikiAnimationProvider : MainAPI() {
 
                 if (!foundGeneric) {
                     val nestedIframe = Jsoup.parse(html).selectFirst("iframe")?.let {
-                        it.attr("src").ifBlank { it.attr("data-src").ifBlank { it.attr("data-litespeed-src") } }
+                        it.attr("src").ifBlank {
+                            it.attr("data-src").ifBlank { it.attr("data-litespeed-src") }
+                        }
                     }
                     if (!nestedIframe.isNullOrBlank() && nestedIframe.startsWith("http")) {
                         if (loadExtractor(nestedIframe, cleanUrl, subtitleCallback, callback)) {
@@ -487,7 +498,9 @@ class ChikiAnimationProvider : MainAPI() {
                     }
                 }
                 if (foundGeneric) found = true
-            } catch (e: Exception) { }
+            } catch (e: Exception) {
+                dbg("handleUrl", "❌ ${e.message}")
+            }
         }
 
         fun getIframeSrc(iframe: Element): String =
@@ -498,41 +511,53 @@ class ChikiAnimationProvider : MainAPI() {
         val mirrorOptions: Elements = document.select(
             "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
         )
+        dbg("loadLinks", "mirror options found: ${mirrorOptions.size}")
 
-        coroutineScope {
-            mirrorOptions.map { option ->
-                async {
-                    val value = option.attr("value").trim()
-                    if (value.isBlank()) return@async
-                    if (value.startsWith("http") || value.startsWith("//")) {
-                        handleUrl(value, data); return@async
-                    }
-                    var decoded: String? = null
+        // -------------------------------------------------------------------
+        // SEQUENTIAL PROCESSING
+        //
+        // Do NOT use coroutineScope { async { ... } } here. Running DM and GX
+        // in parallel stretches GX's request window past the TTL of its
+        // session tokens (kaken/apx), causing "dcx failed for config" errors
+        // and silent failures. Sequential processing keeps GX's window tight.
+        // -------------------------------------------------------------------
+        for (option in mirrorOptions) {
+            val value = option.attr("value").trim()
+            if (value.isBlank()) continue
+
+            if (value.startsWith("http") || value.startsWith("//")) {
+                handleUrl(value, data)
+                continue
+            }
+
+            var decoded: String? = try {
+                String(Base64.decode(value, Base64.DEFAULT))
+            } catch (e: Exception) {
+                try {
+                    String(Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP))
+                } catch (e2: Exception) {
                     try {
-                        decoded = String(Base64.decode(value, Base64.DEFAULT))
-                    } catch (e: Exception) {
-                        try {
-                            decoded = String(Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP))
-                        } catch (e2: Exception) {
-                            try {
-                                decoded = String(Base64.decode(value, Base64.NO_PADDING or Base64.NO_WRAP))
-                            } catch (e3: Exception) { decoded = null }
-                        }
-                    }
-                    if (decoded.isNullOrBlank()) return@async
-
-                    try {
-                        Jsoup.parse(decoded).select("iframe").forEach { iframe ->
-                            val src = getIframeSrc(iframe)
-                            if (src.isNotBlank()) handleUrl(src, data)
-                        }
-                    } catch (e: Exception) { }
-
-                    Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { m ->
-                        handleUrl(m.value, data)
-                    }
+                        String(Base64.decode(value, Base64.NO_PADDING or Base64.NO_WRAP))
+                    } catch (e3: Exception) { null }
                 }
-            }.awaitAll()
+            }
+            if (decoded.isNullOrBlank()) {
+                dbg("mirror", "❌ decode failed len=${value.length}")
+                continue
+            }
+
+            dbg("mirror", "✓ decoded: ${decoded.take(200)}")
+
+            try {
+                Jsoup.parse(decoded).select("iframe").forEach { iframe ->
+                    val src = getIframeSrc(iframe)
+                    if (src.isNotBlank()) handleUrl(src, data)
+                }
+            } catch (e: Exception) { }
+
+            Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { m ->
+                handleUrl(m.value, data)
+            }
         }
 
         if (!found) {
