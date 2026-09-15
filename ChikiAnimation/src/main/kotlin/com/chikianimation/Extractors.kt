@@ -602,7 +602,11 @@ class DailymotionExtractor : ExtractorApi() {
         val qualities = json.optJSONObject("qualities")
         log("DM", "qualities present=${qualities != null}")
         if (qualities != null) {
-            log("DM", "quality keys=${qualities.keys().asSequence().toList()}")
+            // FIX: replace Iterator.asSequence().toList() with manual collection
+            val keysList = mutableListOf<String>()
+            qualities.keys().forEach { keysList.add(it) }
+            log("DM", "quality keys=$keysList")
+
             qualities.keys().forEach { key ->
                 val qualityArray = qualities.optJSONArray(key) ?: return@forEach
                 log("DM", "  key='$key' array size=${qualityArray.length()}")
@@ -730,7 +734,10 @@ class GoogleDriveExtractor : ExtractorApi() {
         }
 
         log("GDrive.resolve", "HTTP status=${first.code}")
-        log("GDrive.resolve", "header keys=${first.headers.keys}")
+        // FIX: collect header keys manually instead of .keys on Map (which is fine but consistent style)
+        val headerKeysList = mutableListOf<String>()
+        first.headers.keys.forEach { headerKeysList.add(it) }
+        log("GDrive.resolve", "header keys=$headerKeysList")
         log("GDrive.resolve", "Content-Type='${first.headers["Content-Type"] ?: first.headers["content-type"]}'")
 
         val location = first.headers["Location"] ?: first.headers["location"]
