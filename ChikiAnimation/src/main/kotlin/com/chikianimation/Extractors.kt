@@ -62,11 +62,10 @@ class GalaxyDonghua : ExtractorApi() {
             Log.e(tag, "CRITICAL: Failed to decode GD tokens")
             return
         }
-        Log.e(tag, "Tokens successfully retrieved -> pd: ${tokens.pd.take(5)}..., apx length: ${tokens.apx.length}, kaken length: ${tokens.kaken.length}")
+        Log.e(tag, "Tokens successfully retrieved -> pd length: ${tokens.pd.length}, apx length: ${tokens.apx.length}, kaken length: ${tokens.kaken.length}")
 
         val gxBase = embedHost(url)
         
-        // Properly handle absolute vs relative decoded apx paths to prevent double domains
         val decodedApx = try {
             String(Base64.decode(tokens.apx, Base64.DEFAULT)).trim()
         } catch (e: Exception) {
@@ -277,15 +276,24 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        fun grab(re: Regex) = re.find(code)?.groupValues?.getOrNull(1)?.trim() ?: ""
+        // Stricter grabber to ensure 'pd' matches the long cryptographic token instead of short timestamps
+        fun grabToken(varName: String): String {
+            val match = Regex("""(?:window\.)?$varName\s*=\s*["']([^"']+)["']""").find(code)?.groupValues?.getOrNull(1)?.trim()
+            if (match != null) return match
+            val altMatch = Regex("""\b$varName\s*:\s*["']([^"']+)["']""").find(code)?.groupValues?.getOrNull(1)?.trim()
+            return altMatch ?: ""
+        }
 
-        val pd = grab(Regex("""(?:window\.)?pd=["']([^"']+)["']"""))
-        val ps = grab(Regex("""(?:window\.)?ps=["']([^"']+)["']"""))
-        val qsx = grab(Regex("""(?:window\.)?qsx=["']([^"']+)["']"""))
-        val kaken = grab(Regex("""(?:window\.)?kaken=["']([^"']+)["']"""))
-        val apx = grab(Regex("""(?:window\.)?apx=["']([^"']+)["']"""))
+        // Specifically target the long base64/hash token for pd (ignoring numbers/timestamps)
+        val pdMatch = Regex("""pd\s*=\s*["']([A-Za-z0-9+/=_-]{30,})["']""").find(code)?.groupValues?.getOrNull(1)?.trim()
+            ?: grabToken("pd")
 
-        if (listOf(pd, ps, qsx, kaken, apx).all { it.isBlank() }) return null
+        val ps = grabToken("ps")
+        val qsx = grabToken("qsx")
+        val kaken = grabToken("kaken")
+        val apx = grabToken("apx")
+
+        if (listOf(pd, apx).all { it.isBlank() }) return null
         Log.e(tag, "Successfully parsed tokens via JSFuck fallback.")
         return GdTokens(pd, ps, qsx, kaken, apx)
     }
