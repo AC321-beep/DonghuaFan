@@ -240,7 +240,30 @@ class ChikiAnimationProvider : MainAPI() {
 
         var found = false
 
-        suspend fun handleUrl(rawUrl: String, ref: String) {
+        fun getIframeSrc(iframe: Element): String {
+            return iframe.attr("src").ifBlank {
+                iframe.attr("data-src").ifBlank {
+                    iframe.attr("data-litespeed-src").ifBlank {
+                        iframe.attr("data-lazy-src")
+                    }
+                }
+            }
+        }
+
+        fun safeBase64Decode(value: String): String? {
+            return try {
+                String(Base64.decode(value, Base64.DEFAULT))
+            } catch (e: Exception) {
+                try {
+                    String(Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP))
+                } catch (e2: Exception) { null }
+            }
+        }
+
+        suspend fun handleUrl(rawUrl: String, ref: String, depth: Int = 0) {
+            // Prevent infinite nesting loops
+            if (depth > 2) return
+            
             val cleanUrl = try { fixUrl(rawUrl) } catch (e: Exception) { return }
             if (!cleanUrl.startsWith("http")) return
 
@@ -251,6 +274,20 @@ class ChikiAnimationProvider : MainAPI() {
             ) return
 
             try {
+                // EXPLICIT CALL: Cloudstream's built-in Dailymotion extraction
+                if (cleanUrl.contains("dailymotion.com", true) || cleanUrl.contains("dai.ly", true)) {
+                    com.lagradost.cloudstream3.extractors.Dailymotion().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                    found = true
+                    return
+                }
+
+                // EXPLICIT CALL: Was missing in original code, preventing GalaxyDonghua links from ever loading
+                if (cleanUrl.contains("galaxydonghua", true)) {
+                    GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                    found = true
+                    return
+                }
+
                 if (cleanUrl.contains("ghbrisk.com", true)) {
                     Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true
@@ -264,7 +301,8 @@ class ChikiAnimationProvider : MainAPI() {
                 }
 
                 val html = app.get(cleanUrl, headers = mapOf("Referer" to ref)).text
-                val streamRegex = Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)[^\s"'<>\\]*)""")
+                // Added query string capture to streamRegex to ensure token-secured mp4/m3u8 urls aren't broken
+                val streamRegex = Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
                 var foundGeneric = false
 
                 streamRegex.findAll(html).forEach { m ->
@@ -290,11 +328,11 @@ class ChikiAnimationProvider : MainAPI() {
 
                 if (!foundGeneric) {
                     val iframeNode = Jsoup.parse(html).selectFirst("iframe")
-                    val nestedIframe = iframeNode?.let { it.attr("src").ifBlank { it.attr("data-src").ifBlank { it.attr("data-litespeed-src") } } }
+                    val nestedIframe = iframeNode?.let { getIframeSrc(it) }
                     if (!nestedIframe.isNullOrBlank() && nestedIframe.startsWith("http")) {
-                        if (loadExtractor(nestedIframe, cleanUrl, subtitleCallback, callback)) {
-                            foundGeneric = true
-                        }
+                        // RECURSIVE CALL: Instead of `loadExtractor`, recursively process inner iframes so they benefit from Dailymotion & Galaxy calls above.
+                        handleUrl(nestedIframe, cleanUrl, depth + 1)
+                        foundGeneric = true
                     }
                 }
                 if (foundGeneric) found = true
@@ -302,17 +340,25 @@ class ChikiAnimationProvider : MainAPI() {
             } catch (e: Exception) { }
         }
 
-        fun getIframeSrc(iframe: Element): String {
-            return iframe.attr("src").ifBlank {
-                iframe.attr("data-src").ifBlank {
-                    iframe.attr("data-litespeed-src")
+        suspend fun processDecodedHtml(decoded: String, ref: String) {
+            try {
+                Jsoup.parse(decoded).select("iframe").forEach { iframe ->
+                    val src = getIframeSrc(iframe)
+                    if (src.isNotBlank()) handleUrl(src, ref)
                 }
+            } catch (e: Exception) { }
+
+            Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { m ->
+                handleUrl(m.value, ref)
             }
         }
 
         val mirrorOptions = document.select(
             "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
         )
+        
+        // Some players place data-video attributes instead of options
+        val serverListItems = document.select(".server_list li, ul.episodes li, .mirror_link, .mirrors li")
 
         coroutineScope {
             mirrorOptions.map { option ->
@@ -325,24 +371,26 @@ class ChikiAnimationProvider : MainAPI() {
                         return@async
                     }
 
-                    val decoded: String? = try {
-                        String(Base64.decode(value, Base64.DEFAULT))
-                    } catch (e: Exception) {
-                        try {
-                            String(Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP))
-                        } catch (e2: Exception) { null }
+                    val decoded = safeBase64Decode(value)
+                    if (!decoded.isNullOrBlank()) {
+                        processDecodedHtml(decoded, data)
                     }
-                    if (decoded.isNullOrBlank()) return@async
+                }
+            }.awaitAll()
 
-                    try {
-                        Jsoup.parse(decoded).select("iframe").forEach { iframe ->
-                            val src = getIframeSrc(iframe)
-                            if (src.isNotBlank()) handleUrl(src, data)
+            serverListItems.map { el ->
+                async {
+                    val videoAttr = el.attr("data-video").ifBlank { el.attr("data-src") }.ifBlank { el.attr("data-embed") }
+                    if (videoAttr.isNotBlank()) {
+                        if (videoAttr.startsWith("http") || videoAttr.startsWith("//")) {
+                            handleUrl(videoAttr, data)
+                        } else if (videoAttr.length > 20) {
+                            val decoded = safeBase64Decode(videoAttr)
+                            if (!decoded.isNullOrBlank()) {
+                                if (decoded.startsWith("http")) handleUrl(decoded, data)
+                                else processDecodedHtml(decoded, data)
+                            }
                         }
-                    } catch (e: Exception) { }
-
-                    Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { m ->
-                        handleUrl(m.value, data)
                     }
                 }
             }.awaitAll()
@@ -364,24 +412,9 @@ class ChikiAnimationProvider : MainAPI() {
 
                 Regex("""['"]([A-Za-z0-9+/=_-]{60,})['"]""").findAll(body).forEach { m ->
                     val blob = m.groupValues[1]
-                    val decoded: String? = try {
-                        String(Base64.decode(blob, Base64.DEFAULT))
-                    } catch (e: Exception) {
-                        try {
-                            String(Base64.decode(blob, Base64.URL_SAFE or Base64.NO_WRAP))
-                        } catch (e2: Exception) { null }
-                    }
-                    if (decoded.isNullOrBlank()) return@forEach
-
-                    try {
-                        Jsoup.parse(decoded).select("iframe").forEach { iframe ->
-                            val src = getIframeSrc(iframe)
-                            if (src.isNotBlank()) handleUrl(src, data)
-                        }
-                    } catch (e: Exception) { }
-
-                    Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { mm ->
-                        handleUrl(mm.value, data)
+                    val decoded = safeBase64Decode(blob)
+                    if (!decoded.isNullOrBlank()) {
+                        processDecodedHtml(decoded, data)
                     }
                 }
             }
