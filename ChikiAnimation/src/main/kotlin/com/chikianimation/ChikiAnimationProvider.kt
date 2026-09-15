@@ -40,7 +40,7 @@ class ChikiAnimationProvider : MainAPI() {
         val url = buildPageUrl(request.data, page)
         
         val items = try {
-            val document = app.get(url, headers = defaultHeaders).document
+            val document = app.get(url, headers = defaultHeaders, cacheTime = 15).document
             document.select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
                 .mapNotNull { it.toSearchResult() }
                 .distinctBy { it.url }
@@ -127,26 +127,21 @@ class ChikiAnimationProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         val document = try {
-            app.get(url, headers = defaultHeaders).document
+            app.get(url, headers = defaultHeaders, cacheTime = 15).document
         } catch (e: Exception) {
             return null
         }
 
-        val title = document.selectFirst("h1.entry-title")?.text()?.trim()
-            ?: document.selectFirst("h1")?.text()?.trim()
+        val title = document.selectFirst("h1.entry-title, h1[itemprop=name], h1")?.text()?.trim()
             ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
             ?: return null
 
-        val poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim()
-            ?: document.selectFirst("div.thumb img.wp-post-image")?.attr("src")?.trim()
-            ?: document.selectFirst("div.thumb img")?.attr("src")?.trim()
-            ?: document.selectFirst("img.wp-post-image")?.attr("src")?.trim()
-            ?: ""
+        val poster = document.selectFirst("div.thumb img.wp-post-image, div.thumb img, img.wp-post-image")?.let {
+            it.attr("src").ifBlank { it.attr("data-src") }
+        }?.trim() ?: document.selectFirst("meta[property=og:image]")?.attr("content")?.trim() ?: ""
 
         val description = document
-            .selectFirst("div.entry-content[itemprop=description]")?.text()?.trim()
-            ?: document.selectFirst("div.entry-content")?.text()?.trim()
-            ?: document.selectFirst("div[itemprop=description]")?.text()?.trim()
+            .selectFirst("div.entry-content[itemprop=description], div.entry-content, div[itemprop=description]")?.text()?.trim()
 
         val genres = document.select("div.genxed a, span.genxed a, .spe .genxed a")
             .map { it.text().trim() }
@@ -181,7 +176,7 @@ class ChikiAnimationProvider : MainAPI() {
                 ?.attr("href")?.trim()
             if (!epPage.isNullOrBlank()) {
                 epListElements = try {
-                    app.get(fixUrl(epPage), headers = defaultHeaders).document
+                    app.get(fixUrl(epPage), headers = defaultHeaders, cacheTime = 15).document
                         .select(".episodelist li, .eplister li")
                 } catch (e: Exception) {
                     org.jsoup.select.Elements()
@@ -189,23 +184,24 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
+        val epNumRegex = Regex("""(?i)(\d+(?:\.\d+)?)""")
+        val episodePrefixRegex = Regex("""(?i)^\s*Episode\s*""")
+
         val episodes = epListElements.mapNotNull { info ->
-            val href = info.selectFirst("a[href]")?.attr("href")?.trim()
-                ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val anchor = info.selectFirst("a[href]") ?: return@mapNotNull null
+            val href = anchor.attr("href").trim().takeIf { it.isNotBlank() } ?: return@mapNotNull null
 
             val rawTitle = info.selectFirst(".epl-title")?.text()?.trim()
-                ?: info.selectFirst("a span")?.text()?.trim()
-                ?: info.selectFirst("a")?.text()?.trim()
-                ?: ""
+                ?: anchor.selectFirst("span")?.text()?.trim()
+                ?: anchor.text().trim()
 
             val dateText = info.selectFirst(".epl-date, .date, .time")
                 ?.text()?.trim()?.takeIf { it.isNotBlank() }
 
-            val epNum = Regex("""(?i)(\d+(?:\.\d+)?)""")
-                .find(rawTitle)?.groupValues?.get(1)?.toFloatOrNull()
+            val epNum = epNumRegex.find(rawTitle)?.groupValues?.get(1)?.toFloatOrNull()
 
             val cleanName = rawTitle
-                .replace(Regex("""(?i)^\s*Episode\s*"""), "")
+                .replace(episodePrefixRegex, "")
                 .trim()
                 .ifBlank { rawTitle.ifBlank { "Episode" } }
 
@@ -253,24 +249,27 @@ class ChikiAnimationProvider : MainAPI() {
                 cleanUrl.contains("doubleclick", true)
             ) return
 
-            // Safely isolated execution per URL to prevent one broken source from crashing others
             try {
                 when {
-                    cleanUrl.contains("ghbrisk.com", true) -> {
-                        Log.d("ChikiDebug", "Routing to Ghbrisk extractor: $cleanUrl")
-                        Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                        found = true
-                    }
+                    // 1. GalaxyDonghua evaluated FIRST
                     cleanUrl.contains("galaxydonghua", true) -> {
                         Log.d("ChikiDebug", "Routing to GalaxyDonghua extractor: $cleanUrl")
                         GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, callback)
                         found = true
                     }
-                    cleanUrl.contains("dailymotion", true) || cleanUrl.contains("dai.ly", true) -> {
-                        Log.d("ChikiDebug", "Delegating Dailymotion safely: $cleanUrl")
-                        val ok = loadExtractor(cleanUrl, referer = ref, subtitleCallback, callback)
-                        if (ok) found = true
+                    // 2. Ghbrisk evaluated SECOND
+                    cleanUrl.contains("ghbrisk.com", true) -> {
+                        Log.d("ChikiDebug", "Routing to Ghbrisk extractor: $cleanUrl")
+                        Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                        found = true
                     }
+                    // 3. Custom Dailymotion via Fully Qualified Name
+                    cleanUrl.contains("dailymotion", true) || cleanUrl.contains("dai.ly", true) -> {
+                        Log.d("ChikiDebug", "Routing to custom Dailymotion via Fully Qualified Name: $cleanUrl")
+                        com.chikianimation.Dailymotion().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                        found = true
+                    }
+                    // 4. Core CloudStream extractor fallback
                     else -> {
                         val ok = loadExtractor(cleanUrl, referer = ref, subtitleCallback, callback)
                         if (ok) found = true
