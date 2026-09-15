@@ -602,35 +602,51 @@ class DailymotionExtractor : ExtractorApi() {
         val qualities = json.optJSONObject("qualities")
         log("DM", "qualities present=${qualities != null}")
         if (qualities != null) {
-            // FIX: replace Iterator.asSequence().toList() with manual collection
-            val keysList = mutableListOf<String>()
-            qualities.keys().forEach { keysList.add(it) }
-            log("DM", "quality keys=$keysList")
-
-            qualities.keys().forEach { key ->
-                val qualityArray = qualities.optJSONArray(key) ?: return@forEach
-                log("DM", "  key='$key' array size=${qualityArray.length()}")
-                for (i in 0 until qualityArray.length()) {
-                    val qualityObj = qualityArray.optJSONObject(i) ?: continue
-                    val streamUrl = qualityObj.optString("url").takeIf { it.isNotBlank() } ?: continue
-                    val type = qualityObj.optString("type", "video/mp4")
-                    val isM3u8 = streamUrl.contains(".m3u8") || type.contains("m3u8", true)
-
-                    log("DM", "    ✓ emitting key='$key' type='$type' url=${streamUrl.take(100)}")
-
-                    callback.invoke(
-                        newExtractorLink(
-                            source = this.name,
-                            name = "${this.name} – $key",
-                            url = streamUrl,
-                            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = "https://www.dailymotion.com/"
-                            this.quality = key.filter { it.isDigit() }.toIntOrNull() ?: Qualities.Unknown.value
-                        }
-                    )
-                    emittedStreams++
+            val qualityNames = qualities.names()
+            if (qualityNames != null) {
+                val keysList = mutableListOf<String>()
+                for (idx in 0 until qualityNames.length()) {
+                    keysList.add(qualityNames.optString(idx))
                 }
+                log("DM", "quality keys=$keysList")
+
+                for (idx in 0 until qualityNames.length()) {
+                    val key = qualityNames.optString(idx)
+                    val qualityArray = qualities.optJSONArray(key)
+                    if (qualityArray == null) {
+                        log("DM", "  key='$key' → null array, skipping")
+                        continue
+                    }
+                    log("DM", "  key='$key' array size=${qualityArray.length()}")
+
+                    for (i in 0 until qualityArray.length()) {
+                        val qualityObj = qualityArray.optJSONObject(i)
+                        if (qualityObj == null) continue
+
+                        val streamUrl = qualityObj.optString("url")
+                        if (streamUrl.isBlank()) continue
+
+                        val type = qualityObj.optString("type", "video/mp4")
+                        val isM3u8 = streamUrl.contains(".m3u8") || type.contains("m3u8", true)
+
+                        log("DM", "    ✓ emitting key='$key' type='$type' url=${streamUrl.take(100)}")
+
+                        callback.invoke(
+                            newExtractorLink(
+                                source = this.name,
+                                name = "${this.name} – $key",
+                                url = streamUrl,
+                                type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = "https://www.dailymotion.com/"
+                                this.quality = key.filter { it.isDigit() }.toIntOrNull() ?: Qualities.Unknown.value
+                            }
+                        )
+                        emittedStreams++
+                    }
+                }
+            } else {
+                log("DM", "  ❌ names() returned null for qualities")
             }
         }
 
@@ -638,13 +654,19 @@ class DailymotionExtractor : ExtractorApi() {
         val subtitles = json.optJSONObject("subtitles")
         log("DM", "subtitles present=${subtitles != null}")
         if (subtitles != null) {
-            subtitles.keys().forEach { langCode ->
-                val subUrl = subtitles.optString(langCode).takeIf { it.isNotBlank() } ?: return@forEach
-                log("DM", "  ✓ emitting subtitle lang='$langCode' url=$subUrl")
-                subtitleCallback.invoke(
-                    newSubtitleFile(langCode, subUrl)
-                )
-                emittedSubs++
+            val subNames = subtitles.names()
+            if (subNames != null) {
+                for (idx in 0 until subNames.length()) {
+                    val langCode = subNames.optString(idx)
+                    val subUrl = subtitles.optString(langCode)
+                    if (subUrl.isBlank()) continue
+
+                    log("DM", "  ✓ emitting subtitle lang='$langCode' url=$subUrl")
+                    subtitleCallback.invoke(
+                        newSubtitleFile(langCode, subUrl)
+                    )
+                    emittedSubs++
+                }
             }
         }
 
@@ -679,8 +701,13 @@ class GoogleDriveExtractor : ExtractorApi() {
     ) {
         logEnter("GDrive", url, referer)
 
-        val fileId = idPatterns.firstNotNullOfOrNull {
-            it.find(url)?.groupValues?.getOrNull(1)
+        var fileId: String? = null
+        for (pattern in idPatterns) {
+            val m = pattern.find(url)
+            if (m != null) {
+                fileId = m.groupValues.getOrNull(1)
+                break
+            }
         }
         if (fileId == null) {
             log("GDrive", "❌ no file ID matched in url")
@@ -734,9 +761,12 @@ class GoogleDriveExtractor : ExtractorApi() {
         }
 
         log("GDrive.resolve", "HTTP status=${first.code}")
-        // FIX: collect header keys manually instead of .keys on Map (which is fine but consistent style)
+
+        // Manually iterate Map keys with a plain for loop
         val headerKeysList = mutableListOf<String>()
-        first.headers.keys.forEach { headerKeysList.add(it) }
+        for (k in first.headers.keys) {
+            headerKeysList.add(k)
+        }
         log("GDrive.resolve", "header keys=$headerKeysList")
         log("GDrive.resolve", "Content-Type='${first.headers["Content-Type"] ?: first.headers["content-type"]}'")
 
