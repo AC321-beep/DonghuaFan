@@ -1,6 +1,7 @@
 package com.chikianimation
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.Filesim
@@ -40,36 +41,69 @@ class GalaxyDonghua : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        val tag = "GalaxyDonghuaDebug"
+        Log.e(tag, "Starting extraction for URL: $url")
+
         val headers = mapOf(
             "User-Agent" to UA,
             "Referer" to (referer ?: GX),
             "Accept" to "*/*"
         )
 
-        val page = try { app.get(url, headers = headers).text } catch (e: Exception) { return }
-        val tokens = decodeGdTokens(page) ?: return
+        val page = try {
+            app.get(url, headers = headers).text
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to fetch embed page: ${e.message}")
+            return
+        }
+
+        val tokens = decodeGdTokens(page)
+        if (tokens == null) {
+            Log.e(tag, "CRITICAL: Failed to decode GD tokens (Both window variables and JSFuck failed)")
+            return
+        }
+        Log.e(tag, "Tokens successfully retrieved -> pd: ${tokens.pd.take(5)}..., apx length: ${tokens.apx.length}, kaken length: ${tokens.kaken.length}")
 
         val gxBase = embedHost(url)
         val apiConfigBase = "$gxBase/wp-json/gd/v1/config"
         
         val apiUrlToCall = try {
             if (tokens.apx.isNotBlank()) {
-                 String(Base64.decode(tokens.apx, Base64.DEFAULT)).trim()
+                String(Base64.decode(tokens.apx, Base64.DEFAULT)).trim()
             } else {
                 apiConfigBase
             }
-        } catch (e: Exception) { apiConfigBase }
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to decode apx base64, falling back to config base: ${e.message}")
+            apiConfigBase
+        }
+        Log.e(tag, "Target API Config URL: $apiUrlToCall")
 
-        val configRes = try { app.get(apiUrlToCall, headers = headers).text }
-            catch (e: Exception) { return }
+        val configRes = try {
+            app.get(apiUrlToCall, headers = headers).text
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to fetch API config response: ${e.message}")
+            return
+        }
+        Log.e(tag, "Config response fetched (length: ${configRes.length})")
 
         val configPlain = dcx(configRes.trim(), tokens.kaken)
             ?: dcx(configRes.trim(), tokens.apx)
             ?: dcx(configRes.trim(), tokens.pd)
-            ?: return
+
+        if (configPlain == null) {
+            Log.e(tag, "CRITICAL: Failed to decrypt config response using keys kaken, apx, or pd!")
+            return
+        }
+        Log.e(tag, "Config decrypted successfully.")
 
         val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""")
-            .find(configPlain)?.groupValues?.get(1) ?: return
+            .find(configPlain)?.groupValues?.get(1)
+
+        if (apiUrlTemplate == null) {
+            Log.e(tag, "CRITICAL: Could not find 'url' pattern inside decrypted config plain text.")
+            return
+        }
 
         val fixedApi = apiUrlTemplate
             .replace("{pd}", tokens.pd)
@@ -77,6 +111,8 @@ class GalaxyDonghua : ExtractorApi() {
             .replace("{qsx}", tokens.qsx)
             .replace("{kaken}", tokens.kaken)
             .replace("{apx}", tokens.apx)
+
+        Log.e(tag, "Final POST API Endpoint: $fixedApi")
 
         val apiRes = try {
             app.post(
@@ -88,12 +124,21 @@ class GalaxyDonghua : ExtractorApi() {
                     "apx" to tokens.apx
                 )
             ).text
-        } catch (e: Exception) { return }
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to execute POST request to stream API: ${e.message}")
+            return
+        }
+        Log.e(tag, "POST response fetched (length: ${apiRes.length})")
 
         val apiPlain = dcx(apiRes.trim(), tokens.kaken)
             ?: dcx(apiRes.trim(), tokens.apx)
             ?: dcx(apiRes.trim(), tokens.pd)
-            ?: return
+
+        if (apiPlain == null) {
+            Log.e(tag, "CRITICAL: Failed to decrypt final stream API response payload!")
+            return
+        }
+        Log.e(tag, "Stream API response decrypted successfully. Parsing links...")
 
         val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""")
             .find(apiPlain)?.groupValues?.get(1) ?: gxBase
@@ -104,6 +149,7 @@ class GalaxyDonghua : ExtractorApi() {
             "Origin" to gxBase
         )
 
+        var linkCount = 0
         Regex(""""file"\s*:\s*"([^"]+)"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?(?:[^{}]*?"type"\s*:\s*"([^"]*)")?""")
             .findAll(apiPlain)
             .forEach { m ->
@@ -113,6 +159,9 @@ class GalaxyDonghua : ExtractorApi() {
                 val isM3u8 = streamUrl.contains(".m3u8") ||
                         type.contains("hls", true) ||
                         type.contains("m3u8", true)
+
+                linkCount++
+                Log.e(tag, "Found Stream Link [$label]: $streamUrl")
 
                 callback.invoke(
                     newExtractorLink(
@@ -128,16 +177,7 @@ class GalaxyDonghua : ExtractorApi() {
                 )
             }
 
-        Regex(""""file"\s*:\s*"([^"]+\.(?:vtt|srt))"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?""")
-            .findAll(apiPlain)
-            .forEach { m ->
-                subtitleCallback.invoke(
-                    newSubtitleFile(
-                        lang = m.groupValues[2].ifBlank { "Sub" },
-                        url = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
-                    )
-                )
-            }
+        Log.e(tag, "Extraction complete. Total links generated: $linkCount")
     }
 
     private data class GdTokens(
@@ -146,7 +186,8 @@ class GalaxyDonghua : ExtractorApi() {
     )
 
     private fun decodeGdTokens(page: String): GdTokens? {
-        // 1. Direct window variable scraping (Modern GalaxyDonghua layout)
+        val tag = "GalaxyDonghuaDebug"
+        
         fun grabVar(name: String): String {
             return Regex("""(?:window\.)?$name\s*=\s*["']([^"']+)["']""").find(page)?.groupValues?.get(1)?.trim()
                 ?: Regex("""var\s+$name\s*=\s*["']([^"']+)["']""").find(page)?.groupValues?.get(1)?.trim()
@@ -160,10 +201,12 @@ class GalaxyDonghua : ExtractorApi() {
         val directApx = grabVar("apx")
 
         if (directPd.isNotBlank() || directApx.isNotBlank()) {
+            Log.e(tag, "Successfully grabbed tokens via Direct Window Variables parsing.")
             return GdTokens(directPd, directPs, directQsx, directKaken, directApx)
         }
 
-        // 2. Fallback to legacy JSFuck parser if direct variables aren't found
+        Log.e(tag, "Direct window variables not found. Falling back to JSFuck parser...")
+
         val startMatch = Regex("""ﾟωﾟﾉ\s*=""").find(page) ?: return null
         val jStart = startMatch.range.first
         val endMatch = Regex("""\)\s*\(\s*ﾟΘﾟ\s*\)\s*\)\s*\(\s*'_'\s*\)""")
@@ -240,6 +283,7 @@ class GalaxyDonghua : ExtractorApi() {
         val apx = grab(Regex("""(?:window\.)?apx=["']([^"']+)["']"""))
 
         if (listOf(pd, ps, qsx, kaken, apx).all { it.isBlank() }) return null
+        Log.e(tag, "Successfully parsed tokens via JSFuck fallback.")
         return GdTokens(pd, ps, qsx, kaken, apx)
     }
 
