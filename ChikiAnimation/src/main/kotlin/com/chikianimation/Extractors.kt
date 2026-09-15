@@ -19,6 +19,9 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.abs
 
+// ---------------------------------------------------------------------------
+// DEBUG HELPERS
+// ---------------------------------------------------------------------------
 private const val DBG = "ChikiDbg"
 
 private fun log(scope: String, msg: String) {
@@ -35,7 +38,7 @@ private fun logExit(scope: String, success: Boolean, extra: String = "") {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Ghbrisk
+// 1. Ghbrisk – Streamwish mirror (ghbrisk.com)
 // ---------------------------------------------------------------------------
 class Ghbrisk : Filesim() {
     override var name = "Streamwish"
@@ -44,10 +47,7 @@ class Ghbrisk : Filesim() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. GalaxyDonghua
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// 2. GalaxyDonghua — API endpoint auto-discovery
+// 2. GalaxyDonghua – API endpoint auto-discovery
 // ---------------------------------------------------------------------------
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
@@ -59,14 +59,6 @@ class GalaxyDonghua : ExtractorApi() {
         const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/120.0.0.0 Safari/537.36"
-
-        // Extra candidate subdomains to try
-        val ALT_HOSTS = listOf(
-            "https://galaxydonghua.xyz",
-            "https://api.galaxydonghua.xyz",
-            "https://player.galaxydonghua.xyz",
-            "https://cdn.galaxydonghua.xyz"
-        )
     }
 
     override suspend fun getUrl(
@@ -121,12 +113,14 @@ class GalaxyDonghua : ExtractorApi() {
             .findAll(page).map { it.groupValues[1] }.toList()
         log("GX", "found ${scriptSrcs.size} script src URLs")
 
-        for (rawSrc in scriptSrcs.take(15)) {  // cap at 15 to avoid runaway
-            val src = if (rawSrc.startsWith("//")) "https:$rawSrc"
-                      else if (rawSrc.startsWith("/")) "$gxBase$rawSrc"
-                      else rawSrc
+        for (rawSrc in scriptSrcs.take(15)) {
+            val src = when {
+                rawSrc.startsWith("//") -> "https:$rawSrc"
+                rawSrc.startsWith("/") -> "$gxBase$rawSrc"
+                else -> rawSrc
+            }
             if (!src.startsWith("http")) continue
-            if (!src.contains("galaxydonghua", true)) continue  // skip 3rd party CDNs
+            if (!src.contains("galaxydonghua", true)) continue
 
             try {
                 val js = app.get(src, headers = headers).text
@@ -137,9 +131,7 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        // (c) Scan the decoded JSFuck content for URLs
-        //     (already done inside decodeGdTokens if you want to return it,
-        //      but here we just re-parse the raw page for base64 blobs)
+        // (c) Scan base64 blobs in the page
         Regex("""["']([A-Za-z0-9+/=_-]{200,})["']""").findAll(page).forEach { m ->
             val blob = m.groupValues[1]
             try {
@@ -149,10 +141,13 @@ class GalaxyDonghua : ExtractorApi() {
         }
 
         log("GX", "discovered ${discovered.size} unique API paths")
+        if (discovered.isNotEmpty()) {
+            discovered.take(20).forEach { log("GX", "  • $it") }
+        }
 
-        // ── 4. Add fallback candidates if discovery yielded nothing ────────
+        // ── 4. Fallback candidates if discovery yielded nothing ────────────
         if (discovered.isEmpty()) {
-            log("GX", "⚠ no paths discovered from page — using fallback list")
+            log("GX", "⚠ no paths discovered — using fallback list")
             listOf(
                 "/api/gd/v1/config",
                 "/api/gd/v2/config",
@@ -215,7 +210,6 @@ class GalaxyDonghua : ExtractorApi() {
         log("GX", "configPlain len=${configPlain.length}")
         log("GX", "configPlain preview: ${configPlain.take(400)}")
 
-        // Extract API URL template
         var apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""")
             .find(configPlain)?.groupValues?.get(1)
         if (apiUrlTemplate == null) {
@@ -313,28 +307,22 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     /**
-     * Scans arbitrary text for candidate API paths. Adds any absolute or
-     * relative URLs matching the patterns to [out].
+     * Scans arbitrary text for candidate API paths.
      */
     private fun scanForApiPaths(text: String, source: String, out: MutableSet<String>) {
         // Full absolute URLs
         val absRegex = Regex("""https?://[^\s"'<>\\]+?""")
         absRegex.findAll(text).forEach { m ->
             val u = m.value.trimEnd('.', ',', ')', '(', ';', ':')
-            // Only keep URLs that point to galaxydonghua or contain /api/ or /wp-json/
-            if (u.contains("galaxydonghua", true) ||
-                u.contains("/api/", true) ||
-                u.contains("/wp-json/", true)
-            ) {
-                // Extract only the path portion if same host
-                if (u.contains("galaxydonghua.xyz")) {
-                    val path = u.substringAfter("galaxydonghua.xyz")
-                    if (path.isNotBlank() && (path.startsWith("/api/") || path.startsWith("/wp-json/"))) {
-                        out.add(path.substringBefore("'").substringBefore("\""))
-                    }
-                } else {
-                    out.add(u)
+            if (u.contains("galaxydonghua", true)) {
+                val path = u.substringAfter("galaxydonghua.xyz")
+                if (path.isNotBlank() &&
+                    (path.startsWith("/api/") || path.startsWith("/wp-json/"))
+                ) {
+                    out.add(path.substringBefore("'").substringBefore("\""))
                 }
+            } else if (u.contains("/api/", true) && !u.contains("vidverto", true)) {
+                out.add(u)
             }
         }
 
@@ -346,7 +334,7 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     /**
-     * A valid config response must contain `{` AND not be a "fail" message.
+     * A valid config response must contain `{` and not be a "fail" message.
      */
     private fun isAcceptableConfig(body: String): Boolean {
         val t = body.trim()
@@ -361,14 +349,245 @@ class GalaxyDonghua : ExtractorApi() {
         return true
     }
 
-    // ... (all other helper methods unchanged: decodeGdTokens, stripConstants,
-    //      splitTopLevelTerms, evalArithmetic, packrBase36, dcx, pbkdf2Sha256,
-    //      aesDecrypt, fixStreamUrl, embedHost)
-    // ... 
+    private data class GdTokens(
+        val pd: String, val ps: String, val qsx: String,
+        val kaken: String, val apx: String
+    )
+
+    private fun decodeGdTokens(page: String): GdTokens? {
+        val startMatch = Regex("""ﾟωﾟﾉ\s*=""").find(page) ?: return null
+        val jStart = startMatch.range.first
+        val endMatch = Regex("""\)\s*\(\s*ﾟΘﾟ\s*\)\s*\)\s*\(\s*'_'\s*\)""")
+            .find(page, jStart) ?: return null
+        val jEnd = endMatch.range.last + 1
+
+        val jsfuck = page.substring(jStart, jEnd)
+            .replace(Regex("""[\s\u00a0\u3000]+"""), "")
+
+        val bStart = jsfuck.indexOf("(ﾟεﾟ+")
+        if (bStart < 0) return null
+
+        val commentEnd = jsfuck.indexOf("*/", bStart)
+        val markerEnd = if (commentEnd >= 0) commentEnd + 2 else bStart + 5
+        var body = jsfuck.substring(markerEnd)
+
+        val oMarker = body.lastIndexOf("(ﾟДﾟ)[ﾟoﾟ]")
+        if (oMarker >= 0) body = body.substring(0, oMarker)
+
+        val segs = body.split("(ﾟДﾟ)[ﾟεﾟ]")
+        val sb = StringBuilder()
+
+        for (i in 1 until segs.size) {
+            val s = stripConstants(segs[i]).trim().trimStart('+').trimEnd('+')
+            val digits = StringBuilder()
+            for (term in splitTopLevelTerms(s)) {
+                val t = term.trim()
+                val raw = if (t.startsWith("-")) {
+                    val n = evalArithmetic(t.substring(1)) ?: return null
+                    -n
+                } else evalArithmetic(t.trimStart('+')) ?: return null
+                val v = abs(raw)
+                if (v > 7) return null
+                digits.append(v)
+            }
+            if (digits.isNotEmpty()) sb.append(digits.toString().toInt(8).toChar())
+        }
+
+        val packrCall = sb.toString()
+        val pStart = packrCall.indexOf("}('")
+        if (pStart < 0) return null
+        val packedStart = pStart + 3
+        val packedEnd = packrCall.indexOf("',", packedStart)
+        if (packedEnd < 0) return null
+        val packed = packrCall.substring(packedStart, packedEnd)
+
+        val num1Start = packedEnd + 2
+        val num1End = packrCall.indexOf(",", num1Start)
+        if (num1End < 0) return null
+        val a = packrCall.substring(num1Start, num1End).toIntOrNull() ?: return null
+
+        val dictStartRaw = packrCall.indexOf(",'", num1End)
+        if (dictStartRaw < 0) return null
+        val dictStart = dictStartRaw + 2
+        val dictEnd = packrCall.indexOf("'.split", dictStart)
+        if (dictEnd < 0) return null
+
+        val dict = packrCall.substring(dictStart, dictEnd).split("|")
+        var code = packed
+        for (idx in (a - 1) downTo 0) {
+            val k = dict.getOrNull(idx)
+            if (!k.isNullOrEmpty()) {
+                code = Regex("""\b${Regex.escape(packrBase36(idx, a))}\b""")
+                    .replace(code, Regex.escapeReplacement(k))
+            }
+        }
+
+        fun grab(re: Regex) = re.find(code)?.groupValues?.getOrNull(1)?.trim()
+
+        val pd = grab(Regex("""(?:window\.)?pd=["']([^"']+)["']""")) ?: return null
+        val ps = grab(Regex("""(?:window\.)?ps=["']([^"']+)["']""")) ?: return null
+        val qsx = grab(Regex("""(?:window\.)?qsx=["']([^"']+)["']""")) ?: return null
+        val kaken = grab(Regex("""(?:window\.)?kaken=["']([^"']+)["']""")) ?: return null
+        val apx = grab(Regex("""(?:window\.)?apx=["']([^"']+)["']""")) ?: return null
+
+        if (listOf(pd, ps, qsx, kaken, apx).any { it.isBlank() }) return null
+        return GdTokens(pd, ps, qsx, kaken, apx)
+    }
+
+    private fun stripConstants(s: String): String {
+        var t = s
+        for ((k, v) in listOf(
+            "(c^_^o)" to "0", "(o^_^o)" to "3",
+            "(ﾟΘﾟ)" to "1", "(ﾟｰﾟ)" to "4",
+            "c^_^o" to "0", "o^_^o" to "3",
+            "ﾟΘﾟ" to "1", "ﾟｰﾟ" to "4"
+        )) t = t.replace(k, v)
+        return t
+    }
+
+    private fun splitTopLevelTerms(s: String): List<String> {
+        val terms = mutableListOf<String>()
+        var depth = 0
+        var cur = StringBuilder()
+        for (ch in s) {
+            when (ch) {
+                '(' -> { depth++; cur.append(ch) }
+                ')' -> { depth--; cur.append(ch) }
+                '+', '-' -> if (depth == 0) {
+                    if (cur.isNotBlank()) terms.add(cur.toString())
+                    cur = StringBuilder().append(ch)
+                } else cur.append(ch)
+                else -> cur.append(ch)
+            }
+        }
+        if (cur.isNotBlank()) terms.add(cur.toString())
+        return terms.filter { it != "+" && it != "-" }
+    }
+
+    private fun evalArithmetic(s: String): Int? {
+        val clean = s.filter { it != ' ' }
+        val values = mutableListOf<Int>()
+        val ops = mutableListOf<Char>()
+        var i = 0
+        while (i < clean.length) {
+            val c = clean[i]
+            when {
+                c.isDigit() -> {
+                    var v = 0
+                    while (i < clean.length && clean[i].isDigit()) {
+                        v = v * 10 + (clean[i] - '0'); i++
+                    }
+                    values.add(v)
+                }
+                c == '(' -> { ops.add(c); i++ }
+                c == ')' -> {
+                    while (ops.isNotEmpty() && ops.last() != '(') {
+                        if (values.size < 2) return null
+                        val b = values.removeAt(values.lastIndex)
+                        val a = values.removeAt(values.lastIndex)
+                        val op = ops.removeAt(ops.lastIndex)
+                        values.add(if (op == '+') a + b else a - b)
+                    }
+                    if (ops.isEmpty()) return null
+                    ops.removeAt(ops.lastIndex); i++
+                }
+                c == '+' || c == '-' -> {
+                    while (ops.isNotEmpty() && ops.last() != '(') {
+                        if (values.size < 2) return null
+                        val b = values.removeAt(values.lastIndex)
+                        val a = values.removeAt(values.lastIndex)
+                        val op = ops.removeAt(ops.lastIndex)
+                        values.add(if (op == '+') a + b else a - b)
+                    }
+                    ops.add(c); i++
+                }
+                else -> return null
+            }
+        }
+        while (ops.isNotEmpty()) {
+            if (ops.last() == '(' || values.size < 2) return null
+            val b = values.removeAt(values.lastIndex)
+            val a = values.removeAt(values.lastIndex)
+            val op = ops.removeAt(ops.lastIndex)
+            values.add(if (op == '+') a + b else a - b)
+        }
+        return values.firstOrNull()
+    }
+
+    private fun packrBase36(c: Int, a: Int): String {
+        val prefix = if (c < a) "" else packrBase36(c / a, a)
+        val rem = c % a
+        val suffix = if (rem > 35) (rem + 29).toChar().toString() else rem.toString(36)
+        return prefix + suffix
+    }
+
+    private fun dcx(input: String, password: String): String? = try {
+        val data = Base64.decode(input.trim(), Base64.DEFAULT)
+        if (data.size < 16) null else {
+            val salt = data.copyOfRange(0, 16)
+            val ct = data.copyOfRange(16, data.size)
+            val derived = pbkdf2Sha256(password.toByteArray(Charsets.UTF_8), salt, 10000, 48)
+            if (derived == null) null
+            else aesDecrypt(ct, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
+        }
+    } catch (e: Exception) { null }
+
+    private fun pbkdf2Sha256(
+        password: ByteArray, salt: ByteArray, iterations: Int, dkLen: Int
+    ): ByteArray? = try {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(password, "HmacSHA256"))
+        val out = ByteArray(dkLen)
+        val blocks = (dkLen + 31) / 32
+        var offset = 0
+        for (block in 1..blocks) {
+            val u = ByteArray(salt.size + 4)
+            System.arraycopy(salt, 0, u, 0, salt.size)
+            u[salt.size] = (block ushr 24).toByte()
+            u[salt.size + 1] = (block ushr 16).toByte()
+            u[salt.size + 2] = (block ushr 8).toByte()
+            u[salt.size + 3] = block.toByte()
+            val t = mac.doFinal(u)
+            var last = t
+            for (i in 1 until iterations) {
+                last = mac.doFinal(last)
+                for (j in t.indices) t[j] = (t[j].toInt() xor last[j].toInt()).toByte()
+            }
+            val n = minOf(32, dkLen - offset)
+            System.arraycopy(t, 0, out, offset, n)
+            offset += n
+        }
+        out
+    } catch (e: Exception) { null }
+
+    private fun aesDecrypt(blob: ByteArray, key: ByteArray, iv: ByteArray): String? {
+        if (key.size != 16 && key.size != 24 && key.size != 32) return null
+        if (iv.size != 16) return null
+        return try {
+            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+            String(cipher.doFinal(blob), Charsets.UTF_8)
+        } catch (e: Exception) { null }
+    }
+
+    private fun fixStreamUrl(url: String, base: String): String? {
+        val u = url.trim()
+        if (u.isBlank()) return null
+        if (u.startsWith("http://") || u.startsWith("https://")) return u
+        if (u.startsWith("//")) return "https:$u"
+        val host = try { val uri = URI(base); "${uri.scheme}://${uri.host}" }
+            catch (e: Exception) { null }
+        return if (u.startsWith("/")) (host ?: base.trimEnd('/')) + u
+        else (host ?: base.trimEnd('/')) + "/" + u
+    }
+
+    private fun embedHost(url: String): String = try {
+        val uri = URI(url); "${uri.scheme}://${uri.host}"
+    } catch (e: Exception) { GX }
 }
 
 // ---------------------------------------------------------------------------
-// 3. DailymotionExtractor — FIXED: nested subtitles.data[lang].url
+// 3. DailymotionExtractor
 // ---------------------------------------------------------------------------
 class DailymotionExtractor : ExtractorApi() {
     override var name = "Dailymotion"
@@ -418,13 +637,14 @@ class DailymotionExtractor : ExtractorApi() {
 
         var emittedStreams = 0
         val qualities = json.optJSONObject("qualities")
+        log("DM", "qualities present=${qualities != null}")
         if (qualities != null) {
             val qualityNames = qualities.names()
             if (qualityNames != null) {
                 for (idx in 0 until qualityNames.length()) {
                     val key = qualityNames.optString(idx)
-                    val qualityArray = qualities.optJSONArray(key) ?: continue
-
+                    val qualityArray = qualities.optJSONArray(key)
+                    if (qualityArray == null) continue
                     for (i in 0 until qualityArray.length()) {
                         val qualityObj = qualityArray.optJSONObject(i) ?: continue
                         val streamUrl = qualityObj.optString("url")
@@ -458,8 +678,6 @@ class DailymotionExtractor : ExtractorApi() {
         val subtitles = json.optJSONObject("subtitles")
         log("DM", "subtitles present=${subtitles != null}")
         if (subtitles != null) {
-            // Dailymotion nests real subtitles inside `data.{langCode}.url`.
-            // Other keys like `enable` are boolean flags we should ignore.
             val dataNode = subtitles.optJSONObject("data")
             val subtitleSource = dataNode ?: subtitles
 
@@ -477,12 +695,8 @@ class DailymotionExtractor : ExtractorApi() {
                         else -> null
                     }
 
-                    if (subUrl.isNullOrBlank()) {
-                        log("DM", "  ⚠ skipping non-URL subtitle '$langCode'")
-                        continue
-                    }
-
-                    log("DM", "  ✓ subtitle lang='$langCode' url=$subUrl")
+                    if (subUrl.isNullOrBlank()) continue
+                    log("DM", "  ✓ subtitle lang='$langCode'")
                     subtitleCallback.invoke(newSubtitleFile(langCode, subUrl))
                     emittedSubs++
                 }
@@ -511,7 +725,7 @@ class DailymotionExtractor : ExtractorApi() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. GoogleDriveExtractor — unchanged
+// 4. GoogleDriveExtractor
 // ---------------------------------------------------------------------------
 class GoogleDriveExtractor : ExtractorApi() {
     override var name = "Google Drive"
