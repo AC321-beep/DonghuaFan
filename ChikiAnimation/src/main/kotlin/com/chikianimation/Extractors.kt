@@ -451,3 +451,141 @@ class DailymotionExtractor : ExtractorApi() {
         return regex.find(url)?.groupValues?.get(1)
     }
 }
+
+// ---------------------------------------------------------------------------
+// 4. GoogleDriveExtractor – direct drive.google.com file resolver
+// ---------------------------------------------------------------------------
+/**
+ * Handles:
+ *   https://drive.google.com/file/d/{ID}/preview
+ *   https://drive.google.com/file/d/{ID}/view
+ *   https://drive.google.com/uc?id={ID}
+ *   https://drive.google.com/open?id={ID}
+ *   https://docs.google.com/uc?id={ID}
+ *
+ * Google Drive serves files in two modes:
+ *   1. Small files  → 302 redirect straight to a playable media URL.
+ *   2. Large files  → HTML "virus scan" page containing a uuid + confirm token
+ *                     which must be sent back to obtain the real link.
+ */
+class GoogleDriveExtractor : ExtractorApi() {
+    override var name = "Google Drive"
+    override var mainUrl = "https://drive.google.com"
+    override val requiresReferer = false
+
+    private val idPatterns = listOf(
+        Regex("""/file/d/([a-zA-Z0-9_-]{10,})"""),
+        Regex("""[?&]id=([a-zA-Z0-9_-]{10,})"""),
+        Regex("""/d/([a-zA-Z0-9_-]{10,})""")
+    )
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val fileId = idPatterns.firstNotNullOfOrNull {
+            it.find(url)?.groupValues?.getOrNull(1)
+        } ?: return
+
+        val headers = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer" to "https://drive.google.com/"
+        )
+
+        val directUrl = resolveDirectUrl(fileId, headers) ?: return
+
+        callback.invoke(
+            newExtractorLink(
+                source = this.name,
+                name = this.name,
+                url = directUrl,
+                type = if (directUrl.contains(".m3u8", true))
+                    ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            ) {
+                this.referer = "https://drive.google.com/"
+                this.quality = Qualities.Unknown.value
+                this.headers = headers
+            }
+        )
+    }
+
+    /**
+     * Returns a playable direct URL for the given Google Drive file id.
+     */
+    private suspend fun resolveDirectUrl(
+        fileId: String,
+        headers: Map<String, String>
+    ): String? {
+        val downloadUrl = "https://drive.google.com/uc?export=download&id=$fileId"
+
+        // Step 1 — probe the download URL without auto-following redirects
+        val first = try {
+            app.get(downloadUrl, headers = headers, allowRedirects = false)
+        } catch (e: Exception) {
+            return null
+        }
+
+        // Case A: direct 302/303 → use Location header
+        val location = first.headers["Location"] ?: first.headers["location"]
+        if (!location.isNullOrBlank() &&
+            (location.contains(".mp4", true) ||
+                    location.contains(".mkv", true) ||
+                    location.contains(".webm", true) ||
+                    location.contains("videoplayback", true))
+        ) {
+            return location
+        }
+
+        val body = first.text
+
+        // Case B: 200 OK with HTML body → search for confirm form
+        if (body.isBlank()) {
+            if (!location.isNullOrBlank() && location.startsWith("http")) return location
+            return null
+        }
+
+        // Extract uuid + confirm token from the "virus scan warning" form
+        val uuid = Regex("""name="uuid"\s+value="([^"]+)"""")
+            .find(body)?.groupValues?.getOrNull(1)
+            ?: Regex("""uuid=([a-zA-Z0-9_-]+)""")
+                .find(body)?.groupValues?.getOrNull(1)
+
+        val confirm = Regex("""name="confirm"\s+value="([^"]+)"""")
+            .find(body)?.groupValues?.getOrNull(1)
+            ?: "t"
+
+        if (!uuid.isNullOrBlank()) {
+            val confirmUrl =
+                "https://drive.usercontent.google.com/download" +
+                        "?id=$fileId&export=download&confirm=$confirm&uuid=$uuid"
+
+            val confirmed = try {
+                app.get(confirmUrl, headers = headers, allowRedirects = false)
+            } catch (e: Exception) {
+                null
+            }
+
+            val confirmedLoc = confirmed?.headers?.get("Location")
+                ?: confirmed?.headers?.get("location")
+            if (!confirmedLoc.isNullOrBlank() && confirmedLoc.startsWith("http")) {
+                return confirmedLoc
+            }
+
+            // Fallback: let the player follow redirects
+            return confirmUrl
+        }
+
+        // Case C: legacy confirm= token in body
+        val legacyConfirm = Regex("""confirm=([0-9A-Za-z_-]+)""")
+            .find(body)?.groupValues?.getOrNull(1)
+        if (!legacyConfirm.isNullOrBlank()) {
+            return "$downloadUrl&confirm=$legacyConfirm"
+        }
+
+        // Case D: fall back to the plain uc URL
+        return downloadUrl
+    }
+}
