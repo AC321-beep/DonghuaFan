@@ -66,14 +66,19 @@ class GalaxyDonghua : ExtractorApi() {
 
         val gxBase = embedHost(url)
         
-        // Dynamically construct the config URL using apx, qsx, pd, and ps just like the new player does
+        // Properly handle absolute vs relative decoded apx paths to prevent double domains
         val decodedApx = try {
             String(Base64.decode(tokens.apx, Base64.DEFAULT)).trim()
         } catch (e: Exception) {
             tokens.apx
         }
-        val normalizedPath = if (decodedApx.startsWith("/")) decodedApx else "/$decodedApx"
-        val apiUrlToCall = "$gxBase$normalizedPath${tokens.qsx}${tokens.pd}${tokens.ps}"
+
+        val apiUrlToCall = if (decodedApx.startsWith("http")) {
+            "$decodedApx${tokens.qsx}${tokens.pd}${tokens.ps}"
+        } else {
+            val normalizedPath = if (decodedApx.startsWith("/")) decodedApx else "/$decodedApx"
+            "$gxBase$normalizedPath${tokens.qsx}${tokens.pd}${tokens.ps}"
+        }
         
         Log.e(tag, "Target API Config URL: $apiUrlToCall")
 
