@@ -1,6 +1,7 @@
 package com.chikianimation
 
 import android.util.Base64
+import com.lagradost.api.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
@@ -53,13 +54,11 @@ class ChikiAnimationProvider : MainAPI() {
     // DEBUG HELPERS
     // =========================================================================
     private fun dbg(tag: String, msg: String) {
-        println("╔══ [ChikiDbg][$tag] $msg")
+        Log.e("ChikiDbg", "[$tag] $msg")
     }
 
     private fun dbgSection(tag: String) {
-        println("╔══════════════════════════════════════════════════════════════")
-        println("║ [ChikiDbg] SECTION: $tag")
-        println("╚══════════════════════════════════════════════════════════════")
+        Log.e("ChikiDbg", "════════ SECTION: $tag ════════")
     }
 
     // =========================================================================
@@ -110,7 +109,10 @@ class ChikiAnimationProvider : MainAPI() {
         }
         val pagBlock = document.selectFirst(".pagination, .wp-pagenavi, .page-numbers")
 
-        dbg("hasNext", "relNext=${relNext != null} nextClass=${nextClass != null} explicit=$explicitNext pagBlock=${pagBlock != null}")
+        dbg(
+            "hasNext",
+            "relNext=${relNext != null} nextClass=${nextClass != null} explicit=$explicitNext pagBlock=${pagBlock != null}"
+        )
 
         return relNext != null || nextClass != null || explicitNext || pagBlock != null
     }
