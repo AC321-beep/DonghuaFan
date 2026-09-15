@@ -44,10 +44,12 @@ class GalaxyDonghua : ExtractorApi() {
         val tag = "GalaxyDonghuaDebug"
         Log.e(tag, "Starting extraction for URL: $url")
 
+        // Added X-Requested-With header to bypass server bot protection (length: 0 fix)
         val headers = mapOf(
             "User-Agent" to UA,
             "Referer" to (referer ?: GX),
-            "Accept" to "*/*"
+            "Accept" to "text/plain, */*; q=0.01",
+            "X-Requested-With" to "XMLHttpRequest"
         )
 
         val page = try {
@@ -89,9 +91,9 @@ class GalaxyDonghua : ExtractorApi() {
         }
         Log.e(tag, "Config response fetched (length: ${configRes.length})")
 
-        val configPlain = dcx(configRes.trim(), tokens.kaken)
+        val configPlain = dcx(configRes.trim(), tokens.pd)
+            ?: dcx(configRes.trim(), tokens.kaken)
             ?: dcx(configRes.trim(), tokens.apx)
-            ?: dcx(configRes.trim(), tokens.pd)
 
         if (configPlain == null) {
             Log.e(tag, "CRITICAL: Failed to decrypt config response!")
@@ -132,9 +134,9 @@ class GalaxyDonghua : ExtractorApi() {
         }
         Log.e(tag, "POST response fetched (length: ${apiRes.length})")
 
-        val apiPlain = dcx(apiRes.trim(), tokens.kaken)
+        val apiPlain = dcx(apiRes.trim(), tokens.pd)
+            ?: dcx(apiRes.trim(), tokens.kaken)
             ?: dcx(apiRes.trim(), tokens.apx)
-            ?: dcx(apiRes.trim(), tokens.pd)
 
         if (apiPlain == null) {
             Log.e(tag, "CRITICAL: Failed to decrypt final stream API response payload!")
@@ -194,14 +196,14 @@ class GalaxyDonghua : ExtractorApi() {
             val matches = Regex("""(?:window\.)?$name\s*=\s*["']([^"']+)["']""").findAll(page)
             for (match in matches) {
                 val value = match.groupValues[1].trim()
-                if (value.isNotBlank() && !value.all { it.isDigit() }) {
+                if (value.isNotBlank() && !value.matches(Regex("""^\d{10,}$"""))) {
                     return value
                 }
             }
             val altMatches = Regex("""\b$name\s*:\s*["']([^"']+)["']""").findAll(page)
             for (match in altMatches) {
                 val value = match.groupValues[1].trim()
-                if (value.isNotBlank() && !value.all { it.isDigit() }) {
+                if (value.isNotBlank() && !value.matches(Regex("""^\d{10,}$"""))) {
                     return value
                 }
             }
@@ -215,7 +217,7 @@ class GalaxyDonghua : ExtractorApi() {
         val directApx = grabVar("apx")
 
         if (directPd.isNotBlank() || directApx.isNotBlank()) {
-            Log.e(tag, "Successfully grabbed tokens via Direct Window Variables parsing (Filtered).")
+            Log.e(tag, "Successfully grabbed tokens via Direct Window Variables parsing (Strict Filter).")
             return GdTokens(directPd, directPs, directQsx, directKaken, directApx)
         }
 
@@ -289,10 +291,21 @@ class GalaxyDonghua : ExtractorApi() {
         }
 
         fun grabJsToken(varName: String): String {
-            val match = Regex("""(?:window\.)?$varName\s*=\s*["']([^"']+)["']""").find(code)?.groupValues?.getOrNull(1)?.trim()
-                ?: Regex("""\b$varName\s*:\s*["']([^"']+)["']""").find(code)?.groupValues?.getOrNull(1)?.trim()
-                ?: ""
-            return match.replace(Regex("""\d{10,}$"""), "")
+            val matches = Regex("""(?:window\.)?$varName\s*=\s*["']([^"']+)["']""").findAll(code)
+            for (match in matches) {
+                val value = match.groupValues[1].trim()
+                if (value.isNotBlank() && !value.matches(Regex("""^\d{10,}$"""))) {
+                    return value
+                }
+            }
+            val altMatches = Regex("""\b$varName\s*:\s*["']([^"']+)["']""").findAll(code)
+            for (match in altMatches) {
+                val value = match.groupValues[1].trim()
+                if (value.isNotBlank() && !value.matches(Regex("""^\d{10,}$"""))) {
+                    return value
+                }
+            }
+            return ""
         }
 
         val pd = grabJsToken("pd")
