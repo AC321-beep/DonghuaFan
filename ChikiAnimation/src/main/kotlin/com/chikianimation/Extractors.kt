@@ -191,9 +191,21 @@ class GalaxyDonghua : ExtractorApi() {
         val tag = "GalaxyDonghuaDebug"
         
         fun grabVar(name: String): String {
-            return Regex("""(?:window\.)?$name\s*=\s*["']([^"']+)["']""").find(page)?.groupValues?.get(1)?.trim()
-                ?: Regex("""var\s+$name\s*=\s*["']([^"']+)["']""").find(page)?.groupValues?.get(1)?.trim()
-                ?: ""
+            val matches = Regex("""(?:window\.)?$name\s*=\s*["']([^"']+)["']""").findAll(page)
+            for (match in matches) {
+                val value = match.groupValues[1].trim()
+                if (value.isNotBlank() && !value.all { it.isDigit() }) {
+                    return value
+                }
+            }
+            val altMatches = Regex("""\b$name\s*:\s*["']([^"']+)["']""").findAll(page)
+            for (match in altMatches) {
+                val value = match.groupValues[1].trim()
+                if (value.isNotBlank() && !value.all { it.isDigit() }) {
+                    return value
+                }
+            }
+            return ""
         }
 
         val directPd = grabVar("pd")
@@ -203,11 +215,11 @@ class GalaxyDonghua : ExtractorApi() {
         val directApx = grabVar("apx")
 
         if (directPd.isNotBlank() || directApx.isNotBlank()) {
-            Log.e(tag, "Successfully grabbed tokens via Direct Window Variables parsing.")
+            Log.e(tag, "Successfully grabbed tokens via Direct Window Variables parsing (Filtered).")
             return GdTokens(directPd, directPs, directQsx, directKaken, directApx)
         }
 
-        Log.e(tag, "Direct window variables not found. Falling back to JSFuck parser...")
+        Log.e(tag, "Direct window variables not found or invalid. Falling back to JSFuck parser...")
 
         val startMatch = Regex("""ﾟωﾟﾉ\s*=""").find(page) ?: return null
         val jStart = startMatch.range.first
@@ -276,22 +288,18 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        // Stricter grabber to ensure 'pd' matches the long cryptographic token instead of short timestamps
-        fun grabToken(varName: String): String {
+        fun grabJsToken(varName: String): String {
             val match = Regex("""(?:window\.)?$varName\s*=\s*["']([^"']+)["']""").find(code)?.groupValues?.getOrNull(1)?.trim()
-            if (match != null) return match
-            val altMatch = Regex("""\b$varName\s*:\s*["']([^"']+)["']""").find(code)?.groupValues?.getOrNull(1)?.trim()
-            return altMatch ?: ""
+                ?: Regex("""\b$varName\s*:\s*["']([^"']+)["']""").find(code)?.groupValues?.getOrNull(1)?.trim()
+                ?: ""
+            return match.replace(Regex("""\d{10,}$"""), "")
         }
 
-        // Specifically target the long base64/hash token for pd (ignoring numbers/timestamps)
-        val pdMatch = Regex("""pd\s*=\s*["']([A-Za-z0-9+/=_-]{30,})["']""").find(code)?.groupValues?.getOrNull(1)?.trim()
-            ?: grabToken("pd")
-
-        val ps = grabToken("ps")
-        val qsx = grabToken("qsx")
-        val kaken = grabToken("kaken")
-        val apx = grabToken("apx")
+        val pd = grabJsToken("pd")
+        val ps = grabJsToken("ps")
+        val qsx = grabJsToken("qsx")
+        val kaken = grabJsToken("kaken")
+        val apx = grabJsToken("apx")
 
         if (listOf(pd, apx).all { it.isBlank() }) return null
         Log.e(tag, "Successfully parsed tokens via JSFuck fallback.")
