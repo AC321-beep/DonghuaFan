@@ -9,7 +9,9 @@ import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import org.json.JSONObject
 import java.net.URI
 import javax.crypto.Cipher
 import javax.crypto.Mac
@@ -20,7 +22,7 @@ import kotlin.math.abs
 private const val DBG = "ChikiDbg"
 
 // ===========================================================================
-// Ghbrisk – Streamwish mirror
+// 1. Ghbrisk – Streamwish mirror
 // ===========================================================================
 class Ghbrisk : Filesim() {
     override var name = "Streamwish"
@@ -29,7 +31,7 @@ class Ghbrisk : Filesim() {
 }
 
 // ===========================================================================
-// GalaxyDonghua – with debug logging + endpoint auto-discovery
+// 2. GalaxyDonghua – with debug logging + endpoint auto-discovery
 // ===========================================================================
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
@@ -74,24 +76,23 @@ class GalaxyDonghua : ExtractorApi() {
 
         val gxBase = embedHost(url)
 
-        // ---- Dump config-related strings from player JS ----
+        // Dump config/API strings from the player JS to help debugging
         try {
             val js = app.get("$gxBase/assets/js/player-v4.6.6.min.js", headers = headers).text
             Log.e(DBG, "[GX] player JS len=${js.length}")
             val hits = Regex("""["']([^"']{0,100}config[^"']{0,100})["']""", RegexOption.IGNORE_CASE)
                 .findAll(js).map { it.groupValues[1] }.distinct().toList()
-            Log.e(DBG, "[GX] config-related strings found=${hits.size}")
+            Log.e(DBG, "[GX] config-related strings=${hits.size}")
             hits.take(30).forEach { s -> Log.e(DBG, "[GX]   · '$s'") }
 
             val apiHits = Regex("""["']([^"']{0,100}(?:wp-json|/api/|/gd/)[^"']{0,100})["']""", RegexOption.IGNORE_CASE)
                 .findAll(js).map { it.groupValues[1] }.distinct().toList()
-            Log.e(DBG, "[GX] API-related strings found=${apiHits.size}")
+            Log.e(DBG, "[GX] API-related strings=${apiHits.size}")
             apiHits.take(30).forEach { s -> Log.e(DBG, "[GX]   · '$s'") }
         } catch (e: Exception) {
             Log.e(DBG, "[GX] player JS fetch failed: ${e.message}")
         }
 
-        // ---- Try a broad list of candidate endpoints ----
         val candidates = listOf(
             "/wp-json/gd/v1/config", "/wp-json/gd/v2/config", "/wp-json/gd/config",
             "/wp-json/gd/v1/player", "/wp-json/gd/v1/init",
@@ -112,7 +113,6 @@ class GalaxyDonghua : ExtractorApi() {
         for (path in candidates) {
             val testUrl = "$gxBase$path"
 
-            // GET
             val getRes = try { app.get(testUrl, headers = headers).text }
                          catch (e: Exception) { null }
             if (getRes != null && getRes.length > 30 && !getRes.startsWith("<") &&
@@ -121,7 +121,6 @@ class GalaxyDonghua : ExtractorApi() {
                 configRes = getRes; usedPath = path; break
             }
 
-            // POST with tokens as body
             val postRes = try {
                 app.post(testUrl, headers = headers, data = mapOf(
                     "pd" to tokens.pd, "ps" to tokens.ps,
@@ -151,7 +150,7 @@ class GalaxyDonghua : ExtractorApi() {
         val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""")
             .find(configPlain)?.groupValues?.get(1)
             ?: run {
-                Log.e(DBG, "[GX] ❌ apiUrlTemplate not found in config")
+                Log.e(DBG, "[GX] ❌ apiUrlTemplate not found")
                 return
             }
         Log.e(DBG, "[GX] apiUrlTemplate='$apiUrlTemplate'")
@@ -452,4 +451,245 @@ class GalaxyDonghua : ExtractorApi() {
     private fun embedHost(url: String): String = try {
         val uri = URI(url); "${uri.scheme}://${uri.host}"
     } catch (e: Exception) { GX }
+}
+
+// ===========================================================================
+// 3. DailymotionExtractor – stable metadata API
+// ===========================================================================
+class DailymotionExtractor : ExtractorApi() {
+    override var name = "Dailymotion"
+    override var mainUrl = "https://www.dailymotion.com"
+    override val requiresReferer = false
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        Log.e(DBG, "════ [DM] ▶ ENTER url='$url'")
+
+        val videoId = extractVideoId(url) ?: run {
+            Log.e(DBG, "[DM] ❌ no video ID")
+            return
+        }
+        Log.e(DBG, "[DM] videoId='$videoId'")
+
+        val metadataUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
+        val html = try {
+            app.get(metadataUrl, headers = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer" to "https://www.dailymotion.com/",
+                "Accept" to "application/json"
+            )).text
+        } catch (e: Exception) {
+            Log.e(DBG, "[DM] ❌ fetch failed: ${e.message}")
+            return
+        }
+        Log.e(DBG, "[DM] metadata fetch OK, len=${html.length}")
+
+        val json = try { JSONObject(html) } catch (e: Exception) {
+            Log.e(DBG, "[DM] ❌ JSON parse failed: ${e.message}")
+            return
+        }
+
+        var emittedStreams = 0
+        val qualities = json.optJSONObject("qualities")
+        if (qualities != null) {
+            val names = qualities.names()
+            if (names != null) {
+                for (i in 0 until names.length()) {
+                    val key = names.optString(i)
+                    val arr = qualities.optJSONArray(key) ?: continue
+                    for (j in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(j) ?: continue
+                        val streamUrl = obj.optString("url").takeIf { it.isNotBlank() } ?: continue
+                        val type = obj.optString("type", "video/mp4")
+                        val isM3u8 = streamUrl.contains(".m3u8") ||
+                                type.contains("m3u8", true) ||
+                                type.contains("mpegurl", true)
+                        Log.e(DBG, "[DM]   ✓ quality '$key' type='$type'")
+                        callback.invoke(
+                            newExtractorLink(
+                                source = this.name,
+                                name = "${this.name} – $key",
+                                url = streamUrl,
+                                type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = "https://www.dailymotion.com/"
+                                this.quality = key.filter { it.isDigit() }.toIntOrNull()
+                                    ?: Qualities.Unknown.value
+                            }
+                        )
+                        emittedStreams++
+                    }
+                }
+            }
+        }
+
+        var emittedSubs = 0
+        val subtitles = json.optJSONObject("subtitles")
+        if (subtitles != null) {
+            val dataNode = subtitles.optJSONObject("data") ?: subtitles
+            val subNames = dataNode.names()
+            if (subNames != null) {
+                for (i in 0 until subNames.length()) {
+                    val langCode = subNames.optString(i)
+                    if (langCode == "enable" || langCode == "data") continue
+                    val subVal = dataNode.opt(langCode)
+                    val subUrl = when (subVal) {
+                        is String -> subVal.takeIf { it.startsWith("http", true) }
+                        is JSONObject -> subVal.optString("url")
+                            .takeIf { it.startsWith("http", true) }
+                        else -> null
+                    } ?: continue
+                    Log.e(DBG, "[DM]   ✓ subtitle '$langCode'")
+                    subtitleCallback.invoke(newSubtitleFile(langCode, subUrl))
+                    emittedSubs++
+                }
+            }
+        }
+
+        Log.e(DBG, "[DM] ✓ EXIT streams=$emittedStreams subs=$emittedSubs")
+    }
+
+    private fun extractVideoId(url: String): String? {
+        val patterns = listOf(
+            Regex("""/embed/video/([a-zA-Z0-9]+)"""),
+            Regex("""/video/([a-zA-Z0-9]+)"""),
+            Regex("""[?&]video=([a-zA-Z0-9]+)"""),
+            Regex("""dai\.ly/([a-zA-Z0-9]+)""")
+        )
+        for (p in patterns) {
+            val m = p.find(url)
+            if (m != null) {
+                val id = m.groupValues[1]
+                if (id.isNotBlank()) return id
+            }
+        }
+        return null
+    }
+}
+
+// ===========================================================================
+// 4. GoogleDriveExtractor – direct file resolver
+// ===========================================================================
+class GoogleDriveExtractor : ExtractorApi() {
+    override var name = "Google Drive"
+    override var mainUrl = "https://drive.google.com"
+    override val requiresReferer = false
+
+    private val idPatterns = listOf(
+        Regex("""/file/d/([a-zA-Z0-9_-]{10,})"""),
+        Regex("""[?&]id=([a-zA-Z0-9_-]{10,})"""),
+        Regex("""/d/([a-zA-Z0-9_-]{10,})""")
+    )
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        Log.e(DBG, "════ [GDrive] ▶ ENTER url='$url'")
+
+        var fileId: String? = null
+        for (pattern in idPatterns) {
+            val m = pattern.find(url)
+            if (m != null) {
+                fileId = m.groupValues.getOrNull(1); break
+            }
+        }
+        if (fileId == null) {
+            Log.e(DBG, "[GDrive] ❌ no file ID")
+            return
+        }
+        Log.e(DBG, "[GDrive] fileId='$fileId'")
+
+        val headers = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer" to "https://drive.google.com/"
+        )
+
+        val directUrl = resolveDirectUrl(fileId, headers)
+        if (directUrl == null) {
+            Log.e(DBG, "[GDrive] ❌ resolve failed")
+            return
+        }
+        Log.e(DBG, "[GDrive] ✓ directUrl='$directUrl'")
+
+        callback.invoke(
+            newExtractorLink(
+                source = this.name,
+                name = this.name,
+                url = directUrl,
+                type = if (directUrl.contains(".m3u8", true))
+                    ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            ) {
+                this.referer = "https://drive.google.com/"
+                this.quality = Qualities.Unknown.value
+                this.headers = headers
+            }
+        )
+        Log.e(DBG, "[GDrive] ✓ EXIT")
+    }
+
+    private suspend fun resolveDirectUrl(
+        fileId: String,
+        headers: Map<String, String>
+    ): String? {
+        val downloadUrl = "https://drive.google.com/uc?export=download&id=$fileId"
+
+        val first = try {
+            app.get(downloadUrl, headers = headers, allowRedirects = false)
+        } catch (e: Exception) { return null }
+
+        val location = first.headers["Location"] ?: first.headers["location"]
+        if (!location.isNullOrBlank() &&
+            (location.contains(".mp4", true) ||
+                    location.contains(".mkv", true) ||
+                    location.contains(".webm", true) ||
+                    location.contains("videoplayback", true))
+        ) return location
+
+        val body = first.text
+        if (body.isBlank()) {
+            if (!location.isNullOrBlank() && location.startsWith("http")) return location
+            return null
+        }
+
+        val uuid = Regex("""name="uuid"\s+value="([^"]+)"""")
+            .find(body)?.groupValues?.getOrNull(1)
+            ?: Regex("""uuid=([a-zA-Z0-9_-]+)""")
+                .find(body)?.groupValues?.getOrNull(1)
+
+        val confirm = Regex("""name="confirm"\s+value="([^"]+)"""")
+            .find(body)?.groupValues?.getOrNull(1)
+            ?: "t"
+
+        if (!uuid.isNullOrBlank()) {
+            val confirmUrl = "https://drive.usercontent.google.com/download" +
+                    "?id=$fileId&export=download&confirm=$confirm&uuid=$uuid"
+
+            val confirmed = try {
+                app.get(confirmUrl, headers = headers, allowRedirects = false)
+            } catch (e: Exception) { null }
+
+            val confirmedLoc = confirmed?.headers?.get("Location")
+                ?: confirmed?.headers?.get("location")
+            if (!confirmedLoc.isNullOrBlank() && confirmedLoc.startsWith("http")) {
+                return confirmedLoc
+            }
+            return confirmUrl
+        }
+
+        val legacyConfirm = Regex("""confirm=([0-9A-Za-z_-]+)""")
+            .find(body)?.groupValues?.getOrNull(1)
+        if (!legacyConfirm.isNullOrBlank()) {
+            return "$downloadUrl&confirm=$legacyConfirm"
+        }
+
+        return downloadUrl
+    }
 }
