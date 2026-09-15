@@ -76,7 +76,7 @@ class GalaxyDonghua : ExtractorApi() {
 
         val gxBase = embedHost(url)
 
-        // Dump config/API strings from the player JS to help debugging
+        // Dump config/API strings from player JS
         try {
             val js = app.get("$gxBase/assets/js/player-v4.6.6.min.js", headers = headers).text
             Log.e(DBG, "[GX] player JS len=${js.length}")
@@ -454,7 +454,7 @@ class GalaxyDonghua : ExtractorApi() {
 }
 
 // ===========================================================================
-// 3. DailymotionExtractor – stable metadata API
+// 3. DailymotionExtractor
 // ===========================================================================
 class DailymotionExtractor : ExtractorApi() {
     override var name = "Dailymotion"
@@ -572,7 +572,7 @@ class DailymotionExtractor : ExtractorApi() {
 }
 
 // ===========================================================================
-// 4. GoogleDriveExtractor – direct file resolver
+// 4. GoogleDriveExtractor
 // ===========================================================================
 class GoogleDriveExtractor : ExtractorApi() {
     override var name = "Google Drive"
