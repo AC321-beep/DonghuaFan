@@ -298,10 +298,11 @@ class ChikiAnimationProvider : MainAPI() {
                                         source = "Dailymotion",
                                         name = "Dailymotion HD",
                                         url = streamUrl.replace("\\/", "/"),
-                                        referer = cleanUrl,
-                                        quality = Qualities.Unknown.value,
                                         type = ExtractorLinkType.M3U8
-                                    )
+                                    ) {
+                                        this.referer = cleanUrl
+                                        this.quality = Qualities.Unknown.value
+                                    }
                                 )
                                 found = true
                                 return
