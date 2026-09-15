@@ -30,7 +30,7 @@ class ChikiAnimationProvider : MainAPI() {
     )
 
     private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Referer" to mainUrl,
         "Origin" to mainUrl
     )
@@ -274,14 +274,55 @@ class ChikiAnimationProvider : MainAPI() {
             ) return
 
             try {
-                // EXPLICIT CALL: Cloudstream's built-in Dailymotion extraction
-                if (cleanUrl.contains("dailymotion.com", true) || cleanUrl.contains("dai.ly", true)) {
+                // 1. CUSTOM GEO DAILYMOTION INTERCEPTOR
+                if (cleanUrl.contains("geo.dailymotion.com/player", true)) {
+                    val videoId = Regex("""video=([a-zA-Z0-9_-]+)""").find(cleanUrl)?.groupValues?.get(1)
+                    if (videoId != null) {
+                        try {
+                            // Extract stream using geo API format observed in HAR files
+                            val apiUrl = "https://geo.dailymotion.com/videos/$videoId"
+                            val playerId = Regex("""player/([a-zA-Z0-9]+)\.html""").find(cleanUrl)?.groupValues?.get(1)
+                            val reqHeaders = mapOf(
+                                "Referer" to cleanUrl,
+                                "Accept" to "application/json",
+                                "x-dm-geo-embedder" to mainUrl,
+                                "x-dm-geo-player-id" to (playerId ?: "")
+                            ).filterValues { it.isNotBlank() }
+
+                            val apiRes = app.get(apiUrl, headers = reqHeaders).text
+                            val streamUrl = Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""").find(apiRes)?.groupValues?.get(1)
+
+                            if (!streamUrl.isNullOrBlank()) {
+                                callback.invoke(
+                                    newExtractorLink(
+                                        source = "Dailymotion",
+                                        name = "Dailymotion HD",
+                                        url = streamUrl.replace("\\/", "/"),
+                                        referer = cleanUrl,
+                                        quality = Qualities.Unknown.value,
+                                        type = ExtractorLinkType.M3U8
+                                    )
+                                )
+                                found = true
+                                return
+                            }
+                        } catch (e: Exception) { }
+
+                        // Fallback: Convert to Standard Dailymotion URL and pass to built-in extractor
+                        val realDmUrl = "https://www.dailymotion.com/embed/video/$videoId"
+                        com.lagradost.cloudstream3.extractors.Dailymotion().getUrl(realDmUrl, ref, subtitleCallback, callback)
+                        found = true
+                        return
+                    }
+                } 
+                // 2. STANDARD DAILYMOTION
+                else if (cleanUrl.contains("dailymotion.com", true) || cleanUrl.contains("dai.ly", true)) {
                     com.lagradost.cloudstream3.extractors.Dailymotion().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true
                     return
                 }
 
-                // EXPLICIT CALL: Was missing in original code, preventing GalaxyDonghua links from ever loading
+                // 3. GALAXY DONGHUA
                 if (cleanUrl.contains("galaxydonghua", true)) {
                     GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true
@@ -301,7 +342,6 @@ class ChikiAnimationProvider : MainAPI() {
                 }
 
                 val html = app.get(cleanUrl, headers = mapOf("Referer" to ref)).text
-                // Added query string capture to streamRegex to ensure token-secured mp4/m3u8 urls aren't broken
                 val streamRegex = Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
                 var foundGeneric = false
 
@@ -330,7 +370,6 @@ class ChikiAnimationProvider : MainAPI() {
                     val iframeNode = Jsoup.parse(html).selectFirst("iframe")
                     val nestedIframe = iframeNode?.let { getIframeSrc(it) }
                     if (!nestedIframe.isNullOrBlank() && nestedIframe.startsWith("http")) {
-                        // RECURSIVE CALL: Instead of `loadExtractor`, recursively process inner iframes so they benefit from Dailymotion & Galaxy calls above.
                         handleUrl(nestedIframe, cleanUrl, depth + 1)
                         foundGeneric = true
                     }
@@ -357,7 +396,6 @@ class ChikiAnimationProvider : MainAPI() {
             "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
         )
         
-        // Some players place data-video attributes instead of options
         val serverListItems = document.select(".server_list li, ul.episodes li, .mirror_link, .mirrors li")
 
         coroutineScope {
