@@ -44,7 +44,7 @@ class Ghbrisk : Filesim() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. GalaxyDonghua — FIXED: same-origin referer + ID-aware endpoint probing
+// 2. GalaxyDonghua
 // ---------------------------------------------------------------------------
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
@@ -57,21 +57,15 @@ class GalaxyDonghua : ExtractorApi() {
                 "AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/120.0.0.0 Safari/537.36"
 
-        // Static config endpoint candidates (no ID).
-        val STATIC_CONFIG_PATHS = listOf(
+        // Base config endpoint paths — ID variants are generated at runtime.
+        val BASE_CONFIG_PATHS = listOf(
+            "/api/gd/v1/config",     // ← confirmed to exist
             "/wp-json/gd/v1/config",
             "/wp-json/gd/v2/config",
-            "/wp-json/gd/v1/get-config",
-            "/wp-json/gd/v1/settings",
-            "/wp-json/gd/config",
-            "/wp-json/gd/v1/player",
-            "/wp-json/gd/v1/player/config",
-            "/wp-json/gd/v1/init",
-            "/wp-json/gd/v1/data",
-            "/wp-json/gd/v1/embed",
-            "/wp-json/gd/v1/source",
-            "/api/gd/v1/config",
-            "/api/config"
+            "/api/gd/v1/get-config",
+            "/api/gd/v1/settings",
+            "/api/gd/v1/init",
+            "/api/gd/config"
         )
     }
 
@@ -84,19 +78,16 @@ class GalaxyDonghua : ExtractorApi() {
         logEnter("GX", url, referer)
 
         val gxBase = embedHost(url)
-
-        // Extract the embed ID from the URL: /embed/4T0LPCyh → 4T0LPCyh
         val embedId = Regex("""/embed/([A-Za-z0-9_-]+)""")
             .find(url)?.groupValues?.getOrNull(1)
         log("GX", "embedId='$embedId'")
 
-        // ── FIX #1: use SAME-ORIGIN referer for all subsequent requests ──
-        // The config endpoint likely rejects cross-origin referers with 404.
         val headers = mapOf(
             "User-Agent" to UA,
-            "Referer" to url,          // the embed URL itself, not chikianimation
+            "Referer" to url,
             "Origin" to gxBase,
-            "Accept" to "*/*"
+            "Accept" to "application/json, text/plain, */*",
+            "X-Requested-With" to "XMLHttpRequest"
         )
 
         val page = try {
@@ -117,39 +108,21 @@ class GalaxyDonghua : ExtractorApi() {
         }
         log("GX", "✓ tokens decoded")
 
-        // ── FIX #2: also scan the page for ANY /wp-json or /api path, not just /wp-json ──
-        val discovered = mutableListOf<String>()
-        val pathRegex = Regex("""["'](/(?:wp-json|api)/[a-zA-Z0-9_\-/]+)["']""")
-        pathRegex.findAll(page).forEach { m ->
-            val path = m.groupValues[1]
-            if (!discovered.contains(path)) discovered.add(path)
-        }
-        log("GX", "discovered paths in page: $discovered")
-
-        // ── FIX #3: build candidates that include the embed ID as path/query ──
+        // Build candidates: base path, then with various query/path ID forms.
         val candidates = mutableListOf<String>()
-        discovered.forEach { if (!candidates.contains(it)) candidates.add(it) }
-        STATIC_CONFIG_PATHS.forEach { if (!candidates.contains(it)) candidates.add(it) }
-
+        BASE_CONFIG_PATHS.forEach { base ->
+            if (!candidates.contains(base)) candidates.add(base)
+        }
         if (!embedId.isNullOrBlank()) {
-            // Variants where the ID is embedded in the path
-            STATIC_CONFIG_PATHS.forEach { base ->
-                val withId = "$base/$embedId"
-                if (!candidates.contains(withId)) candidates.add(withId)
+            val queryNames = listOf("code", "id", "hash", "key", "embed", "v")
+            BASE_CONFIG_PATHS.forEach { base ->
+                queryNames.forEach { q ->
+                    val u = "$base?$q=$embedId"
+                    if (!candidates.contains(u)) candidates.add(u)
+                }
+                val pathVariant = "$base/$embedId"
+                if (!candidates.contains(pathVariant)) candidates.add(pathVariant)
             }
-            // Variants where the ID is a query param
-            STATIC_CONFIG_PATHS.forEach { base ->
-                val withId = "$base?id=$embedId"
-                if (!candidates.contains(withId)) candidates.add(withId)
-            }
-            // Direct embed-scoped endpoints
-            val extras = listOf(
-                "/embed/$embedId/config",
-                "/embed/$embedId/data",
-                "/embed/$embedId/player",
-                "/embed/$embedId/source"
-            )
-            extras.forEach { if (!candidates.contains(it)) candidates.add(it) }
         }
 
         log("GX", "total candidate endpoints: ${candidates.size}")
@@ -158,29 +131,42 @@ class GalaxyDonghua : ExtractorApi() {
         var usedPath: String? = null
 
         for (candidate in candidates) {
-            val fullUrl = if (candidate.startsWith("http")) candidate else "$gxBase$candidate"
-            val res = try {
-                val r = app.get(fullUrl, headers = headers).text
-                val isHtml404 = r.contains("404 Not Found") ||
-                        (r.trimStart().startsWith("<") && !r.contains("{"))
-                if (isHtml404 || r.length < 20) {
-                    log("GX", "  ✗ $candidate → HTML/404/empty")
-                    null
-                } else if (!r.contains("{") && !r.contains("=")) {
-                    log("GX", "  ✗ $candidate → no JSON-ish content")
-                    null
-                } else {
-                    log("GX", "  ✓ $candidate → len=${r.length}")
-                    r
-                }
-            } catch (e: Exception) {
-                log("GX", "  ✗ $candidate → ${e.message}")
-                null
-            }
-            if (res != null) {
-                configRes = res
+            val fullUrl = "$gxBase$candidate"
+
+            // Try GET first
+            val r = try {
+                app.get(fullUrl, headers = headers).text
+            } catch (e: Exception) { null }
+
+            if (r != null && isAcceptableConfig(r)) {
+                log("GX", "  ✓ GET $candidate → len=${r.length}")
+                configRes = r
                 usedPath = candidate
                 break
+            } else if (r != null) {
+                log("GX", "  ✗ GET $candidate → rejected (${r.take(80)})")
+            }
+
+            // Try POST as fallback
+            val p = try {
+                app.post(
+                    fullUrl,
+                    headers = headers,
+                    data = mapOf(
+                        "id" to (embedId ?: ""),
+                        "code" to (embedId ?: ""),
+                        "embed" to (embedId ?: "")
+                    )
+                ).text
+            } catch (e: Exception) { null }
+
+            if (p != null && isAcceptableConfig(p)) {
+                log("GX", "  ✓ POST $candidate → len=${p.length}")
+                configRes = p
+                usedPath = candidate
+                break
+            } else if (p != null) {
+                log("GX", "  ✗ POST $candidate → rejected (${p.take(80)})")
             }
         }
 
@@ -194,7 +180,7 @@ class GalaxyDonghua : ExtractorApi() {
         val configPlain = dcx(configRes.trim(), tokens.kaken)
             ?: dcx(configRes.trim(), tokens.apx)
             ?: run {
-                log("GX", "⚠ dcx failed for config — using raw")
+                log("GX", "⚠ dcx failed — using raw")
                 configRes.trim()
             }
 
@@ -249,7 +235,7 @@ class GalaxyDonghua : ExtractorApi() {
         val apiPlain = dcx(apiRes.trim(), tokens.kaken)
             ?: dcx(apiRes.trim(), tokens.apx)
             ?: run {
-                log("GX", "⚠ dcx failed for api response — using raw")
+                log("GX", "⚠ dcx failed — using raw")
                 apiRes.trim()
             }
 
@@ -306,6 +292,22 @@ class GalaxyDonghua : ExtractorApi() {
             }
 
         logExit("GX", emittedStreams > 0, "streams=$emittedStreams subs=$emittedSubs")
+    }
+
+    /**
+     * A valid config response must contain `{` AND not be a "fail" message.
+     */
+    private fun isAcceptableConfig(body: String): Boolean {
+        val t = body.trim()
+        if (t.length < 15) return false
+        if (!t.contains("{")) return false
+        if (t.contains("404 Not Found", true)) return false
+        if (t.contains("\"status\":\"fail\"", true)) return false
+        if (t.contains("\"status\": \"fail\"", true)) return false
+        if (t.contains("\"message\":\"Not Found\"", true)) return false
+        if (t.contains("\"message\": \"Not Found\"", true)) return false
+        if (t.startsWith("<") && !t.contains("{")) return false
+        return true
     }
 
     private data class GdTokens(
@@ -546,7 +548,7 @@ class GalaxyDonghua : ExtractorApi() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. DailymotionExtractor — FIXED: filter out boolean "enable" subtitles
+// 3. DailymotionExtractor — FIXED: nested subtitles.data[lang].url
 // ---------------------------------------------------------------------------
 class DailymotionExtractor : ExtractorApi() {
     override var name = "Dailymotion"
@@ -596,21 +598,12 @@ class DailymotionExtractor : ExtractorApi() {
 
         var emittedStreams = 0
         val qualities = json.optJSONObject("qualities")
-        log("DM", "qualities present=${qualities != null}")
         if (qualities != null) {
             val qualityNames = qualities.names()
             if (qualityNames != null) {
-                val keysList = mutableListOf<String>()
-                for (idx in 0 until qualityNames.length()) {
-                    keysList.add(qualityNames.optString(idx))
-                }
-                log("DM", "quality keys=$keysList")
-
                 for (idx in 0 until qualityNames.length()) {
                     val key = qualityNames.optString(idx)
-                    val qualityArray = qualities.optJSONArray(key)
-                    if (qualityArray == null) continue
-                    log("DM", "  key='$key' array size=${qualityArray.length()}")
+                    val qualityArray = qualities.optJSONArray(key) ?: continue
 
                     for (i in 0 until qualityArray.length()) {
                         val qualityObj = qualityArray.optJSONObject(i) ?: continue
@@ -621,7 +614,7 @@ class DailymotionExtractor : ExtractorApi() {
                                 type.contains("m3u8", true) ||
                                 type.contains("mpegurl", true)
 
-                        log("DM", "    ✓ key='$key' type='$type'")
+                        log("DM", "    ✓ quality key='$key' type='$type'")
 
                         callback.invoke(
                             newExtractorLink(
@@ -645,20 +638,24 @@ class DailymotionExtractor : ExtractorApi() {
         val subtitles = json.optJSONObject("subtitles")
         log("DM", "subtitles present=${subtitles != null}")
         if (subtitles != null) {
-            val subNames = subtitles.names()
+            // Dailymotion nests real subtitles inside `data.{langCode}.url`.
+            // Other keys like `enable` are boolean flags we should ignore.
+            val dataNode = subtitles.optJSONObject("data")
+            val subtitleSource = dataNode ?: subtitles
+
+            val subNames = subtitleSource.names()
             if (subNames != null) {
                 for (idx in 0 until subNames.length()) {
                     val langCode = subNames.optString(idx)
-                    // FIX: skip boolean flags like "enable":true
-                    // Only try to read a URL if the value is an object with "url" or a string starting with http
-                    val subUrl: String? = try {
-                        val subVal = subtitles.opt(langCode)
-                        when (subVal) {
-                            is String -> subVal.takeIf { it.startsWith("http", true) }
-                            is JSONObject -> subVal.optString("url").takeIf { it.startsWith("http", true) }
-                            else -> null
-                        }
-                    } catch (e: Exception) { null }
+                    if (langCode == "enable" || langCode == "data") continue
+
+                    val subVal = subtitleSource.opt(langCode)
+                    val subUrl: String? = when (subVal) {
+                        is String -> subVal.takeIf { it.startsWith("http", true) }
+                        is JSONObject -> subVal.optString("url")
+                            .takeIf { it.startsWith("http", true) }
+                        else -> null
+                    }
 
                     if (subUrl.isNullOrBlank()) {
                         log("DM", "  ⚠ skipping non-URL subtitle '$langCode'")
