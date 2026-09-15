@@ -1,6 +1,7 @@
 package com.chikianimation
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.Filesim
@@ -8,6 +9,7 @@ import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import java.net.URI
 import javax.crypto.Cipher
@@ -22,6 +24,7 @@ class Ghbrisk : Filesim() {
     override val requiresReferer = true
 }
 
+// 1. GalaxyDonghua placed FIRST exactly as instructed
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
     override var mainUrl = GX
@@ -364,4 +367,55 @@ class GalaxyDonghua : ExtractorApi() {
     private fun embedHost(url: String): String = try {
         val uri = URI(url); "${uri.scheme}://${uri.host}"
     } catch (e: Exception) { GX }
+}
+
+// 2. Custom Dailymotion locked down by name and placed securely at the bottom
+class Dailymotion : ExtractorApi() {
+    override var name = "Dailymotion"
+    override var mainUrl = "https://www.dailymotion.com"
+    override val requiresReferer = false
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        Log.d("ChikiDebug", "Custom Dailymotion extractor invoked with URL: $url")
+        val id = Regex("""(?:dailymotion\.com/(?:embed/)?video/|geo\.dailymotion\.com/(?:player/[^/]+/video/|player\.html\?video=)|dai\.ly/)([a-zA-Z0-9_-]+)""")
+            .find(url)?.groupValues?.get(1) ?: return
+
+        val metaUrl = "https://www.dailymotion.com/player/metadata/video/$id"
+        val headers = mapOf("Referer" to (referer ?: mainUrl))
+
+        val response = try {
+            app.get(metaUrl, headers = headers).text
+        } catch (e: Exception) {
+            app.get("https://www.dailymotion.com/embed/video/$id", headers = headers).text
+        }
+
+        val m3u8Url = Regex(""""type"\s*:\s*"application/x-mpegURL"\s*,\s*"url"\s*:\s*"([^"]+)"""")
+            .find(response)?.groupValues?.get(1)?.replace("\\/", "/")
+            ?: Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""")
+            .find(response)?.groupValues?.get(1)?.replace("\\/", "/")
+            ?: return
+
+        M3u8Helper.generateM3u8(
+            this.name,
+            m3u8Url,
+            "https://www.dailymotion.com/",
+            headers = mapOf("Referer" to "https://www.dailymotion.com/")
+        ).forEach { callback.invoke(it) }
+
+        Regex(""""url"\s*:\s*"([^"]+\.(?:vtt|srt)[^"]*)"[^{}]*?"language"\s*:\s*"([^"]*)"""")
+            .findAll(response)
+            .forEach { m ->
+                subtitleCallback.invoke(
+                    newSubtitleFile(
+                        lang = m.groupValues[2].ifBlank { "Sub" },
+                        url = m.groupValues[1].replace("\\/", "/")
+                    )
+                )
+            }
+    }
 }
