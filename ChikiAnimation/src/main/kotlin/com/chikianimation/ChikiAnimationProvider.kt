@@ -160,7 +160,6 @@ class ChikiAnimationProvider : MainAPI() {
         val encoded = query.trim().replace(" ", "+")
 
         val results = mutableListOf<SearchResponse>()
-        // Sequential — keeps request window short
         for (page in 1..3) {
             try {
                 val url = if (page == 1) "$mainUrl/?s=$encoded"
@@ -309,7 +308,7 @@ class ChikiAnimationProvider : MainAPI() {
     private data class EpisodeMeta(val season: Int?, val start: Int?, val end: Int?)
 
     /**
-     * Parses (season, start, end) with cascading fallbacks:
+     * Cascading parser for (season, start, end):
      *   1. Meta span ("Eps S4-419 to 422 - ...")
      *   2. Title ("... Season 4 Episode 419 to 422 ...")
      *   3. URL slug (".../season-4-episode-419-to-422-...")
@@ -323,7 +322,6 @@ class ChikiAnimationProvider : MainAPI() {
         var start: Int? = null
         var end: Int? = null
 
-        // 1. Meta span with S-prefix
         val withSeason = Regex(
             """Eps\s+S(\d+)\s*[-–]?\s*\(?\s*(\d+)(?:\s*(?:to|[-–])\s*(\d+))?"""
         ).find(metaSpan)
@@ -332,7 +330,6 @@ class ChikiAnimationProvider : MainAPI() {
             start = withSeason.groupValues[2].toIntOrNull()
             end = withSeason.groupValues[3].toIntOrNull()
         } else {
-            // 2. Meta span without S-prefix
             val noSeason = Regex("""Eps\s+(\d+)(?:\s*(?:to|[-–])\s*(\d+))?""")
                 .find(metaSpan)
             if (noSeason != null) {
@@ -341,19 +338,15 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // 3. Season from title
         if (season == null) {
             season = Regex("""(?i)Season\s*(\d+)""").find(fullTitle)
                 ?.groupValues?.get(1)?.toIntOrNull()
         }
-
-        // 4. Season from URL slug
         if (season == null) {
             season = Regex("""season-(\d+)""").find(pageUrl)
                 ?.groupValues?.get(1)?.toIntOrNull()
         }
 
-        // 5. Episode from title
         if (start == null) {
             val epFromTitle = Regex(
                 """(?i)Episode\s+(\d+)(?:\s*(?:to|[-–])\s*(\d+))?"""
@@ -363,8 +356,6 @@ class ChikiAnimationProvider : MainAPI() {
                 end = epFromTitle.groupValues[2].toIntOrNull()
             }
         }
-
-        // 6. Episode from URL slug
         if (start == null) {
             val epFromUrl = Regex("""episode-(\d+)(?:-to-(\d+))?""").find(pageUrl)
             if (epFromUrl != null) {
@@ -373,9 +364,7 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // 7. "Season N" with no episode → treat as Episode 1
         if (season != null && start == null) start = 1
-
         return EpisodeMeta(season, start, end)
     }
 
@@ -390,7 +379,7 @@ class ChikiAnimationProvider : MainAPI() {
      * Descriptive name only — CloudStream prepends "S{n}:E{m}" automatically.
      *   (419, 422)  → "Episodes 419-422"
      *   (80, null)  → "Episode 80"
-     *   (1, 30)     → "Episodes 1-30"
+     *   (null,null) + "Full" in title  → "Full"
      */
     private fun buildShortEpisodeName(
         start: Int?,
@@ -399,11 +388,12 @@ class ChikiAnimationProvider : MainAPI() {
     ): String = when {
         start != null && end != null && end != start -> "Episodes $start-$end"
         start != null -> "Episode $start"
+        fullTitle.contains("Full", ignoreCase = true) -> "Full"
         else -> fullTitle.take(60).ifBlank { "Episode" }
     }
 
     // =========================================================================
-    // LOAD LINKS — SEQUENTIAL MIRROR PROCESSING (critical for GX tokens)
+    // LOAD LINKS — SEQUENTIAL MIRRORS + DEDUPE + HONEST SUCCESS FLAG
     // =========================================================================
     override suspend fun loadLinks(
         data: String,
@@ -421,7 +411,14 @@ class ChikiAnimationProvider : MainAPI() {
             return false
         }
 
-        var found = false
+        var linkCount = 0
+        val seenUrls = mutableSetOf<String>()
+
+        // Wrapped callback: counts real emissions
+        val wrappedCallback: (ExtractorLink) -> Unit = { link ->
+            linkCount++
+            callback.invoke(link)
+        }
 
         suspend fun handleUrl(rawUrl: String, ref: String) {
             val cleanUrl = if (rawUrl.startsWith("//")) "https:$rawUrl" else fixUrl(rawUrl)
@@ -429,32 +426,37 @@ class ChikiAnimationProvider : MainAPI() {
             if (cleanUrl.contains(" ")) return
             if (blacklistHosts.any { cleanUrl.contains(it, true) }) return
 
+            if (!seenUrls.add(cleanUrl)) {
+                dbg("handleUrl", "⏭ skipping duplicate: $cleanUrl")
+                return
+            }
+
             try {
                 if (cleanUrl.contains("ghbrisk.com", true)) {
                     dbg("handleUrl", "✔ ROUTE Ghbrisk")
-                    Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                    found = true; return
+                    Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, wrappedCallback)
+                    return
                 }
                 if (cleanUrl.contains("dailymotion.com", true) ||
                     cleanUrl.contains("dai.ly", true)) {
                     dbg("handleUrl", "✔ ROUTE Dailymotion")
-                    DailymotionExtractor().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                    found = true; return
+                    DailymotionExtractor().getUrl(cleanUrl, ref, subtitleCallback, wrappedCallback)
+                    return
                 }
                 if (cleanUrl.contains("galaxydonghua.xyz", true)) {
                     dbg("handleUrl", "✔ ROUTE GalaxyDonghua")
-                    GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                    found = true; return
+                    GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, wrappedCallback)
+                    return
                 }
                 if (cleanUrl.contains("drive.google.com", true) ||
                     cleanUrl.contains("docs.google.com", true)) {
                     dbg("handleUrl", "✔ ROUTE GoogleDrive")
-                    GoogleDriveExtractor().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                    found = true; return
+                    GoogleDriveExtractor().getUrl(cleanUrl, ref, subtitleCallback, wrappedCallback)
+                    return
                 }
-                if (loadExtractor(cleanUrl, referer = ref, subtitleCallback, callback)) {
+                if (loadExtractor(cleanUrl, referer = ref, subtitleCallback, wrappedCallback)) {
                     dbg("handleUrl", "✔ loadExtractor TRUE")
-                    found = true; return
+                    return
                 }
 
                 val html = try {
@@ -470,11 +472,11 @@ class ChikiAnimationProvider : MainAPI() {
                     if (fileUrl.contains(".m3u8", true)) {
                         try {
                             M3u8Helper.generateM3u8("Generic HLS", fileUrl, cleanUrl)
-                                .forEach { callback.invoke(it) }
+                                .forEach { wrappedCallback.invoke(it) }
                             foundGeneric = true
                         } catch (e: Exception) { }
                     } else if (fileUrl.contains(".mp4", true)) {
-                        callback.invoke(newExtractorLink(
+                        wrappedCallback.invoke(newExtractorLink(
                             source = "Generic MP4", name = "Generic MP4",
                             url = fileUrl, type = ExtractorLinkType.VIDEO
                         ) {
@@ -492,12 +494,11 @@ class ChikiAnimationProvider : MainAPI() {
                         }
                     }
                     if (!nestedIframe.isNullOrBlank() && nestedIframe.startsWith("http")) {
-                        if (loadExtractor(nestedIframe, cleanUrl, subtitleCallback, callback)) {
+                        if (loadExtractor(nestedIframe, cleanUrl, subtitleCallback, wrappedCallback)) {
                             foundGeneric = true
                         }
                     }
                 }
-                if (foundGeneric) found = true
             } catch (e: Exception) {
                 dbg("handleUrl", "❌ ${e.message}")
             }
@@ -513,14 +514,7 @@ class ChikiAnimationProvider : MainAPI() {
         )
         dbg("loadLinks", "mirror options found: ${mirrorOptions.size}")
 
-        // -------------------------------------------------------------------
-        // SEQUENTIAL PROCESSING
-        //
-        // Do NOT use coroutineScope { async { ... } } here. Running DM and GX
-        // in parallel stretches GX's request window past the TTL of its
-        // session tokens (kaken/apx), causing "dcx failed for config" errors
-        // and silent failures. Sequential processing keeps GX's window tight.
-        // -------------------------------------------------------------------
+        // SEQUENTIAL — protects GX's session token TTL
         for (option in mirrorOptions) {
             val value = option.attr("value").trim()
             if (value.isBlank()) continue
@@ -560,14 +554,14 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        if (!found) {
+        if (linkCount == 0) {
             document.select("iframe").forEach { iframe ->
                 val src = getIframeSrc(iframe)
                 if (src.isNotBlank()) handleUrl(src, data)
             }
         }
 
-        if (!found) {
+        if (linkCount == 0) {
             document.select("script").forEach { script ->
                 val body = script.data()
                 Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
@@ -594,7 +588,7 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        dbg("loadLinks", "════ FINAL RETURN found=$found ════")
-        return found
+        dbg("loadLinks", "════ FINAL RETURN linkCount=$linkCount ════")
+        return linkCount > 0
     }
 }
