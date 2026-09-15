@@ -47,15 +47,31 @@ class GalaxyDonghua : ExtractorApi() {
         )
 
         val page = try { app.get(url, headers = headers).text } catch (e: Exception) { return }
+        
+        // --- THIS WAS THE FAILING POINT ---
+        // The old decodeGdTokens() was failing to extract the JSFuck array.
         val tokens = decodeGdTokens(page) ?: return
 
         val gxBase = embedHost(url)
-        val apiConfigBase = "$gxBase/wp-json/gd/v1/config"
-        val configRes = try { app.get(apiConfigBase, headers = headers).text }
+        val apiConfigBase = "$gxBase/wp-json/gd/v1/config" // They still fall back to this!
+        
+        // Try the new /api-config/ route first if apx is available, otherwise fallback
+        val apiUrlToCall = try {
+            if (tokens.apx.isNotBlank()) {
+                 String(Base64.decode(tokens.apx, Base64.DEFAULT)).trim()
+            } else {
+                apiConfigBase
+            }
+        } catch (e: Exception) { apiConfigBase }
+
+        // Fetch the config (GET request)
+        val configRes = try { app.get(apiUrlToCall, headers = headers).text }
             catch (e: Exception) { return }
 
+        // Decrypt the response using PBKDF2 (The exact logic we saw in the JS `dcx` function)
         val configPlain = dcx(configRes.trim(), tokens.kaken)
             ?: dcx(configRes.trim(), tokens.apx)
+            ?: dcx(configRes.trim(), tokens.pd) // The new player uses window.pd!
             ?: return
 
         val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""")
@@ -68,6 +84,7 @@ class GalaxyDonghua : ExtractorApi() {
             .replace("{kaken}", tokens.kaken)
             .replace("{apx}", tokens.apx)
 
+        // Make the final POST request to get the streams
         val apiRes = try {
             app.post(
                 fixedApi,
@@ -80,8 +97,10 @@ class GalaxyDonghua : ExtractorApi() {
             ).text
         } catch (e: Exception) { return }
 
+        // Decrypt the final stream URLs
         val apiPlain = dcx(apiRes.trim(), tokens.kaken)
             ?: dcx(apiRes.trim(), tokens.apx)
+            ?: dcx(apiRes.trim(), tokens.pd) // Attempt pd fallback again
             ?: return
 
         val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""")
@@ -135,13 +154,22 @@ class GalaxyDonghua : ExtractorApi() {
     )
 
     private fun decodeGdTokens(page: String): GdTokens? {
-        val startMatch = Regex("""ﾟωﾟﾉ\s*=""").find(page) ?: return null
-        val jStart = startMatch.range.first
-        val endMatch = Regex("""\)\s*\(\s*ﾟΘﾟ\s*\)\s*\)\s*\(\s*'_'\s*\)""")
-            .find(page, jStart) ?: return null
-        val jEnd = endMatch.range.last + 1
+        // --- MORE AGGRESSIVE JSFUCK EXTRACTION ---
+        // Look for the classic JSFuck start
+        val jsFuckStart = page.indexOf("ﾟωﾟﾉ= /｀ｍ´）ﾉ ~┻━┻   //*´∇｀*/ ['_']; o=(ﾟｰﾟ)  =_=3;")
+        if (jsFuckStart < 0) return null
 
-        val jsfuck = page.substring(jStart, jEnd)
+        // Find where the massive JSFuck block ends
+        val jsFuckEndPattern = "')();"
+        var jsFuckEnd = page.indexOf(jsFuckEndPattern, jsFuckStart)
+        
+        // Fallback for slightly different endings
+        if (jsFuckEnd < 0) {
+           jsFuckEnd = page.indexOf(";)();", jsFuckStart)
+        }
+        if (jsFuckEnd < 0) return null
+
+        val jsfuck = page.substring(jsFuckStart, jsFuckEnd + jsFuckEndPattern.length)
             .replace(Regex("""[\s\u00a0\u3000]+"""), "")
 
         val bStart = jsfuck.indexOf("(ﾟεﾟ+")
@@ -166,7 +194,7 @@ class GalaxyDonghua : ExtractorApi() {
                     val n = evalArithmetic(t.substring(1)) ?: return null
                     -n
                 } else evalArithmetic(t.trimStart('+')) ?: return null
-                val v = abs(raw)
+                val v = kotlin.math.abs(raw)
                 if (v > 7) return null
                 digits.append(v)
             }
@@ -202,15 +230,15 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        fun grab(re: Regex) = re.find(code)?.groupValues?.getOrNull(1)?.trim()
+        fun grab(re: Regex) = re.find(code)?.groupValues?.getOrNull(1)?.trim() ?: ""
 
-        val pd = grab(Regex("""(?:window\.)?pd=["']([^"']+)["']""")) ?: return null
-        val ps = grab(Regex("""(?:window\.)?ps=["']([^"']+)["']""")) ?: return null
-        val qsx = grab(Regex("""(?:window\.)?qsx=["']([^"']+)["']""")) ?: return null
-        val kaken = grab(Regex("""(?:window\.)?kaken=["']([^"']+)["']""")) ?: return null
-        val apx = grab(Regex("""(?:window\.)?apx=["']([^"']+)["']""")) ?: return null
+        // We use empty strings as fallbacks now so the rest of the object doesn't fail
+        val pd = grab(Regex("""(?:window\.)?pd=["']([^"']+)["']""")) 
+        val ps = grab(Regex("""(?:window\.)?ps=["']([^"']+)["']""")) 
+        val qsx = grab(Regex("""(?:window\.)?qsx=["']([^"']+)["']""")) 
+        val kaken = grab(Regex("""(?:window\.)?kaken=["']([^"']+)["']""")) 
+        val apx = grab(Regex("""(?:window\.)?apx=["']([^"']+)["']""")) 
 
-        if (listOf(pd, ps, qsx, kaken, apx).any { it.isBlank() }) return null
         return GdTokens(pd, ps, qsx, kaken, apx)
     }
 
@@ -315,8 +343,8 @@ class GalaxyDonghua : ExtractorApi() {
     private fun pbkdf2Sha256(
         password: ByteArray, salt: ByteArray, iterations: Int, dkLen: Int
     ): ByteArray? = try {
-        val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(password, "HmacSHA256"))
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(javax.crypto.spec.SecretKeySpec(password, "HmacSHA256"))
         val out = ByteArray(dkLen)
         val blocks = (dkLen + 31) / 32
         var offset = 0
@@ -333,7 +361,7 @@ class GalaxyDonghua : ExtractorApi() {
                 last = mac.doFinal(last)
                 for (j in t.indices) t[j] = (t[j].toInt() xor last[j].toInt()).toByte()
             }
-            val n = minOf(32, dkLen - offset)
+            val n = kotlin.math.min(32, dkLen - offset)
             System.arraycopy(t, 0, out, offset, n)
             offset += n
         }
@@ -344,8 +372,8 @@ class GalaxyDonghua : ExtractorApi() {
         if (key.size != 16 && key.size != 24 && key.size != 32) return null
         if (iv.size != 16) return null
         return try {
-            val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+            val cipher = javax.crypto.Cipher.getInstance("AES/CBC/PKCS5Padding")
+            cipher.init(javax.crypto.Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(key, "AES"), javax.crypto.spec.IvParameterSpec(iv))
             String(cipher.doFinal(blob), Charsets.UTF_8)
         } catch (e: Exception) { null }
     }
@@ -355,13 +383,13 @@ class GalaxyDonghua : ExtractorApi() {
         if (u.isBlank()) return null
         if (u.startsWith("http://") || u.startsWith("https://")) return u
         if (u.startsWith("//")) return "https:$u"
-        val host = try { val uri = URI(base); "${uri.scheme}://${uri.host}" }
+        val host = try { val uri = java.net.URI(base); "${uri.scheme}://${uri.host}" }
             catch (e: Exception) { null }
         return if (u.startsWith("/")) (host ?: base.trimEnd('/')) + u
         else (host ?: base.trimEnd('/')) + "/" + u
     }
 
     private fun embedHost(url: String): String = try {
-        val uri = URI(url); "${uri.scheme}://${uri.host}"
+        val uri = java.net.URI(url); "${uri.scheme}://${uri.host}"
     } catch (e: Exception) { GX }
 }
