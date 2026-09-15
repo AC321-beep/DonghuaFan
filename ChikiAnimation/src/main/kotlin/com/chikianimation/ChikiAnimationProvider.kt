@@ -47,7 +47,8 @@ class ChikiAnimationProvider : MainAPI() {
         "vidverto", "pubfuture", "360yield", "eskimi", "onetag", "openx.net",
         "imasdk.googleapis.com", "mox.tv", "googletagmanager", "google-analytics",
         "googleadservices", "adservice.google", "amazon-adsystem", "criteo",
-        "taboola", "outbrain", "mgid", "propellerads", "adsterra"
+        "taboola", "outbrain", "mgid", "propellerads", "adsterra",
+        "schema.org", "w3.org", "dmcdn.net"
     )
 
     // =========================================================================
@@ -310,7 +311,9 @@ class ChikiAnimationProvider : MainAPI() {
             val dateText = info.selectFirst(".epl-date, .date, .time, td.date")
                 ?.text()?.trim()?.takeIf { it.isNotBlank() }
 
-            val epNum = Regex("""(?i)(\d+(?:\.\d+)?)""")
+            // FIX: require "Episode" keyword before number so titles like
+            // "... 3000 Years Season 1 ..." don't parse as episode 3000.
+            val epNum = Regex("""(?i)Episode\s+(\d+(?:\.\d+)?)""")
                 .find(rawTitle)?.groupValues?.get(1)?.toFloatOrNull()
 
             val cleanName = rawTitle
@@ -374,6 +377,11 @@ class ChikiAnimationProvider : MainAPI() {
 
             if (!cleanUrl.startsWith("http")) {
                 dbg("handleUrl", "⛔ not http")
+                return
+            }
+
+            if (cleanUrl.contains(" ")) {
+                dbg("handleUrl", "⛔ URL contains space")
                 return
             }
 
