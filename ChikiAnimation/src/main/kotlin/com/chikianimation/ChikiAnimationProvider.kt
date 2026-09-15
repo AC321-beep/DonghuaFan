@@ -1,7 +1,6 @@
 package com.chikianimation
 
 import android.util.Base64
-import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
@@ -40,7 +39,7 @@ class ChikiAnimationProvider : MainAPI() {
         val url = buildPageUrl(request.data, page)
         
         val items = try {
-            val document = app.get(url, headers = defaultHeaders, cacheTime = 15).document
+            val document = app.get(url, headers = defaultHeaders).document
             document.select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
                 .mapNotNull { it.toSearchResult() }
                 .distinctBy { it.url }
@@ -53,10 +52,13 @@ class ChikiAnimationProvider : MainAPI() {
 
     private fun buildPageUrl(base: String, page: Int): String {
         if (page <= 1) return "$mainUrl/$base"
-        val split = base.split("?", limit = 2)
-        val path = split[0].trimEnd('/')
-        val query = if (split.size > 1) "?${split[1]}" else ""
-        return "$mainUrl/$path/page/$page/$query"
+        return when {
+            !base.contains("?") -> {
+                val trimmed = base.trimEnd('/')
+                "$mainUrl/$trimmed/page/$page/"
+            }
+            else -> "$mainUrl/$base&page=$page"
+        }
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
@@ -124,7 +126,7 @@ class ChikiAnimationProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         val document = try {
-            app.get(url, headers = defaultHeaders, cacheTime = 15).document
+            app.get(url, headers = defaultHeaders).document
         } catch (e: Exception) {
             return null
         }
@@ -178,16 +180,13 @@ class ChikiAnimationProvider : MainAPI() {
                 ?.attr("href")?.trim()
             if (!epPage.isNullOrBlank()) {
                 epListElements = try {
-                    app.get(fixUrl(epPage), headers = defaultHeaders, cacheTime = 15).document
+                    app.get(fixUrl(epPage), headers = defaultHeaders).document
                         .select(".episodelist li, .eplister li")
                 } catch (e: Exception) {
                     org.jsoup.select.Elements()
                 }
             }
         }
-
-        val epNumRegex = Regex("""(?i)(\d+(?:\.\d+)?)""")
-        val episodePrefixRegex = Regex("""(?i)^\s*Episode\s*""")
 
         val episodes = epListElements.mapNotNull { info ->
             val href = info.selectFirst("a[href]")?.attr("href")?.trim()
@@ -201,10 +200,11 @@ class ChikiAnimationProvider : MainAPI() {
             val dateText = info.selectFirst(".epl-date, .date, .time")
                 ?.text()?.trim()?.takeIf { it.isNotBlank() }
 
-            val epNum = epNumRegex.find(rawTitle)?.groupValues?.get(1)?.toFloatOrNull()
+            val epNum = Regex("""(?i)(\d+(?:\.\d+)?)""")
+                .find(rawTitle)?.groupValues?.get(1)?.toFloatOrNull()
 
             val cleanName = rawTitle
-                .replace(episodePrefixRegex, "")
+                .replace(Regex("""(?i)^\s*Episode\s*"""), "")
                 .trim()
                 .ifBlank { rawTitle.ifBlank { "Episode" } }
 
@@ -232,11 +232,9 @@ class ChikiAnimationProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        Log.d("ChikiDebug", "loadLinks initiated for URL: $data")
         val document = try {
             app.get(data, headers = defaultHeaders).document
         } catch (e: Exception) {
-            Log.d("ChikiDebug", "Failed to fetch episode page: ${e.message}")
             return false
         }
 
@@ -253,30 +251,55 @@ class ChikiAnimationProvider : MainAPI() {
             ) return
 
             try {
-                when {
-                    cleanUrl.contains("ghbrisk.com", true) -> {
-                        Log.d("ChikiDebug", "Routing to Ghbrisk extractor: $cleanUrl")
-                        Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                        found = true
-                    }
-                    cleanUrl.contains("galaxydonghua", true) -> {
-                        Log.d("ChikiDebug", "Routing to GalaxyDonghua extractor: $cleanUrl")
-                        GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                        found = true
-                    }
-                    cleanUrl.contains("dailymotion", true) || cleanUrl.contains("dai.ly", true) -> {
-                        Log.d("ChikiDebug", "Delegating Dailymotion safely to CloudStream core: $cleanUrl")
-                        val ok = loadExtractor(cleanUrl, referer = ref, subtitleCallback, callback)
-                        if (ok) found = true
-                    }
-                    else -> {
-                        val ok = loadExtractor(cleanUrl, referer = ref, subtitleCallback, callback)
-                        if (ok) found = true
+                if (cleanUrl.contains("ghbrisk.com", true)) {
+                    Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                    found = true
+                    return
+                }
+
+                val ok = loadExtractor(cleanUrl, referer = ref, subtitleCallback, callback)
+                if (ok) {
+                    found = true
+                    return
+                }
+
+                val html = app.get(cleanUrl, headers = mapOf("Referer" to ref)).text
+                val streamRegex = Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)[^\s"'<>\\]*)""")
+                var foundGeneric = false
+
+                streamRegex.findAll(html).forEach { m ->
+                    val fileUrl = m.groupValues[1].replace("\\/", "/")
+                    if (fileUrl.contains(".m3u8", ignoreCase = true)) {
+                        M3u8Helper.generateM3u8("Generic HLS", fileUrl, cleanUrl).forEach { callback.invoke(it) }
+                        foundGeneric = true
+                    } else if (fileUrl.contains(".mp4", ignoreCase = true)) {
+                        callback.invoke(
+                            newExtractorLink(
+                                source = "Generic MP4",
+                                name = "Generic MP4",
+                                url = fileUrl,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = cleanUrl
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        foundGeneric = true
                     }
                 }
-            } catch (e: Exception) {
-                Log.d("ChikiDebug", "Isolated failure in handleUrl for $cleanUrl: ${e.message}")
-            }
+
+                if (!foundGeneric) {
+                    val iframeNode = Jsoup.parse(html).selectFirst("iframe")
+                    val nestedIframe = iframeNode?.let { it.attr("src").ifBlank { it.attr("data-src").ifBlank { it.attr("data-litespeed-src") } } }
+                    if (!nestedIframe.isNullOrBlank() && nestedIframe.startsWith("http")) {
+                        if (loadExtractor(nestedIframe, cleanUrl, subtitleCallback, callback)) {
+                            foundGeneric = true
+                        }
+                    }
+                }
+                if (foundGeneric) found = true
+
+            } catch (e: Exception) { }
         }
 
         fun getIframeSrc(iframe: Element): String {
@@ -290,40 +313,37 @@ class ChikiAnimationProvider : MainAPI() {
         val mirrorOptions = document.select(
             "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
         )
-        Log.d("ChikiDebug", "Found mirror options count: ${mirrorOptions.size}")
 
         coroutineScope {
             mirrorOptions.map { option ->
                 async {
-                    try {
-                        val value = option.attr("value").trim()
-                        if (value.isBlank()) return@async
+                    val value = option.attr("value").trim()
+                    if (value.isBlank()) return@async
 
-                        if (value.startsWith("http") || value.startsWith("//")) {
-                            handleUrl(value, data)
-                            return@async
-                        }
+                    if (value.startsWith("http") || value.startsWith("//")) {
+                        handleUrl(value, data)
+                        return@async
+                    }
 
-                        val decoded: String? = try {
-                            String(Base64.decode(value, Base64.DEFAULT))
-                        } catch (e: Exception) {
-                            try {
-                                String(Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP))
-                            } catch (e2: Exception) { null }
-                        }
-                        if (decoded.isNullOrBlank()) return@async
-
+                    val decoded: String? = try {
+                        String(Base64.decode(value, Base64.DEFAULT))
+                    } catch (e: Exception) {
                         try {
-                            Jsoup.parse(decoded).select("iframe").forEach { iframe ->
-                                val src = getIframeSrc(iframe)
-                                if (src.isNotBlank()) handleUrl(src, data)
-                            }
-                        } catch (e: Exception) { }
+                            String(Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP))
+                        } catch (e2: Exception) { null }
+                    }
+                    if (decoded.isNullOrBlank()) return@async
 
-                        Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { m ->
-                            handleUrl(m.value, data)
+                    try {
+                        Jsoup.parse(decoded).select("iframe").forEach { iframe ->
+                            val src = getIframeSrc(iframe)
+                            if (src.isNotBlank()) handleUrl(src, data)
                         }
                     } catch (e: Exception) { }
+
+                    Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { m ->
+                        handleUrl(m.value, data)
+                    }
                 }
             }.awaitAll()
         }
@@ -337,39 +357,36 @@ class ChikiAnimationProvider : MainAPI() {
 
         if (!found) {
             document.select("script").forEach { script ->
-                try {
-                    val body = script.data()
+                val body = script.data()
 
-                    Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
-                        .findAll(body).forEach { m -> handleUrl(m.value, data) }
+                Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
+                    .findAll(body).forEach { m -> handleUrl(m.value, data) }
 
-                    Regex("""['"]([A-Za-z0-9+/=_-]{60,})['"]""").findAll(body).forEach { m ->
-                        val blob = m.groupValues[1]
-                        val decoded: String? = try {
-                            String(Base64.decode(blob, Base64.DEFAULT))
-                        } catch (e: Exception) {
-                            try {
-                                String(Base64.decode(blob, Base64.URL_SAFE or Base64.NO_WRAP))
-                            } catch (e2: Exception) { null }
-                        }
-                        if (decoded.isNullOrBlank()) return@forEach
-
+                Regex("""['"]([A-Za-z0-9+/=_-]{60,})['"]""").findAll(body).forEach { m ->
+                    val blob = m.groupValues[1]
+                    val decoded: String? = try {
+                        String(Base64.decode(blob, Base64.DEFAULT))
+                    } catch (e: Exception) {
                         try {
-                            Jsoup.parse(decoded).select("iframe").forEach { iframe ->
-                                val src = getIframeSrc(iframe)
-                                if (src.isNotBlank()) handleUrl(src, data)
-                            }
-                        } catch (e: Exception) { }
-
-                        Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { mm ->
-                            handleUrl(mm.value, data)
-                        }
+                            String(Base64.decode(blob, Base64.URL_SAFE or Base64.NO_WRAP))
+                        } catch (e2: Exception) { null }
                     }
-                } catch (e: Exception) { }
+                    if (decoded.isNullOrBlank()) return@forEach
+
+                    try {
+                        Jsoup.parse(decoded).select("iframe").forEach { iframe ->
+                            val src = getIframeSrc(iframe)
+                            if (src.isNotBlank()) handleUrl(src, data)
+                        }
+                    } catch (e: Exception) { }
+
+                    Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { mm ->
+                        handleUrl(mm.value, data)
+                    }
+                }
             }
         }
 
-        Log.d("ChikiDebug", "loadLinks finished. Final 'found' status: $found")
         return found
     }
 }
