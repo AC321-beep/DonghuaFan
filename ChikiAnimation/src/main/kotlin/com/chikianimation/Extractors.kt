@@ -96,7 +96,7 @@ class GalaxyDonghua : ExtractorApi() {
             logExit("GX", false, "token decode failed")
             return
         }
-        log("GX", "✓ tokens: pd=${tokens.pd.take(8)}... ps=${tokens.ps.take(8)}... qsx=${tokens.qsx.take(8)}...")
+        log("GX", "✓ tokens: pd=${tokens.pd.take(8)}... ps=${tokens.ps.take(8)}...")
 
         val gxBase = embedHost(url)
         log("GX", "gxBase='$gxBase'")
@@ -120,7 +120,6 @@ class GalaxyDonghua : ExtractorApi() {
                 return
             }
         log("GX", "✓ config plain len=${configPlain.length}")
-        log("GX", "config plain preview: ${configPlain.take(300)}")
 
         val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""")
             .find(configPlain)?.groupValues?.get(1)
@@ -165,7 +164,6 @@ class GalaxyDonghua : ExtractorApi() {
                 return
             }
         log("GX", "✓ api plain len=${apiPlain.length}")
-        log("GX", "api plain preview: ${apiPlain.take(400)}")
 
         val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""")
             .find(apiPlain)?.groupValues?.get(1) ?: gxBase
@@ -182,7 +180,7 @@ class GalaxyDonghua : ExtractorApi() {
             .findAll(apiPlain)
             .forEach { m ->
                 val streamUrl = fixStreamUrl(m.groupValues[1], baseURL) ?: run {
-                    log("GX", "  ⛔ fixStreamUrl returned null for '${m.groupValues[1]}'")
+                    log("GX", "  ⛔ fixStreamUrl returned null")
                     return@forEach
                 }
                 val label = m.groupValues[2].ifBlank { "Auto" }
@@ -191,7 +189,7 @@ class GalaxyDonghua : ExtractorApi() {
                         type.contains("hls", true) ||
                         type.contains("m3u8", true)
 
-                log("GX", "  ✓ emitting stream label='$label' type='$type' url=$streamUrl")
+                log("GX", "  ✓ stream label='$label' type='$type' url=$streamUrl")
 
                 callback.invoke(
                     newExtractorLink(
@@ -214,7 +212,7 @@ class GalaxyDonghua : ExtractorApi() {
             .forEach { m ->
                 val subUrl = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
                 val lang = m.groupValues[2].ifBlank { "Sub" }
-                log("GX", "  ✓ emitting subtitle lang='$lang' url=$subUrl")
+                log("GX", "  ✓ subtitle lang='$lang'")
                 subtitleCallback.invoke(
                     newSubtitleFile(lang = lang, url = subUrl)
                 )
@@ -242,7 +240,6 @@ class GalaxyDonghua : ExtractorApi() {
             return null
         }
         val jEnd = endMatch.range.last + 1
-        log("GX.decode", "jsfuck slice range=[$jStart..$jEnd]")
 
         val jsfuck = page.substring(jStart, jEnd)
             .replace(Regex("""[\s\u00a0\u3000]+"""), "")
@@ -260,10 +257,9 @@ class GalaxyDonghua : ExtractorApi() {
 
         val oMarker = body.lastIndexOf("(ﾟДﾟ)[ﾟoﾟ]")
         if (oMarker >= 0) body = body.substring(0, oMarker)
-        log("GX.decode", "body len=${body.length}")
 
         val segs = body.split("(ﾟДﾟ)[ﾟεﾟ]")
-        log("GX.decode", "split into ${segs.size} segments")
+        log("GX.decode", "segments=${segs.size}")
         val sb = StringBuilder()
 
         for (i in 1 until segs.size) {
@@ -272,31 +268,20 @@ class GalaxyDonghua : ExtractorApi() {
             for (term in splitTopLevelTerms(s)) {
                 val t = term.trim()
                 val raw = if (t.startsWith("-")) {
-                    val n = evalArithmetic(t.substring(1)) ?: run {
-                        log("GX.decode", "  ❌ evalArithmetic failed on seg[$i] term='$t'")
-                        return null
-                    }
+                    val n = evalArithmetic(t.substring(1)) ?: return null
                     -n
-                } else evalArithmetic(t.trimStart('+')) ?: run {
-                    log("GX.decode", "  ❌ evalArithmetic failed on seg[$i] term='$t'")
-                    return null
-                }
+                } else evalArithmetic(t.trimStart('+')) ?: return null
                 val v = abs(raw)
-                if (v > 7) {
-                    log("GX.decode", "  ❌ digit value $v > 7 on seg[$i]")
-                    return null
-                }
+                if (v > 7) return null
                 digits.append(v)
             }
             if (digits.isNotEmpty()) {
-                val c = digits.toString().toInt(8).toChar()
-                sb.append(c)
+                sb.append(digits.toString().toInt(8).toChar())
             }
         }
 
         val packrCall = sb.toString()
         log("GX.decode", "packrCall len=${packrCall.length}")
-        log("GX.decode", "packrCall preview: ${packrCall.take(300)}")
 
         val pStart = packrCall.indexOf("}('")
         if (pStart < 0) {
@@ -305,38 +290,22 @@ class GalaxyDonghua : ExtractorApi() {
         }
         val packedStart = pStart + 3
         val packedEnd = packrCall.indexOf("',", packedStart)
-        if (packedEnd < 0) {
-            log("GX.decode", "❌ no packed end marker")
-            return null
-        }
+        if (packedEnd < 0) return null
         val packed = packrCall.substring(packedStart, packedEnd)
 
         val num1Start = packedEnd + 2
         val num1End = packrCall.indexOf(",", num1Start)
-        if (num1End < 0) {
-            log("GX.decode", "❌ no a-value marker")
-            return null
-        }
-        val a = packrCall.substring(num1Start, num1End).toIntOrNull() ?: run {
-            log("GX.decode", "❌ a value not parseable")
-            return null
-        }
-        log("GX.decode", "packed len=${packed.length} a=$a")
+        if (num1End < 0) return null
+        val a = packrCall.substring(num1Start, num1End).toIntOrNull() ?: return null
 
         val dictStartRaw = packrCall.indexOf(",'", num1End)
-        if (dictStartRaw < 0) {
-            log("GX.decode", "❌ no dict start marker")
-            return null
-        }
+        if (dictStartRaw < 0) return null
         val dictStart = dictStartRaw + 2
         val dictEnd = packrCall.indexOf("'.split", dictStart)
-        if (dictEnd < 0) {
-            log("GX.decode", "❌ no dict end marker")
-            return null
-        }
+        if (dictEnd < 0) return null
 
         val dict = packrCall.substring(dictStart, dictEnd).split("|")
-        log("GX.decode", "dict entries=${dict.size}")
+        log("GX.decode", "dict=${dict.size} a=$a")
 
         var code = packed
         for (idx in (a - 1) downTo 0) {
@@ -346,32 +315,16 @@ class GalaxyDonghua : ExtractorApi() {
                     .replace(code, Regex.escapeReplacement(k))
             }
         }
-        log("GX.decode", "unpacked code len=${code.length}")
 
         fun grab(re: Regex) = re.find(code)?.groupValues?.getOrNull(1)?.trim()
 
-        val pd = grab(Regex("""(?:window\.)?pd=["']([^"']+)["']""")) ?: run {
-            log("GX.decode", "❌ pd not found in code")
-            return null
-        }
-        val ps = grab(Regex("""(?:window\.)?ps=["']([^"']+)["']""")) ?: run {
-            log("GX.decode", "❌ ps not found in code")
-            return null
-        }
-        val qsx = grab(Regex("""(?:window\.)?qsx=["']([^"']+)["']""")) ?: run {
-            log("GX.decode", "❌ qsx not found in code")
-            return null
-        }
-        val kaken = grab(Regex("""(?:window\.)?kaken=["']([^"']+)["']""")) ?: run {
-            log("GX.decode", "❌ kaken not found in code")
-            return null
-        }
-        val apx = grab(Regex("""(?:window\.)?apx=["']([^"']+)["']""")) ?: run {
-            log("GX.decode", "❌ apx not found in code")
-            return null
-        }
+        val pd = grab(Regex("""(?:window\.)?pd=["']([^"']+)["']""")) ?: return null
+        val ps = grab(Regex("""(?:window\.)?ps=["']([^"']+)["']""")) ?: return null
+        val qsx = grab(Regex("""(?:window\.)?qsx=["']([^"']+)["']""")) ?: return null
+        val kaken = grab(Regex("""(?:window\.)?kaken=["']([^"']+)["']""")) ?: return null
+        val apx = grab(Regex("""(?:window\.)?apx=["']([^"']+)["']""")) ?: return null
 
-        log("GX.decode", "✓ pd=${pd.take(8)}... ps=${ps.take(8)}... qsx=${qsx.take(8)}...")
+        log("GX.decode", "✓ pd=${pd.take(8)}... ps=${ps.take(8)}...")
         return GdTokens(pd, ps, qsx, kaken, apx)
     }
 
@@ -464,26 +417,14 @@ class GalaxyDonghua : ExtractorApi() {
 
     private fun dcx(input: String, password: String): String? = try {
         val data = Base64.decode(input.trim(), Base64.DEFAULT)
-        if (data.size < 16) {
-            log("GX.dcx", "data too short: ${data.size}")
-            null
-        } else {
+        if (data.size < 16) null else {
             val salt = data.copyOfRange(0, 16)
             val ct = data.copyOfRange(16, data.size)
             val derived = pbkdf2Sha256(password.toByteArray(Charsets.UTF_8), salt, 10000, 48)
-            if (derived == null) {
-                log("GX.dcx", "pbkdf2 returned null")
-                null
-            } else {
-                val out = aesDecrypt(ct, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
-                if (out == null) log("GX.dcx", "aesDecrypt returned null") else log("GX.dcx", "✓ decrypted len=${out.length}")
-                out
-            }
+            if (derived == null) null
+            else aesDecrypt(ct, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
         }
-    } catch (e: Exception) {
-        log("GX.dcx", "❌ exception: ${e.message}")
-        null
-    }
+    } catch (e: Exception) { null }
 
     private fun pbkdf2Sha256(
         password: ByteArray, salt: ByteArray, iterations: Int, dkLen: Int
@@ -540,7 +481,7 @@ class GalaxyDonghua : ExtractorApi() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. DailymotionExtractor – custom fallback for missing built‑in
+// 3. DailymotionExtractor
 // ---------------------------------------------------------------------------
 class DailymotionExtractor : ExtractorApi() {
     override var name = "Dailymotion"
@@ -556,7 +497,7 @@ class DailymotionExtractor : ExtractorApi() {
         logEnter("DM", url, referer)
 
         val videoId = extractVideoId(url) ?: run {
-            log("DM", "❌ could not extract video ID from url")
+            log("DM", "❌ could not extract video ID")
             logExit("DM", false, "no video ID")
             return
         }
@@ -580,9 +521,7 @@ class DailymotionExtractor : ExtractorApi() {
         val metadataRegex = Regex("""playerMetadata\s*=\s*(\{.+?\});""", RegexOption.DOT_MATCHES_ALL)
         val metadataMatch = metadataRegex.find(html)
         if (metadataMatch == null) {
-            log("DM", "❌ playerMetadata NOT FOUND in HTML")
-            log("DM", "HTML preview (first 800 chars):")
-            println(html.take(800))
+            log("DM", "❌ playerMetadata NOT FOUND")
             logExit("DM", false, "no playerMetadata")
             return
         }
@@ -593,7 +532,6 @@ class DailymotionExtractor : ExtractorApi() {
             JSONObject(metadataJson)
         } catch (e: Exception) {
             log("DM", "❌ JSON parse failed: ${e.message}")
-            log("DM", "metadata preview: ${metadataJson.take(500)}")
             logExit("DM", false, "JSON parse failed")
             return
         }
@@ -613,23 +551,17 @@ class DailymotionExtractor : ExtractorApi() {
                 for (idx in 0 until qualityNames.length()) {
                     val key = qualityNames.optString(idx)
                     val qualityArray = qualities.optJSONArray(key)
-                    if (qualityArray == null) {
-                        log("DM", "  key='$key' → null array, skipping")
-                        continue
-                    }
+                    if (qualityArray == null) continue
                     log("DM", "  key='$key' array size=${qualityArray.length()}")
 
                     for (i in 0 until qualityArray.length()) {
-                        val qualityObj = qualityArray.optJSONObject(i)
-                        if (qualityObj == null) continue
-
+                        val qualityObj = qualityArray.optJSONObject(i) ?: continue
                         val streamUrl = qualityObj.optString("url")
                         if (streamUrl.isBlank()) continue
-
                         val type = qualityObj.optString("type", "video/mp4")
                         val isM3u8 = streamUrl.contains(".m3u8") || type.contains("m3u8", true)
 
-                        log("DM", "    ✓ emitting key='$key' type='$type' url=${streamUrl.take(100)}")
+                        log("DM", "    ✓ key='$key' type='$type'")
 
                         callback.invoke(
                             newExtractorLink(
@@ -646,7 +578,7 @@ class DailymotionExtractor : ExtractorApi() {
                     }
                 }
             } else {
-                log("DM", "  ❌ names() returned null for qualities")
+                log("DM", "  ❌ names() returned null")
             }
         }
 
@@ -660,11 +592,8 @@ class DailymotionExtractor : ExtractorApi() {
                     val langCode = subNames.optString(idx)
                     val subUrl = subtitles.optString(langCode)
                     if (subUrl.isBlank()) continue
-
-                    log("DM", "  ✓ emitting subtitle lang='$langCode' url=$subUrl")
-                    subtitleCallback.invoke(
-                        newSubtitleFile(langCode, subUrl)
-                    )
+                    log("DM", "  ✓ subtitle lang='$langCode'")
+                    subtitleCallback.invoke(newSubtitleFile(langCode, subUrl))
                     emittedSubs++
                 }
             }
@@ -680,7 +609,7 @@ class DailymotionExtractor : ExtractorApi() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. GoogleDriveExtractor – direct drive.google.com file resolver
+// 4. GoogleDriveExtractor
 // ---------------------------------------------------------------------------
 class GoogleDriveExtractor : ExtractorApi() {
     override var name = "Google Drive"
@@ -710,7 +639,7 @@ class GoogleDriveExtractor : ExtractorApi() {
             }
         }
         if (fileId == null) {
-            log("GDrive", "❌ no file ID matched in url")
+            log("GDrive", "❌ no file ID matched")
             logExit("GDrive", false, "no file ID")
             return
         }
@@ -761,14 +690,7 @@ class GoogleDriveExtractor : ExtractorApi() {
         }
 
         log("GDrive.resolve", "HTTP status=${first.code}")
-
-        // Manually iterate Map keys with a plain for loop
-        val headerKeysList = mutableListOf<String>()
-        for (k in first.headers.keys) {
-            headerKeysList.add(k)
-        }
-        log("GDrive.resolve", "header keys=$headerKeysList")
-        log("GDrive.resolve", "Content-Type='${first.headers["Content-Type"] ?: first.headers["content-type"]}'")
+        log("GDrive.resolve", "header names=${first.headers.names()}")
 
         val location = first.headers["Location"] ?: first.headers["location"]
         log("GDrive.resolve", "Location='$location'")
@@ -788,15 +710,12 @@ class GoogleDriveExtractor : ExtractorApi() {
 
         if (body.isBlank()) {
             if (!location.isNullOrBlank() && location.startsWith("http")) {
-                log("GDrive.resolve", "✓ Case A2: use Location header anyway")
+                log("GDrive.resolve", "✓ Case A2: use Location header")
                 return location
             }
             log("GDrive.resolve", "❌ body blank and no Location")
             return null
         }
-
-        log("GDrive.resolve", "body preview (first 500):")
-        println(body.take(500))
 
         val uuid = Regex("""name="uuid"\s+value="([^"]+)"""")
             .find(body)?.groupValues?.getOrNull(1)
@@ -813,7 +732,7 @@ class GoogleDriveExtractor : ExtractorApi() {
             val confirmUrl =
                 "https://drive.usercontent.google.com/download" +
                         "?id=$fileId&export=download&confirm=$confirm&uuid=$uuid"
-            log("GDrive.resolve", "Case B: fetching confirmUrl='$confirmUrl'")
+            log("GDrive.resolve", "Case B: confirmUrl='$confirmUrl'")
 
             val confirmed = try {
                 app.get(confirmUrl, headers = headers, allowRedirects = false)
@@ -842,7 +761,7 @@ class GoogleDriveExtractor : ExtractorApi() {
             return "$downloadUrl&confirm=$legacyConfirm"
         }
 
-        log("GDrive.resolve", "Case D: returning plain uc URL as last resort")
+        log("GDrive.resolve", "Case D: returning plain uc URL")
         return downloadUrl
     }
 }
