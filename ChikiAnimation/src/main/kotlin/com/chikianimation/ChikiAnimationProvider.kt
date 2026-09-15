@@ -51,16 +51,8 @@ class ChikiAnimationProvider : MainAPI() {
         "schema.org", "w3.org", "dmcdn.net"
     )
 
-    // =========================================================================
-    // DEBUG HELPERS
-    // =========================================================================
-    private fun dbg(tag: String, msg: String) {
-        Log.e("ChikiDbg", "[$tag] $msg")
-    }
-
-    private fun dbgSection(tag: String) {
-        Log.e("ChikiDbg", "════════ SECTION: $tag ════════")
-    }
+    private fun dbg(tag: String, msg: String) = Log.e("ChikiDbg", "[$tag] $msg")
+    private fun dbgSection(tag: String) = Log.e("ChikiDbg", "════════ SECTION: $tag ════════")
 
     // =========================================================================
     // MAIN PAGE
@@ -68,13 +60,10 @@ class ChikiAnimationProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         dbgSection("getMainPage")
         val url = buildPageUrl(request.data, page)
-        dbg("getMainPage", "name='${request.name}' page=$page data='${request.data}'")
-        dbg("getMainPage", "final URL='$url'")
+        dbg("getMainPage", "name='${request.name}' page=$page URL='$url'")
 
         val document: Document = try {
-            val doc = app.get(url, headers = defaultHeaders).document
-            dbg("getMainPage", "HTTP OK. title='${doc.title()}'")
-            doc
+            app.get(url, headers = defaultHeaders).document
         } catch (e: Exception) {
             dbg("getMainPage", "❌ HTTP FAILED: ${e.message}")
             return newHomePageResponse(request.name, emptyList(), false)
@@ -86,11 +75,7 @@ class ChikiAnimationProvider : MainAPI() {
         dbg("getMainPage", "selector matched ${rawSelect.size} raw elements")
 
         val items = rawSelect
-            .mapNotNull { el ->
-                val r = el.toSearchResult()
-                if (r == null) dbg("getMainPage", "  → element dropped")
-                r
-            }
+            .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
 
         dbg("getMainPage", "→ parsed ${items.size} unique items")
@@ -109,12 +94,6 @@ class ChikiAnimationProvider : MainAPI() {
             nextPagePattern.containsMatchIn(it.attr("href"))
         }
         val pagBlock = document.selectFirst(".pagination, .wp-pagenavi, .page-numbers")
-
-        dbg(
-            "hasNext",
-            "relNext=${relNext != null} nextClass=${nextClass != null} explicit=$explicitNext pagBlock=${pagBlock != null}"
-        )
-
         return relNext != null || nextClass != null || explicitNext || pagBlock != null
     }
 
@@ -132,10 +111,8 @@ class ChikiAnimationProvider : MainAPI() {
             rawPath = cleanBase
             query = ""
         }
-
         val path = rawPath.trim('/')
         val paginatedPath = if (path.isEmpty()) "page/$page/" else "$path/page/$page/"
-
         return "$mainUrl/$paginatedPath$query"
     }
 
@@ -146,8 +123,7 @@ class ChikiAnimationProvider : MainAPI() {
             ?: selectFirst("a[href]")
             ?: return null
 
-        val rawHref = anchor.attr("href")
-        val href = fixUrlNull(rawHref) ?: return null
+        val href = fixUrlNull(anchor.attr("href")) ?: return null
         if (href.isBlank()) return null
 
         val excludePatterns = listOf(
@@ -173,16 +149,13 @@ class ChikiAnimationProvider : MainAPI() {
                 ?: selectFirst("img")?.attr("src")
         )
 
-        return newAnimeSearchResponse(title, href) {
-            this.posterUrl = posterUrl
-        }
+        return newAnimeSearchResponse(title, href) { this.posterUrl = posterUrl }
     }
 
     // =========================================================================
     // SEARCH
     // =========================================================================
     override suspend fun search(query: String): List<SearchResponse> {
-        dbgSection("search")
         if (query.isBlank()) return emptyList()
         val encoded = query.trim().replace(" ", "+")
 
@@ -190,34 +163,20 @@ class ChikiAnimationProvider : MainAPI() {
             (1..3).map { page ->
                 async {
                     try {
-                        val url = if (page == 1)
-                            "$mainUrl/?s=$encoded"
-                        else
-                            "$mainUrl/page/$page/?s=$encoded"
-
-                        dbg("search", "page $page → $url")
-
-                        val doc = app.get(url, headers = defaultHeaders).document
-                        val els = doc.select(
-                            "div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx"
-                        )
-                        dbg("search", "  page $page matched ${els.size}")
-
-                        els.mapNotNull { it.toSearchResult() }
-                    } catch (e: Exception) {
-                        dbg("search", "  page $page ❌ ${e.message}")
-                        emptyList()
-                    }
+                        val url = if (page == 1) "$mainUrl/?s=$encoded"
+                                  else "$mainUrl/page/$page/?s=$encoded"
+                        app.get(url, headers = defaultHeaders).document
+                            .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
+                            .mapNotNull { it.toSearchResult() }
+                    } catch (e: Exception) { emptyList() }
                 }
             }.awaitAll().flatten()
         }
-        val distinct = results.distinctBy { it.url }
-        dbg("search", "→ total distinct: ${distinct.size}")
-        return distinct
+        return results.distinctBy { it.url }
     }
 
     // =========================================================================
-    // LOAD
+    // LOAD — WITH SEASON-AWARE EPISODE PARSING
     // =========================================================================
     override suspend fun load(url: String): LoadResponse? {
         dbgSection("load")
@@ -265,7 +224,6 @@ class ChikiAnimationProvider : MainAPI() {
                 .selectFirst(".eplister li > a[href], .episodelist li > a[href], .eplister tr > td > a[href]")
                 ?.attr("href")?.trim()
                 ?: url
-            dbg("load", "→ MOVIE watchHref=$watchHref")
             return newMovieLoadResponse(title, url, TvType.Movie, watchHref) {
                 this.posterUrl = poster
                 this.plot = description
@@ -282,15 +240,11 @@ class ChikiAnimationProvider : MainAPI() {
             val epPage = document
                 .selectFirst(".episodelist li > a[href], .eplister li > a[href], .episodelist tr > td > a[href]")
                 ?.attr("href")?.trim()
-            dbg("load", "epPage='$epPage'")
             if (!epPage.isNullOrBlank()) {
                 epListElements = try {
-                    val sub = app.get(fixUrl(epPage), headers = defaultHeaders).document
-                    sub.select(".episodelist li, .eplister li, .episodelist tr, .eplister tr")
-                } catch (e: Exception) {
-                    dbg("load", "sub-page ❌ ${e.message}")
-                    Elements()
-                }
+                    app.get(fixUrl(epPage), headers = defaultHeaders).document
+                        .select(".episodelist li, .eplister li, .episodelist tr, .eplister tr")
+                } catch (e: Exception) { Elements() }
             }
         }
 
@@ -300,33 +254,35 @@ class ChikiAnimationProvider : MainAPI() {
             val href = info.selectFirst("a[href]")?.attr("href")?.trim()
                 ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
 
-            val rawTitle = info.selectFirst(".epl-title")?.text()?.trim()
+            // Full title from <h3>
+            val fullTitle = info.selectFirst(".playinfo h3")?.text()?.trim()
+                ?: info.selectFirst(".epl-title")?.text()?.trim()
                 ?: info.selectFirst("td.ep-title")?.text()?.trim()
-                ?: info.selectFirst("td.title")?.text()?.trim()
                 ?: info.select("td").getOrNull(1)?.text()?.trim()
                 ?: info.selectFirst("a span")?.text()?.trim()
                 ?: info.selectFirst("a")?.text()?.trim()
                 ?: ""
 
-            val dateText = info.selectFirst(".epl-date, .date, .time, td.date")
-                ?.text()?.trim()?.takeIf { it.isNotBlank() }
+            // Structured metadata from <span>: "Eps S4-419 to 422 - ... - date"
+            val metaSpan = info.selectFirst(".playinfo span")?.text()?.trim()
+                ?: info.selectFirst(".epl-date, .date, .time, td.date")?.text()?.trim()
+                ?: ""
 
-            // FIX: require "Episode" keyword before number so titles like
-            // "... 3000 Years Season 1 ..." don't parse as episode 3000.
-            val epNum = Regex("""(?i)Episode\s+(\d+(?:\.\d+)?)""")
-                .find(rawTitle)?.groupValues?.get(1)?.toFloatOrNull()
+            val (season, epStart, epEnd) = parseSeasonEpisode(metaSpan, fullTitle)
+            val dateText = extractDate(metaSpan)
 
-            val cleanName = rawTitle
-                .replace(Regex("""(?i)^\s*Episode\s*"""), "")
-                .trim()
-                .ifBlank { rawTitle.ifBlank { "Episode" } }
+            val displayName = buildShortEpisodeName(season, epStart, epEnd, fullTitle)
 
-            dbg("load.ep", "✓ '$rawTitle' epNum=$epNum")
+            dbg(
+                "load.ep",
+                "✓ S=$season E=$epStart..${epEnd ?: "-"} name='$displayName'"
+            )
 
             newEpisode(fixUrl(href)) {
-                this.name = cleanName
+                this.name = displayName
                 this.posterUrl = poster
-                if (epNum != null) this.episode = epNum.toInt()
+                if (season != null) this.season = season
+                if (epStart != null) this.episode = epStart
                 if (dateText != null) {
                     this.addDate(dateText, format = "MMMM d, yyyy")
                     this.description = dateText
@@ -334,13 +290,19 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }.distinctBy { it.data }
 
-        val sortedEpisodes = if (episodes.isNotEmpty() && episodes.all { it.episode != null }) {
-            episodes.sortedBy { it.episode }
-        } else {
-            episodes.reversed()
-        }
+        // Sort by season then episode number
+        val sortedEpisodes = episodes.sortedWith(
+            compareBy(
+                { it.season ?: Int.MAX_VALUE },
+                { it.episode ?: Int.MAX_VALUE }
+            )
+        )
 
-        dbg("load", "→ returning ${sortedEpisodes.size} episodes")
+        dbg(
+            "load",
+            "→ returning ${sortedEpisodes.size} episodes " +
+                    "(seasons: ${sortedEpisodes.mapNotNull { it.season }.distinct().sorted()})"
+        )
 
         return newTvSeriesLoadResponse(title, url, TvType.Anime, sortedEpisodes) {
             this.posterUrl = poster
@@ -349,8 +311,95 @@ class ChikiAnimationProvider : MainAPI() {
         }
     }
 
+    /**
+     * Extracts (season, episodeStart, episodeEnd) from the metadata span and title.
+     *
+     * Span patterns handled:
+     *   "Eps S4-419 to 422 - ..."        → (4, 419, 422)
+     *   "Eps S4-419 - ..."                → (4, 419, null)
+     *   "Eps S1-(01-30) - ..."            → (1, 1, 30)
+     *   "Eps S3-80 - ..."                 → (3, 80, null)
+     *   "Eps 79 - ..."                    → (from title, 79, null)
+     *   "Eps 51-60 - ..."                 → (from title, 51, 60)
+     *
+     * Title fallback:
+     *   "... Season 4 Episode 419 to 422 ..."  → season = 4, ep = 419
+     */
+    private data class EpisodeMeta(val season: Int?, val start: Int?, val end: Int?)
+
+    private fun parseSeasonEpisode(metaSpan: String, fullTitle: String): EpisodeMeta {
+        var season: Int? = null
+        var start: Int? = null
+        var end: Int? = null
+
+        // Pattern 1: "Eps S4-419 to 422" or "Eps S1-(01-30)" or "Eps S3-80"
+        val withSeason = Regex("""Eps\s+S(\d+)\s*[-–]?\s*\(?\s*(\d+)(?:\s*(?:to|-)\s*(\d+))?""")
+            .find(metaSpan)
+        if (withSeason != null) {
+            season = withSeason.groupValues[1].toIntOrNull()
+            start = withSeason.groupValues[2].toIntOrNull()
+            end = withSeason.groupValues[3].toIntOrNull()
+        } else {
+            // Pattern 2: "Eps 79" or "Eps 51-60" or "Eps 01-30"
+            val noSeason = Regex("""Eps\s+(\d+)(?:\s*(?:to|-)\s*(\d+))?""")
+                .find(metaSpan)
+            if (noSeason != null) {
+                start = noSeason.groupValues[1].toIntOrNull()
+                end = noSeason.groupValues[2].toIntOrNull()
+            }
+        }
+
+        // Fallback: season from title
+        if (season == null) {
+            val sFromTitle = Regex("""(?i)Season\s*(\d+)""").find(fullTitle)
+            season = sFromTitle?.groupValues?.get(1)?.toIntOrNull()
+        }
+
+        // Fallback: episode from title if still missing
+        if (start == null) {
+            val eFromTitle = Regex("""(?i)Episode\s+(\d+)""").find(fullTitle)
+            start = eFromTitle?.groupValues?.get(1)?.toIntOrNull()
+        }
+
+        return EpisodeMeta(season, start, end)
+    }
+
+    /**
+     * Pulls the release date out of the trailing " - Month d, yyyy" portion of the metadata span.
+     */
+    private fun extractDate(metaSpan: String): String? {
+        val dateRegex = Regex(
+            """(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}"""
+        )
+        return dateRegex.find(metaSpan)?.value
+    }
+
+    /**
+     * Builds a short, readable episode name for the CloudStream list.
+     *   S4 · E419-422  → "S4 · E419-422"
+     *   S1 · E1-30     → "S1 · E1-30"
+     *   S3 · E80       → "S3 · E80"
+     */
+    private fun buildShortEpisodeName(
+        season: Int?,
+        start: Int?,
+        end: Int?,
+        fullTitle: String
+    ): String {
+        val seasonPrefix = if (season != null) "S$season · " else ""
+
+        return when {
+            start != null && end != null && end != start ->
+                "${seasonPrefix}E$start-$end"
+            start != null ->
+                "${seasonPrefix}E$start"
+            else ->
+                fullTitle.take(60).ifBlank { "Episode" }
+        }
+    }
+
     // =========================================================================
-    // LOAD LINKS
+    // LOAD LINKS (unchanged from prior working version)
     // =========================================================================
     override suspend fun loadLinks(
         data: String,
@@ -371,110 +420,65 @@ class ChikiAnimationProvider : MainAPI() {
         var found = false
 
         suspend fun handleUrl(rawUrl: String, ref: String) {
-            dbg("handleUrl", "── ENTER raw='$rawUrl'")
             val cleanUrl = if (rawUrl.startsWith("//")) "https:$rawUrl" else fixUrl(rawUrl)
-            dbg("handleUrl", "cleanUrl='$cleanUrl'")
-
-            if (!cleanUrl.startsWith("http")) {
-                dbg("handleUrl", "⛔ not http")
-                return
-            }
-
-            if (cleanUrl.contains(" ")) {
-                dbg("handleUrl", "⛔ URL contains space")
-                return
-            }
-
-            val hit = blacklistHosts.firstOrNull { cleanUrl.contains(it, true) }
-            if (hit != null) {
-                dbg("handleUrl", "⛔ blacklisted '$hit'")
-                return
-            }
+            if (!cleanUrl.startsWith("http")) return
+            if (cleanUrl.contains(" ")) return
+            if (blacklistHosts.any { cleanUrl.contains(it, true) }) return
 
             try {
                 if (cleanUrl.contains("ghbrisk.com", true)) {
-                    dbg("handleUrl", "✔ ROUTE Ghbrisk")
                     Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                    found = true
-                    return
+                    found = true; return
                 }
-
                 if (cleanUrl.contains("dailymotion.com", true) ||
-                    cleanUrl.contains("dai.ly", true)
-                ) {
-                    dbg("handleUrl", "✔ ROUTE Dailymotion")
+                    cleanUrl.contains("dai.ly", true)) {
                     DailymotionExtractor().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                    found = true
-                    return
+                    found = true; return
                 }
-
                 if (cleanUrl.contains("galaxydonghua.xyz", true)) {
-                    dbg("handleUrl", "✔ ROUTE GalaxyDonghua")
                     GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                    found = true
-                    return
+                    found = true; return
                 }
-
                 if (cleanUrl.contains("drive.google.com", true) ||
-                    cleanUrl.contains("docs.google.com", true)
-                ) {
-                    dbg("handleUrl", "✔ ROUTE GoogleDrive")
+                    cleanUrl.contains("docs.google.com", true)) {
                     GoogleDriveExtractor().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                    found = true
-                    return
+                    found = true; return
                 }
-
                 if (loadExtractor(cleanUrl, referer = ref, subtitleCallback, callback)) {
-                    dbg("handleUrl", "✔ loadExtractor TRUE")
-                    found = true
-                    return
+                    found = true; return
                 }
 
                 val html = try {
                     app.get(cleanUrl, headers = mapOf("Referer" to ref)).text
-                } catch (e: Exception) {
-                    ""
-                }
-
+                } catch (e: Exception) { "" }
                 if (html.isBlank()) return
 
                 val streamRegex = Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)[^\s"'<>\\]*)""")
                 var foundGeneric = false
-
                 streamRegex.findAll(html).forEach { m ->
                     val fileUrl = m.groupValues[1].replace("\\/", "/")
                     if (blacklistHosts.any { fileUrl.contains(it, true) }) return@forEach
-
-                    dbg("handleUrl", "  ✔ stream: $fileUrl")
-
-                    if (fileUrl.contains(".m3u8", ignoreCase = true)) {
+                    if (fileUrl.contains(".m3u8", true)) {
                         try {
                             M3u8Helper.generateM3u8("Generic HLS", fileUrl, cleanUrl)
                                 .forEach { callback.invoke(it) }
                             foundGeneric = true
                         } catch (e: Exception) { }
-                    } else if (fileUrl.contains(".mp4", ignoreCase = true)) {
-                        callback.invoke(
-                            newExtractorLink(
-                                source = "Generic MP4",
-                                name = "Generic MP4",
-                                url = fileUrl,
-                                type = ExtractorLinkType.VIDEO
-                            ) {
-                                this.referer = cleanUrl
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
+                    } else if (fileUrl.contains(".mp4", true)) {
+                        callback.invoke(newExtractorLink(
+                            source = "Generic MP4", name = "Generic MP4",
+                            url = fileUrl, type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = cleanUrl
+                            this.quality = Qualities.Unknown.value
+                        })
                         foundGeneric = true
                     }
                 }
 
                 if (!foundGeneric) {
-                    val iframeNode = Jsoup.parse(html).selectFirst("iframe")
-                    val nestedIframe = iframeNode?.let {
-                        it.attr("src").ifBlank {
-                            it.attr("data-src").ifBlank { it.attr("data-litespeed-src") }
-                        }
+                    val nestedIframe = Jsoup.parse(html).selectFirst("iframe")?.let {
+                        it.attr("src").ifBlank { it.attr("data-src").ifBlank { it.attr("data-litespeed-src") } }
                     }
                     if (!nestedIframe.isNullOrBlank() && nestedIframe.startsWith("http")) {
                         if (loadExtractor(nestedIframe, cleanUrl, subtitleCallback, callback)) {
@@ -482,37 +486,27 @@ class ChikiAnimationProvider : MainAPI() {
                         }
                     }
                 }
-
                 if (foundGeneric) found = true
-            } catch (e: Exception) {
-                dbg("handleUrl", "❌ ${e.message}")
-            }
+            } catch (e: Exception) { }
         }
 
-        fun getIframeSrc(iframe: Element): String {
-            return iframe.attr("src").ifBlank {
-                iframe.attr("data-src").ifBlank {
-                    iframe.attr("data-litespeed-src")
-                }
+        fun getIframeSrc(iframe: Element): String =
+            iframe.attr("src").ifBlank {
+                iframe.attr("data-src").ifBlank { iframe.attr("data-litespeed-src") }
             }
-        }
 
         val mirrorOptions: Elements = document.select(
             "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
         )
-        dbg("loadLinks", "mirror options found: ${mirrorOptions.size}")
 
         coroutineScope {
             mirrorOptions.map { option ->
                 async {
                     val value = option.attr("value").trim()
                     if (value.isBlank()) return@async
-
                     if (value.startsWith("http") || value.startsWith("//")) {
-                        handleUrl(value, data)
-                        return@async
+                        handleUrl(value, data); return@async
                     }
-
                     var decoded: String? = null
                     try {
                         decoded = String(Base64.decode(value, Base64.DEFAULT))
@@ -522,18 +516,10 @@ class ChikiAnimationProvider : MainAPI() {
                         } catch (e2: Exception) {
                             try {
                                 decoded = String(Base64.decode(value, Base64.NO_PADDING or Base64.NO_WRAP))
-                            } catch (e3: Exception) {
-                                decoded = null
-                            }
+                            } catch (e3: Exception) { decoded = null }
                         }
                     }
-
-                    if (decoded.isNullOrBlank()) {
-                        dbg("mirror", "❌ decode failed len=${value.length}")
-                        return@async
-                    }
-
-                    dbg("mirror", "✓ decoded: ${decoded.take(200)}")
+                    if (decoded.isNullOrBlank()) return@async
 
                     try {
                         Jsoup.parse(decoded).select("iframe").forEach { iframe ->
@@ -559,31 +545,23 @@ class ChikiAnimationProvider : MainAPI() {
         if (!found) {
             document.select("script").forEach { script ->
                 val body = script.data()
-
                 Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
                     .findAll(body).forEach { m -> handleUrl(m.value, data) }
-
                 Regex("""['"]([A-Za-z0-9+/=_-]{60,})['"]""").findAll(body).forEach { m ->
                     val blob = m.groupValues[1]
                     var decoded: String? = null
-                    try {
-                        decoded = String(Base64.decode(blob, Base64.DEFAULT))
-                    } catch (e: Exception) {
-                        try {
-                            decoded = String(Base64.decode(blob, Base64.URL_SAFE or Base64.NO_WRAP))
-                        } catch (e2: Exception) {
-                            decoded = null
-                        }
+                    try { decoded = String(Base64.decode(blob, Base64.DEFAULT)) }
+                    catch (e: Exception) {
+                        try { decoded = String(Base64.decode(blob, Base64.URL_SAFE or Base64.NO_WRAP)) }
+                        catch (e2: Exception) { decoded = null }
                     }
                     if (decoded.isNullOrBlank()) return@forEach
-
                     try {
                         Jsoup.parse(decoded).select("iframe").forEach { iframe ->
                             val src = getIframeSrc(iframe)
                             if (src.isNotBlank()) handleUrl(src, data)
                         }
                     } catch (e: Exception) { }
-
                     Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { mm ->
                         handleUrl(mm.value, data)
                     }
