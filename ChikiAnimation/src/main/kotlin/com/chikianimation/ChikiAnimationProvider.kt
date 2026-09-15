@@ -1,10 +1,29 @@
 package com.chikianimation
 
 import android.util.Base64
-import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.MainPageRequest
+import com.lagradost.cloudstream3.HomePageResponse
+import com.lagradost.cloudstream3.LoadResponse
+import com.lagradost.cloudstream3.SearchResponse
+import com.lagradost.cloudstream3.SubtitleFile
+import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.newAnimeSearchResponse
+import com.lagradost.cloudstream3.newEpisode
+import com.lagradost.cloudstream3.newHomePageResponse
+import com.lagradost.cloudstream3.newMovieLoadResponse
+import com.lagradost.cloudstream3.newTvSeriesLoadResponse
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.M3u8Helper
+import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import org.jsoup.select.Elements
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -20,6 +39,9 @@ class ChikiAnimationProvider : MainAPI() {
 
     private data class MainPageEntry(val path: String, val name: String)
 
+    // Redundant entries removed:
+    //   • "Latest Added"  – overlaps with "Recently Updated"
+    //   • "Donghua (ONA)" – entire site is Donghua/ONA
     private val mainPageEntries = listOf(
         MainPageEntry("anime/?status=&type=&order=update", "Recently Updated"),
         MainPageEntry("anime/?status=&type=&order=popular", "Popular"),
@@ -48,10 +70,10 @@ class ChikiAnimationProvider : MainAPI() {
     )
 
     // =========================================================================
-    // DEBUG HELPER
+    // DEBUG HELPERS
     // =========================================================================
     private fun dbg(tag: String, msg: String) {
-        println("╔══ [ChikiDbg][$tag] ══╗ $msg")
+        println("╔══ [ChikiDbg][$tag] $msg")
     }
 
     private fun dbgSection(tag: String) {
@@ -63,7 +85,6 @@ class ChikiAnimationProvider : MainAPI() {
     // =========================================================================
     // MAIN PAGE
     // =========================================================================
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         dbgSection("getMainPage")
         val url = buildPageUrl(request.data, page)
@@ -71,17 +92,18 @@ class ChikiAnimationProvider : MainAPI() {
         dbg("getMainPage", "request.data='${request.data}'")
         dbg("getMainPage", "final URL='$url'")
 
-        val document = try {
+        val document: Document = try {
             val doc = app.get(url, headers = defaultHeaders).document
             dbg("getMainPage", "HTTP OK. title='${doc.title()}'")
             doc
         } catch (e: Exception) {
             dbg("getMainPage", "❌ HTTP FAILED: ${e.message}")
-            e.printStackTrace()
             return newHomePageResponse(request.name, emptyList(), false)
         }
 
-        val rawSelect = document.select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
+        val rawSelect: Elements = document.select(
+            "div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx"
+        )
         dbg("getMainPage", "selector matched ${rawSelect.size} raw elements")
 
         val items = rawSelect
@@ -101,7 +123,7 @@ class ChikiAnimationProvider : MainAPI() {
         return newHomePageResponse(request.name, items, hasNext)
     }
 
-    private fun detectHasNextPage(document: org.jsoup.nodes.Document, currentPage: Int): Boolean {
+    private fun detectHasNextPage(document: Document, currentPage: Int): Boolean {
         val relNext = document.selectFirst("link[rel=next], a[rel=next]")
         dbg("hasNext", "rel=next → ${relNext != null}")
 
@@ -109,7 +131,9 @@ class ChikiAnimationProvider : MainAPI() {
         dbg("hasNext", ".next.page-numbers → ${nextClass != null}")
 
         val nextPagePattern = Regex("""/page/${currentPage + 1}/""")
-        val explicitNext = document.select("a[href]").any { nextPagePattern.containsMatchIn(it.attr("href")) }
+        val explicitNext = document.select("a[href]").any {
+            nextPagePattern.containsMatchIn(it.attr("href"))
+        }
         dbg("hasNext", "explicit /page/${currentPage + 1}/ link → $explicitNext")
 
         val pagBlock = document.selectFirst(".pagination, .wp-pagenavi, .page-numbers")
@@ -123,10 +147,14 @@ class ChikiAnimationProvider : MainAPI() {
         if (page <= 1) return "$mainUrl/$cleanBase"
 
         val queryIndex = cleanBase.indexOf('?')
-        val (rawPath, query) = if (queryIndex >= 0) {
-            cleanBase.substring(0, queryIndex) to cleanBase.substring(queryIndex)
+        val rawPath: String
+        val query: String
+        if (queryIndex >= 0) {
+            rawPath = cleanBase.substring(0, queryIndex)
+            query = cleanBase.substring(queryIndex)
         } else {
-            cleanBase to ""
+            rawPath = cleanBase
+            query = ""
         }
 
         val path = rawPath.trim('/')
@@ -182,7 +210,7 @@ class ChikiAnimationProvider : MainAPI() {
                 ?: selectFirst("img")?.attr("src")
         )
 
-        dbg("toSearchResult", "✓ parsed title='$title' href='$href' poster='$posterUrl'")
+        dbg("toSearchResult", "✓ parsed title='$title' href='$href'")
 
         return newAnimeSearchResponse(title, href) {
             this.posterUrl = posterUrl
@@ -192,7 +220,6 @@ class ChikiAnimationProvider : MainAPI() {
     // =========================================================================
     // SEARCH
     // =========================================================================
-
     override suspend fun search(query: String): List<SearchResponse> {
         dbgSection("search")
         if (query.isBlank()) return emptyList()
@@ -211,7 +238,9 @@ class ChikiAnimationProvider : MainAPI() {
                         dbg("search", "page $page → $url")
 
                         val doc = app.get(url, headers = defaultHeaders).document
-                        val els = doc.select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
+                        val els = doc.select(
+                            "div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx"
+                        )
                         dbg("search", "  page $page → matched ${els.size} elements")
 
                         els.mapNotNull { it.toSearchResult() }
@@ -222,19 +251,19 @@ class ChikiAnimationProvider : MainAPI() {
                 }
             }.awaitAll().flatten()
         }
-        dbg("search", "→ total distinct results: ${results.distinctBy { it.url }.size}")
-        return results.distinctBy { it.url }
+        val distinct = results.distinctBy { it.url }
+        dbg("search", "→ total distinct results: ${distinct.size}")
+        return distinct
     }
 
     // =========================================================================
     // LOAD
     // =========================================================================
-
     override suspend fun load(url: String): LoadResponse? {
         dbgSection("load")
         dbg("load", "URL='$url'")
 
-        val document = try {
+        val document: Document = try {
             app.get(url, headers = defaultHeaders).document
         } catch (e: Exception) {
             dbg("load", "❌ HTTP FAILED: ${e.message}")
@@ -274,11 +303,7 @@ class ChikiAnimationProvider : MainAPI() {
 
         val isMovie = typeText.contains("movie", ignoreCase = true)
 
-        dbg("load", "title='$title'")
-        dbg("load", "poster='$poster'")
-        dbg("load", "genres=${genres.size}")
-        dbg("load", "typeText='$typeText'")
-        dbg("load", "isMovie=$isMovie")
+        dbg("load", "title='$title' poster len=${poster.length} genres=${genres.size} isMovie=$isMovie")
 
         if (isMovie) {
             val watchHref = document
@@ -293,8 +318,7 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // Episode scanning
-        var epListElements = document.select(
+        var epListElements: Elements = document.select(
             ".episodelist li, .eplister li, .episodelist tr, .eplister tr"
         )
         dbg("load", "primary episode selector matched ${epListElements.size} elements")
@@ -308,12 +332,14 @@ class ChikiAnimationProvider : MainAPI() {
             if (!epPage.isNullOrBlank()) {
                 epListElements = try {
                     val sub = app.get(fixUrl(epPage), headers = defaultHeaders).document
-                    val subEls = sub.select(".episodelist li, .eplister li, .episodelist tr, .eplister tr")
+                    val subEls = sub.select(
+                        ".episodelist li, .eplister li, .episodelist tr, .eplister tr"
+                    )
                     dbg("load", "sub-page matched ${subEls.size} elements")
                     subEls
                 } catch (e: Exception) {
                     dbg("load", "sub-page ❌ ${e.message}")
-                    org.jsoup.select.Elements()
+                    Elements()
                 }
             }
         }
@@ -346,7 +372,7 @@ class ChikiAnimationProvider : MainAPI() {
                 .trim()
                 .ifBlank { rawTitle.ifBlank { "Episode" } }
 
-            dbg("load.ep", "  ✓ title='$rawTitle' epNum=$epNum name='$cleanName' href=$href")
+            dbg("load.ep", "  ✓ title='$rawTitle' epNum=$epNum href=$href")
 
             newEpisode(fixUrl(href)) {
                 this.name = cleanName
@@ -379,7 +405,6 @@ class ChikiAnimationProvider : MainAPI() {
     // =========================================================================
     // LOAD LINKS
     // =========================================================================
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -389,7 +414,7 @@ class ChikiAnimationProvider : MainAPI() {
         dbgSection("loadLinks")
         dbg("loadLinks", "data='$data'")
 
-        val document = try {
+        val document: Document = try {
             app.get(data, headers = defaultHeaders).document
         } catch (e: Exception) {
             dbg("loadLinks", "❌ HTTP FAILED: ${e.message}")
@@ -480,7 +505,7 @@ class ChikiAnimationProvider : MainAPI() {
                 streamRegex.findAll(html).forEach { m ->
                     val fileUrl = m.groupValues[1].replace("\\/", "/")
                     if (blacklistHosts.any { fileUrl.contains(it, true) }) {
-                        dbg("handleUrl", "    ⛔ stream blacklisted: $fileUrl")
+                        dbg("handleUrl", "    ⛔ stream blacklisted")
                         return@forEach
                     }
 
@@ -535,7 +560,6 @@ class ChikiAnimationProvider : MainAPI() {
                 }
             } catch (e: Exception) {
                 dbg("handleUrl", "  ❌ EXCEPTION: ${e.message}")
-                e.printStackTrace()
             }
         }
 
@@ -547,8 +571,7 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // ---- Mirror options ----
-        val mirrorOptions = document.select(
+        val mirrorOptions: Elements = document.select(
             "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
         )
         dbg("loadLinks", "mirror options found: ${mirrorOptions.size}")
@@ -572,15 +595,18 @@ class ChikiAnimationProvider : MainAPI() {
                         return@async
                     }
 
-                    val decoded: String? = try {
-                        String(Base64.decode(value, Base64.DEFAULT))
+                    var decoded: String? = null
+                    try {
+                        decoded = String(Base64.decode(value, Base64.DEFAULT))
                     } catch (e: Exception) {
                         try {
-                            String(Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP))
+                            decoded = String(Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP))
                         } catch (e2: Exception) {
                             try {
-                                String(Base64.decode(value, Base64.NO_PADDING or Base64.NO_WRAP))
-                            } catch (e3: Exception) { null }
+                                decoded = String(Base64.decode(value, Base64.NO_PADDING or Base64.NO_WRAP))
+                            } catch (e3: Exception) {
+                                decoded = null
+                            }
                         }
                     }
 
@@ -613,7 +639,6 @@ class ChikiAnimationProvider : MainAPI() {
             }.awaitAll()
         }
 
-        // ---- Top-level iframes ----
         if (!found) {
             val iframes = document.select("iframe")
             dbg("loadLinks", "fallback: top-level iframes = ${iframes.size}")
@@ -624,7 +649,6 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // ---- Inline scripts ----
         if (!found) {
             val scripts = document.select("script")
             dbg("loadLinks", "fallback: scanning ${scripts.size} scripts")
@@ -639,12 +663,15 @@ class ChikiAnimationProvider : MainAPI() {
 
                 Regex("""['"]([A-Za-z0-9+/=_-]{60,})['"]""").findAll(body).forEach { m ->
                     val blob = m.groupValues[1]
-                    val decoded: String? = try {
-                        String(Base64.decode(blob, Base64.DEFAULT))
+                    var decoded: String? = null
+                    try {
+                        decoded = String(Base64.decode(blob, Base64.DEFAULT))
                     } catch (e: Exception) {
                         try {
-                            String(Base64.decode(blob, Base64.URL_SAFE or Base64.NO_WRAP))
-                        } catch (e2: Exception) { null }
+                            decoded = String(Base64.decode(blob, Base64.URL_SAFE or Base64.NO_WRAP))
+                        } catch (e2: Exception) {
+                            decoded = null
+                        }
                     }
                     if (decoded.isNullOrBlank()) return@forEach
 
