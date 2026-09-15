@@ -1,6 +1,7 @@
 package com.chikianimation
 
 import android.util.Base64
+import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.Filesim
@@ -19,26 +20,21 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.math.abs
 
 // ---------------------------------------------------------------------------
-// DEBUG HELPER
+// DEBUG HELPERS
 // ---------------------------------------------------------------------------
 private const val DBG = "ChikiDbg"
 
 private fun log(scope: String, msg: String) {
-    println("╔══ [$DBG][$scope] $msg")
+    Log.e(DBG, "[$scope] $msg")
 }
 
 private fun logEnter(scope: String, url: String, referer: String?) {
-    println("╔══════════════════════════════════════════════════════════════")
-    println("║ [$DBG][$scope] ▶ ENTER")
-    println("║ [$DBG][$scope] url='$url'")
-    println("║ [$DBG][$scope] referer='$referer'")
-    println("╚══════════════════════════════════════════════════════════════")
+    Log.e(DBG, "════ [$scope] ▶ ENTER url='$url' referer='$referer'")
 }
 
 private fun logExit(scope: String, success: Boolean, extra: String = "") {
     val icon = if (success) "✔ EXIT-OK" else "✗ EXIT-FAIL"
-    println("║ [$DBG][$scope] $icon $extra")
-    println("╚══════════════════════════════════════════════════════════════")
+    Log.e(DBG, "[$scope] $icon $extra")
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +518,7 @@ class DailymotionExtractor : ExtractorApi() {
         val metadataMatch = metadataRegex.find(html)
         if (metadataMatch == null) {
             log("DM", "❌ playerMetadata NOT FOUND")
+            log("DM", "HTML preview (first 800 chars): ${html.take(800)}")
             logExit("DM", false, "no playerMetadata")
             return
         }
@@ -532,6 +529,7 @@ class DailymotionExtractor : ExtractorApi() {
             JSONObject(metadataJson)
         } catch (e: Exception) {
             log("DM", "❌ JSON parse failed: ${e.message}")
+            log("DM", "metadata preview: ${metadataJson.take(500)}")
             logExit("DM", false, "JSON parse failed")
             return
         }
@@ -571,7 +569,8 @@ class DailymotionExtractor : ExtractorApi() {
                                 type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
                             ) {
                                 this.referer = "https://www.dailymotion.com/"
-                                this.quality = key.filter { it.isDigit() }.toIntOrNull() ?: Qualities.Unknown.value
+                                this.quality = key.filter { it.isDigit() }.toIntOrNull()
+                                    ?: Qualities.Unknown.value
                             }
                         )
                         emittedStreams++
@@ -716,6 +715,8 @@ class GoogleDriveExtractor : ExtractorApi() {
             log("GDrive.resolve", "❌ body blank and no Location")
             return null
         }
+
+        log("GDrive.resolve", "body preview: ${body.take(500)}")
 
         val uuid = Regex("""name="uuid"\s+value="([^"]+)"""")
             .find(body)?.groupValues?.getOrNull(1)
