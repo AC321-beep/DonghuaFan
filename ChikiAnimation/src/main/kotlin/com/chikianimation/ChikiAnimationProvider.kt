@@ -18,18 +18,20 @@ class ChikiAnimationProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
 
-    // Use a data class for main page entries to avoid string‑parsing issues
     private data class MainPageEntry(val path: String, val name: String)
 
+    // -------------------------------------------------------------------------
+    // Optimized main page list — redundant entries removed:
+    //   • "Latest Added"  – overlaps with "Recently Updated"
+    //   • "Donghua (ONA)" – entire site is Donghua/ONA; identical to Recently Updated
+    // -------------------------------------------------------------------------
     private val mainPageEntries = listOf(
         MainPageEntry("anime/?status=&type=&order=update", "Recently Updated"),
         MainPageEntry("anime/?status=&type=&order=popular", "Popular"),
-        MainPageEntry("anime/?status=&type=&order=latest", "Latest Added"),
         MainPageEntry("anime/?status=&type=ai+animes&order=update", "AI Anime"),
         MainPageEntry("anime/?status=ongoing&type=&order=update", "Ongoing"),
         MainPageEntry("anime/?status=completed&type=&order=update", "Completed"),
-        MainPageEntry("anime/?status=&type=movie&order=update", "Movies"),
-        MainPageEntry("anime/?status=&type=ona&order=update", "Donghua (ONA)")
+        MainPageEntry("anime/?status=&type=movie&order=update", "Movies")
     )
 
     override val mainPage = mainPageOf(
@@ -42,37 +44,69 @@ class ChikiAnimationProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
+    // Hosts serving ads, trackers, or non-video content.
+    private val blacklistHosts = listOf(
+        "youtube", "youtu.be", "disqus", "googlesyndication", "doubleclick",
+        "vidverto", "pubfuture", "360yield", "eskimi", "onetag", "openx.net",
+        "imasdk.googleapis.com", "mox.tv", "googletagmanager", "google-analytics",
+        "googleadservices", "adservice.google", "amazon-adsystem", "criteo",
+        "taboola", "outbrain", "mgid", "propellerads", "adsterra"
+    )
+
+    // =========================================================================
+    // MAIN PAGE
+    // =========================================================================
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = buildPageUrl(request.data, page)
-        val items = try {
-            val document = app.get(url, headers = defaultHeaders).document
-            document.select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
-                .mapNotNull { it.toSearchResult() }
-                .distinctBy { it.url }
+
+        val document = try {
+            app.get(url, headers = defaultHeaders).document
         } catch (e: Exception) {
-            emptyList()
+            return newHomePageResponse(request.name, emptyList(), false)
         }
 
-        // Detect if there is a next page by checking for a pagination link
-        val hasNext = try {
-            val doc = app.get(url, headers = defaultHeaders).document
-            doc.selectFirst("a.next.page-numbers, a[rel=next], .pagination a:contains(Next)") != null
-        } catch (e: Exception) {
-            items.isNotEmpty() // fallback
-        }
+        val items = document
+            .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
+            .mapNotNull { it.toSearchResult() }
+            .distinctBy { it.url }
+
+        val hasNext = detectHasNextPage(document, page)
 
         return newHomePageResponse(request.name, items, hasNext)
     }
 
+    private fun detectHasNextPage(document: org.jsoup.nodes.Document, currentPage: Int): Boolean {
+        if (document.selectFirst("link[rel=next], a[rel=next]") != null) return true
+        if (document.selectFirst("a.next.page-numbers, a.nextpostslink, .pagination a.next") != null) return true
+
+        val nextPagePattern = Regex("""/page/${currentPage + 1}/""")
+        if (document.select("a[href]").any { nextPagePattern.containsMatchIn(it.attr("href")) }) return true
+
+        return document.selectFirst(".pagination, .wp-pagenavi, .page-numbers") != null
+    }
+
+    /**
+     * Builds the paginated URL using WordPress pretty permalinks.
+     *
+     *   "anime/?status=&type=&order=update" page 2
+     *     → https://chikianimation.com/anime/page/2/?status=&type=&order=update
+     */
     private fun buildPageUrl(base: String, page: Int): String {
-        if (page <= 1) return "$mainUrl/$base"
-        return when {
-            !base.contains("?") -> {
-                val trimmed = base.trimEnd('/')
-                "$mainUrl/$trimmed/page/$page/"
-            }
-            else -> "$mainUrl/$base&page=$page"
+        val cleanBase = base.trimStart('/')
+        if (page <= 1) return "$mainUrl/$cleanBase"
+
+        val queryIndex = cleanBase.indexOf('?')
+        val (rawPath, query) = if (queryIndex >= 0) {
+            cleanBase.substring(0, queryIndex) to cleanBase.substring(queryIndex)
+        } else {
+            cleanBase to ""
         }
+
+        val path = rawPath.trim('/')
+        val paginatedPath = if (path.isEmpty()) "page/$page/" else "$path/page/$page/"
+
+        return "$mainUrl/$paginatedPath$query"
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
@@ -85,8 +119,11 @@ class ChikiAnimationProvider : MainAPI() {
         val href = fixUrlNull(anchor.attr("href")) ?: return null
         if (href.isBlank()) return null
 
-        // Filter out non‑content links
-        val excludePatterns = listOf("/genres/", "/bookmark", "/privacy", "/contact", "/dmca", "/page/")
+        val excludePatterns = listOf(
+            "/genres/", "/bookmark", "/privacy", "/contact",
+            "/dmca", "/page/", "/anime-history", "/az-list",
+            "/donor-wall", "/anime-requests", "/shecdule"
+        )
         if (excludePatterns.any { href.contains(it) }) return null
 
         val title = selectFirst("div.tt")?.ownText()?.trim()?.takeIf { it.isNotBlank() }
@@ -110,11 +147,14 @@ class ChikiAnimationProvider : MainAPI() {
         }
     }
 
+    // =========================================================================
+    // SEARCH
+    // =========================================================================
+
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
-        val encoded = query.trim().replace(" ", "+") // better URL encoding
+        val encoded = query.trim().replace(" ", "+")
 
-        // Fetch up to 3 pages in parallel for more results
         val results = coroutineScope {
             (1..3).map { page ->
                 async {
@@ -135,6 +175,10 @@ class ChikiAnimationProvider : MainAPI() {
         }
         return results.distinctBy { it.url }
     }
+
+    // =========================================================================
+    // LOAD (Series / Movie detail)
+    // =========================================================================
 
     override suspend fun load(url: String): LoadResponse? {
         val document = try {
@@ -173,7 +217,7 @@ class ChikiAnimationProvider : MainAPI() {
 
         if (isMovie) {
             val watchHref = document
-                .selectFirst(".eplister li > a[href], .episodelist li > a[href]")
+                .selectFirst(".eplister li > a[href], .episodelist li > a[href], .eplister tr > td > a[href]")
                 ?.attr("href")?.trim()
                 ?: url
 
@@ -184,17 +228,19 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // Episode list handling
-        var epListElements = document.select(".episodelist li, .eplister li")
+        // Support both <li> and <tr> for episode lists
+        var epListElements = document.select(
+            ".episodelist li, .eplister li, .episodelist tr, .eplister tr"
+        )
 
         if (epListElements.isEmpty()) {
             val epPage = document
-                .selectFirst(".episodelist li > a[href], .eplister li > a[href]")
+                .selectFirst(".episodelist li > a[href], .eplister li > a[href], .episodelist tr > td > a[href]")
                 ?.attr("href")?.trim()
             if (!epPage.isNullOrBlank()) {
                 epListElements = try {
                     app.get(fixUrl(epPage), headers = defaultHeaders).document
-                        .select(".episodelist li, .eplister li")
+                        .select(".episodelist li, .eplister li, .episodelist tr, .eplister tr")
                 } catch (e: Exception) {
                     org.jsoup.select.Elements()
                 }
@@ -206,11 +252,14 @@ class ChikiAnimationProvider : MainAPI() {
                 ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
 
             val rawTitle = info.selectFirst(".epl-title")?.text()?.trim()
+                ?: info.selectFirst("td.ep-title")?.text()?.trim()
+                ?: info.selectFirst("td.title")?.text()?.trim()
+                ?: info.select("td").getOrNull(1)?.text()?.trim()
                 ?: info.selectFirst("a span")?.text()?.trim()
                 ?: info.selectFirst("a")?.text()?.trim()
                 ?: ""
 
-            val dateText = info.selectFirst(".epl-date, .date, .time")
+            val dateText = info.selectFirst(".epl-date, .date, .time, td.date")
                 ?.text()?.trim()?.takeIf { it.isNotBlank() }
 
             val epNum = Regex("""(?i)(\d+(?:\.\d+)?)""")
@@ -230,14 +279,24 @@ class ChikiAnimationProvider : MainAPI() {
                     this.description = dateText
                 }
             }
-        }.distinctBy { it.data }.reversed()
+        }.distinctBy { it.data }
 
-        return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
+        val sortedEpisodes = if (episodes.all { it.episode != null }) {
+            episodes.sortedBy { it.episode }
+        } else {
+            episodes.reversed()
+        }
+
+        return newTvSeriesLoadResponse(title, url, TvType.Anime, sortedEpisodes) {
             this.posterUrl = poster
             this.plot = description
             this.tags = genres
         }
     }
+
+    // =========================================================================
+    // LOAD LINKS (Extraction)
+    // =========================================================================
 
     override suspend fun loadLinks(
         data: String,
@@ -254,64 +313,103 @@ class ChikiAnimationProvider : MainAPI() {
         var found = false
 
         suspend fun handleUrl(rawUrl: String, ref: String) {
-            // Normalize protocol‑relative URLs
             val cleanUrl = if (rawUrl.startsWith("//")) "https:$rawUrl" else fixUrl(rawUrl)
             if (!cleanUrl.startsWith("http")) return
 
-            // Skip known non‑video hosts
-            val blacklist = listOf("youtube", "disqus", "googlesyndication", "doubleclick")
-            if (blacklist.any { cleanUrl.contains(it, true) }) return
+            if (blacklistHosts.any { cleanUrl.contains(it, true) }) return
 
             try {
-                // 1. Try dedicated extractors first (including custom Dailymotion)
+                // 1. Ghbrisk (Streamwish mirror)
+                if (cleanUrl.contains("ghbrisk.com", true)) {
+                    Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                    found = true
+                    return
+                }
+
+                // 2. Dailymotion — explicit routing
+                if (cleanUrl.contains("dailymotion.com", true) ||
+                    cleanUrl.contains("dai.ly", true)
+                ) {
+                    DailymotionExtractor().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                    found = true
+                    return
+                }
+
+                // 3. GalaxyDonghua — explicit routing
+                if (cleanUrl.contains("galaxydonghua.xyz", true)) {
+                    GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                    found = true
+                    return
+                }
+
+                // 4. Google Drive — explicit routing
+                if (cleanUrl.contains("drive.google.com", true) ||
+                    cleanUrl.contains("docs.google.com", true)
+                ) {
+                    GoogleDriveExtractor().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                    found = true
+                    return
+                }
+
+                // 5. Generic CloudStream extractor registry
                 if (loadExtractor(cleanUrl, referer = ref, subtitleCallback, callback)) {
                     found = true
                     return
                 }
 
-                // 2. Fallback: fetch page and look for generic streams
-                val html = app.get(cleanUrl, headers = mapOf("Referer" to ref)).text
-                val streamRegex = Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)[^\s"'<>\\]*)""")
-                var foundGeneric = false
+                // 6. Last-resort generic scrape
+                val html = try {
+                    app.get(cleanUrl, headers = mapOf("Referer" to ref)).text
+                } catch (e: Exception) { "" }
 
-                streamRegex.findAll(html).forEach { m ->
-                    val fileUrl = m.groupValues[1].replace("\\/", "/")
-                    if (fileUrl.contains(".m3u8", ignoreCase = true)) {
-                        M3u8Helper.generateM3u8("Generic HLS", fileUrl, cleanUrl).forEach { callback.invoke(it) }
-                        foundGeneric = true
-                    } else if (fileUrl.contains(".mp4", ignoreCase = true)) {
-                        callback.invoke(
-                            newExtractorLink(
-                                source = "Generic MP4",
-                                name = "Generic MP4",
-                                url = fileUrl,
-                                type = ExtractorLinkType.VIDEO
-                            ) {
-                                this.referer = cleanUrl
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                        foundGeneric = true
-                    }
-                }
+                if (html.isNotBlank()) {
+                    val streamRegex = Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)[^\s"'<>\\]*)""")
+                    var foundGeneric = false
 
-                // 3. Try nested iframe if nothing found yet
-                if (!foundGeneric) {
-                    val iframeNode = Jsoup.parse(html).selectFirst("iframe")
-                    val nestedIframe = iframeNode?.let {
-                        it.attr("src").ifBlank {
-                            it.attr("data-src").ifBlank { it.attr("data-litespeed-src") }
-                        }
-                    }
-                    if (!nestedIframe.isNullOrBlank() && nestedIframe.startsWith("http")) {
-                        if (loadExtractor(nestedIframe, cleanUrl, subtitleCallback, callback)) {
+                    streamRegex.findAll(html).forEach { m ->
+                        val fileUrl = m.groupValues[1].replace("\\/", "/")
+                        if (blacklistHosts.any { fileUrl.contains(it, true) }) return@forEach
+
+                        if (fileUrl.contains(".m3u8", ignoreCase = true)) {
+                            try {
+                                M3u8Helper.generateM3u8("Generic HLS", fileUrl, cleanUrl)
+                                    .forEach { callback.invoke(it) }
+                                foundGeneric = true
+                            } catch (e: Exception) { }
+                        } else if (fileUrl.contains(".mp4", ignoreCase = true)) {
+                            callback.invoke(
+                                newExtractorLink(
+                                    source = "Generic MP4",
+                                    name = "Generic MP4",
+                                    url = fileUrl,
+                                    type = ExtractorLinkType.VIDEO
+                                ) {
+                                    this.referer = cleanUrl
+                                    this.quality = Qualities.Unknown.value
+                                }
+                            )
                             foundGeneric = true
                         }
                     }
-                }
-                if (foundGeneric) found = true
 
-            } catch (e: Exception) { /* log if needed */ }
+                    if (!foundGeneric) {
+                        val iframeNode = Jsoup.parse(html).selectFirst("iframe")
+                        val nestedIframe = iframeNode?.let {
+                            it.attr("src").ifBlank {
+                                it.attr("data-src").ifBlank { it.attr("data-litespeed-src") }
+                            }
+                        }
+                        if (!nestedIframe.isNullOrBlank() && nestedIframe.startsWith("http")) {
+                            if (loadExtractor(nestedIframe, cleanUrl, subtitleCallback, callback)) {
+                                foundGeneric = true
+                            }
+                        }
+                    }
+                    if (foundGeneric) found = true
+                }
+            } catch (e: Exception) {
+                // Isolate per-URL failures
+            }
         }
 
         fun getIframeSrc(iframe: Element): String {
@@ -322,7 +420,7 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // Process mirror options
+        // ---- Process mirror options in parallel ----
         val mirrorOptions = document.select(
             "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
         )
@@ -338,17 +436,20 @@ class ChikiAnimationProvider : MainAPI() {
                         return@async
                     }
 
-                    // Try Base64 decoding
+                    // Triple Base64 decode fallback
                     val decoded: String? = try {
                         String(Base64.decode(value, Base64.DEFAULT))
                     } catch (e: Exception) {
                         try {
                             String(Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP))
-                        } catch (e2: Exception) { null }
+                        } catch (e2: Exception) {
+                            try {
+                                String(Base64.decode(value, Base64.NO_PADDING or Base64.NO_WRAP))
+                            } catch (e3: Exception) { null }
+                        }
                     }
                     if (decoded.isNullOrBlank()) return@async
 
-                    // Extract iframes from decoded HTML
                     try {
                         Jsoup.parse(decoded).select("iframe").forEach { iframe ->
                             val src = getIframeSrc(iframe)
@@ -356,7 +457,6 @@ class ChikiAnimationProvider : MainAPI() {
                         }
                     } catch (e: Exception) { }
 
-                    // Also try to find raw URLs in the decoded string
                     Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { m ->
                         handleUrl(m.value, data)
                     }
@@ -364,7 +464,7 @@ class ChikiAnimationProvider : MainAPI() {
             }.awaitAll()
         }
 
-        // If nothing found yet, scan page iframes and scripts
+        // ---- Fallback: top-level iframes ----
         if (!found) {
             document.select("iframe").forEach { iframe ->
                 val src = getIframeSrc(iframe)
@@ -372,15 +472,14 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
+        // ---- Fallback: inline scripts ----
         if (!found) {
             document.select("script").forEach { script ->
                 val body = script.data()
 
-                // Direct stream URLs in scripts
                 Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
                     .findAll(body).forEach { m -> handleUrl(m.value, data) }
 
-                // Base64 blobs
                 Regex("""['"]([A-Za-z0-9+/=_-]{60,})['"]""").findAll(body).forEach { m ->
                     val blob = m.groupValues[1]
                     val decoded: String? = try {
