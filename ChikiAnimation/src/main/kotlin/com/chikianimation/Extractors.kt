@@ -1,7 +1,6 @@
 package com.chikianimation
 
 import android.util.Base64
-import android.util.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.Filesim
@@ -9,8 +8,9 @@ import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.M3u8Helper
+import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import org.json.JSONObject
 import java.net.URI
 import javax.crypto.Cipher
 import javax.crypto.Mac
@@ -18,13 +18,18 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.abs
 
+// ---------------------------------------------------------------------------
+// 1. Ghbrisk – Streamwish mirror (ghbrisk.com)
+// ---------------------------------------------------------------------------
 class Ghbrisk : Filesim() {
     override var name = "Streamwish"
     override var mainUrl = "https://ghbrisk.com"
     override val requiresReferer = true
 }
 
-// 1. GalaxyDonghua placed FIRST exactly as instructed
+// ---------------------------------------------------------------------------
+// 2. GalaxyDonghua – custom decryption extractor
+// ---------------------------------------------------------------------------
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
     override var mainUrl = GX
@@ -369,8 +374,10 @@ class GalaxyDonghua : ExtractorApi() {
     } catch (e: Exception) { GX }
 }
 
-// 2. Custom Dailymotion locked down by name and placed securely at the bottom
-class Dailymotion : ExtractorApi() {
+// ---------------------------------------------------------------------------
+// 3. DailymotionExtractor – custom fallback for missing built‑in
+// ---------------------------------------------------------------------------
+class DailymotionExtractor : ExtractorApi() {
     override var name = "Dailymotion"
     override var mainUrl = "https://www.dailymotion.com"
     override val requiresReferer = false
@@ -381,41 +388,66 @@ class Dailymotion : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        Log.d("ChikiDebug", "Custom Dailymotion extractor invoked with URL: $url")
-        val id = Regex("""(?:dailymotion\.com/(?:embed/)?video/|geo\.dailymotion\.com/(?:player/[^/]+/video/|player\.html\?video=)|dai\.ly/)([a-zA-Z0-9_-]+)""")
-            .find(url)?.groupValues?.get(1) ?: return
+        val videoId = extractVideoId(url) ?: return
 
-        val metaUrl = "https://www.dailymotion.com/player/metadata/video/$id"
-        val headers = mapOf("Referer" to (referer ?: mainUrl))
-
-        val response = try {
-            app.get(metaUrl, headers = headers).text
+        val embedUrl = "https://www.dailymotion.com/embed/video/$videoId"
+        val html = try {
+            app.get(embedUrl, headers = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            )).text
         } catch (e: Exception) {
-            app.get("https://www.dailymotion.com/embed/video/$id", headers = headers).text
+            return
         }
 
-        val m3u8Url = Regex(""""type"\s*:\s*"application/x-mpegURL"\s*,\s*"url"\s*:\s*"([^"]+)"""")
-            .find(response)?.groupValues?.get(1)?.replace("\\/", "/")
-            ?: Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""")
-            .find(response)?.groupValues?.get(1)?.replace("\\/", "/")
-            ?: return
+        val metadataRegex = Regex("""playerMetadata\s*=\s*(\{.+?\});""", RegexOption.DOT_MATCHES_ALL)
+        val metadataMatch = metadataRegex.find(html) ?: return
+        val metadataJson = metadataMatch.groupValues[1]
 
-        M3u8Helper.generateM3u8(
-            this.name,
-            m3u8Url,
-            "https://www.dailymotion.com/",
-            headers = mapOf("Referer" to "https://www.dailymotion.com/")
-        ).forEach { callback.invoke(it) }
+        val json = try {
+            JSONObject(metadataJson)
+        } catch (e: Exception) {
+            return
+        }
 
-        Regex(""""url"\s*:\s*"([^"]+\.(?:vtt|srt)[^"]*)"[^{}]*?"language"\s*:\s*"([^"]*)"""")
-            .findAll(response)
-            .forEach { m ->
-                subtitleCallback.invoke(
-                    newSubtitleFile(
-                        lang = m.groupValues[2].ifBlank { "Sub" },
-                        url = m.groupValues[1].replace("\\/", "/")
+        val qualities = json.optJSONObject("qualities")
+        if (qualities != null) {
+            qualities.keys().forEach { key ->
+                val qualityArray = qualities.optJSONArray(key) ?: return@forEach
+                for (i in 0 until qualityArray.length()) {
+                    val qualityObj = qualityArray.optJSONObject(i) ?: continue
+                    val streamUrl = qualityObj.optString("url").takeIf { it.isNotBlank() } ?: continue
+                    val type = qualityObj.optString("type", "video/mp4")
+
+                    val isM3u8 = streamUrl.contains(".m3u8") || type.contains("m3u8", true)
+
+                    callback.invoke(
+                        newExtractorLink(
+                            source = this.name,
+                            name = "${this.name} – $key",
+                            url = streamUrl,
+                            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = "https://www.dailymotion.com/"
+                            this.quality = key.filter { it.isDigit() }.toIntOrNull() ?: Qualities.Unknown.value
+                        }
                     )
+                }
+            }
+        }
+
+        val subtitles = json.optJSONObject("subtitles")
+        if (subtitles != null) {
+            subtitles.keys().forEach { langCode ->
+                val subUrl = subtitles.optString(langCode).takeIf { it.isNotBlank() } ?: return@forEach
+                subtitleCallback.invoke(
+                    newSubtitleFile(langCode, subUrl)
                 )
             }
+        }
+    }
+
+    private fun extractVideoId(url: String): String? {
+        val regex = Regex("""(?:video/|embed/video/)([a-zA-Z0-9]+)""")
+        return regex.find(url)?.groupValues?.get(1)
     }
 }
