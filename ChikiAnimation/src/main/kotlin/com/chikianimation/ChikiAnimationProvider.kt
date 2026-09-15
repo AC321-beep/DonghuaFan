@@ -30,7 +30,7 @@ class ChikiAnimationProvider : MainAPI() {
     )
 
     private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         "Referer" to mainUrl,
         "Origin" to mainUrl
     )
@@ -192,6 +192,7 @@ class ChikiAnimationProvider : MainAPI() {
             val href = info.selectFirst("a[href]")?.attr("href")?.trim()
                 ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
 
+            val epNumText = info.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val rawTitle = info.selectFirst(".epl-title")?.text()?.trim()
                 ?: info.selectFirst("a span")?.text()?.trim()
                 ?: info.selectFirst("a")?.text()?.trim()
@@ -200,8 +201,20 @@ class ChikiAnimationProvider : MainAPI() {
             val dateText = info.selectFirst(".epl-date, .date, .time")
                 ?.text()?.trim()?.takeIf { it.isNotBlank() }
 
-            val epNum = Regex("""(?i)(\d+(?:\.\d+)?)""")
-                .find(rawTitle)?.groupValues?.get(1)?.toFloatOrNull()
+            val combinedText = "$epNumText $rawTitle"
+
+            // Dynamic Season extraction supporting "Season X", "S4", etc.
+            val seasonNum = Regex("""(?i)(?:season\s*(\d+)|s(\d+))""").find(combinedText)?.let {
+                it.groupValues[1].ifEmpty { it.groupValues[2] }.toIntOrNull()
+            }
+
+            // Dynamic Episode extraction supporting ranges (e.g., "41-50", "01-30", "1 to 16", "Episode 29")
+            val epNum = Regex("""(?i)(?:episode|ep)\s*(\d+)""").find(rawTitle)?.groupValues?.get(1)?.toIntOrNull()
+                ?: Regex("""(\d+)\s*(?:to|-)\s*\d+""").find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
+                ?: Regex("""\((\d+)\s*(?:to|-)\s*\d+\)""").find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
+                ?: Regex("""(\d+)-(\d+)""").find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
+                ?: Regex("""\d+""").find(epNumText)?.value?.toIntOrNull()
+                ?: Regex("""\d+""").find(rawTitle)?.value?.toIntOrNull()
 
             val cleanName = rawTitle
                 .replace(Regex("""(?i)^\s*Episode\s*"""), "")
@@ -211,7 +224,8 @@ class ChikiAnimationProvider : MainAPI() {
             newEpisode(fixUrl(href)) {
                 this.name = cleanName
                 this.posterUrl = poster
-                if (epNum != null) this.episode = epNum.toInt()
+                if (seasonNum != null) this.season = seasonNum
+                if (epNum != null) this.episode = epNum
                 if (dateText != null) {
                     this.addDate(dateText, format = "MMMM d, yyyy")
                     this.description = dateText
@@ -261,7 +275,6 @@ class ChikiAnimationProvider : MainAPI() {
         }
 
         suspend fun handleUrl(rawUrl: String, ref: String, depth: Int = 0) {
-            // Prevent infinite nesting loops
             if (depth > 2) return
             
             val cleanUrl = try { fixUrl(rawUrl) } catch (e: Exception) { return }
@@ -274,12 +287,10 @@ class ChikiAnimationProvider : MainAPI() {
             ) return
 
             try {
-                // 1. CUSTOM GEO DAILYMOTION INTERCEPTOR
                 if (cleanUrl.contains("geo.dailymotion.com/player", true)) {
                     val videoId = Regex("""video=([a-zA-Z0-9_-]+)""").find(cleanUrl)?.groupValues?.get(1)
                     if (videoId != null) {
                         try {
-                            // Extract stream using geo API format observed in HAR files
                             val apiUrl = "https://geo.dailymotion.com/videos/$videoId"
                             val playerId = Regex("""player/([a-zA-Z0-9]+)\.html""").find(cleanUrl)?.groupValues?.get(1)
                             val reqHeaders = mapOf(
@@ -309,21 +320,18 @@ class ChikiAnimationProvider : MainAPI() {
                             }
                         } catch (e: Exception) { }
 
-                        // Fallback: Convert to Standard Dailymotion URL and pass to built-in extractor
                         val realDmUrl = "https://www.dailymotion.com/embed/video/$videoId"
                         com.lagradost.cloudstream3.extractors.Dailymotion().getUrl(realDmUrl, ref, subtitleCallback, callback)
                         found = true
                         return
                     }
                 } 
-                // 2. STANDARD DAILYMOTION
                 else if (cleanUrl.contains("dailymotion.com", true) || cleanUrl.contains("dai.ly", true)) {
                     com.lagradost.cloudstream3.extractors.Dailymotion().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true
                     return
                 }
 
-                // 3. GALAXY DONGHUA
                 if (cleanUrl.contains("galaxydonghua", true)) {
                     GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true
