@@ -19,9 +19,6 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.abs
 
-// ---------------------------------------------------------------------------
-// DEBUG HELPERS
-// ---------------------------------------------------------------------------
 private const val DBG = "ChikiDbg"
 
 private fun log(scope: String, msg: String) {
@@ -38,7 +35,7 @@ private fun logExit(scope: String, success: Boolean, extra: String = "") {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Ghbrisk – Streamwish mirror (ghbrisk.com)
+// 1. Ghbrisk
 // ---------------------------------------------------------------------------
 class Ghbrisk : Filesim() {
     override var name = "Streamwish"
@@ -47,7 +44,7 @@ class Ghbrisk : Filesim() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. GalaxyDonghua – custom decryption extractor
+// 2. GalaxyDonghua
 // ---------------------------------------------------------------------------
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
@@ -92,7 +89,7 @@ class GalaxyDonghua : ExtractorApi() {
             logExit("GX", false, "token decode failed")
             return
         }
-        log("GX", "✓ tokens: pd=${tokens.pd.take(8)}... ps=${tokens.ps.take(8)}...")
+        log("GX", "✓ tokens decoded")
 
         val gxBase = embedHost(url)
         log("GX", "gxBase='$gxBase'")
@@ -101,6 +98,7 @@ class GalaxyDonghua : ExtractorApi() {
         val configRes = try {
             val c = app.get(apiConfigBase, headers = headers).text
             log("GX", "config fetch OK, len=${c.length}")
+            log("GX", "config raw preview: ${c.take(200)}")
             c
         } catch (e: Exception) {
             log("GX", "❌ config fetch failed: ${e.message}")
@@ -108,22 +106,35 @@ class GalaxyDonghua : ExtractorApi() {
             return
         }
 
+        // FIX: try decrypt with kaken/apx, then fall back to raw response.
+        // The config endpoint may return plain JSON or a different wrapper.
         val configPlain = dcx(configRes.trim(), tokens.kaken)
             ?: dcx(configRes.trim(), tokens.apx)
             ?: run {
-                log("GX", "❌ dcx failed for config")
-                logExit("GX", false, "config decrypt failed")
-                return
+                log("GX", "⚠ dcx failed for config — falling back to raw response")
+                configRes.trim()
             }
-        log("GX", "✓ config plain len=${configPlain.length}")
 
-        val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""")
+        log("GX", "configPlain len=${configPlain.length}")
+        log("GX", "configPlain preview: ${configPlain.take(300)}")
+
+        // Try to extract the API URL template. It might be in a JSON wrapper.
+        var apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""")
             .find(configPlain)?.groupValues?.get(1)
-            ?: run {
-                log("GX", "❌ api url template not found")
-                logExit("GX", false, "no api url template")
-                return
-            }
+
+        // Fallback: try to parse whole configPlain as JSON and find "url" field
+        if (apiUrlTemplate == null) {
+            try {
+                val cfg = JSONObject(configPlain)
+                apiUrlTemplate = cfg.optString("url").takeIf { it.isNotBlank() }
+            } catch (e: Exception) { }
+        }
+
+        if (apiUrlTemplate == null) {
+            log("GX", "❌ api url template not found")
+            logExit("GX", false, "no api url template")
+            return
+        }
         log("GX", "apiUrlTemplate='$apiUrlTemplate'")
 
         val fixedApi = apiUrlTemplate
@@ -155,11 +166,12 @@ class GalaxyDonghua : ExtractorApi() {
         val apiPlain = dcx(apiRes.trim(), tokens.kaken)
             ?: dcx(apiRes.trim(), tokens.apx)
             ?: run {
-                log("GX", "❌ dcx failed for api response")
-                logExit("GX", false, "api decrypt failed")
-                return
+                log("GX", "⚠ dcx failed for api response — using raw")
+                apiRes.trim()
             }
-        log("GX", "✓ api plain len=${apiPlain.length}")
+
+        log("GX", "apiPlain len=${apiPlain.length}")
+        log("GX", "apiPlain preview: ${apiPlain.take(400)}")
 
         val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""")
             .find(apiPlain)?.groupValues?.get(1) ?: gxBase
@@ -320,7 +332,7 @@ class GalaxyDonghua : ExtractorApi() {
         val kaken = grab(Regex("""(?:window\.)?kaken=["']([^"']+)["']""")) ?: return null
         val apx = grab(Regex("""(?:window\.)?apx=["']([^"']+)["']""")) ?: return null
 
-        log("GX.decode", "✓ pd=${pd.take(8)}... ps=${ps.take(8)}...")
+        log("GX.decode", "✓ pd=${pd.take(8)}... kaken len=${kaken.length} apx len=${apx.length}")
         return GdTokens(pd, ps, qsx, kaken, apx)
     }
 
@@ -413,14 +425,26 @@ class GalaxyDonghua : ExtractorApi() {
 
     private fun dcx(input: String, password: String): String? = try {
         val data = Base64.decode(input.trim(), Base64.DEFAULT)
-        if (data.size < 16) null else {
+        if (data.size < 16) {
+            log("GX.dcx", "data too short: ${data.size}")
+            null
+        } else {
             val salt = data.copyOfRange(0, 16)
             val ct = data.copyOfRange(16, data.size)
             val derived = pbkdf2Sha256(password.toByteArray(Charsets.UTF_8), salt, 10000, 48)
-            if (derived == null) null
-            else aesDecrypt(ct, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
+            if (derived == null) {
+                log("GX.dcx", "pbkdf2 returned null")
+                null
+            } else {
+                val out = aesDecrypt(ct, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
+                if (out == null) log("GX.dcx", "aesDecrypt returned null") else log("GX.dcx", "✓ decrypted len=${out.length}")
+                out
+            }
         }
-    } catch (e: Exception) { null }
+    } catch (e: Exception) {
+        log("GX.dcx", "❌ exception: ${e.message}")
+        null
+    }
 
     private fun pbkdf2Sha256(
         password: ByteArray, salt: ByteArray, iterations: Int, dkLen: Int
@@ -477,7 +501,7 @@ class GalaxyDonghua : ExtractorApi() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. DailymotionExtractor
+// 3. DailymotionExtractor — FIXED: supports ?video=ID query param
 // ---------------------------------------------------------------------------
 class DailymotionExtractor : ExtractorApi() {
     override var name = "Dailymotion"
@@ -492,8 +516,9 @@ class DailymotionExtractor : ExtractorApi() {
     ) {
         logEnter("DM", url, referer)
 
-        val videoId = extractVideoId(url) ?: run {
-            log("DM", "❌ could not extract video ID")
+        val videoId = extractVideoId(url)
+        if (videoId == null) {
+            log("DM", "❌ could not extract video ID from: $url")
             logExit("DM", false, "no video ID")
             return
         }
@@ -514,23 +539,41 @@ class DailymotionExtractor : ExtractorApi() {
             return
         }
 
+        // Try playerMetadata first
         val metadataRegex = Regex("""playerMetadata\s*=\s*(\{.+?\});""", RegexOption.DOT_MATCHES_ALL)
-        val metadataMatch = metadataRegex.find(html)
-        if (metadataMatch == null) {
-            log("DM", "❌ playerMetadata NOT FOUND")
-            log("DM", "HTML preview (first 800 chars): ${html.take(800)}")
-            logExit("DM", false, "no playerMetadata")
-            return
-        }
-        log("DM", "✓ playerMetadata found, len=${metadataMatch.value.length}")
+        var json: JSONObject? = null
 
-        val metadataJson = metadataMatch.groupValues[1]
-        val json = try {
-            JSONObject(metadataJson)
-        } catch (e: Exception) {
-            log("DM", "❌ JSON parse failed: ${e.message}")
-            log("DM", "metadata preview: ${metadataJson.take(500)}")
-            logExit("DM", false, "JSON parse failed")
+        val metadataMatch = metadataRegex.find(html)
+        if (metadataMatch != null) {
+            log("DM", "✓ playerMetadata found, len=${metadataMatch.value.length}")
+            json = try {
+                JSONObject(metadataMatch.groupValues[1])
+            } catch (e: Exception) {
+                log("DM", "❌ playerMetadata JSON parse failed: ${e.message}")
+                null
+            }
+        } else {
+            log("DM", "⚠ playerMetadata NOT found, trying alternatives...")
+            // Alternative: look for "qualities":{ ... } inside a script
+            val altRegex = Regex(""""qualities"\s*:\s*(\{[^}]+(?:\[[^\]]+\][^}]*)*\})""")
+            val altMatch = altRegex.find(html)
+            if (altMatch != null) {
+                json = try {
+                    JSONObject("""{"qualities":${altMatch.groupValues[1]}}""")
+                } catch (e: Exception) {
+                    log("DM", "❌ alt qualities parse failed: ${e.message}")
+                    null
+                }
+            } else {
+                log("DM", "❌ no qualities found either")
+                log("DM", "HTML preview: ${html.take(1000)}")
+                logExit("DM", false, "no metadata")
+                return
+            }
+        }
+
+        if (json == null) {
+            logExit("DM", false, "json null")
             return
         }
 
@@ -559,7 +602,7 @@ class DailymotionExtractor : ExtractorApi() {
                         val type = qualityObj.optString("type", "video/mp4")
                         val isM3u8 = streamUrl.contains(".m3u8") || type.contains("m3u8", true)
 
-                        log("DM", "    ✓ key='$key' type='$type'")
+                        log("DM", "    ✓ key='$key' type='$type' url=${streamUrl.take(100)}")
 
                         callback.invoke(
                             newExtractorLink(
@@ -601,9 +644,29 @@ class DailymotionExtractor : ExtractorApi() {
         logExit("DM", emittedStreams > 0, "streams=$emittedStreams subs=$emittedSubs")
     }
 
+    /**
+     * FIXED: Now handles all known Dailymotion URL formats:
+     *   https://www.dailymotion.com/video/XXXXX
+     *   https://www.dailymotion.com/embed/video/XXXXX
+     *   https://geo.dailymotion.com/player/xxx.html?video=XXXXX   ← THIS ONE
+     *   https://dai.ly/XXXXX
+     *   https://www.dailymotion.com/player/xxx.html?video=XXXXX
+     */
     private fun extractVideoId(url: String): String? {
-        val regex = Regex("""(?:video/|embed/video/)([a-zA-Z0-9]+)""")
-        return regex.find(url)?.groupValues?.get(1)
+        val patterns = listOf(
+            Regex("""/embed/video/([a-zA-Z0-9]+)"""),
+            Regex("""/video/([a-zA-Z0-9]+)"""),
+            Regex("""[?&]video=([a-zA-Z0-9]+)"""),
+            Regex("""dai\.ly/([a-zA-Z0-9]+)""")
+        )
+        for (p in patterns) {
+            val m = p.find(url)
+            if (m != null) {
+                val id = m.groupValues[1]
+                if (id.isNotBlank()) return id
+            }
+        }
+        return null
     }
 }
 
