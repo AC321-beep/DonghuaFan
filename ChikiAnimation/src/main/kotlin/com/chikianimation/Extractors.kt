@@ -44,7 +44,7 @@ class Ghbrisk : Filesim() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. GalaxyDonghua — FIXED: API endpoint discovery + candidate fallback
+// 2. GalaxyDonghua — FIXED: same-origin referer + ID-aware endpoint probing
 // ---------------------------------------------------------------------------
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
@@ -57,15 +57,21 @@ class GalaxyDonghua : ExtractorApi() {
                 "AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/120.0.0.0 Safari/537.36"
 
-        // Candidate config endpoints to try, in order of likelihood.
-        val CONFIG_PATHS = listOf(
+        // Static config endpoint candidates (no ID).
+        val STATIC_CONFIG_PATHS = listOf(
             "/wp-json/gd/v1/config",
             "/wp-json/gd/v2/config",
             "/wp-json/gd/v1/get-config",
             "/wp-json/gd/v1/settings",
             "/wp-json/gd/config",
             "/wp-json/gd/v1/player",
-            "/wp-json/gd/v1/player/config"
+            "/wp-json/gd/v1/player/config",
+            "/wp-json/gd/v1/init",
+            "/wp-json/gd/v1/data",
+            "/wp-json/gd/v1/embed",
+            "/wp-json/gd/v1/source",
+            "/api/gd/v1/config",
+            "/api/config"
         )
     }
 
@@ -77,9 +83,19 @@ class GalaxyDonghua : ExtractorApi() {
     ) {
         logEnter("GX", url, referer)
 
+        val gxBase = embedHost(url)
+
+        // Extract the embed ID from the URL: /embed/4T0LPCyh → 4T0LPCyh
+        val embedId = Regex("""/embed/([A-Za-z0-9_-]+)""")
+            .find(url)?.groupValues?.getOrNull(1)
+        log("GX", "embedId='$embedId'")
+
+        // ── FIX #1: use SAME-ORIGIN referer for all subsequent requests ──
+        // The config endpoint likely rejects cross-origin referers with 404.
         val headers = mapOf(
             "User-Agent" to UA,
-            "Referer" to (referer ?: GX),
+            "Referer" to url,          // the embed URL itself, not chikianimation
+            "Origin" to gxBase,
             "Accept" to "*/*"
         )
 
@@ -101,39 +117,64 @@ class GalaxyDonghua : ExtractorApi() {
         }
         log("GX", "✓ tokens decoded")
 
-        val gxBase = embedHost(url)
-        log("GX", "gxBase='$gxBase'")
-
-        // ── Discover config endpoint from page HTML ────────────────────────
+        // ── FIX #2: also scan the page for ANY /wp-json or /api path, not just /wp-json ──
         val discovered = mutableListOf<String>()
-        val wpJsonRegex = Regex("""["'](/wp-json/[a-zA-Z0-9_\-/]+)["']""")
-        wpJsonRegex.findAll(page).forEach { m ->
+        val pathRegex = Regex("""["'](/(?:wp-json|api)/[a-zA-Z0-9_\-/]+)["']""")
+        pathRegex.findAll(page).forEach { m ->
             val path = m.groupValues[1]
             if (!discovered.contains(path)) discovered.add(path)
         }
-        log("GX", "discovered /wp-json/ paths in page: $discovered")
+        log("GX", "discovered paths in page: $discovered")
 
-        // Combine discovered + candidate paths, de-duplicated.
-        val allPaths = mutableListOf<String>()
-        discovered.forEach { if (!allPaths.contains(it)) allPaths.add(it) }
-        CONFIG_PATHS.forEach { if (!allPaths.contains(it)) allPaths.add(it) }
+        // ── FIX #3: build candidates that include the embed ID as path/query ──
+        val candidates = mutableListOf<String>()
+        discovered.forEach { if (!candidates.contains(it)) candidates.add(it) }
+        STATIC_CONFIG_PATHS.forEach { if (!candidates.contains(it)) candidates.add(it) }
+
+        if (!embedId.isNullOrBlank()) {
+            // Variants where the ID is embedded in the path
+            STATIC_CONFIG_PATHS.forEach { base ->
+                val withId = "$base/$embedId"
+                if (!candidates.contains(withId)) candidates.add(withId)
+            }
+            // Variants where the ID is a query param
+            STATIC_CONFIG_PATHS.forEach { base ->
+                val withId = "$base?id=$embedId"
+                if (!candidates.contains(withId)) candidates.add(withId)
+            }
+            // Direct embed-scoped endpoints
+            val extras = listOf(
+                "/embed/$embedId/config",
+                "/embed/$embedId/data",
+                "/embed/$embedId/player",
+                "/embed/$embedId/source"
+            )
+            extras.forEach { if (!candidates.contains(it)) candidates.add(it) }
+        }
+
+        log("GX", "total candidate endpoints: ${candidates.size}")
 
         var configRes: String? = null
         var usedPath: String? = null
 
-        for (candidate in allPaths) {
-            val fullUrl = "$gxBase$candidate"
+        for (candidate in candidates) {
+            val fullUrl = if (candidate.startsWith("http")) candidate else "$gxBase$candidate"
             val res = try {
                 val r = app.get(fullUrl, headers = headers).text
-                if (r.contains("404 Not Found") || r.contains("<html") && !r.contains("{")) {
-                    log("GX", "  candidate $candidate → 404/HTML, skipping")
+                val isHtml404 = r.contains("404 Not Found") ||
+                        (r.trimStart().startsWith("<") && !r.contains("{"))
+                if (isHtml404 || r.length < 20) {
+                    log("GX", "  ✗ $candidate → HTML/404/empty")
+                    null
+                } else if (!r.contains("{") && !r.contains("=")) {
+                    log("GX", "  ✗ $candidate → no JSON-ish content")
                     null
                 } else {
-                    log("GX", "  ✓ candidate $candidate → len=${r.length}")
+                    log("GX", "  ✓ $candidate → len=${r.length}")
                     r
                 }
             } catch (e: Exception) {
-                log("GX", "  candidate $candidate → ❌ ${e.message}")
+                log("GX", "  ✗ $candidate → ${e.message}")
                 null
             }
             if (res != null) {
@@ -153,14 +194,13 @@ class GalaxyDonghua : ExtractorApi() {
         val configPlain = dcx(configRes.trim(), tokens.kaken)
             ?: dcx(configRes.trim(), tokens.apx)
             ?: run {
-                log("GX", "⚠ dcx failed for config — using raw response")
+                log("GX", "⚠ dcx failed for config — using raw")
                 configRes.trim()
             }
 
         log("GX", "configPlain len=${configPlain.length}")
         log("GX", "configPlain preview: ${configPlain.take(400)}")
 
-        // Find API URL template — try regex on plaintext first, then JSON wrapper.
         var apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""")
             .find(configPlain)?.groupValues?.get(1)
 
@@ -174,7 +214,7 @@ class GalaxyDonghua : ExtractorApi() {
         }
 
         if (apiUrlTemplate == null) {
-            log("GX", "❌ api url template not found in config")
+            log("GX", "❌ api url template not found")
             logExit("GX", false, "no api url template")
             return
         }
@@ -506,7 +546,7 @@ class GalaxyDonghua : ExtractorApi() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. DailymotionExtractor — FIXED: use official player metadata API
+// 3. DailymotionExtractor — FIXED: filter out boolean "enable" subtitles
 // ---------------------------------------------------------------------------
 class DailymotionExtractor : ExtractorApi() {
     override var name = "Dailymotion"
@@ -529,7 +569,6 @@ class DailymotionExtractor : ExtractorApi() {
         }
         log("DM", "videoId='$videoId'")
 
-        // FIX: use the official player metadata API (JSON, no JS needed).
         val metadataUrl = "https://www.dailymotion.com/player/metadata/video/$videoId"
         log("DM", "fetching metadataUrl='$metadataUrl'")
 
@@ -551,7 +590,6 @@ class DailymotionExtractor : ExtractorApi() {
             JSONObject(html)
         } catch (e: Exception) {
             log("DM", "❌ JSON parse failed: ${e.message}")
-            log("DM", "body preview: ${html.take(500)}")
             logExit("DM", false, "JSON parse failed")
             return
         }
@@ -583,7 +621,7 @@ class DailymotionExtractor : ExtractorApi() {
                                 type.contains("m3u8", true) ||
                                 type.contains("mpegurl", true)
 
-                        log("DM", "    ✓ key='$key' type='$type' url=${streamUrl.take(120)}")
+                        log("DM", "    ✓ key='$key' type='$type'")
 
                         callback.invoke(
                             newExtractorLink(
@@ -611,9 +649,22 @@ class DailymotionExtractor : ExtractorApi() {
             if (subNames != null) {
                 for (idx in 0 until subNames.length()) {
                     val langCode = subNames.optString(idx)
-                    val subObj = subtitles.optJSONObject(langCode)
-                    val subUrl = subObj?.optString("url") ?: subtitles.optString(langCode)
-                    if (subUrl.isBlank()) continue
+                    // FIX: skip boolean flags like "enable":true
+                    // Only try to read a URL if the value is an object with "url" or a string starting with http
+                    val subUrl: String? = try {
+                        val subVal = subtitles.opt(langCode)
+                        when (subVal) {
+                            is String -> subVal.takeIf { it.startsWith("http", true) }
+                            is JSONObject -> subVal.optString("url").takeIf { it.startsWith("http", true) }
+                            else -> null
+                        }
+                    } catch (e: Exception) { null }
+
+                    if (subUrl.isNullOrBlank()) {
+                        log("DM", "  ⚠ skipping non-URL subtitle '$langCode'")
+                        continue
+                    }
+
                     log("DM", "  ✓ subtitle lang='$langCode' url=$subUrl")
                     subtitleCallback.invoke(newSubtitleFile(langCode, subUrl))
                     emittedSubs++
@@ -624,13 +675,6 @@ class DailymotionExtractor : ExtractorApi() {
         logExit("DM", emittedStreams > 0, "streams=$emittedStreams subs=$emittedSubs")
     }
 
-    /**
-     * Handles all known Dailymotion URL formats:
-     *   /video/XXXXX
-     *   /embed/video/XXXXX
-     *   ?video=XXXXX
-     *   dai.ly/XXXXX
-     */
     private fun extractVideoId(url: String): String? {
         val patterns = listOf(
             Regex("""/embed/video/([a-zA-Z0-9]+)"""),
