@@ -59,24 +59,22 @@ class GalaxyDonghua : ExtractorApi() {
 
         val tokens = decodeGdTokens(page)
         if (tokens == null) {
-            Log.e(tag, "CRITICAL: Failed to decode GD tokens (Both window variables and JSFuck failed)")
+            Log.e(tag, "CRITICAL: Failed to decode GD tokens")
             return
         }
         Log.e(tag, "Tokens successfully retrieved -> pd: ${tokens.pd.take(5)}..., apx length: ${tokens.apx.length}, kaken length: ${tokens.kaken.length}")
 
         val gxBase = embedHost(url)
-        val apiConfigBase = "$gxBase/wp-json/gd/v1/config"
         
-        val apiUrlToCall = try {
-            if (tokens.apx.isNotBlank()) {
-                String(Base64.decode(tokens.apx, Base64.DEFAULT)).trim()
-            } else {
-                apiConfigBase
-            }
+        // Dynamically construct the config URL using apx, qsx, pd, and ps just like the new player does
+        val decodedApx = try {
+            String(Base64.decode(tokens.apx, Base64.DEFAULT)).trim()
         } catch (e: Exception) {
-            Log.e(tag, "Failed to decode apx base64, falling back to config base: ${e.message}")
-            apiConfigBase
+            tokens.apx
         }
+        val normalizedPath = if (decodedApx.startsWith("/")) decodedApx else "/$decodedApx"
+        val apiUrlToCall = "$gxBase$normalizedPath${tokens.qsx}${tokens.pd}${tokens.ps}"
+        
         Log.e(tag, "Target API Config URL: $apiUrlToCall")
 
         val configRes = try {
@@ -92,7 +90,7 @@ class GalaxyDonghua : ExtractorApi() {
             ?: dcx(configRes.trim(), tokens.pd)
 
         if (configPlain == null) {
-            Log.e(tag, "CRITICAL: Failed to decrypt config response using keys kaken, apx, or pd!")
+            Log.e(tag, "CRITICAL: Failed to decrypt config response!")
             return
         }
         Log.e(tag, "Config decrypted successfully.")
