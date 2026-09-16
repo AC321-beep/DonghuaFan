@@ -11,6 +11,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import java.net.URI
+import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.spec.IvParameterSpec
@@ -68,13 +69,14 @@ class GalaxyDonghua : ExtractorApi() {
 
         val tokenValues = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx).filter { it.isNotBlank() }
         
-        // Dynamically find the password (the 10-digit Unix timestamp)
-        val password = tokenValues.find { it.matches(Regex("""^\d{10}$""")) } ?: tokens.pd
+        // Dynamically identify the password (10-digit timestamp or UUID)
+        val password = tokenValues.find { it.matches(Regex("""^\d{10}$""")) } 
+            ?: tokenValues.find { it.matches(Regex("""^[a-f0-9\-]{36}$""")) } 
+            ?: tokens.pd
+
         Log.e(tag, "Identified Decryption Password: $password")
 
-        // Filter out the password and small parameters to isolate the encrypted Base64 fragments
         val fragments = tokenValues.filter { it != password && it.length > 20 }
-        
         var configJson: String? = null
         var streamJson: String? = null
 
@@ -87,12 +89,10 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        // BRUTEFORCE STAGE 1: Try decrypting fragments individually
-        for (f in fragments) {
-            checkDecrypted(dcx(f, password))
-        }
+        // BRUTEFORCE STAGE 1: Individual fragments
+        for (f in fragments) checkDecrypted(dcx(f, password))
 
-        // BRUTEFORCE STAGE 2: If the obfuscator split the payload into two halves, concatenate and test every permutation
+        // BRUTEFORCE STAGE 2: 2-part fragment concatenation
         if (streamJson == null && configJson == null) {
             Log.e(tag, "Individual decryption failed. Attempting 2-part fragment concatenation...")
             for (i in fragments.indices) {
@@ -103,7 +103,7 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        // BRUTEFORCE STAGE 3: Extreme fallback for 3-part splits
+        // BRUTEFORCE STAGE 3: 3-part fragment concatenation
         if (streamJson == null && configJson == null && fragments.size >= 3) {
             Log.e(tag, "2-part failed. Attempting 3-part fragment concatenation...")
             for (i in fragments.indices) {
@@ -136,12 +136,41 @@ class GalaxyDonghua : ExtractorApi() {
                 val apiRes = try { app.post(fixedApi, headers = headers, data = postData).text } catch (e: Exception) { "" }
                 streamJson = dcx(apiRes.trim(), password)
             }
+        } else {
+            // FALLBACK: Execute dynamic API request matching exact browser concatenation
+            Log.e(tag, "Local decryption failed. Executing dynamic API GET/POST fallback...")
+            val decodedApx = try { String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT)).trim() } catch (e: Exception) { tokens.apx }
+            val concatenatedPath = "$decodedApx${tokens.qsx}${tokens.pd}${tokens.ps}"
+            val apiUrlToCall = if (concatenatedPath.startsWith("http")) concatenatedPath else "$gxBase/${concatenatedPath.trimStart('/')}"
+            
+            val postData = mapOf("pd" to tokens.pd, "ps" to tokens.ps, "qsx" to tokens.qsx, "kaken" to tokens.kaken, "apx" to tokens.apx)
+
+            var configRes = try { app.get(apiUrlToCall, headers = headers).text } catch (e: Exception) { "" }
+            if (configRes.isBlank()) {
+                configRes = try { app.post(apiUrlToCall, headers = headers, data = postData).text } catch (e: Exception) { "" }
+            }
+
+            configJson = dcx(configRes.trim(), password)
+            if (configJson != null) {
+                val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""").find(configJson)?.groupValues?.get(1)
+                if (apiUrlTemplate != null) {
+                    val fixedApi = apiUrlTemplate
+                        .replace("{pd}", tokens.pd).replace("{ps}", tokens.ps)
+                        .replace("{qsx}", tokens.qsx).replace("{kaken}", tokens.kaken)
+                        .replace("{apx}", tokens.apx)
+
+                    val apiRes = try { app.post(fixedApi, headers = headers, data = postData).text } catch (e: Exception) { "" }
+                    streamJson = dcx(apiRes.trim(), password)
+                }
+            }
         }
 
         if (streamJson == null) {
-            Log.e(tag, "CRITICAL: Bruteforce local decryption and API fallback both failed!")
+            Log.e(tag, "CRITICAL: Stream decryption completely failed!")
             return
         }
+
+        Log.e(tag, "Stream API response decrypted successfully. Parsing links...")
 
         val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""").find(streamJson)?.groupValues?.get(1) ?: gxBase
         val playbackHeaders = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
@@ -278,24 +307,11 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        fun grabJsToken(name: String): String {
-            val matches = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*["']([^"']+)["']""").findAll(code)
-            for (match in matches) return match.groupValues[1].trim()
-            
-            val altMatches = Regex("""['"]?\b$name\b['"]?\s*:\s*["']([^"']+)["']""").findAll(code)
-            for (match in altMatches) return match.groupValues[1].trim()
-
-            val numMatches = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*(\d+)""").findAll(code)
-            for (match in numMatches) return match.groupValues[1].trim()
-            
-            return ""
-        }
-
-        val pd = grabJsToken("pd")
-        val ps = grabJsToken("ps")
-        val qsx = grabJsToken("qsx")
-        val kaken = grabJsToken("kaken")
-        val apx = grabJsToken("apx")
+        val pd = grabVar("pd", code)
+        val ps = grabVar("ps", code)
+        val qsx = grabVar("qsx", code)
+        val kaken = grabVar("kaken", code)
+        val apx = grabVar("apx", code)
 
         if (listOf(pd, apx).all { it.isBlank() }) return null
         return GdTokens(pd, ps, qsx, kaken, apx)
@@ -388,22 +404,24 @@ class GalaxyDonghua : ExtractorApi() {
         return prefix + suffix
     }
 
-    private fun dcx(input: String, password: String): String? = try {
-        // Fix for URL-safe encoding and comma padding tricks deployed by the obfuscator
-        val sanitized = input.trim().replace("-", "+").replace("_", "/").replace(",,", "==").replace(",", "=")
-        val data = Base64.decode(sanitized, Base64.DEFAULT)
-        if (data.size < 16) null else {
-            val salt = data.copyOfRange(0, 16)
-            val ct = data.copyOfRange(16, data.size)
-            val derived = pbkdf2Sha256(password.toByteArray(Charsets.UTF_8), salt, 10000, 48)
-            if (derived == null) null
-            else aesDecrypt(ct, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
+    private fun cryptoJsEvpKDF(password: ByteArray, salt: ByteArray, keySize: Int, ivSize: Int): ByteArray {
+        val derivedBytes = ByteArray(keySize + ivSize)
+        var block: ByteArray? = null
+        var offset = 0
+        val md = MessageDigest.getInstance("MD5")
+        while (offset < derivedBytes.size) {
+            if (block != null) md.update(block)
+            md.update(password)
+            md.update(salt)
+            block = md.digest()
+            val len = minOf(block.size, derivedBytes.size - offset)
+            System.arraycopy(block, 0, derivedBytes, offset, len)
+            offset += len
         }
-    } catch (e: Exception) { null }
+        return derivedBytes
+    }
 
-    private fun pbkdf2Sha256(
-        password: ByteArray, salt: ByteArray, iterations: Int, dkLen: Int
-    ): ByteArray? = try {
+    private fun pbkdf2Sha256(password: ByteArray, salt: ByteArray, iterations: Int, dkLen: Int): ByteArray? = try {
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(password, "HmacSHA256"))
         val out = ByteArray(dkLen)
@@ -437,6 +455,36 @@ class GalaxyDonghua : ExtractorApi() {
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
             String(cipher.doFinal(blob), Charsets.UTF_8)
         } catch (e: Exception) { null }
+    }
+
+    private fun dcx(input: String, password: String): String? {
+        try {
+            val sanitized = input.trim().replace("-", "+").replace("_", "/").replace(",,", "==").replace(",", "=")
+            val data = Base64.decode(sanitized, Base64.DEFAULT)
+            if (data.size < 16) return null
+            
+            // GDPlayer AES payloads use standard OpenSSL format: "Salted__" (8 bytes) + salt (8 bytes)
+            val salt = data.copyOfRange(8, 16) 
+            val ct = data.copyOfRange(16, data.size)
+            val passBytes = password.toByteArray(Charsets.UTF_8)
+
+            // Try standard CryptoJS default (MD5 EvpKDF)
+            try {
+                val derived = cryptoJsEvpKDF(passBytes, salt, 32, 16)
+                val decrypted = aesDecrypt(ct, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
+                if (decrypted != null && decrypted.contains("{")) return decrypted
+            } catch (e: Exception) {}
+
+            // Try PBKDF2 iterations fallback
+            for (iterations in listOf(1000, 5000, 10000)) {
+                try {
+                    val derived = pbkdf2Sha256(passBytes, salt, iterations, 48) ?: continue
+                    val decrypted = aesDecrypt(ct, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
+                    if (decrypted != null && decrypted.contains("{")) return decrypted
+                } catch (e: Exception) {}
+            }
+        } catch (e: Exception) {}
+        return null
     }
 
     private fun fixStreamUrl(url: String, base: String): String? {
