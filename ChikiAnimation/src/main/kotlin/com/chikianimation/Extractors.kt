@@ -64,10 +64,7 @@ class GalaxyDonghua : ExtractorApi() {
             return
         }
         
-        // If the site obfuscated qsx completely, we force the query parameter so the URL doesn't break
-        val qsx = tokens.qsx.ifBlank { "?p=" }
-
-        Log.e(tag, "Tokens successfully retrieved -> pd: ${tokens.pd}, apx length: ${tokens.apx.length}, kaken length: ${tokens.kaken.length}")
+        Log.e(tag, "Tokens retrieved -> pd: ${tokens.pd}, apx: ${tokens.apx.take(10)}..., kaken: ${tokens.kaken.take(10)}...")
 
         val gxBase = embedHost(url)
         
@@ -77,13 +74,12 @@ class GalaxyDonghua : ExtractorApi() {
             tokens.apx
         }
 
-        // Construct the correct API URL. Ensure ?p= is used so the server processes the payload.
+        // Removed the errant `tokens.pd` injection that was corrupting the URL!
         val apiUrlToCall = if (decodedApx.startsWith("http")) {
-            val base = if (decodedApx.contains("?")) decodedApx else "$decodedApx$qsx"
-            "$base${tokens.pd}${tokens.ps}"
+            "$decodedApx${tokens.qsx}${tokens.ps}"
         } else {
             val normalizedPath = if (decodedApx.startsWith("/")) decodedApx else "/$decodedApx"
-            "$gxBase$normalizedPath$qsx${tokens.pd}${tokens.ps}"
+            "$gxBase$normalizedPath${tokens.qsx}${tokens.ps}"
         }
         
         Log.e(tag, "Target API Config URL: $apiUrlToCall")
@@ -96,7 +92,6 @@ class GalaxyDonghua : ExtractorApi() {
         }
         Log.e(tag, "Config response fetched (length: ${configRes.length})")
 
-        // Try decrypting with pd (the timestamp) first, then kaken, then apx
         val configPlain = dcx(configRes.trim(), tokens.pd)
             ?: dcx(configRes.trim(), tokens.kaken)
             ?: dcx(configRes.trim(), tokens.apx)
@@ -118,7 +113,7 @@ class GalaxyDonghua : ExtractorApi() {
         val fixedApi = apiUrlTemplate
             .replace("{pd}", tokens.pd)
             .replace("{ps}", tokens.ps)
-            .replace("{qsx}", qsx)
+            .replace("{qsx}", tokens.qsx)
             .replace("{kaken}", tokens.kaken)
             .replace("{apx}", tokens.apx)
 
@@ -130,7 +125,7 @@ class GalaxyDonghua : ExtractorApi() {
                 headers = headers,
                 data = mapOf(
                     "pd" to tokens.pd, "ps" to tokens.ps,
-                    "qsx" to qsx, "kaken" to tokens.kaken,
+                    "qsx" to tokens.qsx, "kaken" to tokens.kaken,
                     "apx" to tokens.apx
                 )
             ).text
