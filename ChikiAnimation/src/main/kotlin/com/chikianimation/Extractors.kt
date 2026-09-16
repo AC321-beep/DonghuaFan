@@ -48,16 +48,16 @@ class GalaxyDonghua : ExtractorApi() {
         val gxBase = embedHost(url)
 
         val headers = mapOf(
-            "User-Agent"       to UA,
-            "Referer"          to url,
-            "Origin"           to gxBase,
-            "Accept"           to "application/json, text/javascript, */*; q=0.01",
-            "Accept-Language"  to "en-US,en;q=0.9",
-            "Accept-Encoding"  to "identity",
-            "X-Requested-With" to "XMLHttpRequest",
-            "Sec-Fetch-Dest"   to "empty",
-            "Sec-Fetch-Mode"   to "cors",
-            "Sec-Fetch-Site"   to "same-origin",
+            "User-Agent"         to UA,
+            "Referer"            to url,
+            "Origin"             to gxBase,
+            "Accept"             to "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language"    to "en-US,en;q=0.9",
+            "Accept-Encoding"    to "identity",
+            "X-Requested-With"   to "XMLHttpRequest",
+            "Sec-Fetch-Dest"     to "empty",
+            "Sec-Fetch-Mode"     to "cors",
+            "Sec-Fetch-Site"     to "same-origin",
             "sec-ch-ua"          to "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\"",
             "sec-ch-ua-mobile"   to "?0",
             "sec-ch-ua-platform" to "\"Windows\""
@@ -78,17 +78,16 @@ class GalaxyDonghua : ExtractorApi() {
         val password = pickPassword(tokens)
         Log.e(TAG, "Password: $password at +${System.currentTimeMillis() - t0}ms")
 
-        // ══════════════════════════════════════════════════════════════
-        // FAST PATH — hit the API FIRST while pd is fresh.
-        // Only brute-force if the server gives us nothing.
-        // ══════════════════════════════════════════════════════════════
+        // ────────────────────────────────────────────────────────────
+        // FAST PATH — hit the API first while the pd timestamp is fresh
+        // ────────────────────────────────────────────────────────────
         var streamJson: String? = tryFastApi(tokens, password, headers, url, gxBase, t0)
 
-        // ══════════════════════════════════════════════════════════════
-        // SLOW PATH — local brute-force (only when API failed)
-        // ══════════════════════════════════════════════════════════════
+        // ────────────────────────────────────────────────────────────
+        // SLOW PATH — only if the fast path returned nothing
+        // ────────────────────────────────────────────────────────────
         if (streamJson == null) {
-            Log.e(TAG, "Fast API path returned nothing. Falling back to local brute-force…")
+            Log.e(TAG, "Fast path returned nothing. Falling back to local brute-force…")
             streamJson = tryLocalBruteForce(tokens, password, headers, t0)
         }
 
@@ -102,11 +101,14 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  FAST PATH
+    //  FAST PATH — one POST, one GET, no brute-force
     // ────────────────────────────────────────────────────────────────
     private suspend fun tryFastApi(
-        tokens: GdTokens, password: String,
-        headers: Map<String, String>, embedUrl: String, gxBase: String,
+        tokens: GdTokens,
+        password: String,
+        headers: Map<String, String>,
+        embedUrl: String,
+        gxBase: String,
         t0: Long
     ): String? {
         val decodedApx = try {
@@ -123,45 +125,73 @@ class GalaxyDonghua : ExtractorApi() {
 
         val mid = tokens.kaken.ifBlank { tokens.qsx }
         val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
-        val url = prefix + mid + tokens.pd + tokens.ps
+        val apiUrl = prefix + mid + tokens.pd + tokens.ps
 
         val postData = mapOf(
-            "pd" to tokens.pd, "ps" to tokens.ps,
-            "qsx" to tokens.qsx, "kaken" to tokens.kaken, "apx" to tokens.apx
+            "pd"    to tokens.pd,
+            "ps"    to tokens.ps,
+            "qsx"   to tokens.qsx,
+            "kaken" to tokens.kaken,
+            "apx"   to tokens.apx
         )
 
-        // Try POST then GET, form-encoded only. No probes.
+        // POST first
         try {
-            val r = app.post(url, data = postData, headers = headers)
+            val r = app.post(apiUrl, data = postData, headers = headers)
             Log.e(TAG, "Fast POST code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length} at +${System.currentTimeMillis() - t0}ms")
             if (r.text.isNotBlank()) {
-                dcx(r.text.trim(), password)?.let { return it }
+                dcx(r.text.trim(), password)?.let {
+                    Log.e(TAG, "Fast POST decrypted stream JSON")
+                    return it
+                }
+                dcx(r.text.trim(), password)?.let {
+                    // Try to interpret as config, then fetch stream
+                }
+                // If decryption yielded a config (has "url" template), go get stream
+                val maybeConfig = dcx(r.text.trim(), password)
+                if (maybeConfig != null && maybeConfig.contains("\"url\"")) {
+                    val tpl = Regex(""""url"\s*:\s*"([^"]+)"""")
+                        .find(maybeConfig)?.groupValues?.get(1)
+                    if (tpl != null) {
+                        val fixed = tpl
+                            .replace("{pd}", tokens.pd).replace("{ps}", tokens.ps)
+                            .replace("{qsx}", tokens.qsx).replace("{kaken}", tokens.kaken)
+                            .replace("{apx}", tokens.apx)
+                        val r2 = app.post(fixed, data = postData, headers = headers)
+                        Log.e(TAG, "Fast stream-POST code=${r2.code} len=${r2.text.length}")
+                        dcx(r2.text.trim(), password)?.let { return it }
+                    }
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Fast POST ex: ${e.message}")
         }
 
+        // GET fallback
         try {
-            val r = app.get(url, headers = headers)
+            val r = app.get(apiUrl, headers = headers)
             Log.e(TAG, "Fast GET  code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length} at +${System.currentTimeMillis() - t0}ms")
             if (r.text.isNotBlank()) {
-                dcx(r.text.trim(), password)?.let { return it }
+                dcx(r.text.trim(), password)?.let {
+                    Log.e(TAG, "Fast GET decrypted stream JSON")
+                    return it
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Fast GET ex: ${e.message}")
         }
 
-        // If we got a config but no stream, try the stream API
         return null
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  SLOW PATH — only reached when the fast path returned nothing.
-    //  This is where the 8-second PBKDF2 cost lives.
+    //  SLOW PATH — local brute-force across fragments
     // ────────────────────────────────────────────────────────────────
     private suspend fun tryLocalBruteForce(
-        tokens: GdTokens, password: String,
-        headers: Map<String, String>, t0: Long
+        tokens: GdTokens,
+        password: String,
+        headers: Map<String, String>,
+        t0: Long
     ): String? {
         val fragments = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx)
             .filter { it != password && it.length > 20 }
@@ -171,8 +201,11 @@ class GalaxyDonghua : ExtractorApi() {
 
         fun check(d: String?) {
             if (d == null) return
-            if (d.contains(""""file"""") && d.contains(""""sources"""")) streamJson = d
-            else if (d.contains(""""file"""") || d.contains(""""url"""")) configJson = d
+            if (d.contains(""""file"""") && d.contains(""""sources"""")) {
+                streamJson = d
+            } else if (d.contains(""""file"""") || d.contains(""""url"""")) {
+                configJson = d
+            }
         }
 
         // 1-part
@@ -180,23 +213,23 @@ class GalaxyDonghua : ExtractorApi() {
         Log.e(TAG, "1-part done at +${System.currentTimeMillis() - t0}ms: " +
                 "stream=${streamJson != null} config=${configJson != null}")
 
+        // 2-part + 3-part
         if (streamJson == null && configJson == null) {
-            for (i in fragments.indices) for (j in fragments.indices) {
-                if (i == j) continue
-                check(dcx(fragments[i] + fragments[j], password))
+            for (i in fragments.indices) {
+                for (j in fragments.indices) {
+                    if (i == j) continue
+                    check(dcx(fragments[i] + fragments[j], password))
+                    for (k in fragments.indices) {
+                        if (k == i || k == j) continue
+                        check(dcx(fragments[i] + fragments[j] + fragments[k], password))
+                    }
+                }
             }
-            Log.e(TAG, "2-part done at +${System.currentTimeMillis() - t0}ms")
+            Log.e(TAG, "2/3-part done at +${System.currentTimeMillis() - t0}ms: " +
+                    "stream=${streamJson != null} config=${configJson != null}")
         }
 
-        if (streamJson == null && configJson == null && fragments.size >= 3) {
-            for (i in fragments.indices) for (j in fragments.indices) for (k in fragments.indices) {
-                if (i == j || j == k || i == k) continue
-                check(dcx(fragments[i] + fragments[j] + fragments[k], password))
-            }
-            Log.e(TAG, "3-part done at +${System.currentTimeMillis() - t0}ms")
-        }
-
-        // If config found, go get the stream
+        // If we got a config, fetch the stream
         if (streamJson == null && configJson != null) {
             val tpl = Regex(""""url"\s*:\s*"([^"]+)"""")
                 .find(configJson!!)?.groupValues?.get(1)
@@ -206,14 +239,15 @@ class GalaxyDonghua : ExtractorApi() {
                     .replace("{qsx}", tokens.qsx).replace("{kaken}", tokens.kaken)
                     .replace("{apx}", tokens.apx)
                 val post = mapOf(
-                    "pd" to tokens.pd, "ps" to tokens.ps, "qsx" to tokens.qsx,
-                    "kaken" to tokens.kaken, "apx" to tokens.apx
+                    "pd"    to tokens.pd, "ps"    to tokens.ps,
+                    "qsx"   to tokens.qsx, "kaken" to tokens.kaken, "apx" to tokens.apx
                 )
                 try {
                     val r = app.post(fixed, data = post, headers = headers)
+                    Log.e(TAG, "Brute stream-POST code=${r.code} len=${r.text.length}")
                     streamJson = dcx(r.text.trim(), password)
                 } catch (e: Exception) {
-                    Log.e(TAG, "stream POST ex: ${e.message}")
+                    Log.e(TAG, "Brute stream POST ex: ${e.message}")
                 }
             }
         }
@@ -222,23 +256,33 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Stream / sub emit
+    //  Stream / subtitle emit — MUST be suspend (newExtractorLink and
+    //  newSubtitleFile are suspend functions in Cloudstream 3)
     // ────────────────────────────────────────────────────────────────
-    private fun emitStreams(
-        json: String, gxBase: String,
+    private suspend fun emitStreams(
+        json: String,
+        gxBase: String,
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit
     ) {
-        val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1) ?: gxBase
-        val playbackHeaders = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
+        val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""")
+            .find(json)?.groupValues?.get(1) ?: gxBase
+        val playbackHeaders = mapOf(
+            "User-Agent" to UA,
+            "Referer"    to gxBase,
+            "Origin"     to gxBase
+        )
         var count = 0
 
-        val streamRx = Regex(""""file"\s*:\s*"([^"]+)"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?(?:[^{}]*?"type"\s*:\s*"([^"]*)")?""")
+        val streamRx = Regex(
+            """"file"\s*:\s*"([^"]+)"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?(?:[^{}]*?"type"\s*:\s*"([^"]*)")?"""
+        )
         for (m in streamRx.findAll(json)) {
             val streamUrl = fixStreamUrl(m.groupValues[1], baseURL) ?: continue
             val label = m.groupValues[2].ifBlank { "Auto" }
             val type  = m.groupValues[3]
             val isM3u8 = streamUrl.contains(".m3u8") || type.contains("hls", true)
+
             count++
             callback.invoke(newExtractorLink(
                 source = this.name,
@@ -253,7 +297,9 @@ class GalaxyDonghua : ExtractorApi() {
         }
         Log.e(TAG, "Emitted $count stream link(s)")
 
-        val subRx = Regex(""""file"\s*:\s*"([^"]+\.(?:vtt|srt))"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?""")
+        val subRx = Regex(
+            """"file"\s*:\s*"([^"]+\.(?:vtt|srt))"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?"""
+        )
         for (m in subRx.findAll(json)) {
             subtitleCallback.invoke(newSubtitleFile(
                 lang = m.groupValues[2].ifBlank { "Sub" },
@@ -288,7 +334,10 @@ class GalaxyDonghua : ExtractorApi() {
                     .find(text)?.let { return it.groupValues[1].trim() }
                 return ""
             }
-            return GdTokens(grabVar("pd"), grabVar("ps"), grabVar("qsx"), grabVar("kaken"), grabVar("apx"))
+            return GdTokens(
+                grabVar("pd"), grabVar("ps"), grabVar("qsx"),
+                grabVar("kaken"), grabVar("apx")
+            )
         }
 
         val html = extractVars(page)
@@ -301,6 +350,7 @@ class GalaxyDonghua : ExtractorApi() {
             if (endMatch != null) {
                 val jsfuck = page.substring(jStart, endMatch.range.last + 1)
                     .replace(Regex("""[\s\u00a0\u3000]+"""), "")
+
                 val bStart = jsfuck.indexOf("(ﾟεﾟ+")
                 if (bStart >= 0) {
                     val commentEnd = jsfuck.indexOf("*/", bStart)
@@ -311,14 +361,18 @@ class GalaxyDonghua : ExtractorApi() {
 
                     val segs = body.split("(ﾟДﾟ)[ﾟεﾟ]")
                     val sb = StringBuilder()
+
                     for (i in 1 until segs.size) {
                         val s = stripConstants(segs[i]).trim().trimStart('+').trimEnd('+')
                         val digits = StringBuilder()
                         for (term in splitTopLevelTerms(s)) {
                             val t = term.trim()
-                            val raw = if (t.startsWith("-"))
-                                -(evalArithmetic(t.substring(1)) ?: break)
-                            else evalArithmetic(t.trimStart('+')) ?: break
+                            val raw = if (t.startsWith("-")) {
+                                val n = evalArithmetic(t.substring(1)) ?: break
+                                -n
+                            } else {
+                                evalArithmetic(t.trimStart('+')) ?: break
+                            }
                             val v = abs(raw)
                             if (v > 7) break
                             digits.append(v)
@@ -387,7 +441,8 @@ class GalaxyDonghua : ExtractorApi() {
 
     private fun splitTopLevelTerms(s: String): List<String> {
         val terms = mutableListOf<String>()
-        var depth = 0; var cur = StringBuilder()
+        var depth = 0
+        var cur = StringBuilder()
         for (ch in s) {
             when (ch) {
                 '(' -> { depth++; cur.append(ch) }
@@ -405,14 +460,17 @@ class GalaxyDonghua : ExtractorApi() {
 
     private fun evalArithmetic(s: String): Int? {
         val clean = s.filter { it != ' ' }
-        val values = mutableListOf<Int>(); val ops = mutableListOf<Char>()
+        val values = mutableListOf<Int>()
+        val ops = mutableListOf<Char>()
         var i = 0
         while (i < clean.length) {
             val c = clean[i]
             when {
                 c.isDigit() -> {
                     var v = 0
-                    while (i < clean.length && clean[i].isDigit()) { v = v * 10 + (clean[i] - '0'); i++ }
+                    while (i < clean.length && clean[i].isDigit()) {
+                        v = v * 10 + (clean[i] - '0'); i++
+                    }
                     values.add(v)
                 }
                 c == '(' -> { ops.add(c); i++ }
@@ -457,6 +515,9 @@ class GalaxyDonghua : ExtractorApi() {
         return prefix + suffix
     }
 
+    // ────────────────────────────────────────────────────────────────
+    //  Crypto
+    // ────────────────────────────────────────────────────────────────
     private fun cryptoJsEvpKDF(password: ByteArray, salt: ByteArray, keySize: Int, ivSize: Int): ByteArray {
         val derived = ByteArray(keySize + ivSize)
         var block: ByteArray? = null
@@ -513,7 +574,8 @@ class GalaxyDonghua : ExtractorApi() {
     private fun dcx(input: String, password: String): String? {
         if (input.isBlank()) return null
         try {
-            var s = input.trim().replace(",,", "==").replace(",", "=").replace("-", "+").replace("_", "/")
+            var s = input.trim().replace(",,", "==").replace(",", "=")
+            s = s.replace('-', '+').replace('_', '/')
             while (s.length % 4 != 0) s += "="
 
             val data = try { Base64.decode(s, Base64.DEFAULT) } catch (_: Exception) { return null }
@@ -529,32 +591,60 @@ class GalaxyDonghua : ExtractorApi() {
                     data[6] == '_'.code.toByte() && data[7] == '_'.code.toByte()
 
             if (hasMagic) {
-                val salt = data.copyOfRange(8, 16); val ct = data.copyOfRange(16, data.size)
-                try { cryptoJsEvpKDF(passBytes, salt, 32, 16).let { k ->
-                    aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
-                } } catch (_: Exception) {}
+                val salt = data.copyOfRange(8, 16)
+                val ct = data.copyOfRange(16, data.size)
+
+                try {
+                    cryptoJsEvpKDF(passBytes, salt, 32, 16).let { k ->
+                        aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let {
+                            if (it.contains("{")) return it
+                        }
+                    }
+                } catch (_: Exception) {}
+
                 for (iter in intArrayOf(1000, 5000, 10000)) {
-                    try { pbkdf2Sha256(passBytes, salt, iter, 48)?.let { k ->
-                        aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
-                    } } catch (_: Exception) {}
+                    try {
+                        pbkdf2Sha256(passBytes, salt, iter, 48)?.let { k ->
+                            aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let {
+                                if (it.contains("{")) return it
+                            }
+                        }
+                    } catch (_: Exception) {}
                 }
             } else {
-                val salt = data.copyOfRange(0, 16); val ct = data.copyOfRange(16, data.size)
-                try { cryptoJsEvpKDF(passBytes, salt, 32, 16).let { k ->
-                    aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
-                } } catch (_: Exception) {}
+                val salt = data.copyOfRange(0, 16)
+                val ct = data.copyOfRange(16, data.size)
+
+                try {
+                    cryptoJsEvpKDF(passBytes, salt, 32, 16).let { k ->
+                        aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let {
+                            if (it.contains("{")) return it
+                        }
+                    }
+                } catch (_: Exception) {}
+
                 for (iter in intArrayOf(1000, 5000, 10000)) {
-                    try { pbkdf2Sha256(passBytes, salt, iter, 48)?.let { k ->
-                        aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
-                    } } catch (_: Exception) {}
+                    try {
+                        pbkdf2Sha256(passBytes, salt, iter, 48)?.let { k ->
+                            aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let {
+                                if (it.contains("{")) return it
+                            }
+                        }
+                    } catch (_: Exception) {}
                 }
             }
 
-            try { cryptoJsEvpKDF(passBytes, ByteArray(0), 32, 16).let { k ->
-                aesDecrypt(data, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
-            } } catch (_: Exception) {}
+            try {
+                cryptoJsEvpKDF(passBytes, ByteArray(0), 32, 16).let { k ->
+                    aesDecrypt(data, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let {
+                        if (it.contains("{")) return it
+                    }
+                }
+            } catch (_: Exception) {}
 
-            try { aesDecrypt(data, md5Pass, md5Pass)?.let { if (it.contains("{")) return it } } catch (_: Exception) {}
+            try {
+                aesDecrypt(data, md5Pass, md5Pass)?.let { if (it.contains("{")) return it }
+            } catch (_: Exception) {}
 
             try {
                 val c = Cipher.getInstance("AES/ECB/PKCS5Padding")
@@ -562,22 +652,34 @@ class GalaxyDonghua : ExtractorApi() {
                 String(c.doFinal(data), Charsets.UTF_8).let { if (it.contains("{")) return it }
             } catch (_: Exception) {}
 
-            try { aesDecrypt(data, passBytes.copyOf(16), passBytes.copyOf(16))?.let { if (it.contains("{")) return it } } catch (_: Exception) {}
+            try {
+                aesDecrypt(data, passBytes.copyOf(16), passBytes.copyOf(16))?.let {
+                    if (it.contains("{")) return it
+                }
+            } catch (_: Exception) {}
 
         } catch (_: Exception) {}
         return null
     }
 
+    // ────────────────────────────────────────────────────────────────
+    //  URL helpers
+    // ────────────────────────────────────────────────────────────────
     private fun fixStreamUrl(url: String, base: String): String? {
-        val u = url.trim(); if (u.isBlank()) return null
+        val u = url.trim()
+        if (u.isBlank()) return null
         if (u.startsWith("http://") || u.startsWith("https://")) return u
         if (u.startsWith("//")) return "https:$u"
-        val host = try { val uri = URI(base); "${uri.scheme}://${uri.host}" } catch (_: Exception) { null }
+        val host = try {
+            val uri = URI(base)
+            "${uri.scheme}://${uri.host}"
+        } catch (_: Exception) { null }
         return if (u.startsWith("/")) (host ?: base.trimEnd('/')) + u
         else (host ?: base.trimEnd('/')) + "/" + u
     }
 
     private fun embedHost(url: String): String = try {
-        val uri = URI(url); "${uri.scheme}://${uri.host}"
+        val uri = URI(url)
+        "${uri.scheme}://${uri.host}"
     } catch (_: Exception) { GX }
 }
