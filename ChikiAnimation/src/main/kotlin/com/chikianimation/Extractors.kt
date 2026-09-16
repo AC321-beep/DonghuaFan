@@ -64,128 +64,139 @@ class GalaxyDonghua : ExtractorApi() {
             return
         }
 
-        val tokenValues = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx).filter { it.isNotBlank() }
-        
-        // Dynamically identify the password (10 digit timestamp or UUID)
-        val password = tokenValues.find { it.matches(Regex("""^\d{10}$""")) } 
-            ?: tokenValues.find { it.matches(Regex("""^[a-f0-9\-]{36}$""")) } 
-            ?: tokens.pd
+        // The obfuscator swaps pd and kaken. The password is ALWAYS 10 digits. The payload is the massive string.
+        val actualPd = listOf(tokens.pd, tokens.kaken).find { it.matches(Regex("""^\d{10}$""")) } ?: tokens.pd
+        val actualKaken = listOf(tokens.pd, tokens.kaken).maxByOrNull { it.length } ?: tokens.kaken
 
-        Log.e(tag, "Identified Decryption Password: $password")
-
-        var streamJson: String? = null
-        var configJson: String? = null
-
-        // Bruteforce decrypt any embedded payloads in the Javascript variables
-        for (token in tokenValues) {
-            if (token.length < 50) continue
-            val decrypted = dcx(token, password) ?: continue
-            
-            if (decrypted.contains(""""file"""")) {
-                streamJson = decrypted
-            } else if (decrypted.contains(""""url"""")) {
-                configJson = decrypted
-            }
-        }
+        Log.e(tag, "Tokens successfully assigned -> Password: $actualPd | Payload length: ${actualKaken.length}")
 
         val gxBase = embedHost(url)
+        val decodedApx = try {
+            String(Base64.decode(tokens.apx, Base64.DEFAULT)).trim()
+        } catch (e: Exception) {
+            tokens.apx
+        }
 
-        // 1. If streams are already embedded directly in the HTML, parse them instantly!
-        if (streamJson != null) {
-            Log.e(tag, "SUCCESS: Streams found directly embedded in HTML!")
-            parseStreamJson(streamJson, gxBase, callback, subtitleCallback)
+        val baseUrlPart = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/${decodedApx.trimStart('/')}"
+        val qsx = tokens.qsx.ifBlank { "?p=" }
+        val finalQsx = if (baseUrlPart.contains("?") && qsx.startsWith("?")) qsx.replace("?", "&") else qsx
+
+        val apiUrlToCall = "$baseUrlPart$finalQsx$actualPd${tokens.ps}"
+        Log.e(tag, "Target API Config URL: $apiUrlToCall")
+
+        val configRes = try {
+            app.get(apiUrlToCall, headers = headers).text
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to fetch API config response: ${e.message}")
+            return
+        }
+        Log.e(tag, "Config response fetched (length: ${configRes.length})")
+
+        // Decrypt using the 10-digit password
+        val configPlain = dcx(configRes.trim(), actualPd)
+            ?: dcx(configRes.trim(), actualKaken)
+
+        if (configPlain == null) {
+            Log.e(tag, "CRITICAL: Failed to decrypt config response! ConfigRes: ${configRes.take(50)}")
+            return
+        }
+        Log.e(tag, "Config decrypted successfully.")
+
+        val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""")
+            .find(configPlain)?.groupValues?.get(1)
+
+        if (apiUrlTemplate == null) {
+            Log.e(tag, "CRITICAL: Could not find 'url' pattern inside decrypted config plain text.")
             return
         }
 
-        // 2. If config was embedded but streams were not, we must make a POST request
-        if (configJson == null) {
-            Log.e(tag, "Config not embedded. Falling back to dynamic GET request...")
-            val decodedApx = try { String(Base64.decode(tokens.apx, Base64.DEFAULT)).trim() } catch (e: Exception) { tokens.apx }
-            val baseUrlPart = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/${decodedApx.trimStart('/')}"
-            val qsxParam = tokens.qsx.ifBlank { "?p=" }
-            val finalQsx = if (baseUrlPart.contains("?") && qsxParam.startsWith("?")) qsxParam.replace("?", "&") else qsxParam
-
-            val apiUrlToCall = "$baseUrlPart$finalQsx$password${tokens.ps}"
-            val configRes = try { app.get(apiUrlToCall, headers = headers).text } catch (e: Exception) { return }
-            configJson = dcx(configRes.trim(), password)
-        }
-
-        if (configJson == null) {
-            Log.e(tag, "CRITICAL: Failed to obtain or decrypt config JSON!")
-            return
-        }
-
-        val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""").find(configJson)?.groupValues?.get(1) ?: return
         val fixedApi = apiUrlTemplate
-            .replace("{pd}", tokens.pd)
+            .replace("{pd}", tokens.pd) // Keep original token placements for the URL
             .replace("{ps}", tokens.ps)
             .replace("{qsx}", tokens.qsx)
             .replace("{kaken}", tokens.kaken)
             .replace("{apx}", tokens.apx)
 
-        Log.e(tag, "Executing POST to final stream API...")
+        Log.e(tag, "Final POST API Endpoint: $fixedApi")
+
         val apiRes = try {
             app.post(
                 fixedApi,
                 headers = headers,
-                data = mapOf("pd" to tokens.pd, "ps" to tokens.ps, "qsx" to tokens.qsx, "kaken" to tokens.kaken, "apx" to tokens.apx)
+                data = mapOf(
+                    "pd" to tokens.pd, "ps" to tokens.ps,
+                    "qsx" to tokens.qsx, "kaken" to tokens.kaken,
+                    "apx" to tokens.apx
+                )
             ).text
-        } catch (e: Exception) { return }
-
-        streamJson = dcx(apiRes.trim(), password)
-
-        if (streamJson == null) {
-            Log.e(tag, "CRITICAL: Failed to decrypt final stream API response!")
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to execute POST request to stream API: ${e.message}")
             return
         }
+        Log.e(tag, "POST response fetched (length: ${apiRes.length})")
 
-        Log.e(tag, "SUCCESS: Decrypted API response.")
-        parseStreamJson(streamJson, gxBase, callback, subtitleCallback)
-    }
+        val apiPlain = dcx(apiRes.trim(), actualPd)
+            ?: dcx(apiRes.trim(), actualKaken)
 
-    private fun parseStreamJson(
-        apiPlain: String,
-        gxBase: String,
-        callback: (ExtractorLink) -> Unit,
-        subtitleCallback: (SubtitleFile) -> Unit
-    ) {
-        val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""").find(apiPlain)?.groupValues?.get(1) ?: gxBase
-        val playbackHeaders = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
+        if (apiPlain == null) {
+            Log.e(tag, "CRITICAL: Failed to decrypt final stream API response payload!")
+            return
+        }
+        Log.e(tag, "Stream API response decrypted successfully. Parsing links...")
+
+        val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""")
+            .find(apiPlain)?.groupValues?.get(1) ?: gxBase
+
+        val playbackHeaders = mapOf(
+            "User-Agent" to UA,
+            "Referer" to gxBase,
+            "Origin" to gxBase
+        )
+
         var linkCount = 0
+        val streamMatches = Regex(""""file"\s*:\s*"([^"]+)"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?(?:[^{}]*?"type"\s*:\s*"([^"]*)")?""").findAll(apiPlain)
+        
+        // FIXED: Using standard 'for' loop to allow suspend calls
+        for (m in streamMatches) {
+            val streamUrl = fixStreamUrl(m.groupValues[1], baseURL) ?: continue
+            val label = m.groupValues[2].ifBlank { "Auto" }
+            val type = m.groupValues[3]
+            val isM3u8 = streamUrl.contains(".m3u8") ||
+                    type.contains("hls", true) ||
+                    type.contains("m3u8", true)
 
-        Regex(""""file"\s*:\s*"([^"]+)"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?(?:[^{}]*?"type"\s*:\s*"([^"]*)")?""")
-            .findAll(apiPlain).forEach { m ->
-                val streamUrl = fixStreamUrl(m.groupValues[1], baseURL) ?: return@forEach
-                val label = m.groupValues[2].ifBlank { "Auto" }
-                val type = m.groupValues[3]
-                val isM3u8 = streamUrl.contains(".m3u8") || type.contains("hls", true) || type.contains("m3u8", true)
+            linkCount++
+            Log.e(tag, "Found Stream Link [$label]: $streamUrl")
 
-                linkCount++
-                callback.invoke(
-                    newExtractorLink(
-                        source = this.name,
-                        name = "${this.name} – $label",
-                        url = streamUrl,
-                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = gxBase
-                        this.quality = label.filter { it.isDigit() }.toIntOrNull() ?: 0
-                        this.headers = playbackHeaders
-                    }
-                )
-            }
+            callback.invoke(
+                newExtractorLink(
+                    source = this.name,
+                    name = "${this.name} – $label",
+                    url = streamUrl,
+                    type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = gxBase
+                    this.quality = label.filter { it.isDigit() }.toIntOrNull() ?: 0
+                    this.headers = playbackHeaders
+                }
+            )
+        }
 
-        Log.e("GalaxyDonghuaDebug", "Extraction complete. Total links: $linkCount")
+        Log.e(tag, "Extraction complete. Total links generated: $linkCount")
 
-        Regex(""""file"\s*:\s*"([^"]+\.(?:vtt|srt))"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?""")
-            .findAll(apiPlain).forEach { m ->
-                subtitleCallback.invoke(
-                    newSubtitleFile(
-                        lang = m.groupValues[2].ifBlank { "Sub" },
-                        url = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
-                    )
-                )
-            }
+        val subMatches = Regex(""""file"\s*:\s*"([^"]+\.(?:vtt|srt))"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?""").findAll(apiPlain)
+        
+        // FIXED: Using standard 'for' loop to allow suspend calls
+        for (m in subMatches) {
+            subtitleCallback.invoke(
+                newSubtitleFile(
+                    lang = m.groupValues[2].ifBlank { "Sub" },
+                    url = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
+                ) {
+                    // Builder block for SubtitleFile if required
+                }
+            )
+        }
     }
 
     private data class GdTokens(
@@ -194,6 +205,8 @@ class GalaxyDonghua : ExtractorApi() {
     )
 
     private fun decodeGdTokens(page: String): GdTokens? {
+        val tag = "GalaxyDonghuaDebug"
+        
         fun grabVar(name: String, text: String): String {
             val p1 = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*["']([^"']+)["']""").find(text)
             if (p1 != null) return p1.groupValues[1].trim()
@@ -211,8 +224,11 @@ class GalaxyDonghua : ExtractorApi() {
         val directApx = grabVar("apx", page)
 
         if (directPd.isNotBlank() || directApx.isNotBlank()) {
+            Log.e(tag, "Successfully grabbed tokens via Direct Window Variables parsing.")
             return GdTokens(directPd, directPs, directQsx, directKaken, directApx)
         }
+
+        Log.e(tag, "Direct window variables not found or invalid. Falling back to JSFuck parser...")
 
         val startMatch = Regex("""ﾟωﾟﾉ\s*=""").find(page) ?: return null
         val jStart = startMatch.range.first
@@ -220,7 +236,8 @@ class GalaxyDonghua : ExtractorApi() {
             .find(page, jStart) ?: return null
         val jEnd = endMatch.range.last + 1
 
-        val jsfuck = page.substring(jStart, jEnd).replace(Regex("""[\s\u00a0\u3000]+"""), "")
+        val jsfuck = page.substring(jStart, jEnd)
+            .replace(Regex("""[\s\u00a0\u3000]+"""), "")
 
         val bStart = jsfuck.indexOf("(ﾟεﾟ+")
         if (bStart < 0) return null
@@ -275,7 +292,8 @@ class GalaxyDonghua : ExtractorApi() {
         for (idx in (a - 1) downTo 0) {
             val k = dict.getOrNull(idx)
             if (!k.isNullOrEmpty()) {
-                code = Regex("""\b${Regex.escape(packrBase36(idx, a))}\b""").replace(code, Regex.escapeReplacement(k))
+                code = Regex("""\b${Regex.escape(packrBase36(idx, a))}\b""")
+                    .replace(code, Regex.escapeReplacement(k))
             }
         }
 
@@ -286,6 +304,7 @@ class GalaxyDonghua : ExtractorApi() {
         val apx = grabVar("apx", code)
 
         if (listOf(pd, apx).all { it.isBlank() }) return null
+        Log.e(tag, "Successfully parsed tokens via JSFuck fallback.")
         return GdTokens(pd, ps, qsx, kaken, apx)
     }
 
