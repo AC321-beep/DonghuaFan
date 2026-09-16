@@ -34,6 +34,7 @@ class GalaxyDonghua : ExtractorApi() {
         const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) " +
                 "Chrome/124.0.0.0 Safari/537.36"
+        const val TAG = "GalaxyDonghuaDebug"
     }
 
     override suspend fun getUrl(
@@ -42,8 +43,7 @@ class GalaxyDonghua : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val tag = "GalaxyDonghuaDebug"
-        Log.e(tag, "Starting extraction for URL: $url")
+        Log.e(TAG, "Starting extraction for URL: $url")
         val gxBase = embedHost(url)
 
         val headers = mapOf(
@@ -51,19 +51,21 @@ class GalaxyDonghua : ExtractorApi() {
             "Referer" to url,
             "Origin" to gxBase,
             "Accept" to "application/json, text/javascript, */*; q=0.01",
-            "X-Requested-With" to "XMLHttpRequest"
+            "X-Requested-With" to "XMLHttpRequest",
+            "Sec-Fetch-Dest" to "empty",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Site" to "same-origin"
         )
 
         val page = try {
             app.get(url, headers = headers).text
         } catch (e: Exception) {
-            Log.e(tag, "Failed to fetch embed page: ${e.message}")
+            Log.e(TAG, "Failed to fetch embed page: ${e.message}")
             return
         }
 
-        val tokens = decodeGdTokens(page)
-        if (tokens == null) {
-            Log.e(tag, "CRITICAL: Failed to decode GD tokens")
+        val tokens = decodeGdTokens(page) ?: run {
+            Log.e(TAG, "CRITICAL: Failed to decode GD tokens")
             return
         }
 
@@ -73,11 +75,9 @@ class GalaxyDonghua : ExtractorApi() {
         val password = tokenValues.find { it.matches(Regex("""^\d{10}$""")) } 
             ?: tokenValues.find { it.matches(Regex("""^[a-f0-9\-]{36}$""")) } 
             ?: tokens.pd
-        Log.e(tag, "Identified Decryption Password: $password")
+        Log.e(TAG, "Identified Decryption Password: $password")
 
-        // Filter out the password and small parameters to isolate the encrypted Base64 fragments
         val fragments = tokenValues.filter { it != password && it.length > 20 }
-        
         var configJson: String? = null
         var streamJson: String? = null
 
@@ -91,28 +91,16 @@ class GalaxyDonghua : ExtractorApi() {
         }
 
         // BRUTEFORCE STAGE 1: Try decrypting fragments individually
-        for (f in fragments) {
-            checkDecrypted(dcx(f, password))
-        }
+        for (f in fragments) checkDecrypted(dcx(f, password))
 
-        // BRUTEFORCE STAGE 2: Concatenate halves if the obfuscator split the payload
+        // BRUTEFORCE STAGE 2: Try 2-part and 3-part fragment concatenations
         if (streamJson == null && configJson == null) {
-            Log.e(tag, "Individual decryption failed. Attempting 2-part fragment concatenation...")
             for (i in fragments.indices) {
                 for (j in fragments.indices) {
                     if (i == j) continue
                     checkDecrypted(dcx(fragments[i] + fragments[j], password))
-                }
-            }
-        }
-
-        // BRUTEFORCE STAGE 3: Extreme fallback for 3-part splits
-        if (streamJson == null && configJson == null && fragments.size >= 3) {
-            Log.e(tag, "2-part failed. Attempting 3-part fragment concatenation...")
-            for (i in fragments.indices) {
-                for (j in fragments.indices) {
                     for (k in fragments.indices) {
-                        if (i == j || j == k || i == k) continue
+                        if (k == i || k == j) continue
                         checkDecrypted(dcx(fragments[i] + fragments[j] + fragments[k], password))
                     }
                 }
@@ -120,60 +108,47 @@ class GalaxyDonghua : ExtractorApi() {
         }
 
         if (streamJson != null) {
-            Log.e(tag, "SUCCESS: Stream JSON successfully decrypted locally!")
+            Log.e(TAG, "SUCCESS: Stream JSON successfully decrypted locally!")
         } else if (configJson != null) {
-            Log.e(tag, "Config decrypted, but Stream requires POST API.")
-            val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""").find(configJson!!)?.groupValues?.get(1)
-            
-            if (apiUrlTemplate != null) {
-                val fixedApi = apiUrlTemplate
-                    .replace("{pd}", tokens.pd).replace("{ps}", tokens.ps)
-                    .replace("{qsx}", tokens.qsx).replace("{kaken}", tokens.kaken)
-                    .replace("{apx}", tokens.apx)
-
-                val postData = mapOf(
-                    "pd" to tokens.pd, "ps" to tokens.ps,
-                    "qsx" to tokens.qsx, "kaken" to tokens.kaken, "apx" to tokens.apx
-                )
-
-                val apiRes = try { app.post(fixedApi, headers = headers, data = postData).text } catch (e: Exception) { "" }
-                streamJson = dcx(apiRes.trim(), password)
-            }
+            Log.e(TAG, "Config decrypted, but Stream requires POST API.")
+            streamJson = fetchStreamApi(configJson!!, tokens, headers, password)
         } else {
-            // FALLBACK: Execute dynamic API request
-            Log.e(tag, "Local decryption failed. Executing dynamic API GET/POST fallback...")
-            val decodedApx = try { String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT)).trim() } catch (e: Exception) { tokens.apx }
-            val concatenatedPath = "$decodedApx${tokens.qsx}${tokens.pd}${tokens.ps}"
-            val apiUrlToCall = if (concatenatedPath.startsWith("http")) concatenatedPath else "$gxBase/${concatenatedPath.trimStart('/')}"
+            // FALLBACK: Execute dynamic API request matching the exact browser configuration
+            Log.e(TAG, "Local decryption failed. Executing dynamic API fallback...")
+            val decodedApx = try { 
+                String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT), Charsets.UTF_8).trim() 
+            } catch (e: Exception) { tokens.apx }
             
-            val postData = mapOf("pd" to tokens.pd, "ps" to tokens.ps, "qsx" to tokens.qsx, "kaken" to tokens.kaken, "apx" to tokens.apx)
+            val baseUrlPart = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/${decodedApx.trimStart('/')}"
+            
+            // EXACT URL CONCATENATION: apx + qsx + kaken + pd + ps
+            val exactUrl = "$baseUrlPart${tokens.qsx}${tokens.kaken}$password${tokens.ps}"
+            Log.e(TAG, "Target API Config URL: $exactUrl")
 
-            var configRes = try { app.get(apiUrlToCall, headers = headers).text } catch (e: Exception) { "" }
+            val postData = mapOf(
+                "pd" to tokens.pd, "ps" to tokens.ps, "qsx" to tokens.qsx, 
+                "kaken" to tokens.kaken, "apx" to tokens.apx
+            )
+
+            // Try GET first. If dropped (0 bytes), fallback to POST with the token map.
+            var configRes = try { app.get(exactUrl, headers = headers).text } catch (e: Exception) { "" }
             if (configRes.isBlank()) {
-                configRes = try { app.post(apiUrlToCall, headers = headers, data = postData).text } catch (e: Exception) { "" }
+                configRes = try { app.post(exactUrl, headers = headers, data = postData).text } catch (e: Exception) { "" }
             }
 
             configJson = dcx(configRes.trim(), password)
             if (configJson != null) {
-                val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""").find(configJson)?.groupValues?.get(1)
-                if (apiUrlTemplate != null) {
-                    val fixedApi = apiUrlTemplate
-                        .replace("{pd}", tokens.pd).replace("{ps}", tokens.ps)
-                        .replace("{qsx}", tokens.qsx).replace("{kaken}", tokens.kaken)
-                        .replace("{apx}", tokens.apx)
-
-                    val apiRes = try { app.post(fixedApi, headers = headers, data = postData).text } catch (e: Exception) { "" }
-                    streamJson = dcx(apiRes.trim(), password)
-                }
+                Log.e(TAG, "Config JSON decrypted via API fallback.")
+                streamJson = fetchStreamApi(configJson, tokens, headers, password)
             }
         }
 
         if (streamJson == null) {
-            Log.e(tag, "CRITICAL: Stream decryption completely failed!")
+            Log.e(TAG, "CRITICAL: Stream decryption completely failed!")
             return
         }
 
-        Log.e(tag, "Stream API response decrypted successfully. Parsing links...")
+        Log.e(TAG, "Stream API response decrypted successfully. Parsing links...")
 
         val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""").find(streamJson)?.groupValues?.get(1) ?: gxBase
         val playbackHeaders = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
@@ -188,8 +163,6 @@ class GalaxyDonghua : ExtractorApi() {
             val isM3u8 = streamUrl.contains(".m3u8") || type.contains("hls", true) || type.contains("m3u8", true)
 
             linkCount++
-            Log.e(tag, "Found Stream Link [$label]: $streamUrl")
-
             callback.invoke(
                 newExtractorLink(
                     source = this.name,
@@ -204,7 +177,7 @@ class GalaxyDonghua : ExtractorApi() {
             )
         }
 
-        Log.e(tag, "Extraction complete. Total links generated: $linkCount")
+        Log.e(TAG, "Extraction complete. Total links generated: $linkCount")
 
         val subMatches = Regex(""""file"\s*:\s*"([^"]+\.(?:vtt|srt))"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?""").findAll(streamJson)
         for (m in subMatches) {
@@ -217,13 +190,35 @@ class GalaxyDonghua : ExtractorApi() {
         }
     }
 
+    private suspend fun fetchStreamApi(configJson: String, tokens: GdTokens, headers: Map<String, String>, password: String): String? {
+        val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""").find(configJson)?.groupValues?.get(1) ?: return null
+        
+        val fixedApi = apiUrlTemplate
+            .replace("{pd}", tokens.pd)
+            .replace("{ps}", tokens.ps)
+            .replace("{qsx}", tokens.qsx)
+            .replace("{kaken}", tokens.kaken)
+            .replace("{apx}", tokens.apx)
+
+        val postData = mapOf(
+            "pd" to tokens.pd, "ps" to tokens.ps, "qsx" to tokens.qsx, 
+            "kaken" to tokens.kaken, "apx" to tokens.apx
+        )
+
+        var apiRes = try { app.post(fixedApi, headers = headers, data = postData).text } catch (e: Exception) { "" }
+        if (apiRes.isBlank()) {
+            apiRes = try { app.get(fixedApi, headers = headers).text } catch (e: Exception) { "" }
+        }
+        
+        return dcx(apiRes.trim(), password)
+    }
+
     private data class GdTokens(
         val pd: String, val ps: String, val qsx: String,
         val kaken: String, val apx: String
     )
 
     private fun decodeGdTokens(page: String): GdTokens? {
-        // Collects all variables from a given text block
         fun extractVars(text: String): GdTokens {
             fun grabVar(name: String): String {
                 val p1 = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*["']([^"']+)["']""").find(text)
@@ -237,7 +232,7 @@ class GalaxyDonghua : ExtractorApi() {
             return GdTokens(grabVar("pd"), grabVar("ps"), grabVar("qsx"), grabVar("kaken"), grabVar("apx"))
         }
 
-        // Extract tokens scattered in the raw HTML
+        // HTML Surface Tokens (May contain honeypots)
         val htmlTokens = extractVars(page)
 
         var jsFuckText = ""
@@ -298,7 +293,8 @@ class GalaxyDonghua : ExtractorApi() {
                                             for (idx in (a - 1) downTo 0) {
                                                 val k = dict.getOrNull(idx)
                                                 if (!k.isNullOrEmpty()) {
-                                                    code = Regex("""\b${Regex.escape(packrBase36(idx, a))}\b""").replace(code, Regex.escapeReplacement(k))
+                                                    code = Regex("""\b${Regex.escape(packrBase36(idx, a))}\b""")
+                                                        .replace(code, Regex.escapeReplacement(k))
                                                 }
                                             }
                                             jsFuckText = code
@@ -312,10 +308,10 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        // Extract tokens hidden inside the JSFuck payload
+        // JSFuck Encrypted Tokens (The real tokens)
         val jsTokens = extractVars(jsFuckText)
 
-        // Merge results: JSFuck tokens override HTML honeypot tokens to guarantee we grab everything
+        // Merge: Let embedded JSFuck tokens override surface HTML honeypot tokens
         val finalPd = jsTokens.pd.ifBlank { htmlTokens.pd }
         val finalPs = jsTokens.ps.ifBlank { htmlTokens.ps }
         val finalQsx = jsTokens.qsx.ifBlank { htmlTokens.qsx }
@@ -414,20 +410,20 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     private fun cryptoJsEvpKDF(password: ByteArray, salt: ByteArray, keySize: Int, ivSize: Int): ByteArray {
-        val derivedBytes = ByteArray(keySize + ivSize)
+        val derived = ByteArray(keySize + ivSize)
         var block: ByteArray? = null
         var offset = 0
         val md = MessageDigest.getInstance("MD5")
-        while (offset < derivedBytes.size) {
+        while (offset < derived.size) {
             if (block != null) md.update(block)
             md.update(password)
             if (salt.isNotEmpty()) md.update(salt)
             block = md.digest()
-            val len = minOf(block.size, derivedBytes.size - offset)
-            System.arraycopy(block, 0, derivedBytes, offset, len)
+            val len = minOf(block.size, derived.size - offset)
+            System.arraycopy(block, 0, derived, offset, len)
             offset += len
         }
-        return derivedBytes
+        return derived
     }
 
     private fun pbkdf2Sha256(password: ByteArray, salt: ByteArray, iterations: Int, dkLen: Int): ByteArray? = try {
@@ -439,7 +435,7 @@ class GalaxyDonghua : ExtractorApi() {
         for (block in 1..blocks) {
             val u = ByteArray(salt.size + 4)
             System.arraycopy(salt, 0, u, 0, salt.size)
-            u[salt.size] = (block ushr 24).toByte()
+            u[salt.size]     = (block ushr 24).toByte()
             u[salt.size + 1] = (block ushr 16).toByte()
             u[salt.size + 2] = (block ushr 8).toByte()
             u[salt.size + 3] = block.toByte()
@@ -467,62 +463,78 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     private fun dcx(input: String, password: String): String? {
+        if (input.isBlank()) return null
         try {
-            val sanitized = input.trim().replace("-", "+").replace("_", "/").replace(",,", "==").replace(",", "=")
-            val data = Base64.decode(sanitized, Base64.DEFAULT)
-            if (data.isEmpty()) return null
+            var s = input.trim().replace(",,", "==").replace(",", "=").replace("-", "+").replace("_", "/")
+            while (s.length % 4 != 0) s += "="
+
+            val data = try { Base64.decode(s, Base64.DEFAULT) } catch (e: Exception) { return null }
+            if (data.size < 32) return null
 
             val passBytes = password.toByteArray(Charsets.UTF_8)
             val md5Pass = MessageDigest.getInstance("MD5").digest(passBytes)
 
-            // Branch 1: Payload has standard CryptoJS "Salted__" header
-            if (data.size > 16 && String(data.copyOfRange(0, 8)) == "Salted__") {
+            val hasMagic = data.size >= 16 &&
+                    data[0] == 'S'.code.toByte() && data[1] == 'a'.code.toByte() &&
+                    data[2] == 'l'.code.toByte() && data[3] == 't'.code.toByte() &&
+                    data[4] == 'e'.code.toByte() && data[5] == 'd'.code.toByte() &&
+                    data[6] == '_'.code.toByte() && data[7] == '_'.code.toByte()
+
+            if (hasMagic) {
                 val salt = data.copyOfRange(8, 16)
                 val ct = data.copyOfRange(16, data.size)
                 
                 try {
-                    val derived = cryptoJsEvpKDF(passBytes, salt, 32, 16)
-                    val decrypted = aesDecrypt(ct, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
-                    if (decrypted != null && decrypted.contains("{")) return decrypted
+                    cryptoJsEvpKDF(passBytes, salt, 32, 16).let { k ->
+                        aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
+                    }
                 } catch (e: Exception) {}
 
-                for (iterations in listOf(1000, 5000, 10000)) {
+                for (iter in intArrayOf(1000, 5000, 10000, 100000)) {
                     try {
-                        val derived = pbkdf2Sha256(passBytes, salt, iterations, 48) ?: continue
-                        val decrypted = aesDecrypt(ct, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
-                        if (decrypted != null && decrypted.contains("{")) return decrypted
+                        pbkdf2Sha256(passBytes, salt, iter, 48)?.let { k ->
+                            aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
+                        }
+                    } catch (e: Exception) {}
+                }
+            } else {
+                val salt = data.copyOfRange(0, 16)
+                val ct = data.copyOfRange(16, data.size)
+                
+                try {
+                    cryptoJsEvpKDF(passBytes, salt, 32, 16).let { k ->
+                        aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
+                    }
+                } catch (e: Exception) {}
+
+                for (iter in intArrayOf(1000, 5000, 10000, 100000)) {
+                    try {
+                        pbkdf2Sha256(passBytes, salt, iter, 48)?.let { k ->
+                            aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
+                        }
                     } catch (e: Exception) {}
                 }
             }
 
-            // Branch 2: "Saltless" CryptoJS (Missing header, empty salt)
             try {
-                val derived = cryptoJsEvpKDF(passBytes, ByteArray(0), 32, 16)
-                val decrypted = aesDecrypt(data, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
-                if (decrypted != null && decrypted.contains("{")) return decrypted
+                cryptoJsEvpKDF(passBytes, ByteArray(0), 32, 16).let { k ->
+                    aesDecrypt(data, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
+                }
             } catch (e: Exception) {}
 
-            // Branch 3: Raw AES-CBC with MD5 Keys
             try {
-                val decrypted = aesDecrypt(data, md5Pass, md5Pass)
-                if (decrypted != null && decrypted.contains("{")) return decrypted
-            } catch(e: Exception) {}
+                aesDecrypt(data, md5Pass, md5Pass)?.let { if (it.contains("{")) return it }
+            } catch (e: Exception) {}
 
-            // Branch 4: Raw AES-ECB
             try {
-                val cipher = Cipher.getInstance("AES/ECB/PKCS5Padding")
-                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(md5Pass, "AES"))
-                val decrypted = String(cipher.doFinal(data), Charsets.UTF_8)
-                if (decrypted.contains("{")) return decrypted
-            } catch(e: Exception) {}
+                val c = Cipher.getInstance("AES/ECB/PKCS5Padding")
+                c.init(Cipher.DECRYPT_MODE, SecretKeySpec(md5Pass, "AES"))
+                String(c.doFinal(data), Charsets.UTF_8).let { if (it.contains("{")) return it }
+            } catch (e: Exception) {}
 
-            // Branch 5: Raw AES-CBC with Zero-Padded Keys
             try {
-                val key16 = passBytes.copyOf(16)
-                val iv16 = passBytes.copyOf(16)
-                val decrypted = aesDecrypt(data, key16, iv16)
-                if (decrypted != null && decrypted.contains("{")) return decrypted
-            } catch(e: Exception) {}
+                aesDecrypt(data, passBytes.copyOf(16), passBytes.copyOf(16))?.let { if (it.contains("{")) return it }
+            } catch (e: Exception) {}
 
         } catch (e: Exception) {}
         return null
@@ -533,10 +545,8 @@ class GalaxyDonghua : ExtractorApi() {
         if (u.isBlank()) return null
         if (u.startsWith("http://") || u.startsWith("https://")) return u
         if (u.startsWith("//")) return "https:$u"
-        val host = try { val uri = URI(base); "${uri.scheme}://${uri.host}" }
-            catch (e: Exception) { null }
-        return if (u.startsWith("/")) (host ?: base.trimEnd('/')) + u
-        else (host ?: base.trimEnd('/')) + "/" + u
+        val host = try { val uri = URI(base); "${uri.scheme}://${uri.host}" } catch (e: Exception) { null }
+        return if (u.startsWith("/")) (host ?: base.trimEnd('/')) + u else (host ?: base.trimEnd('/')) + "/" + u
     }
 
     private fun embedHost(url: String): String = try {
