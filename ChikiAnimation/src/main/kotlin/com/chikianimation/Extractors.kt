@@ -72,11 +72,16 @@ open class GalaxyDonghua : ExtractorApi() {
                 source = this.name,
                 name = this.name,
                 url = streamUrl,
-                referer = gxBase,
-                quality = Qualities.Unknown.value,
-                type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                headers = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
-            ))
+                type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            ) {
+                this.referer = gxBase
+                this.quality = Qualities.Unknown.value
+                this.headers = mapOf(
+                    "User-Agent" to UA,
+                    "Referer" to gxBase,
+                    "Origin" to gxBase
+                )
+            })
             Log.e(TAG, "Successfully emitted stream link: $streamUrl")
         } else {
             Log.e(TAG, "CRITICAL: Could not find VID_SRC in page source.")
