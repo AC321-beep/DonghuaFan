@@ -1,6 +1,7 @@
 package com.chikianimation
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
@@ -30,8 +31,8 @@ class ChikiAnimationProvider : MainAPI() {
 
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-        "Referer" to mainUrl,
-        "Origin" to mainUrl
+        "Referer"    to mainUrl,
+        "Origin"     to mainUrl
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -243,9 +244,14 @@ class ChikiAnimationProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        val t0 = System.currentTimeMillis()
+        Log.e(TAG, "════════ SECTION: loadLinks ════════")
+        Log.e(TAG, "[loadLinks] data='$data'")
+
         val document = try {
             app.get(data, headers = defaultHeaders).document
         } catch (e: Exception) {
+            Log.e(TAG, "[loadLinks] page fetch failed: ${e.message}")
             return false
         }
 
@@ -297,6 +303,8 @@ class ChikiAnimationProvider : MainAPI() {
                 ?: Regex("""[?&]id=([a-zA-Z0-9_-]{10,})""").find(cleanUrl)?.groupValues?.get(1)
                 ?: return false
 
+            Log.e(TAG, "[GDrive] fileId=$fileId")
+
             val driveViewUrl = "https://drive.google.com/file/d/$fileId/view"
             val encodedDriveUrl = try {
                 URLEncoder.encode(driveViewUrl, "UTF-8")
@@ -317,7 +325,9 @@ class ChikiAnimationProvider : MainAPI() {
 
             for (gpUrl in gdrivePlayerUrls) {
                 try {
+                    Log.e(TAG, "[GDrive] trying mirror: $gpUrl")
                     if (loadExtractor(gpUrl, referer = ref, subtitleCallback, callback)) {
+                        Log.e(TAG, "[GDrive] ✓ mirror succeeded: $gpUrl")
                         return true
                     }
                 } catch (_: Exception) { }
@@ -337,11 +347,13 @@ class ChikiAnimationProvider : MainAPI() {
                     ),
                     allowRedirects = false
                 )
+                Log.e(TAG, "[GDrive] direct probe: code=${response.code} ct=${response.headers["Content-Type"]}")
 
                 // 2a) Follow any 30x redirect straight to the CDN
                 if (response.code in 300..399) {
                     val redirectUrl = response.headers["Location"]
                     if (!redirectUrl.isNullOrBlank() && redirectUrl.startsWith("http")) {
+                        Log.e(TAG, "[GDrive] 30x redirect: ${redirectUrl.take(160)}")
                         callback.invoke(
                             newExtractorLink(
                                 source = this.name,
@@ -362,6 +374,7 @@ class ChikiAnimationProvider : MainAPI() {
                 if (response.code == 200) {
                     val ct = response.headers["Content-Type"] ?: ""
                     if (ct.contains("video", true) || ct.contains("octet-stream", true)) {
+                        Log.e(TAG, "[GDrive] 200 direct video ct=$ct")
                         callback.invoke(
                             newExtractorLink(
                                 source = this.name,
@@ -396,6 +409,7 @@ class ChikiAnimationProvider : MainAPI() {
                             params.add("id=$fileId")
                             params.add("export=download")
                             val confirmedUrl = "$action?" + params.joinToString("&")
+                            Log.e(TAG, "[GDrive] confirm flow: ${confirmedUrl.take(160)}")
 
                             callback.invoke(
                                 newExtractorLink(
@@ -417,6 +431,7 @@ class ChikiAnimationProvider : MainAPI() {
 
             // ---- 3) Absolute last resort - hand the raw URL to the player ----
             try {
+                Log.e(TAG, "[GDrive] last resort: emitting raw download URL")
                 callback.invoke(
                     newExtractorLink(
                         source = this.name,
@@ -447,9 +462,12 @@ class ChikiAnimationProvider : MainAPI() {
                 cleanUrl.contains("doubleclick", true)
             ) return
 
+            Log.e(TAG, "[handleUrl] (depth=$depth) $cleanUrl")
+
             try {
                 // ---- Google Drive FIRST (before any generic fallback) ----
                 if (handleGoogleDrive(cleanUrl, ref)) {
+                    Log.e(TAG, "[handleUrl] ✔ Google Drive handled")
                     found = true
                     return
                 }
@@ -471,6 +489,7 @@ class ChikiAnimationProvider : MainAPI() {
                             val streamUrl = Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""").find(apiRes)?.groupValues?.get(1)
 
                             if (!streamUrl.isNullOrBlank()) {
+                                Log.e(TAG, "[DM] ✓ direct m3u8: ${streamUrl.take(140)}")
                                 callback.invoke(
                                     newExtractorLink(
                                         source = "Dailymotion",
@@ -485,27 +504,40 @@ class ChikiAnimationProvider : MainAPI() {
                                 found = true
                                 return
                             }
-                        } catch (e: Exception) { }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "[DM] api failed: ${e.message}")
+                        }
 
                         val realDmUrl = "https://www.dailymotion.com/embed/video/$videoId"
+                        Log.e(TAG, "[DM] fallback to Dailymotion extractor")
                         com.lagradost.cloudstream3.extractors.Dailymotion().getUrl(realDmUrl, ref, subtitleCallback, callback)
                         found = true
                         return
                     }
                 }
                 else if (cleanUrl.contains("dailymotion.com", true) || cleanUrl.contains("dai.ly", true)) {
+                    Log.e(TAG, "[DM] direct dailymotion link")
                     com.lagradost.cloudstream3.extractors.Dailymotion().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true
                     return
                 }
 
                 if (cleanUrl.contains("galaxydonghua", true)) {
+                    Log.e(TAG, "[handleUrl] ✔ ROUTE GalaxyDonghua")
                     GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true
                     return
                 }
 
+                if (cleanUrl.contains("skylineai.cloud", true)) {
+                    Log.e(TAG, "[handleUrl] ✔ ROUTE SkylineAI")
+                    SkylineAI().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                    found = true
+                    return
+                }
+
                 if (cleanUrl.contains("ghbrisk.com", true)) {
+                    Log.e(TAG, "[handleUrl] ✔ ROUTE Ghbrisk")
                     Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true
                     return
@@ -513,6 +545,7 @@ class ChikiAnimationProvider : MainAPI() {
 
                 val ok = loadExtractor(cleanUrl, referer = ref, subtitleCallback, callback)
                 if (ok) {
+                    Log.e(TAG, "[handleUrl] ✔ loadExtractor TRUE")
                     found = true
                     return
                 }
@@ -524,9 +557,11 @@ class ChikiAnimationProvider : MainAPI() {
                 streamRegex.findAll(html).forEach { m ->
                     val fileUrl = m.groupValues[1].replace("\\/", "/")
                     if (fileUrl.contains(".m3u8", ignoreCase = true)) {
+                        Log.e(TAG, "[generic] m3u8: ${fileUrl.take(140)}")
                         M3u8Helper.generateM3u8("Generic HLS", fileUrl, cleanUrl).forEach { callback.invoke(it) }
                         foundGeneric = true
                     } else if (fileUrl.contains(".mp4", ignoreCase = true)) {
+                        Log.e(TAG, "[generic] mp4: ${fileUrl.take(140)}")
                         callback.invoke(
                             newExtractorLink(
                                 source = "Generic MP4",
@@ -546,13 +581,16 @@ class ChikiAnimationProvider : MainAPI() {
                     val iframeNode = Jsoup.parse(html).selectFirst("iframe")
                     val nestedIframe = iframeNode?.let { getIframeSrc(it) }
                     if (!nestedIframe.isNullOrBlank() && nestedIframe.startsWith("http")) {
+                        Log.e(TAG, "[generic] nested iframe: ${nestedIframe.take(140)}")
                         handleUrl(nestedIframe, cleanUrl, depth + 1)
                         foundGeneric = true
                     }
                 }
                 if (foundGeneric) found = true
 
-            } catch (e: Exception) { }
+            } catch (e: Exception) {
+                Log.e(TAG, "[handleUrl] ex: ${e.message}")
+            }
         }
 
         suspend fun processDecodedHtml(decoded: String, ref: String) {
@@ -574,6 +612,9 @@ class ChikiAnimationProvider : MainAPI() {
 
         val serverListItems = document.select(".server_list li, ul.episodes li, .mirror_link, .mirrors li")
 
+        Log.e(TAG, "[loadLinks] mirror options found: ${mirrorOptions.size}")
+        Log.e(TAG, "[loadLinks] server list items found: ${serverListItems.size}")
+
         coroutineScope {
             mirrorOptions.map { option ->
                 async {
@@ -581,13 +622,17 @@ class ChikiAnimationProvider : MainAPI() {
                     if (value.isBlank()) return@async
 
                     if (value.startsWith("http") || value.startsWith("//")) {
+                        Log.e(TAG, "[mirror] raw url: ${value.take(140)}")
                         handleUrl(value, data)
                         return@async
                     }
 
                     val decoded = safeBase64Decode(value)
                     if (!decoded.isNullOrBlank()) {
+                        Log.e(TAG, "[mirror] ✓ decoded: ${decoded.take(180)}")
                         processDecodedHtml(decoded, data)
+                    } else {
+                        Log.e(TAG, "[mirror] base64 decode failed for: ${value.take(80)}")
                     }
                 }
             }.awaitAll()
@@ -597,10 +642,12 @@ class ChikiAnimationProvider : MainAPI() {
                     val videoAttr = el.attr("data-video").ifBlank { el.attr("data-src") }.ifBlank { el.attr("data-embed") }
                     if (videoAttr.isNotBlank()) {
                         if (videoAttr.startsWith("http") || videoAttr.startsWith("//")) {
+                            Log.e(TAG, "[serverList] raw url: ${videoAttr.take(140)}")
                             handleUrl(videoAttr, data)
                         } else if (videoAttr.length > 20) {
                             val decoded = safeBase64Decode(videoAttr)
                             if (!decoded.isNullOrBlank()) {
+                                Log.e(TAG, "[serverList] ✓ decoded: ${decoded.take(180)}")
                                 if (decoded.startsWith("http")) handleUrl(decoded, data)
                                 else processDecodedHtml(decoded, data)
                             }
@@ -611,6 +658,7 @@ class ChikiAnimationProvider : MainAPI() {
         }
 
         if (!found) {
+            Log.e(TAG, "[loadLinks] fallback: scanning <iframe> elements")
             document.select("iframe").forEach { iframe ->
                 val src = getIframeSrc(iframe)
                 if (src.isNotBlank()) handleUrl(src, data)
@@ -618,6 +666,7 @@ class ChikiAnimationProvider : MainAPI() {
         }
 
         if (!found) {
+            Log.e(TAG, "[loadLinks] fallback: scanning <script> bodies")
             document.select("script").forEach { script ->
                 val body = script.data()
 
@@ -634,6 +683,11 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
+        Log.e(TAG, "[loadLinks] ════ FINAL RETURN found=$found at +${System.currentTimeMillis() - t0}ms ════")
         return found
+    }
+
+    companion object {
+        private const val TAG = "ChikiDbg"
     }
 }
