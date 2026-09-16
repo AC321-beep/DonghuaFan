@@ -44,7 +44,6 @@ open class GalaxyDonghua : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val t0 = System.currentTimeMillis()
-        Log.e(TAG, "[DEBUG] ══ Starting extraction for URL: $url")
         val gxBase = embedHost(url)
 
         val headers = mapOf(
@@ -61,14 +60,12 @@ open class GalaxyDonghua : ExtractorApi() {
         var page = try {
             app.get(url, headers = headers).text
         } catch (e: Exception) {
-            Log.e(TAG, "[DEBUG] Initial GET fetch failed: ${e.message}")
+            Log.e(TAG, "Page fetch failed: ${e.message}")
             return
         }
-        
-        Log.e(TAG, "[DEBUG] Initial GET successful. Page length: ${page.length}")
 
         // ════════════════════════════════════════════════════════
-        // GATEWAY BYPASS (Handles the "Server Selection" form)
+        // GATEWAY BYPASS (Handles the "Server Selection" POST form)
         // ════════════════════════════════════════════════════════
         val formMatch = Regex("""<form\s+id="frmValidation"\s+action="([^"]+)"""").find(page)
         if (formMatch != null) {
@@ -78,16 +75,9 @@ open class GalaxyDonghua : ExtractorApi() {
             val refMatch = Regex("""<input\s+type="hidden"\s+id="referer"\s+name="referer"\s+value="([^"]*)"""").find(page)
             val formReferer = refMatch?.groupValues?.get(1) ?: referer ?: gxBase
 
-            Log.e(TAG, "[DEBUG] Gateway detected! Bypassing via POST to $actionUrl")
             page = try {
                 app.post(actionUrl, headers = headers, data = mapOf("referer" to formReferer)).text
-            } catch (e: Exception) {
-                Log.e(TAG, "[DEBUG] Gateway POST failed: ${e.message}")
-                return
-            }
-            Log.e(TAG, "[DEBUG] POST bypass successful. New page length: ${page.length}")
-        } else {
-            Log.e(TAG, "[DEBUG] No Gateway form detected. Proceeding normally.")
+            } catch (e: Exception) { return }
         }
 
         // ════════════════════════════════════════════════════════
@@ -96,8 +86,6 @@ open class GalaxyDonghua : ExtractorApi() {
         val vidSrcMatch = Regex("""const\s+VID_SRC\s*=\s*"([^"]+)"""").find(page)
         if (vidSrcMatch != null && vidSrcMatch.groupValues[1].isNotBlank()) {
             val streamUrl = vidSrcMatch.groupValues[1].replace("\\/", "/")
-            Log.e(TAG, "[DEBUG] Found unencrypted VID_SRC: $streamUrl")
-            
             val isM3u8 = streamUrl.contains(".m3u8") || streamUrl.contains("hls")
             
             callback.invoke(newExtractorLink(
@@ -117,37 +105,26 @@ open class GalaxyDonghua : ExtractorApi() {
                 val subUrl = m.groupValues[2].replace("\\/", "/")
                 subtitleCallback.invoke(SubtitleFile(lang, subUrl))
             }
-            Log.e(TAG, "[DEBUG] Fast Path Complete. Exiting extractor.")
             return 
-        } else {
-            Log.e(TAG, "[DEBUG] VID_SRC not found. Falling back to JSFuck Decryption.")
         }
 
         // ════════════════════════════════════════════════════════
         // 2. GALAXYDONGHUA SLOW PATH (Encrypted JSFuck Tokens)
         // ════════════════════════════════════════════════════════
-        var tokens = decodeGdTokens(page)
-        if (tokens == null) {
-            Log.e(TAG, "[DEBUG] CRITICAL: decodeGdTokens returned null.")
-            return
-        }
-
+        val tokens = decodeGdTokens(page) ?: return
         val password = pickPassword(tokens)
-        Log.e(TAG, "[DEBUG] Selected Password for Decryption: $password")
         
         var streamJson: String? = tryFastApi(tokens, password, headers, url, gxBase, t0)
 
         if (streamJson == null) {
-            Log.e(TAG, "[DEBUG] Fast API failed. Falling back to local brute-force…")
             streamJson = tryLocalBruteForce(tokens, password, headers, t0)
         }
 
         if (streamJson == null) {
-            Log.e(TAG, "[DEBUG] CRITICAL: Stream decryption failed entirely.")
+            Log.e(TAG, "CRITICAL: Stream decryption failed entirely")
             return
         }
 
-        Log.e(TAG, "[DEBUG] Decryption successful! Parsing stream JSON...")
         emitStreams(streamJson, gxBase, callback, subtitleCallback)
     }
 
@@ -162,10 +139,7 @@ open class GalaxyDonghua : ExtractorApi() {
             String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT), Charsets.UTF_8).trim()
         } catch (_: Exception) { "" }
 
-        if (decodedApx.isBlank() && tokens.kaken.isBlank() && tokens.qsx.isBlank()) {
-            Log.e(TAG, "[DEBUG] tryFastApi: apx, kaken, and qsx are blank. Skipping.")
-            return null
-        }
+        if (decodedApx.isBlank() && tokens.kaken.isBlank() && tokens.qsx.isBlank()) return null
 
         val mid = tokens.kaken.ifBlank { tokens.qsx }
         val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
@@ -179,17 +153,16 @@ open class GalaxyDonghua : ExtractorApi() {
             "kaken" to tokens.kaken, "apx" to tokens.apx
         )
 
-        for ((i, u) in urls.withIndex()) {
-            Log.e(TAG, "[DEBUG] tryFastApi: Requesting API Endpoint [$i]: $u")
+        for (u in urls) {
             try {
                 val r = app.post(u, data = postData, headers = headers)
                 if (r.text.isNotBlank()) dcx(r.text.trim(), password)?.let { return it }
-            } catch (e: Exception) { Log.e(TAG, "[DEBUG] tryFastApi POST error: ${e.message}") }
+            } catch (e: Exception) { }
             
             try {
                 val r = app.get(u, headers = headers)
                 if (r.text.isNotBlank()) dcx(r.text.trim(), password)?.let { return it }
-            } catch (e: Exception) { Log.e(TAG, "[DEBUG] tryFastApi GET error: ${e.message}") }
+            } catch (e: Exception) { }
         }
         return null
     }
@@ -201,8 +174,6 @@ open class GalaxyDonghua : ExtractorApi() {
         tokens: GdTokens, password: String, headers: Map<String, String>, t0: Long
     ): String? {
         val fragments = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx).filter { it != password && it.length > 20 }
-        Log.e(TAG, "[DEBUG] tryLocalBruteForce: Checking ${fragments.size} fragments for payload.")
-        
         var streamJson: String? = null
         var configJson: String? = null
 
@@ -242,7 +213,6 @@ open class GalaxyDonghua : ExtractorApi() {
             val type  = m.groupValues[3]
             val isM3u8 = streamUrl.contains(".m3u8") || type.contains("hls", true)
 
-            Log.e(TAG, "[DEBUG] Found Stream URL: $streamUrl")
             callback.invoke(newExtractorLink(
                 source = this.name,
                 name = "${this.name} – $label",
@@ -262,7 +232,7 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  TOKEN EXTRACTION & JSFUCK DECODER (Updated Fallback)
+    //  AGGRESSIVE TOKEN EXTRACTION & AAENCODE DECODER
     // ────────────────────────────────────────────────────────────────
     protected data class GdTokens(val pd: String, val ps: String, val qsx: String, val kaken: String, val apx: String)
 
@@ -276,31 +246,24 @@ open class GalaxyDonghua : ExtractorApi() {
     private fun decodeGdTokens(page: String): GdTokens? {
         fun extractVars(text: String): GdTokens {
             fun grabVar(name: String): String {
-                Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*["']([^"']+)["']""").find(text)?.let { return it.groupValues[1].trim() }
-                Regex("""['"]?\b$name\b['"]?\s*:\s*["']([^"']+)["']""").find(text)?.let { return it.groupValues[1].trim() }
-                Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*(\d+)""").find(text)?.let { return it.groupValues[1].trim() }
-                return ""
+                // Highly aggressive regex: Finds variable anywhere, handling all quote types, backticks, or pure numbers
+                val rx = Regex("""\b$name\b\s*[:=]\s*['"`]?([^'"`\s,;{}()]+)['"`]?""")
+                return rx.find(text)?.groupValues?.get(1)?.trim() ?: ""
             }
             return GdTokens(grabVar("pd"), grabVar("ps"), grabVar("qsx"), grabVar("kaken"), grabVar("apx"))
         }
 
-        val html = extractVars(page)
-        Log.e(TAG, "[DEBUG] Native HTML variables found -> pd: ${html.pd.isNotBlank()}, ps: ${html.ps.isNotBlank()}")
-        
         var jsFuck = ""
-
         val startMatch = Regex("""ﾟωﾟﾉ\s*=""").find(page)
         if (startMatch != null) {
-            Log.e(TAG, "[DEBUG] JSFuck block detected. Attempting to parse...")
             val jStart = startMatch.range.first
             val endMatch = Regex("""\)\s*\(\s*ﾟΘﾟ\s*\)\s*\)\s*\(\s*'_'\s*\)""").find(page, jStart)
             if (endMatch != null) {
                 val rawJsFuck = page.substring(jStart, endMatch.range.last + 1).replace(Regex("""[\s\u00a0\u3000]+"""), "")
                 val bStart = rawJsFuck.indexOf("(ﾟεﾟ+")
                 if (bStart >= 0) {
-                    val commentEnd = rawJsFuck.indexOf("*/", bStart)
-                    val markerEnd = if (commentEnd >= 0) commentEnd + 2 else bStart + 5
-                    var body = rawJsFuck.substring(markerEnd)
+                    val bodyStart = rawJsFuck.indexOf("*/", bStart).let { if (it >= 0) it + 2 else bStart + 5 }
+                    var body = rawJsFuck.substring(bodyStart)
                     val oMarker = body.lastIndexOf("(ﾟДﾟ)[ﾟoﾟ]")
                     if (oMarker >= 0) body = body.substring(0, oMarker)
 
@@ -312,71 +275,26 @@ open class GalaxyDonghua : ExtractorApi() {
                         val digits = StringBuilder()
                         for (term in splitTopLevelTerms(s)) {
                             val t = term.trim()
-                            val raw = if (t.startsWith("-")) {
-                                val n = evalArithmetic(t.substring(1)) ?: break
-                                -n
-                            } else {
-                                evalArithmetic(t.trimStart('+')) ?: break
-                            }
+                            val raw = if (t.startsWith("-")) -(evalArithmetic(t.substring(1)) ?: 0)
+                                      else evalArithmetic(t.trimStart('+')) ?: 0
                             val v = abs(raw)
-                            if (v > 7) break
-                            digits.append(v)
+                            if (v in 0..7) digits.append(v)
                         }
                         if (digits.isNotEmpty()) sb.append(digits.toString().toInt(8).toChar())
                     }
-
-                    val packrCall = sb.toString()
-                    var unpacked = packrCall 
-
-                    // Fallback fix: If they removed the "p,a,c,k,e,d" packer, 'unpacked' remains the raw string.
-                    val pStart = packrCall.indexOf("}('")
-                    if (pStart >= 0) {
-                        val packedStart = pStart + 3
-                        val packedEnd = packrCall.indexOf("',", packedStart)
-                        if (packedEnd >= 0) {
-                            val packed = packrCall.substring(packedStart, packedEnd)
-                            val num1Start = packedEnd + 2
-                            val num1End = packrCall.indexOf(",", num1Start)
-                            if (num1End >= 0) {
-                                val a = packrCall.substring(num1Start, num1End).toIntOrNull()
-                                if (a != null) {
-                                    val dictStartRaw = packrCall.indexOf(",'", num1End)
-                                    if (dictStartRaw >= 0) {
-                                        val dictStart = dictStartRaw + 2
-                                        val dictEnd = packrCall.indexOf("'.split", dictStart)
-                                        if (dictEnd >= 0) {
-                                            val dict = packrCall.substring(dictStart, dictEnd).split("|")
-                                            var tempCode = packed
-                                            for (idx in (a - 1) downTo 0) {
-                                                val k = dict.getOrNull(idx)
-                                                if (!k.isNullOrEmpty()) {
-                                                    tempCode = Regex("""\b${Regex.escape(packrBase36(idx, a))}\b""")
-                                                        .replace(tempCode, Regex.escapeReplacement(k))
-                                                }
-                                            }
-                                            unpacked = tempCode
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    jsFuck = unpacked
-                    Log.e(TAG, "[DEBUG] JSFuck decoding completed. Result length: ${jsFuck.length}")
+                    jsFuck = sb.toString()
                 }
             }
-        } else {
-            Log.e(TAG, "[DEBUG] No JSFuck block detected.")
         }
 
         val js = extractVars(jsFuck)
+        val html = extractVars(page)
+
         val finalPd    = js.pd.ifBlank    { html.pd }
         val finalPs    = js.ps.ifBlank    { html.ps }
         val finalQsx   = js.qsx.ifBlank   { html.qsx }
         val finalKaken = js.kaken.ifBlank { html.kaken }
         val finalApx   = js.apx.ifBlank   { html.apx }
-
-        Log.e(TAG, "[DEBUG] Final Extracted Tokens -> PD: ${finalPd.take(10)}..., PS: ${finalPs.take(10)}..., QSX: ${finalQsx.take(10)}...")
 
         if (listOf(finalPd, finalApx).all { it.isBlank() }) return null
         return GdTokens(finalPd, finalPs, finalQsx, finalKaken, finalApx)
@@ -458,13 +376,6 @@ open class GalaxyDonghua : ExtractorApi() {
             values.add(if (op == '+') a + b else a - b)
         }
         return values.firstOrNull()
-    }
-
-    private fun packrBase36(c: Int, a: Int): String {
-        val prefix = if (c < a) "" else packrBase36(c / a, a)
-        val rem = c % a
-        val suffix = if (rem > 35) (rem + 29).toChar().toString() else rem.toString(36)
-        return prefix + suffix
     }
 
     // ────────────────────────────────────────────────────────────────
