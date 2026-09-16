@@ -71,31 +71,25 @@ class GalaxyDonghua : ExtractorApi() {
         }
         Log.e(TAG, "Page fetched (len=${page.length}) at +${System.currentTimeMillis() - t0}ms")
 
-        // Decode tokens AND capture the decoded JSFuck source
-        val decoded = decodeGdTokensAndSource(page) ?: run {
+        // ════════════════════════════════════════════════════════════
+        // FULL-PAGE DIAGNOSTICS — the player code lives in the raw
+        // page, not in the small JSFuck block
+        // ════════════════════════════════════════════════════════════
+        diagnoseScripts(page, gxBase, headers)
+
+        // Token extraction (unchanged)
+        val tokens = decodeGdTokens(page) ?: run {
             Log.e(TAG, "CRITICAL: Failed to decode GD tokens")
             return
         }
-        val tokens = decoded.tokens
-
-        // ════════════════════════════════════════════════════════════
-        // DIAGNOSTICS — run on the JSFuck-decoded JS, NOT the raw HTML
-        // ════════════════════════════════════════════════════════════
-        dumpLoadConfig(decoded.jsSource)
-        dumpCookieAssignments(decoded.jsSource)
-        dumpNetworkCalls(decoded.jsSource)
-
         val password = pickPassword(tokens)
         Log.e(TAG, "Password: $password at +${System.currentTimeMillis() - t0}ms")
 
-        // FAST PATH — API call before brute-force, while pd is fresh
         var streamJson: String? = tryFastApi(tokens, password, headers, url, gxBase, t0)
-
         if (streamJson == null) {
             Log.e(TAG, "Fast path returned nothing. Falling back to local brute-force…")
             streamJson = tryLocalBruteForce(tokens, password, headers, t0)
         }
-
         if (streamJson == null) {
             Log.e(TAG, "CRITICAL: stream decryption failed entirely at +${System.currentTimeMillis() - t0}ms")
             return
@@ -106,54 +100,117 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  DIAGNOSTICS — run on decoded JS source
+    //  FULL-PAGE DIAGNOSTICS
     // ────────────────────────────────────────────────────────────────
-    private fun dumpLoadConfig(js: String) {
-        if (js.isBlank()) { Log.e(TAG, "loadConfig dump: JS source is empty"); return }
-        val lcIdx = js.indexOf("function loadConfig")
-        val idx = if (lcIdx >= 0) lcIdx else js.indexOf("loadConfig")
-        if (idx < 0) {
-            Log.e(TAG, "loadConfig not found in decoded JS (len=${js.length})")
-            return
+    private suspend fun diagnoseScripts(
+        page: String,
+        gxBase: String,
+        headers: Map<String, String>
+    ) {
+        // 1) Collect all inline and external script tags
+        val externalUrls = mutableListOf<String>()
+        val inlineScripts = mutableListOf<Pair<Int, String>>()
+
+        val srcRx = Regex("""<script[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>""", RegexOption.IGNORE_CASE)
+        for (m in srcRx.findAll(page)) {
+            externalUrls.add(m.groupValues[1])
         }
-        val start = maxOf(0, idx - 200)
-        val end = minOf(start + 5000, js.length)
-        Log.e(TAG, "════ loadConfig dump BEGIN (js.len=${js.length}) ════")
-        // Split into chunks so logcat doesn't truncate
-        val chunk = js.substring(start, end)
-        val CHUNK = 800
+
+        val inlineRx = Regex(
+            """<script\b[^>]*>(.*?)</script>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        )
         var i = 0
-        while (i < chunk.length) {
-            Log.e(TAG, chunk.substring(i, minOf(i + CHUNK, chunk.length)))
-            i += CHUNK
+        for (m in inlineRx.findAll(page)) {
+            val body = m.groupValues[1]
+            if (body.isNotBlank()) {
+                inlineScripts.add(i to body)
+                i++
+            }
         }
-        Log.e(TAG, "════ loadConfig dump END ════")
-    }
 
-    private fun dumpCookieAssignments(js: String) {
-        if (js.isBlank()) return
-        val rx = Regex("""document\.cookie\s*=\s*[^;\n]{0,200}""")
-        val hits = rx.findAll(js).toList()
-        if (hits.isEmpty()) {
-            Log.e(TAG, "No document.cookie assignments in decoded JS")
-        } else {
-            for (m in hits) Log.e(TAG, "cookie → ${m.value}")
+        Log.e(TAG, "Page has ${inlineScripts.size} inline scripts, ${externalUrls.size} external scripts")
+        for ((idx, body) in inlineScripts) {
+            Log.e(TAG, "  inline #$idx len=${body.length}  contains 'loadConfig'=${body.contains("loadConfig")}")
         }
-    }
+        for ((idx, u) in externalUrls.withIndex()) {
+            Log.e(TAG, "  external #$idx: $u")
+        }
 
-    private fun dumpNetworkCalls(js: String) {
-        if (js.isBlank()) return
-        val rx = Regex("""(?:fetch|XMLHttpRequest|\$\.ajax|axios|\.open)\s*\([^)]{0,250}""")
-        val hits = rx.findAll(js).take(15).toList()
-        if (hits.isEmpty()) {
-            Log.e(TAG, "No network calls in decoded JS")
-        } else {
-            for (m in hits) Log.e(TAG, "net → ${m.value.take(250)}")
+        // 2) Look for loadConfig in EACH inline script + the raw page
+        val candidates = mutableListOf<Pair<String, String>>()
+        candidates.add("RAW-PAGE" to page)
+        for ((idx, body) in inlineScripts) {
+            candidates.add("inline#$idx" to body)
+        }
+
+        var found = false
+        for ((label, content) in candidates) {
+            val idx = content.indexOf("loadConfig")
+            if (idx < 0) continue
+            found = true
+            Log.e(TAG, "════ loadConfig in $label (offset=$idx, len=${content.length}) ════")
+            val start = maxOf(0, idx - 400)
+            val end = minOf(idx + 6000, content.length)
+            val slice = content.substring(start, end)
+            val CHUNK = 800
+            var p = 0
+            while (p < slice.length) {
+                Log.e(TAG, slice.substring(p, minOf(p + CHUNK, slice.length)))
+                p += CHUNK
+            }
+            Log.e(TAG, "════ loadConfig end $label ════")
+        }
+        if (!found) {
+            Log.e(TAG, "loadConfig NOT FOUND in raw page or any inline script")
+        }
+
+        // 3) Search for cookies / fetch / xhr in EACH inline script
+        for ((label, content) in candidates) {
+            val cookieRx = Regex("""document\.cookie\s*=\s*[^;\n]{0,200}""")
+            for (m in cookieRx.findAll(content).take(3)) {
+                Log.e(TAG, "[$label] cookie → ${m.value}")
+            }
+            val netRx = Regex("""(?:fetch|XMLHttpRequest|\$\.ajax|axios|\.open)\s*\([^)]{0,250}""")
+            for (m in netRx.findAll(content).take(10)) {
+                Log.e(TAG, "[$label] net → ${m.value.take(250)}")
+            }
+        }
+
+        // 4) Fetch external scripts and check them too
+        for ((idx, u) in externalUrls.withIndex()) {
+            val abs = when {
+                u.startsWith("http") -> u
+                u.startsWith("//") -> "https:$u"
+                u.startsWith("/") -> "$gxBase$u"
+                else -> "$gxBase/$u"
+            }
+            try {
+                val r = app.get(abs, headers = headers)
+                val body = r.text
+                Log.e(TAG, "  external #$idx fetched len=${body.length}  contains 'loadConfig'=${body.contains("loadConfig")}")
+                if (body.contains("loadConfig")) {
+                    val idx2 = body.indexOf("loadConfig")
+                    Log.e(TAG, "════ loadConfig in external#$idx ($abs) ════")
+                    val start = maxOf(0, idx2 - 400)
+                    val end = minOf(idx2 + 6000, body.length)
+                    val slice = body.substring(start, end)
+                    val CHUNK = 800
+                    var p = 0
+                    while (p < slice.length) {
+                        Log.e(TAG, slice.substring(p, minOf(p + CHUNK, slice.length)))
+                        p += CHUNK
+                    }
+                    Log.e(TAG, "════ end external#$idx ════")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "  external #$idx fetch failed: ${e.message}")
+            }
         }
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  FAST PATH
+    //  FAST PATH — unchanged from previous build
     // ────────────────────────────────────────────────────────────────
     private suspend fun tryFastApi(
         tokens: GdTokens,
@@ -172,31 +229,23 @@ class GalaxyDonghua : ExtractorApi() {
 
         val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
         val mid = tokens.kaken.ifBlank { tokens.qsx }
-        val pd = tokens.pd
-        val ps = tokens.ps
 
-        // Try two URL shapes: kaken-only and kaken+qsx
         val urls = listOf(
-            prefix + mid + pd + ps,
-            prefix + tokens.kaken + tokens.qsx + pd + ps
+            prefix + mid + tokens.pd + tokens.ps,
+            prefix + tokens.kaken + tokens.qsx + tokens.pd + tokens.ps
         )
 
         val postData = mapOf(
-            "pd" to pd, "ps" to ps,
+            "pd" to tokens.pd, "ps" to tokens.ps,
             "qsx" to tokens.qsx, "kaken" to tokens.kaken, "apx" to tokens.apx
         )
 
         for (u in urls) {
-            // POST first
             try {
                 val r = app.post(u, data = postData, headers = headers)
-                val finalUrl = try { r.url.toString() } catch (_: Exception) { "?" }
-                Log.e(TAG, "Fast POST code=${r.code} finalUrl=${finalUrl.take(180)}… ct=${r.headers["Content-Type"]} len=${r.text.length} at +${System.currentTimeMillis() - t0}ms")
+                Log.e(TAG, "Fast POST code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length} at +${System.currentTimeMillis() - t0}ms")
                 if (r.text.isNotBlank()) {
-                    dcx(r.text.trim(), password)?.let {
-                        Log.e(TAG, "Fast POST decrypted stream JSON (url variant: ${u == urls[0]})")
-                        return it
-                    }
+                    dcx(r.text.trim(), password)?.let { return it }
                     val maybeConfig = dcx(r.text.trim(), password)
                     if (maybeConfig != null && maybeConfig.contains("\"url\"")) {
                         val tpl = Regex(""""url"\s*:\s*"([^"]+)"""")
@@ -207,36 +256,23 @@ class GalaxyDonghua : ExtractorApi() {
                                 .replace("{qsx}", tokens.qsx).replace("{kaken}", tokens.kaken)
                                 .replace("{apx}", tokens.apx)
                             val r2 = app.post(fixed, data = postData, headers = headers)
-                            Log.e(TAG, "Fast stream-POST code=${r2.code} len=${r2.text.length}")
                             dcx(r2.text.trim(), password)?.let { return it }
                         }
                     }
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Fast POST ex: ${e.message}")
-            }
+            } catch (e: Exception) { Log.e(TAG, "Fast POST ex: ${e.message}") }
 
-            // GET fallback
             try {
                 val r = app.get(u, headers = headers)
-                val finalUrl = try { r.url.toString() } catch (_: Exception) { "?" }
-                Log.e(TAG, "Fast GET  code=${r.code} finalUrl=${finalUrl.take(180)}… ct=${r.headers["Content-Type"]} len=${r.text.length} at +${System.currentTimeMillis() - t0}ms")
-                if (r.text.isNotBlank()) {
-                    dcx(r.text.trim(), password)?.let {
-                        Log.e(TAG, "Fast GET decrypted stream JSON")
-                        return it
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Fast GET ex: ${e.message}")
-            }
+                Log.e(TAG, "Fast GET  code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length} at +${System.currentTimeMillis() - t0}ms")
+                if (r.text.isNotBlank()) dcx(r.text.trim(), password)?.let { return it }
+            } catch (e: Exception) { Log.e(TAG, "Fast GET ex: ${e.message}") }
         }
-
         return null
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  SLOW PATH
+    //  SLOW PATH — unchanged
     // ────────────────────────────────────────────────────────────────
     private suspend fun tryLocalBruteForce(
         tokens: GdTokens,
@@ -249,7 +285,6 @@ class GalaxyDonghua : ExtractorApi() {
 
         var streamJson: String? = null
         var configJson: String? = null
-
         fun check(d: String?) {
             if (d == null) return
             if (d.contains(""""file"""") && d.contains(""""sources"""")) streamJson = d
@@ -257,7 +292,7 @@ class GalaxyDonghua : ExtractorApi() {
         }
 
         for (f in fragments) check(dcx(f, password))
-        Log.e(TAG, "1-part done at +${System.currentTimeMillis() - t0}ms: stream=${streamJson != null} config=${configJson != null}")
+        Log.e(TAG, "1-part done at +${System.currentTimeMillis() - t0}ms")
 
         if (streamJson == null && configJson == null) {
             for (i in fragments.indices) for (j in fragments.indices) {
@@ -268,7 +303,7 @@ class GalaxyDonghua : ExtractorApi() {
                     check(dcx(fragments[i] + fragments[j] + fragments[k], password))
                 }
             }
-            Log.e(TAG, "2/3-part done at +${System.currentTimeMillis() - t0}ms: stream=${streamJson != null} config=${configJson != null}")
+            Log.e(TAG, "2/3-part done at +${System.currentTimeMillis() - t0}ms")
         }
 
         if (streamJson == null && configJson != null) {
@@ -280,46 +315,40 @@ class GalaxyDonghua : ExtractorApi() {
                     .replace("{qsx}", tokens.qsx).replace("{kaken}", tokens.kaken)
                     .replace("{apx}", tokens.apx)
                 val post = mapOf(
-                    "pd" to tokens.pd, "ps" to tokens.ps,
-                    "qsx" to tokens.qsx, "kaken" to tokens.kaken, "apx" to tokens.apx
+                    "pd" to tokens.pd, "ps" to tokens.ps, "qsx" to tokens.qsx,
+                    "kaken" to tokens.kaken, "apx" to tokens.apx
                 )
                 try {
                     val r = app.post(fixed, data = post, headers = headers)
-                    Log.e(TAG, "Brute stream-POST code=${r.code} len=${r.text.length}")
                     streamJson = dcx(r.text.trim(), password)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Brute stream POST ex: ${e.message}")
-                }
+                } catch (_: Exception) {}
             }
         }
-
         return streamJson
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Stream/sub emit (suspend because newExtractorLink / newSubtitleFile are suspend)
+    //  Emit
     // ────────────────────────────────────────────────────────────────
     private suspend fun emitStreams(
-        json: String,
-        gxBase: String,
+        json: String, gxBase: String,
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit
     ) {
         val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1) ?: gxBase
         val playbackHeaders = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
         var count = 0
-
         val streamRx = Regex(""""file"\s*:\s*"([^"]+)"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?(?:[^{}]*?"type"\s*:\s*"([^"]*)")?""")
         for (m in streamRx.findAll(json)) {
-            val streamUrl = fixStreamUrl(m.groupValues[1], baseURL) ?: continue
+            val u = fixStreamUrl(m.groupValues[1], baseURL) ?: continue
             val label = m.groupValues[2].ifBlank { "Auto" }
             val type = m.groupValues[3]
-            val isM3u8 = streamUrl.contains(".m3u8") || type.contains("hls", true)
+            val isM3u8 = u.contains(".m3u8") || type.contains("hls", true)
             count++
             callback.invoke(newExtractorLink(
                 source = this.name,
                 name   = "${this.name} – $label",
-                url    = streamUrl,
+                url    = u,
                 type   = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
             ) {
                 this.referer = gxBase
@@ -339,14 +368,12 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Token decoding — now ALSO returns the decoded JS source
+    //  Tokens — unchanged
     // ────────────────────────────────────────────────────────────────
     private data class GdTokens(
         val pd: String, val ps: String, val qsx: String,
         val kaken: String, val apx: String
     )
-
-    private data class DecodedResult(val tokens: GdTokens, val jsSource: String)
 
     private fun pickPassword(t: GdTokens): String {
         val all = listOf(t.pd, t.ps, t.qsx, t.kaken, t.apx).filter { it.isNotBlank() }
@@ -355,7 +382,7 @@ class GalaxyDonghua : ExtractorApi() {
             ?: t.pd
     }
 
-    private fun decodeGdTokensAndSource(page: String): DecodedResult? {
+    private fun decodeGdTokens(page: String): GdTokens? {
         fun extractVars(text: String): GdTokens {
             fun grabVar(name: String): String {
                 Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*["']([^"']+)["']""")
@@ -366,7 +393,10 @@ class GalaxyDonghua : ExtractorApi() {
                     .find(text)?.let { return it.groupValues[1].trim() }
                 return ""
             }
-            return GdTokens(grabVar("pd"), grabVar("ps"), grabVar("qsx"), grabVar("kaken"), grabVar("apx"))
+            return GdTokens(
+                grabVar("pd"), grabVar("ps"), grabVar("qsx"),
+                grabVar("kaken"), grabVar("apx")
+            )
         }
 
         val html = extractVars(page)
@@ -379,7 +409,6 @@ class GalaxyDonghua : ExtractorApi() {
             if (endMatch != null) {
                 val jsfuck = page.substring(jStart, endMatch.range.last + 1)
                     .replace(Regex("""[\s\u00a0\u3000]+"""), "")
-
                 val bStart = jsfuck.indexOf("(ﾟεﾟ+")
                 if (bStart >= 0) {
                     val commentEnd = jsfuck.indexOf("*/", bStart)
@@ -395,12 +424,9 @@ class GalaxyDonghua : ExtractorApi() {
                         val digits = StringBuilder()
                         for (term in splitTopLevelTerms(s)) {
                             val t = term.trim()
-                            val raw = if (t.startsWith("-")) {
-                                val n = evalArithmetic(t.substring(1)) ?: break
-                                -n
-                            } else {
-                                evalArithmetic(t.trimStart('+')) ?: break
-                            }
+                            val raw = if (t.startsWith("-"))
+                                -(evalArithmetic(t.substring(1)) ?: break)
+                            else evalArithmetic(t.trimStart('+')) ?: break
                             val v = abs(raw)
                             if (v > 7) break
                             digits.append(v)
@@ -451,21 +477,17 @@ class GalaxyDonghua : ExtractorApi() {
         val finalQsx   = js.qsx.ifBlank   { html.qsx }
         val finalKaken = js.kaken.ifBlank { html.kaken }
         val finalApx   = js.apx.ifBlank   { html.apx }
-
         if (listOf(finalPd, finalApx).all { it.isBlank() }) return null
-        return DecodedResult(
-            GdTokens(finalPd, finalPs, finalQsx, finalKaken, finalApx),
-            jsFuck
-        )
+        return GdTokens(finalPd, finalPs, finalQsx, finalKaken, finalApx)
     }
 
     private fun stripConstants(s: String): String {
         var t = s
         for ((k, v) in listOf(
             "(c^_^o)" to "0", "(o^_^o)" to "3",
-            "(ﾟΘﾟ)" to "1",  "(ﾟｰﾟ)" to "4",
-            "c^_^o"   to "0", "o^_^o"   to "3",
-            "ﾟΘﾟ"     to "1", "ﾟｰﾟ"     to "4"
+            "(ﾟΘﾟ)" to "1", "(ﾟｰﾟ)" to "4",
+            "c^_^o" to "0", "o^_^o" to "3",
+            "ﾟΘﾟ" to "1", "ﾟｰﾟ" to "4"
         )) t = t.replace(k, v)
         return t
     }
@@ -606,13 +628,11 @@ class GalaxyDonghua : ExtractorApi() {
             var s = input.trim().replace(",,", "==").replace(",", "=")
             s = s.replace('-', '+').replace('_', '/')
             while (s.length % 4 != 0) s += "="
-
             val data = try { Base64.decode(s, Base64.DEFAULT) } catch (_: Exception) { return null }
             if (data.size < 32) return null
 
             val passBytes = password.toByteArray(Charsets.UTF_8)
             val md5Pass = MessageDigest.getInstance("MD5").digest(passBytes)
-
             val hasMagic = data.size >= 16 &&
                     data[0] == 'S'.code.toByte() && data[1] == 'a'.code.toByte() &&
                     data[2] == 'l'.code.toByte() && data[3] == 't'.code.toByte() &&
@@ -667,9 +687,6 @@ class GalaxyDonghua : ExtractorApi() {
         return null
     }
 
-    // ────────────────────────────────────────────────────────────────
-    //  URL helpers
-    // ────────────────────────────────────────────────────────────────
     private fun fixStreamUrl(url: String, base: String): String? {
         val u = url.trim()
         if (u.isBlank()) return null
