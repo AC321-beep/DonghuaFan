@@ -25,10 +25,6 @@ class Ghbrisk : Filesim() {
     override val requiresReferer = true
 }
 
-// ────────────────────────────────────────────────────────────────────
-//  PRIMARY EXTRACTOR — galaxydonghua.xyz
-//  Marked `open` so SkylineAI can inherit the full pipeline.
-// ────────────────────────────────────────────────────────────────────
 open class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
     override var mainUrl = GX
@@ -68,30 +64,45 @@ open class GalaxyDonghua : ExtractorApi() {
             "sec-ch-ua-platform" to "\"Windows\""
         )
 
-        // 1) Fetch the embed page
-        val page = try {
+        // 1) Fetch page with a single retry when tokens are missing.
+        //    The site serves a "blocked" ~75 KB page on the first hit
+        //    and the real ~67 KB page on the second.
+        val page1 = try {
             app.get(url, headers = headers).text
         } catch (e: Exception) {
             Log.e(TAG, "Page fetch failed: ${e.message}")
             return
         }
-        Log.e(TAG, "Page fetched (len=${page.length}) at +${System.currentTimeMillis() - t0}ms")
+        Log.e(TAG, "Page fetched (len=${page1.length}) at +${System.currentTimeMillis() - t0}ms")
 
-        // 2) Dump the FULL loadConfig from the RAW page (183 KB player JS lives here)
-        dumpFullLoadConfig(page)
+        var tokens = decodeGdTokens(page1)
+        var pageForDiag = page1
 
-        // 3) Decode the JSFuck tokens
-        val tokens = decodeGdTokens(page) ?: run {
-            Log.e(TAG, "CRITICAL: Failed to decode GD tokens")
+        if (tokens == null) {
+            Log.e(TAG, "First fetch gave no tokens (len=${page1.length}); retrying once…")
+            val page2 = try {
+                app.get(url, headers = headers).text
+            } catch (e: Exception) {
+                Log.e(TAG, "Retry fetch failed: ${e.message}")
+                return
+            }
+            Log.e(TAG, "Retry fetched (len=${page2.length}) at +${System.currentTimeMillis() - t0}ms")
+            tokens = decodeGdTokens(page2)
+            if (tokens != null) pageForDiag = page2
+        }
+
+        dumpFullLoadConfig(pageForDiag)
+
+        if (tokens == null) {
+            Log.e(TAG, "CRITICAL: Failed to decode GD tokens after retry")
             return
         }
+
         val password = pickPassword(tokens)
         Log.e(TAG, "Password: $password at +${System.currentTimeMillis() - t0}ms")
 
-        // 4) Fast path
         var streamJson: String? = tryFastApi(tokens, password, headers, url, gxBase, t0)
 
-        // 5) Slow path
         if (streamJson == null) {
             Log.e(TAG, "Fast path returned nothing. Falling back to local brute-force…")
             streamJson = tryLocalBruteForce(tokens, password, headers, t0)
@@ -107,9 +118,18 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  DIAGNOSTIC — dump full loadConfig body from the raw page
+    //  DIAGNOSTIC — dump external scripts + loadConfig if present
     // ────────────────────────────────────────────────────────────────
     private fun dumpFullLoadConfig(page: String) {
+        // Log every external <script src="…"> so we can see where the
+        // player JS actually lives (it is not inline in the current page).
+        val scriptSrcRx = Regex("""<script[^>]*\bsrc\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+        val extScripts = scriptSrcRx.findAll(page).map { it.groupValues[1] }.toList()
+        if (extScripts.isNotEmpty()) {
+            Log.e(TAG, "external scripts: ${extScripts.size}")
+            for (s in extScripts.take(15)) Log.e(TAG, "  script src: $s")
+        }
+
         val idx = page.indexOf("function loadConfig")
         if (idx < 0) {
             Log.e(TAG, "loadConfig function not present in raw page")
@@ -318,7 +338,7 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Emit — suspend because newExtractorLink / newSubtitleFile are suspend
+    //  Emit
     // ────────────────────────────────────────────────────────────────
     private suspend fun emitStreams(
         json: String,
@@ -713,10 +733,6 @@ open class GalaxyDonghua : ExtractorApi() {
     } catch (_: Exception) { GX }
 }
 
-// ────────────────────────────────────────────────────────────────────
-//  SECONDARY EXTRACTOR — skylineai.cloud
-//  Inherits GalaxyDonghua's full pipeline. Runs it against skylineai.
-// ────────────────────────────────────────────────────────────────────
 class SkylineAI : GalaxyDonghua() {
     override var name = "SkylineAI"
     override var mainUrl = "https://skylineai.cloud"
