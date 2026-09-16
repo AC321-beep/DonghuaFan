@@ -43,6 +43,7 @@ class GalaxyDonghua : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        val t0 = System.currentTimeMillis()
         Log.e(TAG, "Starting extraction for URL: $url")
         val gxBase = embedHost(url)
 
@@ -56,315 +57,250 @@ class GalaxyDonghua : ExtractorApi() {
             "X-Requested-With" to "XMLHttpRequest",
             "Sec-Fetch-Dest"   to "empty",
             "Sec-Fetch-Mode"   to "cors",
-            "Sec-Fetch-Site"   to "same-origin"
+            "Sec-Fetch-Site"   to "same-origin",
+            "sec-ch-ua"          to "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\"",
+            "sec-ch-ua-mobile"   to "?0",
+            "sec-ch-ua-platform" to "\"Windows\""
         )
 
-        // ---- Fetch embed page and capture session cookie -------------
-        val pageResp = try {
-            app.get(url, headers = headers)
+        val page = try {
+            app.get(url, headers = headers).text
         } catch (e: Exception) {
             Log.e(TAG, "Failed to fetch embed page: ${e.message}")
             return
         }
-        val page = pageResp.text
-        val setCookie = pageResp.headers["Set-Cookie"]
-        Log.e(TAG, "Embed page fetched (len=${page.length})")
-        Log.e(TAG, "Page Set-Cookie = $setCookie")
-
-        // Extract just the session cookie name=value pair (drop attributes)
-        val cookie = setCookie
-            ?.split(",")
-            ?.mapNotNull { it.trim().substringBefore(";").takeIf { s -> s.contains("=") } }
-            ?.joinToString("; ")
-        Log.e(TAG, "Forwarded Cookie = $cookie")
-
-        val diagHeaders = if (cookie.isNullOrBlank()) headers
-        else headers + mapOf("Cookie" to cookie)
+        Log.e(TAG, "Page fetched (len=${page.length}) at +${System.currentTimeMillis() - t0}ms")
 
         val tokens = decodeGdTokens(page) ?: run {
             Log.e(TAG, "CRITICAL: Failed to decode GD tokens")
             return
         }
+        val password = pickPassword(tokens)
+        Log.e(TAG, "Password: $password at +${System.currentTimeMillis() - t0}ms")
 
-        val tokenValues = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx)
-            .filter { it.isNotBlank() }
+        // ══════════════════════════════════════════════════════════════
+        // FAST PATH — hit the API FIRST while pd is fresh.
+        // Only brute-force if the server gives us nothing.
+        // ══════════════════════════════════════════════════════════════
+        var streamJson: String? = tryFastApi(tokens, password, headers, url, gxBase, t0)
 
-        val password = tokenValues.find { it.matches(Regex("""^\d{10}$""")) }
-            ?: tokenValues.find { it.matches(Regex("""^[a-f0-9\-]{36}$""")) }
-            ?: tokens.pd
-        Log.e(TAG, "Identified Decryption Password: $password")
-
-        val fragments = tokenValues.filter { it != password && it.length > 20 }
-        Log.e(TAG, "fragments.size=${fragments.size} sizes=${fragments.map { it.length }}")
-
-        var configJson: String? = null
-        var streamJson: String? = null
-
-        fun checkDecrypted(d: String?) {
-            if (d == null) return
-            if (d.contains(""""file"""") && d.contains(""""sources"""")) {
-                streamJson = d
-            } else if (d.contains(""""file"""") || d.contains(""""url"""")) {
-                configJson = d
-            }
-        }
-
-        // ---- Local brute-force decryption ----------------------------
-        for (f in fragments) checkDecrypted(dcx(f, password))
-
-        if (streamJson == null && configJson == null) {
-            for (i in fragments.indices) {
-                for (j in fragments.indices) {
-                    if (i == j) continue
-                    checkDecrypted(dcx(fragments[i] + fragments[j], password))
-                    for (k in fragments.indices) {
-                        if (k == i || k == j) continue
-                        checkDecrypted(dcx(fragments[i] + fragments[j] + fragments[k], password))
-                    }
-                }
-            }
-        }
-
-        if (streamJson != null) {
-            Log.e(TAG, "SUCCESS: Stream JSON decrypted locally!")
-        } else if (configJson != null) {
-            Log.e(TAG, "Config decrypted locally, fetching stream API...")
-            streamJson = fetchStreamApi(configJson!!, tokens, diagHeaders, password)
-        } else {
-            // ─────────────────────────────────────────────────────────
-            // FALLBACK: probe 4 request shapes against the correct URL
-            // ─────────────────────────────────────────────────────────
-            Log.e(TAG, "Local decryption failed. Executing dynamic API fallback...")
-
-            Log.e(TAG, "token snapshot:")
-            Log.e(TAG, "  pd    = '${tokens.pd}' (len=${tokens.pd.length})")
-            Log.e(TAG, "  ps    = '${tokens.ps.take(30)}…' (len=${tokens.ps.length})")
-            Log.e(TAG, "  qsx   = '${tokens.qsx.take(30)}…' (len=${tokens.qsx.length})")
-            Log.e(TAG, "  kaken = '${tokens.kaken.take(30)}…' (len=${tokens.kaken.length})")
-            Log.e(TAG, "  apx   = '${tokens.apx}' (len=${tokens.apx.length})")
-
-            val decodedApx = try {
-                String(
-                    Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT),
-                    Charsets.UTF_8
-                ).trim()
-            } catch (e: Exception) {
-                Log.e(TAG, "apx decode failed: ${e.message}")
-                tokens.apx
-            }
-            Log.e(TAG, "decodedApx = '$decodedApx'")
-
-            val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
-            val mid = tokens.kaken.ifBlank { tokens.qsx }
-            val tailRaw  = tokens.pd + tokens.ps
-            val tailNorm = tokens.pd + tokens.ps.replace(",,", "==").replace(",", "=")
-
-            // The URL that returned 200 last run:
-            val probeUrl = "$prefix$mid$tailRaw"
-            Log.e(TAG, "probe URL = ${probeUrl.take(160)}…")
-
-            // ---- Prepare request-body variants -----------------------
-            val psEq = tokens.ps.replace(",,", "==").replace(",", "=")
-
-            val formRaw = mapOf(
-                "pd" to tokens.pd, "ps" to tokens.ps,
-                "qsx" to tokens.qsx, "kaken" to tokens.kaken, "apx" to tokens.apx
-            )
-            val formEq = mapOf(
-                "pd" to tokens.pd, "ps" to psEq,
-                "qsx" to tokens.qsx, "kaken" to tokens.kaken, "apx" to tokens.apx
-            )
-            val jsonStr = """{"pd":"${tokens.pd}","ps":"${tokens.ps}","qsx":"${tokens.qsx}","kaken":"${tokens.kaken}","apx":"${tokens.apx}"}"""
-
-            val jsonHeaders = diagHeaders + mapOf("Content-Type" to "application/json")
-
-            // ---- Probe 4 shapes --------------------------------------
-            var configRes = ""
-
-            // 1) form-encoded, raw ps
-            try {
-                val r = app.post(probeUrl, headers = diagHeaders, data = formRaw)
-                Log.e(TAG, "[form-raw] code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length}")
-                if (r.text.isNotBlank()) { configRes = r.text; Log.e(TAG, "[form-raw] BODY=${r.text.take(200)}") }
-            } catch (e: Exception) { Log.e(TAG, "[form-raw] ex: ${e.message}") }
-
-            // 2) form-encoded, == padded ps
-            if (configRes.isBlank()) {
-                try {
-                    val r = app.post(probeUrl, headers = diagHeaders, data = formEq)
-                    Log.e(TAG, "[form-eq] code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length}")
-                    if (r.text.isNotBlank()) { configRes = r.text; Log.e(TAG, "[form-eq] BODY=${r.text.take(200)}") }
-                } catch (e: Exception) { Log.e(TAG, "[form-eq] ex: ${e.message}") }
-            }
-
-            // 3) JSON body
-            if (configRes.isBlank()) {
-                try {
-                    val r = app.post(probeUrl, headers = jsonHeaders, json = jsonStr)
-                    Log.e(TAG, "[json] code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length}")
-                    if (r.text.isNotBlank()) { configRes = r.text; Log.e(TAG, "[json] BODY=${r.text.take(200)}") }
-                } catch (e: Exception) { Log.e(TAG, "[json] ex: ${e.message}") }
-            }
-
-            // 4) no body
-            if (configRes.isBlank()) {
-                try {
-                    val r = app.post(probeUrl, headers = diagHeaders, data = emptyMap())
-                    Log.e(TAG, "[no-body] code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length}")
-                    if (r.text.isNotBlank()) { configRes = r.text; Log.e(TAG, "[no-body] BODY=${r.text.take(200)}") }
-                } catch (e: Exception) { Log.e(TAG, "[no-body] ex: ${e.message}") }
-            }
-
-            // 5) GET with cookie
-            if (configRes.isBlank()) {
-                try {
-                    val r = app.get(probeUrl, headers = diagHeaders)
-                    Log.e(TAG, "[GET-cookie] code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length}")
-                    if (r.text.isNotBlank()) { configRes = r.text; Log.e(TAG, "[GET-cookie] BODY=${r.text.take(200)}") }
-                } catch (e: Exception) { Log.e(TAG, "[GET-cookie] ex: ${e.message}") }
-            }
-
-            Log.e(TAG, "configRes len = ${configRes.length}")
-            configJson = dcx(configRes.trim(), password)
-            Log.e(TAG, "configJson decrypted = ${configJson != null}")
-
-            if (configJson != null) {
-                Log.e(TAG, "Config JSON decrypted via API fallback.")
-                streamJson = fetchStreamApi(configJson!!, tokens, diagHeaders, password)
-            }
+        // ══════════════════════════════════════════════════════════════
+        // SLOW PATH — local brute-force (only when API failed)
+        // ══════════════════════════════════════════════════════════════
+        if (streamJson == null) {
+            Log.e(TAG, "Fast API path returned nothing. Falling back to local brute-force…")
+            streamJson = tryLocalBruteForce(tokens, password, headers, t0)
         }
 
         if (streamJson == null) {
-            Log.e(TAG, "CRITICAL: Stream decryption completely failed!")
+            Log.e(TAG, "CRITICAL: stream decryption failed entirely at +${System.currentTimeMillis() - t0}ms")
             return
         }
 
-        Log.e(TAG, "Stream API response decrypted successfully. Parsing links...")
-
-        val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""").find(streamJson)?.groupValues?.get(1) ?: gxBase
-        val playbackHeaders = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
-        var linkCount = 0
-
-        val streamMatches = Regex(""""file"\s*:\s*"([^"]+)"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?(?:[^{}]*?"type"\s*:\s*"([^"]*)")?""").findAll(streamJson)
-
-        for (m in streamMatches) {
-            val streamUrl = fixStreamUrl(m.groupValues[1], baseURL) ?: continue
-            val label = m.groupValues[2].ifBlank { "Auto" }
-            val type = m.groupValues[3]
-            val isM3u8 = streamUrl.contains(".m3u8") || type.contains("hls", true) || type.contains("m3u8", true)
-
-            linkCount++
-            Log.e(TAG, "Found stream [$label]: $streamUrl")
-
-            callback.invoke(
-                newExtractorLink(
-                    source = this.name,
-                    name = "${this.name} – $label",
-                    url = streamUrl,
-                    type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                ) {
-                    this.referer = gxBase
-                    this.quality = label.filter { it.isDigit() }.toIntOrNull() ?: 0
-                    this.headers = playbackHeaders
-                }
-            )
-        }
-
-        Log.e(TAG, "Extraction complete. Total links generated: $linkCount")
-
-        val subMatches = Regex(""""file"\s*:\s*"([^"]+\.(?:vtt|srt))"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?""").findAll(streamJson)
-        for (m in subMatches) {
-            subtitleCallback.invoke(
-                newSubtitleFile(
-                    lang = m.groupValues[2].ifBlank { "Sub" },
-                    url = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
-                )
-            )
-        }
+        Log.e(TAG, "Stream JSON ready at +${System.currentTimeMillis() - t0}ms. Parsing…")
+        emitStreams(streamJson!!, gxBase, callback, subtitleCallback)
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Stream API — POST first, GET fallback, both logged
+    //  FAST PATH
     // ────────────────────────────────────────────────────────────────
-    private suspend fun fetchStreamApi(
-        configJson: String,
-        tokens: GdTokens,
-        headers: Map<String, String>,
-        password: String
+    private suspend fun tryFastApi(
+        tokens: GdTokens, password: String,
+        headers: Map<String, String>, embedUrl: String, gxBase: String,
+        t0: Long
     ): String? {
-        val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""")
-            .find(configJson)?.groupValues?.get(1) ?: run {
-                Log.e(TAG, "fetchStreamApi: no 'url' template found in config")
-                return null
-            }
-        Log.e(TAG, "fetchStreamApi template = ${apiUrlTemplate.take(140)}")
+        val decodedApx = try {
+            String(
+                Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT),
+                Charsets.UTF_8
+            ).trim()
+        } catch (_: Exception) { "" }
 
-        val fixedApi = apiUrlTemplate
-            .replace("{pd}", tokens.pd)
-            .replace("{ps}", tokens.ps)
-            .replace("{qsx}", tokens.qsx)
-            .replace("{kaken}", tokens.kaken)
-            .replace("{apx}", tokens.apx)
-        Log.e(TAG, "fetchStreamApi URL = ${fixedApi.take(180)}")
+        if (decodedApx.isBlank() && tokens.kaken.isBlank() && tokens.qsx.isBlank()) {
+            Log.e(TAG, "Fast path: no apx/kaken/qsx, skipping")
+            return null
+        }
+
+        val mid = tokens.kaken.ifBlank { tokens.qsx }
+        val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
+        val url = prefix + mid + tokens.pd + tokens.ps
 
         val postData = mapOf(
-            "pd" to tokens.pd, "ps" to tokens.ps, "qsx" to tokens.qsx,
-            "kaken" to tokens.kaken, "apx" to tokens.apx
+            "pd" to tokens.pd, "ps" to tokens.ps,
+            "qsx" to tokens.qsx, "kaken" to tokens.kaken, "apx" to tokens.apx
         )
 
-        var apiRes = ""
+        // Try POST then GET, form-encoded only. No probes.
         try {
-            val r = app.post(fixedApi, headers = headers, data = postData)
-            Log.e(TAG, "  stream POST → code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length}")
-            apiRes = r.text
+            val r = app.post(url, data = postData, headers = headers)
+            Log.e(TAG, "Fast POST code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length} at +${System.currentTimeMillis() - t0}ms")
+            if (r.text.isNotBlank()) {
+                dcx(r.text.trim(), password)?.let { return it }
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "  stream POST ex: ${e.message}")
+            Log.e(TAG, "Fast POST ex: ${e.message}")
         }
 
-        if (apiRes.isBlank()) {
-            try {
-                val r = app.get(fixedApi, headers = headers)
-                Log.e(TAG, "  stream GET  → code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length}")
-                apiRes = r.text
-            } catch (e: Exception) {
-                Log.e(TAG, "  stream GET ex: ${e.message}")
+        try {
+            val r = app.get(url, headers = headers)
+            Log.e(TAG, "Fast GET  code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length} at +${System.currentTimeMillis() - t0}ms")
+            if (r.text.isNotBlank()) {
+                dcx(r.text.trim(), password)?.let { return it }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Fast GET ex: ${e.message}")
+        }
+
+        // If we got a config but no stream, try the stream API
+        return null
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  SLOW PATH — only reached when the fast path returned nothing.
+    //  This is where the 8-second PBKDF2 cost lives.
+    // ────────────────────────────────────────────────────────────────
+    private suspend fun tryLocalBruteForce(
+        tokens: GdTokens, password: String,
+        headers: Map<String, String>, t0: Long
+    ): String? {
+        val fragments = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx)
+            .filter { it != password && it.length > 20 }
+
+        var streamJson: String? = null
+        var configJson: String? = null
+
+        fun check(d: String?) {
+            if (d == null) return
+            if (d.contains(""""file"""") && d.contains(""""sources"""")) streamJson = d
+            else if (d.contains(""""file"""") || d.contains(""""url"""")) configJson = d
+        }
+
+        // 1-part
+        for (f in fragments) check(dcx(f, password))
+        Log.e(TAG, "1-part done at +${System.currentTimeMillis() - t0}ms: " +
+                "stream=${streamJson != null} config=${configJson != null}")
+
+        if (streamJson == null && configJson == null) {
+            for (i in fragments.indices) for (j in fragments.indices) {
+                if (i == j) continue
+                check(dcx(fragments[i] + fragments[j], password))
+            }
+            Log.e(TAG, "2-part done at +${System.currentTimeMillis() - t0}ms")
+        }
+
+        if (streamJson == null && configJson == null && fragments.size >= 3) {
+            for (i in fragments.indices) for (j in fragments.indices) for (k in fragments.indices) {
+                if (i == j || j == k || i == k) continue
+                check(dcx(fragments[i] + fragments[j] + fragments[k], password))
+            }
+            Log.e(TAG, "3-part done at +${System.currentTimeMillis() - t0}ms")
+        }
+
+        // If config found, go get the stream
+        if (streamJson == null && configJson != null) {
+            val tpl = Regex(""""url"\s*:\s*"([^"]+)"""")
+                .find(configJson!!)?.groupValues?.get(1)
+            if (tpl != null) {
+                val fixed = tpl
+                    .replace("{pd}", tokens.pd).replace("{ps}", tokens.ps)
+                    .replace("{qsx}", tokens.qsx).replace("{kaken}", tokens.kaken)
+                    .replace("{apx}", tokens.apx)
+                val post = mapOf(
+                    "pd" to tokens.pd, "ps" to tokens.ps, "qsx" to tokens.qsx,
+                    "kaken" to tokens.kaken, "apx" to tokens.apx
+                )
+                try {
+                    val r = app.post(fixed, data = post, headers = headers)
+                    streamJson = dcx(r.text.trim(), password)
+                } catch (e: Exception) {
+                    Log.e(TAG, "stream POST ex: ${e.message}")
+                }
             }
         }
 
-        Log.e(TAG, "stream apiRes len = ${apiRes.length}")
-        return dcx(apiRes.trim(), password)
+        return streamJson
     }
 
+    // ────────────────────────────────────────────────────────────────
+    //  Stream / sub emit
+    // ────────────────────────────────────────────────────────────────
+    private fun emitStreams(
+        json: String, gxBase: String,
+        callback: (ExtractorLink) -> Unit,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1) ?: gxBase
+        val playbackHeaders = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
+        var count = 0
+
+        val streamRx = Regex(""""file"\s*:\s*"([^"]+)"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?(?:[^{}]*?"type"\s*:\s*"([^"]*)")?""")
+        for (m in streamRx.findAll(json)) {
+            val streamUrl = fixStreamUrl(m.groupValues[1], baseURL) ?: continue
+            val label = m.groupValues[2].ifBlank { "Auto" }
+            val type  = m.groupValues[3]
+            val isM3u8 = streamUrl.contains(".m3u8") || type.contains("hls", true)
+            count++
+            callback.invoke(newExtractorLink(
+                source = this.name,
+                name   = "${this.name} – $label",
+                url    = streamUrl,
+                type   = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            ) {
+                this.referer = gxBase
+                this.quality = label.filter { it.isDigit() }.toIntOrNull() ?: 0
+                this.headers = playbackHeaders
+            })
+        }
+        Log.e(TAG, "Emitted $count stream link(s)")
+
+        val subRx = Regex(""""file"\s*:\s*"([^"]+\.(?:vtt|srt))"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?""")
+        for (m in subRx.findAll(json)) {
+            subtitleCallback.invoke(newSubtitleFile(
+                lang = m.groupValues[2].ifBlank { "Sub" },
+                url  = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
+            ))
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  Token extraction
+    // ────────────────────────────────────────────────────────────────
     private data class GdTokens(
         val pd: String, val ps: String, val qsx: String,
         val kaken: String, val apx: String
     )
 
+    private fun pickPassword(t: GdTokens): String {
+        val all = listOf(t.pd, t.ps, t.qsx, t.kaken, t.apx).filter { it.isNotBlank() }
+        return all.firstOrNull { it.matches(Regex("""^\d{10}$""")) }
+            ?: all.firstOrNull { it.matches(Regex("""^[a-f0-9\-]{36}$""")) }
+            ?: t.pd
+    }
+
     private fun decodeGdTokens(page: String): GdTokens? {
         fun extractVars(text: String): GdTokens {
             fun grabVar(name: String): String {
-                val p1 = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*["']([^"']+)["']""").find(text)
-                if (p1 != null) return p1.groupValues[1].trim()
-                val p2 = Regex("""['"]?\b$name\b['"]?\s*:\s*["']([^"']+)["']""").find(text)
-                if (p2 != null) return p2.groupValues[1].trim()
-                val p3 = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*(\d+)""").find(text)
-                if (p3 != null) return p3.groupValues[1].trim()
+                Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*["']([^"']+)["']""")
+                    .find(text)?.let { return it.groupValues[1].trim() }
+                Regex("""['"]?\b$name\b['"]?\s*:\s*["']([^"']+)["']""")
+                    .find(text)?.let { return it.groupValues[1].trim() }
+                Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*(\d+)""")
+                    .find(text)?.let { return it.groupValues[1].trim() }
                 return ""
             }
             return GdTokens(grabVar("pd"), grabVar("ps"), grabVar("qsx"), grabVar("kaken"), grabVar("apx"))
         }
 
-        val htmlTokens = extractVars(page)
+        val html = extractVars(page)
+        var jsFuck = ""
 
-        var jsFuckText = ""
         val startMatch = Regex("""ﾟωﾟﾉ\s*=""").find(page)
         if (startMatch != null) {
             val jStart = startMatch.range.first
             val endMatch = Regex("""\)\s*\(\s*ﾟΘﾟ\s*\)\s*\)\s*\(\s*'_'\s*\)""").find(page, jStart)
             if (endMatch != null) {
-                val jEnd = endMatch.range.last + 1
-                val jsfuck = page.substring(jStart, jEnd).replace(Regex("""[\s\u00a0\u3000]+"""), "")
-
+                val jsfuck = page.substring(jStart, endMatch.range.last + 1)
+                    .replace(Regex("""[\s\u00a0\u3000]+"""), "")
                 val bStart = jsfuck.indexOf("(ﾟεﾟ+")
                 if (bStart >= 0) {
                     val commentEnd = jsfuck.indexOf("*/", bStart)
@@ -375,16 +311,14 @@ class GalaxyDonghua : ExtractorApi() {
 
                     val segs = body.split("(ﾟДﾟ)[ﾟεﾟ]")
                     val sb = StringBuilder()
-
                     for (i in 1 until segs.size) {
                         val s = stripConstants(segs[i]).trim().trimStart('+').trimEnd('+')
                         val digits = StringBuilder()
                         for (term in splitTopLevelTerms(s)) {
                             val t = term.trim()
-                            val raw = if (t.startsWith("-")) {
-                                val n = evalArithmetic(t.substring(1)) ?: break
-                                -n
-                            } else evalArithmetic(t.trimStart('+')) ?: break
+                            val raw = if (t.startsWith("-"))
+                                -(evalArithmetic(t.substring(1)) ?: break)
+                            else evalArithmetic(t.trimStart('+')) ?: break
                             val v = abs(raw)
                             if (v > 7) break
                             digits.append(v)
@@ -418,7 +352,7 @@ class GalaxyDonghua : ExtractorApi() {
                                                         .replace(code, Regex.escapeReplacement(k))
                                                 }
                                             }
-                                            jsFuckText = code
+                                            jsFuck = code
                                         }
                                     }
                                 }
@@ -429,15 +363,12 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        val jsTokens = extractVars(jsFuckText)
-        Log.e(TAG, "decode → html pd='${htmlTokens.pd}' qsx.len=${htmlTokens.qsx.length} kaken.len=${htmlTokens.kaken.length} apx.len=${htmlTokens.apx.length}")
-        Log.e(TAG, "decode → js   pd='${jsTokens.pd}' qsx.len=${jsTokens.qsx.length} kaken.len=${jsTokens.kaken.length} apx.len=${jsTokens.apx.length}")
-
-        val finalPd = jsTokens.pd.ifBlank { htmlTokens.pd }
-        val finalPs = jsTokens.ps.ifBlank { htmlTokens.ps }
-        val finalQsx = jsTokens.qsx.ifBlank { htmlTokens.qsx }
-        val finalKaken = jsTokens.kaken.ifBlank { htmlTokens.kaken }
-        val finalApx = jsTokens.apx.ifBlank { htmlTokens.apx }
+        val js = extractVars(jsFuck)
+        val finalPd    = js.pd.ifBlank    { html.pd }
+        val finalPs    = js.ps.ifBlank    { html.ps }
+        val finalQsx   = js.qsx.ifBlank   { html.qsx }
+        val finalKaken = js.kaken.ifBlank { html.kaken }
+        val finalApx   = js.apx.ifBlank   { html.apx }
 
         if (listOf(finalPd, finalApx).all { it.isBlank() }) return null
         return GdTokens(finalPd, finalPs, finalQsx, finalKaken, finalApx)
@@ -447,17 +378,16 @@ class GalaxyDonghua : ExtractorApi() {
         var t = s
         for ((k, v) in listOf(
             "(c^_^o)" to "0", "(o^_^o)" to "3",
-            "(ﾟΘﾟ)" to "1", "(ﾟｰﾟ)" to "4",
-            "c^_^o" to "0", "o^_^o" to "3",
-            "ﾟΘﾟ" to "1", "ﾟｰﾟ" to "4"
+            "(ﾟΘﾟ)" to "1",  "(ﾟｰﾟ)" to "4",
+            "c^_^o"   to "0", "o^_^o"   to "3",
+            "ﾟΘﾟ"     to "1", "ﾟｰﾟ"     to "4"
         )) t = t.replace(k, v)
         return t
     }
 
     private fun splitTopLevelTerms(s: String): List<String> {
         val terms = mutableListOf<String>()
-        var depth = 0
-        var cur = StringBuilder()
+        var depth = 0; var cur = StringBuilder()
         for (ch in s) {
             when (ch) {
                 '(' -> { depth++; cur.append(ch) }
@@ -475,17 +405,14 @@ class GalaxyDonghua : ExtractorApi() {
 
     private fun evalArithmetic(s: String): Int? {
         val clean = s.filter { it != ' ' }
-        val values = mutableListOf<Int>()
-        val ops = mutableListOf<Char>()
+        val values = mutableListOf<Int>(); val ops = mutableListOf<Char>()
         var i = 0
         while (i < clean.length) {
             val c = clean[i]
             when {
                 c.isDigit() -> {
                     var v = 0
-                    while (i < clean.length && clean[i].isDigit()) {
-                        v = v * 10 + (clean[i] - '0'); i++
-                    }
+                    while (i < clean.length && clean[i].isDigit()) { v = v * 10 + (clean[i] - '0'); i++ }
                     values.add(v)
                 }
                 c == '(' -> { ops.add(c); i++ }
@@ -571,7 +498,7 @@ class GalaxyDonghua : ExtractorApi() {
             offset += n
         }
         out
-    } catch (e: Exception) { null }
+    } catch (_: Exception) { null }
 
     private fun aesDecrypt(blob: ByteArray, key: ByteArray, iv: ByteArray): String? {
         if (key.size != 16 && key.size != 24 && key.size != 32) return null
@@ -580,7 +507,7 @@ class GalaxyDonghua : ExtractorApi() {
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
             String(cipher.doFinal(blob), Charsets.UTF_8)
-        } catch (e: Exception) { null }
+        } catch (_: Exception) { null }
     }
 
     private fun dcx(input: String, password: String): String? {
@@ -589,7 +516,7 @@ class GalaxyDonghua : ExtractorApi() {
             var s = input.trim().replace(",,", "==").replace(",", "=").replace("-", "+").replace("_", "/")
             while (s.length % 4 != 0) s += "="
 
-            val data = try { Base64.decode(s, Base64.DEFAULT) } catch (e: Exception) { return null }
+            val data = try { Base64.decode(s, Base64.DEFAULT) } catch (_: Exception) { return null }
             if (data.size < 32) return null
 
             val passBytes = password.toByteArray(Charsets.UTF_8)
@@ -602,75 +529,55 @@ class GalaxyDonghua : ExtractorApi() {
                     data[6] == '_'.code.toByte() && data[7] == '_'.code.toByte()
 
             if (hasMagic) {
-                val salt = data.copyOfRange(8, 16)
-                val ct = data.copyOfRange(16, data.size)
-
-                try {
-                    cryptoJsEvpKDF(passBytes, salt, 32, 16).let { k ->
+                val salt = data.copyOfRange(8, 16); val ct = data.copyOfRange(16, data.size)
+                try { cryptoJsEvpKDF(passBytes, salt, 32, 16).let { k ->
+                    aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
+                } } catch (_: Exception) {}
+                for (iter in intArrayOf(1000, 5000, 10000)) {
+                    try { pbkdf2Sha256(passBytes, salt, iter, 48)?.let { k ->
                         aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
-                    }
-                } catch (e: Exception) {}
-
-                for (iter in intArrayOf(1000, 5000, 10000, 100000)) {
-                    try {
-                        pbkdf2Sha256(passBytes, salt, iter, 48)?.let { k ->
-                            aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
-                        }
-                    } catch (e: Exception) {}
+                    } } catch (_: Exception) {}
                 }
             } else {
-                val salt = data.copyOfRange(0, 16)
-                val ct = data.copyOfRange(16, data.size)
-
-                try {
-                    cryptoJsEvpKDF(passBytes, salt, 32, 16).let { k ->
+                val salt = data.copyOfRange(0, 16); val ct = data.copyOfRange(16, data.size)
+                try { cryptoJsEvpKDF(passBytes, salt, 32, 16).let { k ->
+                    aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
+                } } catch (_: Exception) {}
+                for (iter in intArrayOf(1000, 5000, 10000)) {
+                    try { pbkdf2Sha256(passBytes, salt, iter, 48)?.let { k ->
                         aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
-                    }
-                } catch (e: Exception) {}
-
-                for (iter in intArrayOf(1000, 5000, 10000, 100000)) {
-                    try {
-                        pbkdf2Sha256(passBytes, salt, iter, 48)?.let { k ->
-                            aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
-                        }
-                    } catch (e: Exception) {}
+                    } } catch (_: Exception) {}
                 }
             }
 
-            try {
-                cryptoJsEvpKDF(passBytes, ByteArray(0), 32, 16).let { k ->
-                    aesDecrypt(data, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
-                }
-            } catch (e: Exception) {}
+            try { cryptoJsEvpKDF(passBytes, ByteArray(0), 32, 16).let { k ->
+                aesDecrypt(data, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
+            } } catch (_: Exception) {}
 
-            try {
-                aesDecrypt(data, md5Pass, md5Pass)?.let { if (it.contains("{")) return it }
-            } catch (e: Exception) {}
+            try { aesDecrypt(data, md5Pass, md5Pass)?.let { if (it.contains("{")) return it } } catch (_: Exception) {}
 
             try {
                 val c = Cipher.getInstance("AES/ECB/PKCS5Padding")
                 c.init(Cipher.DECRYPT_MODE, SecretKeySpec(md5Pass, "AES"))
                 String(c.doFinal(data), Charsets.UTF_8).let { if (it.contains("{")) return it }
-            } catch (e: Exception) {}
+            } catch (_: Exception) {}
 
-            try {
-                aesDecrypt(data, passBytes.copyOf(16), passBytes.copyOf(16))?.let { if (it.contains("{")) return it }
-            } catch (e: Exception) {}
+            try { aesDecrypt(data, passBytes.copyOf(16), passBytes.copyOf(16))?.let { if (it.contains("{")) return it } } catch (_: Exception) {}
 
-        } catch (e: Exception) {}
+        } catch (_: Exception) {}
         return null
     }
 
     private fun fixStreamUrl(url: String, base: String): String? {
-        val u = url.trim()
-        if (u.isBlank()) return null
+        val u = url.trim(); if (u.isBlank()) return null
         if (u.startsWith("http://") || u.startsWith("https://")) return u
         if (u.startsWith("//")) return "https:$u"
-        val host = try { val uri = URI(base); "${uri.scheme}://${uri.host}" } catch (e: Exception) { null }
-        return if (u.startsWith("/")) (host ?: base.trimEnd('/')) + u else (host ?: base.trimEnd('/')) + "/" + u
+        val host = try { val uri = URI(base); "${uri.scheme}://${uri.host}" } catch (_: Exception) { null }
+        return if (u.startsWith("/")) (host ?: base.trimEnd('/')) + u
+        else (host ?: base.trimEnd('/')) + "/" + u
     }
 
     private fun embedHost(url: String): String = try {
         val uri = URI(url); "${uri.scheme}://${uri.host}"
-    } catch (e: Exception) { GX }
+    } catch (_: Exception) { GX }
 }
