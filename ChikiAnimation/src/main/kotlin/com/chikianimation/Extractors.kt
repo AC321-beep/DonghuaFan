@@ -140,7 +140,6 @@ open class GalaxyDonghua : ExtractorApi() {
         val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
         val cleanPrefix = prefix.trimEnd('/')
 
-        // Construct the exact URL path discovered in DevTools: /api-config/{kaken}{qsx}{pd}{ps}?p={apx}&_={timestamp}
         val pathExtension = tokens.kaken + tokens.qsx + tokens.pd + tokens.ps
         val targetUrl = "$cleanPrefix/$pathExtension?p=${tokens.apx}&_=${System.currentTimeMillis()}"
 
@@ -350,24 +349,6 @@ open class GalaxyDonghua : ExtractorApi() {
         return derived
     }
 
-    private fun pbkdf2Sha256(password: ByteArray, salt: ByteArray, iterations: Int, dkLen: Int): ByteArray? = try {
-        val mac = Mac.getInstance("HmacSHA256")
-        mac.init(SecretKeySpec(password, "HmacSHA256"))
-        val out = ByteArray(dkLen)
-        val blocks = (dkLen + 31) / 32
-        var offset = 0
-        for (block in 1..blocks) {
-            val u = ByteArray(salt.size + 4)
-            System.arraycopy(salt, 0, u, 0, salt.size)
-            u[salt.size] = (block ushr 24).toByte(); u[salt.size + 1] = (block ushr 16).toByte(); u[salt.size + 2] = (block ushr 8).toByte(); u[salt.size + 3] = block.toByte()
-            val t = mac.doFinal(u); var last = t
-            for (i in 1 until iterations) { last = mac.doFinal(last); for (j in t.indices) t[j] = (t[j].toInt() xor last[j].toInt()).toByte() }
-            val n = minOf(32, dkLen - offset)
-            System.arraycopy(t, 0, out, offset, n); offset += n
-        }
-        out
-    } catch (_: Exception) { null }
-
     private fun aesDecrypt(blob: ByteArray, key: ByteArray, iv: ByteArray): String? {
         if (key.size != 16 && key.size != 24 && key.size != 32) return null
         if (iv.size != 16) return null
@@ -402,14 +383,6 @@ open class GalaxyDonghua : ExtractorApi() {
                     aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
                 }
             } catch (_: Exception) {}
-
-            for (iter in intArrayOf(1000, 5000, 10000)) {
-                try {
-                    pbkdf2Sha256(passBytes, salt, iter, 48)?.let { k ->
-                        aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
-                    }
-                } catch (_: Exception) {}
-            }
 
             try {
                 cryptoJsEvpKDF(passBytes, ByteArray(0), 32, 16).let { k ->
