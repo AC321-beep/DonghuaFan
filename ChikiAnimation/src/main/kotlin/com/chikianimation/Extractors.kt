@@ -64,9 +64,7 @@ open class GalaxyDonghua : ExtractorApi() {
             "sec-ch-ua-platform" to "\"Windows\""
         )
 
-        // 1) Fetch page with a single retry when tokens are missing.
-        //    The site serves a "blocked" ~75 KB page on the first hit
-        //    and the real ~67 KB page on the second.
+        // ── 1) Fetch page with a single retry when tokens are missing ──
         val page1 = try {
             app.get(url, headers = headers).text
         } catch (e: Exception) {
@@ -91,7 +89,8 @@ open class GalaxyDonghua : ExtractorApi() {
             if (tokens != null) pageForDiag = page2
         }
 
-        dumpFullLoadConfig(pageForDiag)
+        // ── 2) Fetch and dump every external script looking for loadConfig ──
+        dumpLoadConfigFromExternalScripts(pageForDiag, gxBase, headers)
 
         if (tokens == null) {
             Log.e(TAG, "CRITICAL: Failed to decode GD tokens after retry")
@@ -101,8 +100,10 @@ open class GalaxyDonghua : ExtractorApi() {
         val password = pickPassword(tokens)
         Log.e(TAG, "Password: $password at +${System.currentTimeMillis() - t0}ms")
 
+        // ── 3) Fast path ──
         var streamJson: String? = tryFastApi(tokens, password, headers, url, gxBase, t0)
 
+        // ── 4) Slow path ──
         if (streamJson == null) {
             Log.e(TAG, "Fast path returned nothing. Falling back to local brute-force…")
             streamJson = tryLocalBruteForce(tokens, password, headers, t0)
@@ -118,64 +119,47 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  DIAGNOSTIC — dump external scripts + loadConfig if present
+    //  DIAGNOSTIC — fetch external scripts, find and dump loadConfig
     // ────────────────────────────────────────────────────────────────
-    private fun dumpFullLoadConfig(page: String) {
-        // Log every external <script src="…"> so we can see where the
-        // player JS actually lives (it is not inline in the current page).
-        val scriptSrcRx = Regex("""<script[^>]*\bsrc\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-        val extScripts = scriptSrcRx.findAll(page).map { it.groupValues[1] }.toList()
-        if (extScripts.isNotEmpty()) {
-            Log.e(TAG, "external scripts: ${extScripts.size}")
-            for (s in extScripts.take(15)) Log.e(TAG, "  script src: $s")
-        }
+    private suspend fun dumpLoadConfigFromExternalScripts(
+        page: String,
+        gxBase: String,
+        headers: Map<String, String>
+    ) {
+        val srcRx = Regex("""<script[^>]*\bsrc\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+        val extUrls = srcRx.findAll(page).map { it.groupValues[1] }.toList()
+        Log.e(TAG, "external scripts: ${extUrls.size}")
 
-        val idx = page.indexOf("function loadConfig")
-        if (idx < 0) {
-            Log.e(TAG, "loadConfig function not present in raw page")
-            val alt = page.indexOf("loadConfig")
-            if (alt >= 0) {
-                Log.e(TAG, "loadConfig referenced at offset $alt — dumping context")
-                val start = maxOf(0, alt - 400)
-                val end = minOf(start + 8000, page.length)
-                dumpChunks(page.substring(start, end), "loadConfig-context")
-            } else {
-                Log.e(TAG, "loadConfig nowhere in page")
+        var found = false
+        for (src in extUrls) {
+            val abs = when {
+                src.startsWith("http") -> src
+                src.startsWith("//")   -> "https:$src"
+                src.startsWith("/")    -> "$gxBase$src"
+                else                   -> "$gxBase/$src"
             }
-            return
-        }
+            try {
+                val body = app.get(abs, headers = headers).text
+                val hasLC = body.contains("loadConfig")
+                Log.e(TAG, "  $abs → len=${body.length} hasLoadConfig=$hasLC")
 
-        val braceStart = page.indexOf('{', idx)
-        if (braceStart < 0) {
-            Log.e(TAG, "Malformed loadConfig — no opening brace")
-            return
-        }
-
-        var depth = 0
-        var i = braceStart
-        var inStr = false
-        var strCh = ' '
-        var esc = false
-
-        while (i < page.length) {
-            val c = page[i]
-            if (esc) { esc = false }
-            else if (inStr && c == '\\') { esc = true }
-            else if (inStr) { if (c == strCh) inStr = false }
-            else {
-                when (c) {
-                    '"', '\'' -> { inStr = true; strCh = c }
-                    '{' -> depth++
-                    '}' -> { depth--; if (depth == 0) { i++; break } }
+                if (hasLC && !found) {
+                    found = true
+                    val idx = body.indexOf("function loadConfig")
+                    val searchIdx = if (idx >= 0) idx else body.indexOf("loadConfig")
+                    Log.e(TAG, "════ loadConfig source in $abs (offset=$searchIdx) ════")
+                    val start = maxOf(0, searchIdx - 200)
+                    val end = minOf(start + 20000, body.length)
+                    dumpChunks(body.substring(start, end), "loadConfig-src")
+                    Log.e(TAG, "════ end loadConfig ════")
                 }
+            } catch (e: Exception) {
+                Log.e(TAG, "  $abs fetch failed: ${e.message}")
             }
-            i++
         }
-
-        val body = page.substring(braceStart, minOf(i, page.length))
-        Log.e(TAG, "════ full loadConfig body (${body.length} chars) ════")
-        dumpChunks(body, "loadConfig")
-        Log.e(TAG, "════ end loadConfig ════")
+        if (!found) {
+            Log.e(TAG, "loadConfig not found in any external script")
+        }
     }
 
     private fun dumpChunks(text: String, label: String) {
