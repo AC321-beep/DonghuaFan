@@ -47,14 +47,16 @@ open class GalaxyDonghua : ExtractorApi() {
 
         val headers = mapOf(
             "User-Agent"      to UA,
-            "Referer"         to url,
+            "Referer"         to (referer ?: url),
             "Origin"          to gxBase,
-            "Accept"          to "application/json, text/javascript, */*; q=0.01",
+            "Accept"          to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language" to "en-US,en;q=0.9",
-            "X-Requested-With" to "XMLHttpRequest"
+            "Sec-Fetch-Dest"  to "document",
+            "Sec-Fetch-Mode"  to "navigate",
+            "Sec-Fetch-Site"  to "cross-site"
         )
 
-        var page = try {
+        val page = try {
             app.get(url, headers = headers).text
         } catch (e: Exception) {
             Log.e(TAG, "[DEBUG] Initial GET fetch failed: ${e.message}")
@@ -83,47 +85,43 @@ open class GalaxyDonghua : ExtractorApi() {
         }
 
         // ════════════════════════════════════════════════════════
-        // 2. DYNAMIC SERVER LIST DISCOVERY & GATEWAY POST
+        // 2. DYNAMIC SERVER LIST DISCOVERY & DIRECT GET PARSING
         // ════════════════════════════════════════════════════════
-        val formMatch = Regex("""<form\s+id="frmValidation"\s+action="([^"]+)"""").find(page)
-        if (formMatch != null) {
-            val refMatch = Regex("""<input\s+type="hidden"\s+id="referer"\s+name="referer"\s+value="([^"]*)"""").find(page)
-            val formReferer = refMatch?.groupValues?.get(1)?.takeIf { it.isNotBlank() } ?: referer ?: "https://chikianimation.com/"
+        val serverUrls = Regex("""data-url="([^"]+)"""").findAll(page)
+            .map { it.groupValues[1] }
+            .map { if (it.startsWith("/")) gxBase + it else it }
+            .distinct().toList()
 
-            val serverUrls = Regex("""data-url="([^"]+)"""").findAll(page)
-                .map { it.groupValues[1] }
-                .map { if (it.startsWith("/")) gxBase + it else it }
-                .distinct().toList()
-
-            val defaultFormAction = formMatch.groupValues[1].let { if (it.startsWith("/")) gxBase + it else it }
-            val candidateUrls = if (serverUrls.isNotEmpty()) serverUrls.sortedByDescending { it.contains("alt=-1") } else listOf(defaultFormAction)
-
-            var decrypted = false
-            for (targetUrl in candidateUrls) {
-                Log.e(TAG, "[DEBUG] Trying Server URL: $targetUrl")
-                val serverPage = try {
-                    app.post(targetUrl, headers = headers, data = mapOf("referer" to formReferer)).text
-                } catch (e: Exception) { continue }
-
-                val tokens = decodeGdTokens(serverPage) ?: continue
-                val password = pickPassword(tokens)
-                
-                Log.e(TAG, "[DEBUG] Extracted Password: $password")
-
-                val streamJson = fetchAndDecryptApi(tokens, password, headers, gxBase, targetUrl)
-                if (streamJson != null) {
-                    emitStreams(streamJson, gxBase, callback, subtitleCallback)
-                    decrypted = true
-                    break
-                }
-            }
-            if (decrypted) return
-            Log.e(TAG, "[DEBUG] CRITICAL: All candidate servers exhausted.")
+        val candidateUrls = if (serverUrls.isNotEmpty()) {
+            serverUrls.sortedByDescending { it.contains("alt=-1") }
         } else {
-            val tokens = decodeGdTokens(page) ?: return
+            listOf(url)
+        }
+
+        var decrypted = false
+        for (targetUrl in candidateUrls) {
+            Log.e(TAG, "[DEBUG] Trying Server URL: $targetUrl")
+            val serverPage = try {
+                app.get(targetUrl, headers = headers).text
+            } catch (e: Exception) {
+                continue
+            }
+
+            val tokens = decodeGdTokens(serverPage) ?: continue
             val password = pickPassword(tokens)
-            val streamJson = fetchAndDecryptApi(tokens, password, headers, gxBase, url)
-            if (streamJson != null) emitStreams(streamJson, gxBase, callback, subtitleCallback)
+            
+            Log.e(TAG, "[DEBUG] Extracted Password: $password")
+
+            val streamJson = fetchAndDecryptApi(tokens, password, headers, gxBase, targetUrl)
+            if (streamJson != null) {
+                emitStreams(streamJson, gxBase, callback, subtitleCallback)
+                decrypted = true
+                break
+            }
+        }
+        
+        if (!decrypted) {
+            Log.e(TAG, "[DEBUG] CRITICAL: All candidate servers exhausted without decryption.")
         }
     }
 
