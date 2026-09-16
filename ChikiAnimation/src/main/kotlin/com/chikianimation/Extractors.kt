@@ -71,6 +71,13 @@ class GalaxyDonghua : ExtractorApi() {
         }
         Log.e(TAG, "Page fetched (len=${page.length}) at +${System.currentTimeMillis() - t0}ms")
 
+        // ════════════════════════════════════════════════════════════
+        // DIAGNOSTIC DUMPS — reveal what the browser actually sends
+        // ════════════════════════════════════════════════════════════
+        dumpLoadConfig(page)
+        dumpCookieAssignments(page)
+        dumpNetworkCalls(page)
+
         val tokens = decodeGdTokens(page) ?: run {
             Log.e(TAG, "CRITICAL: Failed to decode GD tokens")
             return
@@ -78,14 +85,10 @@ class GalaxyDonghua : ExtractorApi() {
         val password = pickPassword(tokens)
         Log.e(TAG, "Password: $password at +${System.currentTimeMillis() - t0}ms")
 
-        // ────────────────────────────────────────────────────────────
-        // FAST PATH — hit the API first while the pd timestamp is fresh
-        // ────────────────────────────────────────────────────────────
+        // FAST PATH — hit the API first while pd is fresh
         var streamJson: String? = tryFastApi(tokens, password, headers, url, gxBase, t0)
 
-        // ────────────────────────────────────────────────────────────
-        // SLOW PATH — only if the fast path returned nothing
-        // ────────────────────────────────────────────────────────────
+        // SLOW PATH — local brute-force if the fast path failed
         if (streamJson == null) {
             Log.e(TAG, "Fast path returned nothing. Falling back to local brute-force…")
             streamJson = tryLocalBruteForce(tokens, password, headers, t0)
@@ -101,7 +104,56 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  FAST PATH — one POST, one GET, no brute-force
+    //  DIAGNOSTIC #1 — dump the loadConfig function from the page
+    // ────────────────────────────────────────────────────────────────
+    private fun dumpLoadConfig(page: String) {
+        val lcIdx = page.indexOf("function loadConfig")
+        if (lcIdx >= 0) {
+            val dump = page.substring(lcIdx, minOf(lcIdx + 4000, page.length))
+            Log.e(TAG, "════ loadConfig dump BEGIN ════")
+            Log.e(TAG, dump)
+            Log.e(TAG, "════ loadConfig dump END ════")
+        } else {
+            val alt = page.indexOf("loadConfig")
+            if (alt >= 0) {
+                val ctx = page.substring(maxOf(0, alt - 300), minOf(alt + 3500, page.length))
+                Log.e(TAG, "════ loadConfig context BEGIN ════")
+                Log.e(TAG, ctx)
+                Log.e(TAG, "════ loadConfig context END ════")
+            } else {
+                Log.e(TAG, "loadConfig not found in page")
+            }
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  DIAGNOSTIC #2 — any document.cookie assignments
+    // ────────────────────────────────────────────────────────────────
+    private fun dumpCookieAssignments(page: String) {
+        val cookieRx = Regex("""document\.cookie\s*=\s*[^;\n]+""")
+        val hits = cookieRx.findAll(page).toList()
+        if (hits.isEmpty()) {
+            Log.e(TAG, "No document.cookie assignments found")
+        } else {
+            for (m in hits) Log.e(TAG, "document.cookie → ${m.value}")
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  DIAGNOSTIC #3 — any fetch()/xhr()/ajax calls in the page
+    // ────────────────────────────────────────────────────────────────
+    private fun dumpNetworkCalls(page: String) {
+        val fetchRx = Regex("""(?:fetch|XMLHttpRequest|\$\.ajax|axios)\s*\([^)]{0,200}""")
+        val hits = fetchRx.findAll(page).take(10).toList()
+        if (hits.isEmpty()) {
+            Log.e(TAG, "No network calls found in page")
+        } else {
+            for (m in hits) Log.e(TAG, "network call → ${m.value.take(200)}")
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    //  FAST PATH
     // ────────────────────────────────────────────────────────────────
     private suspend fun tryFastApi(
         tokens: GdTokens,
@@ -138,16 +190,13 @@ class GalaxyDonghua : ExtractorApi() {
         // POST first
         try {
             val r = app.post(apiUrl, data = postData, headers = headers)
-            Log.e(TAG, "Fast POST code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length} at +${System.currentTimeMillis() - t0}ms")
+            val finalUrl = try { r.url.toString() } catch (_: Exception) { "?" }
+            Log.e(TAG, "Fast POST code=${r.code} finalUrl=$finalUrl ct=${r.headers["Content-Type"]} len=${r.text.length} at +${System.currentTimeMillis() - t0}ms")
             if (r.text.isNotBlank()) {
                 dcx(r.text.trim(), password)?.let {
                     Log.e(TAG, "Fast POST decrypted stream JSON")
                     return it
                 }
-                dcx(r.text.trim(), password)?.let {
-                    // Try to interpret as config, then fetch stream
-                }
-                // If decryption yielded a config (has "url" template), go get stream
                 val maybeConfig = dcx(r.text.trim(), password)
                 if (maybeConfig != null && maybeConfig.contains("\"url\"")) {
                     val tpl = Regex(""""url"\s*:\s*"([^"]+)"""")
@@ -170,7 +219,8 @@ class GalaxyDonghua : ExtractorApi() {
         // GET fallback
         try {
             val r = app.get(apiUrl, headers = headers)
-            Log.e(TAG, "Fast GET  code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length} at +${System.currentTimeMillis() - t0}ms")
+            val finalUrl = try { r.url.toString() } catch (_: Exception) { "?" }
+            Log.e(TAG, "Fast GET  code=${r.code} finalUrl=$finalUrl ct=${r.headers["Content-Type"]} len=${r.text.length} at +${System.currentTimeMillis() - t0}ms")
             if (r.text.isNotBlank()) {
                 dcx(r.text.trim(), password)?.let {
                     Log.e(TAG, "Fast GET decrypted stream JSON")
@@ -185,7 +235,7 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  SLOW PATH — local brute-force across fragments
+    //  SLOW PATH — local brute-force
     // ────────────────────────────────────────────────────────────────
     private suspend fun tryLocalBruteForce(
         tokens: GdTokens,
@@ -256,8 +306,8 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Stream / subtitle emit — MUST be suspend (newExtractorLink and
-    //  newSubtitleFile are suspend functions in Cloudstream 3)
+    //  Stream / subtitle emit — suspend because newExtractorLink /
+    //  newSubtitleFile are suspend in Cloudstream 3
     // ────────────────────────────────────────────────────────────────
     private suspend fun emitStreams(
         json: String,
