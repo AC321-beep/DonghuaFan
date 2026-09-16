@@ -46,7 +46,6 @@ class GalaxyDonghua : ExtractorApi() {
         Log.e(TAG, "Starting extraction for URL: $url")
         val gxBase = embedHost(url)
 
-        // Browser-fidelity headers for both page fetch and API calls
         val headers = mapOf(
             "User-Agent"       to UA,
             "Referer"          to url,
@@ -60,22 +59,36 @@ class GalaxyDonghua : ExtractorApi() {
             "Sec-Fetch-Site"   to "same-origin"
         )
 
-        val page = try {
-            app.get(url, headers = headers).text
+        // ---- Fetch embed page and capture session cookie -------------
+        val pageResp = try {
+            app.get(url, headers = headers)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to fetch embed page: ${e.message}")
             return
         }
+        val page = pageResp.text
+        val setCookie = pageResp.headers["Set-Cookie"]
         Log.e(TAG, "Embed page fetched (len=${page.length})")
+        Log.e(TAG, "Page Set-Cookie = $setCookie")
+
+        // Extract just the session cookie name=value pair (drop attributes)
+        val cookie = setCookie
+            ?.split(",")
+            ?.mapNotNull { it.trim().substringBefore(";").takeIf { s -> s.contains("=") } }
+            ?.joinToString("; ")
+        Log.e(TAG, "Forwarded Cookie = $cookie")
+
+        val diagHeaders = if (cookie.isNullOrBlank()) headers
+        else headers + mapOf("Cookie" to cookie)
 
         val tokens = decodeGdTokens(page) ?: run {
             Log.e(TAG, "CRITICAL: Failed to decode GD tokens")
             return
         }
 
-        val tokenValues = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx).filter { it.isNotBlank() }
+        val tokenValues = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx)
+            .filter { it.isNotBlank() }
 
-        // Dynamically find the password (the 10-digit Unix timestamp or UUID)
         val password = tokenValues.find { it.matches(Regex("""^\d{10}$""")) }
             ?: tokenValues.find { it.matches(Regex("""^[a-f0-9\-]{36}$""")) }
             ?: tokens.pd
@@ -96,10 +109,9 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        // BRUTEFORCE STAGE 1: Try decrypting fragments individually
+        // ---- Local brute-force decryption ----------------------------
         for (f in fragments) checkDecrypted(dcx(f, password))
 
-        // BRUTEFORCE STAGE 2: Try 2-part and 3-part fragment concatenations
         if (streamJson == null && configJson == null) {
             for (i in fragments.indices) {
                 for (j in fragments.indices) {
@@ -114,21 +126,20 @@ class GalaxyDonghua : ExtractorApi() {
         }
 
         if (streamJson != null) {
-            Log.e(TAG, "SUCCESS: Stream JSON successfully decrypted locally!")
+            Log.e(TAG, "SUCCESS: Stream JSON decrypted locally!")
         } else if (configJson != null) {
             Log.e(TAG, "Config decrypted locally, fetching stream API...")
-            streamJson = fetchStreamApi(configJson!!, tokens, headers, password)
+            streamJson = fetchStreamApi(configJson!!, tokens, diagHeaders, password)
         } else {
-            // ────────────────────────────────────────────────────────
-            // FALLBACK: dynamic API request with full diagnostics
-            // ────────────────────────────────────────────────────────
+            // ─────────────────────────────────────────────────────────
+            // FALLBACK: probe 4 request shapes against the correct URL
+            // ─────────────────────────────────────────────────────────
             Log.e(TAG, "Local decryption failed. Executing dynamic API fallback...")
 
-            // Token snapshot
             Log.e(TAG, "token snapshot:")
             Log.e(TAG, "  pd    = '${tokens.pd}' (len=${tokens.pd.length})")
             Log.e(TAG, "  ps    = '${tokens.ps.take(30)}…' (len=${tokens.ps.length})")
-            Log.e(TAG, "  qsx   = '${tokens.qsx}' (len=${tokens.qsx.length})")
+            Log.e(TAG, "  qsx   = '${tokens.qsx.take(30)}…' (len=${tokens.qsx.length})")
             Log.e(TAG, "  kaken = '${tokens.kaken.take(30)}…' (len=${tokens.kaken.length})")
             Log.e(TAG, "  apx   = '${tokens.apx}' (len=${tokens.apx.length})")
 
@@ -143,43 +154,74 @@ class GalaxyDonghua : ExtractorApi() {
             }
             Log.e(TAG, "decodedApx = '$decodedApx'")
 
-            // Logcat proves: URL = apx_decoded + kaken + pd + ps
+            val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
             val mid = tokens.kaken.ifBlank { tokens.qsx }
             val tailRaw  = tokens.pd + tokens.ps
             val tailNorm = tokens.pd + tokens.ps.replace(",,", "==").replace(",", "=")
 
-            val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
+            // The URL that returned 200 last run:
+            val probeUrl = "$prefix$mid$tailRaw"
+            Log.e(TAG, "probe URL = ${probeUrl.take(160)}…")
 
-            val candidates = linkedSetOf<String>()
-            candidates.add("$prefix$mid$tailRaw")
-            candidates.add("$prefix$mid$tailNorm")
-            candidates.add("$gxBase/api-config$mid$tailRaw")
+            // ---- Prepare request-body variants -----------------------
+            val psEq = tokens.ps.replace(",,", "==").replace(",", "=")
 
-            val postData = mapOf(
+            val formRaw = mapOf(
                 "pd" to tokens.pd, "ps" to tokens.ps,
                 "qsx" to tokens.qsx, "kaken" to tokens.kaken, "apx" to tokens.apx
             )
+            val formEq = mapOf(
+                "pd" to tokens.pd, "ps" to psEq,
+                "qsx" to tokens.qsx, "kaken" to tokens.kaken, "apx" to tokens.apx
+            )
+            val jsonStr = """{"pd":"${tokens.pd}","ps":"${tokens.ps}","qsx":"${tokens.qsx}","kaken":"${tokens.kaken}","apx":"${tokens.apx}"}"""
 
+            val jsonHeaders = diagHeaders + mapOf("Content-Type" to "application/json")
+
+            // ---- Probe 4 shapes --------------------------------------
             var configRes = ""
-            outer@ for (u in candidates) {
-                Log.e(TAG, "candidate URL: $u")
 
-                // POST first — GET has been dropped by the server every session
-                try {
-                    val r = app.post(u, data = postData, headers = headers)
-                    Log.e(TAG, "  POST → code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length}")
-                    if (r.text.isNotBlank()) { configRes = r.text; break@outer }
-                } catch (e: Exception) {
-                    Log.e(TAG, "  POST ex: ${e.message}")
-                }
+            // 1) form-encoded, raw ps
+            try {
+                val r = app.post(probeUrl, headers = diagHeaders, data = formRaw)
+                Log.e(TAG, "[form-raw] code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length}")
+                if (r.text.isNotBlank()) { configRes = r.text; Log.e(TAG, "[form-raw] BODY=${r.text.take(200)}") }
+            } catch (e: Exception) { Log.e(TAG, "[form-raw] ex: ${e.message}") }
 
+            // 2) form-encoded, == padded ps
+            if (configRes.isBlank()) {
                 try {
-                    val r = app.get(u, headers = headers)
-                    Log.e(TAG, "  GET  → code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length}")
-                    if (r.text.isNotBlank()) { configRes = r.text; break@outer }
-                } catch (e: Exception) {
-                    Log.e(TAG, "  GET  ex: ${e.message}")
-                }
+                    val r = app.post(probeUrl, headers = diagHeaders, data = formEq)
+                    Log.e(TAG, "[form-eq] code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length}")
+                    if (r.text.isNotBlank()) { configRes = r.text; Log.e(TAG, "[form-eq] BODY=${r.text.take(200)}") }
+                } catch (e: Exception) { Log.e(TAG, "[form-eq] ex: ${e.message}") }
+            }
+
+            // 3) JSON body
+            if (configRes.isBlank()) {
+                try {
+                    val r = app.post(probeUrl, headers = jsonHeaders, json = jsonStr)
+                    Log.e(TAG, "[json] code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length}")
+                    if (r.text.isNotBlank()) { configRes = r.text; Log.e(TAG, "[json] BODY=${r.text.take(200)}") }
+                } catch (e: Exception) { Log.e(TAG, "[json] ex: ${e.message}") }
+            }
+
+            // 4) no body
+            if (configRes.isBlank()) {
+                try {
+                    val r = app.post(probeUrl, headers = diagHeaders, data = emptyMap())
+                    Log.e(TAG, "[no-body] code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length}")
+                    if (r.text.isNotBlank()) { configRes = r.text; Log.e(TAG, "[no-body] BODY=${r.text.take(200)}") }
+                } catch (e: Exception) { Log.e(TAG, "[no-body] ex: ${e.message}") }
+            }
+
+            // 5) GET with cookie
+            if (configRes.isBlank()) {
+                try {
+                    val r = app.get(probeUrl, headers = diagHeaders)
+                    Log.e(TAG, "[GET-cookie] code=${r.code} ct=${r.headers["Content-Type"]} len=${r.text.length}")
+                    if (r.text.isNotBlank()) { configRes = r.text; Log.e(TAG, "[GET-cookie] BODY=${r.text.take(200)}") }
+                } catch (e: Exception) { Log.e(TAG, "[GET-cookie] ex: ${e.message}") }
             }
 
             Log.e(TAG, "configRes len = ${configRes.length}")
@@ -188,7 +230,7 @@ class GalaxyDonghua : ExtractorApi() {
 
             if (configJson != null) {
                 Log.e(TAG, "Config JSON decrypted via API fallback.")
-                streamJson = fetchStreamApi(configJson!!, tokens, headers, password)
+                streamJson = fetchStreamApi(configJson!!, tokens, diagHeaders, password)
             }
         }
 
@@ -312,7 +354,6 @@ class GalaxyDonghua : ExtractorApi() {
             return GdTokens(grabVar("pd"), grabVar("ps"), grabVar("qsx"), grabVar("kaken"), grabVar("apx"))
         }
 
-        // HTML surface tokens (may contain honeypots)
         val htmlTokens = extractVars(page)
 
         var jsFuckText = ""
@@ -388,12 +429,10 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        // JSFuck embedded tokens (the real ones)
         val jsTokens = extractVars(jsFuckText)
         Log.e(TAG, "decode → html pd='${htmlTokens.pd}' qsx.len=${htmlTokens.qsx.length} kaken.len=${htmlTokens.kaken.length} apx.len=${htmlTokens.apx.length}")
         Log.e(TAG, "decode → js   pd='${jsTokens.pd}' qsx.len=${jsTokens.qsx.length} kaken.len=${jsTokens.kaken.length} apx.len=${jsTokens.apx.length}")
 
-        // Honeypot defense: JSFuck overrides HTML
         val finalPd = jsTokens.pd.ifBlank { htmlTokens.pd }
         val finalPs = jsTokens.ps.ifBlank { htmlTokens.ps }
         val finalQsx = jsTokens.qsx.ifBlank { htmlTokens.qsx }
