@@ -32,7 +32,7 @@ class GalaxyDonghua : ExtractorApi() {
         const val GX = "https://galaxydonghua.xyz"
         const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/124.0.0.0 Safari/537.36"
     }
 
     override suspend fun getUrl(
@@ -43,13 +43,18 @@ class GalaxyDonghua : ExtractorApi() {
     ) {
         val tag = "GalaxyDonghuaDebug"
         Log.e(tag, "Starting extraction for URL: $url")
+        val gxBase = embedHost(url)
 
-        // THE FIX: The server strictly drops the connection (length 0) if the Referer is not the exact embed URL.
+        // Strict Chrome AJAX Headers required to bypass the 0-byte server drop
         val headers = mapOf(
             "User-Agent" to UA,
-            "Referer" to url, 
+            "Referer" to url,
+            "Origin" to gxBase,
             "Accept" to "application/json, text/javascript, */*; q=0.01",
-            "X-Requested-With" to "XMLHttpRequest"
+            "X-Requested-With" to "XMLHttpRequest",
+            "Sec-Fetch-Dest" to "empty",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Site" to "same-origin"
         )
 
         val page = try {
@@ -67,18 +72,17 @@ class GalaxyDonghua : ExtractorApi() {
 
         val tokenValues = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx).filter { it.isNotBlank() }
         
-        // Dynamically find the password regardless of what variable name the obfuscator assigned it today
+        // Dynamically find the password regardless of what variable name the obfuscator assigned it
         val password = tokenValues.find { it.matches(Regex("""^\d{10}$""")) } 
             ?: tokenValues.find { it.matches(Regex("""^[a-f0-9\-]{36}$""")) } 
             ?: tokens.pd
 
         Log.e(tag, "Identified Decryption Password: $password")
 
-        val gxBase = embedHost(url)
         var configJson: String? = null
-
-        // Sometimes the JSON is already embedded in the massive tokens. Let's try to decrypt locally first.
         val massiveTokens = tokenValues.filter { it.length > 50 }
+        
+        // Try local decryption first if the payload is directly embedded
         for (token in massiveTokens) {
             val decrypted = dcx(token, password) ?: continue
             if (decrypted.contains(""""url"""")) {
@@ -88,18 +92,26 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        // If not embedded, execute the GET request with the authorized headers
+        // Execute dynamic request if not embedded
         if (configJson == null) {
-            Log.e(tag, "Config not embedded. Falling back to dynamic GET request...")
+            Log.e(tag, "Config not embedded. Falling back to dynamic API request...")
             val decodedApx = try { String(Base64.decode(tokens.apx, Base64.DEFAULT)).trim() } catch (e: Exception) { tokens.apx }
             val baseUrlPart = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/${decodedApx.trimStart('/')}"
-            
-            val apiUrlToCall = "$baseUrlPart${tokens.qsx}${tokens.pd}${tokens.ps}"
+            val qsx = tokens.qsx
+            val finalQsx = if (baseUrlPart.contains("?") && qsx.startsWith("?")) qsx.replace("?", "&") else qsx
+
+            val apiUrlToCall = "$baseUrlPart$finalQsx$password${tokens.ps}"
             Log.e(tag, "Target API Config URL: $apiUrlToCall")
 
-            val configRes = try { app.get(apiUrlToCall, headers = headers).text } catch (e: Exception) { return }
-            Log.e(tag, "Config response fetched (length: ${configRes.length})")
+            var configRes = try { app.get(apiUrlToCall, headers = headers).text } catch (e: Exception) { "" }
             
+            // If GET returns 0 bytes (blocked), GDPlayer expects a POST request for large payloads
+            if (configRes.isBlank()) {
+                Log.e(tag, "GET returned empty/blocked. Trying POST fallback...")
+                configRes = try { app.post(apiUrlToCall, headers = headers).text } catch (e: Exception) { "" }
+            }
+
+            Log.e(tag, "Config response fetched (length: ${configRes.length})")
             configJson = dcx(configRes.trim(), password)
         }
 
@@ -115,11 +127,13 @@ class GalaxyDonghua : ExtractorApi() {
             return
         }
 
+        val actualKaken = massiveTokens.maxByOrNull { it.length } ?: tokens.kaken
+
         val fixedApi = apiUrlTemplate
-            .replace("{pd}", tokens.pd)
+            .replace("{pd}", password)
             .replace("{ps}", tokens.ps)
             .replace("{qsx}", tokens.qsx)
-            .replace("{kaken}", tokens.kaken)
+            .replace("{kaken}", actualKaken)
             .replace("{apx}", tokens.apx)
 
         Log.e(tag, "Executing POST to final stream API...")
@@ -128,8 +142,8 @@ class GalaxyDonghua : ExtractorApi() {
                 fixedApi,
                 headers = headers,
                 data = mapOf(
-                    "pd" to tokens.pd, "ps" to tokens.ps,
-                    "qsx" to tokens.qsx, "kaken" to tokens.kaken,
+                    "pd" to password, "ps" to tokens.ps,
+                    "qsx" to tokens.qsx, "kaken" to actualKaken,
                     "apx" to tokens.apx
                 )
             ).text
@@ -154,7 +168,6 @@ class GalaxyDonghua : ExtractorApi() {
 
         val streamMatches = Regex(""""file"\s*:\s*"([^"]+)"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?(?:[^{}]*?"type"\s*:\s*"([^"]*)")?""").findAll(streamJson)
         
-        // Loop used instead of forEach to safely call suspend functions
         for (m in streamMatches) {
             val streamUrl = fixStreamUrl(m.groupValues[1], baseURL) ?: continue
             val label = m.groupValues[2].ifBlank { "Auto" }
@@ -289,11 +302,24 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        val pd = grabVar("pd", code)
-        val ps = grabVar("ps", code)
-        val qsx = grabVar("qsx", code)
-        val kaken = grabVar("kaken", code)
-        val apx = grabVar("apx", code)
+        fun grabJsToken(name: String): String {
+            val matches = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*["']([^"']+)["']""").findAll(code)
+            for (match in matches) return match.groupValues[1].trim()
+            
+            val altMatches = Regex("""['"]?\b$name\b['"]?\s*:\s*["']([^"']+)["']""").findAll(code)
+            for (match in altMatches) return match.groupValues[1].trim()
+
+            val numMatches = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*(\d+)""").findAll(code)
+            for (match in numMatches) return match.groupValues[1].trim()
+            
+            return ""
+        }
+
+        val pd = grabJsToken("pd")
+        val ps = grabJsToken("ps")
+        val qsx = grabJsToken("qsx")
+        val kaken = grabJsToken("kaken")
+        val apx = grabJsToken("apx")
 
         if (listOf(pd, apx).all { it.isBlank() }) return null
         Log.e(tag, "Successfully parsed tokens via JSFuck fallback.")
