@@ -21,12 +21,10 @@ class ChikiAnimationProvider : MainAPI() {
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update"          to "Recently Updated",
         "anime/?status=&type=&order=popular"         to "Popular",
-        "anime/?status=&type=&order=latest"          to "Latest Added",
         "anime/?status=&type=ai+animes&order=update" to "AI Anime",
         "anime/?status=ongoing&type=&order=update"   to "Ongoing",
         "anime/?status=completed&type=&order=update" to "Completed",
-        "anime/?status=&type=movie&order=update"     to "Movies",
-        "anime/?status=&type=ona&order=update"       to "Donghua (ONA)"
+        "anime/?status=&type=movie&order=update"     to "Movies"
     )
 
     private val defaultHeaders = mapOf(
@@ -37,7 +35,7 @@ class ChikiAnimationProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = buildPageUrl(request.data, page)
-        
+
         val items = try {
             val document = app.get(url, headers = defaultHeaders).document
             document.select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
@@ -203,12 +201,10 @@ class ChikiAnimationProvider : MainAPI() {
 
             val combinedText = "$epNumText $rawTitle"
 
-            // Dynamic Season extraction supporting "Season X", "S4", etc.
             val seasonNum = Regex("""(?i)(?:season\s*(\d+)|s(\d+))""").find(combinedText)?.let {
                 it.groupValues[1].ifEmpty { it.groupValues[2] }.toIntOrNull()
             }
 
-            // Dynamic Episode extraction supporting ranges (e.g., "41-50", "01-30", "1 to 16", "Episode 29")
             val epNum = Regex("""(?i)(?:episode|ep)\s*(\d+)""").find(rawTitle)?.groupValues?.get(1)?.toIntOrNull()
                 ?: Regex("""(\d+)\s*(?:to|-)\s*\d+""").find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
                 ?: Regex("""\((\d+)\s*(?:to|-)\s*\d+\)""").find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
@@ -274,9 +270,62 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
+        // ----------------------------------------------------------------
+        //  Google Drive → Gdriveplayer conversion helper
+        //  CloudStream's built-in Gdriveplayer extractor is registered for
+        //  gdriveplayer.to, NOT drive.google.com. So a raw Drive URL must
+        //  be wrapped before being handed to loadExtractor().
+        // ----------------------------------------------------------------
+        suspend fun handleGoogleDrive(cleanUrl: String, ref: String): Boolean {
+            if (!cleanUrl.contains("drive.google.com", ignoreCase = true)) return false
+
+            // Try several common Drive URL shapes: /file/d/<id>/, ?id=<id>, uc?id=<id>
+            val fileId = Regex("""/file/d/([a-zA-Z0-9_-]{10,})""").find(cleanUrl)?.groupValues?.get(1)
+                ?: Regex("""[?&]id=([a-zA-Z0-9_-]{10,})""").find(cleanUrl)?.groupValues?.get(1)
+                ?: return false
+
+            val driveViewUrl = "https://drive.google.com/file/d/$fileId/view"
+
+            // 1) Preferred: gdriveplayer.to wrapper (what the built-in extractor expects)
+            val gdrivePlayerUrls = listOf(
+                "https://gdriveplayer.to/embed2.php?link=$driveViewUrl",
+                "https://gdriveplayer.to/embed.php?link=$driveViewUrl",
+                "https://gdriveplayer.co/embed2.php?link=$driveViewUrl",
+                "https://databasegdriveplayer.co/player.php?link=$driveViewUrl"
+            )
+
+            for (gpUrl in gdrivePlayerUrls) {
+                try {
+                    if (loadExtractor(gpUrl, referer = ref, subtitleCallback, callback)) {
+                        return true
+                    }
+                } catch (_: Exception) { }
+            }
+
+            // 2) Fallback: direct Drive download endpoint as a plain VIDEO link
+            //    (works for many public files; CloudStream will follow redirects)
+            try {
+                val directUrl = "https://drive.google.com/uc?export=download&id=$fileId"
+                callback.invoke(
+                    newExtractorLink(
+                        source = this.name,
+                        name = "${this.name} – Google Drive",
+                        url = directUrl,
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = "https://drive.google.com/"
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+                return true
+            } catch (_: Exception) { }
+
+            return false
+        }
+
         suspend fun handleUrl(rawUrl: String, ref: String, depth: Int = 0) {
             if (depth > 2) return
-            
+
             val cleanUrl = try { fixUrl(rawUrl) } catch (e: Exception) { return }
             if (!cleanUrl.startsWith("http")) return
 
@@ -287,6 +336,12 @@ class ChikiAnimationProvider : MainAPI() {
             ) return
 
             try {
+                // ---- Google Drive FIRST (before any generic fallback) ----
+                if (handleGoogleDrive(cleanUrl, ref)) {
+                    found = true
+                    return
+                }
+
                 if (cleanUrl.contains("geo.dailymotion.com/player", true)) {
                     val videoId = Regex("""video=([a-zA-Z0-9_-]+)""").find(cleanUrl)?.groupValues?.get(1)
                     if (videoId != null) {
@@ -325,7 +380,7 @@ class ChikiAnimationProvider : MainAPI() {
                         found = true
                         return
                     }
-                } 
+                }
                 else if (cleanUrl.contains("dailymotion.com", true) || cleanUrl.contains("dai.ly", true)) {
                     com.lagradost.cloudstream3.extractors.Dailymotion().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true
@@ -404,7 +459,7 @@ class ChikiAnimationProvider : MainAPI() {
         val mirrorOptions = document.select(
             "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
         )
-        
+
         val serverListItems = document.select(".server_list li, ul.episodes li, .mirror_link, .mirrors li")
 
         coroutineScope {
