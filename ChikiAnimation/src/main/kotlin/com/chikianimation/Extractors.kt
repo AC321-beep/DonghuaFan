@@ -69,14 +69,15 @@ class GalaxyDonghua : ExtractorApi() {
 
         val tokenValues = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx).filter { it.isNotBlank() }
         
-        // Dynamically identify the password (10-digit timestamp or UUID)
+        // Dynamically find the password (the 10-digit Unix timestamp or UUID)
         val password = tokenValues.find { it.matches(Regex("""^\d{10}$""")) } 
             ?: tokenValues.find { it.matches(Regex("""^[a-f0-9\-]{36}$""")) } 
             ?: tokens.pd
-
         Log.e(tag, "Identified Decryption Password: $password")
 
+        // Filter out the password and small parameters to isolate the encrypted Base64 fragments
         val fragments = tokenValues.filter { it != password && it.length > 20 }
+        
         var configJson: String? = null
         var streamJson: String? = null
 
@@ -89,10 +90,12 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        // BRUTEFORCE STAGE 1: Individual fragments
-        for (f in fragments) checkDecrypted(dcx(f, password))
+        // BRUTEFORCE STAGE 1: Try decrypting fragments individually
+        for (f in fragments) {
+            checkDecrypted(dcx(f, password))
+        }
 
-        // BRUTEFORCE STAGE 2: 2-part fragment concatenation
+        // BRUTEFORCE STAGE 2: Concatenate halves if the obfuscator split the payload
         if (streamJson == null && configJson == null) {
             Log.e(tag, "Individual decryption failed. Attempting 2-part fragment concatenation...")
             for (i in fragments.indices) {
@@ -103,7 +106,7 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        // BRUTEFORCE STAGE 3: 3-part fragment concatenation
+        // BRUTEFORCE STAGE 3: Extreme fallback for 3-part splits
         if (streamJson == null && configJson == null && fragments.size >= 3) {
             Log.e(tag, "2-part failed. Attempting 3-part fragment concatenation...")
             for (i in fragments.indices) {
@@ -137,7 +140,7 @@ class GalaxyDonghua : ExtractorApi() {
                 streamJson = dcx(apiRes.trim(), password)
             }
         } else {
-            // FALLBACK: Execute dynamic API request matching exact browser concatenation
+            // FALLBACK: Execute dynamic API request
             Log.e(tag, "Local decryption failed. Executing dynamic API GET/POST fallback...")
             val decodedApx = try { String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT)).trim() } catch (e: Exception) { tokens.apx }
             val concatenatedPath = "$decodedApx${tokens.qsx}${tokens.pd}${tokens.ps}"
@@ -220,101 +223,107 @@ class GalaxyDonghua : ExtractorApi() {
     )
 
     private fun decodeGdTokens(page: String): GdTokens? {
-        fun grabVar(name: String, text: String): String {
-            val p1 = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*["']([^"']+)["']""").find(text)
-            if (p1 != null) return p1.groupValues[1].trim()
-            val p2 = Regex("""['"]?\b$name\b['"]?\s*:\s*["']([^"']+)["']""").find(text)
-            if (p2 != null) return p2.groupValues[1].trim()
-            val p3 = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*(\d+)""").find(text)
-            if (p3 != null) return p3.groupValues[1].trim()
-            return ""
-        }
-
-        val directPd = grabVar("pd", page)
-        val directPs = grabVar("ps", page)
-        val directQsx = grabVar("qsx", page)
-        val directKaken = grabVar("kaken", page)
-        val directApx = grabVar("apx", page)
-
-        if (directPd.isNotBlank() || directApx.isNotBlank()) {
-            return GdTokens(directPd, directPs, directQsx, directKaken, directApx)
-        }
-
-        val startMatch = Regex("""ﾟωﾟﾉ\s*=""").find(page) ?: return null
-        val jStart = startMatch.range.first
-        val endMatch = Regex("""\)\s*\(\s*ﾟΘﾟ\s*\)\s*\)\s*\(\s*'_'\s*\)""")
-            .find(page, jStart) ?: return null
-        val jEnd = endMatch.range.last + 1
-
-        val jsfuck = page.substring(jStart, jEnd)
-            .replace(Regex("""[\s\u00a0\u3000]+"""), "")
-
-        val bStart = jsfuck.indexOf("(ﾟεﾟ+")
-        if (bStart < 0) return null
-
-        val commentEnd = jsfuck.indexOf("*/", bStart)
-        val markerEnd = if (commentEnd >= 0) commentEnd + 2 else bStart + 5
-        var body = jsfuck.substring(markerEnd)
-
-        val oMarker = body.lastIndexOf("(ﾟДﾟ)[ﾟoﾟ]")
-        if (oMarker >= 0) body = body.substring(0, oMarker)
-
-        val segs = body.split("(ﾟДﾟ)[ﾟεﾟ]")
-        val sb = StringBuilder()
-
-        for (i in 1 until segs.size) {
-            val s = stripConstants(segs[i]).trim().trimStart('+').trimEnd('+')
-            val digits = StringBuilder()
-            for (term in splitTopLevelTerms(s)) {
-                val t = term.trim()
-                val raw = if (t.startsWith("-")) {
-                    val n = evalArithmetic(t.substring(1)) ?: return null
-                    -n
-                } else evalArithmetic(t.trimStart('+')) ?: return null
-                val v = abs(raw)
-                if (v > 7) return null
-                digits.append(v)
+        // Collects all variables from a given text block
+        fun extractVars(text: String): GdTokens {
+            fun grabVar(name: String): String {
+                val p1 = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*["']([^"']+)["']""").find(text)
+                if (p1 != null) return p1.groupValues[1].trim()
+                val p2 = Regex("""['"]?\b$name\b['"]?\s*:\s*["']([^"']+)["']""").find(text)
+                if (p2 != null) return p2.groupValues[1].trim()
+                val p3 = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*(\d+)""").find(text)
+                if (p3 != null) return p3.groupValues[1].trim()
+                return ""
             }
-            if (digits.isNotEmpty()) sb.append(digits.toString().toInt(8).toChar())
+            return GdTokens(grabVar("pd"), grabVar("ps"), grabVar("qsx"), grabVar("kaken"), grabVar("apx"))
         }
 
-        val packrCall = sb.toString()
-        val pStart = packrCall.indexOf("}('")
-        if (pStart < 0) return null
-        val packedStart = pStart + 3
-        val packedEnd = packrCall.indexOf("',", packedStart)
-        if (packedEnd < 0) return null
-        val packed = packrCall.substring(packedStart, packedEnd)
+        // Extract tokens scattered in the raw HTML
+        val htmlTokens = extractVars(page)
 
-        val num1Start = packedEnd + 2
-        val num1End = packrCall.indexOf(",", num1Start)
-        if (num1End < 0) return null
-        val a = packrCall.substring(num1Start, num1End).toIntOrNull() ?: return null
+        var jsFuckText = ""
+        val startMatch = Regex("""ﾟωﾟﾉ\s*=""").find(page)
+        if (startMatch != null) {
+            val jStart = startMatch.range.first
+            val endMatch = Regex("""\)\s*\(\s*ﾟΘﾟ\s*\)\s*\)\s*\(\s*'_'\s*\)""").find(page, jStart)
+            if (endMatch != null) {
+                val jEnd = endMatch.range.last + 1
+                val jsfuck = page.substring(jStart, jEnd).replace(Regex("""[\s\u00a0\u3000]+"""), "")
 
-        val dictStartRaw = packrCall.indexOf(",'", num1End)
-        if (dictStartRaw < 0) return null
-        val dictStart = dictStartRaw + 2
-        val dictEnd = packrCall.indexOf("'.split", dictStart)
-        if (dictEnd < 0) return null
+                val bStart = jsfuck.indexOf("(ﾟεﾟ+")
+                if (bStart >= 0) {
+                    val commentEnd = jsfuck.indexOf("*/", bStart)
+                    val markerEnd = if (commentEnd >= 0) commentEnd + 2 else bStart + 5
+                    var body = jsfuck.substring(markerEnd)
+                    val oMarker = body.lastIndexOf("(ﾟДﾟ)[ﾟoﾟ]")
+                    if (oMarker >= 0) body = body.substring(0, oMarker)
 
-        val dict = packrCall.substring(dictStart, dictEnd).split("|")
-        var code = packed
-        for (idx in (a - 1) downTo 0) {
-            val k = dict.getOrNull(idx)
-            if (!k.isNullOrEmpty()) {
-                code = Regex("""\b${Regex.escape(packrBase36(idx, a))}\b""")
-                    .replace(code, Regex.escapeReplacement(k))
+                    val segs = body.split("(ﾟДﾟ)[ﾟεﾟ]")
+                    val sb = StringBuilder()
+
+                    for (i in 1 until segs.size) {
+                        val s = stripConstants(segs[i]).trim().trimStart('+').trimEnd('+')
+                        val digits = StringBuilder()
+                        for (term in splitTopLevelTerms(s)) {
+                            val t = term.trim()
+                            val raw = if (t.startsWith("-")) {
+                                val n = evalArithmetic(t.substring(1)) ?: break
+                                -n
+                            } else evalArithmetic(t.trimStart('+')) ?: break
+                            val v = abs(raw)
+                            if (v > 7) break
+                            digits.append(v)
+                        }
+                        if (digits.isNotEmpty()) sb.append(digits.toString().toInt(8).toChar())
+                    }
+
+                    val packrCall = sb.toString()
+                    val pStart = packrCall.indexOf("}('")
+                    if (pStart >= 0) {
+                        val packedStart = pStart + 3
+                        val packedEnd = packrCall.indexOf("',", packedStart)
+                        if (packedEnd >= 0) {
+                            val packed = packrCall.substring(packedStart, packedEnd)
+                            val num1Start = packedEnd + 2
+                            val num1End = packrCall.indexOf(",", num1Start)
+                            if (num1End >= 0) {
+                                val a = packrCall.substring(num1Start, num1End).toIntOrNull()
+                                if (a != null) {
+                                    val dictStartRaw = packrCall.indexOf(",'", num1End)
+                                    if (dictStartRaw >= 0) {
+                                        val dictStart = dictStartRaw + 2
+                                        val dictEnd = packrCall.indexOf("'.split", dictStart)
+                                        if (dictEnd >= 0) {
+                                            val dict = packrCall.substring(dictStart, dictEnd).split("|")
+                                            var code = packed
+                                            for (idx in (a - 1) downTo 0) {
+                                                val k = dict.getOrNull(idx)
+                                                if (!k.isNullOrEmpty()) {
+                                                    code = Regex("""\b${Regex.escape(packrBase36(idx, a))}\b""").replace(code, Regex.escapeReplacement(k))
+                                                }
+                                            }
+                                            jsFuckText = code
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        val pd = grabVar("pd", code)
-        val ps = grabVar("ps", code)
-        val qsx = grabVar("qsx", code)
-        val kaken = grabVar("kaken", code)
-        val apx = grabVar("apx", code)
+        // Extract tokens hidden inside the JSFuck payload
+        val jsTokens = extractVars(jsFuckText)
 
-        if (listOf(pd, apx).all { it.isBlank() }) return null
-        return GdTokens(pd, ps, qsx, kaken, apx)
+        // Merge results: JSFuck tokens override HTML honeypot tokens to guarantee we grab everything
+        val finalPd = jsTokens.pd.ifBlank { htmlTokens.pd }
+        val finalPs = jsTokens.ps.ifBlank { htmlTokens.ps }
+        val finalQsx = jsTokens.qsx.ifBlank { htmlTokens.qsx }
+        val finalKaken = jsTokens.kaken.ifBlank { htmlTokens.kaken }
+        val finalApx = jsTokens.apx.ifBlank { htmlTokens.apx }
+
+        if (listOf(finalPd, finalApx).all { it.isBlank() }) return null
+        return GdTokens(finalPd, finalPs, finalQsx, finalKaken, finalApx)
     }
 
     private fun stripConstants(s: String): String {
@@ -412,7 +421,7 @@ class GalaxyDonghua : ExtractorApi() {
         while (offset < derivedBytes.size) {
             if (block != null) md.update(block)
             md.update(password)
-            md.update(salt)
+            if (salt.isNotEmpty()) md.update(salt)
             block = md.digest()
             val len = minOf(block.size, derivedBytes.size - offset)
             System.arraycopy(block, 0, derivedBytes, offset, len)
@@ -461,28 +470,60 @@ class GalaxyDonghua : ExtractorApi() {
         try {
             val sanitized = input.trim().replace("-", "+").replace("_", "/").replace(",,", "==").replace(",", "=")
             val data = Base64.decode(sanitized, Base64.DEFAULT)
-            if (data.size < 16) return null
-            
-            // GDPlayer AES payloads use standard OpenSSL format: "Salted__" (8 bytes) + salt (8 bytes)
-            val salt = data.copyOfRange(8, 16) 
-            val ct = data.copyOfRange(16, data.size)
+            if (data.isEmpty()) return null
+
             val passBytes = password.toByteArray(Charsets.UTF_8)
+            val md5Pass = MessageDigest.getInstance("MD5").digest(passBytes)
 
-            // Try standard CryptoJS default (MD5 EvpKDF)
-            try {
-                val derived = cryptoJsEvpKDF(passBytes, salt, 32, 16)
-                val decrypted = aesDecrypt(ct, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
-                if (decrypted != null && decrypted.contains("{")) return decrypted
-            } catch (e: Exception) {}
-
-            // Try PBKDF2 iterations fallback
-            for (iterations in listOf(1000, 5000, 10000)) {
+            // Branch 1: Payload has standard CryptoJS "Salted__" header
+            if (data.size > 16 && String(data.copyOfRange(0, 8)) == "Salted__") {
+                val salt = data.copyOfRange(8, 16)
+                val ct = data.copyOfRange(16, data.size)
+                
                 try {
-                    val derived = pbkdf2Sha256(passBytes, salt, iterations, 48) ?: continue
+                    val derived = cryptoJsEvpKDF(passBytes, salt, 32, 16)
                     val decrypted = aesDecrypt(ct, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
                     if (decrypted != null && decrypted.contains("{")) return decrypted
                 } catch (e: Exception) {}
+
+                for (iterations in listOf(1000, 5000, 10000)) {
+                    try {
+                        val derived = pbkdf2Sha256(passBytes, salt, iterations, 48) ?: continue
+                        val decrypted = aesDecrypt(ct, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
+                        if (decrypted != null && decrypted.contains("{")) return decrypted
+                    } catch (e: Exception) {}
+                }
             }
+
+            // Branch 2: "Saltless" CryptoJS (Missing header, empty salt)
+            try {
+                val derived = cryptoJsEvpKDF(passBytes, ByteArray(0), 32, 16)
+                val decrypted = aesDecrypt(data, derived.copyOfRange(0, 32), derived.copyOfRange(32, 48))
+                if (decrypted != null && decrypted.contains("{")) return decrypted
+            } catch (e: Exception) {}
+
+            // Branch 3: Raw AES-CBC with MD5 Keys
+            try {
+                val decrypted = aesDecrypt(data, md5Pass, md5Pass)
+                if (decrypted != null && decrypted.contains("{")) return decrypted
+            } catch(e: Exception) {}
+
+            // Branch 4: Raw AES-ECB
+            try {
+                val cipher = Cipher.getInstance("AES/ECB/PKCS5Padding")
+                cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(md5Pass, "AES"))
+                val decrypted = String(cipher.doFinal(data), Charsets.UTF_8)
+                if (decrypted.contains("{")) return decrypted
+            } catch(e: Exception) {}
+
+            // Branch 5: Raw AES-CBC with Zero-Padded Keys
+            try {
+                val key16 = passBytes.copyOf(16)
+                val iv16 = passBytes.copyOf(16)
+                val decrypted = aesDecrypt(data, key16, iv16)
+                if (decrypted != null && decrypted.contains("{")) return decrypted
+            } catch(e: Exception) {}
+
         } catch (e: Exception) {}
         return null
     }
