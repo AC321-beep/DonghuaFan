@@ -64,11 +64,11 @@ class GalaxyDonghua : ExtractorApi() {
             return
         }
 
-        // Dynamically identify the password (10 digits) and the payload (massive string)
-        val password = listOf(tokens.pd, tokens.kaken).find { it.matches(Regex("""^\d{10}$""")) } ?: tokens.pd
-        val payload = listOf(tokens.pd, tokens.kaken).find { it.length > 50 } ?: tokens.kaken
+        // The obfuscator swaps pd and kaken. The password is ALWAYS 10 digits. The payload is the massive string.
+        val actualPd = listOf(tokens.pd, tokens.kaken).find { it.matches(Regex("""^\d{10}$""")) } ?: tokens.pd
+        val actualKaken = listOf(tokens.pd, tokens.kaken).maxByOrNull { it.length } ?: tokens.kaken
 
-        Log.e(tag, "Tokens successfully assigned -> Password: $password | Payload length: ${payload.length}")
+        Log.e(tag, "Tokens successfully assigned -> Password: $actualPd | Payload length: ${actualKaken.length}")
 
         val gxBase = embedHost(url)
         val decodedApx = try {
@@ -81,8 +81,8 @@ class GalaxyDonghua : ExtractorApi() {
         val qsx = tokens.qsx.ifBlank { "?p=" }
         val finalQsx = if (baseUrlPart.contains("?") && qsx.startsWith("?")) qsx.replace("?", "&") else qsx
 
-        // The URL MUST include the query parameter, the payload, and the cache-busting timestamp
-        val apiUrlToCall = "$baseUrlPart$finalQsx$payload${tokens.ps}"
+        // FIXED TYPO: Injecting the 10-digit password (actualPd) into the URL, NOT the payload!
+        val apiUrlToCall = "$baseUrlPart$finalQsx$actualPd${tokens.ps}"
         Log.e(tag, "Target API Config URL: $apiUrlToCall")
 
         val configRes = try {
@@ -93,10 +93,12 @@ class GalaxyDonghua : ExtractorApi() {
         }
         Log.e(tag, "Config response fetched (length: ${configRes.length})")
 
-        // Use the dynamically identified 10-digit password for decryption
-        val configPlain = dcx(configRes.trim(), password)
+        // Decrypt using the 10-digit password
+        val configPlain = dcx(configRes.trim(), actualPd)
+            ?: dcx(configRes.trim(), actualKaken)
+
         if (configPlain == null) {
-            Log.e(tag, "CRITICAL: Failed to decrypt config response! ConfigRes: ${configRes.take(50)}")
+            Log.e(tag, "CRITICAL: Failed to decrypt config response!")
             return
         }
         Log.e(tag, "Config decrypted successfully.")
@@ -110,10 +112,10 @@ class GalaxyDonghua : ExtractorApi() {
         }
 
         val fixedApi = apiUrlTemplate
-            .replace("{pd}", tokens.pd)
+            .replace("{pd}", actualPd)
             .replace("{ps}", tokens.ps)
             .replace("{qsx}", tokens.qsx)
-            .replace("{kaken}", tokens.kaken)
+            .replace("{kaken}", actualKaken)
             .replace("{apx}", tokens.apx)
 
         Log.e(tag, "Final POST API Endpoint: $fixedApi")
@@ -123,8 +125,8 @@ class GalaxyDonghua : ExtractorApi() {
                 fixedApi,
                 headers = headers,
                 data = mapOf(
-                    "pd" to tokens.pd, "ps" to tokens.ps,
-                    "qsx" to tokens.qsx, "kaken" to tokens.kaken,
+                    "pd" to actualPd, "ps" to tokens.ps,
+                    "qsx" to tokens.qsx, "kaken" to actualKaken,
                     "apx" to tokens.apx
                 )
             ).text
@@ -134,7 +136,9 @@ class GalaxyDonghua : ExtractorApi() {
         }
         Log.e(tag, "POST response fetched (length: ${apiRes.length})")
 
-        val apiPlain = dcx(apiRes.trim(), password)
+        val apiPlain = dcx(apiRes.trim(), actualPd)
+            ?: dcx(apiRes.trim(), actualKaken)
+
         if (apiPlain == null) {
             Log.e(tag, "CRITICAL: Failed to decrypt final stream API response payload!")
             return
@@ -189,20 +193,24 @@ class GalaxyDonghua : ExtractorApi() {
     private fun decodeGdTokens(page: String): GdTokens? {
         val tag = "GalaxyDonghuaDebug"
         
-        // Rock-solid regex using \b boundaries to prevent extracting overlapping var names
-        fun grabVar(name: String, text: String): String {
-            val p1 = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*["']([^"']+)["']""").find(text)
-            if (p1 != null) return p1.groupValues[1].trim()
-            val p2 = Regex("""['"]?\b$name\b['"]?\s*:\s*["']([^"']+)["']""").find(text)
-            if (p2 != null) return p2.groupValues[1].trim()
+        fun grabVar(name: String): String {
+            val matches = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*["']([^"']+)["']""").findAll(page)
+            for (match in matches) return match.groupValues[1].trim()
+            
+            val altMatches = Regex("""['"]?\b$name\b['"]?\s*:\s*["']([^"']+)["']""").findAll(page)
+            for (match in altMatches) return match.groupValues[1].trim()
+            
+            val numMatches = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*(\d+)""").findAll(page)
+            for (match in numMatches) return match.groupValues[1].trim()
+            
             return ""
         }
 
-        val directPd = grabVar("pd", page)
-        val directPs = grabVar("ps", page)
-        val directQsx = grabVar("qsx", page)
-        val directKaken = grabVar("kaken", page)
-        val directApx = grabVar("apx", page)
+        val directPd = grabVar("pd")
+        val directPs = grabVar("ps")
+        val directQsx = grabVar("qsx")
+        val directKaken = grabVar("kaken")
+        val directApx = grabVar("apx")
 
         if (directPd.isNotBlank() || directApx.isNotBlank()) {
             Log.e(tag, "Successfully grabbed tokens via Direct Window Variables parsing.")
@@ -278,11 +286,24 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        val pd = grabVar("pd", code)
-        val ps = grabVar("ps", code)
-        val qsx = grabVar("qsx", code)
-        val kaken = grabVar("kaken", code)
-        val apx = grabVar("apx", code)
+        fun grabJsToken(name: String): String {
+            val matches = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*["']([^"']+)["']""").findAll(code)
+            for (match in matches) return match.groupValues[1].trim()
+            
+            val altMatches = Regex("""['"]?\b$name\b['"]?\s*:\s*["']([^"']+)["']""").findAll(code)
+            for (match in altMatches) return match.groupValues[1].trim()
+
+            val numMatches = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*(\d+)""").findAll(code)
+            for (match in numMatches) return match.groupValues[1].trim()
+            
+            return ""
+        }
+
+        val pd = grabJsToken("pd")
+        val ps = grabJsToken("ps")
+        val qsx = grabJsToken("qsx")
+        val kaken = grabJsToken("kaken")
+        val apx = grabJsToken("apx")
 
         if (listOf(pd, apx).all { it.isBlank() }) return null
         Log.e(tag, "Successfully parsed tokens via JSFuck fallback.")
