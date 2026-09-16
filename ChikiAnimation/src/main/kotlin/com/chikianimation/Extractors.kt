@@ -27,9 +27,9 @@ class Ghbrisk : Filesim() {
 
 // ────────────────────────────────────────────────────────────────────
 //  PRIMARY EXTRACTOR — galaxydonghua.xyz
-//  Serves "All Sub Player 1" in the ChikiAnimation dropdown.
+//  Marked `open` so SkylineAI can inherit the full pipeline.
 // ────────────────────────────────────────────────────────────────────
-class GalaxyDonghua : ExtractorApi() {
+open class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
     override var mainUrl = GX
     override val requiresReferer = true
@@ -77,11 +77,10 @@ class GalaxyDonghua : ExtractorApi() {
         }
         Log.e(TAG, "Page fetched (len=${page.length}) at +${System.currentTimeMillis() - t0}ms")
 
-        // 2) Dump the FULL loadConfig function from the RAW page.
-        //    The 183 KB player JS lives here, not in the small JSFuck blob.
+        // 2) Dump the FULL loadConfig from the RAW page (183 KB player JS lives here)
         dumpFullLoadConfig(page)
 
-        // 3) Decode the JSFuck tokens (pd / ps / qsx / kaken / apx)
+        // 3) Decode the JSFuck tokens
         val tokens = decodeGdTokens(page) ?: run {
             Log.e(TAG, "CRITICAL: Failed to decode GD tokens")
             return
@@ -89,10 +88,10 @@ class GalaxyDonghua : ExtractorApi() {
         val password = pickPassword(tokens)
         Log.e(TAG, "Password: $password at +${System.currentTimeMillis() - t0}ms")
 
-        // 4) Fast path — hit the API while pd is fresh
+        // 4) Fast path
         var streamJson: String? = tryFastApi(tokens, password, headers, url, gxBase, t0)
 
-        // 5) Slow path — brute-force decryption if the fast path failed
+        // 5) Slow path
         if (streamJson == null) {
             Log.e(TAG, "Fast path returned nothing. Falling back to local brute-force…")
             streamJson = tryLocalBruteForce(tokens, password, headers, t0)
@@ -108,26 +107,24 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  DIAGNOSTIC — dump the full loadConfig body from the RAW page
+    //  DIAGNOSTIC — dump full loadConfig body from the raw page
     // ────────────────────────────────────────────────────────────────
     private fun dumpFullLoadConfig(page: String) {
         val idx = page.indexOf("function loadConfig")
         if (idx < 0) {
             Log.e(TAG, "loadConfig function not present in raw page")
-            // Try alternative forms
             val alt = page.indexOf("loadConfig")
             if (alt >= 0) {
                 Log.e(TAG, "loadConfig referenced at offset $alt — dumping context")
                 val start = maxOf(0, alt - 400)
                 val end = minOf(start + 8000, page.length)
-                dumpChunks(page.substring(start, end), "loadConfig context")
+                dumpChunks(page.substring(start, end), "loadConfig-context")
             } else {
                 Log.e(TAG, "loadConfig nowhere in page")
             }
             return
         }
 
-        // Brace-match to find the full function body
         val braceStart = page.indexOf('{', idx)
         if (braceStart < 0) {
             Log.e(TAG, "Malformed loadConfig — no opening brace")
@@ -281,11 +278,9 @@ class GalaxyDonghua : ExtractorApi() {
             else if (d.contains(""""file"""") || d.contains(""""url"""")) configJson = d
         }
 
-        // 1-part
         for (f in fragments) check(dcx(f, password))
         Log.e(TAG, "1-part done at +${System.currentTimeMillis() - t0}ms: stream=${streamJson != null} config=${configJson != null}")
 
-        // 2-part + 3-part
         if (streamJson == null && configJson == null) {
             for (i in fragments.indices) for (j in fragments.indices) {
                 if (i == j) continue
@@ -298,7 +293,6 @@ class GalaxyDonghua : ExtractorApi() {
             Log.e(TAG, "2/3-part done at +${System.currentTimeMillis() - t0}ms: stream=${streamJson != null} config=${configJson != null}")
         }
 
-        // If we got a config, fetch the stream
         if (streamJson == null && configJson != null) {
             val tpl = Regex(""""url"\s*:\s*"([^"]+)"""")
                 .find(configJson!!)?.groupValues?.get(1)
@@ -721,10 +715,7 @@ class GalaxyDonghua : ExtractorApi() {
 
 // ────────────────────────────────────────────────────────────────────
 //  SECONDARY EXTRACTOR — skylineai.cloud
-//  Serves "All Sub Player 2" in the ChikiAnimation dropdown.
-//  Inherits GalaxyDonghua's entire pipeline; runs it against the
-//  skylineai.cloud host. If skylineai serves the same GDPlayer
-//  template, extraction works. If not, one log line tells us.
+//  Inherits GalaxyDonghua's full pipeline. Runs it against skylineai.
 // ────────────────────────────────────────────────────────────────────
 class SkylineAI : GalaxyDonghua() {
     override var name = "SkylineAI"
