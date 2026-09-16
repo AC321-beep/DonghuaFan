@@ -31,8 +31,10 @@ open class GalaxyDonghua : ExtractorApi() {
 
     companion object {
         const val GX = "https://galaxydonghua.xyz"
-        const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        const val TAG = "GalaxyDonghua"
+        const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/124.0.0.0 Safari/537.36"
+        const val TAG = "GalaxyDonghuaDebug"
     }
 
     override suspend fun getUrl(
@@ -42,6 +44,7 @@ open class GalaxyDonghua : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val t0 = System.currentTimeMillis()
+        Log.e(TAG, "[DEBUG] ══ Starting extraction for URL: $url")
         val gxBase = embedHost(url)
 
         val headers = mapOf(
@@ -58,32 +61,11 @@ open class GalaxyDonghua : ExtractorApi() {
         var page = try {
             app.get(url, headers = headers).text
         } catch (e: Exception) {
-            Log.e(TAG, "Page fetch failed: ${e.message}")
+            Log.e(TAG, "[DEBUG] Initial GET fetch failed: ${e.message}")
             return
         }
-
-        // ════════════════════════════════════════════════════════
-        // GATEWAY BYPASS (Handles the "Server Selection" POST form)
-        // ════════════════════════════════════════════════════════
-        val formMatch = Regex("""<form\s+id="frmValidation"\s+action="([^"]+)"""").find(page)
-        if (formMatch != null) {
-            var actionUrl = formMatch.groupValues[1]
-            if (actionUrl.startsWith("/")) actionUrl = gxBase + actionUrl
-            
-            val refMatch = Regex("""<input\s+type="hidden"\s+id="referer"\s+name="referer"\s+value="([^"]*)"""").find(page)
-            
-            // FIX: Force a valid referer if the form payload is blank to prevent 404/infinite loops
-            val formReferer = refMatch?.groupValues?.get(1)?.takeIf { it.isNotBlank() } 
-                ?: referer 
-                ?: "https://chikianimation.com/"
-
-            page = try {
-                app.post(actionUrl, headers = headers, data = mapOf("referer" to formReferer)).text
-            } catch (e: Exception) { 
-                Log.e(TAG, "Gateway POST failed: ${e.message}")
-                return 
-            }
-        }
+        
+        Log.e(TAG, "[DEBUG] Initial GET successful. Page length: ${page.length}")
 
         // ════════════════════════════════════════════════════════
         // 1. SKYLINE AI FAST PATH (Unencrypted VID_SRC)
@@ -92,7 +74,8 @@ open class GalaxyDonghua : ExtractorApi() {
         if (vidSrcMatch != null && vidSrcMatch.groupValues[1].isNotBlank()) {
             val streamUrl = vidSrcMatch.groupValues[1].replace("\\/", "/")
             val isM3u8 = streamUrl.contains(".m3u8") || streamUrl.contains("hls")
-            
+            Log.e(TAG, "[DEBUG] Found unencrypted VID_SRC: $streamUrl")
+
             callback.invoke(newExtractorLink(
                 source = this.name,
                 name = this.name,
@@ -103,71 +86,157 @@ open class GalaxyDonghua : ExtractorApi() {
                 this.quality = Qualities.Unknown.value
                 this.headers = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
             })
-            
+
             val subRx = Regex("""<track\s+kind="subtitles"\s+label="([^"]+)"\s+srclang="[^"]*"\s+src="([^"]+)"""")
             for (m in subRx.findAll(page)) {
                 val lang = m.groupValues[1]
                 val subUrl = m.groupValues[2].replace("\\/", "/")
                 subtitleCallback.invoke(SubtitleFile(lang, subUrl))
             }
-            return 
-        }
-
-        // ════════════════════════════════════════════════════════
-        // 2. GALAXYDONGHUA SLOW PATH (Encrypted JSFuck Tokens)
-        // ════════════════════════════════════════════════════════
-        val tokens = decodeGdTokens(page) ?: return
-        val password = pickPassword(tokens)
-        
-        var streamJson: String? = tryFastApi(tokens, password, headers, url, gxBase, t0)
-
-        if (streamJson == null) {
-            streamJson = tryLocalBruteForce(tokens, password)
-        }
-
-        if (streamJson == null) {
-            Log.e(TAG, "CRITICAL: Stream decryption failed entirely")
+            Log.e(TAG, "[DEBUG] Fast Path Complete. Exiting extractor.")
             return
         }
 
-        emitStreams(streamJson, gxBase, callback, subtitleCallback)
+        // ════════════════════════════════════════════════════════
+        // 2. DYNAMIC SERVER LIST DISCOVERY & GATEWAY POST
+        // ════════════════════════════════════════════════════════
+        val formMatch = Regex("""<form\s+id="frmValidation"\s+action="([^"]+)"""").find(page)
+        if (formMatch != null) {
+            Log.e(TAG, "[DEBUG] Gateway form detected.")
+            val refMatch = Regex("""<input\s+type="hidden"\s+id="referer"\s+name="referer"\s+value="([^"]*)"""").find(page)
+            val formReferer = refMatch?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
+                ?: referer
+                ?: "https://chikianimation.com/"
+            
+            Log.e(TAG, "[DEBUG] Extracted Form Referer: $formReferer")
+
+            // Collect all available servers dynamically from data-url attributes
+            val serverUrls = Regex("""data-url="([^"]+)"""").findAll(page)
+                .map { it.groupValues[1] }
+                .map { if (it.startsWith("/")) gxBase + it else it }
+                .distinct()
+                .toList()
+
+            Log.e(TAG, "[DEBUG] Found ${serverUrls.size} server(s) dynamically in HTML dropdown.")
+
+            val defaultFormAction = formMatch.groupValues[1].let { if (it.startsWith("/")) gxBase + it else it }
+            
+            // Prioritize Server 1 (alt=-1) if present, otherwise try servers in order
+            val candidateUrls = if (serverUrls.isNotEmpty()) {
+                serverUrls.sortedByDescending { it.contains("alt=-1") }
+            } else {
+                listOf(defaultFormAction)
+            }
+
+            Log.e(TAG, "[DEBUG] Candidate Server URLs prioritized: $candidateUrls")
+
+            var decrypted = false
+            for (targetUrl in candidateUrls) {
+                Log.e(TAG, "[DEBUG] Trying Server URL: $targetUrl")
+                val serverPage = try {
+                    app.post(targetUrl, headers = headers, data = mapOf("referer" to formReferer)).text
+                } catch (e: Exception) {
+                    Log.e(TAG, "[DEBUG] POST to server failed: ${e.message}")
+                    continue
+                }
+
+                val tokens = decodeGdTokens(serverPage)
+                if (tokens == null) {
+                    Log.e(TAG, "[DEBUG] Failed to decode JSFuck tokens for this server.")
+                    continue
+                }
+                
+                val password = pickPassword(tokens)
+                Log.e(TAG, "[DEBUG] Selected AES Password: $password")
+
+                var streamJson = tryFastApi(tokens, password, headers, gxBase)
+                if (streamJson == null) {
+                    Log.e(TAG, "[DEBUG] Fast API failed. Falling back to local brute-force…")
+                    streamJson = tryLocalBruteForce(tokens, password)
+                }
+
+                if (streamJson != null) {
+                    Log.e(TAG, "[DEBUG] Decryption successful! Parsing stream JSON...")
+                    emitStreams(streamJson, gxBase, callback, subtitleCallback)
+                    decrypted = true
+                    break
+                } else {
+                    Log.e(TAG, "[DEBUG] Stream decryption failed for this server.")
+                }
+            }
+
+            if (decrypted) return
+            Log.e(TAG, "[DEBUG] CRITICAL: All candidate servers exhausted without successful stream decryption.")
+        } else {
+            Log.e(TAG, "[DEBUG] No Gateway form detected. Proceeding with direct extraction.")
+            val tokens = decodeGdTokens(page)
+            if (tokens == null) {
+                Log.e(TAG, "[DEBUG] CRITICAL: decodeGdTokens returned null.")
+                return
+            }
+            
+            val password = pickPassword(tokens)
+            Log.e(TAG, "[DEBUG] Selected AES Password: $password")
+
+            var streamJson = tryFastApi(tokens, password, headers, gxBase)
+            if (streamJson == null) {
+                Log.e(TAG, "[DEBUG] Fast API failed. Falling back to local brute-force…")
+                streamJson = tryLocalBruteForce(tokens, password)
+            }
+
+            if (streamJson != null) {
+                Log.e(TAG, "[DEBUG] Decryption successful! Parsing stream JSON...")
+                emitStreams(streamJson, gxBase, callback, subtitleCallback)
+            } else {
+                Log.e(TAG, "[DEBUG] CRITICAL: Stream decryption failed entirely.")
+            }
+        }
     }
 
     // ────────────────────────────────────────────────────────────────
     //  FAST API POST
     // ────────────────────────────────────────────────────────────────
     private suspend fun tryFastApi(
-        tokens: GdTokens, password: String, headers: Map<String, String>,
-        embedUrl: String, gxBase: String, t0: Long
+        tokens: GdTokens, password: String, headers: Map<String, String>, gxBase: String
     ): String? {
         val decodedApx = try {
             String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT), Charsets.UTF_8).trim()
         } catch (_: Exception) { "" }
 
-        if (decodedApx.isBlank() && tokens.kaken.isBlank() && tokens.qsx.isBlank()) return null
-
-        val mid = tokens.kaken.ifBlank { tokens.qsx }
         val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
-        val urls = listOf(
-            prefix + mid + tokens.pd + tokens.ps,
-            prefix + tokens.kaken + tokens.qsx + tokens.pd + tokens.ps
-        )
+        val mid = tokens.kaken.ifBlank { tokens.qsx }
+
+        val urls = mutableListOf<String>()
+        if (mid.isNotBlank()) {
+            urls.add(prefix + mid + tokens.pd + tokens.ps)
+            urls.add(prefix + tokens.kaken + tokens.qsx + tokens.pd + tokens.ps)
+        }
+        val cleanPrefix = prefix.trimEnd('/')
+        urls.add("$cleanPrefix/${tokens.pd}${tokens.ps}")
+        urls.add("$cleanPrefix/${tokens.pd}")
+        urls.add(cleanPrefix)
 
         val postData = mapOf(
             "pd" to tokens.pd, "ps" to tokens.ps, "qsx" to tokens.qsx,
             "kaken" to tokens.kaken, "apx" to tokens.apx
         )
 
-        for (u in urls) {
+        val apiHeaders = headers.toMutableMap().apply {
+            put("X-Requested-With", "XMLHttpRequest")
+            put("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+        }
+
+        for ((i, u) in urls.distinct().withIndex()) {
+            Log.e(TAG, "[DEBUG] tryFastApi: Requesting API Endpoint [$i]: $u")
             try {
-                val r = app.post(u, data = postData, headers = headers)
+                val r = app.post(u, data = postData, headers = apiHeaders)
                 if (r.text.isNotBlank()) dcx(r.text.trim(), password)?.let { return it }
-            } catch (e: Exception) { }
-            
+            } catch (e: Exception) { Log.e(TAG, "[DEBUG] tryFastApi POST error: ${e.message}") }
+
             try {
-                val r = app.get(u, headers = headers)
+                val r = app.get(u, headers = apiHeaders)
                 if (r.text.isNotBlank()) dcx(r.text.trim(), password)?.let { return it }
-            } catch (e: Exception) { }
+            } catch (e: Exception) { Log.e(TAG, "[DEBUG] tryFastApi GET error: ${e.message}") }
         }
         return null
     }
@@ -176,13 +245,16 @@ open class GalaxyDonghua : ExtractorApi() {
     //  LOCAL BRUTE FORCE
     // ────────────────────────────────────────────────────────────────
     private fun tryLocalBruteForce(tokens: GdTokens, password: String): String? {
-        val fragments = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx).filter { it != password && it.length > 20 }
+        val fragments = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx)
+            .filter { it != password && it.length > 20 }
         
+        Log.e(TAG, "[DEBUG] tryLocalBruteForce: Checking ${fragments.size} fragments for payload.")
+
         for (f in fragments) {
             val d = dcx(f, password)
             if (d != null && d.contains(""""file"""") && d.contains(""""sources"""")) return d
         }
-        
+
         for (i in fragments.indices) {
             for (j in fragments.indices) {
                 if (i == j) continue
@@ -194,7 +266,7 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  EMIT STREAMS (Now marked suspend and using for-loops)
+    //  EMIT STREAMS
     // ────────────────────────────────────────────────────────────────
     private suspend fun emitStreams(
         json: String, gxBase: String, callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit
@@ -209,6 +281,7 @@ open class GalaxyDonghua : ExtractorApi() {
             val type  = m.groupValues[3]
             val isM3u8 = streamUrl.contains(".m3u8") || type.contains("hls", true)
 
+            Log.e(TAG, "[DEBUG] Emitting Stream URL: $streamUrl (Label: $label)")
             callback.invoke(newExtractorLink(
                 source = this.name,
                 name = "${this.name} – $label",
@@ -223,12 +296,16 @@ open class GalaxyDonghua : ExtractorApi() {
 
         val subRx = Regex(""""file"\s*:\s*"([^"]+\.(?:vtt|srt))"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?""")
         for (m in subRx.findAll(json)) {
-            subtitleCallback.invoke(SubtitleFile(m.groupValues[2].ifBlank { "Sub" }, fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]))
+            val subUrl = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
+            Log.e(TAG, "[DEBUG] Emitting Subtitle URL: $subUrl")
+            subtitleCallback.invoke(
+                SubtitleFile(m.groupValues[2].ifBlank { "Sub" }, subUrl)
+            )
         }
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  AGGRESSIVE TOKEN EXTRACTION & NATIVE KOTLIN JSFUCK DECODER
+    //  TOKEN EXTRACTION & NATIVE JSFUCK/AAENCODE DECODER
     // ────────────────────────────────────────────────────────────────
     protected data class GdTokens(val pd: String, val ps: String, val qsx: String, val kaken: String, val apx: String)
 
@@ -242,8 +319,15 @@ open class GalaxyDonghua : ExtractorApi() {
     private fun decodeGdTokens(page: String): GdTokens? {
         fun extractVars(text: String): GdTokens {
             fun grabVar(name: String): String {
-                val rx = Regex("""\b$name\b\s*[:=]\s*['"`]?([^'"`\s,;{}()]+)['"`]?""")
-                return rx.find(text)?.groupValues?.get(1)?.trim() ?: ""
+                // Check quoted string first to preserve trailing Base64 padding like commas
+                Regex("""\b$name\b\s*[:=]\s*['"`]([^'"`]+)['"`]""").find(text)?.let {
+                    return it.groupValues[1].trim()
+                }
+                // Check unquoted number/identifier
+                Regex("""\b$name\b\s*[:=]\s*([^'"`\s,;{}()]+)""").find(text)?.let {
+                    return it.groupValues[1].trim()
+                }
+                return ""
             }
             return GdTokens(grabVar("pd"), grabVar("ps"), grabVar("qsx"), grabVar("kaken"), grabVar("apx"))
         }
@@ -251,8 +335,11 @@ open class GalaxyDonghua : ExtractorApi() {
         var jsFuck = ""
         val startMatch = Regex("""ﾟωﾟﾉ\s*=""").find(page)
         if (startMatch != null) {
+            Log.e(TAG, "[DEBUG] JSFuck block detected. Attempting decode...")
             val jStart = startMatch.range.first
             val endMatch = Regex("""\)\s*\(\s*ﾟΘﾟ\s*\)\s*\)\s*\(\s*'_'\s*\)""").find(page, jStart)
+                ?: Regex("""\)\s*\(\s*'_'\s*\)""").find(page, jStart)
+
             if (endMatch != null) {
                 val rawJsFuck = page.substring(jStart, endMatch.range.last + 1).replace(Regex("""[\s\u00a0\u3000]+"""), "")
                 val bStart = rawJsFuck.indexOf("(ﾟεﾟ+")
@@ -277,7 +364,45 @@ open class GalaxyDonghua : ExtractorApi() {
                         }
                         if (digits.isNotEmpty()) sb.append(digits.toString().toInt(8).toChar())
                     }
-                    jsFuck = sb.toString()
+
+                    val packrCall = sb.toString()
+                    var unpacked = packrCall
+
+                    // Handle legacy p,a,c,k,e,d wrapper if present
+                    val pStart = packrCall.indexOf("}('")
+                    if (pStart >= 0) {
+                        val packedStart = pStart + 3
+                        val packedEnd = packrCall.indexOf("',", packedStart)
+                        if (packedEnd >= 0) {
+                            val packed = packrCall.substring(packedStart, packedEnd)
+                            val num1Start = packedEnd + 2
+                            val num1End = packrCall.indexOf(",", num1Start)
+                            if (num1End >= 0) {
+                                val a = packrCall.substring(num1Start, num1End).toIntOrNull()
+                                if (a != null) {
+                                    val dictStartRaw = packrCall.indexOf(",'", num1End)
+                                    if (dictStartRaw >= 0) {
+                                        val dictStart = dictStartRaw + 2
+                                        val dictEnd = packrCall.indexOf("'.split", dictStart)
+                                        if (dictEnd >= 0) {
+                                            val dict = packrCall.substring(dictStart, dictEnd).split("|")
+                                            var tempCode = packed
+                                            for (idx in (a - 1) downTo 0) {
+                                                val k = dict.getOrNull(idx)
+                                                if (!k.isNullOrEmpty()) {
+                                                    tempCode = Regex("""\b${Regex.escape(packrBase36(idx, a))}\b""")
+                                                        .replace(tempCode, Regex.escapeReplacement(k))
+                                                }
+                                            }
+                                            unpacked = tempCode
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    jsFuck = unpacked
+                    Log.e(TAG, "[DEBUG] JSFuck decoding completed. Length: ${jsFuck.length}")
                 }
             }
         }
@@ -290,6 +415,8 @@ open class GalaxyDonghua : ExtractorApi() {
         val finalQsx   = js.qsx.ifBlank   { html.qsx }
         val finalKaken = js.kaken.ifBlank { html.kaken }
         val finalApx   = js.apx.ifBlank   { html.apx }
+
+        Log.e(TAG, "[DEBUG] Extracted Tokens -> PD: ${finalPd.take(10)}, PS: ${finalPs.take(15)}..., APX: ${finalApx.take(15)}...")
 
         if (listOf(finalPd, finalApx).all { it.isBlank() }) return null
         return GdTokens(finalPd, finalPs, finalQsx, finalKaken, finalApx)
@@ -371,6 +498,13 @@ open class GalaxyDonghua : ExtractorApi() {
             values.add(if (op == '+') a + b else a - b)
         }
         return values.firstOrNull()
+    }
+
+    private fun packrBase36(c: Int, a: Int): String {
+        val prefix = if (c < a) "" else packrBase36(c / a, a)
+        val rem = c % a
+        val suffix = if (rem > 35) (rem + 29).toChar().toString() else rem.toString(36)
+        return prefix + suffix
     }
 
     // ────────────────────────────────────────────────────────────────
