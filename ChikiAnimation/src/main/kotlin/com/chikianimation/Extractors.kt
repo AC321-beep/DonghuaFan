@@ -44,7 +44,6 @@ class GalaxyDonghua : ExtractorApi() {
         val tag = "GalaxyDonghuaDebug"
         Log.e(tag, "Starting extraction for URL: $url")
 
-        // Added X-Requested-With header to bypass server bot protection (length: 0 fix)
         val headers = mapOf(
             "User-Agent" to UA,
             "Referer" to (referer ?: GX),
@@ -64,7 +63,11 @@ class GalaxyDonghua : ExtractorApi() {
             Log.e(tag, "CRITICAL: Failed to decode GD tokens")
             return
         }
-        Log.e(tag, "Tokens successfully retrieved -> pd length: ${tokens.pd.length}, apx length: ${tokens.apx.length}, kaken length: ${tokens.kaken.length}")
+        
+        // If the site obfuscated qsx completely, we force the query parameter so the URL doesn't break
+        val qsx = tokens.qsx.ifBlank { "?p=" }
+
+        Log.e(tag, "Tokens successfully retrieved -> pd: ${tokens.pd}, apx length: ${tokens.apx.length}, kaken length: ${tokens.kaken.length}")
 
         val gxBase = embedHost(url)
         
@@ -74,11 +77,13 @@ class GalaxyDonghua : ExtractorApi() {
             tokens.apx
         }
 
+        // Construct the correct API URL. Ensure ?p= is used so the server processes the payload.
         val apiUrlToCall = if (decodedApx.startsWith("http")) {
-            "$decodedApx${tokens.qsx}${tokens.pd}${tokens.ps}"
+            val base = if (decodedApx.contains("?")) decodedApx else "$decodedApx$qsx"
+            "$base${tokens.pd}${tokens.ps}"
         } else {
             val normalizedPath = if (decodedApx.startsWith("/")) decodedApx else "/$decodedApx"
-            "$gxBase$normalizedPath${tokens.qsx}${tokens.pd}${tokens.ps}"
+            "$gxBase$normalizedPath$qsx${tokens.pd}${tokens.ps}"
         }
         
         Log.e(tag, "Target API Config URL: $apiUrlToCall")
@@ -91,6 +96,7 @@ class GalaxyDonghua : ExtractorApi() {
         }
         Log.e(tag, "Config response fetched (length: ${configRes.length})")
 
+        // Try decrypting with pd (the timestamp) first, then kaken, then apx
         val configPlain = dcx(configRes.trim(), tokens.pd)
             ?: dcx(configRes.trim(), tokens.kaken)
             ?: dcx(configRes.trim(), tokens.apx)
@@ -112,7 +118,7 @@ class GalaxyDonghua : ExtractorApi() {
         val fixedApi = apiUrlTemplate
             .replace("{pd}", tokens.pd)
             .replace("{ps}", tokens.ps)
-            .replace("{qsx}", tokens.qsx)
+            .replace("{qsx}", qsx)
             .replace("{kaken}", tokens.kaken)
             .replace("{apx}", tokens.apx)
 
@@ -124,7 +130,7 @@ class GalaxyDonghua : ExtractorApi() {
                 headers = headers,
                 data = mapOf(
                     "pd" to tokens.pd, "ps" to tokens.ps,
-                    "qsx" to tokens.qsx, "kaken" to tokens.kaken,
+                    "qsx" to qsx, "kaken" to tokens.kaken,
                     "apx" to tokens.apx
                 )
             ).text
@@ -193,21 +199,9 @@ class GalaxyDonghua : ExtractorApi() {
         val tag = "GalaxyDonghuaDebug"
         
         fun grabVar(name: String): String {
-            val matches = Regex("""(?:window\.)?$name\s*=\s*["']([^"']+)["']""").findAll(page)
-            for (match in matches) {
-                val value = match.groupValues[1].trim()
-                if (value.isNotBlank() && !value.matches(Regex("""^\d{10,}$"""))) {
-                    return value
-                }
-            }
-            val altMatches = Regex("""\b$name\s*:\s*["']([^"']+)["']""").findAll(page)
-            for (match in altMatches) {
-                val value = match.groupValues[1].trim()
-                if (value.isNotBlank() && !value.matches(Regex("""^\d{10,}$"""))) {
-                    return value
-                }
-            }
-            return ""
+            return Regex("""(?:window\.)?$name\s*=\s*["']([^"']+)["']""").find(page)?.groupValues?.get(1)?.trim()
+                ?: Regex("""var\s+$name\s*=\s*["']([^"']+)["']""").find(page)?.groupValues?.get(1)?.trim()
+                ?: ""
         }
 
         val directPd = grabVar("pd")
@@ -217,7 +211,7 @@ class GalaxyDonghua : ExtractorApi() {
         val directApx = grabVar("apx")
 
         if (directPd.isNotBlank() || directApx.isNotBlank()) {
-            Log.e(tag, "Successfully grabbed tokens via Direct Window Variables parsing (Strict Filter).")
+            Log.e(tag, "Successfully grabbed tokens via Direct Window Variables parsing.")
             return GdTokens(directPd, directPs, directQsx, directKaken, directApx)
         }
 
@@ -291,21 +285,9 @@ class GalaxyDonghua : ExtractorApi() {
         }
 
         fun grabJsToken(varName: String): String {
-            val matches = Regex("""(?:window\.)?$varName\s*=\s*["']([^"']+)["']""").findAll(code)
-            for (match in matches) {
-                val value = match.groupValues[1].trim()
-                if (value.isNotBlank() && !value.matches(Regex("""^\d{10,}$"""))) {
-                    return value
-                }
-            }
-            val altMatches = Regex("""\b$varName\s*:\s*["']([^"']+)["']""").findAll(code)
-            for (match in altMatches) {
-                val value = match.groupValues[1].trim()
-                if (value.isNotBlank() && !value.matches(Regex("""^\d{10,}$"""))) {
-                    return value
-                }
-            }
-            return ""
+            return Regex("""(?:window\.)?$varName\s*=\s*["']([^"']+)["']""").find(code)?.groupValues?.getOrNull(1)?.trim()
+                ?: Regex("""\b$varName\s*:\s*["']([^"']+)["']""").find(code)?.groupValues?.getOrNull(1)?.trim()
+                ?: ""
         }
 
         val pd = grabJsToken("pd")
