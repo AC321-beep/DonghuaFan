@@ -68,107 +68,80 @@ class GalaxyDonghua : ExtractorApi() {
 
         val tokenValues = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx).filter { it.isNotBlank() }
         
-        // Dynamically find the 10-digit decryption password for local decryption usage
-        val password = tokenValues.find { it.matches(Regex("""^\d{10}$""")) } 
-            ?: tokenValues.find { it.matches(Regex("""^[a-f0-9\-]{36}$""")) } 
-            ?: tokens.pd
-
+        // Dynamically find the password (the 10-digit Unix timestamp)
+        val password = tokenValues.find { it.matches(Regex("""^\d{10}$""")) } ?: tokens.pd
         Log.e(tag, "Identified Decryption Password: $password")
 
+        // Filter out the password and small parameters to isolate the encrypted Base64 fragments
+        val fragments = tokenValues.filter { it != password && it.length > 20 }
+        
         var configJson: String? = null
         var streamJson: String? = null
-        
-        // Attempt local decryption first for embedded payloads
-        val massiveTokens = tokenValues.filter { it.length > 50 }
-        for (token in massiveTokens) {
-            val decrypted = dcx(token, password) ?: continue
-            if (decrypted.contains(""""file"""") && decrypted.contains(""""sources"""")) {
-                streamJson = decrypted
-                Log.e(tag, "SUCCESS: Stream JSON found directly embedded in HTML!")
-            } else if (decrypted.contains(""""url"""")) {
-                configJson = decrypted
-                Log.e(tag, "SUCCESS: Config JSON found directly embedded in HTML!")
+
+        fun checkDecrypted(d: String?) {
+            if (d == null) return
+            if (d.contains(""""file"""") && d.contains(""""sources"""")) {
+                streamJson = d
+            } else if (d.contains(""""file"""") || d.contains(""""url"""")) {
+                configJson = d
             }
         }
 
-        // Proceed to network fetch if config was not embedded
-        if (streamJson == null) {
-            if (configJson == null) {
-                Log.e(tag, "Config not embedded. Executing dynamic API POST request...")
-                
-                // Decode APX and strictly concatenate the path exactly as JS does (apx + qsx + pd + ps)
-                val decodedApx = try { String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT)).trim() } catch (e: Exception) { tokens.apx }
-                val concatenatedPath = "$decodedApx${tokens.qsx}${tokens.pd}${tokens.ps}"
-                val apiUrlToCall = if (concatenatedPath.startsWith("http")) concatenatedPath else "$gxBase/${concatenatedPath.trimStart('/')}"
-                
-                Log.e(tag, "Target API Config URL: $apiUrlToCall")
+        // BRUTEFORCE STAGE 1: Try decrypting fragments individually
+        for (f in fragments) {
+            checkDecrypted(dcx(f, password))
+        }
 
-                // GDPlayer strictly expects a POST request populated with the token form data to bypass the length:0 drop
+        // BRUTEFORCE STAGE 2: If the obfuscator split the payload into two halves, concatenate and test every permutation
+        if (streamJson == null && configJson == null) {
+            Log.e(tag, "Individual decryption failed. Attempting 2-part fragment concatenation...")
+            for (i in fragments.indices) {
+                for (j in fragments.indices) {
+                    if (i == j) continue
+                    checkDecrypted(dcx(fragments[i] + fragments[j], password))
+                }
+            }
+        }
+
+        // BRUTEFORCE STAGE 3: Extreme fallback for 3-part splits
+        if (streamJson == null && configJson == null && fragments.size >= 3) {
+            Log.e(tag, "2-part failed. Attempting 3-part fragment concatenation...")
+            for (i in fragments.indices) {
+                for (j in fragments.indices) {
+                    for (k in fragments.indices) {
+                        if (i == j || j == k || i == k) continue
+                        checkDecrypted(dcx(fragments[i] + fragments[j] + fragments[k], password))
+                    }
+                }
+            }
+        }
+
+        if (streamJson != null) {
+            Log.e(tag, "SUCCESS: Stream JSON successfully decrypted locally!")
+        } else if (configJson != null) {
+            Log.e(tag, "Config decrypted, but Stream requires POST API.")
+            val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""").find(configJson!!)?.groupValues?.get(1)
+            
+            if (apiUrlTemplate != null) {
+                val fixedApi = apiUrlTemplate
+                    .replace("{pd}", tokens.pd).replace("{ps}", tokens.ps)
+                    .replace("{qsx}", tokens.qsx).replace("{kaken}", tokens.kaken)
+                    .replace("{apx}", tokens.apx)
+
                 val postData = mapOf(
-                    "pd" to tokens.pd, 
-                    "ps" to tokens.ps,
-                    "qsx" to tokens.qsx, 
-                    "kaken" to tokens.kaken, 
-                    "apx" to tokens.apx
+                    "pd" to tokens.pd, "ps" to tokens.ps,
+                    "qsx" to tokens.qsx, "kaken" to tokens.kaken, "apx" to tokens.apx
                 )
 
-                var configRes = try { app.get(apiUrlToCall, headers = headers).text } catch (e: Exception) { "" }
-                if (configRes.isBlank()) {
-                    configRes = try { app.post(apiUrlToCall, headers = headers, data = postData).text } catch (e: Exception) { "" }
-                }
-
-                Log.e(tag, "Config response fetched (length: ${configRes.length})")
-                configJson = dcx(configRes.trim(), password)
+                val apiRes = try { app.post(fixedApi, headers = headers, data = postData).text } catch (e: Exception) { "" }
+                streamJson = dcx(apiRes.trim(), password)
             }
-
-            if (configJson == null) {
-                Log.e(tag, "CRITICAL: Failed to decrypt config JSON!")
-                return
-            }
-            Log.e(tag, "Config decrypted successfully.")
-
-            val apiUrlTemplate = Regex(""""url"\s*:\s*"([^"]+)"""").find(configJson)?.groupValues?.get(1)
-            if (apiUrlTemplate == null) {
-                Log.e(tag, "CRITICAL: Could not find 'url' pattern inside decrypted config.")
-                return
-            }
-
-            // Replace template variables using the exact original tokens, regardless of logical assignment
-            val fixedApi = apiUrlTemplate
-                .replace("{pd}", tokens.pd)
-                .replace("{ps}", tokens.ps)
-                .replace("{qsx}", tokens.qsx)
-                .replace("{kaken}", tokens.kaken)
-                .replace("{apx}", tokens.apx)
-
-            Log.e(tag, "Executing POST to final stream API...")
-            val apiRes = try {
-                app.post(
-                    fixedApi,
-                    headers = headers,
-                    data = mapOf(
-                        "pd" to tokens.pd, 
-                        "ps" to tokens.ps,
-                        "qsx" to tokens.qsx, 
-                        "kaken" to tokens.kaken,
-                        "apx" to tokens.apx
-                    )
-                ).text
-            } catch (e: Exception) {
-                Log.e(tag, "Failed to execute POST request: ${e.message}")
-                return
-            }
-            
-            Log.e(tag, "POST response fetched (length: ${apiRes.length})")
-            streamJson = dcx(apiRes.trim(), password)
         }
 
         if (streamJson == null) {
-            Log.e(tag, "CRITICAL: Failed to decrypt final stream API response!")
+            Log.e(tag, "CRITICAL: Bruteforce local decryption and API fallback both failed!")
             return
         }
-
-        Log.e(tag, "Stream API response decrypted successfully. Parsing links...")
 
         val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""").find(streamJson)?.groupValues?.get(1) ?: gxBase
         val playbackHeaders = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
@@ -218,8 +191,6 @@ class GalaxyDonghua : ExtractorApi() {
     )
 
     private fun decodeGdTokens(page: String): GdTokens? {
-        val tag = "GalaxyDonghuaDebug"
-        
         fun grabVar(name: String, text: String): String {
             val p1 = Regex("""(?:(?:window\.)?\b$name\b|window\[['"]$name['"]\])\s*=\s*["']([^"']+)["']""").find(text)
             if (p1 != null) return p1.groupValues[1].trim()
@@ -237,11 +208,8 @@ class GalaxyDonghua : ExtractorApi() {
         val directApx = grabVar("apx", page)
 
         if (directPd.isNotBlank() || directApx.isNotBlank()) {
-            Log.e(tag, "Successfully grabbed tokens via Direct Window Variables parsing.")
             return GdTokens(directPd, directPs, directQsx, directKaken, directApx)
         }
-
-        Log.e(tag, "Direct window variables not found or invalid. Falling back to JSFuck parser...")
 
         val startMatch = Regex("""ﾟωﾟﾉ\s*=""").find(page) ?: return null
         val jStart = startMatch.range.first
@@ -330,7 +298,6 @@ class GalaxyDonghua : ExtractorApi() {
         val apx = grabJsToken("apx")
 
         if (listOf(pd, apx).all { it.isBlank() }) return null
-        Log.e(tag, "Successfully parsed tokens via JSFuck fallback.")
         return GdTokens(pd, ps, qsx, kaken, apx)
     }
 
@@ -422,8 +389,8 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     private fun dcx(input: String, password: String): String? = try {
-        // Fix for the server's Base64 comma padding trick
-        val sanitized = input.trim().replace(",,", "==").replace(",", "=")
+        // Fix for URL-safe encoding and comma padding tricks deployed by the obfuscator
+        val sanitized = input.trim().replace("-", "+").replace("_", "/").replace(",,", "==").replace(",", "=")
         val data = Base64.decode(sanitized, Base64.DEFAULT)
         if (data.size < 16) null else {
             val salt = data.copyOfRange(0, 16)
