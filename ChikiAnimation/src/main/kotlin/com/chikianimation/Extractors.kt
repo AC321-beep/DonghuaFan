@@ -13,7 +13,6 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import java.net.URI
 import java.security.MessageDigest
 import javax.crypto.Cipher
-import javax.crypto.Mac
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.abs
@@ -47,14 +46,12 @@ open class GalaxyDonghua : ExtractorApi() {
         val gxBase = embedHost(url)
 
         val headers = mapOf(
-            "User-Agent"         to UA,
-            "Referer"            to (referer ?: url),
-            "Origin"             to gxBase,
-            "Accept"             to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language"    to "en-US,en;q=0.9",
-            "Sec-Fetch-Dest"     to "document",
-            "Sec-Fetch-Mode"     to "navigate",
-            "Sec-Fetch-Site"     to "cross-site"
+            "User-Agent"      to UA,
+            "Referer"         to url,
+            "Origin"          to gxBase,
+            "Accept"          to "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language" to "en-US,en;q=0.9",
+            "X-Requested-With" to "XMLHttpRequest"
         )
 
         var page = try {
@@ -71,7 +68,6 @@ open class GalaxyDonghua : ExtractorApi() {
         if (vidSrcMatch != null && vidSrcMatch.groupValues[1].isNotBlank()) {
             val streamUrl = vidSrcMatch.groupValues[1].replace("\\/", "/")
             val isM3u8 = streamUrl.contains(".m3u8") || streamUrl.contains("hls")
-            Log.e(TAG, "[DEBUG] Found unencrypted VID_SRC: $streamUrl")
 
             callback.invoke(newExtractorLink(
                 source = this.name, name = this.name, url = streamUrl,
@@ -114,10 +110,7 @@ open class GalaxyDonghua : ExtractorApi() {
                 
                 Log.e(TAG, "[DEBUG] Extracted Password: $password")
 
-                // CRITICAL FIX: Pass the targetUrl as the embedUrl so the API request has the correct Referer
-                var streamJson = tryFastApi(tokens, password, headers, gxBase, targetUrl)
-                if (streamJson == null) streamJson = tryLocalBruteForce(tokens, password)
-
+                val streamJson = fetchAndDecryptApi(tokens, password, headers, gxBase, targetUrl)
                 if (streamJson != null) {
                     emitStreams(streamJson, gxBase, callback, subtitleCallback)
                     decrypted = true
@@ -125,20 +118,19 @@ open class GalaxyDonghua : ExtractorApi() {
                 }
             }
             if (decrypted) return
-            Log.e(TAG, "[DEBUG] CRITICAL: All candidate servers exhausted without successful stream decryption.")
+            Log.e(TAG, "[DEBUG] CRITICAL: All candidate servers exhausted.")
         } else {
             val tokens = decodeGdTokens(page) ?: return
             val password = pickPassword(tokens)
-            var streamJson = tryFastApi(tokens, password, headers, gxBase, url)
-            if (streamJson == null) streamJson = tryLocalBruteForce(tokens, password)
+            val streamJson = fetchAndDecryptApi(tokens, password, headers, gxBase, url)
             if (streamJson != null) emitStreams(streamJson, gxBase, callback, subtitleCallback)
         }
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  FAST API POST
+    //  SINGLE-SHOT PRECISE API GET (No Guessing / No Timeouts)
     // ────────────────────────────────────────────────────────────────
-    private suspend fun tryFastApi(
+    private suspend fun fetchAndDecryptApi(
         tokens: GdTokens, password: String, headers: Map<String, String>, gxBase: String, embedUrl: String
     ): String? {
         val decodedApx = try {
@@ -148,51 +140,26 @@ open class GalaxyDonghua : ExtractorApi() {
         val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
         val cleanPrefix = prefix.trimEnd('/')
 
-        // FIX: Prioritize the exact decoded base endpoint first to prevent Coroutine timeouts
-        val urls = listOf(
-            cleanPrefix,
-            "$cleanPrefix/${tokens.pd}",
-            "$cleanPrefix/${tokens.pd}${tokens.ps}"
-        ).distinct()
-
-        val postData = mapOf(
-            "pd" to tokens.pd, "ps" to tokens.ps, "qsx" to tokens.qsx,
-            "kaken" to tokens.kaken, "apx" to tokens.apx
-        )
+        // Construct the exact URL path discovered in DevTools: /api-config/{kaken}{qsx}{pd}{ps}?p={apx}&_={timestamp}
+        val pathExtension = tokens.kaken + tokens.qsx + tokens.pd + tokens.ps
+        val targetUrl = "$cleanPrefix/$pathExtension?p=${tokens.apx}&_=${System.currentTimeMillis()}"
 
         val apiHeaders = headers.toMutableMap().apply {
-            put("X-Requested-With", "XMLHttpRequest")
-            put("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
-            put("Referer", embedUrl) // CRITICAL FIX: Embed URL must be the Referer for the API, not the domain!
-            put("Origin", gxBase)
+            put("Referer", embedUrl)
         }
 
-        for ((i, u) in urls.withIndex()) {
-            Log.e(TAG, "[DEBUG] tryFastApi: Requesting Endpoint [$i]: $u")
-            try {
-                val r = app.post(u, data = postData, headers = apiHeaders)
-                val text = r.text.trim()
-                Log.e(TAG, "[DEBUG] API Response Length: ${text.length} | Preview: ${text.take(150)}")
-                
-                if (text.isNotBlank()) {
-                    // FIX: Unwrap JSON if the backend returned {"data": "U2FsdGVk..."}
-                    val cipher = Regex(""""(?:data|file|source|sources)"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1) ?: text
-                    dcx(cipher, password)?.let { return it }
-                }
-            } catch (e: Exception) { Log.e(TAG, "[DEBUG] tryFastApi POST error: ${e.message}") }
-        }
-        return null
-    }
+        Log.e(TAG, "[DEBUG] Fetching Precise API Target: $targetUrl")
+        try {
+            val r = app.get(targetUrl, headers = apiHeaders)
+            val text = r.text.trim()
+            Log.e(TAG, "[DEBUG] API Response Length: ${text.length} | Preview: ${text.take(150)}")
 
-    // ────────────────────────────────────────────────────────────────
-    //  LOCAL BRUTE FORCE
-    // ────────────────────────────────────────────────────────────────
-    private fun tryLocalBruteForce(tokens: GdTokens, password: String): String? {
-        val fragments = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx).filter { it != password && it.length > 20 }
-        for (f in fragments) dcx(f, password)?.let { if (it.contains(""""file"""")) return it }
-        for (i in fragments.indices) for (j in fragments.indices) {
-            if (i == j) continue
-            dcx(fragments[i] + fragments[j], password)?.let { if (it.contains(""""file"""")) return it }
+            if (text.isNotBlank()) {
+                val cipher = Regex(""""(?:data|file|source|sources)"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1) ?: text
+                return dcx(cipher, password)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "[DEBUG] API request error: ${e.message}")
         }
         return null
     }
