@@ -8,6 +8,7 @@ import org.jsoup.nodes.Element
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import java.net.URLEncoder
 
 class ChikiAnimationProvider : MainAPI() {
 
@@ -270,28 +271,48 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // ----------------------------------------------------------------
-        //  Google Drive → Gdriveplayer conversion helper
-        //  CloudStream's built-in Gdriveplayer extractor is registered for
-        //  gdriveplayer.to, NOT drive.google.com. So a raw Drive URL must
-        //  be wrapped before being handed to loadExtractor().
-        // ----------------------------------------------------------------
+        // --------------------------------------------------------------------
+        //  Google Drive → playable stream
+        //
+        //  NOTE:  The Drive file in this provider is served by Google through
+        //  YouTube's SABR / UMP pipeline:
+        //
+        //     POST https://rr5---sn-....c.drive.google.com/videoplayback
+        //          ?source=webdrive&sabr=1&driveid=<FILE_ID>
+        //     Content-Type: application/vnd.yt-ump
+        //
+        //  That response is *not* an mp4.  It can only be consumed by a
+        //  player that speaks the SABR protocol (i.e. the YouTube iframe).
+        //
+        //  Therefore the only reliable way to play a Drive file inside
+        //  CloudStream is to route it through a service that wraps the
+        //  YouTube iframe (gdriveplayer.* mirrors) or to fetch the
+        //  confirmation-protected direct download URL for small / non-SABR
+        //  files.
+        // --------------------------------------------------------------------
         suspend fun handleGoogleDrive(cleanUrl: String, ref: String): Boolean {
             if (!cleanUrl.contains("drive.google.com", ignoreCase = true)) return false
 
-            // Try several common Drive URL shapes: /file/d/<id>/, ?id=<id>, uc?id=<id>
             val fileId = Regex("""/file/d/([a-zA-Z0-9_-]{10,})""").find(cleanUrl)?.groupValues?.get(1)
                 ?: Regex("""[?&]id=([a-zA-Z0-9_-]{10,})""").find(cleanUrl)?.groupValues?.get(1)
                 ?: return false
 
             val driveViewUrl = "https://drive.google.com/file/d/$fileId/view"
+            val encodedDriveUrl = try {
+                URLEncoder.encode(driveViewUrl, "UTF-8")
+            } catch (_: Exception) {
+                driveViewUrl
+            }
 
-            // 1) Preferred: gdriveplayer.to wrapper (what the built-in extractor expects)
+            // ---- 1) gdriveplayer.* mirrors (preferred - they proxy SABR) ----
             val gdrivePlayerUrls = listOf(
-                "https://gdriveplayer.to/embed2.php?link=$driveViewUrl",
-                "https://gdriveplayer.to/embed.php?link=$driveViewUrl",
-                "https://gdriveplayer.co/embed2.php?link=$driveViewUrl",
-                "https://databasegdriveplayer.co/player.php?link=$driveViewUrl"
+                "https://gdriveplayer.to/embed2.php?link=$encodedDriveUrl",
+                "https://gdriveplayer.co/embed2.php?link=$encodedDriveUrl",
+                "https://gdriveplayer.me/embed2.php?link=$encodedDriveUrl",
+                "https://gdriveplayer.io/embed2.php?link=$encodedDriveUrl",
+                "https://databasegdriveplayer.co/player.php?link=$encodedDriveUrl",
+                "https://databasegdriveplayer.xyz/player.php?link=$encodedDriveUrl",
+                "https://anime.gdriveplayer.to/embed2.php?link=$encodedDriveUrl"
             )
 
             for (gpUrl in gdrivePlayerUrls) {
@@ -302,19 +323,110 @@ class ChikiAnimationProvider : MainAPI() {
                 } catch (_: Exception) { }
             }
 
-            // 2) Fallback: direct Drive download endpoint as a plain VIDEO link
-            //    (works for many public files; CloudStream will follow redirects)
+            // ---- 2) Direct Drive download / confirm flow ----
+            val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
             try {
                 val directUrl = "https://drive.google.com/uc?export=download&id=$fileId"
+                val response = app.get(
+                    directUrl,
+                    headers = mapOf(
+                        "User-Agent" to ua,
+                        "Referer" to "https://drive.google.com/"
+                    ),
+                    allowRedirects = false
+                )
+
+                // 2a) Follow any 30x redirect straight to the CDN
+                if (response.code in 300..399) {
+                    val redirectUrl = response.headers["Location"]
+                    if (!redirectUrl.isNullOrBlank() && redirectUrl.startsWith("http")) {
+                        callback.invoke(
+                            newExtractorLink(
+                                source = this.name,
+                                name = "${this.name} – Drive",
+                                url = redirectUrl,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = "https://drive.google.com/"
+                                this.quality = Qualities.Unknown.value
+                                this.headers = mapOf("User-Agent" to ua)
+                            }
+                        )
+                        return true
+                    }
+                }
+
+                // 2b) Direct hit - file is served inline
+                if (response.code == 200) {
+                    val ct = response.headers["Content-Type"] ?: ""
+                    if (ct.contains("video", true) || ct.contains("octet-stream", true)) {
+                        callback.invoke(
+                            newExtractorLink(
+                                source = this.name,
+                                name = "${this.name} – Drive",
+                                url = directUrl,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = "https://drive.google.com/"
+                                this.quality = Qualities.Unknown.value
+                                this.headers = mapOf("User-Agent" to ua)
+                            }
+                        )
+                        return true
+                    }
+
+                    // 2c) Large-file "virus scan" confirmation page
+                    if (ct.contains("text/html", true)) {
+                        val html = response.text
+                        val doc = Jsoup.parse(html)
+
+                        val form = doc.selectFirst("form")
+                        val action = form?.attr("action")?.takeIf { it.isNotBlank() }
+                        val uuid = form?.selectFirst("input[name=uuid]")?.attr("value")?.takeIf { it.isNotBlank() }
+                        val confirm = form?.selectFirst("input[name=confirm]")?.attr("value")?.takeIf { it.isNotBlank() }
+                        val at = form?.selectFirst("input[name=at]")?.attr("value")?.takeIf { it.isNotBlank() }
+
+                        if (!action.isNullOrBlank()) {
+                            val params = mutableListOf<String>()
+                            if (!uuid.isNullOrBlank()) params.add("uuid=$uuid")
+                            if (!confirm.isNullOrBlank()) params.add("confirm=$confirm")
+                            if (!at.isNullOrBlank()) params.add("at=$at")
+                            params.add("id=$fileId")
+                            params.add("export=download")
+                            val confirmedUrl = "$action?" + params.joinToString("&")
+
+                            callback.invoke(
+                                newExtractorLink(
+                                    source = this.name,
+                                    name = "${this.name} – Drive (confirmed)",
+                                    url = confirmedUrl,
+                                    type = ExtractorLinkType.VIDEO
+                                ) {
+                                    this.referer = "https://drive.google.com/"
+                                    this.quality = Qualities.Unknown.value
+                                    this.headers = mapOf("User-Agent" to ua)
+                                }
+                            )
+                            return true
+                        }
+                    }
+                }
+            } catch (_: Exception) { }
+
+            // ---- 3) Absolute last resort - hand the raw URL to the player ----
+            try {
                 callback.invoke(
                     newExtractorLink(
                         source = this.name,
-                        name = "${this.name} – Google Drive",
-                        url = directUrl,
+                        name = "${this.name} – Drive (direct)",
+                        url = "https://drive.google.com/uc?export=download&id=$fileId",
                         type = ExtractorLinkType.VIDEO
                     ) {
                         this.referer = "https://drive.google.com/"
                         this.quality = Qualities.Unknown.value
+                        this.headers = mapOf("User-Agent" to ua)
                     }
                 )
                 return true
