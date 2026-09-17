@@ -132,24 +132,32 @@ class AnimekhorProvider : MainAPI() {
                 val okId = Regex("""/video(?:embed)?/(\d+)""").find(finalUrl)?.groupValues?.get(1) ?: finalUrl.substringAfterLast("/")
                 finalUrl = "https://ok.ru/videoembed/$okId"
             }
-
-            if (!extractedUrls.add(finalUrl)) return
-
-            try { 
-                loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback) 
-            } catch (e: Exception) { 
-                // Fails silently
+            
+            if (finalUrl.contains("playhydrax.com")) {
+                finalUrl = finalUrl.replace("playhydrax.com", "abyssplayer.com")
             }
 
+            // Stricter deduplication trimming parameters off ends of identical URLs
+            val dedupUrl = finalUrl.trimEnd('/')
+            if (!extractedUrls.add(dedupUrl)) return
+
             try {
-                when {
-                    "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> OkRuCustom().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "p2pstream" in finalUrl -> P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "upns.live" in finalUrl -> UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "bysekoze.com" in finalUrl -> Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
-                    "abyssplayer.com" in finalUrl -> AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                // If it successfully matches our domains, return true so we don't accidentally
+                // call Cloudstream's loadExtractor directly after it. Prevents the Duplicates issue entirely.
+                val isHandled = when {
+                    "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> { OkRuCustom().getUrl(finalUrl, mainUrl, subtitleCallback, callback); true }
+                    "p2pstream" in finalUrl -> { P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback); true }
+                    "upns.live" in finalUrl -> { UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, callback); true }
+                    "emturbovid" in finalUrl -> { Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback); true }
+                    "bysekoze.com" in finalUrl -> { Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, callback); true }
+                    "rumble.com" in finalUrl -> { Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback); true }
+                    "abyssplayer.com" in finalUrl -> { AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, callback); true }
+                    else -> false
+                }
+
+                // If not handled by our custom extractor suite, fall back to native CloudStream
+                if (!isHandled) {
+                    loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
                 }
             } catch (e: Exception) { 
                 // Fails silently
@@ -157,8 +165,7 @@ class AnimekhorProvider : MainAPI() {
         }
 
         val rawHtml = document.html()
-        // Updated regex to catch AbyssPlayer domains natively encoded in HTML elements
-        val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com|abyssplayer\.com)[^"'\s<>]+""")
+        val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com|abyssplayer\.com|playhydrax\.com)[^"'\s<>]+""")
         globalUrlRegex.findAll(rawHtml).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
             invokeExtractor(cleanUrl, "Raw Source")
