@@ -30,9 +30,7 @@ open class GalaxyDonghua : ExtractorApi() {
 
     companion object {
         const val GX = "https://galaxydonghua.xyz"
-        const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-                "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                "Chrome/124.0.0.0 Safari/537.36"
+        const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         const val TAG = "GalaxyDonghuaDebug"
     }
 
@@ -42,7 +40,7 @@ open class GalaxyDonghua : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        Log.e(TAG, "[DEBUG] ══ Starting extraction for URL: $url")
+        Log.e(TAG, "[STEP 1] ══ Starting extraction for URL: $url")
         val gxBase = embedHost(url)
 
         val headers = mapOf(
@@ -56,84 +54,101 @@ open class GalaxyDonghua : ExtractorApi() {
             "Sec-Fetch-Site"  to "cross-site"
         )
 
+        Log.e(TAG, "[STEP 2] Fetching initial HTML page...")
         val page = try {
-            app.get(url, headers = headers).text
+            val r = app.get(url, headers = headers)
+            Log.e(TAG, "[STEP 3] Initial GET success | Status: ${r.code} | Length: ${r.text.length}")
+            r.text
         } catch (e: Exception) {
-            Log.e(TAG, "[DEBUG] Initial GET fetch failed: ${e.message}")
+            Log.e(TAG, "[STEP 3 ERROR] Initial GET fetch failed: ${e.message}")
             return
         }
 
         // ════════════════════════════════════════════════════════
-        // 1. SKYLINE AI FAST PATH (Unencrypted VID_SRC)
+        // 1. SKYLINE AI FAST PATH
         // ════════════════════════════════════════════════════════
+        Log.e(TAG, "[STEP 4] Checking for unencrypted VID_SRC...")
         val vidSrcMatch = Regex("""const\s+VID_SRC\s*=\s*"([^"]+)"""").find(page)
         if (vidSrcMatch != null && vidSrcMatch.groupValues[1].isNotBlank()) {
             val streamUrl = vidSrcMatch.groupValues[1].replace("\\/", "/")
+            Log.e(TAG, "[STEP 4 SUCCESS] Found Skyline VID_SRC: $streamUrl")
             val isM3u8 = streamUrl.contains(".m3u8") || streamUrl.contains("hls")
-
-            callback.invoke(newExtractorLink(
-                source = this.name, name = this.name, url = streamUrl,
-                type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-            ) {
-                this.referer = gxBase; this.quality = Qualities.Unknown.value
-                this.headers = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
+            callback.invoke(newExtractorLink(this.name, this.name, streamUrl, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                this.referer = gxBase; this.quality = Qualities.Unknown.value; this.headers = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
             })
-            for (m in Regex("""<track\s+kind="subtitles"\s+label="([^"]+)"\s+srclang="[^"]*"\s+src="([^"]+)"""").findAll(page)) {
-                subtitleCallback.invoke(SubtitleFile(m.groupValues[1], m.groupValues[2].replace("\\/", "/")))
-            }
             return
         }
 
         // ════════════════════════════════════════════════════════
-        // 2. DYNAMIC SERVER LIST DISCOVERY & DIRECT GET PARSING
+        // 2. DYNAMIC SERVER LIST DISCOVERY
         // ════════════════════════════════════════════════════════
+        Log.e(TAG, "[STEP 5] Parsing for alternative server URLs...")
         val serverUrls = Regex("""data-url="([^"]+)"""").findAll(page)
             .map { it.groupValues[1] }
             .map { if (it.startsWith("/")) gxBase + it else it }
             .distinct().toList()
 
+        Log.e(TAG, "[STEP 6] Server URLs found via regex: ${serverUrls.size}")
+        
         val candidateUrls = if (serverUrls.isNotEmpty()) {
             serverUrls.sortedByDescending { it.contains("alt=-1") }
         } else {
+            Log.e(TAG, "[STEP 6 WARNING] No data-url attributes found! Defaulting to original URL.")
             listOf(url)
         }
 
         var decrypted = false
-        for (targetUrl in candidateUrls) {
-            Log.e(TAG, "[DEBUG] Trying Server URL: $targetUrl")
+        for ((index, targetUrl) in candidateUrls.withIndex()) {
+            Log.e(TAG, "[STEP 7] --- Testing Candidate [$index]: $targetUrl ---")
+            
             val serverPage = try {
-                app.get(targetUrl, headers = headers).text
+                val r = app.get(targetUrl, headers = headers)
+                Log.e(TAG, "[STEP 8] Server GET status: ${r.code} | Length: ${r.text.length}")
+                r.text
             } catch (e: Exception) {
+                Log.e(TAG, "[STEP 8 ERROR] Server GET failed: ${e.message}")
                 continue
             }
 
-            val tokens = decodeGdTokens(serverPage) ?: continue
-            val password = pickPassword(tokens)
+            Log.e(TAG, "[STEP 9] Passing server page to token decoder...")
+            val tokens = decodeGdTokens(serverPage)
+            if (tokens == null) {
+                Log.e(TAG, "[STEP 10 ERROR] Token decoder returned NULL. Skipping this candidate.")
+                continue
+            }
             
-            Log.e(TAG, "[DEBUG] Extracted Password: $password")
+            val password = pickPassword(tokens)
+            Log.e(TAG, "[STEP 11] Tokens ready. Password picked: $password")
 
+            Log.e(TAG, "[STEP 12] Initiating fetchAndDecryptApi...")
             val streamJson = fetchAndDecryptApi(tokens, password, headers, gxBase, targetUrl)
             if (streamJson != null) {
+                Log.e(TAG, "[STEP 14] Decryption successful! Emitting streams.")
                 emitStreams(streamJson, gxBase, callback, subtitleCallback)
                 decrypted = true
                 break
+            } else {
+                Log.e(TAG, "[STEP 14 ERROR] fetchAndDecryptApi returned NULL.")
             }
         }
         
         if (!decrypted) {
-            Log.e(TAG, "[DEBUG] CRITICAL: All candidate servers exhausted without decryption.")
+            Log.e(TAG, "[STEP 15 CRITICAL] All candidate servers exhausted without decryption.")
         }
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  SINGLE-SHOT PRECISE API GET (No Guessing / No Timeouts)
+    //  SINGLE-SHOT PRECISE API GET
     // ────────────────────────────────────────────────────────────────
     private suspend fun fetchAndDecryptApi(
         tokens: GdTokens, password: String, headers: Map<String, String>, gxBase: String, embedUrl: String
     ): String? {
         val decodedApx = try {
             String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT), Charsets.UTF_8).trim()
-        } catch (_: Exception) { "" }
+        } catch (e: Exception) { 
+            Log.e(TAG, "[API ERROR] Failed to decode APX token: ${e.message}")
+            "" 
+        }
 
         val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
         val cleanPrefix = prefix.trimEnd('/')
@@ -141,22 +156,24 @@ open class GalaxyDonghua : ExtractorApi() {
         val pathExtension = tokens.kaken + tokens.qsx + tokens.pd + tokens.ps
         val targetUrl = "$cleanPrefix/$pathExtension?p=${tokens.apx}&_=${System.currentTimeMillis()}"
 
-        val apiHeaders = headers.toMutableMap().apply {
-            put("Referer", embedUrl)
-        }
+        val apiHeaders = headers.toMutableMap().apply { put("Referer", embedUrl) }
 
-        Log.e(TAG, "[DEBUG] Fetching Precise API Target: $targetUrl")
+        Log.e(TAG, "[STEP 13] Requesting API: $targetUrl")
         try {
             val r = app.get(targetUrl, headers = apiHeaders)
             val text = r.text.trim()
-            Log.e(TAG, "[DEBUG] API Response Length: ${text.length} | Preview: ${text.take(150)}")
+            Log.e(TAG, "[STEP 13 API RES] Code: ${r.code} | Length: ${text.length}")
 
             if (text.isNotBlank()) {
                 val cipher = Regex(""""(?:data|file|source|sources)"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1) ?: text
-                return dcx(cipher, password)
+                val decryptedData = dcx(cipher, password)
+                if (decryptedData == null) Log.e(TAG, "[STEP 13 ERROR] CryptoJS dcx() returned null for cipher chunk.")
+                return decryptedData
+            } else {
+                Log.e(TAG, "[STEP 13 ERROR] API response body is empty!")
             }
         } catch (e: Exception) {
-            Log.e(TAG, "[DEBUG] API request error: ${e.message}")
+            Log.e(TAG, "[STEP 13 EXCEPTION] API network error: ${e.message}")
         }
         return null
     }
@@ -174,11 +191,7 @@ open class GalaxyDonghua : ExtractorApi() {
             val label = m.groupValues[2].ifBlank { "Auto" }
             val type  = m.groupValues[3]
             val isM3u8 = streamUrl.contains(".m3u8") || type.contains("hls", true)
-            Log.e(TAG, "[DEBUG] Emitting Stream URL: $streamUrl")
-            callback.invoke(newExtractorLink(
-                source = this.name, name = "${this.name} – $label", url = streamUrl,
-                type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-            ) {
+            callback.invoke(newExtractorLink(this.name, "${this.name} – $label", streamUrl, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
                 this.referer = gxBase; this.quality = label.filter { it.isDigit() }.toIntOrNull() ?: Qualities.Unknown.value; this.headers = playbackHeaders
             })
         }
@@ -201,6 +214,8 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     private fun decodeGdTokens(page: String): GdTokens? {
+        Log.e(TAG, "[TOKEN 1] Starting decode process. Page length: ${page.length}")
+        
         fun extractVars(text: String): GdTokens {
             fun grabVar(name: String): String {
                 Regex("""\b$name\b\s*[:=]\s*['"`]([^'"`]+)['"`]""").find(text)?.let { return it.groupValues[1].trim() }
@@ -213,9 +228,11 @@ open class GalaxyDonghua : ExtractorApi() {
         var jsFuck = ""
         val startMatch = Regex("""ﾟωﾟﾉ\s*=""").find(page)
         if (startMatch != null) {
+            Log.e(TAG, "[TOKEN 2] Found JSFuck payload start index: ${startMatch.range.first}")
             val jStart = startMatch.range.first
             val endMatch = Regex("""\)\s*\(\s*ﾟΘﾟ\s*\)\s*\)\s*\(\s*'_'\s*\)""").find(page, jStart) ?: Regex("""\)\s*\(\s*'_'\s*\)""").find(page, jStart)
             if (endMatch != null) {
+                Log.e(TAG, "[TOKEN 3] Found JSFuck payload end index: ${endMatch.range.last}")
                 val rawJsFuck = page.substring(jStart, endMatch.range.last + 1).replace(Regex("""[\s\u00a0\u3000]+"""), "")
                 val bStart = rawJsFuck.indexOf("(ﾟεﾟ+")
                 if (bStart >= 0) {
@@ -238,8 +255,13 @@ open class GalaxyDonghua : ExtractorApi() {
                         if (digits.isNotEmpty()) sb.append(digits.toString().toInt(8).toChar())
                     }
                     jsFuck = sb.toString()
+                    Log.e(TAG, "[TOKEN 4] Decoded JSFuck logic to JS string. Length: ${jsFuck.length}")
                 }
+            } else {
+                Log.e(TAG, "[TOKEN ERROR] Could not find end of JSFuck payload.")
             }
+        } else {
+            Log.e(TAG, "[TOKEN WARNING] No JSFuck 'ﾟωﾟﾉ' magic bytes found on page.")
         }
 
         val js = extractVars(jsFuck)
@@ -251,7 +273,12 @@ open class GalaxyDonghua : ExtractorApi() {
         val finalKaken = js.kaken.ifBlank { html.kaken }
         val finalApx   = js.apx.ifBlank   { html.apx }
 
-        if (listOf(finalPd, finalApx).all { it.isBlank() }) return null
+        Log.e(TAG, "[TOKEN FINAL] PD: $finalPd | PS: $finalPs | QSX: $finalQsx | KAKEN: $finalKaken | APX: $finalApx")
+
+        if (listOf(finalPd, finalApx).all { it.isBlank() }) {
+            Log.e(TAG, "[TOKEN ERROR] Both PD and APX are blank. Extraction failed.")
+            return null
+        }
         return GdTokens(finalPd, finalPs, finalQsx, finalKaken, finalApx)
     }
 
