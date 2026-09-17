@@ -115,7 +115,11 @@ class AnimekhorProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data).document
-        val extractedUrls = ConcurrentHashMap.newKeySet<String>()
+        
+        // Iframe URL deduplication
+        val extractedIframeUrls = ConcurrentHashMap.newKeySet<String>()
+        // Final Output Stream deduplication (Stops exact identical resolutions showing up)
+        val yieldedStreamUrls = ConcurrentHashMap.newKeySet<String>()
 
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl.trim()
@@ -137,27 +141,34 @@ class AnimekhorProvider : MainAPI() {
                 finalUrl = finalUrl.replace("playhydrax.com", "abyssplayer.com")
             }
 
-            // Stricter deduplication trimming parameters off ends of identical URLs
-            val dedupUrl = finalUrl.trimEnd('/')
-            if (!extractedUrls.add(dedupUrl)) return
+            // Stripping query parameters blocks duplicates of the exact same video embedded differently
+            val dedupUrl = finalUrl.substringBefore("?")
+            if (!extractedIframeUrls.add(dedupUrl)) return
+
+            // This intercepts links right before passing them to the UI player. 
+            // Completely obliterates duplicates across Extractors.
+            val trackingCallback: (ExtractorLink) -> Unit = { link ->
+                if (yieldedStreamUrls.add(link.url)) {
+                    callback(link)
+                }
+            }
 
             try {
-                // If it successfully matches our domains, return true so we don't accidentally
-                // call Cloudstream's loadExtractor directly after it. Prevents the Duplicates issue entirely.
+                // Using our highly optimized custom extractors first and skipping native if handled
+                // to prevent double executions entirely for these specific robust extractors.
                 val isHandled = when {
-                    "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> { OkRuCustom().getUrl(finalUrl, mainUrl, subtitleCallback, callback); true }
-                    "p2pstream" in finalUrl -> { P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, callback); true }
-                    "upns.live" in finalUrl -> { UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, callback); true }
-                    "emturbovid" in finalUrl -> { Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback); true }
-                    "bysekoze.com" in finalUrl -> { Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, callback); true }
-                    "rumble.com" in finalUrl -> { Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback); true }
-                    "abyssplayer.com" in finalUrl -> { AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, callback); true }
+                    "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> { OkRuCustom().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
+                    "p2pstream" in finalUrl -> { P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
+                    "upns.live" in finalUrl -> { UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
+                    "emturbovid" in finalUrl -> { Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
+                    "bysekoze.com" in finalUrl -> { Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
+                    "rumble.com" in finalUrl -> { Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
+                    "abyssplayer.com" in finalUrl -> { AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
                     else -> false
                 }
 
-                // If not handled by our custom extractor suite, fall back to native CloudStream
                 if (!isHandled) {
-                    loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, callback)
+                    loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, trackingCallback)
                 }
             } catch (e: Exception) { 
                 // Fails silently
