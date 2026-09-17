@@ -110,6 +110,7 @@ class OkRu : ExtractorApi() {
 }
 
 class Dtube : ExtractorApi() {
+class Dtube : ExtractorApi() {
     override val name = "DTube"
     override val mainUrl = "https://play.d.tube"
     override val requiresReferer = false
@@ -123,49 +124,64 @@ class Dtube : ExtractorApi() {
             val uuidRegex = Regex("""([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})""", RegexOption.IGNORE_CASE)
             videoId = uuidRegex.find(url)?.groupValues?.get(1)
 
-            // 2. If it's a short token like ?v=RgTP7r..., query DTube's video API to resolve the UUID
-            if (videoId == null) {
-                val shortParamRegex = Regex("""[?&]v=([a-zA-Z0-9_-]+)""")
-                val shortId = shortParamRegex.find(url)?.groupValues?.get(1)
-                Log.d("DTubeDebug", "Extracted short ID parameter: $shortId")
+            // 2. Extract short token if present
+            val shortParamRegex = Regex("""[?&]v=([a-zA-Z0-9_-]+)""")
+            val shortId = shortParamRegex.find(url)?.groupValues?.get(1) ?: if (videoId == null) url.substringAfterLast("/").takeIf { it.isNotBlank() } else null
 
-                if (shortId != null) {
-                    val apiUrl = "https://api.d.tube/videos/$shortId"
-                    Log.d("DTubeDebug", "Querying DTube API: $apiUrl")
-                    try {
-                        val apiResponse = app.get(apiUrl).text
-                        if (apiResponse.startsWith("{")) {
-                            val json = JSONObject(apiResponse)
-                            videoId = json.optString("_id").takeIf { it.isNotBlank() }
-                                ?: json.optString("id").takeIf { it.isNotBlank() }
-                                ?: json.optString("uuid").takeIf { it.isNotBlank() }
-                                ?: uuidRegex.find(apiResponse)?.groupValues?.get(1)
-                            Log.d("DTubeDebug", "Resolved videoId from API JSON: $videoId")
+            // 3. Query DTube API to fetch the full video metadata JSON
+            val lookupId = shortId ?: videoId
+            if (lookupId != null) {
+                val apiUrl = "https://api.d.tube/videos/$lookupId"
+                Log.d("DTubeDebug", "Querying DTube API: $apiUrl")
+                try {
+                    val apiResponse = app.get(apiUrl).text
+                    Log.d("DTubeDebug", "API Response length: ${apiResponse.length}, starts with: ${apiResponse.take(100)}")
+                    
+                    if (apiResponse.startsWith("{")) {
+                        val json = JSONObject(apiResponse)
+                        
+                        // Log available JSON keys to inspect structure in Logcat if needed
+                        Log.d("DTubeDebug", "API JSON keys: ${json.keys().asSequence().toList()}")
+
+                        // Extract resolved UUID if present
+                        videoId = json.optString("_id").takeIf { it.isNotBlank() }
+                            ?: json.optString("id").takeIf { it.isNotBlank() }
+                            ?: json.optString("uuid").takeIf { it.isNotBlank() }
+                            ?: videoId
+
+                        // Check if the API directly provides an HLS or stream URL
+                        val directHls = json.optString("hlsUrl").takeIf { it.isNotBlank() }
+                            ?: json.optString("manifestUrl").takeIf { it.isNotBlank() }
+                            ?: json.optString("gatewayUrl").takeIf { it.isNotBlank() }
+
+                        if (!directHls.isNullOrBlank()) {
+                            Log.d("DTubeDebug", "Found direct stream URL in API JSON: $directHls")
+                            M3u8Helper.generateM3u8(name, directHls, url).forEach(callback)
+                            return
                         }
-                    } catch (e: Exception) {
-                        Log.d("DTubeDebug", "API lookup failed: ${e.localizedMessage}")
                     }
+                } catch (e: Exception) {
+                    Log.d("DTubeDebug", "API lookup exception: ${e.localizedMessage}")
                 }
             }
 
-            // 3. If we successfully resolved the UUID, probe the NAS storage nodes
+            // 4. Fallback to probing NAS nodes if we have a resolved UUID
             if (videoId != null) {
-                val nasNodes = listOf("nas1", "nas2", "nas3", "nas4", "video")
+                Log.d("DTubeDebug", "Resolved videoId for NAS probing: $videoId")
+                val nasNodes = listOf("nas1", "nas2", "nas3", "nas4", "video", "ipfs")
                 var success = false
                 
                 for (node in nasNodes) {
                     val m3u8Url = "https://$node.d.tube/videos/$videoId/master.m3u8"
                     Log.d("DTubeDebug", "Probing node URL: $m3u8Url")
                     try {
-                        val headCheck = app.get(m3u8Url, headers = mapOf("Range" to "bytes=0-100"))
-                        if (headCheck.code == 200) {
-                            Log.d("DTubeDebug", "Found working manifest on node: $node")
-                            M3u8Helper.generateM3u8(name, m3u8Url, url).forEach(callback)
-                            success = true
-                            break
-                        }
+                        app.get(m3u8Url, headers = mapOf("Range" to "bytes=0-100"))
+                        Log.d("DTubeDebug", "Found working manifest on node: $node")
+                        M3u8Helper.generateM3u8(name, m3u8Url, url).forEach(callback)
+                        success = true
+                        break
                     } catch (e: Exception) {
-                        // Try next node
+                        Log.d("DTubeDebug", "Node $node failed: ${e.localizedMessage}")
                     }
                 }
                 if (!success) {
