@@ -174,16 +174,13 @@ class AbyssPlayer : ExtractorApi() {
             "Referer" to "https://playhydrax.com/"
         )
 
-        // Fetch script data to extract the encrypted payload
         val doc = try { app.get(url, headers = headers).document } catch (e: Exception) { return }
         val scriptData = doc.select("script").joinToString("\n") { it.data() }
         val encrypted = Regex("""const\s+datas\s*=\s*"([^"]*)"""").find(scriptData)?.groupValues?.getOrNull(1) ?: return
 
-        // Prepare JSON payload request body natively
         val payload = """{"text":"$encrypted"}"""
         val reqBody = payload.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
 
-        // Post encrypted string to the decoding API
         val responseText = try {
             app.post(
                 "https://enc-dec.app/api/dec-abyss",
@@ -195,26 +192,43 @@ class AbyssPlayer : ExtractorApi() {
         val json = JSONObject(responseText).optJSONObject("result") ?: return
         val sources = json.optJSONArray("sources") ?: return
 
-        // Process decodes sources
         for (i in 0 until sources.length()) {
-            val src = sources.optJSONObject(i) ?: continue
-            if (src.optBoolean("status", false)) {
-                val srcUrl = src.optString("url")
-                if (srcUrl.isNotBlank()) {
-                    if (srcUrl.contains(".m3u8")) {
-                        // Native Cloudstream utility to unpack/sort adaptive HLS qualities automatically
-                        M3u8Helper.generateM3u8(name, srcUrl, mainUrl).forEach(callback)
-                    } else {
-                        callback(
-                            newExtractorLink(
-                                name = name,
-                                source = name,
-                                url = srcUrl,
-                                type = INFER_TYPE
-                            ) {
-                                this.referer = mainUrl
+            val src = sources.optJSONObject(i)
+            if (src != null) {
+                if (src.optBoolean("status", false) || src.has("url")) {
+                    val srcUrl = src.optString("url")
+                    if (srcUrl.isNotBlank()) {
+                        // Extract label or quality from JSON explicitly for visual naming
+                        val label = src.optString("label").ifBlank { src.optString("quality") }
+                        val sourceName = if (label.isNotBlank()) "$name $label" else name
+                        
+                        if (srcUrl.contains(".m3u8")) {
+                            M3u8Helper.generateM3u8(sourceName, srcUrl, mainUrl).forEach(callback)
+                        } else {
+                            val qualityInt = when {
+                                label.contains("1080") -> Qualities.P1080.value
+                                label.contains("720") -> Qualities.P720.value
+                                label.contains("480") -> Qualities.P480.value
+                                label.contains("360") -> Qualities.P360.value
+                                else -> Qualities.Unknown.value
                             }
-                        )
+                            callback(
+                                newExtractorLink(name = name, source = sourceName, url = srcUrl, type = INFER_TYPE) {
+                                    this.referer = mainUrl
+                                    this.quality = qualityInt
+                                }
+                            )
+                        }
+                    }
+                }
+            } else {
+                // Fallback for primitive string arrays
+                val stringUrl = sources.optString(i)
+                if (stringUrl.isNotBlank()) {
+                    if (stringUrl.contains(".m3u8")) {
+                        M3u8Helper.generateM3u8(name, stringUrl, mainUrl).forEach(callback)
+                    } else {
+                        callback(newExtractorLink(name = name, source = name, url = stringUrl, type = INFER_TYPE) { this.referer = mainUrl })
                     }
                 }
             }
