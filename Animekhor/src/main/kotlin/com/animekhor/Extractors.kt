@@ -9,6 +9,8 @@ import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 
 private suspend fun manualJsUnpackExtraction(url: String, name: String, headers: Map<String, String>, callback: (ExtractorLink) -> Unit) {
@@ -154,6 +156,66 @@ class Rumble : ExtractorApi() {
                             this.quality = qualityInt
                         }
                     )
+                }
+            }
+        }
+    }
+}
+
+class AbyssPlayer : ExtractorApi() {
+    override val name = "AbyssPlayer"
+    override val mainUrl = "https://abyssplayer.com"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        val headers = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+            "Origin" to "https://playhydrax.com",
+            "Referer" to "https://playhydrax.com/"
+        )
+
+        // Fetch script data to extract the encrypted payload
+        val doc = try { app.get(url, headers = headers).document } catch (e: Exception) { return }
+        val scriptData = doc.select("script").joinToString("\n") { it.data() }
+        val encrypted = Regex("""const\s+datas\s*=\s*"([^"]*)"""").find(scriptData)?.groupValues?.getOrNull(1) ?: return
+
+        // Prepare JSON payload request body natively
+        val payload = """{"text":"$encrypted"}"""
+        val reqBody = payload.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
+
+        // Post encrypted string to the decoding API
+        val responseText = try {
+            app.post(
+                "https://enc-dec.app/api/dec-abyss",
+                headers = headers + mapOf("Content-Type" to "application/json"),
+                requestBody = reqBody
+            ).text
+        } catch (e: Exception) { return }
+
+        val json = JSONObject(responseText).optJSONObject("result") ?: return
+        val sources = json.optJSONArray("sources") ?: return
+
+        // Process decodes sources
+        for (i in 0 until sources.length()) {
+            val src = sources.optJSONObject(i) ?: continue
+            if (src.optBoolean("status", false)) {
+                val srcUrl = src.optString("url")
+                if (srcUrl.isNotBlank()) {
+                    if (srcUrl.contains(".m3u8")) {
+                        // Native Cloudstream utility to unpack/sort adaptive HLS qualities automatically
+                        M3u8Helper.generateM3u8(name, srcUrl, mainUrl).forEach(callback)
+                    } else {
+                        callback(
+                            newExtractorLink(
+                                name = name,
+                                source = name,
+                                url = srcUrl,
+                                type = INFER_TYPE
+                            ) {
+                                this.referer = mainUrl
+                            }
+                        )
+                    }
                 }
             }
         }
