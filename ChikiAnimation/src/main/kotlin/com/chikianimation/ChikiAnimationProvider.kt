@@ -36,18 +36,43 @@ class ChikiAnimationProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = buildPageUrl(request.data, page)
+        val primaryUrl = buildPageUrl(request.data, page)
+        val fallbackUrl = buildFallbackPageUrl(page)
 
-        val items = try {
-            val document = app.get(url, headers = defaultHeaders).document
-            document.select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
+        // 1) Try the primary archive URL
+        var items = fetchMainPageItems(primaryUrl)
+        if (items.isNotEmpty()) {
+            Log.e(TAG, "[getMainPage] ✓ primary '${request.name}' page=$page → $primaryUrl (${items.size} items)")
+            return newHomePageResponse(request.name, items, true)
+        }
+
+        // 2) Fallback to sitewide /page/N/ (used while the site archives are down)
+        if (fallbackUrl != primaryUrl) {
+            Log.e(TAG, "[getMainPage] primary empty for '${request.name}', trying fallback → $fallbackUrl")
+            items = fetchMainPageItems(fallbackUrl)
+            if (items.isNotEmpty()) {
+                Log.e(TAG, "[getMainPage] ✓ fallback '${request.name}' page=$page → $fallbackUrl (${items.size} items)")
+                return newHomePageResponse(request.name, items, true)
+            }
+        }
+
+        Log.e(TAG, "[getMainPage] ✗ both primary and fallback failed for '${request.name}' page=$page")
+        return newHomePageResponse(request.name, emptyList(), false)
+    }
+
+    private suspend fun fetchMainPageItems(url: String): List<SearchResponse> {
+        return try {
+            val response = app.get(url, headers = defaultHeaders)
+            Log.e(TAG, "[fetchMainPageItems] HTTP ${response.code} ← $url")
+            if (response.code !in 200..299) return emptyList()
+            response.document
+                .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
                 .mapNotNull { it.toSearchResult() }
                 .distinctBy { it.url }
         } catch (e: Exception) {
+            Log.e(TAG, "[fetchMainPageItems] EXCEPTION $url → ${e.message}")
             emptyList()
         }
-
-        return newHomePageResponse(request.name, items, items.isNotEmpty())
     }
 
     private fun buildPageUrl(base: String, page: Int): String {
@@ -59,6 +84,11 @@ class ChikiAnimationProvider : MainAPI() {
             }
             else -> "$mainUrl/$base&page=$page"
         }
+    }
+
+    /** Temporary sitewide pagination fallback: https://chikianimation.com/page/N/ */
+    private fun buildFallbackPageUrl(page: Int): String {
+        return if (page <= 1) mainUrl else "$mainUrl/page/$page/"
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
