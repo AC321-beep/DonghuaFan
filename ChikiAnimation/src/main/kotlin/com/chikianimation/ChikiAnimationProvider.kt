@@ -271,25 +271,6 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // --------------------------------------------------------------------
-        //  Google Drive → playable stream
-        //
-        //  NOTE:  The Drive file in this provider is served by Google through
-        //  YouTube's SABR / UMP pipeline:
-        //
-        //     POST https://rr5---sn-....c.drive.google.com/videoplayback
-        //          ?source=webdrive&sabr=1&driveid=<FILE_ID>
-        //     Content-Type: application/vnd.yt-ump
-        //
-        //  That response is *not* an mp4.  It can only be consumed by a
-        //  player that speaks the SABR protocol (i.e. the YouTube iframe).
-        //
-        //  Therefore the only reliable way to play a Drive file inside
-        //  CloudStream is to route it through a service that wraps the
-        //  YouTube iframe (gdriveplayer.* mirrors) or to fetch the
-        //  confirmation-protected direct download URL for small / non-SABR
-        //  files.
-        // --------------------------------------------------------------------
         suspend fun handleGoogleDrive(cleanUrl: String, ref: String): Boolean {
             if (!cleanUrl.contains("drive.google.com", ignoreCase = true)) return false
 
@@ -304,7 +285,6 @@ class ChikiAnimationProvider : MainAPI() {
                 driveViewUrl
             }
 
-            // ---- 1) gdriveplayer.* mirrors (preferred - they proxy SABR) ----
             val gdrivePlayerUrls = listOf(
                 "https://gdriveplayer.to/embed2.php?link=$encodedDriveUrl",
                 "https://gdriveplayer.co/embed2.php?link=$encodedDriveUrl",
@@ -323,7 +303,6 @@ class ChikiAnimationProvider : MainAPI() {
                 } catch (_: Exception) { }
             }
 
-            // ---- 2) Direct Drive download / confirm flow ----
             val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
@@ -338,7 +317,6 @@ class ChikiAnimationProvider : MainAPI() {
                     allowRedirects = false
                 )
 
-                // 2a) Follow any 30x redirect straight to the CDN
                 if (response.code in 300..399) {
                     val redirectUrl = response.headers["Location"]
                     if (!redirectUrl.isNullOrBlank() && redirectUrl.startsWith("http")) {
@@ -358,7 +336,6 @@ class ChikiAnimationProvider : MainAPI() {
                     }
                 }
 
-                // 2b) Direct hit - file is served inline
                 if (response.code == 200) {
                     val ct = response.headers["Content-Type"] ?: ""
                     if (ct.contains("video", true) || ct.contains("octet-stream", true)) {
@@ -377,7 +354,6 @@ class ChikiAnimationProvider : MainAPI() {
                         return true
                     }
 
-                    // 2c) Large-file "virus scan" confirmation page
                     if (ct.contains("text/html", true)) {
                         val html = response.text
                         val doc = Jsoup.parse(html)
@@ -415,7 +391,6 @@ class ChikiAnimationProvider : MainAPI() {
                 }
             } catch (_: Exception) { }
 
-            // ---- 3) Absolute last resort - hand the raw URL to the player ----
             try {
                 callback.invoke(
                     newExtractorLink(
@@ -448,7 +423,6 @@ class ChikiAnimationProvider : MainAPI() {
             ) return
 
             try {
-                // ---- Google Drive FIRST (before any generic fallback) ----
                 if (handleGoogleDrive(cleanUrl, ref)) {
                     found = true
                     return
@@ -495,6 +469,13 @@ class ChikiAnimationProvider : MainAPI() {
                 }
                 else if (cleanUrl.contains("dailymotion.com", true) || cleanUrl.contains("dai.ly", true)) {
                     com.lagradost.cloudstream3.extractors.Dailymotion().getUrl(cleanUrl, ref, subtitleCallback, callback)
+                    found = true
+                    return
+                }
+
+                // >>> NEW: Added Skyline AI Route <<<
+                if (cleanUrl.contains("skylineai.cloud", true)) {
+                    SkylineAI().getUrl(cleanUrl, ref, subtitleCallback, callback)
                     found = true
                     return
                 }
