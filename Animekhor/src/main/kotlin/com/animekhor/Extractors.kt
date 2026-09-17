@@ -73,8 +73,9 @@ class OkRuCustom : ExtractorApi() {
                         else -> Qualities.Unknown.value
                     }
 
-                    // Explicitly put MP4 into the name property so Cloudstream appends the resolution correctly
-                    callback(newExtractorLink(name = "${this.name} MP4", source = "${this.name} MP4", url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"), type = INFER_TYPE) {
+                    val displayLabel = if (qualityValue != Qualities.Unknown.value) "MP4 ${qualityValue}p" else "MP4 $qName"
+
+                    callback(newExtractorLink(name = "${this.name} MP4", source = "${this.name} $displayLabel", url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"), type = INFER_TYPE) {
                         this.referer = "https://ok.ru/"
                         this.quality = qualityValue
                     })
@@ -206,26 +207,43 @@ class AbyssPlayer : ExtractorApi() {
                     val srcUrl = src.optString("url")
                     if (srcUrl.isNotBlank() && dedupSources.add(srcUrl)) {
                         
-                        val label = src.optString("label").ifBlank { src.optString("quality") }
+                        val rawLabel = src.optString("label")
+                            .ifBlank { src.optString("quality") }
+                            .ifBlank { src.optString("type") }
+                            .ifBlank { src.optString("res") }
+                            .ifBlank { src.optString("resolution") }
                         
                         val qualityInt = when {
-                            label.contains("1080") -> Qualities.P1080.value
-                            label.contains("720") -> Qualities.P720.value
-                            label.contains("480") -> Qualities.P480.value
-                            label.contains("360") -> Qualities.P360.value
+                            rawLabel.contains("1080") || rawLabel.contains("FHD", true) -> Qualities.P1080.value
+                            rawLabel.contains("720") || rawLabel.contains("HD", true) -> Qualities.P720.value
+                            rawLabel.contains("480") || rawLabel.contains("SD", true) -> Qualities.P480.value
+                            rawLabel.contains("360") -> Qualities.P360.value
                             else -> Qualities.Unknown.value
                         }
 
+                        val displayString = if (qualityInt != Qualities.Unknown.value) {
+                            "${qualityInt}p"
+                        } else if (rawLabel.isNotBlank()) {
+                            rawLabel.uppercase()
+                        } else {
+                            ""
+                        }
+
                         if (srcUrl.contains(".m3u8")) {
-                            // Automatically attaches "HLS" into the generated list
                             M3u8Helper.generateM3u8("$name HLS", srcUrl, mainUrl).forEach { link ->
-                                // Force inject JSON quality if m3u8 manifest parsing couldn't detect it automatically
                                 val finalQuality = if (link.quality == Qualities.Unknown.value && qualityInt != Qualities.Unknown.value) qualityInt else link.quality
+                                val finalName = if (finalQuality == qualityInt && qualityInt != Qualities.Unknown.value) {
+                                    "$name HLS ${qualityInt}p"
+                                } else if (link.name == "$name HLS" && displayString.isNotBlank()) {
+                                    "$name HLS $displayString"
+                                } else {
+                                    link.name
+                                }
                                 
                                 callback(
                                     ExtractorLink(
-                                        name = link.name, // M3u8Helper already sets this to "Abyss HLS"
-                                        source = link.name,
+                                        name = link.name,
+                                        source = finalName,
                                         url = link.url,
                                         referer = link.referer,
                                         quality = finalQuality,
@@ -236,9 +254,10 @@ class AbyssPlayer : ExtractorApi() {
                                 )
                             }
                         } else {
-                            // Inject MP4 tag explicitly into the name
+                            // Removed "MP4" padding completely
+                            val sourceName = if (displayString.isNotBlank()) "$name $displayString" else name
                             callback(
-                                newExtractorLink(name = "$name MP4", source = "$name MP4", url = srcUrl, type = INFER_TYPE) {
+                                newExtractorLink(name = name, source = sourceName, url = srcUrl, type = INFER_TYPE) {
                                     this.referer = mainUrl
                                     this.quality = qualityInt
                                 }
@@ -247,13 +266,13 @@ class AbyssPlayer : ExtractorApi() {
                     }
                 }
             } else {
-                // Primitive string fallback
                 val stringUrl = sources.optString(i)
                 if (stringUrl.isNotBlank() && dedupSources.add(stringUrl)) {
                     if (stringUrl.contains(".m3u8")) {
                         M3u8Helper.generateM3u8("$name HLS", stringUrl, mainUrl).forEach(callback)
                     } else {
-                        callback(newExtractorLink(name = "$name MP4", source = "$name MP4", url = stringUrl, type = INFER_TYPE) { this.referer = mainUrl })
+                        // Removed "MP4" padding completely
+                        callback(newExtractorLink(name = name, source = name, url = stringUrl, type = INFER_TYPE) { this.referer = mainUrl })
                     }
                 }
             }
