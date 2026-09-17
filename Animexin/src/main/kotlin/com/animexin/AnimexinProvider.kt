@@ -27,9 +27,8 @@ class AnimexinProvider : MainAPI() {
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update" to "Recently Updated",
         "anime/?status=&type=&order=popular" to "Popular",
-        "anime/?" to "Donghua",
         "anime/?status=&type=movie&order=update" to "Movies",
-        "anime/?status=&sub=raw&order=update" to "Anime (RAW)"
+        "anime/?status=completed&type=&order=update" to "Completed"
     )
 
     private suspend fun resolveCloudflare(url: String): Boolean = suspendCancellableCoroutine { cont ->
@@ -53,13 +52,11 @@ class AnimexinProvider : MainAPI() {
     private suspend fun getSafeDocument(url: String): Document {
         var response = app.get(url, interceptor = cfInterceptor)
         var doc = response.document
-        val title = doc.title().lowercase()
         
-        val isChallenge = listOf("just a moment", "security verification", "attention required", "cloudflare").any { title.contains(it) } || doc.select("div.cf-turnstile").isNotEmpty()
+        val isChallenge = listOf("just a moment", "security verification", "attention required", "cloudflare").any { doc.title().lowercase().contains(it) } || doc.select("div.cf-turnstile").isNotEmpty()
         
         if (isChallenge || response.code in listOf(403, 503)) {
-            val success = resolveCloudflare(url)
-            if (success) {
+            if (resolveCloudflare(url)) {
                 response = app.get(url, interceptor = cfInterceptor)
                 doc = response.document
             } else {
@@ -98,14 +95,11 @@ class AnimexinProvider : MainAPI() {
         if (title.isBlank()) return null
 
         val img = this.selectFirst("img")
-        var poster = img?.let { 
+        val poster = img?.let { 
             it.attr("data-lazy-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                 ?: it.attr("data-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                 ?: it.attr("src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
-        }
-        if (poster.isNullOrBlank()) {
-            poster = this.selectFirst("noscript img")?.attr("src")
-        }
+        } ?: this.selectFirst("noscript img")?.attr("src")
 
         val epText = this.selectFirst(".eggmeta .eggepisode, .bt .epx, .epx")?.text()?.trim()
         val epNum = epText?.let { Regex("""\d+""").find(it)?.value?.toIntOrNull() }
@@ -114,26 +108,20 @@ class AnimexinProvider : MainAPI() {
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = fixUrlNull(poster)
             
-            val posterCookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
             this.posterHeaders = mapOf(
                 "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
                 "Referer" to "$mainUrl/",
-                "Cookie" to posterCookies,
+                "Cookie" to (CookieManager.getInstance().getCookie(mainUrl) ?: ""),
                 "User-Agent" to CFState.userAgent
             ).filterValues { it.isNotBlank() }
 
-            if (epNum != null) {
-                this.addSub(epNum)
-            }
-            if (href.contains("movie", true) || type.equals("Movie", true)) {
-                this.type = TvType.Movie
-            }
+            if (epNum != null) this.addSub(epNum)
+            if (href.contains("movie", true) || type.equals("Movie", true)) this.type = TvType.Movie
         }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val document = getSafeDocument("$mainUrl/?s=$query")
-        return document.select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
+        return getSafeDocument("$mainUrl/?s=$query").select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
     }
@@ -147,33 +135,29 @@ class AnimexinProvider : MainAPI() {
         }
 
         val title = doc.selectFirst("h1.entry-title, .infox h1")?.text()?.trim() ?: "Unknown Title"
-        
         val img = doc.selectFirst("div.thumb img, div.infox img, .bigcontent img")
-        var poster = img?.let { 
+        val poster = img?.let { 
             it.attr("data-lazy-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                 ?: it.attr("data-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                 ?: it.attr("src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
-        }
-        if (poster.isNullOrBlank()) {
-             poster = doc.selectFirst("noscript img")?.attr("src") ?: doc.selectFirst("meta[property=og:image]")?.attr("content")
-        }
+        } ?: doc.selectFirst("noscript img")?.attr("src") ?: doc.selectFirst("meta[property=og:image]")?.attr("content")
 
         val description = doc.selectFirst("div.entry-content, .infox .desc, .bigcontent .desc")?.text()?.trim()
         val isMovie = doc.selectFirst(".spe, .type")?.text()?.contains("Movie", ignoreCase = true) == true
+
+        val commonHeaders = mapOf(
+            "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Referer" to "$mainUrl/",
+            "Cookie" to (CookieManager.getInstance().getCookie(mainUrl) ?: ""),
+            "User-Agent" to CFState.userAgent
+        ).filterValues { it.isNotBlank() }
 
         if (isMovie) {
             val href = doc.selectFirst("div.eplister > ul > li a, .eplister li a, .eps a")?.attr("href") ?: url
             return newMovieLoadResponse(title, url, TvType.Movie, href) {
                 this.posterUrl = fixUrlNull(poster)
                 this.plot = description
-                
-                val posterCookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
-                this.posterHeaders = mapOf(
-                    "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-                    "Referer" to "$mainUrl/",
-                    "Cookie" to posterCookies,
-                    "User-Agent" to CFState.userAgent
-                ).filterValues { it.isNotBlank() }
+                this.posterHeaders = commonHeaders
             }
         }
 
@@ -183,12 +167,11 @@ class AnimexinProvider : MainAPI() {
                 val epHref = fixUrlNull(a.attr("href")) ?: return@mapNotNull null
 
                 val epImg = info.selectFirst("a img")
-                var epPoster = epImg?.let { 
+                val epPoster = epImg?.let { 
                     it.attr("data-lazy-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                         ?: it.attr("data-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                         ?: it.attr("src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
-                }
-                if (epPoster.isNullOrBlank()) epPoster = info.selectFirst("noscript img")?.attr("src")
+                } ?: info.selectFirst("noscript img")?.attr("src")
 
                 val epText = info.selectFirst(".epl-num, .epl-title, .epnum, .epsname")?.text()?.trim() ?: ""
                 val epNum = Regex("""\d+""").find(epText)?.value?.toIntOrNull()
@@ -208,14 +191,7 @@ class AnimexinProvider : MainAPI() {
         return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
             this.posterUrl = fixUrlNull(poster)
             this.plot = description
-            
-            val posterCookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
-            this.posterHeaders = mapOf(
-                "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-                "Referer" to "$mainUrl/",
-                "Cookie" to posterCookies,
-                "User-Agent" to CFState.userAgent
-            ).filterValues { it.isNotBlank() }
+            this.posterHeaders = commonHeaders
         }
     }
 
@@ -226,37 +202,30 @@ class AnimexinProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = getSafeDocument(data)
-        
         val extractedIframeUrls = ConcurrentHashMap.newKeySet<String>()
         val yieldedStreamUrls = ConcurrentHashMap.newKeySet<String>()
 
         suspend fun invokeExtractor(iframeUrl: String) {
             var finalUrl = iframeUrl.trim()
-            if (finalUrl.startsWith("//")) {
-                finalUrl = "https:$finalUrl"
-            } else if (finalUrl.startsWith("/")) {
-                finalUrl = "https://animexin.dev$finalUrl"
-            } else if (!finalUrl.startsWith("http")) {
-                finalUrl = "https://$finalUrl"
-            }
+            if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
+            else if (finalUrl.startsWith("/")) finalUrl = "https://animexin.dev$finalUrl"
+            else if (!finalUrl.startsWith("http")) finalUrl = "https://$finalUrl"
 
             val dedupUrl = finalUrl.substringBefore("?")
             if (!extractedIframeUrls.add(dedupUrl)) return
 
             val trackingCallback: (ExtractorLink) -> Unit = { link ->
-                if (yieldedStreamUrls.add(link.url)) {
-                    callback(link)
-                }
+                if (yieldedStreamUrls.add(link.url)) callback(link)
             }
 
             try {
                 val isHandled = when {
                     "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> {
-                        OkRu().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback)
+                        OkRu().getUrl(finalUrl, mainUrl)?.forEach { trackingCallback(it) }
                         true
                     }
                     "d.tube" in finalUrl || "dtube" in finalUrl -> {
-                        Dtube().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback)
+                        Dtube().getUrl(finalUrl, mainUrl)?.forEach { trackingCallback(it) }
                         true
                     }
                     else -> false
@@ -283,9 +252,7 @@ class AnimexinProvider : MainAPI() {
                             decoded
                         } else null
 
-                        if (!iframeSrc.isNullOrBlank()) {
-                            invokeExtractor(iframeSrc)
-                        }
+                        if (!iframeSrc.isNullOrBlank()) invokeExtractor(iframeSrc)
                     }
                 }
             }.awaitAll()
