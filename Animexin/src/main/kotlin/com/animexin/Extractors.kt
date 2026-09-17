@@ -1,5 +1,6 @@
 package com.Animexin
 
+import android.util.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.Filesim
@@ -130,6 +131,7 @@ class Dtube : ExtractorApi() {
     override val requiresReferer = false
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        Log.d("DTubeDebug", "Starting DTube extraction for URL: $url")
         try {
             var videoId: String? = null
             
@@ -138,23 +140,33 @@ class Dtube : ExtractorApi() {
             
             // 1. Check if the UUID is directly in the URL provided to the extractor
             videoId = uuidRegex.find(url)?.groupValues?.get(1)
+            Log.d("DTubeDebug", "Extracted videoId from URL directly: $videoId")
             
             // 2. If it's a short URL, fetch the page and scrape the UUID from the HTML/JS config
             if (videoId == null) {
+                Log.d("DTubeDebug", "videoId was null from direct URL, fetching page: $url")
                 val response = app.get(url, referer = referer ?: mainUrl).text
                 videoId = uuidRegex.find(response)?.groupValues?.get(1)
+                Log.d("DTubeDebug", "Extracted videoId from fetched HTML: $videoId")
             }
 
             // 3. If we successfully grabbed the UUID, build the manifest URL and pass it to Cloudstream
             if (videoId != null) {
-                // Cloudstream's OkHttp bypasses the CORS browser errors, allowing seamless playback
                 val m3u8Url = "https://nas2.d.tube/videos/$videoId/master.m3u8"
+                Log.d("DTubeDebug", "Generated final M3u8 URL: $m3u8Url")
                 
-                // M3u8Helper will automatically read the 360p and 720p variants from the manifest
-                M3u8Helper.generateM3u8(name, m3u8Url, url).forEach(callback)
+                val links = M3u8Helper.generateM3u8(name, m3u8Url, url)
+                Log.d("DTubeDebug", "Generated ${links.size} stream links from M3u8Helper")
+                
+                links.forEach { link ->
+                    Log.d("DTubeDebug", "Yielding link -> Name: ${link.name}, Quality: ${link.quality}, URL: ${link.url}")
+                    callback(link)
+                }
+            } else {
+                Log.e("DTubeDebug", "Failed to find any valid UUID/videoId for URL: $url")
             }
         } catch (e: Exception) {
-            // Fails silently to allow fallback extractors to run
+            Log.e("DTubeDebug", "Exception occurred during DTube extraction: ${e.localizedMessage}", e)
         }
     }
 }
