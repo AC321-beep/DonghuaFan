@@ -118,18 +118,37 @@ class Dtube : ExtractorApi() {
         Log.d("DTubeDebug", "Starting DTube extraction for URL: $url")
         try {
             var videoId: String? = null
-            val uuidRegex = Regex("""([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})""", RegexOption.IGNORE_CASE)
             
+            // 1. Check if direct UUID is present in the URL
+            val uuidRegex = Regex("""([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})""", RegexOption.IGNORE_CASE)
             videoId = uuidRegex.find(url)?.groupValues?.get(1)
-            Log.d("DTubeDebug", "Extracted videoId from URL directly: $videoId")
 
+            // 2. If it's a short token like ?v=RgTP7r..., query DTube's video API to resolve the UUID
             if (videoId == null) {
-                Log.d("DTubeDebug", "videoId was null from direct URL, fetching page: $url")
-                val response = app.get(url, referer = referer ?: mainUrl).text
-                videoId = uuidRegex.find(response)?.groupValues?.get(1)
-                Log.d("DTubeDebug", "Extracted videoId from fetched HTML: $videoId")
+                val shortParamRegex = Regex("""[?&]v=([a-zA-Z0-9_-]+)""")
+                val shortId = shortParamRegex.find(url)?.groupValues?.get(1)
+                Log.d("DTubeDebug", "Extracted short ID parameter: $shortId")
+
+                if (shortId != null) {
+                    val apiUrl = "https://api.d.tube/videos/$shortId"
+                    Log.d("DTubeDebug", "Querying DTube API: $apiUrl")
+                    try {
+                        val apiResponse = app.get(apiUrl).text
+                        if (apiResponse.startsWith("{")) {
+                            val json = JSONObject(apiResponse)
+                            videoId = json.optString("_id").takeIf { it.isNotBlank() }
+                                ?: json.optString("id").takeIf { it.isNotBlank() }
+                                ?: json.optString("uuid").takeIf { it.isNotBlank() }
+                                ?: uuidRegex.find(apiResponse)?.groupValues?.get(1)
+                            Log.d("DTubeDebug", "Resolved videoId from API JSON: $videoId")
+                        }
+                    } catch (e: Exception) {
+                        Log.d("DTubeDebug", "API lookup failed: ${e.localizedMessage}")
+                    }
+                }
             }
 
+            // 3. If we successfully resolved the UUID, probe the NAS storage nodes
             if (videoId != null) {
                 val nasNodes = listOf("nas1", "nas2", "nas3", "nas4", "video")
                 var success = false
@@ -139,25 +158,24 @@ class Dtube : ExtractorApi() {
                     Log.d("DTubeDebug", "Probing node URL: $m3u8Url")
                     try {
                         val headCheck = app.get(m3u8Url, headers = mapOf("Range" to "bytes=0-100"))
-                        Log.d("DTubeDebug", "Node $node responded with status code: ${headCheck.code}")
                         if (headCheck.code == 200) {
-                            Log.d("DTubeDebug", "Found working manifest on node: $node -> $m3u8Url")
+                            Log.d("DTubeDebug", "Found working manifest on node: $node")
                             M3u8Helper.generateM3u8(name, m3u8Url, url).forEach(callback)
                             success = true
                             break
                         }
                     } catch (e: Exception) {
-                        Log.d("DTubeDebug", "Node $node failed with exception: ${e.localizedMessage}")
+                        // Try next node
                     }
                 }
                 if (!success) {
-                    Log.e("DTubeDebug", "All DTube NAS nodes failed to return a 200 OK for videoId: $videoId")
+                    Log.e("DTubeDebug", "All DTube NAS nodes failed for videoId: $videoId")
                 }
             } else {
-                Log.e("DTubeDebug", "Failed to find any valid UUID/videoId for URL: $url")
+                Log.e("DTubeDebug", "Failed to resolve videoId for URL: $url")
             }
         } catch (e: Exception) {
-            Log.e("DTubeDebug", "Exception occurred during DTube extraction: ${e.localizedMessage}", e)
+            Log.e("DTubeDebug", "Exception during DTube extraction: ${e.localizedMessage}", e)
         }
     }
 }
