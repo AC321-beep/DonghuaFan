@@ -6,14 +6,7 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.Filesim
 import com.lagradost.cloudstream3.extractors.StreamSB
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
-import com.lagradost.cloudstream3.utils.ExtractorApi
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.INFER_TYPE
-import com.lagradost.cloudstream3.utils.JsUnpacker
-import com.lagradost.cloudstream3.utils.M3u8Helper
-import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.utils.*
 import org.json.JSONObject
 
 class FileMoonSx : Filesim() {
@@ -27,7 +20,7 @@ class Waaw : StreamSB() {
 
 class Wishfast : StreamWishExtractor() {
     override var name = "StreamWish"
-    override var mainUrl = "https://wishfast.top"
+    override val mainUrl = "https://wishfast.top"
 }
 
 class Vtbe : ExtractorApi() {
@@ -37,14 +30,8 @@ class Vtbe : ExtractorApi() {
 
     override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
         val response = app.get(url, referer = mainUrl).document
-        
-        // Find the packed Javascript script tag
         val script = response.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return null
-        
-        // Unpack and extract the .m3u8 file
         val unpacked = JsUnpacker(script).unpack() ?: return null
-        
-        // Improved Regex: Handles optional spaces and both single/double quotes
         val match = Regex("""sources:\s*\[\s*\{\s*file:\s*['"](.*?)['"]""").find(unpacked)
         val link = match?.groupValues?.get(1) ?: return null
 
@@ -77,7 +64,6 @@ class OkRu : ExtractorApi() {
             if (!jsonStr.startsWith("{")) return
             val json = JSONObject(jsonStr)
 
-            // 1. EXTRACT MP4 FIRST (Fastest playback)
             val videos = json.optJSONArray("videos")
             if (videos != null && videos.length() > 0) {
                 for (i in 0 until videos.length()) {
@@ -99,7 +85,6 @@ class OkRu : ExtractorApi() {
                         else -> Qualities.Unknown.value
                     }
 
-                    // Explicitly label MP4 so Cloudstream groups and orders them perfectly
                     callback(newExtractorLink(name = "${this.name} MP4", source = "${this.name} MP4", url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"), type = INFER_TYPE) {
                         this.referer = "https://ok.ru/"
                         this.quality = qualityValue
@@ -107,7 +92,6 @@ class OkRu : ExtractorApi() {
                 }
             }
 
-            // 2. EXTRACT HLS/DASH SECOND (Adaptive fallback)
             val hlsUrl = json.optString("hlsManifestUrl")
             if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
                 M3u8Helper.generateM3u8("$name HLS", hlsUrl.replace("\\u0026", "&").replace("\\/", "/"), url).forEach(callback)
@@ -134,15 +118,11 @@ class Dtube : ExtractorApi() {
         Log.d("DTubeDebug", "Starting DTube extraction for URL: $url")
         try {
             var videoId: String? = null
-            
-            // Standard Regex to find a UUID (e.g., c7dd97cb-c32c-4580-a449-79eab2005130)
             val uuidRegex = Regex("""([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})""", RegexOption.IGNORE_CASE)
             
-            // 1. Check if the UUID is directly in the URL provided to the extractor
             videoId = uuidRegex.find(url)?.groupValues?.get(1)
             Log.d("DTubeDebug", "Extracted videoId from URL directly: $videoId")
-            
-            // 2. If it's a short URL, fetch the page and scrape the UUID from the HTML/JS config
+
             if (videoId == null) {
                 Log.d("DTubeDebug", "videoId was null from direct URL, fetching page: $url")
                 val response = app.get(url, referer = referer ?: mainUrl).text
@@ -150,17 +130,28 @@ class Dtube : ExtractorApi() {
                 Log.d("DTubeDebug", "Extracted videoId from fetched HTML: $videoId")
             }
 
-            // 3. If we successfully grabbed the UUID, build the manifest URL and pass it to Cloudstream
             if (videoId != null) {
-                val m3u8Url = "https://nas2.d.tube/videos/$videoId/master.m3u8"
-                Log.d("DTubeDebug", "Generated final M3u8 URL: $m3u8Url")
+                val nasNodes = listOf("nas1", "nas2", "nas3", "nas4", "video")
+                var success = false
                 
-                val links = M3u8Helper.generateM3u8(name, m3u8Url, url)
-                Log.d("DTubeDebug", "Generated ${links.size} stream links from M3u8Helper")
-                
-                links.forEach { link ->
-                    Log.d("DTubeDebug", "Yielding link -> Name: ${link.name}, Quality: ${link.quality}, URL: ${link.url}")
-                    callback(link)
+                for (node in nasNodes) {
+                    val m3u8Url = "https://$node.d.tube/videos/$videoId/master.m3u8"
+                    Log.d("DTubeDebug", "Probing node URL: $m3u8Url")
+                    try {
+                        val headCheck = app.get(m3u8Url, headers = mapOf("Range" to "bytes=0-100"))
+                        Log.d("DTubeDebug", "Node $node responded with status code: ${headCheck.code}")
+                        if (headCheck.code == 200) {
+                            Log.d("DTubeDebug", "Found working manifest on node: $node -> $m3u8Url")
+                            M3u8Helper.generateM3u8(name, m3u8Url, url).forEach(callback)
+                            success = true
+                            break
+                        }
+                    } catch (e: Exception) {
+                        Log.d("DTubeDebug", "Node $node failed with exception: ${e.localizedMessage}")
+                    }
+                }
+                if (!success) {
+                    Log.e("DTubeDebug", "All DTube NAS nodes failed to return a 200 OK for videoId: $videoId")
                 }
             } else {
                 Log.e("DTubeDebug", "Failed to find any valid UUID/videoId for URL: $url")
