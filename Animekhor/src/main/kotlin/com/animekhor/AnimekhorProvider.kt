@@ -149,6 +149,7 @@ class AnimekhorProvider : MainAPI() {
                     "emturbovid" in finalUrl -> Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                     "bysekoze.com" in finalUrl -> Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                     "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
+                    "abyssplayer.com" in finalUrl -> AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, callback)
                 }
             } catch (e: Exception) { 
                 // Fails silently
@@ -156,7 +157,8 @@ class AnimekhorProvider : MainAPI() {
         }
 
         val rawHtml = document.html()
-        val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com)[^"'\s<>]+""")
+        // Updated regex to catch AbyssPlayer domains natively encoded in HTML elements
+        val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com|abyssplayer\.com)[^"'\s<>]+""")
         globalUrlRegex.findAll(rawHtml).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
             invokeExtractor(cleanUrl, "Raw Source")
