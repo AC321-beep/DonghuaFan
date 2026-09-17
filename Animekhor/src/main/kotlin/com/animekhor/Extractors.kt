@@ -73,9 +73,8 @@ class OkRuCustom : ExtractorApi() {
                         else -> Qualities.Unknown.value
                     }
 
-                    val displayLabel = if (qualityValue != Qualities.Unknown.value) "MP4 ${qualityValue}p" else "MP4 $qName"
-
-                    callback(newExtractorLink(name = this.name, source = "${this.name} $displayLabel", url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"), type = INFER_TYPE) {
+                    // Explicitly put MP4 into the name property so Cloudstream appends the resolution correctly
+                    callback(newExtractorLink(name = "${this.name} MP4", source = "${this.name} MP4", url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"), type = INFER_TYPE) {
                         this.referer = "https://ok.ru/"
                         this.quality = qualityValue
                     })
@@ -89,7 +88,7 @@ class OkRuCustom : ExtractorApi() {
             } else {
                 val dashUrl = json.optString("dashManifestUrl")
                 if (dashUrl.isNotBlank() && !dashUrl.contains("usr_login")) {
-                    callback(newExtractorLink(name = name, source = "$name DASH", url = dashUrl.replace("\\u0026", "&").replace("\\/", "/"), type = com.lagradost.cloudstream3.utils.ExtractorLinkType.DASH) { this.referer = "https://ok.ru/" })
+                    callback(newExtractorLink(name = "$name DASH", source = "$name DASH", url = dashUrl.replace("\\u0026", "&").replace("\\/", "/"), type = com.lagradost.cloudstream3.utils.ExtractorLinkType.DASH) { this.referer = "https://ok.ru/" })
                 }
             }
         } catch (e: Exception) {
@@ -169,7 +168,7 @@ class Rumble : ExtractorApi() {
 }
 
 class AbyssPlayer : ExtractorApi() {
-    override val name = "Abyss" // Clean display name
+    override val name = "Abyss"
     override val mainUrl = "https://abyssplayer.com"
     override val requiresReferer = true
 
@@ -220,13 +219,13 @@ class AbyssPlayer : ExtractorApi() {
                         if (srcUrl.contains(".m3u8")) {
                             // Automatically attaches "HLS" into the generated list
                             M3u8Helper.generateM3u8("$name HLS", srcUrl, mainUrl).forEach { link ->
-                                val finalQuality = if (link.quality == Qualities.Unknown.value) qualityInt else link.quality
-                                val finalName = if (finalQuality == qualityInt && qualityInt != Qualities.Unknown.value) "$name HLS ${qualityInt}p" else link.name
+                                // Force inject JSON quality if m3u8 manifest parsing couldn't detect it automatically
+                                val finalQuality = if (link.quality == Qualities.Unknown.value && qualityInt != Qualities.Unknown.value) qualityInt else link.quality
                                 
                                 callback(
                                     ExtractorLink(
-                                        name = link.name,
-                                        source = finalName,
+                                        name = link.name, // M3u8Helper already sets this to "Abyss HLS"
+                                        source = link.name,
                                         url = link.url,
                                         referer = link.referer,
                                         quality = finalQuality,
@@ -237,10 +236,9 @@ class AbyssPlayer : ExtractorApi() {
                                 )
                             }
                         } else {
-                            // Explicitly labels the direct links as MP4
-                            val sourceName = if (qualityInt != Qualities.Unknown.value) "$name MP4 ${qualityInt}p" else "$name MP4"
+                            // Inject MP4 tag explicitly into the name
                             callback(
-                                newExtractorLink(name = name, source = sourceName, url = srcUrl, type = INFER_TYPE) {
+                                newExtractorLink(name = "$name MP4", source = "$name MP4", url = srcUrl, type = INFER_TYPE) {
                                     this.referer = mainUrl
                                     this.quality = qualityInt
                                 }
@@ -249,12 +247,13 @@ class AbyssPlayer : ExtractorApi() {
                     }
                 }
             } else {
+                // Primitive string fallback
                 val stringUrl = sources.optString(i)
                 if (stringUrl.isNotBlank() && dedupSources.add(stringUrl)) {
                     if (stringUrl.contains(".m3u8")) {
                         M3u8Helper.generateM3u8("$name HLS", stringUrl, mainUrl).forEach(callback)
                     } else {
-                        callback(newExtractorLink(name = name, source = "$name MP4", url = stringUrl, type = INFER_TYPE) { this.referer = mainUrl })
+                        callback(newExtractorLink(name = "$name MP4", source = "$name MP4", url = stringUrl, type = INFER_TYPE) { this.referer = mainUrl })
                     }
                 }
             }
