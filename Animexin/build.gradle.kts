@@ -4,6 +4,6 @@ cloudstream {
    status = 1
    tvTypes = listOf("Anime", "Movie")
    language = "zh"
-   version = 4
-   iconUrl = "https://www.google.com/s2/favicons?domain=animexin.dev&sz=256"
+   version = 5
+   iconUrl = "https://icons.duckduckgo.com/ip3/animexin.dev.ico"
 }
