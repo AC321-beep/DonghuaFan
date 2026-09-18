@@ -10,7 +10,11 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.mozilla.javascript.Context
 import org.mozilla.javascript.Function
@@ -173,29 +177,12 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Sources endpoint
-    //
-    //  From the site's own loadSources():
-    //    url:  atob(apx).replace('api-config/','api/') + '?' + ps
-    //    method: POST
-    //    body: utekmek
-    //  Confirmed by browser XHR:
-    //    POST https://galaxydonghua.xyz/api/?p=S1AvQ0Zz...
-    //    body = <utekmek value>
-    //
-    //  Then decrypt with the confirmed algorithm:
-    //    salt    = raw[0..16]
-    //    ct      = raw[16..]
-    //    derived = PBKDF2-HMAC-SHA256(pd, salt, 10000, 48)
-    //    key     = derived[0..32]
-    //    iv      = derived[32..48]
-    //    plain   = AES-CBC-Pkcs7(ct, key, iv)
+    //  Sources endpoint (POST raw body via OkHttp)
     // ────────────────────────────────────────────────────────────────
     private suspend fun fetchAndDecryptApi(
         tokens: GdTokens, headers: Map<String, String>, gxBase: String,
         embedUrl: String, playerJs: String?, cryptoJs: String
     ): String? {
-        // apx decodes to https://galaxydonghua.xyz/api-config/
         val apxDecoded = try {
             String(
                 Base64.decode(
@@ -210,13 +197,10 @@ open class GalaxyDonghua : ExtractorApi() {
             apxDecoded.replace("api-config/", "api/")
         else "$gxBase/api/"
 
-        // ps at runtime is "p=..." — clean our token the same way the site does
         val psClean = tokens.ps.replace(",,", "==").replace(",", "=")
         val sourcesUrl = apiRoot.trimEnd('/') + "/?" + psClean
 
-        // Body is the raw utekmek string
         val utekmekClean = tokens.utekmek.replace(",,", "==").replace(",", "=")
-        val body = utekmekClean.toRequestBody("application/x-www-form-urlencoded".toMediaTypeOrNull())
 
         val apiHeaders = headers.toMutableMap().apply {
             put("Referer", embedUrl)
@@ -229,9 +213,19 @@ open class GalaxyDonghua : ExtractorApi() {
         Log.e(TAG, "[STEP 13] body=${utekmekClean.take(80)}…")
 
         val sourcesCt = try {
-            val r = app.post(sourcesUrl, data = body, headers = apiHeaders)
-            Log.e(TAG, "[STEP 13 RES] ${r.code} | ${r.text.length}B")
-            r.text.trim()
+            withContext(Dispatchers.IO) {
+                val client = OkHttpClient()
+                val body = utekmekClean.toRequestBody(
+                    "application/x-www-form-urlencoded; charset=UTF-8".toMediaTypeOrNull()
+                )
+                val reqBuilder = Request.Builder().url(sourcesUrl).post(body)
+                apiHeaders.forEach { (k, v) -> reqBuilder.addHeader(k, v) }
+                val resp = client.newCall(reqBuilder.build()).execute()
+                val code = resp.code
+                val txt = resp.body?.string()?.trim() ?: ""
+                Log.e(TAG, "[STEP 13 RES] $code | ${txt.length}B")
+                txt
+            }
         } catch (e: Exception) {
             Log.e(TAG, "[STEP 13 ERR] ${e.message}")
             ""
@@ -241,13 +235,11 @@ open class GalaxyDonghua : ExtractorApi() {
 
         Log.e(TAG, "[STEP 13] head=${sourcesCt.take(80)}")
 
-        // Already plaintext?
         if (sourcesCt.startsWith("{") && sourcesCt.contains("\"file\"")) {
             Log.e(TAG, "[DEC] plain JSON")
             return sourcesCt
         }
 
-        // Rhino best-effort
         if (playerJs != null && cryptoJs.isNotEmpty()) {
             val r = GdRhino.tryDecrypt(playerJs, cryptoJs, sourcesCt, tokens.toGlobalMap())
             if (r != null && r.trimStart().startsWith("{")) {
@@ -256,7 +248,6 @@ open class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        // Static — the confirmed algorithm
         val plain = decryptGdPayload(sourcesCt, tokens.pd)
         if (plain != null && plain.trimStart().startsWith("{")) {
             Log.e(TAG, "[DEC] static OK — ${plain.length}B")
