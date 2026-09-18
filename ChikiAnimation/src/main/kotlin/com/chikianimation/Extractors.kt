@@ -67,7 +67,6 @@ open class GalaxyDonghua : ExtractorApi() {
             return
         }
 
-        // 1. SKYLINE AI FAST PATH
         Log.e(TAG, "[STEP 4] Checking for unencrypted VID_SRC...")
         val vidSrcMatch = Regex("const[ \\t]+VID_SRC[ \\t]*=[ \\t]*[\"']([^\"']+)[\"']").find(page)
         if (vidSrcMatch != null && vidSrcMatch.groupValues[1].isNotBlank()) {
@@ -80,7 +79,6 @@ open class GalaxyDonghua : ExtractorApi() {
             return
         }
 
-        // 2. DYNAMIC SERVER LIST DISCOVERY
         Log.e(TAG, "[STEP 5] Parsing for alternative server URLs...")
         val serverUrls = Regex("data-url=[\"']([^\"']+)[\"']").findAll(page)
             .map { it.groupValues[1] }
@@ -229,10 +227,11 @@ open class GalaxyDonghua : ExtractorApi() {
         val args = mutableListOf<String>()
         var i = 0
         while (i < s.length && args.size < 4) {
-            if (s[i] == '\'') {
+            val c = s[i]
+            if (c == '\'' || c == '"') {
                 var end = i + 1
                 while (end < s.length) {
-                    end = s.indexOf('\'', end)
+                    end = s.indexOf(c, end)
                     if (end < 0) return null
                     var slashCount = 0
                     var ci = end - 1
@@ -247,10 +246,10 @@ open class GalaxyDonghua : ExtractorApi() {
                     }
                     end++
                 }
-            } else if (s[i] == ',' || s[i] == ' ') {
+            } else if (c == ',' || c == ' ' || c == '\t' || c == '\n' || c == '\r') {
                 i++
             } else {
-                val end = s.indexOfAny(charArrayOf(',', ')', ' '), i).let { if (it < 0) s.length else it }
+                val end = s.indexOfAny(charArrayOf(',', ')', ' ', '\t', '\n', '\r'), i).let { if (it < 0) s.length else it }
                 args.add(s.substring(i, end))
                 i = end
             }
@@ -273,21 +272,24 @@ open class GalaxyDonghua : ExtractorApi() {
         Log.e(TAG, "[TOKEN 1] Starting decode process. Page length: ${page.length}")
         
         fun extractHtmlFallback(n: String, text: String): String {
-            val strPattern = "(?:\"$n\"|'$n'|\\b$n\\b)[ \\t]*\\]?[ \\t]*[:=][ \\t]*(?:atob[ \\t]*\\([ \\t]*)?[\"']([^\"']+)[\"']"
+            // Strictly bounded max lengths ({1,250}) eliminate Catastrophic Backtracking (ReDoS) freezing
+            val strPattern = "[\"']?$n[\"']?[ \\t]*]?[ \\t]*[:=][ \\t]*[\"']([^\"']{1,250})[\"']"
             Regex(strPattern).find(text)?.let { return it.groupValues[1].trim() }
-            val numPattern = "(?:\"$n\"|'$n'|\\b$n\\b)[ \\t]*\\]?[ \\t]*[:=][ \\t]*([^\"'[ \\t],;{}()\u005B\u005D]+)"
+            val numPattern = "[\"']?$n[\"']?[ \\t]*]?[ \\t]*[:=][ \\t]*([a-zA-Z0-9\\-_]{1,250})"
             Regex(numPattern).find(text)?.let { return it.groupValues[1].trim() }
             return ""
         }
 
         fun extractSmartJs(n: String, text: String): String {
-            val directRx = Regex("(?:\"$n\"|'$n'|\\b$n\\b)[ \\t]*\\]?[ \\t]*[:=][ \\t]*(?:atob[ \\t]*\\([ \\t]*)?[\"']([^\"']+)[\"']")
-            val dMatch = directRx.find(text)?.groupValues?.get(1)
-            if (dMatch != null) return dMatch.substringBefore("-,")
+            // Explicitly split 'atob' wrapper vs standard string to prevent nested ReDoS loops
+            val atobRx = Regex("[\"']?$n[\"']?[ \\t]*]?[ \\t]*[:=][ \\t]*atob[ \\t]*\\([ \\t]*[\"']([^\"']{1,250})[\"']")
+            atobRx.find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
 
-            val indRx = Regex("[\"']$n[\"'][;,][ \\t]*(?:var[ \\t]+)?(?:[a-zA-Z0-9_]+)[ \\t]*=[ \\t]*[\"']([^\"']+)[\"']")
-            val iMatch = indRx.find(text)?.groupValues?.get(1)
-            if (iMatch != null) return iMatch.substringBefore("-,")
+            val strRx = Regex("[\"']?$n[\"']?[ \\t]*]?[ \\t]*[:=][ \\t]*[\"']([^\"']{1,250})[\"']")
+            strRx.find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
+
+            val indRx = Regex("[\"']$n[\"'][;,][ \\t]*(?:var[ \\t]+)?(?:[a-zA-Z0-9_]+)[ \\t]*=[ \\t]*[\"']([^\"']{1,250})[\"']")
+            indRx.find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
             
             return ""
         }
@@ -332,25 +334,24 @@ open class GalaxyDonghua : ExtractorApi() {
                     jsFuck = sb.toString()
                     Log.e(TAG, "[TOKEN 4] Decoded JSFuck logic to JS string. Length: ${jsFuck.length}")
                     
-                    // --- OPTIMIZED DEAN EDWARDS UNPACKER ---
-                    if (jsFuck.contains("eval(function(p,a,c,k,e,d)") && jsFuck.contains(".split")) {
+                    // --- OPTIMIZED DEAN EDWARDS UNPACKER (Fixes False Positive String Truncation) ---
+                    val startPacked = jsFuck.indexOf("}(")
+                    if (startPacked >= 0) {
                         try {
-                            val startPacked = jsFuck.indexOf("}(")
-                            if (startPacked >= 0) {
-                                val snippet = jsFuck.substring(startPacked)
-                                val endIdx = snippet.indexOf("'.split").takeIf { it >= 0 } ?: snippet.indexOf("\".split")
-                                if (endIdx >= 0) {
-                                    val rawArgs = snippet.substring(2, endIdx + 1)
-                                    val parts = splitPackedJsArgs(rawArgs)
-                                    if (parts != null && parts.size >= 4) {
-                                        val payloadRaw = parts[0].replace("\\'", "'").replace("\\\"", "\"").replace("\\n", "\n").replace("\\/", "/")
-                                        val base = parts.getOrNull(1)?.toIntOrNull() ?: 36
-                                        val keywords = parts.getOrNull(3)?.split("|") ?: emptyList()
-                                        
-                                        jsFuck = decodePackedJs(payloadRaw, keywords, base)
-                                        Log.e(TAG, "[TOKEN 5] Unpacked Dean Edwards via Optimized Native Decoder. Length: ${jsFuck.length}")
-                                    }
-                                }
+                            val rawArgs = jsFuck.substring(startPacked + 2)
+                            val parts = splitPackedJsArgs(rawArgs)
+                            if (parts != null && parts.size >= 4) {
+                                val payloadRaw = parts[0]
+                                    .replace("\\'", "'")
+                                    .replace("\\\"", "\"")
+                                    .replace("\\n", "\n")
+                                    .replace("\\/", "/")
+                                    .replace("\\\\", "\\")
+                                val base = parts[1].toIntOrNull() ?: 36
+                                val keywords = parts[3].split("|")
+                                
+                                jsFuck = decodePackedJs(payloadRaw, keywords, base)
+                                Log.e(TAG, "[TOKEN 5] Unpacked Dean Edwards via Optimized Native Decoder. Length: ${jsFuck.length}")
                             }
                         } catch (e: Exception) {
                             Log.e(TAG, "[TOKEN ERROR] Native DE unpacker failed: ${e.message}")
