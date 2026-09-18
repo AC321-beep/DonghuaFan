@@ -11,12 +11,9 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import java.net.URI
-import java.security.MessageDigest
 import javax.crypto.Cipher
 import javax.crypto.Mac
-import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.IvParameterSpec
-import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.abs
 
@@ -37,6 +34,8 @@ open class GalaxyDonghua : ExtractorApi() {
         const val TAG = "GalaxyDonghuaDebug"
         private const val BASE36_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
         private const val BASE62_CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        private const val PBKDF2_ITERATIONS = 10_000
+        private const val PBKDF2_DERIVED_LEN = 48   // 32-byte key + 16-byte IV
     }
 
     override suspend fun getUrl(
@@ -59,36 +58,7 @@ open class GalaxyDonghua : ExtractorApi() {
             r.text
         } catch (e: Exception) { Log.e(TAG, "[STEP 2 ERR] ${e.message}"); return }
 
-        // ─── SCRIPT DISCOVERY — the AES logic must live somewhere in here ───
-        val scriptSrcs = Regex("""<script[^>]+src\s*=\s*["']([^"']+)["']""")
-            .findAll(page).map { it.groupValues[1] }.distinct().toList()
-        Log.e(TAG, "[SCRIPTS] External count: ${scriptSrcs.size}")
-        for (s in scriptSrcs) {
-            val absUrl = if (s.startsWith("http")) s
-                         else if (s.startsWith("//")) "https:$s"
-                         else gxBase + (if (s.startsWith("/")) s else "/$s")
-            Log.e(TAG, "[SCRIPTS] src=$absUrl")
-            try {
-                val sr = app.get(absUrl, headers = headers)
-                Log.e(TAG, "[SCRIPTS] $absUrl → ${sr.code} | ${sr.text.length}B")
-                val body = sr.text
-                if (body.length in 100..200_000) {
-                    // Log the whole thing in 900-char chunks so we can grep for AES/CryptoJS
-                    body.chunked(900).forEachIndexed { idx, chunk ->
-                        Log.e(TAG, "[SCRIPT $absUrl][$idx]: $chunk")
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "[SCRIPTS ERR] $absUrl → ${e.message}")
-            }
-        }
-        val inlineScripts = Regex("<script(?![^>]*src)[^>]*>(.*?)</script>", RegexOption.DOT_MATCHES_ALL)
-            .findAll(page).map { it.groupValues[1] }.filter { it.length > 100 }.toList()
-        Log.e(TAG, "[SCRIPTS] Inline count (≥100 chars): ${inlineScripts.size}")
-        inlineScripts.forEachIndexed { i, s ->
-            Log.e(TAG, "[INLINE $i] len=${s.length} head=${s.take(200).replace("\n", " ")}")
-        }
-
+        // Fast path: unencrypted VID_SRC
         val vid = Regex("const[ \\t]+VID_SRC[ \\t]*=[ \\t]*[\"']([^\"']+)[\"']").find(page)
         if (vid != null && vid.groupValues[1].isNotBlank()) {
             val su = vid.groupValues[1].replace("\\/", "/")
@@ -135,38 +105,110 @@ open class GalaxyDonghua : ExtractorApi() {
         } catch (_: Exception) { "" }
         val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
         val pathExtension = tokens.kaken + tokens.qsx + tokens.pd + tokens.ps
-        val modernUrl = "${prefix.trimEnd('/')}/$pathExtension?p=${tokens.apx}&_=${System.currentTimeMillis()}"
+        val targetUrl = "${prefix.trimEnd('/')}/$pathExtension?p=${tokens.apx}&_=${System.currentTimeMillis()}"
 
-        val xhrHeaders = headers.toMutableMap().apply {
+        val apiHeaders = headers.toMutableMap().apply {
             put("Referer", embedUrl)
             put("X-Requested-With", "XMLHttpRequest")
             put("Accept", "application/json, text/javascript, */*; q=0.01")
         }
 
-        Log.e(TAG, "[T2] modern: $modernUrl")
+        Log.e(TAG, "[STEP 13] API: $targetUrl")
         val text = try {
-            val r = app.get(modernUrl, headers = xhrHeaders)
-            Log.e(TAG, "[T2 RAW] code=${r.code} len=${r.text.length}")
+            val r = app.get(targetUrl, headers = apiHeaders)
+            Log.e(TAG, "[STEP 13 API RES] ${r.code} | ${r.text.length}B")
             r.text.trim()
-        } catch (e: Exception) { Log.e(TAG, "[T2 ERR] ${e.message}"); return null }
+        } catch (e: Exception) { Log.e(TAG, "[STEP 13 ERR] ${e.message}"); return null }
 
+        if (text.isBlank()) return null
+
+        // Some responses may be plain JSON
         if (text.startsWith("{") && text.contains("\"file\"", true)) {
-            Log.e(TAG, "[T2 HIT] plain JSON"); return text
+            Log.e(TAG, "[DEC] plain JSON (unexpected)")
+            return text
         }
 
-        val rawCt = decodeBase64Flexible(text)
-        if (rawCt != null && rawCt.size >= 32) {
-            Log.e(TAG, "[HEX] CT size=${rawCt.size}")
-            Log.e(TAG, "[HEX] CT[0..32]  = ${hex(rawCt.copyOfRange(0, minOf(32, rawCt.size)))}")
+        // ── THE REAL DECRYPT: PBKDF2-HMAC-SHA256(pd, salt, 10000, 48) → AES-CBC ──
+        val plain = decryptGdPayload(text, tokens.pd)
+        if (plain != null) {
+            Log.e(TAG, "[DEC] OK — ${plain.length}B")
+        } else {
+            Log.e(TAG, "[DEC] FAILED — head=${text.take(80)}")
         }
-        decodeBase64Deep(tokens.utekmek)?.let { u ->
-            Log.e(TAG, "[HEX] UT size=${u.size}")
-            Log.e(TAG, "[HEX] UT[0..64]  = ${hex(u)}")
-        }
+        return plain
+    }
 
-        val cipherRx = Regex("[\"'](?:data|file|source|sources)[\"'][ \\t]*:[ \\t]*[\"']([^\"']+)[\"']")
-        val cipher = cipherRx.find(text)?.groupValues?.get(1) ?: text
-        return dcx(cipher, tokens, pathExtension)
+    /**
+     * Exact port of the site's `dcx()`:
+     *   salt = first 16 bytes of Base64-decoded payload
+     *   ct   = rest
+     *   derived = PBKDF2-HMAC-SHA256(password=pd, salt, 10000, 48 bytes)
+     *   key  = derived[0..32],  iv = derived[32..48]
+     *   AES/CBC/PKCS7
+     */
+    private fun decryptGdPayload(b64: String, pd: String): String? {
+        // Normalise the site's base64 quirks
+        var s = b64.trim()
+            .replace(",,", "==")
+            .replace(",", "=")
+            .replace('-', '+')
+            .replace('_', '/')
+        while (s.length % 4 != 0) s += "="
+
+        val raw = try { Base64.decode(s, Base64.DEFAULT) } catch (_: Exception) { return null }
+        if (raw.size < 32) return null
+
+        val salt = raw.copyOfRange(0, 16)
+        val ct   = raw.copyOfRange(16, raw.size)
+        if (ct.isEmpty() || ct.size % 16 != 0) return null
+
+        val derived = try {
+            pbkdf2HmacSha256(pd.toByteArray(Charsets.UTF_8), salt, PBKDF2_ITERATIONS, PBKDF2_DERIVED_LEN)
+        } catch (e: Exception) {
+            Log.e(TAG, "[DEC] PBKDF2 failed: ${e.message}")
+            return null
+        }
+        val key = derived.copyOfRange(0, 32)
+        val iv  = derived.copyOfRange(32, 48)
+
+        return try {
+            val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+            val plain = String(c.doFinal(ct), Charsets.UTF_8)
+            if (plain.isBlank()) null else plain
+        } catch (e: Exception) {
+            Log.e(TAG, "[DEC] AES-CBC failed: ${e.message}")
+            null
+        }
+    }
+
+    /** Manual PBKDF2-HMAC-SHA256 so we control the byte encoding of the password exactly. */
+    private fun pbkdf2HmacSha256(
+        password: ByteArray, salt: ByteArray, iterations: Int, dkLen: Int
+    ): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(password, "HmacSHA256"))
+        val hLen = 32
+        val blocks = (dkLen + hLen - 1) / hLen
+        val out = ByteArray(blocks * hLen)
+        for (i in 1..blocks) {
+            mac.reset()
+            mac.update(salt)
+            mac.update(byteArrayOf(
+                (i ushr 24).toByte(),
+                (i ushr 16).toByte(),
+                (i ushr 8).toByte(),
+                i.toByte()
+            ))
+            var u = mac.doFinal()
+            val t = u.copyOf()
+            for (j in 2..iterations) {
+                u = mac.doFinal(u)
+                for (k in t.indices) t[k] = (t[k].toInt() xor u[k].toInt()).toByte()
+            }
+            System.arraycopy(t, 0, out, (i - 1) * hLen, hLen)
+        }
+        return out.copyOfRange(0, dkLen)
     }
 
     private suspend fun emitStreams(
@@ -200,7 +242,9 @@ open class GalaxyDonghua : ExtractorApi() {
         val utekmek: String = "", val localKey: String = "", val unpackedJs: String = ""
     )
 
-    // ─── Dean Edwards unpacker (unchanged, compact) ────────────────────
+    // ────────────────────────────────────────────────────────────────
+    //  Dean Edwards unpacker (unchanged)
+    // ────────────────────────────────────────────────────────────────
     private fun toBase(n: Int, base: Int): String {
         if (n == 0) return "0"
         val chars = if (base == 36) BASE36_CHARS else BASE62_CHARS
@@ -208,6 +252,7 @@ open class GalaxyDonghua : ExtractorApi() {
         while (num > 0) { sb.append(chars[num % base]); num /= base }
         return sb.reverse().toString()
     }
+
     private fun splitPackedJsArgs(s: String): List<String>? {
         val args = mutableListOf<String>(); var i = 0
         while (i < s.length && args.size < 4) {
@@ -229,21 +274,25 @@ open class GalaxyDonghua : ExtractorApi() {
         }
         return if (args.size >= 4) args else null
     }
+
     private fun decodePackedJs(payload: String, keywords: List<String>, base: Int): String {
         val parts = keywords.mapIndexedNotNull { i, kw -> if (kw.isNotBlank()) (toBase(i, base) to kw) else null }
         if (parts.isEmpty()) return payload
+        val alt = parts.joinToString("|") { it.first }
         val map = parts.toMap()
-        return Regex("\\b(?:${parts.joinToString("|") { it.first }})\\b").replace(payload) { m -> map[m.value] ?: m.value }
+        return Regex("\\b(?:$alt)\\b").replace(payload) { m -> map[m.value] ?: m.value }
     }
 
     private fun decodeGdTokens(page: String): GdTokens? {
         fun extractSmartJs(n: String, text: String): String {
             Regex("""(?:var\s+|let\s+|const\s+)?\b${Regex.escape(n)}\b\s*=\s*atob\s*\(\s*["']([^"']+)["']\s*\)""")
-                .find(text)?.let { return it.groupValues[1].trim() }
+                .find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
             Regex("""(?:var\s+|let\s+|const\s+)?\b${Regex.escape(n)}\b\s*=\s*["']([^"']+)["']""")
-                .find(text)?.let { return it.groupValues[1].trim() }
+                .find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
             Regex("""["']?${Regex.escape(n)}["']?\s*:\s*["']([^"']+)["']""")
-                .find(text)?.let { return it.groupValues[1].trim() }
+                .find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
+            Regex("""(?:window|self)\s*(?:\.\s*${Regex.escape(n)}|\[\s*["']${Regex.escape(n)}["']\s*\])\s*=\s*["']([^"']+)["']""")
+                .find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
             return ""
         }
         fun extractHtmlFallback(n: String, text: String): String {
@@ -325,6 +374,7 @@ open class GalaxyDonghua : ExtractorApi() {
         )) t = t.replace(k, v)
         return t
     }
+
     private fun splitTopLevelTerms(s: String): List<String> {
         val terms = mutableListOf<String>(); var depth = 0; var cur = StringBuilder()
         for (ch in s) when (ch) {
@@ -339,6 +389,7 @@ open class GalaxyDonghua : ExtractorApi() {
         if (cur.isNotBlank()) terms.add(cur.toString())
         return terms.filter { it != "+" && it != "-" }
     }
+
     private fun evalArithmetic(s: String): Int? {
         val clean = s.filter { it != ' ' }
         val values = mutableListOf<Int>(); val ops = mutableListOf<Char>(); var i = 0
@@ -378,253 +429,6 @@ open class GalaxyDonghua : ExtractorApi() {
             values.add(if (op == '+') a + b else a - b)
         }
         return values.firstOrNull()
-    }
-
-    // ─── Crypto helpers ────────────────────────────────────────────────
-    private fun hex(b: ByteArray): String = b.joinToString("") { "%02x".format(it) }
-    private fun fromHex(s: String): ByteArray? {
-        if (s.length % 2 != 0 || s.isEmpty()) return null
-        return try { ByteArray(s.length / 2) { s.substring(it * 2, it * 2 + 2).toInt(16).toByte() } }
-        catch (_: Exception) { null }
-    }
-    private fun decodeBase64Flexible(s: String): ByteArray? {
-        var t = s.trim().replace(",,", "==").replace(",", "=").replace('-', '+').replace('_', '/')
-        while (t.length % 4 != 0) t += "="
-        return try { Base64.decode(t, Base64.DEFAULT) } catch (_: Exception) { null }
-    }
-    private fun decodeBase64Deep(s: String, rounds: Int = 3): ByteArray? {
-        var current = s; var best: ByteArray? = null
-        for (r in 0 until rounds) {
-            val dec = decodeBase64Flexible(current) ?: break
-            best = dec
-            val txt = try { String(dec, Charsets.UTF_8) } catch (_: Exception) { break }
-            if (txt.length < 8) break
-            if (txt.any { it.code < 32 || it.code > 126 }) break
-            if (!txt.all { it.isLetterOrDigit() || it in "+/=,_-" }) break
-            current = txt
-        }
-        return best
-    }
-    private fun padTo(b: ByteArray, size: Int): ByteArray {
-        if (b.isEmpty()) return ByteArray(size)
-        if (b.size == size) return b
-        val out = ByteArray(size); for (i in 0 until size) out[i] = b[i % b.size]; return out
-    }
-    private fun md5(b: ByteArray) = MessageDigest.getInstance("MD5").digest(b)
-    private fun sha1(b: ByteArray) = MessageDigest.getInstance("SHA-1").digest(b)
-    private fun sha256(b: ByteArray) = MessageDigest.getInstance("SHA-256").digest(b)
-    private fun hmacMd5(k: ByteArray, d: ByteArray) = Mac.getInstance("HmacMD5").run {
-        init(SecretKeySpec(k, "HmacMD5")); doFinal(d)
-    }
-    private fun hmacSha256(k: ByteArray, d: ByteArray) = Mac.getInstance("HmacSHA256").run {
-        init(SecretKeySpec(k, "HmacSHA256")); doFinal(d)
-    }
-
-    private fun aesCbc(ct: ByteArray, key: ByteArray, iv: ByteArray, pad: String = "PKCS5Padding"): ByteArray? {
-        if (key.size !in intArrayOf(16, 24, 32) || iv.size != 16) return null
-        if (ct.isEmpty() || ct.size % 16 != 0) return null
-        return try {
-            val c = Cipher.getInstance("AES/CBC/$pad")
-            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            c.doFinal(ct)
-        } catch (_: Exception) { null }
-    }
-    private fun aesEcb(ct: ByteArray, key: ByteArray, pad: String = "PKCS5Padding"): ByteArray? {
-        if (key.size !in intArrayOf(16, 24, 32)) return null
-        if (ct.isEmpty() || ct.size % 16 != 0) return null
-        return try {
-            val c = Cipher.getInstance("AES/ECB/$pad")
-            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"))
-            c.doFinal(ct)
-        } catch (_: Exception) { null }
-    }
-    private fun aesCtr(ct: ByteArray, key: ByteArray, iv: ByteArray): ByteArray? {
-        if (key.size !in intArrayOf(16, 24, 32) || iv.size != 16) return null
-        return try {
-            val c = Cipher.getInstance("AES/CTR/NoPadding")
-            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            c.doFinal(ct)
-        } catch (_: Exception) { null }
-    }
-
-    private fun isPlausibleJson(b: ByteArray?): Boolean {
-        if (b == null || b.size < 16) return false
-        var printable = 0
-        for (x in b) if (x.toInt() in 9..126) printable++
-        if (printable < b.size * 0.85) return false
-        val t = String(b, Charsets.UTF_8).trim()
-        if (!t.startsWith("{") && !t.startsWith("[")) return false
-        return t.contains("\"file\"") || t.contains("baseUrl") || t.contains("\"sources\"") ||
-               t.contains(".m3u8") || t.contains("\"label\"") || t.contains("\"type\"")
-    }
-
-    private fun tryEverything(ct: ByteArray, key: ByteArray, ivs: List<ByteArray>): ByteArray? {
-        aesEcb(ct, key)?.let { if (isPlausibleJson(it)) return it }
-        aesEcb(ct, key, "NoPadding")?.let { if (isPlausibleJson(it)) return it }
-        for (iv in ivs) {
-            aesCbc(ct, key, iv)?.let { if (isPlausibleJson(it)) return it }
-            aesCbc(ct, key, iv, "NoPadding")?.let { if (isPlausibleJson(it)) return it }
-            aesCtr(ct, key, iv)?.let { if (isPlausibleJson(it)) return it }
-        }
-        return null
-    }
-
-    private fun keyVariants(cand: String, tokens: GdTokens): List<ByteArray> {
-        if (cand.isBlank()) return emptyList()
-        val seen = linkedSetOf<String>(); val out = mutableListOf<ByteArray>()
-        fun push(b: ByteArray?) { if (b == null || b.isEmpty()) return; if (seen.add(hex(b))) out.add(b) }
-        val raw = cand.toByteArray(Charsets.UTF_8)
-        push(padTo(raw, 16)); push(padTo(raw, 24)); push(padTo(raw, 32))
-        val m = md5(raw); push(m); push(sha1(raw).copyOfRange(0, 16))
-        val s2 = sha256(raw); push(s2); push(s2.copyOfRange(0, 16))
-        push(padTo(hex(m).toByteArray(Charsets.US_ASCII), 32))
-        push(padTo(hex(s2).toByteArray(Charsets.US_ASCII), 32))
-        fromHex(cand)?.let { hx ->
-            push(padTo(hx, 16)); push(padTo(hx, 24)); push(padTo(hx, 32))
-            push(md5(hx)); push(sha256(hx))
-        }
-        decodeBase64Deep(cand)?.let { b64 ->
-            for (sz in intArrayOf(16, 24, 32)) {
-                if (b64.size >= sz) push(b64.copyOfRange(0, sz))
-                if (b64.size >= sz + 16) push(b64.copyOfRange(16, 16 + sz))
-                if (b64.isNotEmpty()) push(padTo(b64, sz))
-            }
-            push(md5(b64)); push(sha256(b64)); push(sha256(b64).copyOfRange(0, 16))
-        }
-        if (tokens.localKey.isNotBlank()) {
-            val lk = tokens.localKey.toByteArray()
-            push(hmacMd5(raw, lk)); push(hmacSha256(raw, lk))
-            push(hmacMd5(lk, raw)); push(hmacSha256(lk, raw))
-            push(padTo(raw + lk, 16)); push(padTo(raw + lk, 32))
-            push(padTo(lk + raw, 16)); push(padTo(lk + raw, 32))
-            push(md5(raw + lk)); push(sha256(raw + lk))
-            push(md5(lk + raw)); push(sha256(lk + raw))
-        }
-        try {
-            val f = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA1")
-            push(f.generateSecret(PBEKeySpec(cand.toCharArray(), tokens.localKey.toByteArray(), 1000, 256)).encoded)
-        } catch (_: Exception) {}
-        push(md5(md5(raw))); push(sha256(md5(raw))); push(md5(sha256(raw)))
-        return out
-    }
-
-    /** NEW: treat the raw utekmek bytes as a key/IV container in every plausible layout. */
-    private fun utKeyLayouts(ut: ByteArray): List<Pair<ByteArray, ByteArray>> {
-        val out = mutableListOf<Pair<ByteArray, ByteArray>>()
-        val z16 = ByteArray(16)
-        if (ut.size < 32) return out
-        // (key, iv) pairs
-        fun add(k: ByteArray, iv: ByteArray) { if (k.size in intArrayOf(16, 24, 32) && iv.size == 16) out.add(k to iv) }
-        if (ut.size >= 48) {
-            add(ut.copyOfRange(0, 32), ut.copyOfRange(32, 48))          // key[0..32] IV[32..48]
-            add(ut.copyOfRange(0, 32), z16)                             // key[0..32] IV=0
-            add(ut.copyOfRange(16, 48), ut.copyOfRange(0, 16))          // key[16..48] IV[0..16]
-            add(ut.copyOfRange(32, 64), ut.copyOfRange(0, 16))          // key[32..64] IV[0..16]
-            add(ut.copyOfRange(16, 48), z16)                            // key[16..48] IV=0
-        }
-        if (ut.size >= 32) {
-            add(ut.copyOfRange(0, 16), ut.copyOfRange(16, 32))          // key[0..16] IV[16..32]
-            add(ut.copyOfRange(16, 32), ut.copyOfRange(0, 16))          // key[16..32] IV[0..16]
-        }
-        // hashed variants with zero / self-derived IV
-        add(md5(ut), z16); add(sha256(ut), z16)
-        add(md5(ut), md5(ut)); add(sha256(ut), sha256(ut).copyOfRange(0, 16))
-        return out
-    }
-
-    private fun buildCandidates(tokens: GdTokens, pathExtension: String): List<String> {
-        val out = linkedSetOf<String>()
-        fun add(s: String) { if (s.isNotBlank()) out.add(s) }
-        add(tokens.localKey); add(tokens.utekmek)
-        add(tokens.pd); add(tokens.ps); add(tokens.qsx); add(tokens.kaken); add(tokens.apx)
-        add(pathExtension)
-        val core = listOf(tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.localKey, tokens.utekmek)
-            .filter { it.isNotBlank() }
-        for (a in core) for (b in core) if (a != b) add(a + b)
-        add(tokens.kaken + tokens.qsx + tokens.pd + tokens.ps)
-        add(tokens.localKey + tokens.pd); add(tokens.pd + tokens.localKey)
-        val final = linkedSetOf<String>()
-        for (c in out) { final.add(c); final.add(c.replace(",,", "==").replace(",", "=")) }
-        return final.toList()
-    }
-
-    private fun dcx(input: String, tokens: GdTokens, pathExtension: String): String? {
-        if (input.isBlank()) return null
-        val rawCt = decodeBase64Flexible(input)
-        if (rawCt == null || rawCt.size < 32) { Log.e(TAG, "[DCX] ct invalid"); return null }
-        val z16 = ByteArray(16)
-
-        // Split patterns on CT
-        val ctSplits = mutableListOf<Pair<ByteArray, ByteArray>>()
-        ctSplits.add(z16 to rawCt)
-        if ((rawCt.size - 16) % 16 == 0) ctSplits.add(rawCt.copyOfRange(0, 16) to rawCt.copyOfRange(16, rawCt.size))
-
-        val candidates = buildCandidates(tokens, pathExtension)
-        Log.e(TAG, "[DCX] P1: ${candidates.size} cand × splits")
-
-        // PASS 1 — string candidates
-        for (cand in candidates) for (key in keyVariants(cand, tokens)) for ((iv, ct) in ctSplits) {
-            tryEverything(ct, key, listOf(iv, z16))?.let {
-                Log.e(TAG, "[DCX] P1 HIT '${cand.take(24)}'"); return String(it, Charsets.UTF_8)
-            }
-        }
-
-        // PASS 2 — utekmek as key container
-        decodeBase64Deep(tokens.utekmek)?.let { ut ->
-            Log.e(TAG, "[DCX] P2 UT layouts (${ut.size}B)")
-            for ((k, iv) in utKeyLayouts(ut)) for ((civ, ct) in ctSplits) {
-                val realIv = if (civ === z16 || civ.isEmpty()) iv else civ
-                tryEverything(ct, k, listOf(realIv, iv, z16))?.let {
-                    Log.e(TAG, "[DCX] P2 UT HIT key=${hex(k).take(16)} iv=${hex(realIv).take(16)}")
-                    return String(it, Charsets.UTF_8)
-                }
-            }
-            // also try unwrapping: decrypt UT itself with localKey-derived keys, use result
-            for (src in listOf(tokens.localKey, tokens.pd, tokens.ps)) for (ok in keyVariants(src, tokens)) {
-                val utSplits = listOf(z16 to ut,
-                    if ((ut.size - 16) % 16 == 0) ut.copyOfRange(0, 16) to ut.copyOfRange(16, ut.size) else null).filterNotNull()
-                for ((iv, ct) in utSplits) {
-                    val plain = aesEcb(ct, ok) ?: aesCbc(ct, ok, if (iv.contentEquals(z16)) z16 else iv)
-                    if (plain != null && plain.size >= 16) {
-                        for (sz in intArrayOf(16, 24, 32)) {
-                            val k = when {
-                                plain.size == sz -> plain
-                                plain.size > sz -> plain.copyOfRange(0, sz)
-                                else -> padTo(plain, sz)
-                            }
-                            for ((oiv, oct) in ctSplits) {
-                                tryEverything(oct, k, listOf(oiv, z16, iv))?.let {
-                                    Log.e(TAG, "[DCX] P2 UNWRAP HIT"); return String(it, Charsets.UTF_8)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // PASS 3 — CT prefix as key
-        if (rawCt.size > 48) {
-            Log.e(TAG, "[DCX] P3 CT-as-key")
-            val ctKey32 = rawCt.copyOfRange(0, 32)
-            val ctKey16 = rawCt.copyOfRange(0, 16)
-            val ctIV16  = rawCt.copyOfRange(0, 16)
-            val body1   = rawCt.copyOfRange(32, rawCt.size)
-            val body2   = rawCt.copyOfRange(16, rawCt.size)
-            if (body1.size % 16 == 0) {
-                tryEverything(body1, ctKey32, listOf(z16, ctIV16))?.let {
-                    Log.e(TAG, "[DCX] P3 HIT (32B prefix key)"); return String(it, Charsets.UTF_8)
-                }
-            }
-            if (body2.size % 16 == 0) {
-                tryEverything(body2, ctKey16, listOf(z16, ctIV16))?.let {
-                    Log.e(TAG, "[DCX] P3 HIT (16B prefix key)"); return String(it, Charsets.UTF_8)
-                }
-            }
-        }
-
-        Log.e(TAG, "[DCX] Exhausted — null")
-        return null
     }
 
     private fun fixStreamUrl(url: String, base: String): String? {
