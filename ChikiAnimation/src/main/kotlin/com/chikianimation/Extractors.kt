@@ -213,17 +213,16 @@ open class GalaxyDonghua : ExtractorApi() {
         return all.firstOrNull { it.matches(Regex("""^\d{10}$""")) } ?: all.firstOrNull { it.matches(Regex("""^[a-f0-9\-]{36}$""")) } ?: t.pd
     }
 
-   private fun decodeGdTokens(page: String): GdTokens? {
+  private fun decodeGdTokens(page: String): GdTokens? {
         Log.e(TAG, "[TOKEN 1] Starting decode process. Page length: ${page.length}")
         
         fun extractVars(text: String): GdTokens {
             fun grabVar(name: String): String {
-                // Matches standard assignments and object keys: pd="val", "pd":"val", 'pd'="val", ['pd']="val"
-                val strRegex = Regex("""(?:$name\vert{}["']$name["'])\s*\]?\s*[:=]\s*['"`]([^'"`]+)['"`]""")
+                // Fixed: Standard strings with double backslashes to avoid Kotlin compiler escape errors
+                val strRegex = Regex("(?:$name\vert{}[\"']$name[\"'])\\s*\\]?\\s*[:=]\\s*['\"`]([^'\"`]+)['\"`]")
                 strRegex.find(text)?.let { return it.groupValues[1].trim() }
                 
-                // Matches unquoted numeric fallback: pd=123456
-                val numRegex = Regex("""(?:$name|["']$name["'])\s*\]?\s*[:=]\s*([^'"`\s,;{}()\[\]]+)""")
+                val numRegex = Regex("(?:$name|[\"']$name[\"'])\\s*\\]?\\s*[:=]\\s*([^'\"`\\s,;{}()\\[\\]]+)")
                 numRegex.find(text)?.let { return it.groupValues[1].trim() }
                 
                 return ""
@@ -262,25 +261,10 @@ open class GalaxyDonghua : ExtractorApi() {
                     }
                     jsFuck = sb.toString()
                     Log.e(TAG, "[TOKEN 4] Decoded JSFuck logic to JS string. Length: ${jsFuck.length}")
-                    Log.e(TAG, "[TOKEN 4.1 RAW DECODED] $jsFuck") // Prints exactly what we are parsing
+                    Log.e(TAG, "[TOKEN 4.1 RAW DECODED] $jsFuck")
                     
-                    // --- NESTED OBFUSCATION UNWRAPPING ---
-                    // 1. Unwrap Dean Edwards Packer if present
-                    if (jsFuck.contains("eval(function(p,a,c,k,e,")) {
-                        try {
-                            com.lagradost.cloudstream3.utils.Unpacker.unpack(jsFuck)?.let { unpacked ->
-                                if (unpacked.isNotBlank()) {
-                                    jsFuck = unpacked
-                                    Log.e(TAG, "[TOKEN 5] Unpacked Dean Edwards. Length: ${jsFuck.length}")
-                                }
-                            }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "[TOKEN ERROR] Unpacker failed: ${e.message}")
-                        }
-                    }
-
-                    // 2. Unwrap base64 atob(...) wrap if present
-                    Regex("""atob\s*\(\s*['"]([^'"]+)['"]\s*\)""").find(jsFuck)?.let { match ->
+                    // Unwrap base64 atob(...) wrap if present (Unpacker logic removed to fix build error)
+                    Regex("atob\\s*\\(\\s*['\"]([^'\"]+)['\"]\\s*\\)").find(jsFuck)?.let { match ->
                         try {
                             val decodedAtob = String(Base64.decode(match.groupValues[1], Base64.DEFAULT), Charsets.UTF_8)
                             if (decodedAtob.isNotBlank()) {
