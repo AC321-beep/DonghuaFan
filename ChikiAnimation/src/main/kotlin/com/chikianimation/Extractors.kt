@@ -10,6 +10,8 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.mozilla.javascript.Context
 import org.mozilla.javascript.Function
 import org.mozilla.javascript.ScriptableObject
@@ -38,12 +40,9 @@ open class GalaxyDonghua : ExtractorApi() {
         private const val BASE36_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
         private const val BASE62_CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
-        // Confirmed by browser test:
-        //   SHA256 / 10000 iters / 48 bytes → key[0..32], iv[32..48] → AES-CBC / Pkcs7
         private const val PBKDF2_ITERS = 10_000
         private const val PBKDF2_LEN   = 48
 
-        @Volatile private var cachedPlayerJsUrl: String? = null
         @Volatile private var cachedPlayerJs: String? = null
         @Volatile private var cachedCryptoJs: String? = null
     }
@@ -101,7 +100,7 @@ open class GalaxyDonghua : ExtractorApi() {
             } catch (e: Exception) { Log.e(TAG, "[STEP 8 ERR] ${e.message}"); continue }
 
             val tokens = decodeGdTokens(sp) ?: continue
-            Log.e(TAG, "[TOK] PD=${tokens.pd}")
+            Log.e(TAG, "[TOK] PD=${tokens.pd} PS.len=${tokens.ps.length} UT.len=${tokens.utekmek.length}")
 
             val json = fetchAndDecryptApi(tokens, headers, gxBase, target, playerJs, cryptoJs)
             if (json != null) {
@@ -142,7 +141,6 @@ open class GalaxyDonghua : ExtractorApi() {
             if (text.length < 2_000) continue
             if (Regex("""\bdcx\s*[=(]""").containsMatchIn(text)) {
                 Log.e(TAG, "[JS] accepted")
-                cachedPlayerJsUrl = abs
                 cachedPlayerJs = text
                 return text
             }
@@ -175,84 +173,101 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  API: config endpoint + sources endpoint, both encrypted
+    //  Sources endpoint
+    //
+    //  From the site's own loadSources():
+    //    url:  atob(apx).replace('api-config/','api/') + '?' + ps
+    //    method: POST
+    //    body: utekmek
+    //  Confirmed by browser XHR:
+    //    POST https://galaxydonghua.xyz/api/?p=S1AvQ0Zz...
+    //    body = <utekmek value>
+    //
+    //  Then decrypt with the confirmed algorithm:
+    //    salt    = raw[0..16]
+    //    ct      = raw[16..]
+    //    derived = PBKDF2-HMAC-SHA256(pd, salt, 10000, 48)
+    //    key     = derived[0..32]
+    //    iv      = derived[32..48]
+    //    plain   = AES-CBC-Pkcs7(ct, key, iv)
     // ────────────────────────────────────────────────────────────────
     private suspend fun fetchAndDecryptApi(
         tokens: GdTokens, headers: Map<String, String>, gxBase: String,
         embedUrl: String, playerJs: String?, cryptoJs: String
     ): String? {
+        // apx decodes to https://galaxydonghua.xyz/api-config/
+        val apxDecoded = try {
+            String(
+                Base64.decode(
+                    tokens.apx.replace(",,", "==").replace(",", "="),
+                    Base64.DEFAULT
+                ),
+                Charsets.UTF_8
+            ).trim()
+        } catch (_: Exception) { "" }
+
+        val apiRoot = if (apxDecoded.startsWith("http"))
+            apxDecoded.replace("api-config/", "api/")
+        else "$gxBase/api/"
+
+        // ps at runtime is "p=..." — clean our token the same way the site does
+        val psClean = tokens.ps.replace(",,", "==").replace(",", "=")
+        val sourcesUrl = apiRoot.trimEnd('/') + "/?" + psClean
+
+        // Body is the raw utekmek string
+        val utekmekClean = tokens.utekmek.replace(",,", "==").replace(",", "=")
+        val body = utekmekClean.toRequestBody("application/x-www-form-urlencoded".toMediaTypeOrNull())
+
         val apiHeaders = headers.toMutableMap().apply {
             put("Referer", embedUrl)
             put("X-Requested-With", "XMLHttpRequest")
             put("Accept", "application/json, text/javascript, */*; q=0.01")
+            put("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
         }
 
-        // ── Sources endpoint: /api/?p=<apx>&_=<ts> ──
-        // This is the one that actually carries {"sources":[...]}. Confirmed from browser XHRs.
-        val sourcesUrl = "$gxBase/api/?p=${tokens.apx}&_=${System.currentTimeMillis()}"
-        Log.e(TAG, "[STEP 13] SOURCES: $sourcesUrl")
+        Log.e(TAG, "[STEP 13] POST $sourcesUrl")
+        Log.e(TAG, "[STEP 13] body=${utekmekClean.take(80)}…")
+
         val sourcesCt = try {
-            val r = app.get(sourcesUrl, headers = apiHeaders)
+            val r = app.post(sourcesUrl, data = body, headers = apiHeaders)
             Log.e(TAG, "[STEP 13 RES] ${r.code} | ${r.text.length}B")
             r.text.trim()
-        } catch (e: Exception) { Log.e(TAG, "[STEP 13 ERR] ${e.message}"); "" }
+        } catch (e: Exception) {
+            Log.e(TAG, "[STEP 13 ERR] ${e.message}")
+            ""
+        }
 
-        if (sourcesCt.isNotBlank()) {
-            if (sourcesCt.startsWith("{")) {
-                Log.e(TAG, "[DEC] plain JSON"); return sourcesCt
-            }
+        if (sourcesCt.isBlank()) return null
 
-            // Rhino best-effort
-            if (playerJs != null && cryptoJs.isNotEmpty()) {
-                val r = GdRhino.tryDecrypt(playerJs, cryptoJs, sourcesCt, tokens.toGlobalMap())
-                if (r != null && r.trimStart().startsWith("{")) {
-                    Log.e(TAG, "[DEC] Rhino OK — ${r.length}B")
-                    return r
-                }
-                Log.e(TAG, "[DEC] Rhino failed")
-            }
+        Log.e(TAG, "[STEP 13] head=${sourcesCt.take(80)}")
 
-            val plain = decryptGdPayload(sourcesCt, tokens.pd)
-            if (plain != null && plain.trimStart().startsWith("{")) {
-                Log.e(TAG, "[DEC] static OK — ${plain.length}B")
-                return plain
+        // Already plaintext?
+        if (sourcesCt.startsWith("{") && sourcesCt.contains("\"file\"")) {
+            Log.e(TAG, "[DEC] plain JSON")
+            return sourcesCt
+        }
+
+        // Rhino best-effort
+        if (playerJs != null && cryptoJs.isNotEmpty()) {
+            val r = GdRhino.tryDecrypt(playerJs, cryptoJs, sourcesCt, tokens.toGlobalMap())
+            if (r != null && r.trimStart().startsWith("{")) {
+                Log.e(TAG, "[DEC] Rhino OK — ${r.length}B")
+                return r
             }
         }
 
-        // ── Config endpoint fallback (may also be encrypted) ──
-        val decodedApx = try {
-            String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT),
-                Charsets.UTF_8).trim()
-        } catch (_: Exception) { "" }
-        val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
-        val pathExt = tokens.kaken + tokens.qsx + tokens.pd + tokens.ps
-        val configUrl = "${prefix.trimEnd('/')}/$pathExt?p=${tokens.apx}&_=${System.currentTimeMillis()}"
-
-        Log.e(TAG, "[STEP 13-alt] CONFIG: $configUrl")
-        val configCt = try {
-            val r = app.get(configUrl, headers = apiHeaders)
-            Log.e(TAG, "[STEP 13-alt RES] ${r.code} | ${r.text.length}B")
-            r.text.trim()
-        } catch (e: Exception) { Log.e(TAG, "[STEP 13-alt ERR] ${e.message}"); "" }
-
-        if (configCt.isNotBlank() && !configCt.startsWith("{")) {
-            val plain = decryptGdPayload(configCt, tokens.pd)
-            if (plain != null && plain.trimStart().startsWith("{")) {
-                Log.e(TAG, "[DEC] static (config) OK — ${plain.length}B")
-                return plain
-            }
+        // Static — the confirmed algorithm
+        val plain = decryptGdPayload(sourcesCt, tokens.pd)
+        if (plain != null && plain.trimStart().startsWith("{")) {
+            Log.e(TAG, "[DEC] static OK — ${plain.length}B")
+            return plain
         }
+
         return null
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Decrypt — the algorithm confirmed by browser-side test:
-    //    salt    = raw[0..16]
-    //    ct      = raw[16..]
-    //    derived = PBKDF2-HMAC-SHA256(password=pd, salt, 10000 iters, 48 bytes)
-    //    key     = derived[0..32]
-    //    iv      = derived[32..48]
-    //    plain   = AES-CBC-Pkcs7(ct, key, iv)
+    //  Confirmed decrypt
     // ────────────────────────────────────────────────────────────────
     private fun decryptGdPayload(b64: String, pd: String): String? {
         var s = b64.trim().replace(",,", "==").replace(",", "=")
@@ -261,6 +276,7 @@ open class GalaxyDonghua : ExtractorApi() {
         val raw = try { Base64.decode(s, Base64.DEFAULT) } catch (e: Exception) {
             Log.e(TAG, "[DEC] b64: ${e.message}"); return null
         }
+        Log.e(TAG, "[DEC] raw=${raw.size}B")
         if (raw.size < 32 || (raw.size - 16) % 16 != 0) {
             Log.e(TAG, "[DEC] bad length raw=${raw.size}"); return null
         }
@@ -278,7 +294,9 @@ open class GalaxyDonghua : ExtractorApi() {
         return try {
             val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
             c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            String(c.doFinal(ct), Charsets.UTF_8)
+            val plain = String(c.doFinal(ct), Charsets.UTF_8)
+            Log.e(TAG, "[DEC] plain head=${plain.take(160)}")
+            plain
         } catch (e: Exception) {
             Log.e(TAG, "[DEC] AES: ${e.message}")
             null
@@ -308,13 +326,12 @@ open class GalaxyDonghua : ExtractorApi() {
         if (!json.trimStart().startsWith("{")) {
             Log.e(TAG, "[EMIT] REFUSING — payload doesn't start with '{'"); return
         }
-        Log.e(TAG, "[EMIT] JSON head=${json.take(220)}")
+        Log.e(TAG, "[EMIT] head=${json.take(220)}")
 
         val baseURL = Regex("[\"']baseUrl[\"'][ \\t]*:[ \\t]*[\"']([^\"']+)[\"']").find(json)?.groupValues?.get(1) ?: gxBase
         val ph = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
         var emitted = 0
 
-        // Only accept URLs that look like real video streams
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
             val raw = m.groupValues[1]
             val abs = fixStreamUrl(raw, baseURL) ?: continue
@@ -331,7 +348,6 @@ open class GalaxyDonghua : ExtractorApi() {
         }
         Log.e(TAG, "[EMIT] emitted=$emitted")
 
-        // Subtitles (if any "file" ends in .vtt/.srt)
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+\.(?:vtt|srt))["']""").findAll(json)) {
             val abs = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
             subtitleCallback.invoke(SubtitleFile("Sub", abs))
@@ -339,7 +355,8 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     protected data class GdTokens(
-        val pd: String, val ps: String, val qsx: String, val kaken: String, val apx: String,
+        val pd: String, val ps: String, val qsx: String,
+        val kaken: String, val apx: String,
         val utekmek: String = "", val localKey: String = "", val unpackedJs: String = ""
     ) {
         fun toGlobalMap(): Map<String, String> = mapOf(
@@ -348,7 +365,6 @@ open class GalaxyDonghua : ExtractorApi() {
         ).filterValues { it.isNotBlank() }
     }
 
-    // ── Dean Edwards unpacker ────────────────────────────────────────
     private fun toBase(n: Int, base: Int): String {
         if (n == 0) return "0"
         val chars = if (base == 36) BASE36_CHARS else BASE62_CHARS
@@ -538,9 +554,6 @@ open class GalaxyDonghua : ExtractorApi() {
         try { val uri = URI(url); "${uri.scheme}://${uri.host}" } catch (_: Exception) { GX }
 }
 
-// ─────────────────────────────────────────────────────────────────────
-//  Rhino sandbox — best-effort fallback
-// ─────────────────────────────────────────────────────────────────────
 object GdRhino {
     private const val TAG = "GdRhino"
 
@@ -586,17 +599,12 @@ object GdRhino {
             for ((k, v) in globals) ScriptableObject.putProperty(scope, k, v)
 
             val js = if (preprocess) {
-                val cleaned = RESERVED_KEY_REGEX.replace(playerJs) { m ->
-                    "${m.groupValues[1]}\"${m.groupValues[2]}\":"
-                }
-                Log.e(TAG, "preprocessed JS: ${playerJs.length} → ${cleaned.length} bytes")
-                cleaned
+                RESERVED_KEY_REGEX.replace(playerJs) { m -> "${m.groupValues[1]}\"${m.groupValues[2]}\":" }
             } else playerJs
 
             try { ctx.evaluateString(scope, js, "player", 1, null) }
             catch (e: Throwable) {
-                Log.e(TAG, "${if (preprocess) "player eval (preprocessed)" else "player eval"}: ${e.message}")
-                return null
+                Log.e(TAG, "${if (preprocess) "eval (pp)" else "eval"}: ${e.message}"); return null
             }
 
             val fn = (scope.get("dcx", scope) as? Function) ?: run {
@@ -605,7 +613,7 @@ object GdRhino {
             val result = try { fn.call(ctx, scope, scope, arrayOf<Any>(ciphertext)) }
                          catch (e: Throwable) { Log.e(TAG, "dcx call: ${e.message}"); return null }
             val s = Context.toString(result)
-            Log.e(TAG, "dcx returned ${s.length}B")
+            Log.e(TAG, "dcx → ${s.length}B")
             return s.takeIf { it.length > 20 && it.contains("{") }
         } finally { Context.exit() }
     }
