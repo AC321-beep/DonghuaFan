@@ -250,12 +250,9 @@ class ChikiAnimationProvider : MainAPI() {
             return false
         }
 
-        // Atomic counters — the coroutineScope below runs several handleUrl
-        // branches in parallel, so we need thread-safe state.
         val emitCount = AtomicInteger(0)
         val foundFlag = AtomicInteger(0)
 
-        // Every callback invocation increments emitCount before reaching the caller.
         val countingCallback: (ExtractorLink) -> Unit = { link ->
             emitCount.incrementAndGet()
             callback.invoke(link)
@@ -498,7 +495,6 @@ class ChikiAnimationProvider : MainAPI() {
                     }
                 }
 
-                // ── SkylineAI: only mark success if it actually emitted ──
                 if (cleanUrl.contains("skylineai.cloud", true)) {
                     val before = emitCount.get()
                     try {
@@ -510,19 +506,6 @@ class ChikiAnimationProvider : MainAPI() {
                     }
                 }
 
-                // ── GalaxyDonghua: only mark success if it actually emitted ──
-                if (cleanUrl.contains("galaxydonghua", true)) {
-                    val before = emitCount.get()
-                    try {
-                        GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
-                    } catch (_: Exception) { }
-                    if (emitCount.get() > before) {
-                        foundFlag.set(1)
-                        return
-                    }
-                }
-
-                // ── Ghbrisk: only mark success if it actually emitted ──
                 if (cleanUrl.contains("ghbrisk.com", true)) {
                     val before = emitCount.get()
                     try {
