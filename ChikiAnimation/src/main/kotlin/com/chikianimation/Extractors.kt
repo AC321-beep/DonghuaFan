@@ -17,6 +17,7 @@ import okhttp3.CookieJar
 import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.mozilla.javascript.Context
@@ -52,7 +53,6 @@ open class GalaxyDonghua : ExtractorApi() {
         @Volatile private var cachedPlayerJs: String? = null
         @Volatile private var cachedCryptoJs: String? = null
 
-        // ── Cookie jar: keeps session cookies across requests ──
         private val cookieJar = object : CookieJar {
             private val store = mutableMapOf<String, MutableList<Cookie>>()
             override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
@@ -71,17 +71,22 @@ open class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        // ── OkHttp client with full wire logging ──
         private val client: OkHttpClient = OkHttpClient.Builder()
+            .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
             .cookieJar(cookieJar)
             .addNetworkInterceptor { chain ->
                 val req = chain.request()
-                Log.e(TAG, "[HTTP-out] ${req.method} ${req.url}")
-                req.headers.names().forEach { n ->
-                    Log.e(TAG, "[HTTP-out]   $n: ${req.header(n)}")
+                // Force Content-Type: text/plain with NO charset
+                val cleaned = req.newBuilder()
+                    .header("Content-Type", "text/plain")
+                    .build()
+                Log.e(TAG, "[HTTP-out] ${cleaned.method} ${cleaned.url}")
+                Log.e(TAG, "[HTTP-out]   protocol: ${chain.connection()?.protocol()}")
+                cleaned.headers.names().forEach { n ->
+                    Log.e(TAG, "[HTTP-out]   $n: ${cleaned.header(n)}")
                 }
-                Log.e(TAG, "[HTTP-out]   body.length=${req.body?.contentLength() ?: 0L}")
-                val resp = chain.proceed(req)
+                Log.e(TAG, "[HTTP-out]   body.length=${cleaned.body?.contentLength() ?: 0L}")
+                val resp = chain.proceed(cleaned)
                 Log.e(TAG, "[HTTP-in] ${resp.code} ${resp.message}")
                 resp.headers.names().forEach { n ->
                     Log.e(TAG, "[HTTP-in]   $n: ${resp.header(n)}")
@@ -211,18 +216,19 @@ open class GalaxyDonghua : ExtractorApi() {
         embedUrl: String, playerJs: String?, cryptoJs: String
     ): String? {
 
-        // ── DIAGNOSTIC: replay exact cURL from Chrome (byte-identical) ──
+        // ── DIAGNOSTIC with HTTP/2 + text/plain no-charset + priority header ──
         run {
             val exactUrl = "https://galaxydonghua.xyz/api/?p=dEh1WVVRRnUycldacC9GMk5mcXlYR3lQTDgzT2EyZ0NsTnVmTHBBLzROSmIrSnB4KzJzQ0hGcFl1cGU2TXBsV0hRcnJldU5BY2krUmJjT29Hcm5LRUE9PQ,,"
             val exactBody = "dmo4WG83M1dSSmNUcEg4YzcvY0dzQnlBUndxdWU5ZjZxbEFzbVhsNEFJZDFKM0lIL253REdhamE3dnVXZWJLbXNlZUZyWU1LZXBRcE1ZMFlwVFh4QmEwSmRVK2U5THVtYzh0MHBYUXpycGFsQnpRdjJnUUkydGhSdFdwU29tUDBtMTBOVENtbll4bGJURSsyQzBURkJNOCt2aHNvMnJCTG1Lazk5aHpYbzBFR2E1Rksyd3ptZWtXZWgzbm5GZHlSckk2SE9GVlExSDNod0Rha2dEOUYwOU85WlB2dmh1aFI2ZkNpVWRMZnNhVkUzOFBkeEdYbDljNDU1UFJIR0FJaE1PZG82QXZjeFZjTDI4TzdDZWNzampKVnlPdE96bnkreTVjWjd4Q3UrcmM9-,THJjNkh0Q2treUpLdnA2ZVoxL1hpMEhLRkRxOExKY2R0cVBCRFhld0JMRFc4WGF3dUlUUnNPK3B3d3poSmlOU1BjQTArRkhrUEI5UDJWellipakg2Z1E9PQ,,"
 
-            Log.e(TAG, "[TEST-EXACT] input URL : $exactUrl")
-            Log.e(TAG, "[TEST-EXACT] body len  : ${exactBody.length}")
             try {
                 withContext(Dispatchers.IO) {
+                    // body with NO content-type (null) → we control the header
+                    val rawBytes = exactBody.toByteArray(Charsets.UTF_8)
+                    val body = rawBytes.toRequestBody(null)
                     val req = Request.Builder()
                         .url(exactUrl)
-                        .post(exactBody.toRequestBody("text/plain".toMediaTypeOrNull()))
+                        .post(body)
                         .apply {
                             addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36")
                             addHeader("Accept", "text/plain, */*; q=0.01")
@@ -231,6 +237,7 @@ open class GalaxyDonghua : ExtractorApi() {
                             addHeader("Content-Type", "text/plain")
                             addHeader("Origin", "https://galaxydonghua.xyz")
                             addHeader("Pragma", "no-cache")
+                            addHeader("priority", "u=1, i")
                             addHeader("Sec-Fetch-Dest", "empty")
                             addHeader("Sec-Fetch-Mode", "cors")
                             addHeader("Sec-Fetch-Site", "same-origin")
@@ -238,12 +245,14 @@ open class GalaxyDonghua : ExtractorApi() {
                         }
                         .build()
 
-                    Log.e(TAG, "[TEST-EXACT] OkHttp will send: ${req.url}")
-                    Log.e(TAG, "[TEST-EXACT] body.contentLength(): ${req.body?.contentLength()}")
+                    Log.e(TAG, "[TEST-EXACT] url=${req.url}")
+                    Log.e(TAG, "[TEST-EXACT] encodedQuery=${req.url.encodedQuery}")
+                    Log.e(TAG, "[TEST-EXACT] bodyLen=${req.body?.contentLength()}")
 
                     client.newCall(req).execute().use { resp ->
                         val b = resp.body?.string()?.trim() ?: ""
-                        Log.e(TAG, "[TEST-EXACT RES] code=${resp.code} len=${b.length} head=${b.take(120)}")
+                        Log.e(TAG, "[TEST-EXACT RES] code=${resp.code} protocol=${resp.protocol} len=${b.length}")
+                        Log.e(TAG, "[TEST-EXACT RES] head=${b.take(120)}")
                     }
                 }
             } catch (e: Exception) {
@@ -271,6 +280,7 @@ open class GalaxyDonghua : ExtractorApi() {
             "Cache-Control" to "no-cache",
             "Pragma" to "no-cache",
             "Origin" to gxBase,
+            "priority" to "u=1, i",
             "Sec-Fetch-Dest" to "empty",
             "Sec-Fetch-Mode" to "cors",
             "Sec-Fetch-Site" to "same-origin",
@@ -280,7 +290,7 @@ open class GalaxyDonghua : ExtractorApi() {
             "sec-ch-ua-platform" to "\"Windows\""
         )
 
-        // ── Config warm-up (sets session cookie) ──
+        // ── Config warm-up ──
         val configUrl = "$gxBase/api-config/${tokens.qsx}?p=${tokens.ps}&_=$now"
         Log.e(TAG, "[STEP 13-pre] GET $configUrl")
         try {
@@ -306,12 +316,13 @@ open class GalaxyDonghua : ExtractorApi() {
 
         val (code, respBody, respHdr) = try {
             withContext(Dispatchers.IO) {
-                val body = bodyText.toRequestBody("text/plain".toMediaTypeOrNull())
+                val rawBytes = bodyText.toByteArray(Charsets.UTF_8)
+                val body = rawBytes.toRequestBody(null)
                 val hdrs = chromeHeaders().apply { put("Content-Type", "text/plain") }
                 val req = Request.Builder().url(sourcesUrl).post(body).apply {
                     hdrs.forEach { (k, v) -> addHeader(k, v) }
                 }.build()
-                Log.e(TAG, "[STEP 13] OkHttp sees URL: ${req.url}")
+                Log.e(TAG, "[STEP 13] OkHttp will send URL: ${req.url}")
                 client.newCall(req).execute().use { resp ->
                     val b = resp.body?.string()?.trim() ?: ""
                     val h = resp.headers.names().joinToString("; ") { n -> "$n=${resp.header(n)}" }
