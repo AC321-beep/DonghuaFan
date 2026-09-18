@@ -59,6 +59,36 @@ open class GalaxyDonghua : ExtractorApi() {
             r.text
         } catch (e: Exception) { Log.e(TAG, "[STEP 2 ERR] ${e.message}"); return }
 
+        // ─── SCRIPT DISCOVERY — the AES logic must live somewhere in here ───
+        val scriptSrcs = Regex("""<script[^>]+src\s*=\s*["']([^"']+)["']""")
+            .findAll(page).map { it.groupValues[1] }.distinct().toList()
+        Log.e(TAG, "[SCRIPTS] External count: ${scriptSrcs.size}")
+        for (s in scriptSrcs) {
+            val absUrl = if (s.startsWith("http")) s
+                         else if (s.startsWith("//")) "https:$s"
+                         else gxBase + (if (s.startsWith("/")) s else "/$s")
+            Log.e(TAG, "[SCRIPTS] src=$absUrl")
+            try {
+                val sr = app.get(absUrl, headers = headers)
+                Log.e(TAG, "[SCRIPTS] $absUrl → ${sr.code} | ${sr.text.length}B")
+                val body = sr.text
+                if (body.length in 100..200_000) {
+                    // Log the whole thing in 900-char chunks so we can grep for AES/CryptoJS
+                    body.chunked(900).forEachIndexed { idx, chunk ->
+                        Log.e(TAG, "[SCRIPT $absUrl][$idx]: $chunk")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "[SCRIPTS ERR] $absUrl → ${e.message}")
+            }
+        }
+        val inlineScripts = Regex("<script(?![^>]*src)[^>]*>(.*?)</script>", RegexOption.DOT_MATCHES_ALL)
+            .findAll(page).map { it.groupValues[1] }.filter { it.length > 100 }.toList()
+        Log.e(TAG, "[SCRIPTS] Inline count (≥100 chars): ${inlineScripts.size}")
+        inlineScripts.forEachIndexed { i, s ->
+            Log.e(TAG, "[INLINE $i] len=${s.length} head=${s.take(200).replace("\n", " ")}")
+        }
+
         val vid = Regex("const[ \\t]+VID_SRC[ \\t]*=[ \\t]*[\"']([^\"']+)[\"']").find(page)
         if (vid != null && vid.groupValues[1].isNotBlank()) {
             val su = vid.groupValues[1].replace("\\/", "/")
@@ -85,21 +115,7 @@ open class GalaxyDonghua : ExtractorApi() {
             } catch (e: Exception) { Log.e(TAG, "[STEP 8 ERR] ${e.message}"); continue }
 
             val tokens = decodeGdTokens(sp) ?: continue
-
-            // ─── FULL DIAGNOSTIC DUMP ────────────────────────────────
-            Log.e(TAG, "[TOK] PD       = ${tokens.pd}")
-            Log.e(TAG, "[TOK] PS       = ${tokens.ps}")
-            Log.e(TAG, "[TOK] QSX      = ${tokens.qsx}")
-            Log.e(TAG, "[TOK] KAKEN    = ${tokens.kaken}")
-            Log.e(TAG, "[TOK] APX      = ${tokens.apx}")
-            Log.e(TAG, "[TOK] UTEKMEK  = ${tokens.utekmek}")
-            Log.e(TAG, "[TOK] LOCALKEY = ${tokens.localKey}")
-            Log.e(TAG, "[TOK] JS_LEN   = ${tokens.unpackedJs.length}")
-            Log.e(TAG, "[TOK] JS_START>>>")
-            tokens.unpackedJs.chunked(900).forEachIndexed { idx, chunk ->
-                Log.e(TAG, "[TOK] JS[$idx]: $chunk")
-            }
-            Log.e(TAG, "[TOK] <<<JS_END")
+            Log.e(TAG, "[TOK] PD=${tokens.pd} LK=${tokens.localKey} UT.len=${tokens.utekmek.length}")
 
             val json = fetchAndDecryptApi(tokens, headers, gxBase, target)
             if (json != null) {
@@ -114,15 +130,12 @@ open class GalaxyDonghua : ExtractorApi() {
     private suspend fun fetchAndDecryptApi(
         tokens: GdTokens, headers: Map<String, String>, gxBase: String, embedUrl: String
     ): String? {
-        // ─── Build URLs ────────────────────────────────────────────────
         val decodedApx = try {
             String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT), Charsets.UTF_8).trim()
         } catch (_: Exception) { "" }
         val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
         val pathExtension = tokens.kaken + tokens.qsx + tokens.pd + tokens.ps
         val modernUrl = "${prefix.trimEnd('/')}/$pathExtension?p=${tokens.apx}&_=${System.currentTimeMillis()}"
-        val legacyKaken = tokens.kaken.replace(",,", "==").replace(",", "=")
-        val legacyUrl = "$gxBase/api/?$legacyKaken=&_=${System.currentTimeMillis()}"
 
         val xhrHeaders = headers.toMutableMap().apply {
             put("Referer", embedUrl)
@@ -130,22 +143,10 @@ open class GalaxyDonghua : ExtractorApi() {
             put("Accept", "application/json, text/javascript, */*; q=0.01")
         }
 
-        // ─── TEST 1: legacy plain endpoint ─────────────────────────────
-        Log.e(TAG, "[T1] legacy: $legacyUrl")
-        try {
-            val r = app.get(legacyUrl, headers = xhrHeaders)
-            Log.e(TAG, "[T1 RAW] code=${r.code} len=${r.text.length} head=${r.text.take(180).replace("\n", " ")}")
-            val t = r.text.trim()
-            if (t.startsWith("{") && t.contains("\"file\"", true)) {
-                Log.e(TAG, "[T1 HIT] plain JSON"); return t
-            }
-        } catch (e: Exception) { Log.e(TAG, "[T1 ERR] ${e.message}") }
-
-        // ─── TEST 2: modern endpoint with XHR headers ──────────────────
         Log.e(TAG, "[T2] modern: $modernUrl")
         val text = try {
             val r = app.get(modernUrl, headers = xhrHeaders)
-            Log.e(TAG, "[T2 RAW] code=${r.code} len=${r.text.length} head=${r.text.take(180).replace("\n", " ")}")
+            Log.e(TAG, "[T2 RAW] code=${r.code} len=${r.text.length}")
             r.text.trim()
         } catch (e: Exception) { Log.e(TAG, "[T2 ERR] ${e.message}"); return null }
 
@@ -153,45 +154,16 @@ open class GalaxyDonghua : ExtractorApi() {
             Log.e(TAG, "[T2 HIT] plain JSON"); return text
         }
 
-        // ─── Hex dumps so we can actually see the shape ────────────────
         val rawCt = decodeBase64Flexible(text)
         if (rawCt != null && rawCt.size >= 32) {
             Log.e(TAG, "[HEX] CT size=${rawCt.size}")
             Log.e(TAG, "[HEX] CT[0..32]  = ${hex(rawCt.copyOfRange(0, minOf(32, rawCt.size)))}")
-            Log.e(TAG, "[HEX] CT[last16]= ${hex(rawCt.copyOfRange(rawCt.size - 16, rawCt.size))}")
         }
         decodeBase64Deep(tokens.utekmek)?.let { u ->
             Log.e(TAG, "[HEX] UT size=${u.size}")
-            Log.e(TAG, "[HEX] UT[0..32]  = ${hex(u.copyOfRange(0, minOf(32, u.size)))}")
-            Log.e(TAG, "[HEX] UT[last16]= ${hex(u.copyOfRange(u.size - 16, u.size))}")
+            Log.e(TAG, "[HEX] UT[0..64]  = ${hex(u)}")
         }
 
-        // ─── TEST 3: Rhino evaluation of the site's own JS ─────────────
-        Log.e(TAG, "[T3] Rhino")
-        try {
-            val cryptoJs = try {
-                app.get("https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js").text
-            } catch (_: Exception) { "" }
-            Log.e(TAG, "[T3] cryptoJs=${cryptoJs.length}B")
-
-            val tokenMap = linkedMapOf(
-                "pd" to tokens.pd.replace(",,", "==").replace(",", "="),
-                "ps" to tokens.ps.replace(",,", "==").replace(",", "="),
-                "qsx" to tokens.qsx.replace(",,", "==").replace(",", "="),
-                "kaken" to tokens.kaken.replace(",,", "==").replace(",", "="),
-                "apx" to tokens.apx.replace(",,", "==").replace(",", "="),
-                "utekmek" to tokens.utekmek.replace(",,", "==").replace(",", "="),
-                "localKey" to tokens.localKey
-            )
-            val rhino = GalaxyRhinoHelper.callDecryptor(tokens.unpackedJs, text, tokenMap, cryptoJs)
-            Log.e(TAG, "[T3 RES] ${rhino?.take(300)}")
-            if (rhino != null && rhino.contains("{") && rhino.contains("file")) return rhino
-        } catch (e: Throwable) {
-            Log.e(TAG, "[T3 ERR] ${e.javaClass.simpleName}: ${e.message}")
-        }
-
-        // ─── TEST 4: Kotlin brute-force ────────────────────────────────
-        Log.e(TAG, "[T4] Kotlin brute-force")
         val cipherRx = Regex("[\"'](?:data|file|source|sources)[\"'][ \\t]*:[ \\t]*[\"']([^\"']+)[\"']")
         val cipher = cipherRx.find(text)?.groupValues?.get(1) ?: text
         return dcx(cipher, tokens, pathExtension)
@@ -223,17 +195,12 @@ open class GalaxyDonghua : ExtractorApi() {
         }
     }
 
-    // ────────────────────────────────────────────────────────────────
-    //  Tokens
-    // ────────────────────────────────────────────────────────────────
     protected data class GdTokens(
         val pd: String, val ps: String, val qsx: String, val kaken: String, val apx: String,
         val utekmek: String = "", val localKey: String = "", val unpackedJs: String = ""
     )
 
-    // ────────────────────────────────────────────────────────────────
-    //  Dean Edwards unpacker
-    // ────────────────────────────────────────────────────────────────
+    // ─── Dean Edwards unpacker (unchanged, compact) ────────────────────
     private fun toBase(n: Int, base: Int): String {
         if (n == 0) return "0"
         val chars = if (base == 36) BASE36_CHARS else BASE62_CHARS
@@ -241,7 +208,6 @@ open class GalaxyDonghua : ExtractorApi() {
         while (num > 0) { sb.append(chars[num % base]); num /= base }
         return sb.reverse().toString()
     }
-
     private fun splitPackedJsArgs(s: String): List<String>? {
         val args = mutableListOf<String>(); var i = 0
         while (i < s.length && args.size < 4) {
@@ -263,25 +229,21 @@ open class GalaxyDonghua : ExtractorApi() {
         }
         return if (args.size >= 4) args else null
     }
-
     private fun decodePackedJs(payload: String, keywords: List<String>, base: Int): String {
         val parts = keywords.mapIndexedNotNull { i, kw -> if (kw.isNotBlank()) (toBase(i, base) to kw) else null }
         if (parts.isEmpty()) return payload
-        val alt = parts.joinToString("|") { it.first }
         val map = parts.toMap()
-        return Regex("\\b(?:$alt)\\b").replace(payload) { m -> map[m.value] ?: m.value }
+        return Regex("\\b(?:${parts.joinToString("|") { it.first }})\\b").replace(payload) { m -> map[m.value] ?: m.value }
     }
 
     private fun decodeGdTokens(page: String): GdTokens? {
         fun extractSmartJs(n: String, text: String): String {
             Regex("""(?:var\s+|let\s+|const\s+)?\b${Regex.escape(n)}\b\s*=\s*atob\s*\(\s*["']([^"']+)["']\s*\)""")
-                .find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
+                .find(text)?.let { return it.groupValues[1].trim() }
             Regex("""(?:var\s+|let\s+|const\s+)?\b${Regex.escape(n)}\b\s*=\s*["']([^"']+)["']""")
-                .find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
+                .find(text)?.let { return it.groupValues[1].trim() }
             Regex("""["']?${Regex.escape(n)}["']?\s*:\s*["']([^"']+)["']""")
-                .find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
-            Regex("""(?:window|self)\s*(?:\.\s*${Regex.escape(n)}|\[\s*["']${Regex.escape(n)}["']\s*\])\s*=\s*["']([^"']+)["']""")
-                .find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
+                .find(text)?.let { return it.groupValues[1].trim() }
             return ""
         }
         fun extractHtmlFallback(n: String, text: String): String {
@@ -345,7 +307,8 @@ open class GalaxyDonghua : ExtractorApi() {
         fun pick(n: String) = extractSmartJs(n, jsFuck).ifBlank { extractHtmlFallback(n, page) }.replace("==", ",,")
 
         val t = GdTokens(
-            pd = pick("pd"), ps = pick("ps"), qsx = pick("qsx"), kaken = pick("kaken"), apx = pick("apx"),
+            pd = pick("pd"), ps = pick("ps"), qsx = pick("qsx"),
+            kaken = pick("kaken"), apx = pick("apx"),
             utekmek = pick("utekmek"),
             localKey = pick("localKey").ifBlank { pick("local_key") }.ifBlank { pick("localkey") },
             unpackedJs = jsFuck
@@ -362,7 +325,6 @@ open class GalaxyDonghua : ExtractorApi() {
         )) t = t.replace(k, v)
         return t
     }
-
     private fun splitTopLevelTerms(s: String): List<String> {
         val terms = mutableListOf<String>(); var depth = 0; var cur = StringBuilder()
         for (ch in s) when (ch) {
@@ -377,7 +339,6 @@ open class GalaxyDonghua : ExtractorApi() {
         if (cur.isNotBlank()) terms.add(cur.toString())
         return terms.filter { it != "+" && it != "-" }
     }
-
     private fun evalArithmetic(s: String): Int? {
         val clean = s.filter { it != ' ' }
         val values = mutableListOf<Int>(); val ops = mutableListOf<Char>(); var i = 0
@@ -419,9 +380,7 @@ open class GalaxyDonghua : ExtractorApi() {
         return values.firstOrNull()
     }
 
-    // ────────────────────────────────────────────────────────────────
-    //  Crypto (byte-level, no String round-trips)
-    // ────────────────────────────────────────────────────────────────
+    // ─── Crypto helpers ────────────────────────────────────────────────
     private fun hex(b: ByteArray): String = b.joinToString("") { "%02x".format(it) }
     private fun fromHex(s: String): ByteArray? {
         if (s.length % 2 != 0 || s.isEmpty()) return null
@@ -454,11 +413,60 @@ open class GalaxyDonghua : ExtractorApi() {
     private fun md5(b: ByteArray) = MessageDigest.getInstance("MD5").digest(b)
     private fun sha1(b: ByteArray) = MessageDigest.getInstance("SHA-1").digest(b)
     private fun sha256(b: ByteArray) = MessageDigest.getInstance("SHA-256").digest(b)
-    private fun hmacMd5(key: ByteArray, data: ByteArray): ByteArray {
-        val m = Mac.getInstance("HmacMD5"); m.init(SecretKeySpec(key, "HmacMD5")); return m.doFinal(data)
+    private fun hmacMd5(k: ByteArray, d: ByteArray) = Mac.getInstance("HmacMD5").run {
+        init(SecretKeySpec(k, "HmacMD5")); doFinal(d)
     }
-    private fun hmacSha256(key: ByteArray, data: ByteArray): ByteArray {
-        val m = Mac.getInstance("HmacSHA256"); m.init(SecretKeySpec(key, "HmacSHA256")); return m.doFinal(data)
+    private fun hmacSha256(k: ByteArray, d: ByteArray) = Mac.getInstance("HmacSHA256").run {
+        init(SecretKeySpec(k, "HmacSHA256")); doFinal(d)
+    }
+
+    private fun aesCbc(ct: ByteArray, key: ByteArray, iv: ByteArray, pad: String = "PKCS5Padding"): ByteArray? {
+        if (key.size !in intArrayOf(16, 24, 32) || iv.size != 16) return null
+        if (ct.isEmpty() || ct.size % 16 != 0) return null
+        return try {
+            val c = Cipher.getInstance("AES/CBC/$pad")
+            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+            c.doFinal(ct)
+        } catch (_: Exception) { null }
+    }
+    private fun aesEcb(ct: ByteArray, key: ByteArray, pad: String = "PKCS5Padding"): ByteArray? {
+        if (key.size !in intArrayOf(16, 24, 32)) return null
+        if (ct.isEmpty() || ct.size % 16 != 0) return null
+        return try {
+            val c = Cipher.getInstance("AES/ECB/$pad")
+            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"))
+            c.doFinal(ct)
+        } catch (_: Exception) { null }
+    }
+    private fun aesCtr(ct: ByteArray, key: ByteArray, iv: ByteArray): ByteArray? {
+        if (key.size !in intArrayOf(16, 24, 32) || iv.size != 16) return null
+        return try {
+            val c = Cipher.getInstance("AES/CTR/NoPadding")
+            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+            c.doFinal(ct)
+        } catch (_: Exception) { null }
+    }
+
+    private fun isPlausibleJson(b: ByteArray?): Boolean {
+        if (b == null || b.size < 16) return false
+        var printable = 0
+        for (x in b) if (x.toInt() in 9..126) printable++
+        if (printable < b.size * 0.85) return false
+        val t = String(b, Charsets.UTF_8).trim()
+        if (!t.startsWith("{") && !t.startsWith("[")) return false
+        return t.contains("\"file\"") || t.contains("baseUrl") || t.contains("\"sources\"") ||
+               t.contains(".m3u8") || t.contains("\"label\"") || t.contains("\"type\"")
+    }
+
+    private fun tryEverything(ct: ByteArray, key: ByteArray, ivs: List<ByteArray>): ByteArray? {
+        aesEcb(ct, key)?.let { if (isPlausibleJson(it)) return it }
+        aesEcb(ct, key, "NoPadding")?.let { if (isPlausibleJson(it)) return it }
+        for (iv in ivs) {
+            aesCbc(ct, key, iv)?.let { if (isPlausibleJson(it)) return it }
+            aesCbc(ct, key, iv, "NoPadding")?.let { if (isPlausibleJson(it)) return it }
+            aesCtr(ct, key, iv)?.let { if (isPlausibleJson(it)) return it }
+        }
+        return null
     }
 
     private fun keyVariants(cand: String, tokens: GdTokens): List<ByteArray> {
@@ -467,10 +475,8 @@ open class GalaxyDonghua : ExtractorApi() {
         fun push(b: ByteArray?) { if (b == null || b.isEmpty()) return; if (seen.add(hex(b))) out.add(b) }
         val raw = cand.toByteArray(Charsets.UTF_8)
         push(padTo(raw, 16)); push(padTo(raw, 24)); push(padTo(raw, 32))
-        val m = md5(raw); push(m)
-        val s1 = sha1(raw); push(s1.copyOfRange(0, 16)); push(padTo(s1, 16)); push(padTo(s1, 32))
-        val s2 = sha256(raw); push(s2)
-        push(fromHex(hex(m))); push(fromHex(hex(s2)))
+        val m = md5(raw); push(m); push(sha1(raw).copyOfRange(0, 16))
+        val s2 = sha256(raw); push(s2); push(s2.copyOfRange(0, 16))
         push(padTo(hex(m).toByteArray(Charsets.US_ASCII), 32))
         push(padTo(hex(s2).toByteArray(Charsets.US_ASCII), 32))
         fromHex(cand)?.let { hx ->
@@ -496,79 +502,34 @@ open class GalaxyDonghua : ExtractorApi() {
         }
         try {
             val f = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA1")
-            val spec = PBEKeySpec(cand.toCharArray(), tokens.localKey.toByteArray(), 1000, 256)
-            push(f.generateSecret(spec).encoded)
+            push(f.generateSecret(PBEKeySpec(cand.toCharArray(), tokens.localKey.toByteArray(), 1000, 256)).encoded)
         } catch (_: Exception) {}
         push(md5(md5(raw))); push(sha256(md5(raw))); push(md5(sha256(raw)))
         return out
     }
 
-    private fun aesCbcBytes(ct: ByteArray, key: ByteArray, iv: ByteArray, pad: String = "PKCS5Padding"): ByteArray? {
-        if (key.size !in intArrayOf(16, 24, 32)) return null
-        if (iv.size != 16) return null
-        if (ct.isEmpty() || ct.size % 16 != 0) return null
-        return try {
-            val c = Cipher.getInstance("AES/CBC/$pad")
-            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            c.doFinal(ct)
-        } catch (_: Exception) { null }
-    }
-    private fun aesEcbBytes(ct: ByteArray, key: ByteArray, pad: String = "PKCS5Padding"): ByteArray? {
-        if (key.size !in intArrayOf(16, 24, 32)) return null
-        if (ct.isEmpty() || ct.size % 16 != 0) return null
-        return try {
-            val c = Cipher.getInstance("AES/ECB/$pad")
-            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"))
-            c.doFinal(ct)
-        } catch (_: Exception) { null }
-    }
-    private fun aesCtrBytes(ct: ByteArray, key: ByteArray, iv: ByteArray): ByteArray? {
-        if (key.size !in intArrayOf(16, 24, 32) || iv.size != 16) return null
-        return try {
-            val c = Cipher.getInstance("AES/CTR/NoPadding")
-            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            c.doFinal(ct)
-        } catch (_: Exception) { null }
-    }
-    private fun aesCfbBytes(ct: ByteArray, key: ByteArray, iv: ByteArray): ByteArray? {
-        if (key.size !in intArrayOf(16, 24, 32) || iv.size != 16) return null
-        return try {
-            val c = Cipher.getInstance("AES/CFB/NoPadding")
-            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            c.doFinal(ct)
-        } catch (_: Exception) { null }
-    }
-    private fun aesOfbBytes(ct: ByteArray, key: ByteArray, iv: ByteArray): ByteArray? {
-        if (key.size !in intArrayOf(16, 24, 32) || iv.size != 16) return null
-        return try {
-            val c = Cipher.getInstance("AES/OFB/NoPadding")
-            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-            c.doFinal(ct)
-        } catch (_: Exception) { null }
-    }
-
-    private fun isPlausibleJson(b: ByteArray?): Boolean {
-        if (b == null || b.size < 16) return false
-        var printable = 0
-        for (x in b) if (x.toInt() in 9..126) printable++
-        if (printable < b.size * 0.85) return false
-        val t = String(b, Charsets.UTF_8).trim()
-        if (!t.startsWith("{") && !t.startsWith("[")) return false
-        return t.contains("\"file\"") || t.contains("baseUrl") || t.contains("\"sources\"") ||
-               t.contains(".m3u8") || t.contains("\"label\"") || t.contains("\"type\"")
-    }
-
-    private fun tryEverything(ct: ByteArray, key: ByteArray, ivs: List<ByteArray>): ByteArray? {
-        aesEcbBytes(ct, key)?.let { if (isPlausibleJson(it)) return it }
-        aesEcbBytes(ct, key, "NoPadding")?.let { if (isPlausibleJson(it)) return it }
-        for (iv in ivs) {
-            aesCbcBytes(ct, key, iv)?.let { if (isPlausibleJson(it)) return it }
-            aesCbcBytes(ct, key, iv, "NoPadding")?.let { if (isPlausibleJson(it)) return it }
-            aesCtrBytes(ct, key, iv)?.let { if (isPlausibleJson(it)) return it }
-            aesCfbBytes(ct, key, iv)?.let { if (isPlausibleJson(it)) return it }
-            aesOfbBytes(ct, key, iv)?.let { if (isPlausibleJson(it)) return it }
+    /** NEW: treat the raw utekmek bytes as a key/IV container in every plausible layout. */
+    private fun utKeyLayouts(ut: ByteArray): List<Pair<ByteArray, ByteArray>> {
+        val out = mutableListOf<Pair<ByteArray, ByteArray>>()
+        val z16 = ByteArray(16)
+        if (ut.size < 32) return out
+        // (key, iv) pairs
+        fun add(k: ByteArray, iv: ByteArray) { if (k.size in intArrayOf(16, 24, 32) && iv.size == 16) out.add(k to iv) }
+        if (ut.size >= 48) {
+            add(ut.copyOfRange(0, 32), ut.copyOfRange(32, 48))          // key[0..32] IV[32..48]
+            add(ut.copyOfRange(0, 32), z16)                             // key[0..32] IV=0
+            add(ut.copyOfRange(16, 48), ut.copyOfRange(0, 16))          // key[16..48] IV[0..16]
+            add(ut.copyOfRange(32, 64), ut.copyOfRange(0, 16))          // key[32..64] IV[0..16]
+            add(ut.copyOfRange(16, 48), z16)                            // key[16..48] IV=0
         }
-        return null
+        if (ut.size >= 32) {
+            add(ut.copyOfRange(0, 16), ut.copyOfRange(16, 32))          // key[0..16] IV[16..32]
+            add(ut.copyOfRange(16, 32), ut.copyOfRange(0, 16))          // key[16..32] IV[0..16]
+        }
+        // hashed variants with zero / self-derived IV
+        add(md5(ut), z16); add(sha256(ut), z16)
+        add(md5(ut), md5(ut)); add(sha256(ut), sha256(ut).copyOfRange(0, 16))
+        return out
     }
 
     private fun buildCandidates(tokens: GdTokens, pathExtension: String): List<String> {
@@ -582,13 +543,6 @@ open class GalaxyDonghua : ExtractorApi() {
         for (a in core) for (b in core) if (a != b) add(a + b)
         add(tokens.kaken + tokens.qsx + tokens.pd + tokens.ps)
         add(tokens.localKey + tokens.pd); add(tokens.pd + tokens.localKey)
-        add(tokens.localKey + tokens.ps); add(tokens.ps + tokens.localKey)
-        if (tokens.unpackedJs.isNotBlank()) {
-            for (m in Regex("""(?:var\s+|let\s+|const\s+)?([A-Za-z_][A-Za-z0-9_]{2,})\s*=\s*["']([^"']{6,})["']""").findAll(tokens.unpackedJs))
-                add(m.groupValues[2])
-            for (m in Regex("""["']?([A-Za-z_][A-Za-z0-9_]{2,})["']?\s*:\s*["']([^"']{6,})["']""").findAll(tokens.unpackedJs))
-                add(m.groupValues[2])
-        }
         val final = linkedSetOf<String>()
         for (c in out) { final.add(c); final.add(c.replace(",,", "==").replace(",", "=")) }
         return final.toList()
@@ -598,75 +552,78 @@ open class GalaxyDonghua : ExtractorApi() {
         if (input.isBlank()) return null
         val rawCt = decodeBase64Flexible(input)
         if (rawCt == null || rawCt.size < 32) { Log.e(TAG, "[DCX] ct invalid"); return null }
-        val zero16 = ByteArray(16)
-        val splits = mutableListOf<Pair<ByteArray, ByteArray>>()
-        splits.add(zero16 to rawCt)
-        if ((rawCt.size - 16) % 16 == 0) splits.add(rawCt.copyOfRange(0, 16) to rawCt.copyOfRange(16, rawCt.size))
-        val candidates = buildCandidates(tokens, pathExtension)
-        Log.e(TAG, "[DCX] ${candidates.size} candidates × ${splits.size} splits × ${rawCt.size}B")
+        val z16 = ByteArray(16)
 
-        // PASS 1
-        for (cand in candidates) for (key in keyVariants(cand, tokens)) for ((iv, ct) in splits) {
-            if (iv.contentEquals(zero16)) {
-                aesEcbBytes(ct, key)?.let { if (isPlausibleJson(it)) {
-                    Log.e(TAG, "[DCX] P1 ECB '${cand.take(24)}'"); return String(it, Charsets.UTF_8) } }
-            } else {
-                tryEverything(ct, key, listOf(iv, zero16))?.let {
-                    Log.e(TAG, "[DCX] P1 CBC '${cand.take(24)}'"); return String(it, Charsets.UTF_8) }
+        // Split patterns on CT
+        val ctSplits = mutableListOf<Pair<ByteArray, ByteArray>>()
+        ctSplits.add(z16 to rawCt)
+        if ((rawCt.size - 16) % 16 == 0) ctSplits.add(rawCt.copyOfRange(0, 16) to rawCt.copyOfRange(16, rawCt.size))
+
+        val candidates = buildCandidates(tokens, pathExtension)
+        Log.e(TAG, "[DCX] P1: ${candidates.size} cand × splits")
+
+        // PASS 1 — string candidates
+        for (cand in candidates) for (key in keyVariants(cand, tokens)) for ((iv, ct) in ctSplits) {
+            tryEverything(ct, key, listOf(iv, z16))?.let {
+                Log.e(TAG, "[DCX] P1 HIT '${cand.take(24)}'"); return String(it, Charsets.UTF_8)
             }
         }
 
-        // PASS 2 — utekmek unwrap
-        decodeBase64Deep(tokens.utekmek)?.let { inner ->
-            Log.e(TAG, "[DCX] P2 utekmek ${inner.size}B")
-            val directKeys = mutableListOf<ByteArray>()
-            for (sz in intArrayOf(16, 24, 32)) {
-                if (inner.size >= sz) directKeys.add(inner.copyOfRange(0, sz))
-                if (inner.size >= sz + 16) directKeys.add(inner.copyOfRange(16, 16 + sz))
-            }
-            directKeys.add(md5(inner)); directKeys.add(sha256(inner))
-            directKeys.add(padTo(inner, 32))
-            directKeys.add(md5(inner + tokens.localKey.toByteArray()))
-            for (k in directKeys) for ((iv, ct) in splits) {
-                if (iv.contentEquals(zero16)) {
-                    aesEcbBytes(ct, k)?.let { if (isPlausibleJson(it)) {
-                        Log.e(TAG, "[DCX] P2 direct ECB"); return String(it, Charsets.UTF_8) } }
-                } else {
-                    tryEverything(ct, k, listOf(iv, zero16))?.let {
-                        Log.e(TAG, "[DCX] P2 direct CBC"); return String(it, Charsets.UTF_8) }
+        // PASS 2 — utekmek as key container
+        decodeBase64Deep(tokens.utekmek)?.let { ut ->
+            Log.e(TAG, "[DCX] P2 UT layouts (${ut.size}B)")
+            for ((k, iv) in utKeyLayouts(ut)) for ((civ, ct) in ctSplits) {
+                val realIv = if (civ === z16 || civ.isEmpty()) iv else civ
+                tryEverything(ct, k, listOf(realIv, iv, z16))?.let {
+                    Log.e(TAG, "[DCX] P2 UT HIT key=${hex(k).take(16)} iv=${hex(realIv).take(16)}")
+                    return String(it, Charsets.UTF_8)
                 }
             }
-            val outerSources = listOf(tokens.localKey, tokens.pd, tokens.ps, tokens.kaken,
-                tokens.localKey + tokens.pd, tokens.pd + tokens.localKey)
-            for (src in outerSources) for (ok in keyVariants(src, tokens)) {
-                val utSplits = listOf(
-                    zero16 to inner,
-                    if ((inner.size - 16) % 16 == 0) inner.copyOfRange(0, 16) to inner.copyOfRange(16, inner.size) else null
-                ).filterNotNull()
+            // also try unwrapping: decrypt UT itself with localKey-derived keys, use result
+            for (src in listOf(tokens.localKey, tokens.pd, tokens.ps)) for (ok in keyVariants(src, tokens)) {
+                val utSplits = listOf(z16 to ut,
+                    if ((ut.size - 16) % 16 == 0) ut.copyOfRange(0, 16) to ut.copyOfRange(16, ut.size) else null).filterNotNull()
                 for ((iv, ct) in utSplits) {
-                    val plain = if (iv.contentEquals(zero16)) aesEcbBytes(ct, ok) ?: aesCbcBytes(ct, ok, zero16)
-                                else aesCbcBytes(ct, ok, iv)
+                    val plain = aesEcb(ct, ok) ?: aesCbc(ct, ok, if (iv.contentEquals(z16)) z16 else iv)
                     if (plain != null && plain.size >= 16) {
-                        val innerKeys = mutableListOf<ByteArray>()
                         for (sz in intArrayOf(16, 24, 32)) {
-                            if (plain.size >= sz) innerKeys.add(plain.copyOfRange(0, sz))
-                            if (plain.size >= sz + 16) innerKeys.add(plain.copyOfRange(16, 16 + sz))
-                        }
-                        innerKeys.add(md5(plain)); innerKeys.add(sha256(plain)); innerKeys.add(padTo(plain, 32))
-                        for (ik in innerKeys) for ((oiv, oct) in splits) {
-                            if (oiv.contentEquals(zero16)) {
-                                aesEcbBytes(oct, ik)?.let { if (isPlausibleJson(it)) {
-                                    Log.e(TAG, "[DCX] P2 unwrap ECB"); return String(it, Charsets.UTF_8) } }
-                            } else {
-                                tryEverything(oct, ik, listOf(oiv, zero16))?.let {
-                                    Log.e(TAG, "[DCX] P2 unwrap CBC"); return String(it, Charsets.UTF_8) }
+                            val k = when {
+                                plain.size == sz -> plain
+                                plain.size > sz -> plain.copyOfRange(0, sz)
+                                else -> padTo(plain, sz)
+                            }
+                            for ((oiv, oct) in ctSplits) {
+                                tryEverything(oct, k, listOf(oiv, z16, iv))?.let {
+                                    Log.e(TAG, "[DCX] P2 UNWRAP HIT"); return String(it, Charsets.UTF_8)
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        Log.e(TAG, "[DCX] Exhausted ${candidates.size} — null")
+
+        // PASS 3 — CT prefix as key
+        if (rawCt.size > 48) {
+            Log.e(TAG, "[DCX] P3 CT-as-key")
+            val ctKey32 = rawCt.copyOfRange(0, 32)
+            val ctKey16 = rawCt.copyOfRange(0, 16)
+            val ctIV16  = rawCt.copyOfRange(0, 16)
+            val body1   = rawCt.copyOfRange(32, rawCt.size)
+            val body2   = rawCt.copyOfRange(16, rawCt.size)
+            if (body1.size % 16 == 0) {
+                tryEverything(body1, ctKey32, listOf(z16, ctIV16))?.let {
+                    Log.e(TAG, "[DCX] P3 HIT (32B prefix key)"); return String(it, Charsets.UTF_8)
+                }
+            }
+            if (body2.size % 16 == 0) {
+                tryEverything(body2, ctKey16, listOf(z16, ctIV16))?.let {
+                    Log.e(TAG, "[DCX] P3 HIT (16B prefix key)"); return String(it, Charsets.UTF_8)
+                }
+            }
+        }
+
+        Log.e(TAG, "[DCX] Exhausted — null")
         return null
     }
 
@@ -681,71 +638,6 @@ open class GalaxyDonghua : ExtractorApi() {
 
     private fun embedHost(url: String): String =
         try { val uri = URI(url); "${uri.scheme}://${uri.host}" } catch (_: Exception) { GX }
-}
-
-// ─────────────────────────────────────────────────────────────────────
-//  Rhino helper — only loads if Rhino is on the classpath (which it is,
-//  because the Lk21 extractor already depends on it).
-// ─────────────────────────────────────────────────────────────────────
-object GalaxyRhinoHelper {
-    fun callDecryptor(
-        js: String,
-        ciphertext: String,
-        tokens: Map<String, String>,
-        cryptoJs: String
-    ): String? {
-        val ctx = org.mozilla.javascript.Context.enter()
-        try {
-            ctx.optimizationLevel = -1
-            val scope = ctx.initStandardObjects()
-            org.mozilla.javascript.ScriptableObject.putProperty(scope, "window", scope)
-            org.mozilla.javascript.ScriptableObject.putProperty(scope, "globalThis", scope)
-            org.mozilla.javascript.ScriptableObject.putProperty(scope, "navigator", ctx.newObject(scope))
-            org.mozilla.javascript.ScriptableObject.putProperty(scope, "location", ctx.newObject(scope))
-            org.mozilla.javascript.ScriptableObject.putProperty(scope, "document", ctx.newObject(scope))
-
-            ctx.evaluateString(scope, """
-                var setTimeout=function(){};var clearTimeout=function(){};
-                var console={log:function(){},warn:function(){},error:function(){}};
-                var atob=function(s){try{var b=java.util.Base64.getDecoder().decode(new java.lang.String(s).getBytes("ISO-8859-1"));return new java.lang.String(b,0,b.length,"ISO-8859-1");}catch(e){return '';}};
-                var btoa=function(s){try{return java.util.Base64.getEncoder().encodeToString(new java.lang.String(s).getBytes("ISO-8859-1"));}catch(e){return '';}};
-            """.trimIndent(), "polyfill", 1, null)
-
-            if (cryptoJs.isNotBlank()) {
-                try {
-                    ctx.evaluateString(scope, cryptoJs, "cryptojs", 1, null)
-                } catch (e: Throwable) {
-                    Log.e("GalaxyRhino", "cryptojs eval failed: ${e.message}")
-                }
-            }
-
-            for ((k, v) in tokens) {
-                org.mozilla.javascript.ScriptableObject.putProperty(scope, k, v)
-            }
-
-            ctx.evaluateString(scope, js, "site", 1, null)
-
-            val names = mutableListOf<String>()
-            for (id in scope.ids) if (id is String) names.add(id)
-            names.addAll(listOf("dcx", "_L", "decrypt", "decode", "dec", "getStreams", "main", "unpack", "getSources"))
-
-            val args = arrayOf<Any>(ciphertext)
-            for (name in names.distinct()) {
-                val v = try { scope.get(name, scope) } catch (_: Throwable) { null }
-                if (v is org.mozilla.javascript.Function) {
-                    val result = try { v.call(ctx, scope, scope, args) } catch (_: Throwable) { continue }
-                    val s = try { org.mozilla.javascript.Context.toString(result) } catch (_: Throwable) { null }
-                    if (s != null && s.length > 20 && (s.contains("{") || s.contains("http") || s.contains(".m3u8"))) {
-                        Log.e("GalaxyRhino", "entry '$name' returned ${s.length}B")
-                        return s
-                    }
-                }
-            }
-            return null
-        } finally {
-            org.mozilla.javascript.Context.exit()
-        }
-    }
 }
 
 class SkylineAI : GalaxyDonghua() {
