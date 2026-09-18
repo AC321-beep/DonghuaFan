@@ -261,7 +261,7 @@ open class GalaxyDonghua : ExtractorApi() {
 
     private fun decodePackedJs(payload: String, keywords: List<String>, base: Int): String {
         val parts = keywords.mapIndexedNotNull { i, kw ->
-            if (kw.isNotBlank()) (toBase(i, base) to kw) else null // Removed Regex.escape() which corrupted Kotlin keys
+            if (kw.isNotBlank()) (toBase(i, base) to kw) else null
         }
         if (parts.isEmpty()) return payload
         val alternation = parts.joinToString("|") { it.first }
@@ -282,7 +282,6 @@ open class GalaxyDonghua : ExtractorApi() {
         }
 
         fun extractSmartJs(n: String, text: String): String {
-            // Unbounded capture groups removed length limiters (fixes >250 char truncation)
             val atobRx = Regex("[\"']?$n[\"']?[ \\t]*\\]?[ \\t]*[:=][ \\t]*atob[ \\t]*\\([ \\t]*[\"']([^\"']+)[\"']")
             atobRx.find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
 
@@ -476,18 +475,23 @@ open class GalaxyDonghua : ExtractorApi() {
     // ────────────────────────────────────────────────────────────────
     //  CRYPTO & UTILS
     // ────────────────────────────────────────────────────────────────
+    
+    // FIX: Accurately replicates CryptoJS's EvpKDF by instantiating a new MD5 context on every iteration
     private fun cryptoJsEvpKDF(password: ByteArray, salt: ByteArray, keySize: Int, ivSize: Int): ByteArray {
         val derived = ByteArray(keySize + ivSize)
         var block: ByteArray? = null
         var offset = 0
-        val md = MessageDigest.getInstance("MD5")
+        
         while (offset < derived.size) {
+            val md = MessageDigest.getInstance("MD5") // Must be instantiated inside the loop
             if (block != null) md.update(block)
             md.update(password)
             if (salt.isNotEmpty()) md.update(salt)
             block = md.digest()
+            
             val len = minOf(block.size, derived.size - offset)
-            System.arraycopy(block, 0, derived, offset, len); offset += len
+            System.arraycopy(block, 0, derived, offset, len)
+            offset += len
         }
         return derived
     }
