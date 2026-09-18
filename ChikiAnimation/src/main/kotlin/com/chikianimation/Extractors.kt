@@ -300,12 +300,13 @@ open class GalaxyDonghua : ExtractorApi() {
 
                                         // Score printable ASCII in first 64 bytes
                                         var printable = 0
-                                        val sample = bytes.take(minOf(64, bytes.size))
+                                        val sampleLen = minOf(64, bytes.size)
+                                        val sample = bytes.copyOfRange(0, sampleLen)   // ByteArray
                                         for (b in sample) {
                                             val ui = b.toInt() and 0xFF
                                             if (ui in 32..126 || ui == 10 || ui == 13 || ui == 9) printable++
                                         }
-                                        val pct = if (sample.isNotEmpty()) printable * 100 / sample.size else 0
+                                        val pct = if (sampleLen > 0) printable * 100 / sampleLen else 0
 
                                         if (pct > bestPrintable) {
                                             bestPrintable = pct
