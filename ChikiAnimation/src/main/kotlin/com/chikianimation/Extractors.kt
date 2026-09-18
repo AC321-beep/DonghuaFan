@@ -37,13 +37,14 @@ open class GalaxyDonghua : ExtractorApi() {
         const val TAG = "GalaxyDonghuaDebug"
         private const val BASE36_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
         private const val BASE62_CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        private const val PBKDF2_ITERS = 10_000
-        private const val PBKDF2_LEN   = 48
 
         @Volatile private var cachedPlayerJsUrl: String? = null
         @Volatile private var cachedPlayerJs: String? = null
         @Volatile private var cachedCryptoJs: String? = null
         @Volatile private var cachedCryptoJsUrl: String? = null
+
+        /** When the exhaustive tester finds a working combination, remember it so we don't repeat. */
+        @Volatile private var solvedRecipe: String? = null
     }
 
     override suspend fun getUrl(
@@ -78,7 +79,6 @@ open class GalaxyDonghua : ExtractorApi() {
             }); return
         }
 
-        // Prefer the site's own assets (falls back to CDN if not present)
         val allSrcs = Regex("""<script[^>]+src\s*=\s*["']([^"']+)["']""")
             .findAll(page).map { it.groupValues[1] }.distinct().toList()
         Log.e(TAG, "[JS] script srcs: $allSrcs")
@@ -112,9 +112,6 @@ open class GalaxyDonghua : ExtractorApi() {
         if (!ok) Log.e(TAG, "[STEP 15 CRITICAL] All candidates failed.")
     }
 
-    // ────────────────────────────────────────────────────────────────
-    //  Player JS discovery (tighter)
-    // ────────────────────────────────────────────────────────────────
     private suspend fun fetchPlayerJs(
         srcs: List<String>, gxBase: String, headers: Map<String, String>
     ): String? {
@@ -122,7 +119,6 @@ open class GalaxyDonghua : ExtractorApi() {
             if (it.isNotEmpty()) { Log.e(TAG, "[JS] cached player.js (${it.length}B)"); return it }
         }
 
-        // Prefer exact patterns — the site's bundle is named player-vX.Y.Z.min.js
         val exactPatterns = listOf(
             Regex("/player-v[0-9][^/]*\\.min\\.js", RegexOption.IGNORE_CASE),
             Regex("/player\\.min\\.js", RegexOption.IGNORE_CASE),
@@ -130,22 +126,13 @@ open class GalaxyDonghua : ExtractorApi() {
         )
         var ordered = exactPatterns.flatMap { r -> srcs.filter { r.containsMatchIn(it) } }.distinct()
 
-        // Fallback: any .js, but exclude libraries we know don't contain the cipher
-        val excludePatterns = listOf(
-            "jwplayer", "lulustream", "crypto-js", "jquery", "globalThis"
-        )
         if (ordered.isEmpty()) {
-            ordered = srcs.filter { s ->
-                s.endsWith(".js") && excludePatterns.none { s.contains(it, true) }
-            }
+            val excludePatterns = listOf("jwplayer", "lulustream", "crypto-js", "jquery", "globalThis")
+            ordered = srcs.filter { s -> s.endsWith(".js") && excludePatterns.none { s.contains(it, true) } }
         }
 
         Log.e(TAG, "[JS] ordered candidates: $ordered")
-        if (ordered.isEmpty()) {
-            Log.e(TAG, "[JS] no candidates")
-            cachedPlayerJs = ""
-            return null
-        }
+        if (ordered.isEmpty()) { cachedPlayerJs = ""; return null }
 
         for (src in ordered) {
             val abs = absolutize(src, gxBase)
@@ -157,7 +144,6 @@ open class GalaxyDonghua : ExtractorApi() {
             } catch (e: Exception) { Log.e(TAG, "[JS ERR] ${e.message}"); continue }
 
             if (text.length < 2_000) { Log.e(TAG, "[JS] skipped — too small"); continue }
-
             if (Regex("""\bdcx\s*[=(]""").containsMatchIn(text)) {
                 Log.e(TAG, "[JS] accepted — defines dcx()")
                 cachedPlayerJsUrl = abs
@@ -177,35 +163,22 @@ open class GalaxyDonghua : ExtractorApi() {
         else -> base.trimEnd('/') + "/" + src
     }
 
-    // ────────────────────────────────────────────────────────────────
-    //  CryptoJS — prefer the site's own copy (guaranteed version match)
-    // ────────────────────────────────────────────────────────────────
     private suspend fun getCryptoJs(
         srcs: List<String>, gxBase: String, headers: Map<String, String>
     ): String {
         cachedCryptoJs?.let { return it }
-
         val fromSite = srcs.firstOrNull { it.contains("crypto-js", true) }
         val url = if (fromSite != null) absolutize(fromSite, gxBase)
                   else "https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js"
-
         val js = try {
             val r = app.get(url, headers = headers)
             Log.e(TAG, "[JS] crypto-js ${r.code} | ${r.text.length}B | $url")
             r.text
-        } catch (e: Exception) {
-            Log.e(TAG, "[JS] crypto-js fetch failed: ${e.message}"); ""
-        }
-        if (js.isNotEmpty()) {
-            cachedCryptoJsUrl = url
-            cachedCryptoJs = js
-        }
+        } catch (e: Exception) { Log.e(TAG, "[JS] crypto-js failed: ${e.message}"); "" }
+        if (js.isNotEmpty()) { cachedCryptoJsUrl = url; cachedCryptoJs = js }
         return js
     }
 
-    // ────────────────────────────────────────────────────────────────
-    //  API + decrypt
-    // ────────────────────────────────────────────────────────────────
     private suspend fun fetchAndDecryptApi(
         tokens: GdTokens, headers: Map<String, String>, gxBase: String,
         embedUrl: String, playerJs: String?, cryptoJs: String
@@ -235,46 +208,128 @@ open class GalaxyDonghua : ExtractorApi() {
             Log.e(TAG, "[DEC] plain JSON"); return text
         }
 
-        // Rhino (best-effort — likely fails on Rhino's parser but keep trying)
-        if (playerJs != null && cryptoJs.isNotEmpty()) {
-            val result = GdRhino.tryDecrypt(playerJs, cryptoJs, text, tokens.toGlobalMap())
-            if (result != null && result.contains("{")) {
-                Log.e(TAG, "[DEC] Rhino OK — ${result.length}B"); return result
-            }
-            Log.e(TAG, "[DEC] Rhino failed — using static")
+        // Try the exhaustive static tester FIRST — we need to know the real recipe
+        val static = decryptGdPayload(text, tokens.pd)
+        if (static != null && static.trimStart().startsWith("{")) {
+            Log.e(TAG, "[DEC] static OK — ${static.length}B")
+            return static
         }
 
-        return decryptGdPayload(text, tokens.pd)?.also {
-            Log.e(TAG, "[DEC] static OK — ${it.length}B head=${it.take(160)}")
+        // Rhino is currently failing on the parser; leave as last resort
+        if (playerJs != null && cryptoJs.isNotEmpty()) {
+            val result = GdRhino.tryDecrypt(playerJs, cryptoJs, text, tokens.toGlobalMap())
+            if (result != null && result.trimStart().startsWith("{")) {
+                Log.e(TAG, "[DEC] Rhino OK — ${result.length}B")
+                return result
+            }
+            Log.e(TAG, "[DEC] Rhino failed too")
         }
+
+        return null
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Static decrypt (the algorithm we verified)
+    //  EXHAUSTIVE decrypt tester — logs the winning recipe
     // ────────────────────────────────────────────────────────────────
     private fun decryptGdPayload(b64: String, pd: String): String? {
-        var s = b64.trim().replace(",,", "==").replace(",", "=").replace('-', '+').replace('_', '/')
+        Log.e(TAG, "[DEC] raw len=${b64.length} head=${b64.take(60)} tail=${b64.takeLast(30)}")
+
+        val b64Variants = listOf(
+            "asis"        to b64.trim(),
+            "commas"      to b64.trim().replace(",,", "==").replace(",", "="),
+            "urlsafe"     to b64.trim().replace('-', '+').replace('_', '/'),
+            "commas+url"  to b64.trim().replace(",,", "==").replace(",", "=").replace('-', '+').replace('_', '/')
+        )
+
+        var tried = 0
+        for ((bName, b0) in b64Variants) {
+            var s = b0
+            while (s.length % 4 != 0) s += "="
+            val raw = try { Base64.decode(s, Base64.DEFAULT) } catch (_: Exception) { continue }
+            if (raw.size < 32) continue
+
+            // salt/ct splits
+            val splits = mutableListOf<Pair<String, Pair<ByteArray, ByteArray>>>()
+            if (raw.size > 16) splits.add("s16" to (raw.copyOfRange(0, 16) to raw.copyOfRange(16, raw.size)))
+            if (raw.size > 8)  splits.add("s8"  to (raw.copyOfRange(0, 8)  to raw.copyOfRange(8, raw.size)))
+
+            for ((sName, pair) in splits) {
+                val (salt, ct) = pair
+                if (ct.isEmpty() || ct.size % 16 != 0) continue
+
+                val pdVariants = listOf(
+                    "pd"       to pd.toByteArray(Charsets.UTF_8),
+                    "pd-trim"  to pd.trim().toByteArray(Charsets.UTF_8)
+                )
+
+                for ((pdName, pdBytes) in pdVariants) {
+                    val kdfList = listOf(
+                        Triple("HmacSHA256", 10000, 48),
+                        Triple("HmacSHA256", 10000, 32),
+                        Triple("HmacSHA256", 10000, 16),
+                        Triple("HmacSHA256", 1000, 48),
+                        Triple("HmacSHA1",   10000, 48),
+                        Triple("HmacSHA1",   1000, 48)
+                    )
+                    for ((algo, iters, dkLen) in kdfList) {
+                        val dk = try { pbkdf2Hmac(pdBytes, salt, iters, dkLen, algo) }
+                                 catch (_: Exception) { continue }
+
+                        val keyChoices = mutableListOf<Pair<String, ByteArray>>()
+                        if (dk.size >= 32) keyChoices.add("k32" to dk.copyOfRange(0, 32))
+                        if (dk.size >= 24) keyChoices.add("k24" to dk.copyOfRange(0, 24))
+                        if (dk.size >= 16) keyChoices.add("k16" to dk.copyOfRange(0, 16))
+
+                        for ((keyName, key) in keyChoices) {
+                            val ivChoices = mutableListOf<Pair<String, ByteArray>>()
+                            if (dk.size >= 48) ivChoices.add("iv48" to dk.copyOfRange(32, 48))
+                            if (dk.size >= 32) ivChoices.add("ivAfter16" to dk.copyOfRange(16, 32))
+                            ivChoices.add("iv0" to ByteArray(16))
+                            ivChoices.add("ivSalt" to salt)
+
+                            for ((ivName, iv) in ivChoices) {
+                                if (iv.size != 16) continue
+                                for (mode in listOf(
+                                    "AES/CBC/PKCS5Padding",
+                                    "AES/CBC/NoPadding",
+                                    "AES/ECB/PKCS5Padding"
+                                )) {
+                                    tried++
+                                    try {
+                                        val c = Cipher.getInstance(mode)
+                                        if (mode.contains("ECB")) {
+                                            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"))
+                                        } else {
+                                            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+                                        }
+                                        val bytes = c.doFinal(ct)
+                                        val plain = String(bytes, Charsets.UTF_8).trimStart()
+                                        if (plain.startsWith("{") && plain.contains("\"", false)) {
+                                            val recipe = "$bName/$sName/$pdName/$algo/$iters/dkLen=$dkLen/$keyName/$ivName/$mode"
+                                            Log.e(TAG, "[DEC HIT] recipe=$recipe")
+                                            Log.e(TAG, "[DEC HIT] head=${plain.take(220)}")
+                                            solvedRecipe = recipe
+                                            return plain
+                                        }
+                                    } catch (_: Exception) { }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Log.e(TAG, "[DEC] exhausted $tried variants — no JSON produced")
+        Log.e(TAG, "[DEC] CT first 32B hex: ${b64Hex(b64)}")
+        return null
+    }
+
+    private fun b64Hex(b64: String): String {
+        var s = b64.trim().replace(",,", "==").replace(",", "=")
         while (s.length % 4 != 0) s += "="
-
-        val raw = try { Base64.decode(s, Base64.DEFAULT) } catch (_: Exception) { return null }
-        if (raw.size < 32 || raw.size % 16 != 0) return null
-
-        val salt = raw.copyOfRange(0, 16)
-        val ct   = raw.copyOfRange(16, raw.size)
-
-        val derived = try {
-            pbkdf2Hmac(pd.toByteArray(Charsets.UTF_8), salt, PBKDF2_ITERS, PBKDF2_LEN, "HmacSHA256")
-        } catch (_: Exception) { return null }
-
-        return try {
-            val c = Cipher.getInstance("AES/CBC/NoPadding")
-            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(derived.copyOfRange(0, 32), "AES"),
-                IvParameterSpec(derived.copyOfRange(32, 48)))
-            var text = String(c.doFinal(ct), Charsets.UTF_8)
-            val end = text.lastIndexOf('}')
-            if (end in 0 until text.length - 1) text = text.substring(0, end + 1)
-            text
-        } catch (e: Exception) { Log.e(TAG, "[DEC-static] ${e.message}"); null }
+        val raw = try { Base64.decode(s, Base64.DEFAULT) } catch (_: Exception) { return "n/a" }
+        return raw.copyOfRange(0, minOf(32, raw.size)).joinToString("") { "%02x".format(it) }
     }
 
     private fun pbkdf2Hmac(pw: ByteArray, salt: ByteArray, iters: Int, dkLen: Int, algo: String): ByteArray {
@@ -291,15 +346,19 @@ open class GalaxyDonghua : ExtractorApi() {
         return out.copyOfRange(0, dkLen)
     }
 
-    // ────────────────────────────────────────────────────────────────
-    //  emitStreams — with diagnostics
-    // ────────────────────────────────────────────────────────────────
     private suspend fun emitStreams(
         json: String, gxBase: String,
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit
     ) {
         Log.e(TAG, "[EMIT] JSON length=${json.length}")
+
+        if (!json.trimStart().startsWith("{")) {
+            Log.e(TAG, "[EMIT] REFUSING — payload doesn't start with '{' (decryption wrong)")
+            Log.e(TAG, "[EMIT] first 120 chars: ${json.take(120)}")
+            return
+        }
+
         json.chunked(900).forEachIndexed { i, c -> Log.e(TAG, "[EMIT] JSON[$i]: $c") }
 
         val baseURL = Regex("[\"']baseUrl[\"'][ \\t]*:[ \\t]*[\"']([^\"']+)[\"']").find(json)?.groupValues?.get(1) ?: gxBase
@@ -308,7 +367,6 @@ open class GalaxyDonghua : ExtractorApi() {
         val ph = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
         var emitted = 0
 
-        // Primary matcher — any "file" key
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
             val raw = m.groupValues[1]
             val abs = fixStreamUrl(raw, baseURL) ?: continue
@@ -323,7 +381,6 @@ open class GalaxyDonghua : ExtractorApi() {
             emitted++
         }
 
-        // Fallback matcher — generic "url"/"link"/"src"
         if (emitted == 0) {
             for (m in Regex("""["'](?:url|link|src)["']\s*:\s*["'](https?://[^"']+|//[^"']+)["']""").findAll(json)) {
                 val abs = fixStreamUrl(m.groupValues[1], baseURL) ?: continue
@@ -347,9 +404,6 @@ open class GalaxyDonghua : ExtractorApi() {
         }
     }
 
-    // ────────────────────────────────────────────────────────────────
-    //  Tokens
-    // ────────────────────────────────────────────────────────────────
     protected data class GdTokens(
         val pd: String, val ps: String, val qsx: String, val kaken: String, val apx: String,
         val utekmek: String = "", val localKey: String = "", val unpackedJs: String = ""
@@ -360,9 +414,6 @@ open class GalaxyDonghua : ExtractorApi() {
         ).filterValues { it.isNotBlank() }
     }
 
-    // ────────────────────────────────────────────────────────────────
-    //  Dean Edwards unpacker
-    // ────────────────────────────────────────────────────────────────
     private fun toBase(n: Int, base: Int): String {
         if (n == 0) return "0"
         val chars = if (base == 36) BASE36_CHARS else BASE62_CHARS
@@ -552,9 +603,6 @@ open class GalaxyDonghua : ExtractorApi() {
         try { val uri = URI(url); "${uri.scheme}://${uri.host}" } catch (_: Exception) { GX }
 }
 
-// ─────────────────────────────────────────────────────────────────────
-//  Rhino — best-effort, since 1.7.14 chokes on some minified syntax
-// ─────────────────────────────────────────────────────────────────────
 object GdRhino {
     private const val TAG = "GdRhino"
 
@@ -585,8 +633,6 @@ object GdRhino {
 
             for ((k, v) in globals) ScriptableObject.putProperty(scope, k, v)
 
-            // The site's bundle won't parse in Rhino 1.7.14 due to reserved-word property keys.
-            // Best effort only.
             try { ctx.evaluateString(scope, playerJs, "player", 1, null) }
             catch (e: Throwable) { Log.e(TAG, "player eval: ${e.message}"); return null }
 
