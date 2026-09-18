@@ -12,6 +12,9 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.Cookie
+import okhttp3.CookieJar
+import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -49,7 +52,43 @@ open class GalaxyDonghua : ExtractorApi() {
         @Volatile private var cachedPlayerJs: String? = null
         @Volatile private var cachedCryptoJs: String? = null
 
-        private val client = OkHttpClient()
+        // ── Cookie jar: keeps session cookies across requests ──
+        private val cookieJar = object : CookieJar {
+            private val store = mutableMapOf<String, MutableList<Cookie>>()
+            override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+                if (cookies.isEmpty()) return
+                val list = store.getOrPut(url.host) { mutableListOf() }
+                for (c in cookies) {
+                    list.removeAll { it.name == c.name }
+                    list.add(c)
+                    Log.e(TAG, "[COOKIE+] ${url.host}  ${c.name}=${c.value.take(40)}…")
+                }
+            }
+            override fun loadForRequest(url: HttpUrl): List<Cookie> {
+                val l = store[url.host].orEmpty()
+                Log.e(TAG, "[COOKIE→] ${url.host}  sending ${l.size}: ${l.map { it.name }}")
+                return l
+            }
+        }
+
+        // ── OkHttp client with full wire logging ──
+        private val client: OkHttpClient = OkHttpClient.Builder()
+            .cookieJar(cookieJar)
+            .addNetworkInterceptor { chain ->
+                val req = chain.request()
+                Log.e(TAG, "[HTTP-out] ${req.method} ${req.url}")
+                req.headers.names().forEach { n ->
+                    Log.e(TAG, "[HTTP-out]   $n: ${req.header(n)}")
+                }
+                Log.e(TAG, "[HTTP-out]   body.length=${req.body?.contentLength() ?: 0L}")
+                val resp = chain.proceed(req)
+                Log.e(TAG, "[HTTP-in] ${resp.code} ${resp.message}")
+                resp.headers.names().forEach { n ->
+                    Log.e(TAG, "[HTTP-in]   $n: ${resp.header(n)}")
+                }
+                resp
+            }
+            .build()
     }
 
     override suspend fun getUrl(
@@ -172,7 +211,7 @@ open class GalaxyDonghua : ExtractorApi() {
         embedUrl: String, playerJs: String?, cryptoJs: String
     ): String? {
 
-        // ── DIAGNOSTIC: replay the exact working cURL from Chrome ──
+        // ── DIAGNOSTIC: replay exact cURL from Chrome (byte-identical) ──
         run {
             val exactUrl = "https://galaxydonghua.xyz/api/?p=dEh1WVVRRnUycldacC9GMk5mcXlYR3lQTDgzT2EyZ0NsTnVmTHBBLzROSmIrSnB4KzJzQ0hGcFl1cGU2TXBsV0hRcnJldU5BY2krUmJjT29Hcm5LRUE9PQ,,"
             val exactBody = "dmo4WG83M1dSSmNUcEg4YzcvY0dzQnlBUndxdWU5ZjZxbEFzbVhsNEFJZDFKM0lIL253REdhamE3dnVXZWJLbXNlZUZyWU1LZXBRcE1ZMFlwVFh4QmEwSmRVK2U5THVtYzh0MHBYUXpycGFsQnpRdjJnUUkydGhSdFdwU29tUDBtMTBOVENtbll4bGJURSsyQzBURkJNOCt2aHNvMnJCTG1Lazk5aHpYbzBFR2E1Rksyd3ptZWtXZWgzbm5GZHlSckk2SE9GVlExSDNod0Rha2dEOUYwOU85WlB2dmh1aFI2ZkNpVWRMZnNhVkUzOFBkeEdYbDljNDU1UFJIR0FJaE1PZG82QXZjeFZjTDI4TzdDZWNzampKVnlPdE96bnkreTVjWjd4Q3UrcmM9-,THJjNkh0Q2treUpLdnA2ZVoxL1hpMEhLRkRxOExKY2R0cVBCRFhld0JMRFc4WGF3dUlUUnNPK3B3d3poSmlOU1BjQTArRkhrUEI5UDJWellipakg2Z1E9PQ,,"
@@ -241,7 +280,7 @@ open class GalaxyDonghua : ExtractorApi() {
             "sec-ch-ua-platform" to "\"Windows\""
         )
 
-        // ── Config warm-up ──
+        // ── Config warm-up (sets session cookie) ──
         val configUrl = "$gxBase/api-config/${tokens.qsx}?p=${tokens.ps}&_=$now"
         Log.e(TAG, "[STEP 13-pre] GET $configUrl")
         try {
@@ -258,7 +297,7 @@ open class GalaxyDonghua : ExtractorApi() {
             Log.e(TAG, "[STEP 13-pre ERR] ${e.message}")
         }
 
-        // ── Sources ──
+        // ── Sources POST ──
         val sourcesUrl = apiRoot.trimEnd('/') + "/?p=" + tokens.ps
         val bodyText = tokens.qsx + "-," + tokens.utekmek
 
