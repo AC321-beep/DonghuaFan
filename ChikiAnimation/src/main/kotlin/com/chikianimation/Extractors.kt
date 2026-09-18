@@ -1,3 +1,5 @@
+package com.chikianimation
+
 import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.SubtitleFile
@@ -220,7 +222,6 @@ open class GalaxyDonghua : ExtractorApi() {
         
         fun extractVars(text: String): GdTokens {
             fun grabVar(n: String): String {
-                // Strict String escaping used here to prevent Github Actions compilation failure
                 val strPattern = "(?:\"" + n + "\"|'" + n + "'|\\b" + n + "\\b)\\s*\\]?\\s*[:=]\\s*(?:atob\\s*\\(\\s*)?[\"']([^\"']+)[\"']"
                 Regex(strPattern).find(text)?.let { return it.groupValues[1].trim() }
                 
@@ -241,7 +242,6 @@ open class GalaxyDonghua : ExtractorApi() {
             if (endMatch != null) {
                 Log.e(TAG, "[TOKEN 3] Found JSFuck payload end index: ${endMatch.range.last}")
                 
-                // Manual replace chain to avoid Unicode Regex escape compiler errors
                 val rawJsFuck = page.substring(jStart, endMatch.range.last + 1)
                     .replace(" ", "")
                     .replace("\u00a0", "")
