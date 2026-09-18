@@ -48,6 +48,9 @@ open class GalaxyDonghua : ExtractorApi() {
 
         @Volatile private var cachedPlayerJs: String? = null
         @Volatile private var cachedCryptoJs: String? = null
+
+        // Shared client — reuses connection pool across calls
+        private val client = OkHttpClient()
     }
 
     override suspend fun getUrl(
@@ -132,9 +135,7 @@ open class GalaxyDonghua : ExtractorApi() {
         if (ordered.isEmpty()) { cachedPlayerJs = ""; return null }
         for (src in ordered) {
             val abs = absolutize(src, gxBase)
-            val text = try {
-                app.get(abs, headers = headers).text
-            } catch (_: Exception) { continue }
+            val text = try { app.get(abs, headers = headers).text } catch (_: Exception) { continue }
             if (text.length < 2_000) continue
             if (Regex("""\bdcx\s*[=(]""").containsMatchIn(text)) {
                 cachedPlayerJs = text
@@ -165,18 +166,12 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Sources endpoint — confirmed by cURL from Chrome
-    //    POST <apiRoot>/api/?p=<ps>
-    //    Content-Type: text/plain
-    //    Body: <qsx>- ,<utekmek>   (concatenated raw, no encoding)
+    //  Two requests (matching the browser exactly):
+    //    1. GET  /api-config/<qsx>?p=<ps>&_=<ts>     — session setup
+    //    2. POST /api/?p=<ps>  (body=<qsx>-,<utekmek>)  — actual sources
     //
-    //  Then decrypt:
-    //    salt    = raw[0..16]
-    //    ct      = raw[16..]
-    //    derived = PBKDF2-HMAC-SHA256(pd, salt, 10000, 48)
-    //    key     = derived[0..32]
-    //    iv      = derived[32..48]
-    //    plain   = AES-CBC-Pkcs7(ct, key, iv)
+    //  No Referer (site sets Referrer-Policy: no-referrer).
+    //  Send sec-fetch-* + sec-ch-ua* like Chrome does.
     // ────────────────────────────────────────────────────────────────
     private suspend fun fetchAndDecryptApi(
         tokens: GdTokens, headers: Map<String, String>, gxBase: String,
@@ -192,57 +187,87 @@ open class GalaxyDonghua : ExtractorApi() {
             apxDecoded.replace("api-config/", "api/")
         else "$gxBase/api/"
 
-        // URL: /api/?p=<ps>  — ps is already in the site's quirky padding form
-        val sourcesUrl = apiRoot.trimEnd('/') + "/?p=" + tokens.ps
+        val now = System.currentTimeMillis()
 
-        // Body: <qsx>- ,<utekmek>  — matches the cURL exactly
+        // ---- shared header block, Chrome-like ----
+        fun chromeHeaders(): MutableMap<String, String> = mutableMapOf(
+            "User-Agent" to UA,
+            "Accept" to "text/plain, */*; q=0.01",
+            "Accept-Language" to "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Cache-Control" to "no-cache",
+            "Pragma" to "no-cache",
+            "Origin" to gxBase,
+            "Sec-Fetch-Dest" to "empty",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Site" to "same-origin",
+            "X-Requested-With" to "XMLHttpRequest",
+            "sec-ch-ua" to "\"Google Chrome\";v=\"124\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"124\"",
+            "sec-ch-ua-mobile" to "?0",
+            "sec-ch-ua-platform" to "\"Windows\""
+        )
+        // NOTE: no Referer — matches the browser
+
+        // ── Step 1: config request ──
+        val configUrl = "$gxBase/api-config/${tokens.qsx}?p=${tokens.ps}&_=$now"
+        Log.e(TAG, "[STEP 13-pre] GET $configUrl")
+        try {
+            val r = withContext(Dispatchers.IO) {
+                val req = Request.Builder().url(configUrl).get().apply {
+                    chromeHeaders().forEach { (k, v) -> addHeader(k, v) }
+                    removeHeader("Content-Type")
+                }.build()
+                client.newCall(req).execute().use { resp ->
+                    Pair(resp.code, resp.body?.string()?.trim() ?: "")
+                }
+            }
+            Log.e(TAG, "[STEP 13-pre RES] ${r.first} | ${r.second.length}B | head=${r.second.take(60)}")
+        } catch (e: Exception) {
+            Log.e(TAG, "[STEP 13-pre ERR] ${e.message}")
+        }
+
+        // ── Step 2: sources request ──
+        val sourcesUrl = apiRoot.trimEnd('/') + "/?p=" + tokens.ps
         val bodyText = tokens.qsx + "-," + tokens.utekmek
 
-        val apiHeaders = mapOf(
-            "User-Agent" to UA,
-            "Referer" to embedUrl,
-            "Origin" to gxBase,
-            "Accept" to "text/plain, */*; q=0.01",
-            "X-Requested-With" to "XMLHttpRequest",
-            "Content-Type" to "text/plain"
-        )
-
         Log.e(TAG, "[STEP 13] POST $sourcesUrl")
-        Log.e(TAG, "[STEP 13] body[0..60]=${bodyText.take(60)}…")
+        Log.e(TAG, "[STEP 13] body.len=${bodyText.length} head=${bodyText.take(60)}…")
 
-        val sourcesCt = try {
+        val (code, respBody, respHdr) = try {
             withContext(Dispatchers.IO) {
-                val client = OkHttpClient()
                 val body = bodyText.toRequestBody("text/plain".toMediaTypeOrNull())
+                val hdrs = chromeHeaders().apply { put("Content-Type", "text/plain") }
                 val req = Request.Builder().url(sourcesUrl).post(body).apply {
-                    apiHeaders.forEach { (k, v) -> addHeader(k, v) }
+                    hdrs.forEach { (k, v) -> addHeader(k, v) }
                 }.build()
-                val resp = client.newCall(req).execute()
-                val code = resp.code
-                val txt = resp.body?.string()?.trim() ?: ""
-                Log.e(TAG, "[STEP 13 RES] $code | ${txt.length}B")
-                txt
+                client.newCall(req).execute().use { resp ->
+                    val b = resp.body?.string()?.trim() ?: ""
+                    val h = resp.headers.names().joinToString("; ") { n -> "$n=${resp.header(n)}" }
+                    Triple(resp.code, b, h)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "[STEP 13 ERR] ${e.message}")
-            ""
+            Triple(0, "", "")
         }
 
-        if (sourcesCt.isBlank()) return null
-        Log.e(TAG, "[STEP 13] head=${sourcesCt.take(80)}")
+        Log.e(TAG, "[STEP 13 RES] code=$code len=${respBody.length}")
+        Log.e(TAG, "[STEP 13 RES] headers=$respHdr")
+        Log.e(TAG, "[STEP 13 RES] head=${respBody.take(120)}")
 
-        if (sourcesCt.startsWith("{") && sourcesCt.contains("\"file\"")) {
-            Log.e(TAG, "[DEC] plain JSON"); return sourcesCt
+        if (respBody.isBlank()) return null
+
+        if (respBody.startsWith("{") && respBody.contains("\"file\"")) {
+            Log.e(TAG, "[DEC] plain JSON"); return respBody
         }
 
         if (playerJs != null && cryptoJs.isNotEmpty()) {
-            val r = GdRhino.tryDecrypt(playerJs, cryptoJs, sourcesCt, tokens.toGlobalMap())
+            val r = GdRhino.tryDecrypt(playerJs, cryptoJs, respBody, tokens.toGlobalMap())
             if (r != null && r.trimStart().startsWith("{")) {
                 Log.e(TAG, "[DEC] Rhino OK — ${r.length}B"); return r
             }
         }
 
-        val plain = decryptGdPayload(sourcesCt, tokens.pd)
+        val plain = decryptGdPayload(respBody, tokens.pd)
         if (plain != null && plain.trimStart().startsWith("{")) {
             Log.e(TAG, "[DEC] static OK — ${plain.length}B")
             return plain
@@ -256,20 +281,16 @@ open class GalaxyDonghua : ExtractorApi() {
         val raw = try { Base64.decode(s, Base64.DEFAULT) } catch (e: Exception) {
             Log.e(TAG, "[DEC] b64: ${e.message}"); return null
         }
-        Log.e(TAG, "[DEC] raw=${raw.size}B")
         if (raw.size < 32 || (raw.size - 16) % 16 != 0) {
             Log.e(TAG, "[DEC] bad length raw=${raw.size}"); return null
         }
         val salt = raw.copyOfRange(0, 16)
         val ct   = raw.copyOfRange(16, raw.size)
-
         val derived = try {
             pbkdf2Hmac(pd.toByteArray(Charsets.UTF_8), salt, PBKDF2_ITERS, PBKDF2_LEN, "HmacSHA256")
         } catch (e: Exception) { Log.e(TAG, "[DEC] KDF: ${e.message}"); return null }
-
         val key = derived.copyOfRange(0, 32)
         val iv  = derived.copyOfRange(32, 48)
-
         return try {
             val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
             c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
