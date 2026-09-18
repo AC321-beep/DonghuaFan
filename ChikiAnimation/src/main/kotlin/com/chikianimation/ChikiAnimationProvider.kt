@@ -9,6 +9,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import java.net.URLEncoder
+import java.util.concurrent.atomic.AtomicInteger
 
 class ChikiAnimationProvider : MainAPI() {
 
@@ -249,7 +250,16 @@ class ChikiAnimationProvider : MainAPI() {
             return false
         }
 
-        var found = false
+        // Atomic counters — the coroutineScope below runs several handleUrl
+        // branches in parallel, so we need thread-safe state.
+        val emitCount = AtomicInteger(0)
+        val foundFlag = AtomicInteger(0)
+
+        // Every callback invocation increments emitCount before reaching the caller.
+        val countingCallback: (ExtractorLink) -> Unit = { link ->
+            emitCount.incrementAndGet()
+            callback.invoke(link)
+        }
 
         fun getIframeSrc(iframe: Element): String {
             return iframe.attr("src").ifBlank {
@@ -424,13 +434,14 @@ class ChikiAnimationProvider : MainAPI() {
 
             try {
                 if (handleGoogleDrive(cleanUrl, ref)) {
-                    found = true
+                    foundFlag.set(1)
                     return
                 }
 
                 if (cleanUrl.contains("geo.dailymotion.com/player", true)) {
                     val videoId = Regex("""video=([a-zA-Z0-9_-]+)""").find(cleanUrl)?.groupValues?.get(1)
                     if (videoId != null) {
+                        val before = emitCount.get()
                         try {
                             val apiUrl = "https://geo.dailymotion.com/videos/$videoId"
                             val playerId = Regex("""player/([a-zA-Z0-9]+)\.html""").find(cleanUrl)?.groupValues?.get(1)
@@ -445,7 +456,7 @@ class ChikiAnimationProvider : MainAPI() {
                             val streamUrl = Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""").find(apiRes)?.groupValues?.get(1)
 
                             if (!streamUrl.isNullOrBlank()) {
-                                callback.invoke(
+                                countingCallback.invoke(
                                     newExtractorLink(
                                         source = "Dailymotion",
                                         name = "Dailymotion HD",
@@ -456,45 +467,79 @@ class ChikiAnimationProvider : MainAPI() {
                                         this.quality = Qualities.Unknown.value
                                     }
                                 )
-                                found = true
-                                return
                             }
                         } catch (e: Exception) { }
 
-                        val realDmUrl = "https://www.dailymotion.com/embed/video/$videoId"
-                        com.lagradost.cloudstream3.extractors.Dailymotion().getUrl(realDmUrl, ref, subtitleCallback, callback)
-                        found = true
-                        return
+                        if (emitCount.get() == before) {
+                            val realDmUrl = "https://www.dailymotion.com/embed/video/$videoId"
+                            try {
+                                com.lagradost.cloudstream3.extractors.Dailymotion().getUrl(
+                                    realDmUrl, ref, subtitleCallback, countingCallback
+                                )
+                            } catch (_: Exception) { }
+                        }
+
+                        if (emitCount.get() > before) {
+                            foundFlag.set(1)
+                            return
+                        }
                     }
                 }
                 else if (cleanUrl.contains("dailymotion.com", true) || cleanUrl.contains("dai.ly", true)) {
-                    com.lagradost.cloudstream3.extractors.Dailymotion().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                    found = true
-                    return
+                    val before = emitCount.get()
+                    try {
+                        com.lagradost.cloudstream3.extractors.Dailymotion().getUrl(
+                            cleanUrl, ref, subtitleCallback, countingCallback
+                        )
+                    } catch (_: Exception) { }
+                    if (emitCount.get() > before) {
+                        foundFlag.set(1)
+                        return
+                    }
                 }
 
-                // >>> NEW: Added Skyline AI Route <<<
+                // ── SkylineAI: only mark success if it actually emitted ──
                 if (cleanUrl.contains("skylineai.cloud", true)) {
-                    SkylineAI().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                    found = true
-                    return
+                    val before = emitCount.get()
+                    try {
+                        SkylineAI().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
+                    } catch (_: Exception) { }
+                    if (emitCount.get() > before) {
+                        foundFlag.set(1)
+                        return
+                    }
                 }
 
+                // ── GalaxyDonghua: only mark success if it actually emitted ──
                 if (cleanUrl.contains("galaxydonghua", true)) {
-                    GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                    found = true
-                    return
+                    val before = emitCount.get()
+                    try {
+                        GalaxyDonghua().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
+                    } catch (_: Exception) { }
+                    if (emitCount.get() > before) {
+                        foundFlag.set(1)
+                        return
+                    }
                 }
 
+                // ── Ghbrisk: only mark success if it actually emitted ──
                 if (cleanUrl.contains("ghbrisk.com", true)) {
-                    Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, callback)
-                    found = true
-                    return
+                    val before = emitCount.get()
+                    try {
+                        Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
+                    } catch (_: Exception) { }
+                    if (emitCount.get() > before) {
+                        foundFlag.set(1)
+                        return
+                    }
                 }
 
-                val ok = loadExtractor(cleanUrl, referer = ref, subtitleCallback, callback)
-                if (ok) {
-                    found = true
+                val before = emitCount.get()
+                val ok = try {
+                    loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
+                } catch (_: Exception) { false }
+                if (ok || emitCount.get() > before) {
+                    foundFlag.set(1)
                     return
                 }
 
@@ -505,10 +550,10 @@ class ChikiAnimationProvider : MainAPI() {
                 streamRegex.findAll(html).forEach { m ->
                     val fileUrl = m.groupValues[1].replace("\\/", "/")
                     if (fileUrl.contains(".m3u8", ignoreCase = true)) {
-                        M3u8Helper.generateM3u8("Generic HLS", fileUrl, cleanUrl).forEach { callback.invoke(it) }
+                        M3u8Helper.generateM3u8("Generic HLS", fileUrl, cleanUrl).forEach { countingCallback.invoke(it) }
                         foundGeneric = true
                     } else if (fileUrl.contains(".mp4", ignoreCase = true)) {
-                        callback.invoke(
+                        countingCallback.invoke(
                             newExtractorLink(
                                 source = "Generic MP4",
                                 name = "Generic MP4",
@@ -531,7 +576,7 @@ class ChikiAnimationProvider : MainAPI() {
                         foundGeneric = true
                     }
                 }
-                if (foundGeneric) found = true
+                if (foundGeneric) foundFlag.set(1)
 
             } catch (e: Exception) { }
         }
@@ -591,14 +636,14 @@ class ChikiAnimationProvider : MainAPI() {
             }.awaitAll()
         }
 
-        if (!found) {
+        if (foundFlag.get() == 0) {
             document.select("iframe").forEach { iframe ->
                 val src = getIframeSrc(iframe)
                 if (src.isNotBlank()) handleUrl(src, data)
             }
         }
 
-        if (!found) {
+        if (foundFlag.get() == 0) {
             document.select("script").forEach { script ->
                 val body = script.data()
 
@@ -615,6 +660,6 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        return found
+        return foundFlag.get() == 1
     }
 }
