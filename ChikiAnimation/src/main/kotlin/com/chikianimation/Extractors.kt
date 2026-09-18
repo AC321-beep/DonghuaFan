@@ -1,5 +1,3 @@
-package com.chikianimation
-
 import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.SubtitleFile
@@ -57,7 +55,7 @@ open class GalaxyDonghua : ExtractorApi() {
         Log.e(TAG, "[STEP 2] Fetching initial HTML page...")
         val page = try {
             val r = app.get(url, headers = headers)
-            Log.e(TAG, "[STEP 3] Initial GET success | Status: ${r.code} | Length: ${r.text.length}")
+            Log.e(TAG, "[STEP 3] Initial GET success | Status: ${r.code} \vert{} Length:${r.text.length}")
             r.text
         } catch (e: Exception) {
             Log.e(TAG, "[STEP 3 ERROR] Initial GET fetch failed: ${e.message}")
@@ -68,7 +66,7 @@ open class GalaxyDonghua : ExtractorApi() {
         // 1. SKYLINE AI FAST PATH
         // ════════════════════════════════════════════════════════
         Log.e(TAG, "[STEP 4] Checking for unencrypted VID_SRC...")
-        val vidSrcMatch = Regex("""const\s+VID_SRC\s*=\s*"([^"]+)"""").find(page)
+        val vidSrcMatch = Regex("const\\s+VID_SRC\\s*=\\s*\"([^\"]+)\"").find(page)
         if (vidSrcMatch != null && vidSrcMatch.groupValues[1].isNotBlank()) {
             val streamUrl = vidSrcMatch.groupValues[1].replace("\\/", "/")
             Log.e(TAG, "[STEP 4 SUCCESS] Found Skyline VID_SRC: $streamUrl")
@@ -83,7 +81,7 @@ open class GalaxyDonghua : ExtractorApi() {
         // 2. DYNAMIC SERVER LIST DISCOVERY
         // ════════════════════════════════════════════════════════
         Log.e(TAG, "[STEP 5] Parsing for alternative server URLs...")
-        val serverUrls = Regex("""data-url="([^"]+)"""").findAll(page)
+        val serverUrls = Regex("data-url=\"([^\"]+)\"").findAll(page)
             .map { it.groupValues[1] }
             .map { if (it.startsWith("/")) gxBase + it else it }
             .distinct().toList()
@@ -99,11 +97,11 @@ open class GalaxyDonghua : ExtractorApi() {
 
         var decrypted = false
         for ((index, targetUrl) in candidateUrls.withIndex()) {
-            Log.e(TAG, "[STEP 7] --- Testing Candidate [$index]: $targetUrl ---")
+            Log.e(TAG, "[STEP 7] --- Testing Candidate [$index]:$targetUrl ---")
             
             val serverPage = try {
                 val r = app.get(targetUrl, headers = headers)
-                Log.e(TAG, "[STEP 8] Server GET status: ${r.code} | Length: ${r.text.length}")
+                Log.e(TAG, "[STEP 8] Server GET status: ${r.code} \vert{} Length:${r.text.length}")
                 r.text
             } catch (e: Exception) {
                 Log.e(TAG, "[STEP 8 ERROR] Server GET failed: ${e.message}")
@@ -162,10 +160,10 @@ open class GalaxyDonghua : ExtractorApi() {
         try {
             val r = app.get(targetUrl, headers = apiHeaders)
             val text = r.text.trim()
-            Log.e(TAG, "[STEP 13 API RES] Code: ${r.code} | Length: ${text.length}")
+            Log.e(TAG, "[STEP 13 API RES] Code: ${r.code} \vert{} Length:${text.length}")
 
             if (text.isNotBlank()) {
-                val cipher = Regex(""""(?:data|file|source|sources)"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1) ?: text
+                val cipher = Regex("\"(?:data|file|source|sources)\"\\s*:\\s*\"([^\"]+)\"").find(text)?.groupValues?.get(1) ?: text
                 val decryptedData = dcx(cipher, password)
                 if (decryptedData == null) Log.e(TAG, "[STEP 13 ERROR] CryptoJS dcx() returned null for cipher chunk.")
                 return decryptedData
@@ -182,21 +180,21 @@ open class GalaxyDonghua : ExtractorApi() {
     //  EMIT STREAMS
     // ────────────────────────────────────────────────────────────────
     private suspend fun emitStreams(json: String, gxBase: String, callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit) {
-        val baseURL = Regex(""""baseUrl"\s*:\s*"([^"]+)"""").find(json)?.groupValues?.get(1) ?: gxBase
+        val baseURL = Regex("\"baseUrl\"\\s*:\\s*\"([^\"]+)\"").find(json)?.groupValues?.get(1) ?: gxBase
         val playbackHeaders = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
 
-        val streamRx = Regex(""""file"\s*:\s*"([^"]+)"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?(?:[^{}]*?"type"\s*:\s*"([^"]*)")?""")
+        val streamRx = Regex("\"file\"\\s*:\\s*\"([^\"]+)\"(?:[^{}]*?\"label\"\\s*:\\s*\"([^\"]*)\")?(?:[^{}]*?\"type\"\\s*:\\s*\"([^\"]*)\")?")
         for (m in streamRx.findAll(json)) {
             val streamUrl = fixStreamUrl(m.groupValues[1], baseURL) ?: continue
             val label = m.groupValues[2].ifBlank { "Auto" }
             val type  = m.groupValues[3]
             val isM3u8 = streamUrl.contains(".m3u8") || type.contains("hls", true)
-            callback.invoke(newExtractorLink(this.name, "${this.name} – $label", streamUrl, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+            callback.invoke(newExtractorLink(this.name, "${this.name} –$label", streamUrl, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
                 this.referer = gxBase; this.quality = label.filter { it.isDigit() }.toIntOrNull() ?: Qualities.Unknown.value; this.headers = playbackHeaders
             })
         }
 
-        val subRx = Regex(""""file"\s*:\s*"([^"]+\.(?:vtt|srt))"(?:[^{}]*?"label"\s*:\s*"([^"]*)")?""")
+        val subRx = Regex("\"file\"\\s*:\\s*\"([^\"]+\\.(?:vtt|srt))\"(?:[^{}]*?\"label\"\\s*:\\s*\"([^\"]*)\")?")
         for (m in subRx.findAll(json)) {
             val subUrl = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
             subtitleCallback.invoke(SubtitleFile(m.groupValues[2].ifBlank { "Sub" }, subUrl))
@@ -210,15 +208,14 @@ open class GalaxyDonghua : ExtractorApi() {
 
     private fun pickPassword(t: GdTokens): String {
         val all = listOf(t.pd, t.ps, t.qsx, t.kaken, t.apx).filter { it.isNotBlank() }
-        return all.firstOrNull { it.matches(Regex("""^\d{10}$""")) } ?: all.firstOrNull { it.matches(Regex("""^[a-f0-9\-]{36}$""")) } ?: t.pd
+        return all.firstOrNull { it.matches(Regex("^\\d{10}$")) } ?: all.firstOrNull { it.matches(Regex("^[a-f0-9\\-]{36}$")) } ?: t.pd
     }
 
-  private fun decodeGdTokens(page: String): GdTokens? {
+    private fun decodeGdTokens(page: String): GdTokens? {
         Log.e(TAG, "[TOKEN 1] Starting decode process. Page length: ${page.length}")
         
         fun extractVars(text: String): GdTokens {
             fun grabVar(name: String): String {
-                // Fixed: Standard strings with double backslashes to avoid Kotlin compiler escape errors
                 val strRegex = Regex("(?:$name\vert{}[\"']$name[\"'])\\s*\\]?\\s*[:=]\\s*['\"`]([^'\"`]+)['\"`]")
                 strRegex.find(text)?.let { return it.groupValues[1].trim() }
                 
@@ -231,14 +228,14 @@ open class GalaxyDonghua : ExtractorApi() {
         }
 
         var jsFuck = ""
-        val startMatch = Regex("""ﾟωﾟﾉ\s*=""").find(page)
+        val startMatch = Regex("ﾟωﾟﾉ\\s*=").find(page)
         if (startMatch != null) {
             Log.e(TAG, "[TOKEN 2] Found JSFuck payload start index: ${startMatch.range.first}")
             val jStart = startMatch.range.first
-            val endMatch = Regex("""\)\s*\(\s*ﾟΘﾟ\s*\)\s*\)\s*\(\s*'_'\s*\)""").find(page, jStart) ?: Regex("""\)\s*\(\s*'_'\s*\)""").find(page, jStart)
+            val endMatch = Regex("\\)\\s*\\(\\s*ﾟΘﾟ\\s*\\)\\s*\\)\\s*\\(\\s*'_'\\s*\\)").find(page, jStart) ?: Regex("\\)\\s*\\(\\s*'_'\\s*\\)").find(page, jStart)
             if (endMatch != null) {
                 Log.e(TAG, "[TOKEN 3] Found JSFuck payload end index: ${endMatch.range.last}")
-                val rawJsFuck = page.substring(jStart, endMatch.range.last + 1).replace(Regex("""[\s\u00a0\u3000]+"""), "")
+                val rawJsFuck = page.substring(jStart, endMatch.range.last + 1).replace(Regex("[\\s\\u00a0\\u3000]+"), "")
                 val bStart = rawJsFuck.indexOf("(ﾟεﾟ+")
                 if (bStart >= 0) {
                     val bodyStart = rawJsFuck.indexOf("*/", bStart).let { if (it >= 0) it + 2 else bStart + 5 }
@@ -263,7 +260,6 @@ open class GalaxyDonghua : ExtractorApi() {
                     Log.e(TAG, "[TOKEN 4] Decoded JSFuck logic to JS string. Length: ${jsFuck.length}")
                     Log.e(TAG, "[TOKEN 4.1 RAW DECODED] $jsFuck")
                     
-                    // Unwrap base64 atob(...) wrap if present (Unpacker logic removed to fix build error)
                     Regex("atob\\s*\\(\\s*['\"]([^'\"]+)['\"]\\s*\\)").find(jsFuck)?.let { match ->
                         try {
                             val decodedAtob = String(Base64.decode(match.groupValues[1], Base64.DEFAULT), Charsets.UTF_8)
