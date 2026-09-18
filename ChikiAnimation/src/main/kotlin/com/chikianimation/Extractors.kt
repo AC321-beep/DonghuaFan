@@ -38,6 +38,11 @@ open class GalaxyDonghua : ExtractorApi() {
         private const val BASE36_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
         private const val BASE62_CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
+        // Confirmed by browser test:
+        //   SHA256 / 10000 iters / 48 bytes → key[0..32], iv[32..48] → AES-CBC / Pkcs7
+        private const val PBKDF2_ITERS = 10_000
+        private const val PBKDF2_LEN   = 48
+
         @Volatile private var cachedPlayerJsUrl: String? = null
         @Volatile private var cachedPlayerJs: String? = null
         @Volatile private var cachedCryptoJs: String? = null
@@ -169,179 +174,115 @@ open class GalaxyDonghua : ExtractorApi() {
         return js
     }
 
+    // ────────────────────────────────────────────────────────────────
+    //  API: config endpoint + sources endpoint, both encrypted
+    // ────────────────────────────────────────────────────────────────
     private suspend fun fetchAndDecryptApi(
         tokens: GdTokens, headers: Map<String, String>, gxBase: String,
         embedUrl: String, playerJs: String?, cryptoJs: String
     ): String? {
-        val decodedApx = try {
-            String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT), Charsets.UTF_8).trim()
-        } catch (_: Exception) { "" }
-        val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
-        val pathExtension = tokens.kaken + tokens.qsx + tokens.pd + tokens.ps
-        val targetUrl = "${prefix.trimEnd('/')}/$pathExtension?p=${tokens.apx}&_=${System.currentTimeMillis()}"
-
         val apiHeaders = headers.toMutableMap().apply {
             put("Referer", embedUrl)
             put("X-Requested-With", "XMLHttpRequest")
             put("Accept", "application/json, text/javascript, */*; q=0.01")
         }
 
-        Log.e(TAG, "[STEP 13] API: $targetUrl")
-        val text = try {
-            val r = app.get(targetUrl, headers = apiHeaders)
-            Log.e(TAG, "[STEP 13 API RES] ${r.code} | ${r.text.length}B")
+        // ── Sources endpoint: /api/?p=<apx>&_=<ts> ──
+        // This is the one that actually carries {"sources":[...]}. Confirmed from browser XHRs.
+        val sourcesUrl = "$gxBase/api/?p=${tokens.apx}&_=${System.currentTimeMillis()}"
+        Log.e(TAG, "[STEP 13] SOURCES: $sourcesUrl")
+        val sourcesCt = try {
+            val r = app.get(sourcesUrl, headers = apiHeaders)
+            Log.e(TAG, "[STEP 13 RES] ${r.code} | ${r.text.length}B")
             r.text.trim()
-        } catch (e: Exception) { Log.e(TAG, "[STEP 13 ERR] ${e.message}"); return null }
+        } catch (e: Exception) { Log.e(TAG, "[STEP 13 ERR] ${e.message}"); "" }
 
-        if (text.isBlank()) return null
-        if (text.startsWith("{") && text.contains("\"file\"", true)) {
-            Log.e(TAG, "[DEC] plain JSON"); return text
-        }
-
-        // Rhino first — the site's own JS is the authoritative decryptor
-        if (playerJs != null && cryptoJs.isNotEmpty()) {
-            val result = GdRhino.tryDecrypt(playerJs, cryptoJs, text, tokens.toGlobalMap())
-            if (result != null && result.trimStart().startsWith("{")) {
-                Log.e(TAG, "[DEC] Rhino OK — ${result.length}B")
-                return result
+        if (sourcesCt.isNotBlank()) {
+            if (sourcesCt.startsWith("{")) {
+                Log.e(TAG, "[DEC] plain JSON"); return sourcesCt
             }
-            Log.e(TAG, "[DEC] Rhino failed")
+
+            // Rhino best-effort
+            if (playerJs != null && cryptoJs.isNotEmpty()) {
+                val r = GdRhino.tryDecrypt(playerJs, cryptoJs, sourcesCt, tokens.toGlobalMap())
+                if (r != null && r.trimStart().startsWith("{")) {
+                    Log.e(TAG, "[DEC] Rhino OK — ${r.length}B")
+                    return r
+                }
+                Log.e(TAG, "[DEC] Rhino failed")
+            }
+
+            val plain = decryptGdPayload(sourcesCt, tokens.pd)
+            if (plain != null && plain.trimStart().startsWith("{")) {
+                Log.e(TAG, "[DEC] static OK — ${plain.length}B")
+                return plain
+            }
         }
 
-        val static = decryptGdPayload(text, tokens.pd)
-        if (static != null && static.trimStart().startsWith("{")) {
-            Log.e(TAG, "[DEC] static OK — ${static.length}B")
-            return static
+        // ── Config endpoint fallback (may also be encrypted) ──
+        val decodedApx = try {
+            String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT),
+                Charsets.UTF_8).trim()
+        } catch (_: Exception) { "" }
+        val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
+        val pathExt = tokens.kaken + tokens.qsx + tokens.pd + tokens.ps
+        val configUrl = "${prefix.trimEnd('/')}/$pathExt?p=${tokens.apx}&_=${System.currentTimeMillis()}"
+
+        Log.e(TAG, "[STEP 13-alt] CONFIG: $configUrl")
+        val configCt = try {
+            val r = app.get(configUrl, headers = apiHeaders)
+            Log.e(TAG, "[STEP 13-alt RES] ${r.code} | ${r.text.length}B")
+            r.text.trim()
+        } catch (e: Exception) { Log.e(TAG, "[STEP 13-alt ERR] ${e.message}"); "" }
+
+        if (configCt.isNotBlank() && !configCt.startsWith("{")) {
+            val plain = decryptGdPayload(configCt, tokens.pd)
+            if (plain != null && plain.trimStart().startsWith("{")) {
+                Log.e(TAG, "[DEC] static (config) OK — ${plain.length}B")
+                return plain
+            }
         }
         return null
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Exhaustive static decrypt tester
+    //  Decrypt — the algorithm confirmed by browser-side test:
+    //    salt    = raw[0..16]
+    //    ct      = raw[16..]
+    //    derived = PBKDF2-HMAC-SHA256(password=pd, salt, 10000 iters, 48 bytes)
+    //    key     = derived[0..32]
+    //    iv      = derived[32..48]
+    //    plain   = AES-CBC-Pkcs7(ct, key, iv)
     // ────────────────────────────────────────────────────────────────
     private fun decryptGdPayload(b64: String, pd: String): String? {
-        Log.e(TAG, "[DEC] raw len=${b64.length} head=${b64.take(48)} tail=${b64.takeLast(24)}")
-
-        val b64Variants = listOf(
-            "asis"        to b64.trim(),
-            "commas"      to b64.trim().replace(",,", "==").replace(",", "="),
-            "urlsafe"     to b64.trim().replace('-', '+').replace('_', '/'),
-            "commas+url"  to b64.trim().replace(",,", "==").replace(",", "=").replace('-', '+').replace('_', '/')
-        )
-
-        var tried = 0
-        var bestPrintable = 0
-        var bestRecipe = ""
-
-        for ((bName, b0) in b64Variants) {
-            var s = b0
-            while (s.length % 4 != 0) s += "="
-            val raw = try { Base64.decode(s, Base64.DEFAULT) } catch (_: Exception) { continue }
-            if (raw.size < 32) continue
-
-            val splits = mutableListOf<Pair<String, Pair<ByteArray, ByteArray>>>()
-            if (raw.size > 16) splits.add("s16" to (raw.copyOfRange(0, 16) to raw.copyOfRange(16, raw.size)))
-            if (raw.size > 8)  splits.add("s8"  to (raw.copyOfRange(0, 8)  to raw.copyOfRange(8, raw.size)))
-
-            val pdVariants = mutableListOf<Pair<String, ByteArray>>()
-            pdVariants.add("pd" to pd.toByteArray(Charsets.UTF_8))
-            pdVariants.add("pd-trim" to pd.trim().toByteArray(Charsets.UTF_8))
-            try {
-                pdVariants.add("pd-b64" to Base64.decode(
-                    pd.trim().replace(",,", "==").replace(",", "="), Base64.DEFAULT))
-            } catch (_: Exception) {}
-            pdVariants.add("pd-nl" to (pd + "\n").toByteArray(Charsets.UTF_8))
-
-            for ((sName, pair) in splits) {
-                val (salt, ct) = pair
-                if (ct.isEmpty() || ct.size % 16 != 0) continue
-
-                for ((pdName, pdBytes) in pdVariants) {
-                    val kdfList = listOf(
-                        Triple("HmacSHA256", 10000, 48),
-                        Triple("HmacSHA256", 10000, 32),
-                        Triple("HmacSHA256", 1000, 48),
-                        Triple("HmacSHA1",   10000, 48),
-                        Triple("HmacSHA1",   1000, 48),
-                        Triple("HmacSHA1",   1, 48)
-                    )
-                    for ((algo, iters, dkLen) in kdfList) {
-                        val dk = try { pbkdf2Hmac(pdBytes, salt, iters, dkLen, algo) }
-                                 catch (_: Exception) { continue }
-
-                        val keyChoices = mutableListOf<Pair<String, ByteArray>>()
-                        if (dk.size >= 32) keyChoices.add("k32" to dk.copyOfRange(0, 32))
-                        if (dk.size >= 24) keyChoices.add("k24" to dk.copyOfRange(0, 24))
-                        if (dk.size >= 16) keyChoices.add("k16" to dk.copyOfRange(0, 16))
-
-                        for ((keyName, key) in keyChoices) {
-                            val ivChoices = mutableListOf<Pair<String, ByteArray>>()
-                            if (dk.size >= 48) ivChoices.add("iv48" to dk.copyOfRange(32, 48))
-                            if (dk.size >= 32) ivChoices.add("ivAfter16" to dk.copyOfRange(16, 32))
-                            ivChoices.add("iv0" to ByteArray(16))
-                            ivChoices.add("ivSalt" to salt)
-
-                            for ((ivName, iv) in ivChoices) {
-                                if (iv.size != 16) continue
-                                for (mode in listOf(
-                                    "AES/CBC/PKCS5Padding",
-                                    "AES/CBC/NoPadding",
-                                    "AES/ECB/PKCS5Padding"
-                                )) {
-                                    tried++
-                                    try {
-                                        val c = Cipher.getInstance(mode)
-                                        if (mode.contains("ECB")) {
-                                            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"))
-                                        } else {
-                                            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-                                        }
-                                        val bytes = c.doFinal(ct)
-
-                                        // Score printable ASCII in first 64 bytes
-                                        var printable = 0
-                                        val sampleLen = minOf(64, bytes.size)
-                                        val sample = bytes.copyOfRange(0, sampleLen)   // ByteArray
-                                        for (b in sample) {
-                                            val ui = b.toInt() and 0xFF
-                                            if (ui in 32..126 || ui == 10 || ui == 13 || ui == 9) printable++
-                                        }
-                                        val pct = if (sampleLen > 0) printable * 100 / sampleLen else 0
-
-                                        if (pct > bestPrintable) {
-                                            bestPrintable = pct
-                                            bestRecipe = "$bName/$sName/$pdName/$algo/$iters/dkLen=$dkLen/$keyName/$ivName/$mode"
-                                            Log.e(TAG, "[DEC NEAR] pct=$pct recipe=$bestRecipe")
-                                            Log.e(TAG, "[DEC NEAR] head=${String(sample, Charsets.UTF_8)}")
-                                        }
-
-                                        val plain = String(bytes, Charsets.UTF_8).trimStart()
-                                        if (plain.startsWith("{") && plain.contains("\"", false)) {
-                                            val recipe = "$bName/$sName/$pdName/$algo/$iters/dkLen=$dkLen/$keyName/$ivName/$mode"
-                                            Log.e(TAG, "[DEC HIT] recipe=$recipe")
-                                            Log.e(TAG, "[DEC HIT] head=${plain.take(220)}")
-                                            return plain
-                                        }
-                                    } catch (_: Exception) { }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Log.e(TAG, "[DEC] exhausted $tried variants — no JSON produced")
-        Log.e(TAG, "[DEC] best printable=$bestPrintable% recipe=$bestRecipe")
-        Log.e(TAG, "[DEC] CT first 32B hex: ${b64Hex(b64)}")
-        return null
-    }
-
-    private fun b64Hex(b64: String): String {
         var s = b64.trim().replace(",,", "==").replace(",", "=")
         while (s.length % 4 != 0) s += "="
-        val raw = try { Base64.decode(s, Base64.DEFAULT) } catch (_: Exception) { return "n/a" }
-        return raw.copyOfRange(0, minOf(32, raw.size)).joinToString("") { "%02x".format(it) }
+
+        val raw = try { Base64.decode(s, Base64.DEFAULT) } catch (e: Exception) {
+            Log.e(TAG, "[DEC] b64: ${e.message}"); return null
+        }
+        if (raw.size < 32 || (raw.size - 16) % 16 != 0) {
+            Log.e(TAG, "[DEC] bad length raw=${raw.size}"); return null
+        }
+
+        val salt = raw.copyOfRange(0, 16)
+        val ct   = raw.copyOfRange(16, raw.size)
+
+        val derived = try {
+            pbkdf2Hmac(pd.toByteArray(Charsets.UTF_8), salt, PBKDF2_ITERS, PBKDF2_LEN, "HmacSHA256")
+        } catch (e: Exception) { Log.e(TAG, "[DEC] KDF: ${e.message}"); return null }
+
+        val key = derived.copyOfRange(0, 32)
+        val iv  = derived.copyOfRange(32, 48)
+
+        return try {
+            val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
+            c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+            String(c.doFinal(ct), Charsets.UTF_8)
+        } catch (e: Exception) {
+            Log.e(TAG, "[DEC] AES: ${e.message}")
+            null
+        }
     }
 
     private fun pbkdf2Hmac(pw: ByteArray, salt: ByteArray, iters: Int, dkLen: Int, algo: String): ByteArray {
@@ -367,16 +308,19 @@ open class GalaxyDonghua : ExtractorApi() {
         if (!json.trimStart().startsWith("{")) {
             Log.e(TAG, "[EMIT] REFUSING — payload doesn't start with '{'"); return
         }
+        Log.e(TAG, "[EMIT] JSON head=${json.take(220)}")
 
         val baseURL = Regex("[\"']baseUrl[\"'][ \\t]*:[ \\t]*[\"']([^\"']+)[\"']").find(json)?.groupValues?.get(1) ?: gxBase
         val ph = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
         var emitted = 0
 
+        // Only accept URLs that look like real video streams
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
             val raw = m.groupValues[1]
             val abs = fixStreamUrl(raw, baseURL) ?: continue
             val isM3u8 = abs.contains(".m3u8") || abs.contains("hls", true)
-            Log.e(TAG, "[EMIT] file '$raw' → '$abs' (m3u8=$isM3u8)")
+            if (!isM3u8 && !abs.contains(".mp4")) continue
+            Log.e(TAG, "[EMIT] $abs (m3u8=$isM3u8)")
             callback.invoke(newExtractorLink(this.name, this.name, abs,
                 if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
                 this.referer = gxBase
@@ -385,7 +329,13 @@ open class GalaxyDonghua : ExtractorApi() {
             })
             emitted++
         }
-        Log.e(TAG, "[EMIT] total streams emitted=$emitted")
+        Log.e(TAG, "[EMIT] emitted=$emitted")
+
+        // Subtitles (if any "file" ends in .vtt/.srt)
+        for (m in Regex("""["']file["']\s*:\s*["']([^"']+\.(?:vtt|srt))["']""").findAll(json)) {
+            val abs = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
+            subtitleCallback.invoke(SubtitleFile("Sub", abs))
+        }
     }
 
     protected data class GdTokens(
@@ -589,7 +539,7 @@ open class GalaxyDonghua : ExtractorApi() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-//  Rhino sandbox — ES6 + reserved-word key pre-processing
+//  Rhino sandbox — best-effort fallback
 // ─────────────────────────────────────────────────────────────────────
 object GdRhino {
     private const val TAG = "GdRhino"
@@ -601,9 +551,7 @@ object GdRhino {
     fun tryDecrypt(
         playerJs: String, cryptoJs: String, ciphertext: String, globals: Map<String, String>
     ): String? {
-        // Attempt 1: as-is (Rhino's ES6 parser may handle it)
         evalAndCall(playerJs, cryptoJs, ciphertext, globals, preprocess = false)?.let { return it }
-        // Attempt 2: quote reserved-word property keys, then eval
         return evalAndCall(playerJs, cryptoJs, ciphertext, globals, preprocess = true)
     }
 
@@ -652,13 +600,12 @@ object GdRhino {
             }
 
             val fn = (scope.get("dcx", scope) as? Function) ?: run {
-                Log.e(TAG, "dcx not found after ${if (preprocess) "preprocessed" else "raw"} eval")
-                return null
+                Log.e(TAG, "dcx not found"); return null
             }
             val result = try { fn.call(ctx, scope, scope, arrayOf<Any>(ciphertext)) }
                          catch (e: Throwable) { Log.e(TAG, "dcx call: ${e.message}"); return null }
             val s = Context.toString(result)
-            Log.e(TAG, "${if (preprocess) "preprocessed" else "raw"} dcx returned ${s.length}B head=${s.take(80)}")
+            Log.e(TAG, "dcx returned ${s.length}B")
             return s.takeIf { it.length > 20 && it.contains("{") }
         } finally { Context.exit() }
     }
