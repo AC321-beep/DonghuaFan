@@ -165,6 +165,8 @@ open class GalaxyDonghua : ExtractorApi() {
                 
                 if (decryptedData == null) {
                     Log.e(TAG, "[STEP 13 ERROR] CryptoJS dcx() returned null for cipher chunk.")
+                    val preview = if (text.length > 100) text.substring(0, 100) else text
+                    Log.e(TAG, "[STEP 13 ERROR] API Response Preview: $preview")
                 }
                 return decryptedData
             } else {
@@ -259,7 +261,7 @@ open class GalaxyDonghua : ExtractorApi() {
 
     private fun decodePackedJs(payload: String, keywords: List<String>, base: Int): String {
         val parts = keywords.mapIndexedNotNull { i, kw ->
-            if (kw.isNotBlank()) (Regex.escape(toBase(i, base)) to kw) else null
+            if (kw.isNotBlank()) (toBase(i, base) to kw) else null // Removed Regex.escape() which corrupted Kotlin keys
         }
         if (parts.isEmpty()) return payload
         val alternation = parts.joinToString("|") { it.first }
@@ -272,23 +274,22 @@ open class GalaxyDonghua : ExtractorApi() {
         Log.e(TAG, "[TOKEN 1] Starting decode process. Page length: ${page.length}")
         
         fun extractHtmlFallback(n: String, text: String): String {
-            // Strictly bounded max lengths ({1,250}) eliminate Catastrophic Backtracking (ReDoS) freezing
-            val strPattern = "[\"']?$n[\"']?[ \\t]*]?[ \\t]*[:=][ \\t]*[\"']([^\"']{1,250})[\"']"
+            val strPattern = "[\"']?$n[\"']?[ \\t]*\\]?[ \\t]*[:=][ \\t]*(?:atob[ \\t]*\\([ \\t]*)?[\"']([^\"']+)[\"']"
             Regex(strPattern).find(text)?.let { return it.groupValues[1].trim() }
-            val numPattern = "[\"']?$n[\"']?[ \\t]*]?[ \\t]*[:=][ \\t]*([a-zA-Z0-9\\-_]{1,250})"
+            val numPattern = "[\"']?$n[\"']?[ \\t]*\\]?[ \\t]*[:=][ \\t]*([a-zA-Z0-9\\-_]+)"
             Regex(numPattern).find(text)?.let { return it.groupValues[1].trim() }
             return ""
         }
 
         fun extractSmartJs(n: String, text: String): String {
-            // Explicitly split 'atob' wrapper vs standard string to prevent nested ReDoS loops
-            val atobRx = Regex("[\"']?$n[\"']?[ \\t]*]?[ \\t]*[:=][ \\t]*atob[ \\t]*\\([ \\t]*[\"']([^\"']{1,250})[\"']")
+            // Unbounded capture groups removed length limiters (fixes >250 char truncation)
+            val atobRx = Regex("[\"']?$n[\"']?[ \\t]*\\]?[ \\t]*[:=][ \\t]*atob[ \\t]*\\([ \\t]*[\"']([^\"']+)[\"']")
             atobRx.find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
 
-            val strRx = Regex("[\"']?$n[\"']?[ \\t]*]?[ \\t]*[:=][ \\t]*[\"']([^\"']{1,250})[\"']")
+            val strRx = Regex("[\"']?$n[\"']?[ \\t]*\\]?[ \\t]*[:=][ \\t]*[\"']([^\"']+)[\"']")
             strRx.find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
 
-            val indRx = Regex("[\"']$n[\"'][;,][ \\t]*(?:var[ \\t]+)?(?:[a-zA-Z0-9_]+)[ \\t]*=[ \\t]*[\"']([^\"']{1,250})[\"']")
+            val indRx = Regex("[\"']$n[\"'][;,][ \\t]*(?:var[ \\t]+)?(?:[a-zA-Z0-9_]+)[ \\t]*=[ \\t]*[\"']([^\"']+)[\"']")
             indRx.find(text)?.let { return it.groupValues[1].substringBefore("-,").trim() }
             
             return ""
@@ -334,7 +335,7 @@ open class GalaxyDonghua : ExtractorApi() {
                     jsFuck = sb.toString()
                     Log.e(TAG, "[TOKEN 4] Decoded JSFuck logic to JS string. Length: ${jsFuck.length}")
                     
-                    // --- OPTIMIZED DEAN EDWARDS UNPACKER (Fixes False Positive String Truncation) ---
+                    // --- OPTIMIZED DEAN EDWARDS UNPACKER ---
                     val startPacked = jsFuck.indexOf("}(")
                     if (startPacked >= 0) {
                         try {
