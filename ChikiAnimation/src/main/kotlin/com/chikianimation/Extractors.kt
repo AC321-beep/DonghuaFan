@@ -1,6 +1,5 @@
 package com.chikianimation
 
-import android.util.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.Filesim
@@ -23,10 +22,6 @@ class SkylineAI : ExtractorApi() {
     override var mainUrl = "https://skylineai.cloud"
     override val requiresReferer = true
 
-    companion object {
-        private const val TAG = "ChikiPerf"
-    }
-
     private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
     override suspend fun getUrl(
@@ -35,9 +30,6 @@ class SkylineAI : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val t0 = System.currentTimeMillis()
-        Log.e(TAG, "[SkylineAI] Starting extraction for: $url")
-
         val baseHost = embedHost(url)
         val headers = mapOf(
             "User-Agent" to userAgent,
@@ -48,24 +40,17 @@ class SkylineAI : ExtractorApi() {
         )
 
         val page = try {
-            val netStart = System.currentTimeMillis()
-            val text = app.get(url, headers = headers).text
-            Log.e(TAG, "[SkylineAI] Page fetch took ${System.currentTimeMillis() - netStart}ms (${text.length} chars)")
-            text
+            app.get(url, headers = headers).text
         } catch (e: Exception) {
-            Log.e(TAG, "[SkylineAI] Fetch failed: ${e.message}")
             return
         }
 
         // Subtitles parsing
-        val subStart = System.currentTimeMillis()
-        var subCount = 0
         Jsoup.parse(page).select("track").forEach { track ->
             val src = track.attr("src")
             val label = track.attr("label").ifBlank { "Subtitle" }
             if (src.isNotBlank() && (src.contains(".vtt", true) || src.contains(".srt", true))) {
                 subtitleCallback.invoke(SubtitleFile(label, fixUrl(src, baseHost)))
-                subCount++
             }
         }
 
@@ -76,11 +61,9 @@ class SkylineAI : ExtractorApi() {
                 if (file != null) {
                     val label = Regex("""label["']?\s*:\s*["']([^"']+)["']""").find(block)?.groupValues?.get(1) ?: "Subtitle"
                     subtitleCallback.invoke(SubtitleFile(label, fixUrl(file, baseHost)))
-                    subCount++
                 }
             }
         }
-        Log.e(TAG, "[SkylineAI] Subtitle scan found $subCount tracks in ${System.currentTimeMillis() - subStart}ms")
 
         // Video parsing
         val vid = Regex("const[ \\t]+VID_SRC[ \\t]*=[ \\t]*[\"']([^\"']+)[\"']").find(page)
@@ -97,7 +80,6 @@ class SkylineAI : ExtractorApi() {
                 this.quality = Qualities.Unknown.value
                 this.headers = mapOf("User-Agent" to userAgent, "Referer" to baseHost, "Origin" to baseHost)
             })
-            Log.e(TAG, "[SkylineAI] VID_SRC found, total time: ${System.currentTimeMillis() - t0}ms")
             return
         }
 
@@ -117,7 +99,6 @@ class SkylineAI : ExtractorApi() {
                 this.headers = mapOf("User-Agent" to userAgent, "Referer" to baseHost, "Origin" to baseHost)
             })
         }
-        Log.e(TAG, "[SkylineAI] Fallback completed, total time: ${System.currentTimeMillis() - t0}ms")
     }
 
     private fun fixUrl(url: String, base: String): String = when {
