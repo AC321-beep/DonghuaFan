@@ -113,12 +113,9 @@ open class GalaxyDonghua : ExtractorApi() {
                 Log.e(TAG, "[STEP 10 ERROR] Token decoder returned NULL. Skipping this candidate.")
                 continue
             }
-            
-            val password = pickPassword(tokens)
-            Log.e(TAG, "[STEP 11] Tokens ready. Password picked: $password")
 
-            Log.e(TAG, "[STEP 12] Initiating fetchAndDecryptApi...")
-            val streamJson = fetchAndDecryptApi(tokens, password, headers, gxBase, targetUrl)
+            Log.e(TAG, "[STEP 12] Initiating fetchAndDecryptApi via brute-force...")
+            val streamJson = fetchAndDecryptApi(tokens, headers, gxBase, targetUrl)
             if (streamJson != null) {
                 Log.e(TAG, "[STEP 14] Decryption successful! Emitting streams.")
                 emitStreams(streamJson, gxBase, callback, subtitleCallback)
@@ -135,14 +132,11 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     private suspend fun fetchAndDecryptApi(
-        tokens: GdTokens, password: String, headers: Map<String, String>, gxBase: String, embedUrl: String
+        tokens: GdTokens, headers: Map<String, String>, gxBase: String, embedUrl: String
     ): String? {
         val decodedApx = try {
             String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT), Charsets.UTF_8).trim()
-        } catch (e: Exception) { 
-            Log.e(TAG, "[API ERROR] Failed to decode APX token: ${e.message}")
-            "" 
-        }
+        } catch (e: Exception) { "" }
 
         val prefix = if (decodedApx.startsWith("http")) decodedApx else "$gxBase/api-config/"
         val cleanPrefix = prefix.trimEnd('/')
@@ -161,14 +155,25 @@ open class GalaxyDonghua : ExtractorApi() {
             if (text.isNotBlank()) {
                 val cipherRx = Regex("[\"'](?:data|file|source|sources)[\"'][ \\t]*:[ \\t]*[\"']([^\"']+)[\"']")
                 val cipher = cipherRx.find(text)?.groupValues?.get(1) ?: text
-                val decryptedData = dcx(cipher, password)
                 
-                if (decryptedData == null) {
-                    Log.e(TAG, "[STEP 13 ERROR] CryptoJS dcx() returned null for cipher chunk.")
-                    val preview = if (text.length > 100) text.substring(0, 100) else text
-                    Log.e(TAG, "[STEP 13 ERROR] API Response Preview: $preview")
+                // Brute force AES decryption against ALL scraped variables and their base64-decoded variants
+                val candidates = listOf(
+                    tokens.pd, tokens.ps, tokens.qsx, tokens.kaken, tokens.apx, tokens.localKey, tokens.utekmek
+                ).filter { it.isNotBlank() }.flatMap { 
+                    val decoded = try {
+                        String(Base64.decode(it.replace(",,", "==").replace(",", "="), Base64.DEFAULT), Charsets.UTF_8).trim()
+                    } catch (e: Exception) { "" }
+                    listOf(it, decoded)
+                }.filter { it.isNotBlank() }.distinct()
+
+                for (pass in candidates) {
+                    val decryptedData = dcx(cipher, pass)
+                    if (decryptedData != null && (decryptedData.contains("{") || decryptedData.contains("["))) {
+                        Log.e(TAG, "[STEP 13 SUCCESS] AES Decrypted successfully using dynamic key!")
+                        return decryptedData
+                    }
                 }
-                return decryptedData
+                Log.e(TAG, "[STEP 13 ERROR] Exhausted all ${candidates.size} potential keys. Decryption failed.")
             } else {
                 Log.e(TAG, "[STEP 13 ERROR] API response body is empty!")
             }
@@ -201,14 +206,10 @@ open class GalaxyDonghua : ExtractorApi() {
         }
     }
 
-    protected data class GdTokens(val pd: String, val ps: String, val qsx: String, val kaken: String, val apx: String)
-
-    private fun pickPassword(t: GdTokens): String {
-        val all = listOf(t.pd, t.ps, t.qsx, t.kaken, t.apx).filter { it.isNotBlank() }
-        val d10Rx = Regex("^\\d{10}$")
-        val hexRx = Regex("^[a-f0-9\\-]{36}$")
-        return all.firstOrNull { it.matches(d10Rx) } ?: all.firstOrNull { it.matches(hexRx) } ?: t.pd
-    }
+    protected data class GdTokens(
+        val pd: String, val ps: String, val qsx: String, val kaken: String, val apx: String,
+        val localKey: String, val utekmek: String
+    )
 
     // ────────────────────────────────────────────────────────────────
     //  DEAN EDWARDS OPTIMIZED UNPACKER LOGIC
@@ -334,7 +335,6 @@ open class GalaxyDonghua : ExtractorApi() {
                     jsFuck = sb.toString()
                     Log.e(TAG, "[TOKEN 4] Decoded JSFuck logic to JS string. Length: ${jsFuck.length}")
                     
-                    // --- OPTIMIZED DEAN EDWARDS UNPACKER ---
                     val startPacked = jsFuck.indexOf("}(")
                     if (startPacked >= 0) {
                         try {
@@ -358,7 +358,6 @@ open class GalaxyDonghua : ExtractorApi() {
                         }
                     }
                     
-                    // --- NATIVE ATOB UNWRAPPER ---
                     Regex("atob[ \\t]*\\([ \\t]*[\"']([^\"']+)[\"'][ \\t]*\\)").find(jsFuck)?.let { match ->
                         try {
                             val decodedAtob = String(Base64.decode(match.groupValues[1], Base64.DEFAULT), Charsets.UTF_8)
@@ -383,20 +382,24 @@ open class GalaxyDonghua : ExtractorApi() {
         val jsQsx = extractSmartJs("qsx", jsFuck)
         val jsKaken = extractSmartJs("kaken", jsFuck)
         val jsApx = extractSmartJs("apx", jsFuck)
+        val jsLocalKey = extractSmartJs("localKey", jsFuck)
+        val jsUtekmek = extractSmartJs("utekmek", jsFuck)
 
-        val finalPd    = jsPd.ifBlank { extractHtmlFallback("pd", page) }.replace("==", ",,")
-        val finalPs    = jsPs.ifBlank { extractHtmlFallback("ps", page) }.replace("==", ",,")
-        val finalQsx   = jsQsx.ifBlank { extractHtmlFallback("qsx", page) }.replace("==", ",,")
-        val finalKaken = jsKaken.ifBlank { extractHtmlFallback("kaken", page) }.replace("==", ",,")
-        val finalApx   = jsApx.ifBlank { extractHtmlFallback("apx", page) }.replace("==", ",,")
+        val finalPd       = jsPd.ifBlank { extractHtmlFallback("pd", page) }.replace("==", ",,")
+        val finalPs       = jsPs.ifBlank { extractHtmlFallback("ps", page) }.replace("==", ",,")
+        val finalQsx      = jsQsx.ifBlank { extractHtmlFallback("qsx", page) }.replace("==", ",,")
+        val finalKaken    = jsKaken.ifBlank { extractHtmlFallback("kaken", page) }.replace("==", ",,")
+        val finalApx      = jsApx.ifBlank { extractHtmlFallback("apx", page) }.replace("==", ",,")
+        val finalLocalKey = jsLocalKey.ifBlank { extractHtmlFallback("localKey", page) }.replace("==", ",,")
+        val finalUtekmek  = jsUtekmek.ifBlank { extractHtmlFallback("utekmek", page) }.replace("==", ",,")
 
-        Log.e(TAG, "[TOKEN FINAL] PD: $finalPd | PS: $finalPs | QSX: $finalQsx | KAKEN: $finalKaken | APX: $finalApx")
+        Log.e(TAG, "[TOKEN FINAL] Extracted tokens mapped for brute-forcing.")
 
         if (listOf(finalPd, finalApx).all { it.isBlank() }) {
             Log.e(TAG, "[TOKEN ERROR] Both PD and APX are blank. Extraction failed.")
             return null
         }
-        return GdTokens(finalPd, finalPs, finalQsx, finalKaken, finalApx)
+        return GdTokens(finalPd, finalPs, finalQsx, finalKaken, finalApx, finalLocalKey, finalUtekmek)
     }
 
     private fun stripConstants(s: String): String {
@@ -475,15 +478,13 @@ open class GalaxyDonghua : ExtractorApi() {
     // ────────────────────────────────────────────────────────────────
     //  CRYPTO & UTILS
     // ────────────────────────────────────────────────────────────────
-    
-    // FIX: Accurately replicates CryptoJS's EvpKDF by instantiating a new MD5 context on every iteration
     private fun cryptoJsEvpKDF(password: ByteArray, salt: ByteArray, keySize: Int, ivSize: Int): ByteArray {
         val derived = ByteArray(keySize + ivSize)
         var block: ByteArray? = null
         var offset = 0
         
         while (offset < derived.size) {
-            val md = MessageDigest.getInstance("MD5") // Must be instantiated inside the loop
+            val md = MessageDigest.getInstance("MD5")
             if (block != null) md.update(block)
             md.update(password)
             if (salt.isNotEmpty()) md.update(salt)
@@ -507,7 +508,7 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     private fun dcx(input: String, password: String): String? {
-        if (input.isBlank()) return null
+        if (input.isBlank() || password.isBlank()) return null
         try {
             var s = input.trim().replace(",,", "==").replace(",", "=").replace('-', '+').replace('_', '/')
             while (s.length % 4 != 0) s += "="
@@ -527,22 +528,22 @@ open class GalaxyDonghua : ExtractorApi() {
 
             try {
                 cryptoJsEvpKDF(passBytes, salt, 32, 16).let { k ->
-                    aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
+                    aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{") || it.contains("[")) return it }
                 }
             } catch (_: Exception) {}
 
             try {
                 cryptoJsEvpKDF(passBytes, ByteArray(0), 32, 16).let { k ->
-                    aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{")) return it }
+                    aesDecrypt(ct, k.copyOfRange(0, 32), k.copyOfRange(32, 48))?.let { if (it.contains("{") || it.contains("[")) return it }
                 }
             } catch (_: Exception) {}
 
-            try { aesDecrypt(ct, md5Pass, md5Pass)?.let { if (it.contains("{")) return it } } catch (_: Exception) {}
+            try { aesDecrypt(ct, md5Pass, md5Pass)?.let { if (it.contains("{") || it.contains("[")) return it } } catch (_: Exception) {}
 
             try {
                 val c = Cipher.getInstance("AES/ECB/PKCS5Padding")
                 c.init(Cipher.DECRYPT_MODE, SecretKeySpec(md5Pass, "AES"))
-                String(c.doFinal(ct), Charsets.UTF_8).let { if (it.contains("{")) return it }
+                String(c.doFinal(ct), Charsets.UTF_8).let { if (it.contains("{") || it.contains("[")) return it }
             } catch (_: Exception) {}
 
         } catch (_: Exception) {}
