@@ -213,13 +213,19 @@ open class GalaxyDonghua : ExtractorApi() {
         return all.firstOrNull { it.matches(Regex("""^\d{10}$""")) } ?: all.firstOrNull { it.matches(Regex("""^[a-f0-9\-]{36}$""")) } ?: t.pd
     }
 
-    private fun decodeGdTokens(page: String): GdTokens? {
+   private fun decodeGdTokens(page: String): GdTokens? {
         Log.e(TAG, "[TOKEN 1] Starting decode process. Page length: ${page.length}")
         
         fun extractVars(text: String): GdTokens {
             fun grabVar(name: String): String {
-                Regex("""\b$name\b\s*[:=]\s*['"`]([^'"`]+)['"`]""").find(text)?.let { return it.groupValues[1].trim() }
-                Regex("""\b$name\b\s*[:=]\s*([^'"`\s,;{}()]+)""").find(text)?.let { return it.groupValues[1].trim() }
+                // Matches standard assignments and object keys: pd="val", "pd":"val", 'pd'="val", ['pd']="val"
+                val strRegex = Regex("""(?:$name\vert{}["']$name["'])\s*\]?\s*[:=]\s*['"`]([^'"`]+)['"`]""")
+                strRegex.find(text)?.let { return it.groupValues[1].trim() }
+                
+                // Matches unquoted numeric fallback: pd=123456
+                val numRegex = Regex("""(?:$name|["']$name["'])\s*\]?\s*[:=]\s*([^'"`\s,;{}()\[\]]+)""")
+                numRegex.find(text)?.let { return it.groupValues[1].trim() }
+                
                 return ""
             }
             return GdTokens(grabVar("pd"), grabVar("ps"), grabVar("qsx"), grabVar("kaken"), grabVar("apx"))
@@ -256,6 +262,35 @@ open class GalaxyDonghua : ExtractorApi() {
                     }
                     jsFuck = sb.toString()
                     Log.e(TAG, "[TOKEN 4] Decoded JSFuck logic to JS string. Length: ${jsFuck.length}")
+                    Log.e(TAG, "[TOKEN 4.1 RAW DECODED] $jsFuck") // Prints exactly what we are parsing
+                    
+                    // --- NESTED OBFUSCATION UNWRAPPING ---
+                    // 1. Unwrap Dean Edwards Packer if present
+                    if (jsFuck.contains("eval(function(p,a,c,k,e,")) {
+                        try {
+                            com.lagradost.cloudstream3.utils.Unpacker.unpack(jsFuck)?.let { unpacked ->
+                                if (unpacked.isNotBlank()) {
+                                    jsFuck = unpacked
+                                    Log.e(TAG, "[TOKEN 5] Unpacked Dean Edwards. Length: ${jsFuck.length}")
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "[TOKEN ERROR] Unpacker failed: ${e.message}")
+                        }
+                    }
+
+                    // 2. Unwrap base64 atob(...) wrap if present
+                    Regex("""atob\s*\(\s*['"]([^'"]+)['"]\s*\)""").find(jsFuck)?.let { match ->
+                        try {
+                            val decodedAtob = String(Base64.decode(match.groupValues[1], Base64.DEFAULT), Charsets.UTF_8)
+                            if (decodedAtob.isNotBlank()) {
+                                jsFuck = decodedAtob
+                                Log.e(TAG, "[TOKEN 6] Unwrapped atob. Length: ${jsFuck.length}")
+                            }
+                        } catch (e: Exception) {
+                            Log.e(TAG, "[TOKEN ERROR] atob decode failed: ${e.message}")
+                        }
+                    }
                 }
             } else {
                 Log.e(TAG, "[TOKEN ERROR] Could not find end of JSFuck payload.")
@@ -273,7 +308,7 @@ open class GalaxyDonghua : ExtractorApi() {
         val finalKaken = js.kaken.ifBlank { html.kaken }
         val finalApx   = js.apx.ifBlank   { html.apx }
 
-        Log.e(TAG, "[TOKEN FINAL] PD: $finalPd | PS: $finalPs | QSX: $finalQsx | KAKEN: $finalKaken | APX: $finalApx")
+        Log.e(TAG, "[TOKEN FINAL] PD: $finalPd | PS: $finalPs \vert{} QSX:$finalQsx | KAKEN: $finalKaken \vert{} APX:$finalApx")
 
         if (listOf(finalPd, finalApx).all { it.isBlank() }) {
             Log.e(TAG, "[TOKEN ERROR] Both PD and APX are blank. Extraction failed.")
