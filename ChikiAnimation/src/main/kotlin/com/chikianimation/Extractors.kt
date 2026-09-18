@@ -12,7 +12,6 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.mozilla.javascript.Context
 import org.mozilla.javascript.Function
-import org.mozilla.javascript.Scriptable
 import org.mozilla.javascript.ScriptableObject
 import java.net.URI
 import javax.crypto.Cipher
@@ -41,8 +40,7 @@ open class GalaxyDonghua : ExtractorApi() {
         private const val PBKDF2_ITERS = 10_000
         private const val PBKDF2_LEN   = 48
 
-        // Cached across requests within a session — the site doesn't change
-        // player.js mid-session, and re-evaluating 180KB of JS in Rhino is slow.
+        // Session-level caches. Nullable "not yet attempted"; empty string = attempted and failed.
         @Volatile private var cachedPlayerJsUrl: String? = null
         @Volatile private var cachedPlayerJs: String? = null
         @Volatile private var cachedCryptoJs: String? = null
@@ -81,8 +79,9 @@ open class GalaxyDonghua : ExtractorApi() {
             }); return
         }
 
-        // ─── DYNAMIC: discover the player JS the embed page uses ───────
+        // ─── dynamic: discover the site's own player.js + CryptoJS ────
         val playerJs = fetchPlayerJs(page, gxBase, headers)
+        val cryptoJs = getCryptoJs()
 
         val candidates = Regex("data-url=[\"']([^\"']+)[\"']").findAll(page)
             .map { it.groupValues[1] }.map { if (it.startsWith("/")) gxBase + it else it }
@@ -98,11 +97,11 @@ open class GalaxyDonghua : ExtractorApi() {
             } catch (e: Exception) { Log.e(TAG, "[STEP 8 ERR] ${e.message}"); continue }
 
             val tokens = decodeGdTokens(sp) ?: continue
-            Log.e(TAG, "[TOK] PD=${tokens.pd}")
+            Log.e(TAG, "[TOK] PD=${tokens.pd} LK=${tokens.localKey} UT.len=${tokens.utekmek.length}")
 
-            val json = fetchAndDecryptApi(tokens, headers, gxBase, target, playerJs)
+            val json = fetchAndDecryptApi(tokens, headers, gxBase, target, playerJs, cryptoJs)
             if (json != null) {
-                Log.e(TAG, "[STEP 14] OK — ${json.length}B")
+                Log.e(TAG, "[STEP 14] Decrypted OK — ${json.length}B")
                 emitStreams(json, gxBase, callback, subtitleCallback)
                 ok = true; break
             }
@@ -111,31 +110,31 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Player JS discovery + fetch (dynamic)
+    //  Dynamic discovery of the site's player.js
     // ────────────────────────────────────────────────────────────────
     private suspend fun fetchPlayerJs(
         page: String, gxBase: String, headers: Map<String, String>
     ): String? {
-        // Try the URL we already have cached first
         cachedPlayerJs?.let {
-            Log.e(TAG, "[JS] using cached playerJs (${it.length}B)")
-            return it
+            if (it.isNotEmpty()) Log.e(TAG, "[JS] cached player.js (${it.length}B)")
+            return it.ifEmpty { null }
         }
 
-        // Look for a script tag whose src contains "player" and ".min.js"
         val srcs = Regex("""<script[^>]+src\s*=\s*["']([^"']+)["']""")
             .findAll(page).map { it.groupValues[1] }.distinct().toList()
         Log.e(TAG, "[JS] script srcs: $srcs")
 
-        val candidates = srcs.filter {
-            it.contains("player", ignoreCase = true) && it.contains(".js")
-        }
-        if (candidates.isEmpty()) {
-            Log.e(TAG, "[JS] no player script found")
+        // Prefer scripts that mention "player". If none, try all .js files.
+        val preferred = srcs.filter { it.contains("player", true) && it.contains(".js") }
+        val ordered = (preferred + srcs.filterNot { it in preferred }).distinct()
+
+        if (ordered.isEmpty()) {
+            Log.e(TAG, "[JS] no scripts in page")
+            cachedPlayerJs = ""
             return null
         }
 
-        for (src in candidates) {
+        for (src in ordered) {
             val abs = absolutize(src, gxBase)
             Log.e(TAG, "[JS] fetching $abs")
             val text = try {
@@ -144,16 +143,20 @@ open class GalaxyDonghua : ExtractorApi() {
                 r.text
             } catch (e: Exception) { Log.e(TAG, "[JS ERR] ${e.message}"); continue }
 
-            // Only accept JS that actually defines dcx()
-            if (text.contains("function dcx") || text.contains("dcx=function") ||
-                Regex("""\bdcx\s*[=(]""").containsMatchIn(text)) {
+            // Reject anything too small to define the algorithm
+            if (text.length < 2_000) { Log.e(TAG, "[JS] skipped — too small"); continue }
+
+            // Look for dcx or a synonymous decrypt entry point
+            if (Regex("""\b(?:dcx|decrypt|decode)\s*[=(]""").containsMatchIn(text)) {
+                Log.e(TAG, "[JS] accepted — defines decrypt entry point")
                 cachedPlayerJsUrl = abs
                 cachedPlayerJs = text
                 return text
-            } else {
-                Log.e(TAG, "[JS] skipped — no dcx() defined")
             }
+            Log.e(TAG, "[JS] skipped — no known entry point")
         }
+        Log.e(TAG, "[JS] gave up — none of the scripts define dcx/decrypt/decode")
+        cachedPlayerJs = ""
         return null
     }
 
@@ -164,12 +167,24 @@ open class GalaxyDonghua : ExtractorApi() {
         else -> base.trimEnd('/') + "/" + src
     }
 
+    private suspend fun getCryptoJs(): String {
+        cachedCryptoJs?.let { return it }
+        val js = try {
+            app.get("https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js").text
+        } catch (e: Exception) {
+            Log.e(TAG, "[JS] crypto-js fetch failed: ${e.message}"); ""
+        }
+        cachedCryptoJs = js
+        if (js.isNotEmpty()) Log.e(TAG, "[JS] crypto-js loaded ${js.length}B")
+        return js
+    }
+
     // ────────────────────────────────────────────────────────────────
-    //  API + decrypt
+    //  API fetch + decrypt (Rhino primary, static fallback)
     // ────────────────────────────────────────────────────────────────
     private suspend fun fetchAndDecryptApi(
         tokens: GdTokens, headers: Map<String, String>, gxBase: String,
-        embedUrl: String, playerJs: String?
+        embedUrl: String, playerJs: String?, cryptoJs: String
     ): String? {
         val decodedApx = try {
             String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT), Charsets.UTF_8).trim()
@@ -190,38 +205,37 @@ open class GalaxyDonghua : ExtractorApi() {
             Log.e(TAG, "[STEP 13 API RES] ${r.code} | ${r.text.length}B")
             r.text.trim()
         } catch (e: Exception) { Log.e(TAG, "[STEP 13 ERR] ${e.message}"); return null }
-        if (text.isBlank()) return null
-        if (text.startsWith("{") && text.contains("\"file\"", true)) return text
 
-        // ── PRIMARY: hand the ciphertext to the site's own dcx() ──────
-        if (playerJs != null) {
-            val cryptoJs = getCryptoJs()
+        if (text.isBlank()) return null
+        if (text.startsWith("{") && text.contains("\"file\"", true)) {
+            Log.e(TAG, "[DEC] plain JSON (server skipped encryption)")
+            return text
+        }
+
+        // ── PRIMARY: Rhino running the site's own dcx() ──────────────
+        if (playerJs != null && cryptoJs.isNotEmpty()) {
             val result = GdRhino.tryDecrypt(playerJs, cryptoJs, text, tokens.toGlobalMap())
             if (result != null && result.contains("{")) {
                 Log.e(TAG, "[DEC] Rhino OK — ${result.length}B")
                 return result
             }
-            Log.e(TAG, "[DEC] Rhino failed — falling back to static Kotlin")
+            Log.e(TAG, "[DEC] Rhino failed — falling back to static")
+        } else if (playerJs == null) {
+            Log.e(TAG, "[DEC] player.js unavailable — going straight to static")
         }
 
-        // ── FALLBACK: static Kotlin port of the current algorithm ─────
-        return decryptGdPayload(text, tokens.pd)
-    }
-
-    private suspend fun getCryptoJs(): String {
-        cachedCryptoJs?.let { return it }
-        val js = try {
-            app.get("https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js").text
-        } catch (e: Exception) {
-            Log.e(TAG, "[JS] crypto-js fetch failed: ${e.message}")
-            ""
+        // ── FALLBACK: static Kotlin port ────────────────────────────
+        val static = decryptGdPayload(text, tokens.pd)
+        if (static != null) {
+            Log.e(TAG, "[DEC] static OK — ${static.length}B")
+        } else {
+            Log.e(TAG, "[DEC] static failed")
         }
-        cachedCryptoJs = js
-        return js
+        return static
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Static fallback (current known algorithm)
+    //  Static fallback — port of the current known algorithm
     // ────────────────────────────────────────────────────────────────
     private fun decryptGdPayload(b64: String, pd: String): String? {
         var s = b64.trim()
@@ -280,30 +294,64 @@ open class GalaxyDonghua : ExtractorApi() {
         return out.copyOfRange(0, dkLen)
     }
 
+    // ────────────────────────────────────────────────────────────────
+    //  Emit streams — diagnostic logging + looser matching
+    // ────────────────────────────────────────────────────────────────
     private suspend fun emitStreams(
         json: String, gxBase: String,
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit
     ) {
-        val baseURL = Regex("[\"']baseUrl[\"'][ \\t]*:[ \\t]*[\"']([^\"']+)[\"']").find(json)?.groupValues?.get(1) ?: gxBase
+        Log.e(TAG, "[EMIT] JSON length=${json.length}")
+        json.chunked(900).forEachIndexed { i, chunk ->
+            Log.e(TAG, "[EMIT] JSON[$i]: $chunk")
+        }
+
+        val baseURL = Regex("[\"']baseUrl[\"'][ \\t]*:[ \\t]*[\"']([^\"']+)[\"']")
+            .find(json)?.groupValues?.get(1) ?: gxBase
+        Log.e(TAG, "[EMIT] baseURL=$baseURL")
+
         val ph = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
 
-        val rx = Regex("[\"']file[\"'][ \\t]*:[ \\t]*[\"']([^\"']+)[\"'](?:[^{}]*?[\"']label[\"'][ \\t]*:[ \\t]*[\"']([^\"']*)[\"'])?(?:[^{}]*?[\"']type[\"'][ \\t]*:[ \\t]*[\"']([^\"']*)[\"'])?")
-        for (m in rx.findAll(json)) {
-            val u = fixStreamUrl(m.groupValues[1], baseURL) ?: continue
-            val label = m.groupValues[2].ifBlank { "Auto" }
-            val isM3u8 = u.contains(".m3u8") || m.groupValues[3].contains("hls", true)
-            callback.invoke(newExtractorLink(this.name, "${this.name} – $label", u,
+        var emitted = 0
+        // Primary: any "file" key with an URL-ish value
+        for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
+            val raw = m.groupValues[1]
+            val abs = fixStreamUrl(raw, baseURL) ?: continue
+            val isM3u8 = abs.contains(".m3u8") || abs.contains("hls", true)
+            Log.e(TAG, "[EMIT] file '$raw' → '$abs' (m3u8=$isM3u8)")
+            callback.invoke(newExtractorLink(this.name, this.name, abs,
                 if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
                 this.referer = gxBase
-                this.quality = label.filter { it.isDigit() }.toIntOrNull() ?: Qualities.Unknown.value
+                this.quality = Qualities.Unknown.value
                 this.headers = ph
             })
+            emitted++
         }
-        val subRx = Regex("[\"']file[\"'][ \\t]*:[ \\t]*[\"']([^\"']+\\.(?:vtt|srt))[\"'](?:[^{}]*?[\"']label[\"'][ \\t]*:[ \\t]*[\"']([^\"']*)[\"'])?")
-        for (m in subRx.findAll(json)) {
-            val u = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
-            subtitleCallback.invoke(SubtitleFile(m.groupValues[2].ifBlank { "Sub" }, u))
+
+        // Fallback: generic "url" / "link" / "src" keys
+        if (emitted == 0) {
+            for (m in Regex("""["'](?:url|link|src)["']\s*:\s*["'](https?://[^"']+|//[^"']+)["']""").findAll(json)) {
+                val abs = fixStreamUrl(m.groupValues[1], baseURL) ?: continue
+                val isM3u8 = abs.contains(".m3u8")
+                Log.e(TAG, "[EMIT-alt] '$abs'")
+                callback.invoke(newExtractorLink(this.name, this.name, abs,
+                    if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                    this.referer = gxBase; this.quality = Qualities.Unknown.value
+                    this.headers = ph
+                })
+                emitted++
+            }
+            Log.e(TAG, "[EMIT-alt] matched $emitted via url/link/src")
+        }
+
+        Log.e(TAG, "[EMIT] total streams emitted=$emitted")
+
+        // Subtitles
+        for (m in Regex("""["']file["']\s*:\s*["']([^"']+\.(?:vtt|srt))["']""").findAll(json)) {
+            val abs = fixStreamUrl(m.groupValues[1], baseURL) ?: m.groupValues[1]
+            Log.e(TAG, "[EMIT] subtitle $abs")
+            subtitleCallback.invoke(SubtitleFile("Sub", abs))
         }
     }
 
@@ -314,7 +362,6 @@ open class GalaxyDonghua : ExtractorApi() {
         val pd: String, val ps: String, val qsx: String, val kaken: String, val apx: String,
         val utekmek: String = "", val localKey: String = "", val unpackedJs: String = ""
     ) {
-        /** All the globals the site's own JS might reference. */
         fun toGlobalMap(): Map<String, String> = mapOf(
             "pd"       to pd,
             "ps"       to ps,
@@ -327,7 +374,7 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Dean Edwards unpacker (only used to extract tokens from the config script)
+    //  Dean Edwards unpacker
     // ────────────────────────────────────────────────────────────────
     private fun toBase(n: Int, base: Int): String {
         if (n == 0) return "0"
@@ -519,7 +566,7 @@ open class GalaxyDonghua : ExtractorApi() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-//  Rhino runner — evaluates the site's own player.js and calls dcx()
+//  Rhino sandbox — runs the site's own player.js and calls its dcx()
 // ─────────────────────────────────────────────────────────────────────
 object GdRhino {
     private const val TAG = "GdRhino"
@@ -540,11 +587,11 @@ object GdRhino {
             ScriptableObject.putProperty(scope, "location", ctx.newObject(scope))
             ScriptableObject.putProperty(scope, "document", ctx.newObject(scope))
 
-            // Browser polyfills the site's code might touch
+            // Browser polyfills
             ctx.evaluateString(scope, """
                 var setTimeout = function(){};
                 var clearTimeout = function(){};
-                var setInterval = function(){};
+                var setInterval = function(){ return 0; };
                 var clearInterval = function(){};
                 var console = {log:function(){},warn:function(){},error:function(){},info:function(){}};
                 var atob = function(s){
@@ -560,44 +607,74 @@ object GdRhino {
                             new java.lang.String(s).getBytes("ISO-8859-1"));
                     } catch(e) { return ''; }
                 };
-                var decodeURIComponent = function(s){ return s; };
-                var encodeURIComponent = function(s){ return s; };
+                var decodeURIComponent = function(s){
+                    try { return java.net.URLDecoder.decode(s, "UTF-8"); }
+                    catch(e) { return s; }
+                };
+                var encodeURIComponent = function(s){
+                    try { return java.net.URLEncoder.encode(s, "UTF-8"); }
+                    catch(e) { return s; }
+                };
                 var localStorage = {
                     getItem: function(){ return null; },
                     setItem: function(){},
-                    removeItem: function(){}
+                    removeItem: function(){},
+                    clear: function(){}
                 };
             """.trimIndent(), "polyfill", 1, null)
 
-            // 1. CryptoJS (site uses it heavily)
+            // 1. CryptoJS — must be loaded before the site's own script
             if (cryptoJs.isNotBlank()) {
                 try { ctx.evaluateString(scope, cryptoJs, "cryptojs", 1, null) }
-                catch (e: Throwable) { Log.e(TAG, "cryptojs eval: ${e.message}") }
+                catch (e: Throwable) { Log.e(TAG, "cryptojs: ${e.message}") }
             }
 
-            // 2. Pre-seed globals (pd, ps, utekmek, ...) BEFORE the player JS
-            //    so the site's dcx() finds them on the scope chain.
+            // 2. Pre-seed globals (pd, ps, utekmek, ...)
             for ((k, v) in globals) {
                 ScriptableObject.putProperty(scope, k, v)
             }
 
-            // 3. The site's own code (defines dcx, etc.)
+            // 3. Evaluate the site's player.js
             try { ctx.evaluateString(scope, playerJs, "player", 1, null) }
             catch (e: Throwable) { Log.e(TAG, "player eval: ${e.message}") }
 
-            // 4. Call dcx() — the exact function name from player-v4.6.6.min.js
-            val fn = scope.get("dcx", scope) as? Function ?: run {
-                Log.e(TAG, "dcx not found")
+            // 4. Find the decrypt entry point. First by name, then by shape.
+            val preferredNames = listOf("dcx", "decrypt", "decode", "decryptData", "decodeData")
+            var fn: Function? = null
+            var fnName: String? = null
+            for (n in preferredNames) {
+                val v = try { scope.get(n, scope) } catch (_: Throwable) { null }
+                if (v is Function) { fn = v; fnName = n; break }
+            }
+
+            if (fn == null) {
+                // Search: any 1-argument global Function whose source hints at Base64/AES
+                for (id in scope.ids) {
+                    if (id !is String) continue
+                    val v = try { scope.get(id, scope) } catch (_: Throwable) { continue }
+                    if (v !is Function) continue
+                    val src = try { v.toString() } catch (_: Throwable) { continue }
+                    if (src.contains("AES") || src.contains("PBKDF2") ||
+                        (src.contains("Base64.parse") && src.contains("decrypt"))) {
+                        fn = v; fnName = id; break
+                    }
+                }
+            }
+
+            if (fn == null) {
+                Log.e(TAG, "no decrypt entry point found (tried $preferredNames + shape search)")
                 return null
             }
+            Log.e(TAG, "calling entry '$fnName'")
+
             val result = try {
                 fn.call(ctx, scope, scope, arrayOf<Any>(ciphertext))
             } catch (e: Throwable) {
-                Log.e(TAG, "dcx call: ${e.message}")
+                Log.e(TAG, "$fnName call: ${e.message}")
                 return null
             }
             val s = Context.toString(result)
-            Log.e(TAG, "dcx returned ${s.length}B")
+            Log.e(TAG, "$fnName returned ${s.length}B")
             return s.takeIf { it.length > 20 && it.contains("{") }
         } finally {
             Context.exit()
