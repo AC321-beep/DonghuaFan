@@ -12,12 +12,7 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.Cookie
-import okhttp3.CookieJar
-import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.OkHttpClient
-import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.mozilla.javascript.Context
@@ -52,48 +47,6 @@ open class GalaxyDonghua : ExtractorApi() {
 
         @Volatile private var cachedPlayerJs: String? = null
         @Volatile private var cachedCryptoJs: String? = null
-
-        private val cookieJar = object : CookieJar {
-            private val store = mutableMapOf<String, MutableList<Cookie>>()
-            override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
-                if (cookies.isEmpty()) return
-                val list = store.getOrPut(url.host) { mutableListOf() }
-                for (c in cookies) {
-                    list.removeAll { it.name == c.name }
-                    list.add(c)
-                    Log.e(TAG, "[COOKIE+] ${url.host}  ${c.name}=${c.value.take(40)}…")
-                }
-            }
-            override fun loadForRequest(url: HttpUrl): List<Cookie> {
-                val l = store[url.host].orEmpty()
-                Log.e(TAG, "[COOKIE→] ${url.host}  sending ${l.size}: ${l.map { it.name }}")
-                return l
-            }
-        }
-
-        private val client: OkHttpClient = OkHttpClient.Builder()
-            .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-            .cookieJar(cookieJar)
-            .addNetworkInterceptor { chain ->
-                val req = chain.request()
-                // Force Content-Type: text/plain with NO charset
-                val cleaned = req.newBuilder()
-                    .header("Content-Type", "text/plain")
-                    .build()
-                Log.e(TAG, "[HTTP-out] ${cleaned.method} ${cleaned.url}")
-                Log.e(TAG, "[HTTP-out]   protocol: ${chain.connection()?.protocol()}")
-                cleaned.headers.names().forEach { n ->
-                    Log.e(TAG, "[HTTP-out]   $n: ${cleaned.header(n)}")
-                }
-                Log.e(TAG, "[HTTP-out]   body.length=${cleaned.body?.contentLength() ?: 0L}")
-                val resp = chain.proceed(cleaned)
-                Log.e(TAG, "[HTTP-in] ${resp.code} ${resp.message}")
-                resp.headers.names().forEach { n ->
-                    Log.e(TAG, "[HTTP-in]   $n: ${resp.header(n)}")
-                }
-                resp
-            }
-            .build()
     }
 
     override suspend fun getUrl(
@@ -209,21 +162,22 @@ open class GalaxyDonghua : ExtractorApi() {
     }
 
     // ────────────────────────────────────────────────────────────────
-    //  Sources fetch + decrypt
+    //  Uses CloudStream's own base client (app.baseClient) so the
+    //  cookie jar populated by our earlier app.get() calls is visible
+    //  to these requests too.
     // ────────────────────────────────────────────────────────────────
     private suspend fun fetchAndDecryptApi(
         tokens: GdTokens, headers: Map<String, String>, gxBase: String,
         embedUrl: String, playerJs: String?, cryptoJs: String
     ): String? {
 
-        // ── DIAGNOSTIC with HTTP/2 + text/plain no-charset + priority header ──
+        // ── DIAGNOSTIC: replay exact cURL from Chrome using app.baseClient ──
         run {
             val exactUrl = "https://galaxydonghua.xyz/api/?p=dEh1WVVRRnUycldacC9GMk5mcXlYR3lQTDgzT2EyZ0NsTnVmTHBBLzROSmIrSnB4KzJzQ0hGcFl1cGU2TXBsV0hRcnJldU5BY2krUmJjT29Hcm5LRUE9PQ,,"
             val exactBody = "dmo4WG83M1dSSmNUcEg4YzcvY0dzQnlBUndxdWU5ZjZxbEFzbVhsNEFJZDFKM0lIL253REdhamE3dnVXZWJLbXNlZUZyWU1LZXBRcE1ZMFlwVFh4QmEwSmRVK2U5THVtYzh0MHBYUXpycGFsQnpRdjJnUUkydGhSdFdwU29tUDBtMTBOVENtbll4bGJURSsyQzBURkJNOCt2aHNvMnJCTG1Lazk5aHpYbzBFR2E1Rksyd3ptZWtXZWgzbm5GZHlSckk2SE9GVlExSDNod0Rha2dEOUYwOU85WlB2dmh1aFI2ZkNpVWRMZnNhVkUzOFBkeEdYbDljNDU1UFJIR0FJaE1PZG82QXZjeFZjTDI4TzdDZWNzampKVnlPdE96bnkreTVjWjd4Q3UrcmM9-,THJjNkh0Q2treUpLdnA2ZVoxL1hpMEhLRkRxOExKY2R0cVBCRFhld0JMRFc4WGF3dUlUUnNPK3B3d3poSmlOU1BjQTArRkhrUEI5UDJWellipakg2Z1E9PQ,,"
 
             try {
                 withContext(Dispatchers.IO) {
-                    // body with NO content-type (null) → we control the header
                     val rawBytes = exactBody.toByteArray(Charsets.UTF_8)
                     val body = rawBytes.toRequestBody(null)
                     val req = Request.Builder()
@@ -246,10 +200,9 @@ open class GalaxyDonghua : ExtractorApi() {
                         .build()
 
                     Log.e(TAG, "[TEST-EXACT] url=${req.url}")
-                    Log.e(TAG, "[TEST-EXACT] encodedQuery=${req.url.encodedQuery}")
-                    Log.e(TAG, "[TEST-EXACT] bodyLen=${req.body?.contentLength()}")
+                    Log.e(TAG, "[TEST-EXACT] using app.baseClient")
 
-                    client.newCall(req).execute().use { resp ->
+                    app.baseClient.newCall(req).execute().use { resp ->
                         val b = resp.body?.string()?.trim() ?: ""
                         Log.e(TAG, "[TEST-EXACT RES] code=${resp.code} protocol=${resp.protocol} len=${b.length}")
                         Log.e(TAG, "[TEST-EXACT RES] head=${b.take(120)}")
@@ -298,7 +251,7 @@ open class GalaxyDonghua : ExtractorApi() {
                 val req = Request.Builder().url(configUrl).get().apply {
                     chromeHeaders().forEach { (k, v) -> addHeader(k, v) }
                 }.build()
-                client.newCall(req).execute().use { resp ->
+                app.baseClient.newCall(req).execute().use { resp ->
                     val b = resp.body?.string()?.trim() ?: ""
                     Log.e(TAG, "[STEP 13-pre RES] ${resp.code} | ${b.length}B | head=${b.take(60)}")
                 }
@@ -323,7 +276,7 @@ open class GalaxyDonghua : ExtractorApi() {
                     hdrs.forEach { (k, v) -> addHeader(k, v) }
                 }.build()
                 Log.e(TAG, "[STEP 13] OkHttp will send URL: ${req.url}")
-                client.newCall(req).execute().use { resp ->
+                app.baseClient.newCall(req).execute().use { resp ->
                     val b = resp.body?.string()?.trim() ?: ""
                     val h = resp.headers.names().joinToString("; ") { n -> "$n=${resp.header(n)}" }
                     Triple(resp.code, b, h)
