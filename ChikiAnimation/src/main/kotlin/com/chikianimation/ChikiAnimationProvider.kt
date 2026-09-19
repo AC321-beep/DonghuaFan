@@ -286,7 +286,6 @@ class ChikiAnimationProvider : MainAPI() {
             try {
                 Log.e(TAG, "Attempting direct .googlevideo.com extraction to bypass HTML quotas...")
                 val previewUrl = "https://drive.google.com/file/d/$fileId/preview"
-                // Using full browser headers to avoid Google throwing 403 on the preview page
                 val html = app.get(previewUrl, headers = mapOf("User-Agent" to defaultUserAgent, "Accept" to "text/html")).text
                 
                 val rawStream = Regex("""(https://[^\s"']+\.googlevideo\.com/videoplayback\?[^\s"']+)""")
@@ -380,7 +379,6 @@ class ChikiAnimationProvider : MainAPI() {
                         Log.e(TAG, "Processing Dailymotion ID: $videoId")
                         val before = emitCount.get()
                         try {
-                            // Fixing Dailymotion 403 Error by syncing User-Agent perfectly
                             val apiUrl = "https://geo.dailymotion.com/videos/$videoId"
                             val reqHeaders = mapOf(
                                 "User-Agent" to defaultUserAgent,
@@ -389,7 +387,7 @@ class ChikiAnimationProvider : MainAPI() {
                                 "x-dm-geo-embedder" to mainUrl
                             )
                             val apiRes = app.get(apiUrl, headers = reqHeaders).text
-                            val streamUrl = Regex("""["']url["']\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").find(apiRes)?.groupValues?.get(1)
+                            val streamUrl = Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""").find(apiRes)?.groupValues?.get(1)
 
                             if (!streamUrl.isNullOrBlank()) {
                                 val m3u8Url = streamUrl.replace("\\/", "/")
@@ -397,7 +395,6 @@ class ChikiAnimationProvider : MainAPI() {
                                 
                                 countingCallback(newExtractorLink("Dailymotion", "Dailymotion", m3u8Url, ExtractorLinkType.M3U8) {
                                     this.referer = cleanUrl
-                                    // Injecting same headers into ExoPlayer prevents the 403 CDN crash
                                     this.headers = mapOf(
                                         "User-Agent" to defaultUserAgent,
                                         "Origin" to "https://geo.dailymotion.com",
@@ -434,4 +431,13 @@ class ChikiAnimationProvider : MainAPI() {
                 val before = emitCount.get()
                 val ok = try {
                     loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
-                } catch (
+                } catch (_: Exception) { false }
+
+                if (ok || emitCount.get() > before) {
+                    foundFlag.set(1)
+                    return
+                }
+
+                if (cleanUrl.contains(".m3u8", true)) {
+                    Log.e(TAG, "Generating generic M3u8 links for: $cleanUrl")
+        
