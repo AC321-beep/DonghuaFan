@@ -2,6 +2,7 @@ package com.chikianimation
 
 import android.util.Base64
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
@@ -264,30 +265,25 @@ class ChikiAnimationProvider : MainAPI() {
                 ?: return false
 
             val driveViewUrl = "https://drive.google.com/file/d/$fileId/view"
-            
-            // 1. Try Cloudstream's native, reliable Google Drive extractor first
-            try {
-                if (loadExtractor(driveViewUrl, ref, subtitleCallback, countingCallback)) {
-                    return true
-                }
-            } catch (_: Exception) {}
-
-            // 2. Try proxy players if native extraction hits a quota limit
             val encodedDriveUrl = try { URLEncoder.encode(driveViewUrl, "UTF-8") } catch (_: Exception) { driveViewUrl }
+            
+            // Exclusively use reliable proxy players to avoid Error 3003 (Quota/Virus HTML pages)
             val proxyUrls = listOf(
                 "https://gdriveplayer.to/embed2.php?link=$encodedDriveUrl",
-                "https://databasegdriveplayer.co/player.php?link=$encodedDriveUrl"
+                "https://databasegdriveplayer.co/player.php?link=$encodedDriveUrl",
+                "https://anime.gdriveplayer.to/embed2.php?link=$encodedDriveUrl"
             )
 
+            var foundProxy = false
             for (proxy in proxyUrls) {
                 try {
                     if (loadExtractor(proxy, referer = ref, subtitleCallback, countingCallback)) {
-                        return true
+                        foundProxy = true
                     }
                 } catch (_: Exception) {}
             }
 
-            return false
+            return foundProxy
         }
 
         suspend fun handleUrl(rawUrl: String, ref: String, depth: Int = 0) {
@@ -338,8 +334,17 @@ class ChikiAnimationProvider : MainAPI() {
                             val streamUrl = Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""").find(apiRes)?.groupValues?.get(1)
 
                             if (!streamUrl.isNullOrBlank()) {
+                                // 1. Video stream
                                 val m3u8Url = streamUrl.replace("\\/", "/")
                                 M3u8Helper.generateM3u8("Dailymotion", m3u8Url, cleanUrl).forEach { countingCallback(it) }
+                                
+                                // 2. Subtitles
+                                Regex(""""([a-zA-Z0-9_-]+)"\s*:\s*\{[^}]*"urls"\s*:\s*\[\s*"([^"]+\.vtt[^"]*)"""")
+                                    .findAll(apiRes).forEach { match ->
+                                        val langLabel = match.groupValues[1].uppercase()
+                                        val subUrl = match.groupValues[2].replace("\\/", "/")
+                                        subtitleCallback.invoke(SubtitleFile(langLabel, subUrl))
+                                    }
                             }
                         } catch (_: Exception) { }
 
@@ -442,4 +447,5 @@ class ChikiAnimationProvider : MainAPI() {
 
         return foundFlag.get() > 0 || emitCount.get() > 0
     }
-}
+                                      }
+                                      
