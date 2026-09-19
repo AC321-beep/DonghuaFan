@@ -285,6 +285,7 @@ class ChikiAnimationProvider : MainAPI() {
             try {
                 Log.e(TAG, "Attempting direct .googlevideo.com extraction to bypass HTML quotas...")
                 val previewUrl = "https://drive.google.com/file/d/$fileId/preview"
+                // Using full browser headers to avoid Google throwing 403 on the preview page
                 val html = app.get(previewUrl, headers = mapOf("User-Agent" to defaultUserAgent, "Accept" to "text/html")).text
                 
                 val rawStream = Regex("""(https://[^\s"']+\.googlevideo\.com/videoplayback\?[^\s"']+)""")
@@ -387,7 +388,7 @@ class ChikiAnimationProvider : MainAPI() {
                             )
                             val apiRes = app.get(apiUrl, headers = reqHeaders).text
                             
-                            val streamUrl = Regex("\"url\"\\s*:\\s*\"([^\"]+\\.m3u8[^\"]*)\"").find(apiRes)?.groupValues?.get(1)
+                            val streamUrl = Regex("""["']url["']\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").find(apiRes)?.groupValues?.get(1)
 
                             if (!streamUrl.isNullOrBlank()) {
                                 val m3u8Url = streamUrl.replace("\\/", "/")
@@ -438,5 +439,4 @@ class ChikiAnimationProvider : MainAPI() {
                     return
                 }
 
-                if (cleanUrl.contains(".m3u8", true)) {
-                    Log.e(TAG, "Generating gener
+                
