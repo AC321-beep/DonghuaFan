@@ -106,21 +106,19 @@ class ChikiAnimationProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
         val encoded = query.trim()
-        val results = coroutineScope {
-            (1..2).map { page ->
-                async {
-                    try {
-                        val url = if (page == 1) "$mainUrl/?s=$encoded" else "$mainUrl/page/$page/?s=$encoded"
-                        app.get(url, headers = defaultHeaders).document
-                            .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
-                            .mapNotNull { it.toSearchResult() }
-                    } catch (e: Exception) {
-                        emptyList()
-                    }
-                }
-            }.awaitAll().flatten()
+        val allItems = mutableListOf<SearchResponse>()
+        
+        // Reverted to standard, crash-proof loop to avoid coroutine type inference issues
+        for (page in 1..2) {
+            try {
+                val url = if (page == 1) "$mainUrl/?s=$encoded" else "$mainUrl/page/$page/?s=$encoded"
+                val docs = app.get(url, headers = defaultHeaders).document
+                    .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
+                    .mapNotNull { it.toSearchResult() }
+                allItems.addAll(docs)
+            } catch (_: Exception) {}
         }
-        return results.distinctBy { it.url }
+        return allItems.distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse? {
@@ -255,12 +253,14 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        fun getIframeSrc(iframe: Element): String = iframe.attr("src").ifBlank {
-            iframe.attr("data-src").ifBlank {
-                iframe.attr("data-litespeed-src").ifBlank {
-                    iframe.attr("data-lazy-src")
-                }
-            }
+        fun getIframeSrc(iframe: Element): String {
+            val src = iframe.attr("src")
+            if (src.isNotBlank()) return src
+            val dSrc = iframe.attr("data-src")
+            if (dSrc.isNotBlank()) return dSrc
+            val lSrc = iframe.attr("data-litespeed-src")
+            if (lSrc.isNotBlank()) return lSrc
+            return iframe.attr("data-lazy-src")
         }
 
         fun safeBase64Decode(value: String): String? = try {
@@ -286,6 +286,7 @@ class ChikiAnimationProvider : MainAPI() {
             try {
                 Log.e(TAG, "Attempting direct .googlevideo.com extraction to bypass HTML quotas...")
                 val previewUrl = "https://drive.google.com/file/d/$fileId/preview"
+                // Using full browser headers to avoid Google throwing 403 on the preview page
                 val html = app.get(previewUrl, headers = mapOf("User-Agent" to defaultUserAgent, "Accept" to "text/html")).text
                 
                 val rawStream = Regex("""(https://[^\s"']+\.googlevideo\.com/videoplayback\?[^\s"']+)""")
@@ -387,7 +388,9 @@ class ChikiAnimationProvider : MainAPI() {
                                 "x-dm-geo-embedder" to mainUrl
                             )
                             val apiRes = app.get(apiUrl, headers = reqHeaders).text
-                            val streamUrl = Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""").find(apiRes)?.groupValues?.get(1)
+                            
+                            // Replaced raw string with standard escaped string to prevent older Kotlin compiler crashes
+                            val streamUrl = Regex("\"url\"\\s*:\\s*\"([^\"]+\\.m3u8[^\"]*)\"").find(apiRes)?.groupValues?.get(1)
 
                             if (!streamUrl.isNullOrBlank()) {
                                 val m3u8Url = streamUrl.replace("\\/", "/")
@@ -430,14 +433,4 @@ class ChikiAnimationProvider : MainAPI() {
 
                 val before = emitCount.get()
                 val ok = try {
-                    loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
-                } catch (_: Exception) { false }
-
-                if (ok || emitCount.get() > before) {
-                    foundFlag.set(1)
-                    return
-                }
-
-                if (cleanUrl.contains(".m3u8", true)) {
-                    Log.e(TAG, "Generating generic M3u8 links for: $cleanUrl")
-        
+                    loadExtractor(cleanUrl, referer = ref, subtitleCallback, co
