@@ -280,50 +280,44 @@ class ChikiAnimationProvider : MainAPI() {
         }
 
         /**
-         * Optimised Google Drive handler.
+         * Robust Google Drive handler.
          *
-         * Strategy (single reliable path):
-         *   1. Extract the GDrive file id.
-         *   2. Fetch the `/preview` HTML page.
-         *   3. Locate the `drive.usercontent.google.com/u/0/uc?id=...` direct-download
-         *      URL that is embedded in the page's `itemJson` block.
-         *   4. Hand that direct URL to CloudStream's built-in extractor system.
+         * Why the old approach failed:
+         *  - Modern GDrive preview pages build the .googlevideo.com playback URL in JS,
+         *    so it never appears in the initial HTML.
+         *  - The third-party proxies (gdriveplayer.to etc.) returned loadExtractor=true
+         *    without emitting any link, producing false-positive success.
+         *  - Scraping itemJson from /preview only works for a signed-in browser session;
+         *    an anonymous HTTP fetch often gets a stripped response (as seen in the
+         *    latest logcat where "Could not find any direct download URL" was logged).
          *
-         * The old `.googlevideo.com/videoplayback` scrape is intentionally removed
-         * because modern GDrive preview pages build that URL client-side via JS and
-         * it is never present in the initial HTML response.
-         *
-         * The bogus third-party proxy chain (gdriveplayer.to, databasegdriveplayer.co,
-         * anime.gdriveplayer.to) is also removed because those hosts returned
-         * `loadExtractor == true` without ever emitting a real link, which produced
-         * false-positive successes and blocked the fallback path.
+         * New strategy:
+         *  1. Try the built-in extractor on the original URL.
+         *  2. Build the standard public direct-download URLs from the file id and try
+         *     each one through the built-in extractors. These endpoints work for any
+         *     file that is shared publicly / "anyone with the link".
+         *  3. Emit the direct usercontent URL as a generic VIDEO link as a last resort
+         *     so the player can follow the redirect chain itself.
+         *  4. Only if all that fails, fetch /preview and scrape with a broad regex.
          */
         suspend fun handleGoogleDrive(cleanUrl: String, ref: String): Boolean {
             if (!cleanUrl.contains("drive.google.com", ignoreCase = true) &&
                 !cleanUrl.contains("drive.usercontent.google.com", ignoreCase = true)
             ) return false
 
-            // Handle the direct-download variant immediately
-            if (cleanUrl.contains("drive.usercontent.google.com", ignoreCase = true)) {
-                Log.e(TAG, "Direct usercontent URL detected, forwarding to extractors: $cleanUrl")
-                val before = emitCount.get()
-                try {
-                    loadExtractor(cleanUrl, referer = "https://drive.google.com/", subtitleCallback, countingCallback)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Extractor on usercontent URL threw: ${e.message}")
-                }
-                if (emitCount.get() > before) return true
-                // Last resort: emit the direct download URL as a generic VIDEO link
-                countingCallback(newExtractorLink("Google Drive", "Google Drive", cleanUrl, ExtractorLinkType.VIDEO) {
-                    this.referer = "https://drive.google.com/"
-                    this.quality = Qualities.Unknown.value
-                    this.headers = mapOf("User-Agent" to defaultUserAgent)
-                })
-                return emitCount.get() > before
+            // 1) Built-in extractor against whatever URL we were handed
+            val beforeInitial = emitCount.get()
+            try {
+                loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
+            } catch (e: Exception) {
+                Log.e(TAG, "Built-in extractor on original URL threw: ${e.message}")
+            }
+            if (emitCount.get() > beforeInitial) {
+                Log.e(TAG, "Built-in extractor succeeded on original URL.")
+                return true
             }
 
-            Log.e(TAG, "Found GDrive URL: $cleanUrl")
-
+            // 2) Extract file id
             val fileId = Regex("/file/d/([a-zA-Z0-9_-]{10,})").find(cleanUrl)?.groupValues?.get(1)
                 ?: Regex("[?&]id=([a-zA-Z0-9_-]{10,})").find(cleanUrl)?.groupValues?.get(1)
 
@@ -332,7 +326,6 @@ class ChikiAnimationProvider : MainAPI() {
                 return false
             }
 
-            // Skip already-processed files within this loadLinks() call
             if (!processedGdriveIds.add(fileId)) {
                 Log.e(TAG, "GDrive file $fileId already processed in this call, skipping.")
                 return emitCount.get() > 0
@@ -340,20 +333,49 @@ class ChikiAnimationProvider : MainAPI() {
 
             Log.e(TAG, "Extracted File ID: $fileId")
 
-            // 1) Try the built-in extractor against the original /preview URL first
-            val beforeBuiltIn = emitCount.get()
-            try {
-                loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
-            } catch (e: Exception) {
-                Log.e(TAG, "Built-in extractor on original URL threw: ${e.message}")
-            }
-            if (emitCount.get() > beforeBuiltIn) {
-                Log.e(TAG, "Built-in extractor succeeded on original GDrive URL.")
-                return true
+            // 3) Try constructed public direct-download URLs through the extractor system
+            val directCandidates = listOf(
+                "https://drive.usercontent.google.com/download?id=$fileId&export=download&authuser=0",
+                "https://drive.usercontent.google.com/u/0/uc?id=$fileId&export=download",
+                "https://drive.usercontent.google.com/uc?id=$fileId&export=download",
+                "https://drive.google.com/uc?export=download&id=$fileId",
+                "https://drive.google.com/uc?id=$fileId&export=download"
+            )
+
+            for (direct in directCandidates) {
+                Log.e(TAG, "Trying direct download candidate: $direct")
+                val before = emitCount.get()
+                try {
+                    loadExtractor(direct, referer = "https://drive.google.com/", subtitleCallback, countingCallback)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Extractor threw on $direct: ${e.message}")
+                }
+                if (emitCount.get() > before) {
+                    Log.e(TAG, "Extractor emitted via direct candidate: $direct")
+                    return true
+                }
+
+                // If extractors don't handle it, emit usercontent URLs as generic VIDEO
+                if (direct.contains("drive.usercontent.google.com")) {
+                    countingCallback(
+                        newExtractorLink("Google Drive", "Google Drive", direct, ExtractorLinkType.VIDEO) {
+                            this.referer = "https://drive.google.com/"
+                            this.quality = Qualities.Unknown.value
+                            this.headers = mapOf(
+                                "User-Agent" to defaultUserAgent,
+                                "Accept" to "*/*"
+                            )
+                        }
+                    )
+                    if (emitCount.get() > before) {
+                        Log.e(TAG, "Emitted direct usercontent URL as generic VIDEO: $direct")
+                        return true
+                    }
+                }
             }
 
-            // 2) Fetch /preview and pull the embedded direct download URL
-            Log.e(TAG, "Built-in extractor failed. Fetching preview HTML to locate direct download URL...")
+            // 4) Last resort: scrape /preview with a broad file-id-based regex
+            Log.e(TAG, "Constructed URLs failed. Fetching preview HTML as last resort...")
             val previewUrl = "https://drive.google.com/file/d/$fileId/preview"
             val html = try {
                 app.get(
@@ -361,7 +383,8 @@ class ChikiAnimationProvider : MainAPI() {
                     headers = mapOf(
                         "User-Agent" to defaultUserAgent,
                         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language" to "en-US,en;q=0.9"
+                        "Accept-Language" to "en-US,en;q=0.9",
+                        "Referer" to "https://drive.google.com/"
                     )
                 ).text
             } catch (e: Exception) {
@@ -369,57 +392,48 @@ class ChikiAnimationProvider : MainAPI() {
                 null
             }
 
-            if (html.isNullOrBlank()) {
-                Log.e(TAG, "Preview HTML was empty, aborting GDrive extraction.")
-                return false
+            if (!html.isNullOrBlank()) {
+                val patterns = listOf(
+                    Regex("""https://drive\.usercontent\.google\.com/u/\d+/uc\?id=$fileId[^"'\\\s]*"""),
+                    Regex("""https://drive\.usercontent\.google\.com/[^"'\\\s]*?id=$fileId[^"'\\\s]*"""),
+                    Regex("""https://drive\.google\.com/uc\?[^"'\\\s]*?id=$fileId[^"'\\\s]*"""),
+                    Regex("""https://[^"'\\\s]*?usercontent[^"'\\\s]*?id=$fileId[^"'\\\s]*""")
+                )
+                for (p in patterns) {
+                    val found = p.find(html)?.value
+                    if (!found.isNullOrBlank()) {
+                        val clean = found.replace("\\u0026", "&")
+                            .replace("\\/", "/")
+                            .replace("\\u003d", "=")
+                        Log.e(TAG, "Found direct URL in preview HTML: $clean")
+                        val before = emitCount.get()
+                        try {
+                            loadExtractor(
+                                clean,
+                                referer = "https://drive.google.com/",
+                                subtitleCallback,
+                                countingCallback
+                            )
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Extractor threw on scraped URL: ${e.message}")
+                        }
+                        if (emitCount.get() > before) return true
+
+                        countingCallback(
+                            newExtractorLink("Google Drive", "Google Drive", clean, ExtractorLinkType.VIDEO) {
+                                this.referer = "https://drive.google.com/"
+                                this.quality = Qualities.Unknown.value
+                                this.headers = mapOf("User-Agent" to defaultUserAgent)
+                            }
+                        )
+                        if (emitCount.get() > before) return true
+                    }
+                }
+                Log.e(TAG, "No direct URL matched in preview HTML (length=${html.length}).")
             }
 
-            // Prefer the canonical /u/0/uc form; fall back to any usercontent link
-            val directDownload = Regex(
-                """https://drive\.usercontent\.google\.com/u/\d+/uc\?id=[^"'\\\s]+"""
-            ).find(html)?.value
-                ?: Regex(
-                    """https://drive\.usercontent\.google\.com/[^"'\\\s]*?id=[^"'\\\s&]+[^"'\\\s]*"""
-                ).find(html)?.value
-                ?: Regex(
-                    """https://drive\.google\.com/uc\?[^"'\\\s]*?id=[^"'\\\s&]+[^"'\\\s]*"""
-                ).find(html)?.value
-
-            if (directDownload.isNullOrBlank()) {
-                Log.e(TAG, "Could not find any direct download URL in preview HTML.")
-                return false
-            }
-
-            // Un-escape JSON-encoded URLs just in case
-            val cleanDownload = directDownload
-                .replace("\\u0026", "&")
-                .replace("\\/", "/")
-                .replace("\\u003d", "=")
-
-            Log.e(TAG, "Found direct download URL: $cleanDownload")
-
-            val beforeDownload = emitCount.get()
-            try {
-                loadExtractor(cleanDownload, referer = "https://drive.google.com/", subtitleCallback, countingCallback)
-            } catch (e: Exception) {
-                Log.e(TAG, "Extractor on direct download URL threw: ${e.message}")
-            }
-            if (emitCount.get() > beforeDownload) {
-                Log.e(TAG, "Extractor succeeded on direct download URL.")
-                return true
-            }
-
-            // 3) Last resort: emit the direct download URL as a generic VIDEO link
-            Log.e(TAG, "No extractor handled direct URL. Emitting it as a generic VIDEO link.")
-            countingCallback(newExtractorLink("Google Drive", "Google Drive", cleanDownload, ExtractorLinkType.VIDEO) {
-                this.referer = "https://drive.google.com/"
-                this.quality = Qualities.Unknown.value
-                this.headers = mapOf("User-Agent" to defaultUserAgent)
-            })
-
-            val success = emitCount.get() > beforeDownload
-            Log.e(TAG, "handleGoogleDrive finished. Success: $success")
-            return success
+            Log.e(TAG, "handleGoogleDrive finished. No links emitted.")
+            return false
         }
 
         suspend fun handleUrl(rawUrl: String, ref: String, depth: Int = 0) {
@@ -457,7 +471,7 @@ class ChikiAnimationProvider : MainAPI() {
                     }
                 }
 
-                // Google Drive (original + direct usercontent URLs)
+                // Google Drive
                 if (cleanUrl.contains("drive.google.com", true) ||
                     cleanUrl.contains("drive.usercontent.google.com", true)
                 ) {
@@ -466,10 +480,9 @@ class ChikiAnimationProvider : MainAPI() {
                         foundFlag.set(1)
                         return
                     }
-                    // If GDrive handling failed, fall through so generic extractor can still try
                 }
 
-                // Dailymotion (geo embed) — keep existing behaviour
+                // Dailymotion (geo embed)
                 if (cleanUrl.contains("geo.dailymotion.com/player", true)) {
                     val videoId = Regex("video=([a-zA-Z0-9_-]+)").find(cleanUrl)?.groupValues?.get(1)
                     if (videoId != null && processedDmIds.add(videoId)) {
@@ -491,15 +504,19 @@ class ChikiAnimationProvider : MainAPI() {
                             if (!streamUrl.isNullOrBlank()) {
                                 val m3u8Url = streamUrl.replace("\\/", "/")
                                 Log.e(TAG, "Pushing native Dailymotion HLS stream: $m3u8Url")
-                                countingCallback(newExtractorLink("Dailymotion", "Dailymotion", m3u8Url, ExtractorLinkType.M3U8) {
-                                    this.referer = cleanUrl
-                                    this.headers = mapOf(
-                                        "User-Agent" to defaultUserAgent,
-                                        "Origin" to "https://geo.dailymotion.com",
-                                        "Referer" to cleanUrl
-                                    )
-                                    this.quality = Qualities.Unknown.value
-                                })
+                                countingCallback(
+                                    newExtractorLink(
+                                        "Dailymotion", "Dailymotion", m3u8Url, ExtractorLinkType.M3U8
+                                    ) {
+                                        this.referer = cleanUrl
+                                        this.headers = mapOf(
+                                            "User-Agent" to defaultUserAgent,
+                                            "Origin" to "https://geo.dailymotion.com",
+                                            "Referer" to cleanUrl
+                                        )
+                                        this.quality = Qualities.Unknown.value
+                                    }
+                                )
                             }
                         } catch (e: Exception) {
                             Log.e(TAG, "Dailymotion API scrape failed: ${e.message}")
@@ -554,10 +571,12 @@ class ChikiAnimationProvider : MainAPI() {
                     return
                 } else if (cleanUrl.contains(".mp4", true)) {
                     Log.e(TAG, "Yielding generic MP4 link: $cleanUrl")
-                    countingCallback(newExtractorLink("Generic MP4", "Generic MP4", cleanUrl, ExtractorLinkType.VIDEO) {
-                        this.referer = ref
-                        this.quality = Qualities.Unknown.value
-                    })
+                    countingCallback(
+                        newExtractorLink("Generic MP4", "Generic MP4", cleanUrl, ExtractorLinkType.VIDEO) {
+                            this.referer = ref
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
                     foundFlag.set(1)
                     return
                 }
