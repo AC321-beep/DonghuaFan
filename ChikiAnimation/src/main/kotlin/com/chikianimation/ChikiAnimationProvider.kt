@@ -1,7 +1,6 @@
 package com.chikianimation
 
 import android.util.Base64
-import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.utils.*
@@ -22,10 +21,6 @@ class ChikiAnimationProvider : MainAPI() {
     override var lang = "zh"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
-
-    companion object {
-        private const val TAG = "ChikiGDriveDebug"
-    }
 
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update"          to "Recently Updated",
@@ -228,11 +223,9 @@ class ChikiAnimationProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        Log.e(TAG, "==== STARTING LOADLINKS ====")
         val document = try {
             app.get(data, headers = defaultHeaders).document
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to load episode page: ${e.message}")
             return false
         }
 
@@ -245,11 +238,8 @@ class ChikiAnimationProvider : MainAPI() {
 
         val countingCallback: (ExtractorLink) -> Unit = { link ->
             if (emittedUrls.add(link.url)) {
-                val count = emitCount.incrementAndGet()
-                Log.e(TAG, ">>> SUCCESS! Link Emitted #$count | Source: ${link.name} | URL: ${link.url}")
+                emitCount.incrementAndGet()
                 callback.invoke(link)
-            } else {
-                Log.e(TAG, "Duplicate link blocked: ${link.url}")
             }
         }
 
@@ -269,55 +259,68 @@ class ChikiAnimationProvider : MainAPI() {
 
         suspend fun handleGoogleDrive(cleanUrl: String, ref: String): Boolean {
             if (!cleanUrl.contains("drive.google.com", ignoreCase = true)) return false
-            Log.e(TAG, "Found GDrive URL: $cleanUrl")
 
             val fileId = Regex("""/file/d/([a-zA-Z0-9_-]{10,})""").find(cleanUrl)?.groupValues?.get(1)
                 ?: Regex("""[?&]id=([a-zA-Z0-9_-]{10,})""").find(cleanUrl)?.groupValues?.get(1)
-                
-            if (fileId == null) {
-                Log.e(TAG, "FAILED to extract File ID from GDrive URL.")
-                return false
-            }
+                ?: return false
 
-            Log.e(TAG, "Extracted File ID: $fileId")
-            val driveViewUrl = "https://drive.google.com/file/d/$fileId/view"
-            
-            Log.e(TAG, "Attempting native Cloudstream GDrive extractor...")
+            // 1. Direct Googlevideo Stream Extraction (Bypasses Quota HTML pages)
             try {
-                if (loadExtractor(driveViewUrl, ref, subtitleCallback, countingCallback)) {
-                    Log.e(TAG, "Native GDrive extractor SUCCEEDED.")
+                val previewUrl = "https://drive.google.com/file/d/$fileId/preview"
+                val html = app.get(previewUrl).text
+                
+                val rawStream = Regex("""(https://[^\s"']+\.googlevideo\.com/videoplayback\?[^\s"']+)""")
+                    .find(html)?.groupValues?.get(1)
+                    
+                if (rawStream != null) {
+                    val cleanStream = rawStream.replace("\\u0026", "&").replace("\\/", "/")
+                    countingCallback(newExtractorLink(this.name, "Google Drive HD", cleanStream, ExtractorLinkType.VIDEO) {
+                        this.referer = "https://drive.google.com/"
+                        this.quality = Qualities.Unknown.value
+                    })
                     return true
-                } else {
-                    Log.e(TAG, "Native GDrive extractor returned FALSE.")
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Native GDrive extractor threw exception: ${e.message}")
-            }
+            } catch (_: Exception) {}
 
+            // 2. Try expanded list of proxy players if direct extraction fails
+            val driveViewUrl = "https://drive.google.com/file/d/$fileId/view"
             val encodedDriveUrl = try { URLEncoder.encode(driveViewUrl, "UTF-8") } catch (_: Exception) { driveViewUrl }
             val proxyUrls = listOf(
                 "https://gdriveplayer.to/embed2.php?link=$encodedDriveUrl",
+                "https://gdriveplayer.me/embed2.php?link=$encodedDriveUrl",
                 "https://databasegdriveplayer.co/player.php?link=$encodedDriveUrl",
-                "https://anime.gdriveplayer.to/embed2.php?link=$encodedDriveUrl"
+                "https://databasegdriveplayer.xyz/player.php?link=$encodedDriveUrl",
+                "https://anime.gdriveplayer.to/embed2.php?link=$encodedDriveUrl",
+                "https://gplayer.us/embed2.php?link=$encodedDriveUrl",
+                "https://gdriveplayer.io/embed2.php?link=$encodedDriveUrl"
             )
 
-            var foundProxy = false
             for (proxy in proxyUrls) {
-                Log.e(TAG, "Attempting Proxy: $proxy")
                 try {
                     if (loadExtractor(proxy, referer = ref, subtitleCallback, countingCallback)) {
-                        Log.e(TAG, "Proxy SUCCEEDED: $proxy")
-                        foundProxy = true
-                    } else {
-                        Log.e(TAG, "Proxy returned FALSE.")
+                        return true
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Proxy threw exception: ${e.message}")
-                }
+                } catch (_: Exception) {}
             }
 
-            Log.e(TAG, "handleGoogleDrive finished. Returning: $foundProxy")
-            return foundProxy
+            // 3. Absolute Last Resort: Direct Download API Probe
+            try {
+                val directUrl = "https://drive.google.com/uc?export=download&id=$fileId"
+                val response = app.get(directUrl, allowRedirects = false)
+                
+                if (response.code in 300..399) {
+                    val redirectUrl = response.headers["Location"]
+                    if (!redirectUrl.isNullOrBlank() && redirectUrl.startsWith("http")) {
+                        countingCallback(newExtractorLink(this.name, "${this.name} - Direct", redirectUrl, ExtractorLinkType.VIDEO) {
+                            this.referer = "https://drive.google.com/"
+                            this.quality = Qualities.Unknown.value
+                        })
+                        return true
+                    }
+                }
+            } catch (_: Exception) {}
+
+            return false
         }
 
         suspend fun handleUrl(rawUrl: String, ref: String, depth: Int = 0) {
@@ -332,8 +335,6 @@ class ChikiAnimationProvider : MainAPI() {
                 cleanUrl.contains("googlesyndication", true) ||
                 cleanUrl.contains("doubleclick", true)
             ) return
-
-            Log.e(TAG, "Checking Extractor for URL: $cleanUrl")
 
             try {
                 if (cleanUrl.contains("skylineai.cloud", true)) {
@@ -371,18 +372,11 @@ class ChikiAnimationProvider : MainAPI() {
 
                             if (!streamUrl.isNullOrBlank()) {
                                 val m3u8Url = streamUrl.replace("\\/", "/")
-                                
+                                // Send ONLY the master playlist directly to ensure native HLS subtitle sync 
                                 countingCallback(newExtractorLink("Dailymotion", "Dailymotion", m3u8Url, ExtractorLinkType.M3U8) {
                                     this.referer = cleanUrl
                                     this.quality = Qualities.Unknown.value
                                 })
-                                
-                                Regex(""""([a-zA-Z0-9_-]+)"\s*:\s*\{[^}]*"urls"\s*:\s*\[\s*"([^"]+\.vtt[^"]*)"""")
-                                    .findAll(apiRes).forEach { match ->
-                                        val langLabel = match.groupValues[1].uppercase()
-                                        val subUrl = match.groupValues[2].replace("\\/", "/")
-                                        subtitleCallback.invoke(SubtitleFile(langLabel, subUrl))
-                                    }
                             }
                         } catch (_: Exception) { }
 
@@ -446,44 +440,4 @@ class ChikiAnimationProvider : MainAPI() {
 
         coroutineScope {
             mirrorOptions.map { option ->
-                async {
-                    val value = option.attr("value").trim()
-                    if (value.isBlank()) return@async
-                    if (value.startsWith("http") || value.startsWith("//")) {
-                        handleUrl(value, data)
-                    } else {
-                        val decoded = safeBase64Decode(value)
-                        if (!decoded.isNullOrBlank()) processDecodedHtml(decoded, data)
-                    }
-                }
-            }.awaitAll()
-
-            serverListItems.map { el ->
-                async {
-                    val videoAttr = el.attr("data-video").ifBlank { el.attr("data-src") }.ifBlank { el.attr("data-embed") }
-                    if (videoAttr.isNotBlank()) {
-                        if (videoAttr.startsWith("http") || videoAttr.startsWith("//")) {
-                            handleUrl(videoAttr, data)
-                        } else if (videoAttr.length > 20) {
-                            val decoded = safeBase64Decode(videoAttr)
-                            if (!decoded.isNullOrBlank()) {
-                                if (decoded.startsWith("http")) handleUrl(decoded, data)
-                                else processDecodedHtml(decoded, data)
-                            }
-                        }
-                    }
-                }
-            }.awaitAll()
-        }
-
-        if (foundFlag.get() == 0) {
-            document.select("iframe").forEach { iframe ->
-                val src = getIframeSrc(iframe)
-                if (src.isNotBlank()) handleUrl(src, data)
-            }
-        }
-
-        Log.e(TAG, "==== FINISHED LOADLINKS ==== Total Links Found: ${emitCount.get()}")
-        return foundFlag.get() > 0 || emitCount.get() > 0
-    }
-}
+                asyn
