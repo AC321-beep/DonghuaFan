@@ -379,7 +379,7 @@ class ChikiAnimationProvider : MainAPI() {
                             val apiUrl = "https://geo.dailymotion.com/videos/$videoId"
                             val reqHeaders = mapOf("Referer" to cleanUrl, "Accept" to "application/json", "x-dm-geo-embedder" to mainUrl)
                             val apiRes = app.get(apiUrl, headers = reqHeaders).text
-                            val streamUrl = Regex(""""url"\s*:\s*"([^"]+\.m3u8[^"]*)"""").find(apiRes)?.groupValues?.get(1)
+                            val streamUrl = Regex("""["']url["']\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").find(apiRes)?.groupValues?.get(1)
 
                             if (!streamUrl.isNullOrBlank()) {
                                 val m3u8Url = streamUrl.replace("\\/", "/")
@@ -440,4 +440,66 @@ class ChikiAnimationProvider : MainAPI() {
                     return
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "handleUrl error on $clea
+                Log.e(TAG, "handleUrl error on $cleanUrl: ${e.message}")
+            }
+        }
+
+        suspend fun processDecodedHtml(decoded: String, ref: String) {
+            Jsoup.parse(decoded).select("iframe").forEach { iframe ->
+                val src = getIframeSrc(iframe)
+                if (src.isNotBlank()) handleUrl(src, ref)
+            }
+            Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { m ->
+                handleUrl(m.value, ref)
+            }
+        }
+
+        val mirrorOptions = document.select("select.mirror option, .mobius option, select#mirror option, select[name=mirror] option")
+        val serverListItems = document.select(".server_list li, ul.episodes li, .mirror_link, .mirrors li")
+
+        coroutineScope {
+            val mirrorJobs = mirrorOptions.mapNotNull { option ->
+                val value = option.attr("value").trim()
+                if (value.isNotBlank()) {
+                    async {
+                        if (value.startsWith("http") || value.startsWith("//")) {
+                            handleUrl(value, data)
+                        } else {
+                            val decoded = safeBase64Decode(value)
+                            if (!decoded.isNullOrBlank()) processDecodedHtml(decoded, data)
+                        }
+                    }
+                } else null
+            }
+
+            val serverJobs = serverListItems.mapNotNull { el ->
+                val videoAttr = el.attr("data-video").ifBlank { el.attr("data-src") }.ifBlank { el.attr("data-embed") }
+                if (videoAttr.isNotBlank()) {
+                    async {
+                        if (videoAttr.startsWith("http") || videoAttr.startsWith("//")) {
+                            handleUrl(videoAttr, data)
+                        } else if (videoAttr.length > 20) {
+                            val decoded = safeBase64Decode(videoAttr)
+                            if (!decoded.isNullOrBlank()) {
+                                if (decoded.startsWith("http")) handleUrl(decoded, data)
+                                else processDecodedHtml(decoded, data)
+                            }
+                        }
+                    }
+                } else null
+            }
+
+            (mirrorJobs + serverJobs).awaitAll()
+        }
+
+        if (foundFlag.get() == 0) {
+            document.select("iframe").forEach { iframe ->
+                val src = getIframeSrc(iframe)
+                if (src.isNotBlank()) handleUrl(src, data)
+            }
+        }
+
+        Log.e(TAG, "==== FINISHED LOADLINKS ==== Total Links Found: ${emitCount.get()}")
+        return foundFlag.get() > 0 || emitCount.get() > 0
+    }
+}
