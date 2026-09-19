@@ -108,7 +108,6 @@ class ChikiAnimationProvider : MainAPI() {
         val encoded = query.trim()
         val allItems = mutableListOf<SearchResponse>()
         
-        // Reverted to standard, crash-proof loop to avoid coroutine type inference issues
         for (page in 1..2) {
             try {
                 val url = if (page == 1) "$mainUrl/?s=$encoded" else "$mainUrl/page/$page/?s=$encoded"
@@ -286,7 +285,6 @@ class ChikiAnimationProvider : MainAPI() {
             try {
                 Log.e(TAG, "Attempting direct .googlevideo.com extraction to bypass HTML quotas...")
                 val previewUrl = "https://drive.google.com/file/d/$fileId/preview"
-                // Using full browser headers to avoid Google throwing 403 on the preview page
                 val html = app.get(previewUrl, headers = mapOf("User-Agent" to defaultUserAgent, "Accept" to "text/html")).text
                 
                 val rawStream = Regex("""(https://[^\s"']+\.googlevideo\.com/videoplayback\?[^\s"']+)""")
@@ -389,7 +387,6 @@ class ChikiAnimationProvider : MainAPI() {
                             )
                             val apiRes = app.get(apiUrl, headers = reqHeaders).text
                             
-                            // Replaced raw string with standard escaped string to prevent older Kotlin compiler crashes
                             val streamUrl = Regex("\"url\"\\s*:\\s*\"([^\"]+\\.m3u8[^\"]*)\"").find(apiRes)?.groupValues?.get(1)
 
                             if (!streamUrl.isNullOrBlank()) {
@@ -433,4 +430,13 @@ class ChikiAnimationProvider : MainAPI() {
 
                 val before = emitCount.get()
                 val ok = try {
-                    loadExtractor(cleanUrl, referer = ref, subtitleCallback, co
+                    loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
+                } catch (_: Exception) { false }
+
+                if (ok || emitCount.get() > before) {
+                    foundFlag.set(1)
+                    return
+                }
+
+                if (cleanUrl.contains(".m3u8", true)) {
+                    Log.e(TAG, "Generating gener
