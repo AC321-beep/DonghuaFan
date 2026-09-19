@@ -27,7 +27,9 @@ class ChikiAnimationProvider : MainAPI() {
         private const val TAG = "ChikiGDriveDebug"
     }
 
-    private val defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+    private val defaultUserAgent =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
     private val defaultHeaders = mapOf(
         "User-Agent" to defaultUserAgent,
@@ -107,7 +109,7 @@ class ChikiAnimationProvider : MainAPI() {
         if (query.isBlank()) return emptyList()
         val encoded = query.trim()
         val allItems = mutableListOf<SearchResponse>()
-        
+
         for (page in 1..2) {
             try {
                 val url = if (page == 1) "$mainUrl/?s=$encoded" else "$mainUrl/page/$page/?s=$encoded"
@@ -169,7 +171,8 @@ class ChikiAnimationProvider : MainAPI() {
 
         var epListElements = document.select(".episodelist li, .eplister li")
         if (epListElements.isEmpty()) {
-            val epPage = document.selectFirst(".episodelist li > a[href], .eplister li > a[href]")?.attr("href")?.trim()
+            val epPage = document.selectFirst(".episodelist li > a[href], .eplister li > a[href]")
+                ?.attr("href")?.trim()
             if (!epPage.isNullOrBlank()) {
                 epListElements = try {
                     app.get(fixUrl(epPage), headers = defaultHeaders).document
@@ -181,12 +184,14 @@ class ChikiAnimationProvider : MainAPI() {
         }
 
         val episodes = epListElements.mapNotNull { info ->
-            val href = info.selectFirst("a[href]")?.attr("href")?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val href = info.selectFirst("a[href]")?.attr("href")?.trim()
+                ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val epNumText = info.selectFirst(".epl-num")?.text()?.trim() ?: ""
             val rawTitle = info.selectFirst(".epl-title")?.text()?.trim()
                 ?: info.selectFirst("a span")?.text()?.trim()
                 ?: info.selectFirst("a")?.text()?.trim() ?: ""
-            val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim()?.takeIf { it.isNotBlank() }
+            val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim()
+                ?.takeIf { it.isNotBlank() }
             val combinedText = "$epNumText $rawTitle"
 
             val seasonNum = Regex("(?i)(?:season\\s*(\\d+)|s(\\d+))").find(combinedText)?.let {
@@ -200,7 +205,8 @@ class ChikiAnimationProvider : MainAPI() {
                 ?: Regex("\\d+").find(epNumText)?.value?.toIntOrNull()
                 ?: Regex("\\d+").find(rawTitle)?.value?.toIntOrNull()
 
-            val cleanName = rawTitle.replace(Regex("(?i)^\\s*Episode\\s*"), "").trim().ifBlank { rawTitle.ifBlank { "Episode" } }
+            val cleanName = rawTitle.replace(Regex("(?i)^\\s*Episode\\s*"), "").trim()
+                .ifBlank { rawTitle.ifBlank { "Episode" } }
 
             newEpisode(fixUrl(href)) {
                 this.name = cleanName
@@ -238,6 +244,7 @@ class ChikiAnimationProvider : MainAPI() {
         val emittedUrls = Collections.synchronizedSet(mutableSetOf<String>())
         val processedUrls = Collections.synchronizedSet(mutableSetOf<String>())
         val processedDmIds = Collections.synchronizedSet(mutableSetOf<String>())
+        val processedGdriveIds = Collections.synchronizedSet(mutableSetOf<String>())
 
         val emitCount = AtomicInteger(0)
         val foundFlag = AtomicInteger(0)
@@ -265,71 +272,154 @@ class ChikiAnimationProvider : MainAPI() {
         fun safeBase64Decode(value: String): String? = try {
             String(Base64.decode(value, Base64.DEFAULT))
         } catch (_: Exception) {
-            try { String(Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP)) } catch (_: Exception) { null }
+            try {
+                String(Base64.decode(value, Base64.URL_SAFE or Base64.NO_WRAP))
+            } catch (_: Exception) {
+                null
+            }
         }
 
+        /**
+         * Optimised Google Drive handler.
+         *
+         * Strategy (single reliable path):
+         *   1. Extract the GDrive file id.
+         *   2. Fetch the `/preview` HTML page.
+         *   3. Locate the `drive.usercontent.google.com/u/0/uc?id=...` direct-download
+         *      URL that is embedded in the page's `itemJson` block.
+         *   4. Hand that direct URL to CloudStream's built-in extractor system.
+         *
+         * The old `.googlevideo.com/videoplayback` scrape is intentionally removed
+         * because modern GDrive preview pages build that URL client-side via JS and
+         * it is never present in the initial HTML response.
+         *
+         * The bogus third-party proxy chain (gdriveplayer.to, databasegdriveplayer.co,
+         * anime.gdriveplayer.to) is also removed because those hosts returned
+         * `loadExtractor == true` without ever emitting a real link, which produced
+         * false-positive successes and blocked the fallback path.
+         */
         suspend fun handleGoogleDrive(cleanUrl: String, ref: String): Boolean {
-            if (!cleanUrl.contains("drive.google.com", ignoreCase = true)) return false
+            if (!cleanUrl.contains("drive.google.com", ignoreCase = true) &&
+                !cleanUrl.contains("drive.usercontent.google.com", ignoreCase = true)
+            ) return false
+
+            // Handle the direct-download variant immediately
+            if (cleanUrl.contains("drive.usercontent.google.com", ignoreCase = true)) {
+                Log.e(TAG, "Direct usercontent URL detected, forwarding to extractors: $cleanUrl")
+                val before = emitCount.get()
+                try {
+                    loadExtractor(cleanUrl, referer = "https://drive.google.com/", subtitleCallback, countingCallback)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Extractor on usercontent URL threw: ${e.message}")
+                }
+                if (emitCount.get() > before) return true
+                // Last resort: emit the direct download URL as a generic VIDEO link
+                countingCallback(newExtractorLink("Google Drive", "Google Drive", cleanUrl, ExtractorLinkType.VIDEO) {
+                    this.referer = "https://drive.google.com/"
+                    this.quality = Qualities.Unknown.value
+                    this.headers = mapOf("User-Agent" to defaultUserAgent)
+                })
+                return emitCount.get() > before
+            }
+
             Log.e(TAG, "Found GDrive URL: $cleanUrl")
 
             val fileId = Regex("/file/d/([a-zA-Z0-9_-]{10,})").find(cleanUrl)?.groupValues?.get(1)
                 ?: Regex("[?&]id=([a-zA-Z0-9_-]{10,})").find(cleanUrl)?.groupValues?.get(1)
-                
+
             if (fileId == null) {
                 Log.e(TAG, "FAILED to extract File ID from GDrive URL.")
                 return false
             }
 
+            // Skip already-processed files within this loadLinks() call
+            if (!processedGdriveIds.add(fileId)) {
+                Log.e(TAG, "GDrive file $fileId already processed in this call, skipping.")
+                return emitCount.get() > 0
+            }
+
             Log.e(TAG, "Extracted File ID: $fileId")
-            
+
+            // 1) Try the built-in extractor against the original /preview URL first
+            val beforeBuiltIn = emitCount.get()
             try {
-                Log.e(TAG, "Attempting direct .googlevideo.com extraction to bypass HTML quotas...")
-                val previewUrl = "https://drive.google.com/file/d/$fileId/preview"
-                val html = app.get(previewUrl, headers = mapOf("User-Agent" to defaultUserAgent, "Accept" to "text/html")).text
-                
-                val rawStream = Regex("(https://[^\\s\"']+\\.googlevideo\\.com/videoplayback\\?[^\\s\"']+)").find(html)?.groupValues?.get(1)
-                    
-                if (rawStream != null) {
-                    val cleanStream = rawStream.replace("\\u0026", "&").replace("\\/", "/")
-                    Log.e(TAG, "SUCCESS! Extracted raw Googlevideo stream: ${cleanStream.take(60)}...")
-                    countingCallback(newExtractorLink(this.name, "Google Drive HD", cleanStream, ExtractorLinkType.VIDEO) {
-                        this.referer = "https://drive.google.com/"
-                        this.quality = Qualities.Unknown.value
-                        this.headers = mapOf("User-Agent" to defaultUserAgent)
-                    })
-                    return true
-                } else {
-                    Log.e(TAG, "Direct extraction failed: Could not find videoplayback URL.")
-                }
+                loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
             } catch (e: Exception) {
-                Log.e(TAG, "Direct extraction threw exception: ${e.message}")
+                Log.e(TAG, "Built-in extractor on original URL threw: ${e.message}")
+            }
+            if (emitCount.get() > beforeBuiltIn) {
+                Log.e(TAG, "Built-in extractor succeeded on original GDrive URL.")
+                return true
             }
 
-            val driveViewUrl = "https://drive.google.com/file/d/$fileId/view"
-            val encodedDriveUrl = try { URLEncoder.encode(driveViewUrl, "UTF-8") } catch (_: Exception) { driveViewUrl }
-            val proxyUrls = listOf(
-                "https://gdriveplayer.to/embed2.php?link=$encodedDriveUrl",
-                "https://databasegdriveplayer.co/player.php?link=$encodedDriveUrl",
-                "https://anime.gdriveplayer.to/embed2.php?link=$encodedDriveUrl"
-            )
-
-            var foundProxy = false
-            for (proxy in proxyUrls) {
-                Log.e(TAG, "Attempting Proxy: $proxy")
-                try {
-                    if (loadExtractor(proxy, referer = ref, subtitleCallback, countingCallback)) {
-                        Log.e(TAG, "Proxy SUCCEEDED: $proxy")
-                        foundProxy = true
-                    } else {
-                        Log.e(TAG, "Proxy returned FALSE.")
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Proxy threw exception: ${e.message}")
-                }
+            // 2) Fetch /preview and pull the embedded direct download URL
+            Log.e(TAG, "Built-in extractor failed. Fetching preview HTML to locate direct download URL...")
+            val previewUrl = "https://drive.google.com/file/d/$fileId/preview"
+            val html = try {
+                app.get(
+                    previewUrl,
+                    headers = mapOf(
+                        "User-Agent" to defaultUserAgent,
+                        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language" to "en-US,en;q=0.9"
+                    )
+                ).text
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to fetch preview page: ${e.message}")
+                null
             }
 
-            Log.e(TAG, "handleGoogleDrive finished. Returning: $foundProxy")
-            return foundProxy
+            if (html.isNullOrBlank()) {
+                Log.e(TAG, "Preview HTML was empty, aborting GDrive extraction.")
+                return false
+            }
+
+            // Prefer the canonical /u/0/uc form; fall back to any usercontent link
+            val directDownload = Regex(
+                """https://drive\.usercontent\.google\.com/u/\d+/uc\?id=[^"'\\\s]+"""
+            ).find(html)?.value
+                ?: Regex(
+                    """https://drive\.usercontent\.google\.com/[^"'\\\s]*?id=[^"'\\\s&]+[^"'\\\s]*"""
+                ).find(html)?.value
+                ?: Regex(
+                    """https://drive\.google\.com/uc\?[^"'\\\s]*?id=[^"'\\\s&]+[^"'\\\s]*"""
+                ).find(html)?.value
+
+            if (directDownload.isNullOrBlank()) {
+                Log.e(TAG, "Could not find any direct download URL in preview HTML.")
+                return false
+            }
+
+            // Un-escape JSON-encoded URLs just in case
+            val cleanDownload = directDownload
+                .replace("\\u0026", "&")
+                .replace("\\/", "/")
+                .replace("\\u003d", "=")
+
+            Log.e(TAG, "Found direct download URL: $cleanDownload")
+
+            val beforeDownload = emitCount.get()
+            try {
+                loadExtractor(cleanDownload, referer = "https://drive.google.com/", subtitleCallback, countingCallback)
+            } catch (e: Exception) {
+                Log.e(TAG, "Extractor on direct download URL threw: ${e.message}")
+            }
+            if (emitCount.get() > beforeDownload) {
+                Log.e(TAG, "Extractor succeeded on direct download URL.")
+                return true
+            }
+
+            // 3) Last resort: emit the direct download URL as a generic VIDEO link
+            Log.e(TAG, "No extractor handled direct URL. Emitting it as a generic VIDEO link.")
+            countingCallback(newExtractorLink("Google Drive", "Google Drive", cleanDownload, ExtractorLinkType.VIDEO) {
+                this.referer = "https://drive.google.com/"
+                this.quality = Qualities.Unknown.value
+                this.headers = mapOf("User-Agent" to defaultUserAgent)
+            })
+
+            val success = emitCount.get() > beforeDownload
+            Log.e(TAG, "handleGoogleDrive finished. Success: $success")
+            return success
         }
 
         suspend fun handleUrl(rawUrl: String, ref: String, depth: Int = 0) {
@@ -348,6 +438,7 @@ class ChikiAnimationProvider : MainAPI() {
             Log.e(TAG, "Checking Extractor for URL: $cleanUrl")
 
             try {
+                // Chiki-specific extractors first
                 if (cleanUrl.contains("skylineai.cloud", true)) {
                     val before = emitCount.get()
                     SkylineAI().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
@@ -366,11 +457,19 @@ class ChikiAnimationProvider : MainAPI() {
                     }
                 }
 
-                if (handleGoogleDrive(cleanUrl, ref)) {
-                    foundFlag.set(1)
-                    return
+                // Google Drive (original + direct usercontent URLs)
+                if (cleanUrl.contains("drive.google.com", true) ||
+                    cleanUrl.contains("drive.usercontent.google.com", true)
+                ) {
+                    val before = emitCount.get()
+                    if (handleGoogleDrive(cleanUrl, ref) && emitCount.get() > before) {
+                        foundFlag.set(1)
+                        return
+                    }
+                    // If GDrive handling failed, fall through so generic extractor can still try
                 }
 
+                // Dailymotion (geo embed) — keep existing behaviour
                 if (cleanUrl.contains("geo.dailymotion.com/player", true)) {
                     val videoId = Regex("video=([a-zA-Z0-9_-]+)").find(cleanUrl)?.groupValues?.get(1)
                     if (videoId != null && processedDmIds.add(videoId)) {
@@ -380,18 +479,18 @@ class ChikiAnimationProvider : MainAPI() {
                             val apiUrl = "https://geo.dailymotion.com/videos/$videoId"
                             val reqHeaders = mapOf(
                                 "User-Agent" to defaultUserAgent,
-                                "Referer" to cleanUrl, 
-                                "Accept" to "application/json", 
+                                "Referer" to cleanUrl,
+                                "Accept" to "application/json",
                                 "x-dm-geo-embedder" to mainUrl
                             )
                             val apiRes = app.get(apiUrl, headers = reqHeaders).text
-                            
-                            val streamUrl = Regex("[\"']url[\"']\\s*:\\s*[\"']([^\"']+\\.m3u8[^\"']*)[\"']").find(apiRes)?.groupValues?.get(1)
+
+                            val streamUrl = Regex("[\"']url[\"']\\s*:\\s*[\"']([^\"']+\\.m3u8[^\"']*)[\"']")
+                                .find(apiRes)?.groupValues?.get(1)
 
                             if (!streamUrl.isNullOrBlank()) {
                                 val m3u8Url = streamUrl.replace("\\/", "/")
-                                Log.e(TAG, "Pushing native Dailymotion HLS stream to keep subtitles perfectly synced: $m3u8Url")
-                                
+                                Log.e(TAG, "Pushing native Dailymotion HLS stream: $m3u8Url")
                                 countingCallback(newExtractorLink("Dailymotion", "Dailymotion", m3u8Url, ExtractorLinkType.M3U8) {
                                     this.referer = cleanUrl
                                     this.headers = mapOf(
@@ -402,24 +501,34 @@ class ChikiAnimationProvider : MainAPI() {
                                     this.quality = Qualities.Unknown.value
                                 })
                             }
-                        } catch (e: Exception) { 
+                        } catch (e: Exception) {
                             Log.e(TAG, "Dailymotion API scrape failed: ${e.message}")
                         }
 
                         if (emitCount.get() == before) {
                             Log.e(TAG, "Fallback to direct Dailymotion extractor")
-                            try { loadExtractor("https://www.dailymotion.com/embed/video/$videoId", ref, subtitleCallback, countingCallback) } catch (_: Exception) { }
+                            try {
+                                loadExtractor(
+                                    "https://www.dailymotion.com/embed/video/$videoId",
+                                    ref, subtitleCallback, countingCallback
+                                )
+                            } catch (_: Exception) {}
                         }
                         if (emitCount.get() > before) {
                             foundFlag.set(1)
                             return
                         }
                     }
-                } else if (cleanUrl.contains("dailymotion.com", true) || cleanUrl.contains("dai.ly", true)) {
-                    val videoId = Regex("(?:video/|dai\\.ly/|embed/video/)([a-zA-Z0-9_-]+)").find(cleanUrl)?.groupValues?.get(1)
+                } else if (cleanUrl.contains("dailymotion.com", true) ||
+                           cleanUrl.contains("dai.ly", true)
+                ) {
+                    val videoId = Regex("(?:video/|dai\\.ly/|embed/video/)([a-zA-Z0-9_-]+)")
+                        .find(cleanUrl)?.groupValues?.get(1)
                     if (videoId == null || processedDmIds.add(videoId)) {
                         val before = emitCount.get()
-                        try { loadExtractor(cleanUrl, ref, subtitleCallback, countingCallback) } catch (_: Exception) { }
+                        try {
+                            loadExtractor(cleanUrl, ref, subtitleCallback, countingCallback)
+                        } catch (_: Exception) {}
                         if (emitCount.get() > before) {
                             foundFlag.set(1)
                             return
@@ -427,12 +536,13 @@ class ChikiAnimationProvider : MainAPI() {
                     }
                 }
 
-                val before = emitCount.get()
+                // Generic built-in extractor pass
+                val beforeGeneric = emitCount.get()
                 val ok = try {
                     loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
                 } catch (_: Exception) { false }
 
-                if (ok || emitCount.get() > before) {
+                if (ok || emitCount.get() > beforeGeneric) {
                     foundFlag.set(1)
                     return
                 }
@@ -466,8 +576,12 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        val mirrorOptions = document.select("select.mirror option, .mobius option, select#mirror option, select[name=mirror] option")
-        val serverListItems = document.select(".server_list li, ul.episodes li, .mirror_link, .mirrors li")
+        val mirrorOptions = document.select(
+            "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
+        )
+        val serverListItems = document.select(
+            ".server_list li, ul.episodes li, .mirror_link, .mirrors li"
+        )
 
         val extractionJobs = mutableListOf<kotlinx.coroutines.Deferred<Unit>>()
 
@@ -480,7 +594,7 @@ class ChikiAnimationProvider : MainAPI() {
                             handleUrl(value, data)
                         } else {
                             val decoded = safeBase64Decode(value)
-                            if (decoded != null && decoded.isNotBlank()) {
+                            if (!decoded.isNullOrBlank()) {
                                 processDecodedHtml(decoded, data)
                             }
                         }
@@ -501,7 +615,7 @@ class ChikiAnimationProvider : MainAPI() {
                             handleUrl(videoAttr, data)
                         } else if (videoAttr.length > 20) {
                             val decoded = safeBase64Decode(videoAttr)
-                            if (decoded != null && decoded.isNotBlank()) {
+                            if (!decoded.isNullOrBlank()) {
                                 if (decoded.startsWith("http")) {
                                     handleUrl(decoded, data)
                                 } else {
@@ -514,7 +628,7 @@ class ChikiAnimationProvider : MainAPI() {
                     extractionJobs.add(job)
                 }
             }
-            
+
             extractionJobs.awaitAll()
         }
 
@@ -525,7 +639,8 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        Log.e(TAG, "==== FINISHED LOADLINKS ==== Total Links Found: ${emitCount.get()}")
-        return foundFlag.get() > 0 || emitCount.get() > 0
+        val totalEmitted = emitCount.get()
+        Log.e(TAG, "==== FINISHED LOADLINKS ==== Total Links Found: $totalEmitted")
+        return totalEmitted > 0
     }
 }
