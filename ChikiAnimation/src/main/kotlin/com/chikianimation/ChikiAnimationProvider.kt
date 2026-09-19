@@ -279,33 +279,131 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
+        // Headers used for all GDrive calls. Accept must be HTML-first so Google
+        // returns the confirmation page (not a partial binary blob) on large files.
+        val gdriveHeaders = mapOf(
+            "User-Agent" to defaultUserAgent,
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Referer" to "https://drive.google.com/"
+        )
+
         /**
-         * Robust Google Drive handler.
+         * Resolve a real playable URL from a Google Drive file id.
          *
-         * Why the old approach failed:
-         *  - Modern GDrive preview pages build the .googlevideo.com playback URL in JS,
-         *    so it never appears in the initial HTML.
-         *  - The third-party proxies (gdriveplayer.to etc.) returned loadExtractor=true
-         *    without emitting any link, producing false-positive success.
-         *  - Scraping itemJson from /preview only works for a signed-in browser session;
-         *    an anonymous HTTP fetch often gets a stripped response (as seen in the
-         *    latest logcat where "Could not find any direct download URL" was logged).
+         * Google returns one of:
+         *   a) 302 redirect to *.googleusercontent.com / *.googlevideo.com (small files)
+         *   b) 200 OK HTML confirmation page containing a form with
+         *      hidden fields: id, export, confirm, uuid, at   (large files >100MB)
+         *   c) 200 OK direct binary (rare, when called with the confirmed URL)
          *
-         * New strategy:
-         *  1. Try the built-in extractor on the original URL.
-         *  2. Build the standard public direct-download URLs from the file id and try
-         *     each one through the built-in extractors. These endpoints work for any
-         *     file that is shared publicly / "anyone with the link".
-         *  3. Emit the direct usercontent URL as a generic VIDEO link as a last resort
-         *     so the player can follow the redirect chain itself.
-         *  4. Only if all that fails, fetch /preview and scrape with a broad regex.
+         * We never emit `drive.usercontent.google.com/download?...` unconfirmed
+         * because ExoPlayer will fetch the HTML confirmation page and fail with
+         * UnrecognizedInputFormatException (exactly what the log shows).
          */
+        suspend fun resolveGdriveStream(fileId: String): String? {
+            val initialUrl =
+                "https://drive.usercontent.google.com/download?id=$fileId&export=download&authuser=0"
+
+            Log.e(TAG, "Resolving GDrive stream: $initialUrl")
+
+            // --- Step 1: initial request, no redirects ---
+            val resp1 = try {
+                app.get(initialUrl, referer = "https://drive.google.com/",
+                    allowRedirects = false, headers = gdriveHeaders)
+            } catch (e: Exception) {
+                Log.e(TAG, "Initial GDrive fetch failed: ${e.message}")
+                return null
+            }
+
+            Log.e(TAG, "Initial status=${resp1.code} ctype=${resp1.headers["Content-Type"] ?: resp1.headers["content-type"]}")
+
+            if (resp1.code in 300..399) {
+                val loc = resp1.headers["Location"] ?: resp1.headers["location"]
+                if (!loc.isNullOrBlank()) {
+                    val absolute = if (loc.startsWith("http")) loc
+                                   else "https://drive.usercontent.google.com$loc"
+                    Log.e(TAG, "Direct redirect → $absolute")
+                    return absolute
+                }
+            }
+
+            val html = try { resp1.text } catch (_: Exception) { "" }
+            Log.e(TAG, "Confirmation HTML length=${html.length}")
+
+            // --- Step 2: parse the confirmation form (hidden inputs + form action) ---
+            val formFields = mutableMapOf<String, String>()
+
+            // Order 1: name="x" value="y"
+            Regex("""<input[^>]*?name=["']([^"']+)["'][^>]*?value=["']([^"']*)["']""")
+                .findAll(html).forEach { formFields[it.groupValues[1]] = it.groupValues[2] }
+            // Order 2: value="y" name="x"
+            Regex("""<input[^>]*?value=["']([^"']*)["'][^>]*?name=["']([^"']+)["']""")
+                .findAll(html).forEach { formFields[it.groupValues[2]] = it.groupValues[1] }
+
+            val action = Regex("""<form[^>]*?action=["']([^"']+)["']""")
+                .find(html)?.groupValues?.get(1)?.replace("&amp;", "&")
+                ?: "https://drive.usercontent.google.com/download"
+
+            Log.e(TAG, "Form action=$action fields=${formFields.keys}")
+
+            // Some responses have JS variables rather than a full form
+            val uuid = formFields["uuid"]
+                ?: Regex("""["']uuid["']\s*[:=]\s*["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+            val confirm = formFields["confirm"] ?: "t"
+            val at = formFields["at"]
+
+            if (uuid.isNullOrBlank()) {
+                Log.e(TAG, "No uuid found; cannot confirm download.")
+                return null
+            }
+
+            val params = linkedMapOf(
+                "id" to fileId,
+                "export" to "download",
+                "confirm" to confirm,
+                "uuid" to uuid
+            )
+            if (!at.isNullOrBlank()) params["at"] = at
+
+            val confirmUrl = action + "?" + params.entries.joinToString("&") {
+                "${it.key}=${URLEncoder.encode(it.value, "UTF-8")}"
+            }
+            Log.e(TAG, "Confirm URL → $confirmUrl")
+
+            // --- Step 3: request confirm URL without following redirects ---
+            val resp2 = try {
+                app.get(confirmUrl, referer = "https://drive.google.com/",
+                    allowRedirects = false, headers = gdriveHeaders)
+            } catch (e: Exception) {
+                Log.e(TAG, "Confirm fetch failed: ${e.message}")
+                // Fall back to emitting the confirm URL itself — ExoPlayer may
+                // follow the redirect if it handles 302 on its own.
+                return confirmUrl
+            }
+
+            Log.e(TAG, "Confirm status=${resp2.code} ctype=${resp2.headers["Content-Type"] ?: resp2.headers["content-type"]}")
+
+            if (resp2.code in 300..399) {
+                val loc = resp2.headers["Location"] ?: resp2.headers["location"]
+                if (!loc.isNullOrBlank()) {
+                    val absolute = if (loc.startsWith("http")) loc
+                                   else "https://drive.usercontent.google.com$loc"
+                    Log.e(TAG, "Confirm redirect → $absolute")
+                    return absolute
+                }
+            }
+
+            // Fallback: emit the confirm URL so ExoPlayer can try.
+            return confirmUrl
+        }
+
         suspend fun handleGoogleDrive(cleanUrl: String, ref: String): Boolean {
             if (!cleanUrl.contains("drive.google.com", ignoreCase = true) &&
                 !cleanUrl.contains("drive.usercontent.google.com", ignoreCase = true)
             ) return false
 
-            // 1) Built-in extractor against whatever URL we were handed
+            // 1) Built-in extractor first
             val beforeInitial = emitCount.get()
             try {
                 loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
@@ -317,7 +415,7 @@ class ChikiAnimationProvider : MainAPI() {
                 return true
             }
 
-            // 2) Extract file id
+            // 2) File id
             val fileId = Regex("/file/d/([a-zA-Z0-9_-]{10,})").find(cleanUrl)?.groupValues?.get(1)
                 ?: Regex("[?&]id=([a-zA-Z0-9_-]{10,})").find(cleanUrl)?.groupValues?.get(1)
 
@@ -333,107 +431,44 @@ class ChikiAnimationProvider : MainAPI() {
 
             Log.e(TAG, "Extracted File ID: $fileId")
 
-            // 3) Try constructed public direct-download URLs through the extractor system
-            val directCandidates = listOf(
-                "https://drive.usercontent.google.com/download?id=$fileId&export=download&authuser=0",
-                "https://drive.usercontent.google.com/u/0/uc?id=$fileId&export=download",
-                "https://drive.usercontent.google.com/uc?id=$fileId&export=download",
-                "https://drive.google.com/uc?export=download&id=$fileId",
-                "https://drive.google.com/uc?id=$fileId&export=download"
-            )
+            // 3) Resolve a real playable URL (handles large-file confirmation)
+            val resolved = resolveGdriveStream(fileId)
 
-            for (direct in directCandidates) {
-                Log.e(TAG, "Trying direct download candidate: $direct")
-                val before = emitCount.get()
-                try {
-                    loadExtractor(direct, referer = "https://drive.google.com/", subtitleCallback, countingCallback)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Extractor threw on $direct: ${e.message}")
-                }
-                if (emitCount.get() > before) {
-                    Log.e(TAG, "Extractor emitted via direct candidate: $direct")
-                    return true
-                }
-
-                // If extractors don't handle it, emit usercontent URLs as generic VIDEO
-                if (direct.contains("drive.usercontent.google.com")) {
-                    countingCallback(
-                        newExtractorLink("Google Drive", "Google Drive", direct, ExtractorLinkType.VIDEO) {
-                            this.referer = "https://drive.google.com/"
-                            this.quality = Qualities.Unknown.value
-                            this.headers = mapOf(
-                                "User-Agent" to defaultUserAgent,
-                                "Accept" to "*/*"
-                            )
-                        }
-                    )
-                    if (emitCount.get() > before) {
-                        Log.e(TAG, "Emitted direct usercontent URL as generic VIDEO: $direct")
-                        return true
-                    }
-                }
+            if (resolved.isNullOrBlank()) {
+                Log.e(TAG, "Could not resolve any playable GDrive URL.")
+                return false
             }
 
-            // 4) Last resort: scrape /preview with a broad file-id-based regex
-            Log.e(TAG, "Constructed URLs failed. Fetching preview HTML as last resort...")
-            val previewUrl = "https://drive.google.com/file/d/$fileId/preview"
-            val html = try {
-                app.get(
-                    previewUrl,
-                    headers = mapOf(
-                        "User-Agent" to defaultUserAgent,
-                        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language" to "en-US,en;q=0.9",
-                        "Referer" to "https://drive.google.com/"
-                    )
-                ).text
+            Log.e(TAG, "Resolved playable URL: $resolved")
+
+            // Give built-in extractors a chance with the resolved URL first
+            val beforeExtractor = emitCount.get()
+            try {
+                loadExtractor(resolved, referer = "https://drive.google.com/",
+                    subtitleCallback, countingCallback)
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to fetch preview page: ${e.message}")
-                null
+                Log.e(TAG, "Extractor on resolved URL threw: ${e.message}")
+            }
+            if (emitCount.get() > beforeExtractor) {
+                Log.e(TAG, "Extractor succeeded on resolved URL.")
+                return true
             }
 
-            if (!html.isNullOrBlank()) {
-                val patterns = listOf(
-                    Regex("""https://drive\.usercontent\.google\.com/u/\d+/uc\?id=$fileId[^"'\\\s]*"""),
-                    Regex("""https://drive\.usercontent\.google\.com/[^"'\\\s]*?id=$fileId[^"'\\\s]*"""),
-                    Regex("""https://drive\.google\.com/uc\?[^"'\\\s]*?id=$fileId[^"'\\\s]*"""),
-                    Regex("""https://[^"'\\\s]*?usercontent[^"'\\\s]*?id=$fileId[^"'\\\s]*""")
-                )
-                for (p in patterns) {
-                    val found = p.find(html)?.value
-                    if (!found.isNullOrBlank()) {
-                        val clean = found.replace("\\u0026", "&")
-                            .replace("\\/", "/")
-                            .replace("\\u003d", "=")
-                        Log.e(TAG, "Found direct URL in preview HTML: $clean")
-                        val before = emitCount.get()
-                        try {
-                            loadExtractor(
-                                clean,
-                                referer = "https://drive.google.com/",
-                                subtitleCallback,
-                                countingCallback
-                            )
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Extractor threw on scraped URL: ${e.message}")
-                        }
-                        if (emitCount.get() > before) return true
-
-                        countingCallback(
-                            newExtractorLink("Google Drive", "Google Drive", clean, ExtractorLinkType.VIDEO) {
-                                this.referer = "https://drive.google.com/"
-                                this.quality = Qualities.Unknown.value
-                                this.headers = mapOf("User-Agent" to defaultUserAgent)
-                            }
-                        )
-                        if (emitCount.get() > before) return true
-                    }
+            // Otherwise emit it ourselves
+            val beforeEmit = emitCount.get()
+            countingCallback(
+                newExtractorLink("Google Drive", "Google Drive", resolved, ExtractorLinkType.VIDEO) {
+                    this.referer = "https://drive.google.com/"
+                    this.quality = Qualities.Unknown.value
+                    this.headers = mapOf(
+                        "User-Agent" to defaultUserAgent,
+                        "Accept" to "*/*"
+                    )
                 }
-                Log.e(TAG, "No direct URL matched in preview HTML (length=${html.length}).")
-            }
-
-            Log.e(TAG, "handleGoogleDrive finished. No links emitted.")
-            return false
+            )
+            val ok = emitCount.get() > beforeEmit
+            Log.e(TAG, "handleGoogleDrive finished. Success: $ok")
+            return ok
         }
 
         suspend fun handleUrl(rawUrl: String, ref: String, depth: Int = 0) {
@@ -452,7 +487,6 @@ class ChikiAnimationProvider : MainAPI() {
             Log.e(TAG, "Checking Extractor for URL: $cleanUrl")
 
             try {
-                // Chiki-specific extractors first
                 if (cleanUrl.contains("skylineai.cloud", true)) {
                     val before = emitCount.get()
                     SkylineAI().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
@@ -471,7 +505,6 @@ class ChikiAnimationProvider : MainAPI() {
                     }
                 }
 
-                // Google Drive
                 if (cleanUrl.contains("drive.google.com", true) ||
                     cleanUrl.contains("drive.usercontent.google.com", true)
                 ) {
@@ -482,7 +515,6 @@ class ChikiAnimationProvider : MainAPI() {
                     }
                 }
 
-                // Dailymotion (geo embed)
                 if (cleanUrl.contains("geo.dailymotion.com/player", true)) {
                     val videoId = Regex("video=([a-zA-Z0-9_-]+)").find(cleanUrl)?.groupValues?.get(1)
                     if (videoId != null && processedDmIds.add(videoId)) {
@@ -553,7 +585,6 @@ class ChikiAnimationProvider : MainAPI() {
                     }
                 }
 
-                // Generic built-in extractor pass
                 val beforeGeneric = emitCount.get()
                 val ok = try {
                     loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
