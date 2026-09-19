@@ -27,6 +27,14 @@ class ChikiAnimationProvider : MainAPI() {
         private const val TAG = "ChikiGDriveDebug"
     }
 
+    private val defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+
+    private val defaultHeaders = mapOf(
+        "User-Agent" to defaultUserAgent,
+        "Referer" to mainUrl,
+        "Origin" to mainUrl
+    )
+
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update"          to "Recently Updated",
         "anime/?status=&type=&order=popular"         to "Popular",
@@ -34,12 +42,6 @@ class ChikiAnimationProvider : MainAPI() {
         "anime/?status=ongoing&type=&order=update"   to "Ongoing",
         "anime/?status=completed&type=&order=update" to "Completed",
         "anime/?status=&type=movie&order=update"     to "Movies"
-    )
-
-    private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-        "Referer" to mainUrl,
-        "Origin" to mainUrl
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -284,7 +286,8 @@ class ChikiAnimationProvider : MainAPI() {
             try {
                 Log.e(TAG, "Attempting direct .googlevideo.com extraction to bypass HTML quotas...")
                 val previewUrl = "https://drive.google.com/file/d/$fileId/preview"
-                val html = app.get(previewUrl).text
+                // Using full browser headers to avoid Google throwing 403 on the preview page
+                val html = app.get(previewUrl, headers = mapOf("User-Agent" to defaultUserAgent, "Accept" to "text/html")).text
                 
                 val rawStream = Regex("""(https://[^\s"']+\.googlevideo\.com/videoplayback\?[^\s"']+)""")
                     .find(html)?.groupValues?.get(1)
@@ -295,6 +298,7 @@ class ChikiAnimationProvider : MainAPI() {
                     countingCallback(newExtractorLink(this.name, "Google Drive HD", cleanStream, ExtractorLinkType.VIDEO) {
                         this.referer = "https://drive.google.com/"
                         this.quality = Qualities.Unknown.value
+                        this.headers = mapOf("User-Agent" to defaultUserAgent)
                     })
                     return true
                 } else {
@@ -376,8 +380,14 @@ class ChikiAnimationProvider : MainAPI() {
                         Log.e(TAG, "Processing Dailymotion ID: $videoId")
                         val before = emitCount.get()
                         try {
+                            // Fixing Dailymotion 403 Error by syncing User-Agent perfectly
                             val apiUrl = "https://geo.dailymotion.com/videos/$videoId"
-                            val reqHeaders = mapOf("Referer" to cleanUrl, "Accept" to "application/json", "x-dm-geo-embedder" to mainUrl)
+                            val reqHeaders = mapOf(
+                                "User-Agent" to defaultUserAgent,
+                                "Referer" to cleanUrl, 
+                                "Accept" to "application/json", 
+                                "x-dm-geo-embedder" to mainUrl
+                            )
                             val apiRes = app.get(apiUrl, headers = reqHeaders).text
                             val streamUrl = Regex("""["']url["']\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").find(apiRes)?.groupValues?.get(1)
 
@@ -387,6 +397,12 @@ class ChikiAnimationProvider : MainAPI() {
                                 
                                 countingCallback(newExtractorLink("Dailymotion", "Dailymotion", m3u8Url, ExtractorLinkType.M3U8) {
                                     this.referer = cleanUrl
+                                    // Injecting same headers into ExoPlayer prevents the 403 CDN crash
+                                    this.headers = mapOf(
+                                        "User-Agent" to defaultUserAgent,
+                                        "Origin" to "https://geo.dailymotion.com",
+                                        "Referer" to cleanUrl
+                                    )
                                     this.quality = Qualities.Unknown.value
                                 })
                             }
@@ -418,88 +434,4 @@ class ChikiAnimationProvider : MainAPI() {
                 val before = emitCount.get()
                 val ok = try {
                     loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
-                } catch (_: Exception) { false }
-
-                if (ok || emitCount.get() > before) {
-                    foundFlag.set(1)
-                    return
-                }
-
-                if (cleanUrl.contains(".m3u8", true)) {
-                    Log.e(TAG, "Generating generic M3u8 links for: $cleanUrl")
-                    M3u8Helper.generateM3u8("Generic HLS", cleanUrl, ref).forEach { countingCallback(it) }
-                    foundFlag.set(1)
-                    return
-                } else if (cleanUrl.contains(".mp4", true)) {
-                    Log.e(TAG, "Yielding generic MP4 link: $cleanUrl")
-                    countingCallback(newExtractorLink("Generic MP4", "Generic MP4", cleanUrl, ExtractorLinkType.VIDEO) {
-                        this.referer = ref
-                        this.quality = Qualities.Unknown.value
-                    })
-                    foundFlag.set(1)
-                    return
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "handleUrl error on $cleanUrl: ${e.message}")
-            }
-        }
-
-        suspend fun processDecodedHtml(decoded: String, ref: String) {
-            Jsoup.parse(decoded).select("iframe").forEach { iframe ->
-                val src = getIframeSrc(iframe)
-                if (src.isNotBlank()) handleUrl(src, ref)
-            }
-            Regex("""https?://[^\s"'<>\\)]+""").findAll(decoded).forEach { m ->
-                handleUrl(m.value, ref)
-            }
-        }
-
-        val mirrorOptions = document.select("select.mirror option, .mobius option, select#mirror option, select[name=mirror] option")
-        val serverListItems = document.select(".server_list li, ul.episodes li, .mirror_link, .mirrors li")
-
-        coroutineScope {
-            val mirrorJobs = mirrorOptions.mapNotNull { option ->
-                val value = option.attr("value").trim()
-                if (value.isNotBlank()) {
-                    async {
-                        if (value.startsWith("http") || value.startsWith("//")) {
-                            handleUrl(value, data)
-                        } else {
-                            val decoded = safeBase64Decode(value)
-                            if (!decoded.isNullOrBlank()) processDecodedHtml(decoded, data)
-                        }
-                    }
-                } else null
-            }
-
-            val serverJobs = serverListItems.mapNotNull { el ->
-                val videoAttr = el.attr("data-video").ifBlank { el.attr("data-src") }.ifBlank { el.attr("data-embed") }
-                if (videoAttr.isNotBlank()) {
-                    async {
-                        if (videoAttr.startsWith("http") || videoAttr.startsWith("//")) {
-                            handleUrl(videoAttr, data)
-                        } else if (videoAttr.length > 20) {
-                            val decoded = safeBase64Decode(videoAttr)
-                            if (!decoded.isNullOrBlank()) {
-                                if (decoded.startsWith("http")) handleUrl(decoded, data)
-                                else processDecodedHtml(decoded, data)
-                            }
-                        }
-                    }
-                } else null
-            }
-
-            (mirrorJobs + serverJobs).awaitAll()
-        }
-
-        if (foundFlag.get() == 0) {
-            document.select("iframe").forEach { iframe ->
-                val src = getIframeSrc(iframe)
-                if (src.isNotBlank()) handleUrl(src, data)
-            }
-        }
-
-        Log.e(TAG, "==== FINISHED LOADLINKS ==== Total Links Found: ${emitCount.get()}")
-        return foundFlag.get() > 0 || emitCount.get() > 0
-    }
-}
+                } catch (
