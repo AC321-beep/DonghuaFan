@@ -189,18 +189,18 @@ class ChikiAnimationProvider : MainAPI() {
             val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim()?.takeIf { it.isNotBlank() }
             val combinedText = "$epNumText $rawTitle"
 
-            val seasonNum = Regex("""(?i)(?:season\s*(\d+)|s(\d+))""").find(combinedText)?.let {
+            val seasonNum = Regex("(?i)(?:season\\s*(\\d+)|s(\\d+))").find(combinedText)?.let {
                 it.groupValues[1].ifEmpty { it.groupValues[2] }.toIntOrNull()
             }
 
-            val epNum = Regex("""(?i)(?:episode|ep)\s*(\d+)""").find(rawTitle)?.groupValues?.get(1)?.toIntOrNull()
-                ?: Regex("""(\d+)\s*(?:to|-)\s*\d+""").find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
-                ?: Regex("""\((\d+)\s*(?:to|-)\s*\d+\)""").find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
-                ?: Regex("""(\d+)-(\d+)""").find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
-                ?: Regex("""\d+""").find(epNumText)?.value?.toIntOrNull()
-                ?: Regex("""\d+""").find(rawTitle)?.value?.toIntOrNull()
+            val epNum = Regex("(?i)(?:episode|ep)\\s*(\\d+)").find(rawTitle)?.groupValues?.get(1)?.toIntOrNull()
+                ?: Regex("(\\d+)\\s*(?:to|-)\\s*\\d+").find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
+                ?: Regex("\\((\\d+)\\s*(?:to|-)\\s*\\d+\\)").find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
+                ?: Regex("(\\d+)-(\\d+)").find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
+                ?: Regex("\\d+").find(epNumText)?.value?.toIntOrNull()
+                ?: Regex("\\d+").find(rawTitle)?.value?.toIntOrNull()
 
-            val cleanName = rawTitle.replace(Regex("""(?i)^\s*Episode\s*"""), "").trim().ifBlank { rawTitle.ifBlank { "Episode" } }
+            val cleanName = rawTitle.replace(Regex("(?i)^\\s*Episode\\s*"), "").trim().ifBlank { rawTitle.ifBlank { "Episode" } }
 
             newEpisode(fixUrl(href)) {
                 this.name = cleanName
@@ -272,8 +272,8 @@ class ChikiAnimationProvider : MainAPI() {
             if (!cleanUrl.contains("drive.google.com", ignoreCase = true)) return false
             Log.e(TAG, "Found GDrive URL: $cleanUrl")
 
-            val fileId = Regex("""/file/d/([a-zA-Z0-9_-]{10,})""").find(cleanUrl)?.groupValues?.get(1)
-                ?: Regex("""[?&]id=([a-zA-Z0-9_-]{10,})""").find(cleanUrl)?.groupValues?.get(1)
+            val fileId = Regex("/file/d/([a-zA-Z0-9_-]{10,})").find(cleanUrl)?.groupValues?.get(1)
+                ?: Regex("[?&]id=([a-zA-Z0-9_-]{10,})").find(cleanUrl)?.groupValues?.get(1)
                 
             if (fileId == null) {
                 Log.e(TAG, "FAILED to extract File ID from GDrive URL.")
@@ -285,11 +285,9 @@ class ChikiAnimationProvider : MainAPI() {
             try {
                 Log.e(TAG, "Attempting direct .googlevideo.com extraction to bypass HTML quotas...")
                 val previewUrl = "https://drive.google.com/file/d/$fileId/preview"
-                // Using full browser headers to avoid Google throwing 403 on the preview page
                 val html = app.get(previewUrl, headers = mapOf("User-Agent" to defaultUserAgent, "Accept" to "text/html")).text
                 
-                val rawStream = Regex("""(https://[^\s"']+\.googlevideo\.com/videoplayback\?[^\s"']+)""")
-                    .find(html)?.groupValues?.get(1)
+                val rawStream = Regex("(https://[^\\s\"']+\\.googlevideo\\.com/videoplayback\\?[^\\s\"']+)").find(html)?.groupValues?.get(1)
                     
                 if (rawStream != null) {
                     val cleanStream = rawStream.replace("\\u0026", "&").replace("\\/", "/")
@@ -374,7 +372,7 @@ class ChikiAnimationProvider : MainAPI() {
                 }
 
                 if (cleanUrl.contains("geo.dailymotion.com/player", true)) {
-                    val videoId = Regex("""video=([a-zA-Z0-9_-]+)""").find(cleanUrl)?.groupValues?.get(1)
+                    val videoId = Regex("video=([a-zA-Z0-9_-]+)").find(cleanUrl)?.groupValues?.get(1)
                     if (videoId != null && processedDmIds.add(videoId)) {
                         Log.e(TAG, "Processing Dailymotion ID: $videoId")
                         val before = emitCount.get()
@@ -388,7 +386,7 @@ class ChikiAnimationProvider : MainAPI() {
                             )
                             val apiRes = app.get(apiUrl, headers = reqHeaders).text
                             
-                            val streamUrl = Regex("""["']url["']\s*:\s*["']([^"']+\.m3u8[^"']*)["']""").find(apiRes)?.groupValues?.get(1)
+                            val streamUrl = Regex("[\"']url[\"']\\s*:\\s*[\"']([^\"']+\\.m3u8[^\"']*)[\"']").find(apiRes)?.groupValues?.get(1)
 
                             if (!streamUrl.isNullOrBlank()) {
                                 val m3u8Url = streamUrl.replace("\\/", "/")
@@ -418,7 +416,7 @@ class ChikiAnimationProvider : MainAPI() {
                         }
                     }
                 } else if (cleanUrl.contains("dailymotion.com", true) || cleanUrl.contains("dai.ly", true)) {
-                    val videoId = Regex("""(?:video/|dai\.ly/|embed/video/)([a-zA-Z0-9_-]+)""").find(cleanUrl)?.groupValues?.get(1)
+                    val videoId = Regex("(?:video/|dai\\.ly/|embed/video/)([a-zA-Z0-9_-]+)").find(cleanUrl)?.groupValues?.get(1)
                     if (videoId == null || processedDmIds.add(videoId)) {
                         val before = emitCount.get()
                         try { loadExtractor(cleanUrl, ref, subtitleCallback, countingCallback) } catch (_: Exception) { }
@@ -439,4 +437,95 @@ class ChikiAnimationProvider : MainAPI() {
                     return
                 }
 
-                
+                if (cleanUrl.contains(".m3u8", true)) {
+                    Log.e(TAG, "Generating generic M3u8 links for: $cleanUrl")
+                    M3u8Helper.generateM3u8("Generic HLS", cleanUrl, ref).forEach { countingCallback(it) }
+                    foundFlag.set(1)
+                    return
+                } else if (cleanUrl.contains(".mp4", true)) {
+                    Log.e(TAG, "Yielding generic MP4 link: $cleanUrl")
+                    countingCallback(newExtractorLink("Generic MP4", "Generic MP4", cleanUrl, ExtractorLinkType.VIDEO) {
+                        this.referer = ref
+                        this.quality = Qualities.Unknown.value
+                    })
+                    foundFlag.set(1)
+                    return
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "handleUrl error on $cleanUrl: ${e.message}")
+            }
+        }
+
+        suspend fun processDecodedHtml(decoded: String, ref: String) {
+            Jsoup.parse(decoded).select("iframe").forEach { iframe ->
+                val src = getIframeSrc(iframe)
+                if (src.isNotBlank()) handleUrl(src, ref)
+            }
+            Regex("https?://[^\\s\"'<>\\\\)]+").findAll(decoded).forEach { m ->
+                handleUrl(m.value, ref)
+            }
+        }
+
+        val mirrorOptions = document.select("select.mirror option, .mobius option, select#mirror option, select[name=mirror] option")
+        val serverListItems = document.select(".server_list li, ul.episodes li, .mirror_link, .mirrors li")
+
+        val extractionJobs = mutableListOf<kotlinx.coroutines.Deferred<Unit>>()
+
+        coroutineScope {
+            for (option in mirrorOptions) {
+                val value = option.attr("value").trim()
+                if (value.isNotBlank()) {
+                    val job = async {
+                        if (value.startsWith("http") || value.startsWith("//")) {
+                            handleUrl(value, data)
+                        } else {
+                            val decoded = safeBase64Decode(value)
+                            if (decoded != null && decoded.isNotBlank()) {
+                                processDecodedHtml(decoded, data)
+                            }
+                        }
+                        Unit
+                    }
+                    extractionJobs.add(job)
+                }
+            }
+
+            for (el in serverListItems) {
+                var videoAttr = el.attr("data-video")
+                if (videoAttr.isBlank()) videoAttr = el.attr("data-src")
+                if (videoAttr.isBlank()) videoAttr = el.attr("data-embed")
+
+                if (videoAttr.isNotBlank()) {
+                    val job = async {
+                        if (videoAttr.startsWith("http") || videoAttr.startsWith("//")) {
+                            handleUrl(videoAttr, data)
+                        } else if (videoAttr.length > 20) {
+                            val decoded = safeBase64Decode(videoAttr)
+                            if (decoded != null && decoded.isNotBlank()) {
+                                if (decoded.startsWith("http")) {
+                                    handleUrl(decoded, data)
+                                } else {
+                                    processDecodedHtml(decoded, data)
+                                }
+                            }
+                        }
+                        Unit
+                    }
+                    extractionJobs.add(job)
+                }
+            }
+            
+            extractionJobs.awaitAll()
+        }
+
+        if (foundFlag.get() == 0) {
+            document.select("iframe").forEach { iframe ->
+                val src = getIframeSrc(iframe)
+                if (src.isNotBlank()) handleUrl(src, data)
+            }
+        }
+
+        Log.e(TAG, "==== FINISHED LOADLINKS ==== Total Links Found: ${emitCount.get()}")
+        return foundFlag.get() > 0 || emitCount.get() > 0
+    }
+}
