@@ -27,8 +27,7 @@ class DonghuaFunProvider : MainAPI() {
     private fun detailUrlToId(url: String): String =
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
-    // Reverted to id/20 to prevent the app from scraping Articles
-    override val mainPage = mainPageOf(
+      override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
         "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Coming Soon"
