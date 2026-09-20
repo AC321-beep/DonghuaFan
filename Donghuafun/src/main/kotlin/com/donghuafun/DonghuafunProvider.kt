@@ -1,7 +1,6 @@
 package com.donghuafun
 
 import android.util.Base64
-import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
@@ -37,17 +36,13 @@ class DonghuaFunProvider : MainAPI() {
         val isComingSoon = request.name == "Coming Soon"
         val isRecentlyUpdated = request.name == "Recently Updated"
         
-        // Define max pages to fetch based on category
         val maxPagesToSearch = if (isComingSoon || isRecentlyUpdated) 5 else 1 
-        
-        // Calculate the exact chunk of backend pages to fetch to prevent duplicates on scrolling
         val startPage = (page - 1) * maxPagesToSearch + 1
         val endPage = startPage + maxPagesToSearch - 1
         
         val items = mutableListOf<SearchResponse>()
         var hasNextPage = false
 
-        // Fetch pages concurrently instead of sequentially for a massive speed boost
         coroutineScope {
             (startPage..endPage).map { p ->
                 async {
@@ -70,16 +65,13 @@ class DonghuaFunProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
-        
-        // Since the site lacks proper search, we must scrape directories locally.
-        // We now scan BOTH 'time' (newest) and 'hits' (popular) to ensure older shows aren't missed.
         val categoriesToScan = listOf("time", "hits")
 
         val pageResults = coroutineScope {
             categoriesToScan.map { category ->
                 async {
                     val categoryResults = mutableListOf<SearchResponse>()
-                    for (page in 1..10) { // Scan 10 pages deep per category
+                    for (page in 1..10) { 
                         val pageUrl = if (page == 1) {
                             "$mainUrl/index.php/vod/show/id/20/by/$category.html"
                         } else {
@@ -87,10 +79,9 @@ class DonghuaFunProvider : MainAPI() {
                         }
                         
                         val doc = try { app.get(pageUrl).document } catch (e: Exception) { null } ?: break
-                        val parsedCards = parseShowCards(doc) // Defaults to false for both flags
+                        val parsedCards = parseShowCards(doc) 
                         if (parsedCards.isEmpty()) break
                         
-                        // Filter locally based on the search query
                         categoryResults.addAll(parsedCards.filter { it.name.contains(query, ignoreCase = true) })
                         
                         val hasNext = doc.select("a.page-next:not(.disabled), a:contains(Next), a:contains(下一页)").isNotEmpty()
@@ -116,18 +107,21 @@ class DonghuaFunProvider : MainAPI() {
         val year = doc.selectFirst("a[href*='/year/']")?.text()?.toIntOrNull()
 
         val episodes = mutableListOf<Episode>()
-        val tabs = doc.select(".anthology-tab a.vod-playerUrl")
+        val tabs = doc.select(".anthology-tab a.swiper-slide, .anthology-tab a")
         val listContainers = doc.select(".anthology-list-box")
         
-        // Hoisted up to share mapping across both the 4K Tab and the Rumble Tab
         val episodeMap = mutableMapOf<Int, Episode>() 
 
-        // --- 1. Original 4K Tab parsing ---
-        val fourKTabIndex = tabs.indexOfFirst { it.text().contains("4K", ignoreCase = true) }
-        val targetIndex = if (fourKTabIndex != -1) fourKTabIndex else 0
+        for ((index, tab) in tabs.withIndex()) {
+            if (index >= listContainers.size) continue
+            
+            val tabName = tab.text().trim()
+            
+            if (tabName.contains("indo", ignoreCase = true) || tabName.contains("vip", ignoreCase = true)) {
+                continue
+            }
 
-        if (targetIndex < listContainers.size) {
-            val container = listContainers[targetIndex]
+            val container = listContainers[index]
             val episodeLinks = container.select("a[href*='/vod/play/id/$showId/']")
 
             for (a in episodeLinks) {
@@ -138,27 +132,14 @@ class DonghuaFunProvider : MainAPI() {
                 
                 if (!episodeMap.containsKey(finalNumber)) {
                     episodeMap[finalNumber] = newEpisode(epUrl) { 
-                        name = epName.ifEmpty { "Episode $finalNumber" }; episode = finalNumber
+                        name = epName.ifEmpty { "Episode $finalNumber" }
+                        episode = finalNumber
                     }
-                }
-            }
-        }
-
-        // --- 2. Minimal Rumble Addition ---
-        val rumbleTabIndex = tabs.indexOfFirst { it.text().contains("Rum", ignoreCase = true) && !it.text().contains("Indo", ignoreCase = true) }
-        
-        if (rumbleTabIndex != -1 && rumbleTabIndex < listContainers.size) {
-            val container = listContainers[rumbleTabIndex]
-            val episodeLinks = container.select("a[href*='/vod/play/id/$showId/']")
-
-            for (a in episodeLinks) {
-                val epUrl = fixUrl(a.attr("href"))
-                val epName = a.selectFirst("span")?.text()?.trim() ?: a.text().trim()
-                val epNumber = parseEpisodeNumber(epName)
-                
-                // If the episode already exists from the 4K tab, append the Rumble URL using a comma separator
-                episodeMap[epNumber]?.let { existingEp ->
-                    existingEp.data += ",$epUrl" 
+                } else {
+                    val existingEp = episodeMap[finalNumber]!!
+                    if (!existingEp.data.contains(epUrl)) {
+                        existingEp.data += ",$epUrl" 
+                    }
                 }
             }
         }
@@ -193,7 +174,6 @@ class DonghuaFunProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var linkFound = false
-        // Split the data string to handle both the original URL and the appended Rumble URL
         val urls = data.split(",") 
 
         for (detailPageUrl in urls) {
@@ -203,7 +183,6 @@ class DonghuaFunProvider : MainAPI() {
             val html = response?.text ?: continue
             val doc = response.document
 
-            // --- Dailymotion Logic Intact ---
             var dailymotionToken: String? = null
             doc.select("iframe[src*='dailymotion']")?.forEach { iframe ->
                 val src = iframe.attr("src")
@@ -218,7 +197,6 @@ class DonghuaFunProvider : MainAPI() {
                 if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) linkFound = true
             }
 
-            // --- Main Player Logic ---
             val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
                 .find(html)?.groupValues?.get(1) ?: continue
 
@@ -232,7 +210,6 @@ class DonghuaFunProvider : MainAPI() {
                 rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
             }
 
-            // --- Subtitle Extraction ---
             val subUrlRaw = Regex(""""(?:subt|vtt|zimu|subtitle|sub)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE)
                 .find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
 
@@ -267,17 +244,12 @@ class DonghuaFunProvider : MainAPI() {
                 subtitleCallback.invoke(SubtitleFile("English", fixUrl(playerConfigSub)))
             }
 
-            // --- Link Routing ---
             if (from.equals("dailymotion", ignoreCase = true)) {
                 val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
                 if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) linkFound = true
             } 
-            // 1. EXPLICIT RUMBLE ROUTING
             else if (rawUrl.contains("rumble.com", ignoreCase = true) || from.contains("rumble", ignoreCase = true)) {
-                // MacCMS sometimes only gives the video ID instead of the full URL. This ensures it's formatted correctly.
                 val finalRumbleUrl = if (rawUrl.startsWith("http")) rawUrl else "https://rumble.com/embed/$rawUrl"
-                
-                // Directly call our custom Rumble extractor
                 Rumble().getUrl(finalRumbleUrl, detailPageUrl, subtitleCallback, callback)
                 linkFound = true
             }
@@ -303,7 +275,6 @@ class DonghuaFunProvider : MainAPI() {
                         linkFound = true
                     }
                 } else {
-                    // Fallback for native extractors (Streamwish, Filemoon, etc.)
                     if (loadExtractor(rawUrl, detailPageUrl, subtitleCallback, callback)) {
                         linkFound = true
                     } else {
@@ -348,9 +319,9 @@ class DonghuaFunProvider : MainAPI() {
                 val containsTrailerKeyword = keywords.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
 
                 when {
-                    isComingSoon -> containsTrailerKeyword       // ONLY show items with trailer keywords
-                    isRecentlyUpdated -> !containsTrailerKeyword // FILTER OUT items with trailer keywords
-                    else -> true                                 // For Most Popular/Search: Keep everything
+                    isComingSoon -> containsTrailerKeyword
+                    isRecentlyUpdated -> !containsTrailerKeyword
+                    else -> true
                 }
             }
             .mapNotNull { a ->
@@ -360,166 +331,5 @@ class DonghuaFunProvider : MainAPI() {
                 val poster = a.selectFirst("img")?.let { it.attr("data-src").ifEmpty { it.attr("src") } }?.takeUnless { it.startsWith("data:") }?.let { fixUrl(it) }
                 newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
             }
-    }
-}
-
-class DonghuaFunExtractor : ExtractorApi() {
-    override val name = "DonghuaFun Player"
-    override val mainUrl = "https://play.donghuafun.com"
-    override val requiresReferer = false
-
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        // Extract the clean cloudokyo.cloud CDN URL
-        val m3u8Url = if (url.contains("?url=")) {
-            url.substringAfter("?url=")
-        } else url
-
-        // Strategy 1: Spoof GanjingWorld (The actual owner of the cloudokyo CDN)
-        val ganjingHeaders = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Origin" to "https://www.ganjingworld.com",
-            "Referer" to "https://www.ganjingworld.com/"
-        )
-
-        // Attempt to parse the playlist safely to prevent the "No Link" bug
-        val extractedLinks = try {
-            M3u8Helper.generateM3u8(
-                this.name,
-                m3u8Url,
-                "https://www.ganjingworld.com/",
-                headers = ganjingHeaders
-            )
-        } catch (e: Exception) {
-            emptyList()
-        }
-
-        if (extractedLinks.isNotEmpty()) {
-            extractedLinks.forEach(callback)
-        } else {
-            // FALLBACK: Emit 3 distinct header strategies directly to ExoPlayer 
-            // to combat Error 2004 (403 Forbidden) and Error 2001.
-            
-            // Server Option 1: GanjingWorld Spoof
-            callback.invoke(
-                newExtractorLink(
-                    this.name,
-                    "DonghuaFun (Ganjing Spoof)",
-                    m3u8Url,
-                    ExtractorLinkType.M3U8
-                ) {
-                    this.quality = Qualities.Unknown.value
-                    this.referer = "https://www.ganjingworld.com/"
-                    this.headers = ganjingHeaders
-                }
-            )
-
-            // Server Option 2: Direct Connection (No Referer)
-            callback.invoke(
-                newExtractorLink(
-                    this.name,
-                    "DonghuaFun (Direct)",
-                    m3u8Url,
-                    ExtractorLinkType.M3U8
-                ) {
-                    this.quality = Qualities.Unknown.value
-                    this.referer = ""
-                    this.headers = mapOf(
-                        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                        "Accept" to "*/*"
-                    )
-                }
-            )
-
-            // Server Option 3: DonghuaFun Web Player Spoof
-            callback.invoke(
-                newExtractorLink(
-                    this.name,
-                    "DonghuaFun (Web Spoof)",
-                    m3u8Url,
-                    ExtractorLinkType.M3U8
-                ) {
-                    this.quality = Qualities.Unknown.value
-                    this.referer = "https://play.donghuafun.com/"
-                    this.headers = mapOf(
-                        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                        "Origin" to "https://play.donghuafun.com",
-                        "Referer" to "https://play.donghuafun.com/"
-                    )
-                }
-            )
-        }
-    }
-}
-
-class Rumble : ExtractorApi() {
-    override var name = "Rumble"
-    override var mainUrl = "https://rumble.com"
-    override val requiresReferer = false
-
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val html = try {
-            app.get(url, referer = referer ?: mainUrl).text
-        } catch (e: Exception) {
-            return
-        }
-
-        val scrapedUrls = mutableSetOf<String>()
-        val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
-        val matches = urlRegex.findAll(html)
-
-        matches.forEach { match ->
-            val cleanUrl = match.value.replace("\\/", "/")
-
-            if (!isCleanVideoUrl(cleanUrl)) return@forEach
-
-            if (scrapedUrls.add(cleanUrl)) {
-                if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
-                    // Flawless HLS stream with the Multi-Quality Selector
-                    M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
-                    
-                } else if (cleanUrl.contains(".mp4", ignoreCase = true)) {
-                    // Smart Quality Locator: Expanded to 250 characters to prevent OutOfBounds & missed resolutions
-                    val startIndex = maxOf(0, match.range.first - 250)
-                    val precedingText = html.substring(startIndex, match.range.first)
-
-                    val qMatch = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""").findAll(precedingText).lastOrNull()
-                        ?: Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""").findAll(precedingText).lastOrNull()
-
-                    val qualityInt = qMatch?.groupValues?.get(1)?.toIntOrNull() ?: Qualities.Unknown.value
-                    val displayLabel = if (qualityInt != Qualities.Unknown.value) "$name ${qualityInt}p" else name
-
-                    callback(
-                        newExtractorLink(
-                            name,
-                            displayLabel,
-                            cleanUrl,
-                            ExtractorLinkType.VIDEO // Explicit MP4 declaration
-                        ) {
-                            this.referer = url
-                            this.quality = qualityInt
-                        }
-                    )
-                }
-            }
-        }
-    }
-
-    // Extracted helper function for improved readability and maintenance
-    private fun isCleanVideoUrl(url: String): Boolean {
-        return !url.contains("/assets/", ignoreCase = true) &&
-               !url.contains("loop", ignoreCase = true) &&
-               !url.contains("preview", ignoreCase = true) &&
-               !url.contains("tracker", ignoreCase = true) &&
-               !url.contains("thumb", ignoreCase = true)
     }
 }
