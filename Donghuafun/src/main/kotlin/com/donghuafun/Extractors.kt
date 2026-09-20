@@ -14,19 +14,16 @@ class DonghuaFunExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Extract the clean cloudokyo.cloud CDN URL
         val m3u8Url = if (url.contains("?url=")) {
             url.substringAfter("?url=")
         } else url
 
-        // Strategy 1: Spoof GanjingWorld (The actual owner of the cloudokyo CDN)
         val ganjingHeaders = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Origin" to "https://www.ganjingworld.com",
             "Referer" to "https://www.ganjingworld.com/"
         )
 
-        // Attempt to parse the playlist safely to prevent the "No Link" bug
         val extractedLinks = try {
             M3u8Helper.generateM3u8(
                 this.name,
@@ -41,10 +38,6 @@ class DonghuaFunExtractor : ExtractorApi() {
         if (extractedLinks.isNotEmpty()) {
             extractedLinks.forEach(callback)
         } else {
-            // FALLBACK: Emit 3 distinct header strategies directly to ExoPlayer 
-            // to combat Error 2004 (403 Forbidden) and Error 2001.
-            
-            // Server Option 1: GanjingWorld Spoof
             callback.invoke(
                 newExtractorLink(
                     this.name,
@@ -58,8 +51,6 @@ class DonghuaFunExtractor : ExtractorApi() {
                 }
             )
 
-            // Server Option 2: Direct Connection (No Referer)
-            // Many CDNs allow connections if the Referer is completely blank
             callback.invoke(
                 newExtractorLink(
                     this.name,
@@ -76,7 +67,6 @@ class DonghuaFunExtractor : ExtractorApi() {
                 }
             )
 
-            // Server Option 3: DonghuaFun Web Player Spoof
             callback.invoke(
                 newExtractorLink(
                     this.name,
@@ -125,11 +115,9 @@ class Rumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
-                    // Flawless HLS stream with the Multi-Quality Selector
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
                     
                 } else if (cleanUrl.contains(".mp4", ignoreCase = true)) {
-                    // Smart Quality Locator: Expanded to 250 characters to prevent OutOfBounds & missed resolutions
                     val startIndex = maxOf(0, match.range.first - 250)
                     val precedingText = html.substring(startIndex, match.range.first)
 
@@ -144,7 +132,7 @@ class Rumble : ExtractorApi() {
                             name,
                             displayLabel,
                             cleanUrl,
-                            ExtractorLinkType.VIDEO // Explicit MP4 declaration
+                            ExtractorLinkType.VIDEO 
                         ) {
                             this.referer = url
                             this.quality = qualityInt
@@ -155,7 +143,6 @@ class Rumble : ExtractorApi() {
         }
     }
 
-    // Extracted helper function for improved readability and maintenance
     private fun isCleanVideoUrl(url: String): Boolean {
         return !url.contains("/assets/", ignoreCase = true) &&
                !url.contains("loop", ignoreCase = true) &&
