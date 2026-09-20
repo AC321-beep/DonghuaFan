@@ -222,6 +222,13 @@ class AnimexinProvider : MainAPI() {
             }
         }
 
+        // Short label appended to the picker name.
+        fun langTag(lang: String?): String? = when (lang) {
+            "eng" -> "[Eng]"
+            "ind" -> "[Indo]"
+            else -> null
+        }
+
         suspend fun invokeExtractor(iframeUrl: String, lang: String? = null) {
             var finalUrl = iframeUrl.trim()
             if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
@@ -231,9 +238,19 @@ class AnimexinProvider : MainAPI() {
             val dedupUrl = finalUrl.substringBefore("?")
             if (!extractedIframeUrls.add(dedupUrl)) return
 
-            // Tag lang on every link before passing to callback. Emit immediately.
+            val tag = langTag(lang)
+
+            // Tag lang on every link AND append [Eng]/[Indo] to the displayed name/source.
+            // Emit immediately — no buffering, no delay.
             val trackingCallback: (ExtractorLink) -> Unit = { link ->
-                val localized = if (lang != null && link.lang != lang) link.copy(lang = lang) else link
+                val localized = if (lang != null) {
+                    link.copy(
+                        name = if (tag != null && !link.name.contains(tag)) "${link.name} $tag" else link.name,
+                        source = if (tag != null && !link.source.contains(tag)) "${link.source} $tag" else link.source,
+                        lang = lang
+                    )
+                } else link
+
                 if (yieldedStreamUrls.add(localized.url)) callback(localized)
             }
 
