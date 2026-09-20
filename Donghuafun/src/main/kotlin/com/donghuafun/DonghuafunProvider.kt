@@ -17,8 +17,7 @@ class DonghuaFunProvider : MainAPI() {
     override var lang = "zh"
     override val hasMainPage = true
     override val hasDownloadSupport = true
-    // 1. Added AnimeMovie to supported types
-    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.Movie)
+    override val supportedTypes = setOf(TvType.Anime)
 
     companion object {
         private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -27,22 +26,22 @@ class DonghuaFunProvider : MainAPI() {
     private fun detailUrlToId(url: String): String =
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
-    // 2. Added Movies to the Homepage UI
     override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
-        "$mainUrl/index.php/vod/show/id/21/by/time.html" to "Movies", // Change 21 if DonghuaFun uses a different category ID for movies
         "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
-        "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Coming Soon"
+        "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Coming Soon",
+        "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Movies"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val isComingSoon = request.name == "Coming Soon"
-        val isRecentlyUpdated = request.name == "Recently Updated" || request.name == "Movies"
-        
-        val maxPagesToSearch = if (isComingSoon || isRecentlyUpdated) 5 else 1 
+        val isRecentlyUpdated = request.name == "Recently Updated"
+        val isMovie = request.name == "Movies"
+
+        val maxPagesToSearch = if (isComingSoon || isRecentlyUpdated || isMovie) 5 else 1
         val startPage = (page - 1) * maxPagesToSearch + 1
         val endPage = startPage + maxPagesToSearch - 1
-        
+
         val items = mutableListOf<SearchResponse>()
         var hasNextPage = false
 
@@ -51,12 +50,12 @@ class DonghuaFunProvider : MainAPI() {
                 async {
                     val pageUrl = if (p == 1) request.data else request.data.replace(".html", "/page/$p.html")
                     val doc = try { app.get(pageUrl).document } catch (e: Exception) { null }
-                    
+
                     if (doc != null) {
                         val elements = doc.select("a[href*='/vod/detail/id/']")
                         if (elements.isNotEmpty()) {
                             hasNextPage = true
-                            parseShowCards(doc, isComingSoon, isRecentlyUpdated)
+                            parseShowCards(doc, isComingSoon, isRecentlyUpdated, isMovie)
                         } else emptyList()
                     } else emptyList()
                 }
@@ -68,31 +67,25 @@ class DonghuaFunProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
-        
-        // 3. Upgraded Search: Now scans both the Anime (id/20) and Movie (id/21) directories
-        val directoriesToScan = listOf(
-            "id/20/by/time", 
-            "id/20/by/hits",
-            "id/21/by/time" 
-        )
+        val categoriesToScan = listOf("time", "hits")
 
         val pageResults = coroutineScope {
-            directoriesToScan.map { directory ->
+            categoriesToScan.map { category ->
                 async {
                     val categoryResults = mutableListOf<SearchResponse>()
-                    for (page in 1..10) { 
+                    for (page in 1..10) {
                         val pageUrl = if (page == 1) {
-                            "$mainUrl/index.php/vod/show/$directory.html"
+                            "$mainUrl/index.php/vod/show/id/20/by/$category.html"
                         } else {
-                            "$mainUrl/index.php/vod/show/$directory/page/$page.html"
+                            "$mainUrl/index.php/vod/show/id/20/by/$category/page/$page.html"
                         }
-                        
+
                         val doc = try { app.get(pageUrl).document } catch (e: Exception) { null } ?: break
-                        val parsedCards = parseShowCards(doc) 
+                        val parsedCards = parseShowCards(doc)
                         if (parsedCards.isEmpty()) break
-                        
+
                         categoryResults.addAll(parsedCards.filter { it.name.contains(query, ignoreCase = true) })
-                        
+
                         val hasNext = doc.select("a.page-next:not(.disabled), a:contains(Next), a:contains(下一页)").isNotEmpty()
                         if (!hasNext) break
                     }
@@ -100,7 +93,7 @@ class DonghuaFunProvider : MainAPI() {
                 }
             }.awaitAll()
         }
-        
+
         results.addAll(pageResults.flatten())
         return results.distinctBy { it.url }
     }
@@ -118,18 +111,19 @@ class DonghuaFunProvider : MainAPI() {
         val episodes = mutableListOf<Episode>()
         val tabs = doc.select(".anthology-tab a.swiper-slide, .anthology-tab a")
         val listContainers = doc.select(".anthology-list-box")
-        
-        val episodeMap = mutableMapOf<Int, Episode>() 
+
+        val episodeMap = mutableMapOf<Int, Episode>()
 
         for ((index, tab) in tabs.withIndex()) {
             if (index >= listContainers.size) continue
-            
+
             val tabName = tab.text().trim()
-            
+
+            // 1. SPEED FILTER: Instantly drop any VIP tabs to prevent them from generating episode links
             if (tabName.contains("vip", ignoreCase = true)) {
                 continue
             }
-            
+
             val container = listContainers[index]
             val episodeLinks = container.select("a[href*='/vod/play/id/$showId/']")
 
@@ -138,18 +132,18 @@ class DonghuaFunProvider : MainAPI() {
                 val epName = a.selectFirst("span")?.text()?.trim() ?: a.text().trim()
                 val epNumber = parseEpisodeNumber(epName)
                 val finalNumber = if (epNumber > 0) epNumber else episodeMap.size + 1
-                
+
                 val epData = "$tabName||$epUrl"
 
                 if (!episodeMap.containsKey(finalNumber)) {
-                    episodeMap[finalNumber] = newEpisode(epData) { 
+                    episodeMap[finalNumber] = newEpisode(epData) {
                         name = epName.ifEmpty { "Episode $finalNumber" }
                         episode = finalNumber
                     }
                 } else {
                     val existingEp = episodeMap[finalNumber]!!
                     if (!existingEp.data.contains(epUrl)) {
-                        existingEp.data += ",,$epData" 
+                        existingEp.data += ",,$epData"
                     }
                 }
             }
@@ -164,24 +158,12 @@ class DonghuaFunProvider : MainAPI() {
             }
         }
 
-        // Dynamically applies Movie or Anime UI layout based on URL ID
-        val type = if (url.contains("id/21")) TvType.AnimeMovie else TvType.Anime
-
-        return if (type == TvType.AnimeMovie && episodes.size <= 1) {
-            newMovieLoadResponse(title, url, TvType.AnimeMovie, episodes.firstOrNull()?.data ?: url) {
-                this.posterUrl = poster?.let { fixUrl(it) }
-                this.plot = description
-                this.tags = tags
-                this.year = year
-            }
-        } else {
-            newAnimeLoadResponse(title, url, type) {
-                this.posterUrl = poster?.let { fixUrl(it) }
-                this.plot = description
-                this.tags = tags
-                this.year = year
-                addEpisodes(DubStatus.None, episodes)
-            }
+        return newAnimeLoadResponse(title, url, TvType.Anime) {
+            posterUrl = poster?.let { fixUrl(it) }
+            plot = description
+            tags?.let { this.tags = it }
+            year?.let { this.year = it }
+            addEpisodes(DubStatus.None, episodes)
         }
     }
 
@@ -193,8 +175,8 @@ class DonghuaFunProvider : MainAPI() {
         val text = sources.filterNotNull().joinToString(" ").lowercase()
         return when {
             Regex("""\b(indonesia|indo|bahasa|id)\b""").containsMatchIn(text) -> "Indo"
-            Regex("""\b(english|eng|rum|dailymotion|4k ads)\b""").containsMatchIn(text) -> "Eng" 
-            else -> "Eng"
+            Regex("""\b(english|eng|rum)\b""").containsMatchIn(text) -> "Eng"
+            else -> null
         }
     }
 
@@ -208,11 +190,11 @@ class DonghuaFunProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         var linkFound = false
-        val rawSources = data.split(",,") 
+        val rawSources = data.split(",,")
         val uniqueSources = rawSources.distinctBy { it.split("||").getOrNull(1) ?: it }
-        
+
         val serverCounter = AtomicInteger(1)
-        
+
         val allLinks = coroutineScope {
             uniqueSources.map { source ->
                 async {
@@ -290,8 +272,9 @@ class DonghuaFunProvider : MainAPI() {
 
                     val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
 
+                    // 2. STABILITY FILTER: Block unstable GanjingWorld raw embeds, but protect the stable DonghuaFun Player (m3u8)
                     if ((rawUrl.contains("ganjingworld.com", ignoreCase = true) || from.contains("ganjing", ignoreCase = true)) && !isM3u8) {
-                        return@async emptyList() 
+                        return@async emptyList()
                     }
 
                     val collectionCallback: (ExtractorLink) -> Unit = { link ->
@@ -301,11 +284,11 @@ class DonghuaFunProvider : MainAPI() {
                     if (dailymotionToken != null) {
                         val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
                         loadExtractor(embedUrl, detailPageUrl, subtitleCallback, collectionCallback)
-                    } 
+                    }
                     else if (from.equals("dailymotion", ignoreCase = true)) {
                         val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
                         loadExtractor(embedUrl, detailPageUrl, subtitleCallback, collectionCallback)
-                    } 
+                    }
                     else if (rawUrl.contains("rumble.com", ignoreCase = true) || from.contains("rumble", ignoreCase = true)) {
                         val finalRumbleUrl = if (rawUrl.startsWith("http")) rawUrl else "https://rumble.com/embed/$rawUrl"
                         Rumble().getUrl(finalRumbleUrl, detailPageUrl, subtitleCallback, collectionCallback)
@@ -316,15 +299,11 @@ class DonghuaFunProvider : MainAPI() {
                         } else rawUrl
                         loadExtractor(extractorUrl, "https://donghuafun.com/", subtitleCallback, collectionCallback)
                     }
-                    else if (rawUrl.contains("ganjingworld.com", ignoreCase = true) || from.contains("ganjing", ignoreCase = true)) {
-                        val finalGanjingUrl = if (rawUrl.startsWith("http")) rawUrl else "https://www.ganjingworld.com/embed/$rawUrl"
-                        GanjingWorld().getUrl(finalGanjingUrl, detailPageUrl, subtitleCallback, collectionCallback)
-                    }
                     else if (rawUrl.isNotEmpty()) {
                         if (!loadExtractor(rawUrl, detailPageUrl, subtitleCallback, collectionCallback)) {
                             val hostName = from.ifEmpty { "Server ${serverCounter.getAndIncrement()}" }
                                 .replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
-                            
+
                             val fallbackLink = newExtractorLink(
                                 name,
                                 hostName,
@@ -342,30 +321,32 @@ class DonghuaFunProvider : MainAPI() {
                             localLinks.add(LinkContext(tabName, from, fallbackLink))
                         }
                     }
-                    
+
                     localLinks
                 }
             }.awaitAll().flatten()
         }
 
+        // --- UI DEDUPLICATION ---
         val seenCombos = mutableSetOf<String>()
 
         for (context in allLinks) {
             val link = context.link
-            
+
             var baseName = if (link.source == this.name) link.name else link.source
-            
+
             baseName = baseName
                 .replace("GeoDailymotion", "Dailymotion", ignoreCase = true)
                 .replace("DonghuaFun Player", "DonghuaFun", ignoreCase = true)
-            
+
+            // Clean out all native resolution brackets/labels
             baseName = baseName
                 .replace(Regex("""\b\d{3,4}p\b""", RegexOption.IGNORE_CASE), "")
                 .replace(Regex("""\b4k\b""", RegexOption.IGNORE_CASE), "")
                 .replace(Regex("""\[.*?\]"""), "")
                 .replace(Regex("""\(.*?\)"""), "")
                 .trim()
-                
+
             if (baseName.isEmpty()) baseName = "Server"
 
             val language = detectLang(context.tabName, context.fromName, link.name) ?: ""
@@ -375,6 +356,7 @@ class DonghuaFunProvider : MainAPI() {
                 if (language.isNotEmpty() && !baseName.contains(language, ignoreCase = true)) append(" [$language]")
             }.trim()
 
+            // Block duplicates only if Name + Exact Quality match
             val uniqueKey = "$finalName-${link.quality}"
             if (seenCombos.add(uniqueKey)) {
                 callback.invoke(
@@ -393,14 +375,19 @@ class DonghuaFunProvider : MainAPI() {
                 linkFound = true
             }
         }
-        
+
         return linkFound
     }
 
-    private fun parseShowCards(doc: Document, isComingSoon: Boolean = false, isRecentlyUpdated: Boolean = false): List<SearchResponse> {
+    private fun parseShowCards(
+        doc: Document,
+        isComingSoon: Boolean = false,
+        isRecentlyUpdated: Boolean = false,
+        isMovie: Boolean = false
+    ): List<SearchResponse> {
         return doc.select("a[href*='/vod/detail/id/']")
             .distinctBy { it.attr("href") }
-            .filter { a -> 
+            .filter { a ->
                 val parent1 = a.parent()
                 val parent2 = a.parent()?.parent()
                 val parent3 = a.parent()?.parent()?.parent()
@@ -411,14 +398,18 @@ class DonghuaFunProvider : MainAPI() {
                     parent1 != null && parent1.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent1
                     else -> a
                 }
-                
+
                 val cardText = container.text()
                 val keywords = listOf("trailer", "coming soon", "not yet aired", "upcoming", "releasing soon", "0 episode")
                 val containsTrailerKeyword = keywords.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
 
+                val movieKeywords = listOf("movie", "film", "剧场版", "电影", "劇場版", "映画")
+                val containsMovieKeyword = movieKeywords.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
+
                 when {
                     isComingSoon -> containsTrailerKeyword
                     isRecentlyUpdated -> !containsTrailerKeyword
+                    isMovie -> containsMovieKeyword && !containsTrailerKeyword
                     else -> true
                 }
             }
