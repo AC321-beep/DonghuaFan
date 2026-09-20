@@ -117,14 +117,18 @@ class DonghuaFunProvider : MainAPI() {
 
         val episodes = mutableListOf<Episode>()
         val tabs = doc.select(".anthology-tab a.vod-playerUrl")
+        val listContainers = doc.select(".anthology-list-box")
+        
+        // Hoisted up to share mapping across both the 4K Tab and the Rumble Tab
+        val episodeMap = mutableMapOf<Int, Episode>() 
+
+        // --- 1. Original 4K Tab parsing ---
         val fourKTabIndex = tabs.indexOfFirst { it.text().contains("4K", ignoreCase = true) }
         val targetIndex = if (fourKTabIndex != -1) fourKTabIndex else 0
 
-        val listContainers = doc.select(".anthology-list-box")
         if (targetIndex < listContainers.size) {
             val container = listContainers[targetIndex]
             val episodeLinks = container.select("a[href*='/vod/play/id/$showId/']")
-            val episodeMap = mutableMapOf<Int, Episode>()
 
             for (a in episodeLinks) {
                 val epUrl = fixUrl(a.attr("href"))
@@ -138,8 +142,28 @@ class DonghuaFunProvider : MainAPI() {
                     }
                 }
             }
-            episodes.addAll(episodeMap.toSortedMap().values)
         }
+
+        // --- 2. Minimal Rumble Addition ---
+        val rumbleTabIndex = tabs.indexOfFirst { it.text().contains("Rum", ignoreCase = true) && !it.text().contains("Indo", ignoreCase = true) }
+        
+        if (rumbleTabIndex != -1 && rumbleTabIndex < listContainers.size) {
+            val container = listContainers[rumbleTabIndex]
+            val episodeLinks = container.select("a[href*='/vod/play/id/$showId/']")
+
+            for (a in episodeLinks) {
+                val epUrl = fixUrl(a.attr("href"))
+                val epName = a.selectFirst("span")?.text()?.trim() ?: a.text().trim()
+                val epNumber = parseEpisodeNumber(epName)
+                
+                // If the episode already exists from the 4K tab, append the Rumble URL using a comma separator
+                episodeMap[epNumber]?.let { existingEp ->
+                    existingEp.data += ",$epUrl" 
+                }
+            }
+        }
+
+        episodes.addAll(episodeMap.toSortedMap().values)
 
         if (episodes.isEmpty() && showId.isNotEmpty()) {
             for (n in 1..300) {
@@ -168,133 +192,132 @@ class DonghuaFunProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val detailPageUrl = data
-        val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to detailPageUrl, "Origin" to mainUrl)
-        
-        // Single network request implementation to speed up player loading
-        val response = try { app.get(detailPageUrl, headers = headers) } catch (e: Exception) { null }
-        val html = response?.text ?: ""
-        val doc = response?.document
+        var linkFound = false
+        // Split the data string to handle both the original URL and the appended Rumble URL
+        val urls = data.split(",") 
 
-        // --- Dailymotion Logic Intact ---
-        var dailymotionToken: String? = null
-        doc?.select("iframe[src*='dailymotion']")?.forEach { iframe ->
-            val src = iframe.attr("src")
-            val match = Regex("""[?&]video=([^&]+)""").find(src)
-            if (match != null) {
-                dailymotionToken = match.groupValues[1]
-                return@forEach
-            }
-        }
-        if (dailymotionToken != null) {
-            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
-            if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
-        }
+        for (detailPageUrl in urls) {
+            val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to detailPageUrl, "Origin" to mainUrl)
+            
+            val response = try { app.get(detailPageUrl, headers = headers) } catch (e: Exception) { null }
+            val html = response?.text ?: continue
+            val doc = response.document
 
-        // --- Main Player Logic ---
-        val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-            .find(html)?.groupValues?.get(1) ?: return false
-
-        var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
-        val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
-        val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-
-        if (encrypt == 1) rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-        else if (encrypt == 2) {
-            rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
-            rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-        }
-
-        // ==========================================
-        // --- IMPROVED SUBTITLE EXTRACTION START ---
-        // ==========================================
-
-        // 1. Extract from MacCMS player_aaaa JSON keys
-        val subUrlRaw = Regex(""""(?:subt|vtt|zimu|subtitle|sub)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE)
-            .find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
-
-        if (subUrlRaw.isNotEmpty()) {
-            var decodedSub = subUrlRaw
-            try {
-                // Decode according to MacCMS encryption, unless it's already a plain HTTP/relative URL
-                if (encrypt == 1 && !decodedSub.startsWith("http")) {
-                    decodedSub = URLDecoder.decode(decodedSub, "UTF-8")
-                } else if (encrypt == 2 && !decodedSub.startsWith("http") && !decodedSub.startsWith("/")) {
-                    decodedSub = String(Base64.decode(decodedSub, Base64.DEFAULT))
-                    decodedSub = URLDecoder.decode(decodedSub, "UTF-8")
+            // --- Dailymotion Logic Intact ---
+            var dailymotionToken: String? = null
+            doc.select("iframe[src*='dailymotion']")?.forEach { iframe ->
+                val src = iframe.attr("src")
+                val match = Regex("""[?&]video=([^&]+)""").find(src)
+                if (match != null) {
+                    dailymotionToken = match.groupValues[1]
+                    return@forEach
                 }
-            } catch (e: Exception) {
-                decodedSub = subUrlRaw // Fallback to raw string if decoding fails
             }
-            if (decodedSub.isNotBlank()) {
-                subtitleCallback.invoke(SubtitleFile("English", fixUrl(decodedSub)))
+            if (dailymotionToken != null) {
+                val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
+                if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) linkFound = true
             }
-        }
 
-        // 2. Extract from standard HTML <track> elements
-        doc?.select("track")?.forEach { track ->
-            val trackSrc = track.attr("src")
-            if (trackSrc.isNotBlank()) {
-                val label = track.attr("label").ifEmpty { track.attr("srclang") }.ifEmpty { track.attr("lang") }.ifEmpty { "English" }
-                subtitleCallback.invoke(SubtitleFile(label, fixUrl(trackSrc)))
-            }
-        }
+            // --- Main Player Logic ---
+            val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+                .find(html)?.groupValues?.get(1) ?: continue
 
-        // 3. Fallback: Extract from generic player configurations (e.g., DPlayer, ArtPlayer)
-        val playerConfigSub = Regex("""subtitle:\s*\{\s*url:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
-            .find(html)?.groupValues?.get(1)?.replace("\\/", "/")
-        if (!playerConfigSub.isNullOrBlank()) {
-            subtitleCallback.invoke(SubtitleFile("English", fixUrl(playerConfigSub)))
-        }
+            var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+            val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
+            val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
-        // ========================================
-        // --- IMPROVED SUBTITLE EXTRACTION END ---
-        // ========================================
-
-        if (from.equals("dailymotion", ignoreCase = true)) {
-            val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
-            if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) return true
-        } 
-        else if (rawUrl.isNotEmpty()) {
-            if (rawUrl.contains("url=")) {
-                rawUrl = rawUrl.substringAfter("url=")
+            if (encrypt == 1) rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+            else if (encrypt == 2) {
+                rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
                 rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
             }
 
-            val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
-            val streamHeaders = mapOf(
-                "User-Agent" to USER_AGENT,
-                "Referer" to "https://donghuafun.com/",
-                "Origin" to "https://donghuafun.com"
-            )
+            // --- Subtitle Extraction ---
+            val subUrlRaw = Regex(""""(?:subt|vtt|zimu|subtitle|sub)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE)
+                .find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
 
-            if (isM3u8) {
-                // Route to our newly created DonghuaFunExtractor by prepending the domain
-                val extractorUrl = if (rawUrl.startsWith("http")) {
-                    "https://play.donghuafun.com/m3u8/?url=$rawUrl"
-                } else rawUrl
-
-                if (loadExtractor(extractorUrl, "https://donghuafun.com/", subtitleCallback, callback)) {
-                    return true
-                }
-            } else {
-                // Strict positional mapping fallback
-                callback.invoke(
-                    newExtractorLink(
-                        this.name,
-                        from.ifEmpty { "Server 1" },
-                        rawUrl,
-                        ExtractorLinkType.VIDEO
-                    ) {
-                        this.headers = streamHeaders
-                        this.referer = "https://donghuafun.com/"
-                        this.quality = Qualities.Unknown.value
+            if (subUrlRaw.isNotEmpty()) {
+                var decodedSub = subUrlRaw
+                try {
+                    if (encrypt == 1 && !decodedSub.startsWith("http")) {
+                        decodedSub = URLDecoder.decode(decodedSub, "UTF-8")
+                    } else if (encrypt == 2 && !decodedSub.startsWith("http") && !decodedSub.startsWith("/")) {
+                        decodedSub = String(Base64.decode(decodedSub, Base64.DEFAULT))
+                        decodedSub = URLDecoder.decode(decodedSub, "UTF-8")
                     }
-                )
+                } catch (e: Exception) {
+                    decodedSub = subUrlRaw
+                }
+                if (decodedSub.isNotBlank()) {
+                    subtitleCallback.invoke(SubtitleFile("English", fixUrl(decodedSub)))
+                }
             }
-            return true
+
+            doc.select("track").forEach { track ->
+                val trackSrc = track.attr("src")
+                if (trackSrc.isNotBlank()) {
+                    val label = track.attr("label").ifEmpty { track.attr("srclang") }.ifEmpty { track.attr("lang") }.ifEmpty { "English" }
+                    subtitleCallback.invoke(SubtitleFile(label, fixUrl(trackSrc)))
+                }
+            }
+
+            val playerConfigSub = Regex("""subtitle:\s*\{\s*url:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
+                .find(html)?.groupValues?.get(1)?.replace("\\/", "/")
+            if (!playerConfigSub.isNullOrBlank()) {
+                subtitleCallback.invoke(SubtitleFile("English", fixUrl(playerConfigSub)))
+            }
+
+            // --- Link Routing ---
+            if (from.equals("dailymotion", ignoreCase = true)) {
+                val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
+                if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, callback)) linkFound = true
+            } 
+            else if (rawUrl.isNotEmpty()) {
+                if (rawUrl.contains("url=")) {
+                    rawUrl = rawUrl.substringAfter("url=")
+                    rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+                }
+
+                val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
+                val streamHeaders = mapOf(
+                    "User-Agent" to USER_AGENT,
+                    "Referer" to "https://donghuafun.com/",
+                    "Origin" to "https://donghuafun.com"
+                )
+
+                if (isM3u8) {
+                    val extractorUrl = if (rawUrl.startsWith("http")) {
+                        "https://play.donghuafun.com/m3u8/?url=$rawUrl"
+                    } else rawUrl
+
+                    if (loadExtractor(extractorUrl, "https://donghuafun.com/", subtitleCallback, callback)) {
+                        linkFound = true
+                    }
+                } else {
+                    // Cloudstream natively intercepts Rumble URLs using loadExtractor and your other extensions pool.
+                    if (loadExtractor(rawUrl, detailPageUrl, subtitleCallback, callback)) {
+                        linkFound = true
+                    } else {
+                        // Dynamically label the fallback if it's the appended Rumble link
+                        val serverName = if (urls.size > 1 && detailPageUrl == urls.last()) "Rumble" else from.ifEmpty { "Server 1" }
+                        callback.invoke(
+                            newExtractorLink(
+                                this.name,
+                                serverName,
+                                rawUrl,
+                                ExtractorLinkType.VIDEO
+                            ) {
+                                this.headers = streamHeaders
+                                this.referer = "https://donghuafun.com/"
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        linkFound = true
+                    }
+                }
+            }
         }
-        return false
+        return linkFound
     }
 
     private fun parseShowCards(doc: Document, isComingSoon: Boolean = false, isRecentlyUpdated: Boolean = false): List<SearchResponse> {
