@@ -19,7 +19,6 @@ class DonghuaFunProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime)
 
     companion object {
-        // Desktop User-Agent to bypass mobile scraper blocks
         private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
 
@@ -125,7 +124,6 @@ class DonghuaFunProvider : MainAPI() {
                 val epNumber = parseEpisodeNumber(epName)
                 val finalNumber = if (epNumber > 0) epNumber else episodeMap.size + 1
                 
-                // Bundle the Tab Name and the URL together separated by "||"
                 val epData = "$tabName||$epUrl"
 
                 if (!episodeMap.containsKey(finalNumber)) {
@@ -164,6 +162,60 @@ class DonghuaFunProvider : MainAPI() {
         return Regex("""(\d+)""").find(name)?.groupValues?.get(1)?.toIntOrNull() ?: -1
     }
 
+    // --- DYNAMIC DETECTION HELPERS ---
+
+    private fun detectLang(vararg sources: String?): String? {
+        val text = sources.filterNotNull().joinToString(" ").lowercase()
+        return when {
+            Regex("""\b(indonesia|indo|bahasa|id)\b""").containsMatchIn(text) -> "Indo"
+            Regex("""\b(english|eng)\b""").containsMatchIn(text) -> "Eng"
+            Regex("""\b(chinese|mandarin|raw|zh|cn)\b""").containsMatchIn(text) -> "RAW"
+            Regex("""\b(hindi|hin)\b""").containsMatchIn(text) -> "Hindi"
+            Regex("""\b(spanish|esp)\b""").containsMatchIn(text) -> "Esp"
+            Regex("""\b(japanese|jap|jp)\b""").containsMatchIn(text) -> "Jap"
+            else -> null
+        }
+    }
+
+    private fun detectResolution(linkName: String, tabName: String): String? {
+        // Priority 1: Exact stream resolution (e.g., 1072p, 804p, 536p)
+        val exactMatch = Regex("""\b(\d{3,4}p)\b""", RegexOption.IGNORE_CASE).find(linkName)?.groupValues?.get(1)
+        if (exactMatch != null) return exactMatch.lowercase()
+
+        // Priority 2: Inferred from tab or link label metadata
+        val combined = "$linkName $tabName".lowercase()
+        return when {
+            combined.contains("4k") || combined.contains("2160") -> "4K"
+            combined.contains("1440") || combined.contains("2k") -> "1440p"
+            combined.contains("1080") -> "1080p"
+            combined.contains("720") -> "720p"
+            combined.contains("480") -> "480p"
+            combined.contains("360") -> "360p"
+            else -> null
+        }
+    }
+
+    private fun cleanSourceName(rawName: String, from: String): String {
+        var name = rawName
+            .replace("GeoDailymotion", "Dailymotion", ignoreCase = true)
+            .replace("DonghuaFun Player", "DonghuaFun", ignoreCase = true)
+            .replace(Regex("""\b\d{3,4}p\b""", RegexOption.IGNORE_CASE), "")
+            .replace(Regex("""\[.*?\]"""), "")
+            .trim()
+
+        if (name.isEmpty() || name.equals("Server", ignoreCase = true) || name.startsWith("Server", ignoreCase = true)) {
+            val fromClean = from.lowercase()
+            name = when {
+                fromClean.contains("dailymotion") -> "Dailymotion"
+                fromClean.contains("rumble") -> "Rumble"
+                fromClean.contains("ganjing") -> "GanjingWorld"
+                from.isNotBlank() -> from.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
+                else -> "Server"
+            }
+        }
+        return name
+    }
+
     @Suppress("DEPRECATION", "DEPRECATION_ERROR")
     override suspend fun loadLinks(
         data: String,
@@ -174,67 +226,12 @@ class DonghuaFunProvider : MainAPI() {
         var linkFound = false
         val sources = data.split(",,") 
 
-        // 1. DYNAMIC DETECTION HELPER FUNCTIONS (Animexin Style)
-        fun detectLang(vararg sources: String?): String {
-            val combined = sources.filterNotNull().joinToString(" ").lowercase()
-            val hasIndo = combined.contains("indonesia") || combined.contains("indo") || combined.contains("bahasa")
-            val hasEng = combined.contains("english") || Regex("""\beng\b""").containsMatchIn(combined) || combined.contains("rum")
-
-            return when {
-                hasEng && !hasIndo -> "Eng"
-                hasIndo && !hasEng -> "Indo"
-                else -> ""
-            }
-        }
-
-        fun detectResolution(vararg sources: String?): String {
-            val combined = sources.filterNotNull().joinToString(" ").lowercase()
-            return when {
-                combined.contains("4k") -> "4K"
-                combined.contains("1080") -> "1080p"
-                combined.contains("720") -> "720p"
-                else -> ""
-            }
-        }
-
         for (source in sources) {
             val parts = source.split("||")
             val tabName = parts.getOrNull(0) ?: ""
             val detailPageUrl = parts.getOrNull(1) ?: continue
 
-            // 2. TAG INJECTOR CALLBACK
-            val tagCallback: (ExtractorLink) -> Unit = { link ->
-                // Scans the tab name AND the extractor's returned name simultaneously
-                val resolution = detectResolution(tabName, link.name)
-                val language = detectLang(tabName, link.name)
-                
-                var finalName = link.name
-                
-                // Apply bracketed tags only if they aren't already naturally inside the string
-                val resTag = if (resolution.isNotEmpty() && !finalName.contains(resolution, ignoreCase = true)) "[$resolution]" else ""
-                val langTag = if (language.isNotEmpty() && !finalName.contains(language, ignoreCase = true)) "[$language]" else ""
-                
-                val appendedTags = "$resTag $langTag".trim()
-                if (appendedTags.isNotEmpty()) {
-                    finalName = "$finalName $appendedTags".trim()
-                }
-
-                callback.invoke(
-                    ExtractorLink(
-                        source = link.source,
-                        name = finalName,
-                        url = link.url,
-                        referer = link.referer,
-                        quality = link.quality,
-                        type = link.type,
-                        headers = link.headers,
-                        extractorData = link.extractorData
-                    )
-                )
-            }
-
             val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to detailPageUrl, "Origin" to mainUrl)
-            
             val response = try { app.get(detailPageUrl, headers = headers) } catch (e: Exception) { null }
             val html = response?.text ?: continue
             val doc = response.document
@@ -247,10 +244,6 @@ class DonghuaFunProvider : MainAPI() {
                     dailymotionToken = match.groupValues[1]
                     return@forEach
                 }
-            }
-            if (dailymotionToken != null) {
-                val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
-                if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, tagCallback)) linkFound = true
             }
 
             val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
@@ -300,7 +293,44 @@ class DonghuaFunProvider : MainAPI() {
                 subtitleCallback.invoke(SubtitleFile("English", fixUrl(playerConfigSub)))
             }
 
-            if (from.equals("dailymotion", ignoreCase = true)) {
+            if (rawUrl.contains("url=")) {
+                rawUrl = rawUrl.substringAfter("url=")
+                rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+            }
+
+            // --- FULLY DYNAMIC TAG CALLBACK ---
+            val tagCallback: (ExtractorLink) -> Unit = { link ->
+                val sourceName = cleanSourceName(link.name, from)
+                val resolution = detectResolution(link.name, tabName)
+                val language = detectLang(tabName, from, link.name)
+
+                val finalName = buildString {
+                    append(sourceName)
+                    if (!resolution.isNullOrBlank()) append(" [$resolution]")
+                    if (!language.isNullOrBlank()) append(" [$language]")
+                }.trim()
+
+                callback.invoke(
+                    ExtractorLink(
+                        source = link.source,
+                        name = finalName,
+                        url = link.url,
+                        referer = link.referer,
+                        quality = link.quality,
+                        type = link.type,
+                        headers = link.headers,
+                        extractorData = link.extractorData
+                    )
+                )
+            }
+
+            val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
+
+            if (dailymotionToken != null) {
+                val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
+                if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, tagCallback)) linkFound = true
+            } 
+            else if (from.equals("dailymotion", ignoreCase = true)) {
                 val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
                 if (loadExtractor(embedUrl, detailPageUrl, subtitleCallback, tagCallback)) linkFound = true
             } 
@@ -309,57 +339,35 @@ class DonghuaFunProvider : MainAPI() {
                 Rumble().getUrl(finalRumbleUrl, detailPageUrl, subtitleCallback, tagCallback)
                 linkFound = true
             }
-            else if (rawUrl.isNotEmpty()) {
-                if (rawUrl.contains("url=")) {
-                    rawUrl = rawUrl.substringAfter("url=")
-                    rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+            else if (isM3u8) {
+                val extractorUrl = if (rawUrl.startsWith("http")) {
+                    "https://play.donghuafun.com/m3u8/?url=$rawUrl"
+                } else rawUrl
+
+                if (loadExtractor(extractorUrl, "https://donghuafun.com/", subtitleCallback, tagCallback)) {
+                    linkFound = true
                 }
-
-                val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
-                val streamHeaders = mapOf(
-                    "User-Agent" to USER_AGENT,
-                    "Referer" to "https://donghuafun.com/",
-                    "Origin" to "https://donghuafun.com"
-                )
-
-                if (isM3u8) {
-                    val extractorUrl = if (rawUrl.startsWith("http")) {
-                        "https://play.donghuafun.com/m3u8/?url=$rawUrl"
-                    } else rawUrl
-
-                    if (loadExtractor(extractorUrl, "https://donghuafun.com/", subtitleCallback, tagCallback)) {
-                        linkFound = true
-                    }
+            }
+            else if (rawUrl.contains("ganjingworld.com", ignoreCase = true) || from.contains("ganjing", ignoreCase = true)) {
+                val finalGanjingUrl = if (rawUrl.startsWith("http")) rawUrl else "https://www.ganjingworld.com/embed/$rawUrl"
+                GanjingWorld().getUrl(finalGanjingUrl, detailPageUrl, subtitleCallback, tagCallback)
+                linkFound = true
+            }
+            else if (rawUrl.isNotEmpty()) {
+                if (loadExtractor(rawUrl, detailPageUrl, subtitleCallback, tagCallback)) {
+                    linkFound = true
                 } else {
-                    if (loadExtractor(rawUrl, detailPageUrl, subtitleCallback, tagCallback)) {
-                        linkFound = true
-                    } else {
-                        val hostName = from.ifEmpty { "Server 1" }.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
-                        
-                        // Manually apply detection for unresolved fallback links
-                        val resolution = detectResolution(tabName, hostName)
-                        val language = detectLang(tabName, hostName)
-                        
-                        val resTag = if (resolution.isNotEmpty() && !hostName.contains(resolution, ignoreCase = true)) "[$resolution]" else ""
-                        val langTag = if (language.isNotEmpty() && !hostName.contains(language, ignoreCase = true)) "[$language]" else ""
-                        
-                        val appendedTags = "$resTag $langTag".trim()
-                        val finalFallbackName = "$hostName $appendedTags".trim()
-
-                        callback.invoke(
-                            newExtractorLink(
-                                this.name,
-                                finalFallbackName,
-                                rawUrl,
-                                ExtractorLinkType.VIDEO
-                            ) {
-                                this.headers = streamHeaders
-                                this.referer = "https://donghuafun.com/"
-                                this.quality = Qualities.Unknown.value
-                            }
+                    tagCallback.invoke(
+                        ExtractorLink(
+                            source = this.name,
+                            name = from.ifEmpty { "Server 1" },
+                            url = rawUrl,
+                            referer = "https://donghuafun.com/",
+                            quality = Qualities.Unknown.value,
+                            type = ExtractorLinkType.VIDEO
                         )
-                        linkFound = true
-                    }
+                    )
+                    linkFound = true
                 }
             }
         }
