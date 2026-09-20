@@ -313,7 +313,9 @@ open class DonghuastreamProvider : MainAPI() {
             var finalUrl = iframeUrl
             var extReferer = iframeUrl
 
-            if (finalUrl.contains("dailymotion", ignoreCase = true)) {
+            // Guard so we never mangle ok.ru URLs through the Dailymotion rewriter
+            if (!finalUrl.contains("ok.ru", ignoreCase = true) &&
+                finalUrl.contains("dailymotion", ignoreCase = true)) {
                 val videoIdMatch = Regex("""[?&]video=([a-zA-Z0-9_-]+)""").find(finalUrl)
                 if (videoIdMatch != null) {
                     finalUrl = "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
@@ -322,6 +324,9 @@ open class DonghuastreamProvider : MainAPI() {
             }
 
             when {
+                "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> {
+                    OkRuCustom().getUrl(finalUrl, extReferer, subtitleCallback, callback)
+                }
                 "rumble.com" in finalUrl -> {
                     Rumble().getUrl(finalUrl, finalUrl, subtitleCallback, callback)
                 }
