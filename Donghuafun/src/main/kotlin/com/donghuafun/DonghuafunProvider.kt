@@ -116,6 +116,12 @@ class DonghuaFunProvider : MainAPI() {
             if (index >= listContainers.size) continue
             
             val tabName = tab.text().trim()
+            
+            // 1. SPEED FILTER: Instantly drop any VIP tabs to prevent them from generating episode links
+            if (tabName.contains("vip", ignoreCase = true)) {
+                continue
+            }
+            
             val container = listContainers[index]
             val episodeLinks = container.select("a[href*='/vod/play/id/$showId/']")
 
@@ -262,11 +268,16 @@ class DonghuaFunProvider : MainAPI() {
                         rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
                     }
 
+                    val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
+
+                    // 2. STABILITY FILTER: Block unstable GanjingWorld raw embeds, but protect the stable DonghuaFun Player (m3u8)
+                    if ((rawUrl.contains("ganjingworld.com", ignoreCase = true) || from.contains("ganjing", ignoreCase = true)) && !isM3u8) {
+                        return@async emptyList() 
+                    }
+
                     val collectionCallback: (ExtractorLink) -> Unit = { link ->
                         localLinks.add(LinkContext(tabName, from, link))
                     }
-
-                    val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
 
                     if (dailymotionToken != null) {
                         val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
@@ -285,10 +296,6 @@ class DonghuaFunProvider : MainAPI() {
                             "https://play.donghuafun.com/m3u8/?url=$rawUrl"
                         } else rawUrl
                         loadExtractor(extractorUrl, "https://donghuafun.com/", subtitleCallback, collectionCallback)
-                    }
-                    else if (rawUrl.contains("ganjingworld.com", ignoreCase = true) || from.contains("ganjing", ignoreCase = true)) {
-                        val finalGanjingUrl = if (rawUrl.startsWith("http")) rawUrl else "https://www.ganjingworld.com/embed/$rawUrl"
-                        GanjingWorld().getUrl(finalGanjingUrl, detailPageUrl, subtitleCallback, collectionCallback)
                     }
                     else if (rawUrl.isNotEmpty()) {
                         if (!loadExtractor(rawUrl, detailPageUrl, subtitleCallback, collectionCallback)) {
@@ -330,10 +337,7 @@ class DonghuaFunProvider : MainAPI() {
                 .replace("GeoDailymotion", "Dailymotion", ignoreCase = true)
                 .replace("DonghuaFun Player", "DonghuaFun", ignoreCase = true)
             
-            if (baseName.equals("DonghuaFun", ignoreCase = true) && context.fromName.contains("ganjing", ignoreCase = true)) {
-                baseName = "GanjingWorld"
-            }
-            
+            // Clean out all native resolution brackets/labels
             baseName = baseName
                 .replace(Regex("""\b\d{3,4}p\b""", RegexOption.IGNORE_CASE), "")
                 .replace(Regex("""\b4k\b""", RegexOption.IGNORE_CASE), "")
@@ -350,7 +354,7 @@ class DonghuaFunProvider : MainAPI() {
                 if (language.isNotEmpty() && !baseName.contains(language, ignoreCase = true)) append(" [$language]")
             }.trim()
 
-            // Removed bucketing. Deduplicates purely by Exact Name + Exact Quality.
+            // Block duplicates only if Name + Exact Quality match
             val uniqueKey = "$finalName-${link.quality}"
             if (seenCombos.add(uniqueKey)) {
                 callback.invoke(
