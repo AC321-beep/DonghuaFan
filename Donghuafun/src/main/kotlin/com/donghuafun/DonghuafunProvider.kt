@@ -299,7 +299,7 @@ class DonghuaFunProvider : MainAPI() {
             }
 
             // --- FULLY DYNAMIC TAG CALLBACK ---
-            val tagCallback: (ExtractorLink) -> Unit = { link ->
+                val tagCallback: (ExtractorLink) -> Unit = { link ->
                 val sourceName = cleanSourceName(link.name, from)
                 val resolution = detectResolution(link.name, tabName)
                 val language = detectLang(tabName, from, link.name)
@@ -311,16 +311,17 @@ class DonghuaFunProvider : MainAPI() {
                 }.trim()
 
                 callback.invoke(
-                    ExtractorLink(
-                        source = link.source,
-                        name = finalName,
-                        url = link.url,
-                        referer = link.referer,
-                        quality = link.quality,
-                        type = link.type,
-                        headers = link.headers,
-                        extractorData = link.extractorData
-                    )
+                    newExtractorLink(
+                        link.source,
+                        finalName,
+                        link.url,
+                        link.type ?: ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = link.referer
+                        this.quality = link.quality
+                        if (link.headers != null) this.headers = link.headers!!
+                        this.extractorData = link.extractorData
+                    }
                 )
             }
 
