@@ -96,3 +96,71 @@ class DonghuaFunExtractor : ExtractorApi() {
         }
     }
 }
+
+class Rumble : ExtractorApi() {
+    override var name = "Rumble"
+    override var mainUrl = "https://rumble.com"
+    override val requiresReferer = false
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val html = try {
+            app.get(url, referer = referer ?: mainUrl).text
+        } catch (e: Exception) {
+            return
+        }
+
+        val scrapedUrls = mutableSetOf<String>()
+        val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
+        val matches = urlRegex.findAll(html)
+
+        matches.forEach { match ->
+            val cleanUrl = match.value.replace("\\/", "/")
+
+            if (!isCleanVideoUrl(cleanUrl)) return@forEach
+
+            if (scrapedUrls.add(cleanUrl)) {
+                if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
+                    // Flawless HLS stream with the Multi-Quality Selector
+                    M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
+                    
+                } else if (cleanUrl.contains(".mp4", ignoreCase = true)) {
+                    // Smart Quality Locator: Expanded to 250 characters to prevent OutOfBounds & missed resolutions
+                    val startIndex = maxOf(0, match.range.first - 250)
+                    val precedingText = html.substring(startIndex, match.range.first)
+
+                    val qMatch = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""").findAll(precedingText).lastOrNull()
+                        ?: Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""").findAll(precedingText).lastOrNull()
+
+                    val qualityInt = qMatch?.groupValues?.get(1)?.toIntOrNull() ?: Qualities.Unknown.value
+                    val displayLabel = if (qualityInt != Qualities.Unknown.value) "$name ${qualityInt}p" else name
+
+                    callback(
+                        newExtractorLink(
+                            name,
+                            displayLabel,
+                            cleanUrl,
+                            ExtractorLinkType.VIDEO // Explicit MP4 declaration
+                        ) {
+                            this.referer = url
+                            this.quality = qualityInt
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    // Extracted helper function for improved readability and maintenance
+    private fun isCleanVideoUrl(url: String): Boolean {
+        return !url.contains("/assets/", ignoreCase = true) &&
+               !url.contains("loop", ignoreCase = true) &&
+               !url.contains("preview", ignoreCase = true) &&
+               !url.contains("tracker", ignoreCase = true) &&
+               !url.contains("thumb", ignoreCase = true)
+    }
+}
