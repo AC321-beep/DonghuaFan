@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import java.net.URLDecoder
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -183,127 +184,141 @@ class DonghuaFunProvider : MainAPI() {
         var linkFound = false
         val rawSources = data.split(",,") 
         val uniqueSources = rawSources.distinctBy { it.split("||").getOrNull(1) ?: it }
-        val allLinks = mutableListOf<LinkContext>()
+        
+        val serverCounter = AtomicInteger(1)
+        
+        val allLinks = coroutineScope {
+            uniqueSources.map { source ->
+                async {
+                    val localLinks = mutableListOf<LinkContext>()
+                    val parts = source.split("||")
+                    val tabName = parts.getOrNull(0) ?: ""
+                    val detailPageUrl = parts.getOrNull(1) ?: return@async emptyList()
 
-        for (source in uniqueSources) {
-            val parts = source.split("||")
-            val tabName = parts.getOrNull(0) ?: ""
-            val detailPageUrl = parts.getOrNull(1) ?: continue
+                    val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to detailPageUrl, "Origin" to mainUrl)
+                    val response = try { app.get(detailPageUrl, headers = headers) } catch (e: Exception) { null }
+                    val html = response?.text ?: return@async emptyList()
+                    val doc = response.document
 
-            val headers = mapOf("User-Agent" to USER_AGENT, "Referer" to detailPageUrl, "Origin" to mainUrl)
-            val response = try { app.get(detailPageUrl, headers = headers) } catch (e: Exception) { null }
-            val html = response?.text ?: continue
-            val doc = response.document
-
-            var dailymotionToken: String? = null
-            doc.select("iframe[src*='dailymotion']")?.forEach { iframe ->
-                val src = iframe.attr("src")
-                val match = Regex("""[?&]video=([^&]+)""").find(src)
-                if (match != null) {
-                    dailymotionToken = match.groupValues[1]
-                    return@forEach
-                }
-            }
-
-            val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-                .find(html)?.groupValues?.get(1) ?: continue
-
-            var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
-            val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
-            val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-
-            if (encrypt == 1) rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-            else if (encrypt == 2) {
-                rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
-                rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-            }
-
-            val subUrlRaw = Regex(""""(?:subt|vtt|zimu|subtitle|sub)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE)
-                .find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
-
-            if (subUrlRaw.isNotEmpty()) {
-                var decodedSub = subUrlRaw
-                try {
-                    if (encrypt == 1 && !decodedSub.startsWith("http")) {
-                        decodedSub = URLDecoder.decode(decodedSub, "UTF-8")
-                    } else if (encrypt == 2 && !decodedSub.startsWith("http") && !decodedSub.startsWith("/")) {
-                        decodedSub = String(Base64.decode(decodedSub, Base64.DEFAULT))
-                        decodedSub = URLDecoder.decode(decodedSub, "UTF-8")
+                    var dailymotionToken: String? = null
+                    doc.select("iframe[src*='dailymotion']")?.forEach { iframe ->
+                        val src = iframe.attr("src")
+                        val match = Regex("""[?&]video=([^&]+)""").find(src)
+                        if (match != null) {
+                            dailymotionToken = match.groupValues[1]
+                            return@forEach
+                        }
                     }
-                } catch (e: Exception) {
-                    decodedSub = subUrlRaw
-                }
-                if (decodedSub.isNotBlank()) {
-                    subtitleCallback.invoke(SubtitleFile("English", fixUrl(decodedSub)))
-                }
-            }
 
-            doc.select("track").forEach { track ->
-                val trackSrc = track.attr("src")
-                if (trackSrc.isNotBlank()) {
-                    val label = track.attr("label").ifEmpty { track.attr("srclang") }.ifEmpty { track.attr("lang") }.ifEmpty { "English" }
-                    subtitleCallback.invoke(SubtitleFile(label, fixUrl(trackSrc)))
-                }
-            }
+                    val playerJson = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
+                        .find(html)?.groupValues?.get(1) ?: return@async emptyList()
 
-            if (rawUrl.contains("url=")) {
-                rawUrl = rawUrl.substringAfter("url=")
-                rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
-            }
+                    var rawUrl = Regex(""""url"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+                    val from = Regex(""""from"\s*:\s*"([^"]+)"""").find(playerJson)?.groupValues?.get(1) ?: ""
+                    val encrypt = Regex(""""encrypt"\s*:\s*(\d+)""").find(playerJson)?.groupValues?.get(1)?.toIntOrNull() ?: 0
 
-            val collectionCallback: (ExtractorLink) -> Unit = { link ->
-                allLinks.add(LinkContext(tabName, from, link))
-            }
+                    if (encrypt == 1) rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+                    else if (encrypt == 2) {
+                        rawUrl = String(Base64.decode(rawUrl, Base64.DEFAULT))
+                        rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+                    }
 
-            val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
+                    val subUrlRaw = Regex(""""(?:subt|vtt|zimu|subtitle|sub)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE)
+                        .find(playerJson)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
 
-            if (dailymotionToken != null) {
-                val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
-                loadExtractor(embedUrl, detailPageUrl, subtitleCallback, collectionCallback)
-            } 
-            else if (from.equals("dailymotion", ignoreCase = true)) {
-                val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
-                loadExtractor(embedUrl, detailPageUrl, subtitleCallback, collectionCallback)
-            } 
-            else if (rawUrl.contains("rumble.com", ignoreCase = true) || from.contains("rumble", ignoreCase = true)) {
-                val finalRumbleUrl = if (rawUrl.startsWith("http")) rawUrl else "https://rumble.com/embed/$rawUrl"
-                Rumble().getUrl(finalRumbleUrl, detailPageUrl, subtitleCallback, collectionCallback)
-            }
-            else if (isM3u8) {
-                val extractorUrl = if (rawUrl.startsWith("http")) {
-                    "https://play.donghuafun.com/m3u8/?url=$rawUrl"
-                } else rawUrl
-                loadExtractor(extractorUrl, "https://donghuafun.com/", subtitleCallback, collectionCallback)
-            }
-            else if (rawUrl.contains("ganjingworld.com", ignoreCase = true) || from.contains("ganjing", ignoreCase = true)) {
-                val finalGanjingUrl = if (rawUrl.startsWith("http")) rawUrl else "https://www.ganjingworld.com/embed/$rawUrl"
-                GanjingWorld().getUrl(finalGanjingUrl, detailPageUrl, subtitleCallback, collectionCallback)
-            }
-            else if (rawUrl.isNotEmpty()) {
-                if (!loadExtractor(rawUrl, detailPageUrl, subtitleCallback, collectionCallback)) {
-                    val hostName = from.ifEmpty { "Server 1" }.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
+                    if (subUrlRaw.isNotEmpty()) {
+                        var decodedSub = subUrlRaw
+                        try {
+                            if (encrypt == 1 && !decodedSub.startsWith("http")) {
+                                decodedSub = URLDecoder.decode(decodedSub, "UTF-8")
+                            } else if (encrypt == 2 && !decodedSub.startsWith("http") && !decodedSub.startsWith("/")) {
+                                decodedSub = String(Base64.decode(decodedSub, Base64.DEFAULT))
+                                decodedSub = URLDecoder.decode(decodedSub, "UTF-8")
+                            }
+                        } catch (e: Exception) {
+                            decodedSub = subUrlRaw
+                        }
+                        if (decodedSub.isNotBlank()) {
+                            subtitleCallback.invoke(SubtitleFile("English", fixUrl(decodedSub)))
+                        }
+                    }
+
+                    doc.select("track").forEach { track ->
+                        val trackSrc = track.attr("src")
+                        if (trackSrc.isNotBlank()) {
+                            val label = track.attr("label").ifEmpty { track.attr("srclang") }.ifEmpty { track.attr("lang") }.ifEmpty { "English" }
+                            subtitleCallback.invoke(SubtitleFile(label, fixUrl(trackSrc)))
+                        }
+                    }
+
+                    val playerConfigSub = Regex("""subtitle:\s*\{\s*url:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
+                        .find(html)?.groupValues?.get(1)?.replace("\\/", "/")
+                    if (!playerConfigSub.isNullOrBlank()) {
+                        subtitleCallback.invoke(SubtitleFile("English", fixUrl(playerConfigSub)))
+                    }
+
+                    if (rawUrl.contains("url=")) {
+                        rawUrl = rawUrl.substringAfter("url=")
+                        rawUrl = URLDecoder.decode(rawUrl, "UTF-8")
+                    }
+
+                    val collectionCallback: (ExtractorLink) -> Unit = { link ->
+                        localLinks.add(LinkContext(tabName, from, link))
+                    }
+
+                    val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
+
+                    if (dailymotionToken != null) {
+                        val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
+                        loadExtractor(embedUrl, detailPageUrl, subtitleCallback, collectionCallback)
+                    } 
+                    else if (from.equals("dailymotion", ignoreCase = true)) {
+                        val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
+                        loadExtractor(embedUrl, detailPageUrl, subtitleCallback, collectionCallback)
+                    } 
+                    else if (rawUrl.contains("rumble.com", ignoreCase = true) || from.contains("rumble", ignoreCase = true)) {
+                        val finalRumbleUrl = if (rawUrl.startsWith("http")) rawUrl else "https://rumble.com/embed/$rawUrl"
+                        Rumble().getUrl(finalRumbleUrl, detailPageUrl, subtitleCallback, collectionCallback)
+                    }
+                    else if (isM3u8) {
+                        val extractorUrl = if (rawUrl.startsWith("http")) {
+                            "https://play.donghuafun.com/m3u8/?url=$rawUrl"
+                        } else rawUrl
+                        loadExtractor(extractorUrl, "https://donghuafun.com/", subtitleCallback, collectionCallback)
+                    }
+                    else if (rawUrl.contains("ganjingworld.com", ignoreCase = true) || from.contains("ganjing", ignoreCase = true)) {
+                        val finalGanjingUrl = if (rawUrl.startsWith("http")) rawUrl else "https://www.ganjingworld.com/embed/$rawUrl"
+                        GanjingWorld().getUrl(finalGanjingUrl, detailPageUrl, subtitleCallback, collectionCallback)
+                    }
+                    else if (rawUrl.isNotEmpty()) {
+                        if (!loadExtractor(rawUrl, detailPageUrl, subtitleCallback, collectionCallback)) {
+                            val hostName = from.ifEmpty { "Server ${serverCounter.getAndIncrement()}" }
+                                .replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
+                            
+                            val fallbackLink = newExtractorLink(
+                                name,
+                                hostName,
+                                rawUrl,
+                                ExtractorLinkType.VIDEO
+                            ) {
+                                this.headers = mapOf(
+                                    "User-Agent" to USER_AGENT,
+                                    "Referer" to "https://donghuafun.com/",
+                                    "Origin" to "https://donghuafun.com"
+                                )
+                                this.referer = "https://donghuafun.com/"
+                                this.quality = Qualities.Unknown.value
+                            }
+                            localLinks.add(LinkContext(tabName, from, fallbackLink))
+                        }
+                    }
                     
-                    val fallbackLink = newExtractorLink(
-                        this.name,
-                        hostName,
-                        rawUrl,
-                        ExtractorLinkType.VIDEO
-                    ) {
-                        this.headers = mapOf(
-                            "User-Agent" to USER_AGENT,
-                            "Referer" to "https://donghuafun.com/",
-                            "Origin" to "https://donghuafun.com"
-                        )
-                        this.referer = "https://donghuafun.com/"
-                        this.quality = Qualities.Unknown.value
-                    }
-                    allLinks.add(LinkContext(tabName, from, fallbackLink))
+                    localLinks
                 }
-            }
+            }.awaitAll().flatten()
         }
 
-        // --- THE ULTIMATE UI DEDUPLICATION ---
-        // Keeps track of the exact Name + Quality combinations that have already been created
+        // --- UI DEDUPLICATION ---
         val seenCombos = mutableSetOf<String>()
 
         for (context in allLinks) {
@@ -319,7 +334,6 @@ class DonghuaFunProvider : MainAPI() {
                 baseName = "GanjingWorld"
             }
             
-            // Absolute Nuke: Destroys all traces of resolution tags from the raw name
             baseName = baseName
                 .replace(Regex("""\b\d{3,4}p\b""", RegexOption.IGNORE_CASE), "")
                 .replace(Regex("""\b4k\b""", RegexOption.IGNORE_CASE), "")
@@ -336,7 +350,7 @@ class DonghuaFunProvider : MainAPI() {
                 if (language.isNotEmpty() && !baseName.contains(language, ignoreCase = true)) append(" [$language]")
             }.trim()
 
-            // If we have NOT already emitted a link with this exact Name AND Quality, allow it.
+            // Removed bucketing. Deduplicates purely by Exact Name + Exact Quality.
             val uniqueKey = "$finalName-${link.quality}"
             if (seenCombos.add(uniqueKey)) {
                 callback.invoke(
