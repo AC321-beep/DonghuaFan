@@ -282,12 +282,23 @@ class DonghuaFunProvider : MainAPI() {
                     }
 
                     if (dailymotionToken != null) {
-                        val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$dailymotionToken"
-                        loadExtractor(embedUrl, detailPageUrl, subtitleCallback, collectionCallback)
+                        // Normalize the geo.dailymotion embed into the standard watch URL
+                        // and pass mainUrl as the referer so the built-in extractor matches.
+                        val normalizedUrl = "https://www.dailymotion.com/video/$dailymotionToken"
+                        loadExtractor(normalizedUrl, mainUrl, subtitleCallback, collectionCallback)
                     }
                     else if (from.equals("dailymotion", ignoreCase = true)) {
-                        val embedUrl = "https://geo.dailymotion.com/player/xkyen.html?video=$rawUrl"
-                        loadExtractor(embedUrl, detailPageUrl, subtitleCallback, collectionCallback)
+                        // Extract the video ID via regex, normalize to the standard watch URL,
+                        // fall back to the raw URL only if it is already a full http URL.
+                        val videoIdMatch = Regex("""[?&]video=([a-zA-Z0-9_-]+)""").find(rawUrl)
+                        val normalizedUrl = if (videoIdMatch != null) {
+                            "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
+                        } else if (rawUrl.startsWith("http")) {
+                            rawUrl
+                        } else {
+                            "https://www.dailymotion.com/video/$rawUrl"
+                        }
+                        loadExtractor(normalizedUrl, mainUrl, subtitleCallback, collectionCallback)
                     }
                     else if (rawUrl.contains("rumble.com", ignoreCase = true) || from.contains("rumble", ignoreCase = true)) {
                         val finalRumbleUrl = if (rawUrl.startsWith("http")) rawUrl else "https://rumble.com/embed/$rawUrl"
