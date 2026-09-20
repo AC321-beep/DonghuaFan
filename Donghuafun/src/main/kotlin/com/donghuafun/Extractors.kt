@@ -2,6 +2,7 @@ package com.donghuafun
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import java.net.URLDecoder
 
 class DonghuaFunExtractor : ExtractorApi() {
     override val name = "DonghuaFun Player"
@@ -14,16 +15,22 @@ class DonghuaFunExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val m3u8Url = if (url.contains("?url=")) {
-            url.substringAfter("?url=")
-        } else url
+        // Extract and safely decode the clean CDN URL
+        val rawUrl = if (url.contains("?url=")) url.substringAfter("?url=") else url
+        val m3u8Url = try {
+            if (rawUrl.startsWith("http")) rawUrl else URLDecoder.decode(rawUrl, "UTF-8")
+        } catch (e: Exception) {
+            rawUrl
+        }
 
+        // Strategy 1: Spoof GanjingWorld (The actual owner of the cloudokyo CDN)
         val ganjingHeaders = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Origin" to "https://www.ganjingworld.com",
             "Referer" to "https://www.ganjingworld.com/"
         )
 
+        // Attempt to parse the playlist safely to prevent the "No Link" bug
         val extractedLinks = try {
             M3u8Helper.generateM3u8(
                 this.name,
@@ -38,6 +45,8 @@ class DonghuaFunExtractor : ExtractorApi() {
         if (extractedLinks.isNotEmpty()) {
             extractedLinks.forEach(callback)
         } else {
+            // FALLBACK: Emit 3 distinct header strategies directly to ExoPlayer 
+            // to combat Error 2004 (403 Forbidden) and Error 2001.
             callback.invoke(
                 newExtractorLink(
                     this.name,
@@ -115,9 +124,11 @@ class Rumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
+                    // Flawless HLS stream with the Multi-Quality Selector
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
                     
                 } else if (cleanUrl.contains(".mp4", ignoreCase = true)) {
+                    // Smart Quality Locator: Scans backward 250 chars for resolution
                     val startIndex = maxOf(0, match.range.first - 250)
                     val precedingText = html.substring(startIndex, match.range.first)
 
@@ -132,7 +143,7 @@ class Rumble : ExtractorApi() {
                             name,
                             displayLabel,
                             cleanUrl,
-                            ExtractorLinkType.VIDEO 
+                            ExtractorLinkType.VIDEO // Explicit MP4 declaration
                         ) {
                             this.referer = url
                             this.quality = qualityInt
@@ -143,6 +154,7 @@ class Rumble : ExtractorApi() {
         }
     }
 
+    // Quarantine Filter
     private fun isCleanVideoUrl(url: String): Boolean {
         return !url.contains("/assets/", ignoreCase = true) &&
                !url.contains("loop", ignoreCase = true) &&
