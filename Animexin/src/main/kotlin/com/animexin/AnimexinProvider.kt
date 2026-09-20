@@ -11,6 +11,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
 
@@ -209,7 +210,6 @@ class AnimexinProvider : MainAPI() {
         val yieldedStreamUrls = ConcurrentHashMap.newKeySet<String>()
 
         // Detect language from any combination of label / attribute / URL.
-        // Returns "eng", "ind", or null when ambiguous.
         fun detectLang(vararg sources: String?): String? {
             val combined = sources.filterNotNull().joinToString(" ").lowercase()
             val hasIndo = combined.contains("indonesia") || combined.contains("indo") || combined.contains("bahasa")
@@ -243,11 +243,10 @@ class AnimexinProvider : MainAPI() {
             // Tag lang on every link AND append [Eng]/[Indo] to the displayed name/source.
             // Emit immediately — no buffering, no delay.
             val trackingCallback: (ExtractorLink) -> Unit = { link ->
-                val localized = if (lang != null) {
+                val localized = if (tag != null) {
                     link.copy(
-                        name = if (tag != null && !link.name.contains(tag)) "${link.name} $tag" else link.name,
-                        source = if (tag != null && !link.source.contains(tag)) "${link.source} $tag" else link.source,
-                        lang = lang
+                        name = if (!link.name.contains(tag)) "${link.name} $tag" else link.name,
+                        source = if (!link.source.contains(tag)) "${link.source} $tag" else link.source
                     )
                 } else link
 
@@ -281,8 +280,34 @@ class AnimexinProvider : MainAPI() {
             ".server-list li a[data-em], .server option, .player option"
         )
 
+        // Read the user's system/app locale (e.g. "en" for English, "id" or "in" for Indonesian)
+        val userLang = Locale.getDefault().language
+
+        // Sort servers dynamically based on user language preference before processing them
+        val sortedServers = servers.sortedByDescending { server ->
+            val lang = detectLang(
+                server.text(),
+                server.attr("data-lang"),
+                server.attr("data-em"),
+                server.attr("data-embed"),
+                server.attr("value")
+            )
+
+            when {
+                // User prefers Indonesian
+                (userLang == "id" || userLang == "in") && lang == "ind" -> 2
+                (userLang == "id" || userLang == "in") && lang == "eng" -> 1
+                
+                // User prefers English (or anything else defaults to English priority)
+                lang == "eng" -> 2
+                lang == "ind" -> 1
+                
+                else -> 0
+            }
+        }
+
         coroutineScope {
-            servers.map { server ->
+            sortedServers.map { server ->
                 async {
                     val lang = detectLang(
                         server.text(),
