@@ -240,15 +240,27 @@ class AnimexinProvider : MainAPI() {
 
             val tag = langTag(lang)
 
-            // Tag lang on every link AND append [Eng]/[Indo] to the displayed name/source.
+           // Tag lang on every link AND append [Eng]/[Indo] to the displayed name/source.
             // Emit immediately — no buffering, no delay.
             val trackingCallback: (ExtractorLink) -> Unit = { link ->
                 val localized = if (tag != null) {
-                    link.copy(
-                        name = if (!link.name.contains(tag)) "${link.name} $tag" else link.name,
-                        source = if (!link.source.contains(tag)) "${link.source} $tag" else link.source
+                    val newName = if (!link.name.contains(tag)) "${link.name} $tag" else link.name
+                    val newSource = if (!link.source.contains(tag)) "${link.source} $tag" else link.source
+                    
+                    // Manually rebuild the ExtractorLink since .copy() is no longer supported
+                    ExtractorLink(
+                        source = newSource,
+                        name = newName,
+                        url = link.url,
+                        referer = link.referer,
+                        quality = link.quality,
+                        type = link.type,
+                        headers = link.headers,
+                        extractorData = link.extractorData
                     )
-                } else link
+                } else {
+                    link
+                }
 
                 if (yieldedStreamUrls.add(localized.url)) callback(localized)
             }
