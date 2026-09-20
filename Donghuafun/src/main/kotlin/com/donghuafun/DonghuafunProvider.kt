@@ -17,7 +17,8 @@ class DonghuaFunProvider : MainAPI() {
     override var lang = "zh"
     override val hasMainPage = true
     override val hasDownloadSupport = true
-    override val supportedTypes = setOf(TvType.Anime)
+    // Safely support both types
+    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
     companion object {
         private val USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -26,6 +27,7 @@ class DonghuaFunProvider : MainAPI() {
     private fun detailUrlToId(url: String): String =
         Regex("""/id/(\d+)\.html""").find(url)?.groupValues?.get(1) ?: ""
 
+    // Reverted to id/20 to prevent the app from scraping Articles
     override val mainPage = mainPageOf(
         "$mainUrl/index.php/vod/show/id/20/by/time.html" to "Recently Updated",
         "$mainUrl/index.php/vod/show/id/20/by/hits.html" to "Most Popular",
@@ -65,7 +67,7 @@ class DonghuaFunProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
-        val categoriesToScan = listOf("time", "hits")
+        val categoriesToScan = listOf("time", "hits") // Searches id/20 which naturally contains both movies and series
 
         val pageResults = coroutineScope {
             categoriesToScan.map { category ->
@@ -106,6 +108,13 @@ class DonghuaFunProvider : MainAPI() {
         val tags = doc.select("a[href*='/class/']").mapNotNull { it.text().trim().takeIf(String::isNotEmpty) }
         val year = doc.selectFirst("a[href*='/year/']")?.text()?.toIntOrNull()
 
+        // --- DYNAMIC MOVIE DETECTION ---
+        // Scans the HTML page for the word "Movie" in the status bar or info blocks
+        val statusText = doc.selectFirst("li:contains(Status:)")?.text() ?: ""
+        val infoTags = doc.select(".this-desc-info span").joinToString(" ") { it.text() }
+        val isMovie = statusText.contains("Movie", ignoreCase = true) || infoTags.contains("Movie", ignoreCase = true)
+        val finalType = if (isMovie) TvType.AnimeMovie else TvType.Anime
+
         val episodes = mutableListOf<Episode>()
         val tabs = doc.select(".anthology-tab a.swiper-slide, .anthology-tab a")
         val listContainers = doc.select(".anthology-list-box")
@@ -117,7 +126,6 @@ class DonghuaFunProvider : MainAPI() {
             
             val tabName = tab.text().trim()
             
-            // 1. SPEED FILTER: Instantly drop any VIP tabs to prevent them from generating episode links
             if (tabName.contains("vip", ignoreCase = true)) {
                 continue
             }
@@ -156,11 +164,12 @@ class DonghuaFunProvider : MainAPI() {
             }
         }
 
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
-            posterUrl = poster?.let { fixUrl(it) }
-            plot = description
-            tags?.let { this.tags = it }
-            year?.let { this.year = it }
+        // Uses the dynamic type to format the UI properly
+        return newAnimeLoadResponse(title, url, finalType) {
+            this.posterUrl = poster?.let { fixUrl(it) }
+            this.plot = description
+            this.tags = tags
+            this.year = year
             addEpisodes(DubStatus.None, episodes)
         }
     }
@@ -173,8 +182,8 @@ class DonghuaFunProvider : MainAPI() {
         val text = sources.filterNotNull().joinToString(" ").lowercase()
         return when {
             Regex("""\b(indonesia|indo|bahasa|id)\b""").containsMatchIn(text) -> "Indo"
-            Regex("""\b(english|eng|rum)\b""").containsMatchIn(text) -> "Eng"
-            else -> null
+            Regex("""\b(english|eng|rum|dailymotion|4k ads)\b""").containsMatchIn(text) -> "Eng" 
+            else -> "Eng"
         }
     }
 
@@ -270,7 +279,6 @@ class DonghuaFunProvider : MainAPI() {
 
                     val isM3u8 = rawUrl.contains(".m3u8", ignoreCase = true)
 
-                    // 2. STABILITY FILTER: Block unstable GanjingWorld raw embeds, but protect the stable DonghuaFun Player (m3u8)
                     if ((rawUrl.contains("ganjingworld.com", ignoreCase = true) || from.contains("ganjing", ignoreCase = true)) && !isM3u8) {
                         return@async emptyList() 
                     }
@@ -296,6 +304,10 @@ class DonghuaFunProvider : MainAPI() {
                             "https://play.donghuafun.com/m3u8/?url=$rawUrl"
                         } else rawUrl
                         loadExtractor(extractorUrl, "https://donghuafun.com/", subtitleCallback, collectionCallback)
+                    }
+                    else if (rawUrl.contains("ganjingworld.com", ignoreCase = true) || from.contains("ganjing", ignoreCase = true)) {
+                        val finalGanjingUrl = if (rawUrl.startsWith("http")) rawUrl else "https://www.ganjingworld.com/embed/$rawUrl"
+                        GanjingWorld().getUrl(finalGanjingUrl, detailPageUrl, subtitleCallback, collectionCallback)
                     }
                     else if (rawUrl.isNotEmpty()) {
                         if (!loadExtractor(rawUrl, detailPageUrl, subtitleCallback, collectionCallback)) {
@@ -325,7 +337,6 @@ class DonghuaFunProvider : MainAPI() {
             }.awaitAll().flatten()
         }
 
-        // --- UI DEDUPLICATION ---
         val seenCombos = mutableSetOf<String>()
 
         for (context in allLinks) {
@@ -337,7 +348,6 @@ class DonghuaFunProvider : MainAPI() {
                 .replace("GeoDailymotion", "Dailymotion", ignoreCase = true)
                 .replace("DonghuaFun Player", "DonghuaFun", ignoreCase = true)
             
-            // Clean out all native resolution brackets/labels
             baseName = baseName
                 .replace(Regex("""\b\d{3,4}p\b""", RegexOption.IGNORE_CASE), "")
                 .replace(Regex("""\b4k\b""", RegexOption.IGNORE_CASE), "")
@@ -354,7 +364,6 @@ class DonghuaFunProvider : MainAPI() {
                 if (language.isNotEmpty() && !baseName.contains(language, ignoreCase = true)) append(" [$language]")
             }.trim()
 
-            // Block duplicates only if Name + Exact Quality match
             val uniqueKey = "$finalName-${link.quality}"
             if (seenCombos.add(uniqueKey)) {
                 callback.invoke(
