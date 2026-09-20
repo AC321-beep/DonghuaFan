@@ -1,17 +1,29 @@
 package com.donghuastream
 
 import android.util.Base64
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.*
-import org.json.JSONObject
 
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
     override var mainUrl = "https://rumble.com"
     override val requiresReferer = false
+
+    companion object {
+        // Precompiled once — was rebuilt on every call
+        private val RE_VIDEO_URL = Regex(
+            """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*"""
+        )
+        private val RE_QUALITY_H = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""")
+        private val RE_QUALITY_BRACE = Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
+
+        // Quarantine keywords — kept as individual checks (faster than regex)
+        private val JUNK_KEYWORDS = listOf("/assets/", "loop", "preview", "tracker", "thumb")
+    }
 
     override suspend fun getUrl(
         url: String,
@@ -19,49 +31,42 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        // Early exit if a caller already passes a direct file
+        if (url.endsWith(".mp4") || url.endsWith(".m3u8")) {
+            callback(newExtractorLink(name, name, url, INFER_TYPE) { this.referer = url })
+            return
+        }
+
         val html = try {
             app.get(url, referer = referer ?: mainUrl).text
         } catch (e: Exception) {
             return
         }
 
-        val scrapedUrls = mutableSetOf<String>()
+        // LinkedHashSet keeps insertion order → highest quality listed first
+        val scrapedUrls = LinkedHashSet<String>()
 
-        // 1. Unified Regex: Captures both standard (https://) and JSON-escaped (https:\/\/) URLs
-        val urlRegex = Regex("""https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*""")
-        val matches = urlRegex.findAll(html)
+        RE_VIDEO_URL.findAll(html).forEach { match ->
+            val cleanUrl = match.value.replace("\\/", "/")
 
-        matches.forEach { match ->
-            val rawUrl = match.value
-            val cleanUrl = rawUrl.replace("\\/", "/")
-
-            // 2. The Quarantine Filter: Destroys the garbage links that caused the ExoPlayer to crash
-            if (cleanUrl.contains("/assets/", ignoreCase = true) ||
-                cleanUrl.contains("loop", ignoreCase = true) ||
-                cleanUrl.contains("preview", ignoreCase = true) ||
-                cleanUrl.contains("tracker", ignoreCase = true) ||
-                cleanUrl.contains("thumb", ignoreCase = true)) {
-                return@forEach
-            }
+            // Quarantine filter — do not remove, prevents ExoPlayer crashes
+            if (JUNK_KEYWORDS.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8")) {
-                    // Flawless HLS stream with the Multi-Quality Selector (Tick mark)
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
-
                 } else if (cleanUrl.contains(".mp4")) {
-                    // 3. Smart Quality Locator: Reads the raw HTML immediately preceding the URL to find the resolution tag
-                    val startIndex = Math.max(0, match.range.first - 150)
-                    val precedingText = html.substring(startIndex, match.range.first)
+                    val precedingText = html.substring(
+                        Math.max(0, match.range.first - 150),
+                        match.range.first
+                    )
 
-                    // Scans the preceding text for "h":720 or "720":{
-                    val qMatch = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""").findAll(precedingText).lastOrNull()
-                        ?: Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""").findAll(precedingText).lastOrNull()
+                    val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull()
+                        ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
 
                     var displayLabel = name
                     var qualityInt = Qualities.Unknown.value
 
-                    // If it finds the resolution tag, apply it to the label
                     if (qMatch != null) {
                         val qStr = qMatch.groupValues[1]
                         displayLabel = "$name ${qStr}p"
@@ -69,12 +74,7 @@ class Rumble : ExtractorApi() {
                     }
 
                     callback(
-                        newExtractorLink(
-                            name,
-                            displayLabel,
-                            cleanUrl,
-                            INFER_TYPE
-                        ) {
+                        newExtractorLink(name, displayLabel, cleanUrl, INFER_TYPE) {
                             this.referer = url
                             this.quality = qualityInt
                         }
@@ -90,84 +90,104 @@ open class PlayStreamplay : ExtractorApi() {
     override var mainUrl = "https://play.streamplay.co.in"
     override val requiresReferer = false
 
+    companion object {
+        // Precompiled headers — was rebuilt on every call
+        private val STREAMPLAY_HEADERS = mapOf(
+            "pragma" to "no-cache",
+            "priority" to "u=0, i",
+            "sec-ch-ua" to "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
+            "sec-ch-ua-mobile" to "?0",
+            "sec-ch-ua-platform" to "\"Windows\"",
+            "sec-fetch-dest" to "document",
+            "sec-fetch-mode" to "navigate",
+            "sec-fetch-site" to "none",
+            "sec-fetch-user" to "?1",
+            "upgrade-insecure-requests" to "1",
+            "user-agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+        )
+        private val RE_EVAL_BLOCK = Regex("""eval\(.*?\)\)\)""", RegexOption.DOT_MATCHES_ALL)
+        private val RE_TOKEN = Regex("""kaken="(.*?)"""")
+    }
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Safe-check to prevent OkHttp crashes if the URL arrives as protocol-relative //
         val fixedUrl = if (url.startsWith("//")) "https:$url" else url
 
-        val doc = app.get(fixedUrl, timeout = 10000).document
-        val packedScript = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return
-        val evalRegex = Regex("""eval\(.*?\)\)\)""", RegexOption.DOT_MATCHES_ALL)
-        val packedCode = evalRegex.find(packedScript)?.value ?: return
-        val unpackedJs = JsUnpacker(packedCode).unpack() ?: return
-        val token = Regex("""kaken="(.*?)"""").find(unpackedJs)?.groupValues?.getOrNull(1) ?: return
-        val apiUrl = "$mainUrl/api/?$token"
-        val response = app.get(apiUrl, timeout = 10000).parsedSafe<Response>() ?: return
+        val doc = try {
+            app.get(fixedUrl, timeout = 10000).document
+        } catch (e: Exception) {
+            return
+        }
 
-        val m3u8Url = response.sources.find { it.file.isNotBlank() }?.file
+        val packedScript = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return
+        val packedCode = RE_EVAL_BLOCK.find(packedScript)?.value ?: return
+
+        // Fast path: token often present in the packed script already — skip JsUnpacker
+        val token = RE_TOKEN.find(packedCode)?.groupValues?.getOrNull(1)
+            ?: run {
+                val unpackedJs = JsUnpacker(packedCode).unpack() ?: return
+                RE_TOKEN.find(unpackedJs)?.groupValues?.getOrNull(1) ?: return
+            }
+
+        val apiUrl = "$mainUrl/api/?$token"
+        val response = try {
+            app.get(apiUrl, timeout = 10000).parsedSafe<Response>()
+        } catch (e: Exception) {
+            null
+        } ?: return
+
+        val m3u8Url = response.sources.firstOrNull { it.file.isNotBlank() }?.file
         if (!m3u8Url.isNullOrEmpty()) {
-            val headers = mapOf(
-                "pragma" to "no-cache",
-                "priority" to "u=0, i",
-                "sec-ch-ua" to "\"Not)A;Brand\";v=\"8\", \"Chromium\";v=\"138\", \"Google Chrome\";v=\"138\"",
-                "sec-ch-ua-mobile" to "?0",
-                "sec-ch-ua-platform" to "\"Windows\"",
-                "sec-fetch-dest" to "document",
-                "sec-fetch-mode" to "navigate",
-                "sec-fetch-site" to "none",
-                "sec-fetch-user" to "?1",
-                "upgrade-insecure-requests" to "1",
-                "user-agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
-            )
-            M3u8Helper.generateM3u8(name, m3u8Url, mainUrl, headers = headers).forEach(callback)
+            M3u8Helper.generateM3u8(name, m3u8Url, mainUrl, headers = STREAMPLAY_HEADERS).forEach(callback)
         }
 
         response.tracks.forEach { subtitle ->
-            subtitleCallback(
-                newSubtitleFile(
-                    lang = subtitle.label,
-                    url = subtitle.file
-                )
-            )
+            if (subtitle.file.isNotBlank()) {
+                subtitleCallback(newSubtitleFile(lang = subtitle.label, url = subtitle.file))
+            }
         }
     }
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
     data class Response(
-        val query: Query,
-        val status: String,
-        val message: String,
+        val query: Query? = null,
+        val status: String? = null,
+        val message: String? = null,
         @param:JsonProperty("embed_url")
-        val embedUrl: String,
+        val embedUrl: String? = null,
         @param:JsonProperty("download_url")
-        val downloadUrl: String,
-        val title: String,
-        val poster: String,
-        val filmstrip: String,
-        val sources: List<Source>,
-        val tracks: List<Track>,
+        val downloadUrl: String? = null,
+        val title: String? = null,
+        val poster: String? = null,
+        val filmstrip: String? = null,
+        val sources: List<Source> = emptyList(),
+        val tracks: List<Track> = emptyList(),
     )
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
     data class Query(
-        val source: String,
-        val id: String,
-        val download: String,
+        val source: String? = null,
+        val id: String? = null,
+        val download: String? = null,
     )
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
     data class Source(
-        val file: String,
-        val type: String,
-        val label: String,
-        val default: Boolean,
+        val file: String = "",
+        val type: String? = null,
+        val label: String? = null,
+        val default: Boolean? = null,
     )
 
+    @JsonIgnoreProperties(ignoreUnknown = true)
     data class Track(
-        val file: String,
-        val label: String,
-        val default: Boolean?,
+        val file: String = "",
+        val label: String = "Subtitle",
+        val default: Boolean? = null,
     )
 }
 
@@ -176,60 +196,96 @@ class OkRuCustom : ExtractorApi() {
     override val mainUrl = "https://ok.ru"
     override val requiresReferer = false
 
+    companion object {
+        // Precompiled regexes
+        private val RE_VIDEO_ID = Regex("""/video(?:embed)?/(\d+)""")
+        private val RE_MID_PARAM = Regex("""[?&]mid=(\d+)""")
+
+        // Static quality map — no re-allocation on every video entry
+        private val QUALITY_MAP = mapOf(
+            "mobile" to Qualities.P144.value,
+            "lowest" to Qualities.P240.value,
+            "low"    to Qualities.P360.value,
+            "sd"     to Qualities.P480.value,
+            "hd"     to Qualities.P720.value,
+            "full"   to Qualities.P1080.value,
+            "quad"   to Qualities.P1440.value,
+            "ultra"  to Qualities.P2160.value,
+        )
+    }
+
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         try {
-            val id = Regex("""/video(?:embed)?/(\d+)""").find(url)?.groupValues?.get(1) ?: url.substringAfterLast("/").substringBefore("?")
-            if (id.isBlank()) return
+            // Multi-pattern id extraction — handles /video/, /videoembed/, ?mid=, and bare-id URLs
+            val id = RE_VIDEO_ID.find(url)?.groupValues?.get(1)
+                ?: RE_MID_PARAM.find(url)?.groupValues?.get(1)
+                ?: url.substringAfterLast("/").substringBefore("?")
+            if (id.isBlank() || !id.all { it.isDigit() }) return
 
             val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id"
-            val jsonStr = app.post(apiUrl).text
+            // parsedSafe uses Jackson — faster and more lenient than org.json
+            val json = app.post(apiUrl).parsedSafe<OkRuResponse>() ?: return
 
-            if (!jsonStr.startsWith("{")) return
-            val json = JSONObject(jsonStr)
+            // 1. MP4 variants first (fastest playback)
+            json.videos?.forEach { video ->
+                val qName = video.name?.lowercase() ?: ""
+                val vidUrl = video.url ?: ""
 
-            // 1. EXTRACT MP4 FIRST (Fastest playback)
-            val videos = json.optJSONArray("videos")
-            if (videos != null && videos.length() > 0) {
-                for (i in 0 until videos.length()) {
-                    val video = videos.getJSONObject(i)
-                    val qName = video.optString("name").lowercase()
-                    val vidUrl = video.optString("url")
+                if (vidUrl.isBlank() || vidUrl.contains("usr_login")) return@forEach
 
-                    if (vidUrl.isBlank() || vidUrl.contains("usr_login")) continue
+                val qualityValue = QUALITY_MAP[qName] ?: Qualities.Unknown.value
+                val displayLabel = if (qualityValue != Qualities.Unknown.value) "MP4 ${qualityValue}p" else "MP4 $qName"
 
-                    val qualityValue = when (qName) {
-                        "mobile" -> Qualities.P144.value
-                        "lowest" -> Qualities.P240.value
-                        "low" -> Qualities.P360.value
-                        "sd" -> Qualities.P480.value
-                        "hd" -> Qualities.P720.value
-                        "full" -> Qualities.P1080.value
-                        "quad" -> Qualities.P1440.value
-                        "ultra" -> Qualities.P2160.value
-                        else -> Qualities.Unknown.value
-                    }
-
-                    val displayLabel = if (qualityValue != Qualities.Unknown.value) "MP4 ${qualityValue}p" else "MP4 $qName"
-
-                    callback(newExtractorLink(name = "${this.name} MP4", source = "${this.name} $displayLabel", url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"), type = INFER_TYPE) {
+                callback(
+                    newExtractorLink(
+                        name = "${this.name} MP4",
+                        source = "${this.name} $displayLabel",
+                        url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"),
+                        type = INFER_TYPE
+                    ) {
                         this.referer = "https://ok.ru/"
                         this.quality = qualityValue
-                    })
-                }
+                    }
+                )
             }
 
-            // 2. EXTRACT HLS/DASH SECOND (Adaptive fallback)
-            val hlsUrl = json.optString("hlsManifestUrl")
+            // 2. HLS fallback
+            val hlsUrl = json.hlsManifestUrl.orEmpty()
             if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
-                M3u8Helper.generateM3u8("$name HLS", hlsUrl.replace("\\u0026", "&").replace("\\/", "/"), url).forEach(callback)
+                M3u8Helper.generateM3u8(
+                    "$name HLS",
+                    hlsUrl.replace("\\u0026", "&").replace("\\/", "/"),
+                    url
+                ).forEach(callback)
             } else {
-                val dashUrl = json.optString("dashManifestUrl")
+                // 3. DASH last resort
+                val dashUrl = json.dashManifestUrl.orEmpty()
                 if (dashUrl.isNotBlank() && !dashUrl.contains("usr_login")) {
-                    callback(newExtractorLink(name = "$name DASH", source = "$name DASH", url = dashUrl.replace("\\u0026", "&").replace("\\/", "/"), type = ExtractorLinkType.DASH) { this.referer = "https://ok.ru/" })
+                    callback(
+                        newExtractorLink(
+                            name = "$name DASH",
+                            source = "$name DASH",
+                            url = dashUrl.replace("\\u0026", "&").replace("\\/", "/"),
+                            type = ExtractorLinkType.DASH
+                        ) { this.referer = "https://ok.ru/" }
+                    )
                 }
             }
         } catch (e: Exception) {
-            // Fails silently
+            
         }
     }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private data class OkRuResponse(
+        val videos: List<OkRuVideo>? = null,
+        val hlsManifestUrl: String? = null,
+        val dashManifestUrl: String? = null,
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private data class OkRuVideo(
+        val name: String? = null,
+        val url: String? = null,
+    )
 }
