@@ -2,11 +2,11 @@ package com.donghuastream
 
 import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonProperty
-import com.lagradost.api.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.*
+import org.json.JSONObject
 
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
@@ -19,11 +19,9 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        Log.d(name, "Starting extraction for: $url")
         val html = try {
             app.get(url, referer = referer ?: mainUrl).text
         } catch (e: Exception) {
-            Log.e(name, "Failed to fetch Rumble embed page: ${e.message}")
             return
         }
 
@@ -50,7 +48,7 @@ class Rumble : ExtractorApi() {
                 if (cleanUrl.contains(".m3u8")) {
                     // Flawless HLS stream with the Multi-Quality Selector (Tick mark)
                     M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
-                    
+
                 } else if (cleanUrl.contains(".mp4")) {
                     // 3. Smart Quality Locator: Reads the raw HTML immediately preceding the URL to find the resolution tag
                     val startIndex = Math.max(0, match.range.first - 150)
@@ -171,4 +169,67 @@ open class PlayStreamplay : ExtractorApi() {
         val label: String,
         val default: Boolean?,
     )
+}
+
+class OkRuCustom : ExtractorApi() {
+    override val name = "OkRu"
+    override val mainUrl = "https://ok.ru"
+    override val requiresReferer = false
+
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        try {
+            val id = Regex("""/video(?:embed)?/(\d+)""").find(url)?.groupValues?.get(1) ?: url.substringAfterLast("/").substringBefore("?")
+            if (id.isBlank()) return
+
+            val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id"
+            val jsonStr = app.post(apiUrl).text
+
+            if (!jsonStr.startsWith("{")) return
+            val json = JSONObject(jsonStr)
+
+            // 1. EXTRACT MP4 FIRST (Fastest playback)
+            val videos = json.optJSONArray("videos")
+            if (videos != null && videos.length() > 0) {
+                for (i in 0 until videos.length()) {
+                    val video = videos.getJSONObject(i)
+                    val qName = video.optString("name").lowercase()
+                    val vidUrl = video.optString("url")
+
+                    if (vidUrl.isBlank() || vidUrl.contains("usr_login")) continue
+
+                    val qualityValue = when (qName) {
+                        "mobile" -> Qualities.P144.value
+                        "lowest" -> Qualities.P240.value
+                        "low" -> Qualities.P360.value
+                        "sd" -> Qualities.P480.value
+                        "hd" -> Qualities.P720.value
+                        "full" -> Qualities.P1080.value
+                        "quad" -> Qualities.P1440.value
+                        "ultra" -> Qualities.P2160.value
+                        else -> Qualities.Unknown.value
+                    }
+
+                    val displayLabel = if (qualityValue != Qualities.Unknown.value) "MP4 ${qualityValue}p" else "MP4 $qName"
+
+                    callback(newExtractorLink(name = "${this.name} MP4", source = "${this.name} $displayLabel", url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"), type = INFER_TYPE) {
+                        this.referer = "https://ok.ru/"
+                        this.quality = qualityValue
+                    })
+                }
+            }
+
+            // 2. EXTRACT HLS/DASH SECOND (Adaptive fallback)
+            val hlsUrl = json.optString("hlsManifestUrl")
+            if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
+                M3u8Helper.generateM3u8("$name HLS", hlsUrl.replace("\\u0026", "&").replace("\\/", "/"), url).forEach(callback)
+            } else {
+                val dashUrl = json.optString("dashManifestUrl")
+                if (dashUrl.isNotBlank() && !dashUrl.contains("usr_login")) {
+                    callback(newExtractorLink(name = "$name DASH", source = "$name DASH", url = dashUrl.replace("\\u0026", "&").replace("\\/", "/"), type = ExtractorLinkType.DASH) { this.referer = "https://ok.ru/" })
+                }
+            }
+        } catch (e: Exception) {
+            // Fails silently
+        }
+    }
 }
