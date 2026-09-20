@@ -52,9 +52,10 @@ class AnimexinProvider : MainAPI() {
     private suspend fun getSafeDocument(url: String): Document {
         var response = app.get(url, interceptor = cfInterceptor)
         var doc = response.document
-        
-        val isChallenge = listOf("just a moment", "security verification", "attention required", "cloudflare").any { doc.title().lowercase().contains(it) } || doc.select("div.cf-turnstile").isNotEmpty()
-        
+
+        val isChallenge = listOf("just a moment", "security verification", "attention required", "cloudflare")
+            .any { doc.title().lowercase().contains(it) } || doc.select("div.cf-turnstile").isNotEmpty()
+
         if (isChallenge || response.code in listOf(403, 503)) {
             if (resolveCloudflare(url)) {
                 response = app.get(url, interceptor = cfInterceptor)
@@ -95,7 +96,7 @@ class AnimexinProvider : MainAPI() {
         if (title.isBlank()) return null
 
         val img = this.selectFirst("img")
-        val poster = img?.let { 
+        val poster = img?.let {
             it.attr("data-lazy-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                 ?: it.attr("data-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                 ?: it.attr("src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
@@ -107,7 +108,7 @@ class AnimexinProvider : MainAPI() {
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
             this.posterUrl = fixUrlNull(poster)
-            
+
             this.posterHeaders = mapOf(
                 "Accept" to "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
                 "Referer" to "$mainUrl/",
@@ -121,7 +122,8 @@ class AnimexinProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        return getSafeDocument("$mainUrl/?s=$query").select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
+        return getSafeDocument("$mainUrl/?s=$query")
+            .select("div.listupd article.bs, div.listupd div.bs, div.listupd div.bsx")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
     }
@@ -136,11 +138,12 @@ class AnimexinProvider : MainAPI() {
 
         val title = doc.selectFirst("h1.entry-title, .infox h1")?.text()?.trim() ?: "Unknown Title"
         val img = doc.selectFirst("div.thumb img, div.infox img, .bigcontent img")
-        val poster = img?.let { 
+        val poster = img?.let {
             it.attr("data-lazy-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                 ?: it.attr("data-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                 ?: it.attr("src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
-        } ?: doc.selectFirst("noscript img")?.attr("src") ?: doc.selectFirst("meta[property=og:image]")?.attr("content")
+        } ?: doc.selectFirst("noscript img")?.attr("src")
+            ?: doc.selectFirst("meta[property=og:image]")?.attr("content")
 
         val description = doc.selectFirst("div.entry-content, .infox .desc, .bigcontent .desc")?.text()?.trim()
         val isMovie = doc.selectFirst(".spe, .type")?.text()?.contains("Movie", ignoreCase = true) == true
@@ -167,7 +170,7 @@ class AnimexinProvider : MainAPI() {
                 val epHref = fixUrlNull(a.attr("href")) ?: return@mapNotNull null
 
                 val epImg = info.selectFirst("a img")
-                val epPoster = epImg?.let { 
+                val epPoster = epImg?.let {
                     it.attr("data-lazy-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                         ?: it.attr("data-src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
                         ?: it.attr("src").takeIf { src -> src.isNotBlank() && !src.startsWith("data:image") }
@@ -205,7 +208,21 @@ class AnimexinProvider : MainAPI() {
         val extractedIframeUrls = ConcurrentHashMap.newKeySet<String>()
         val yieldedStreamUrls = ConcurrentHashMap.newKeySet<String>()
 
-        suspend fun invokeExtractor(iframeUrl: String) {
+        // Detect language from any combination of label / attribute / URL.
+        // Returns "eng", "ind", or null when ambiguous.
+        fun detectLang(vararg sources: String?): String? {
+            val combined = sources.filterNotNull().joinToString(" ").lowercase()
+            val hasIndo = combined.contains("indonesia") || combined.contains("indo") || combined.contains("bahasa")
+            val hasEng = combined.contains("english") || Regex("""\beng\b""").containsMatchIn(combined)
+
+            return when {
+                hasEng && !hasIndo -> "eng"
+                hasIndo && !hasEng -> "ind"
+                else -> null
+            }
+        }
+
+        suspend fun invokeExtractor(iframeUrl: String, lang: String? = null) {
             var finalUrl = iframeUrl.trim()
             if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
             else if (finalUrl.startsWith("/")) finalUrl = "https://animexin.dev$finalUrl"
@@ -214,8 +231,10 @@ class AnimexinProvider : MainAPI() {
             val dedupUrl = finalUrl.substringBefore("?")
             if (!extractedIframeUrls.add(dedupUrl)) return
 
+            // Tag lang on every link before passing to callback. Emit immediately.
             val trackingCallback: (ExtractorLink) -> Unit = { link ->
-                if (yieldedStreamUrls.add(link.url)) callback(link)
+                val localized = if (lang != null && link.lang != lang) link.copy(lang = lang) else link
+                if (yieldedStreamUrls.add(localized.url)) callback(localized)
             }
 
             try {
@@ -239,29 +258,55 @@ class AnimexinProvider : MainAPI() {
             }
         }
 
-        val servers = document.select(".mobius option, select.mirror option, .server-list li a[data-embed], .server-list li a[data-em], .server option, .player option")
+        // 1) Server dropdown / list entries
+        val servers = document.select(
+            ".mobius option, select.mirror option, .server-list li a[data-embed], " +
+            ".server-list li a[data-em], .server option, .player option"
+        )
+
         coroutineScope {
             servers.map { server ->
                 async {
-                    val rawData = server.attr("value").ifBlank { server.attr("data-em").ifBlank { server.attr("data-embed") } }.trim()
+                    val lang = detectLang(
+                        server.text(),
+                        server.attr("data-lang"),
+                        server.attr("data-em"),
+                        server.attr("data-embed"),
+                        server.attr("value")
+                    )
+
+                    val rawData = server.attr("value")
+                        .ifBlank { server.attr("data-em") }
+                        .ifBlank { server.attr("data-embed") }
+                        .trim()
+
                     if (rawData.isNotBlank()) {
-                        val decoded = try { String(Base64.decode(rawData, Base64.DEFAULT)) } catch (e: Exception) { rawData }
+                        val decoded = try {
+                            String(Base64.decode(rawData, Base64.DEFAULT))
+                        } catch (e: Exception) {
+                            rawData
+                        }
+
                         val iframeSrc = if (decoded.contains("<iframe", ignoreCase = true)) {
                             Jsoup.parse(decoded).selectFirst("iframe")?.attr("src")
                         } else if (decoded.startsWith("http") || decoded.startsWith("//")) {
                             decoded
                         } else null
 
-                        if (!iframeSrc.isNullOrBlank()) invokeExtractor(iframeSrc)
+                        if (!iframeSrc.isNullOrBlank()) {
+                            invokeExtractor(iframeSrc, lang)
+                        }
                     }
                 }
             }.awaitAll()
         }
 
+        // 2) Bare iframes in page
         document.select("iframe").forEach { iframe ->
             val src = iframe.attr("src")
             if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
-                invokeExtractor(src)
+                val lang = detectLang(src, iframe.attr("title"), iframe.attr("data-lang"))
+                invokeExtractor(src, lang)
             }
         }
 
