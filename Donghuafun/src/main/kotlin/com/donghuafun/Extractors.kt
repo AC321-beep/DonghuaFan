@@ -108,7 +108,6 @@ class GanjingWorld : ExtractorApi() {
             return
         }
 
-        // GanjingWorld embeds often hold the m3u8 inside a JSON string or direct URL
         val m3u8Regex = Regex("""(https?:\\?/\\?/[^"'\s<>]+?\.m3u8[^"'\s<>]*)""")
         val m3u8Match = m3u8Regex.find(html)?.value?.replace("\\/", "/")
         
@@ -124,19 +123,20 @@ class GanjingWorld : ExtractorApi() {
                 )
             ).forEach(callback)
         } else {
-            // Backup for standard .mp4 embed strings
             val videoRegex = Regex("""(https?:\\?/\\?/[^"'\s<>]+?\.mp4[^"'\s<>]*)""")
             val videoMatch = videoRegex.find(html)?.value?.replace("\\/", "/")
             if (videoMatch != null) {
+                // BUG FIXED: Replaced raw ExtractorLink with modern newExtractorLink builder
                 callback.invoke(
-                    ExtractorLink(
+                    newExtractorLink(
                         name,
                         name,
                         videoMatch,
-                        referer ?: mainUrl,
-                        Qualities.Unknown.value,
                         ExtractorLinkType.VIDEO
-                    )
+                    ) {
+                        this.referer = referer ?: mainUrl
+                        this.quality = Qualities.Unknown.value
+                    }
                 )
             }
         }
