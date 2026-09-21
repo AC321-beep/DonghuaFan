@@ -1,13 +1,14 @@
 package com.donghuastream
 
-import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.Jsoup
-import org.jsoup.nodes.Element
-import java.net.URLDecoder
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import org.jsoup.select.Elements
 
 open class DonghuastreamProvider : MainAPI() {
     override var mainUrl = "https://donghuastream.org"
@@ -23,6 +24,17 @@ open class DonghuastreamProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
+    // PRE-COMPILED REGEXES (Huge performance boost over compiling inside loops)
+    private val junkRegex = Regex("(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\\(4K\\)|\\[4K\\]|\\(1080p\\)|\\[1080p\\]|4K|1080p|720p|Full Movie|Eps Full|Movie)")
+    private val epJunkRegex = Regex("(?i)(Episode|Ep\\.?|Part|SP|Special)\\s*\\d+.*")
+    private val nonAlphaNumericRegex = Regex("[^a-zA-Z0-9]")
+    private val dateRegex = Regex("""([a-zA-Z]+\s+\d{1,2},\s+\d{4})""")
+    private val fullMovieRegex = Regex("""(?i)\bfull\b""")
+    private val epNumRegex = Regex("""(?i)(?:Ep|Eps|Episode|Ep\.|Part|SP|Special)\s*(\d+(?:\s*[-~]\s*\d+)?)""")
+    private val rangeRegex = Regex("""\b(\d+[-~]\d+)\b""")
+    private val digitsRegex = Regex("""\d+""")
+    private val videoIdRegex = Regex("""[?&]video=([a-zA-Z0-9_-]+)""")
+
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update&page=" to "Recently Updated",
         "special_edition" to "Special Edition"
@@ -31,155 +43,112 @@ open class DonghuastreamProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (request.name == "Special Edition") {
             val combinedResults = coroutineScope {
-                val movieDeferred = async {
-                    val url = if (page == 1) "$mainUrl/?s=movie" else "$mainUrl/pagg/$page/?s=movie"
-                    try { app.get(url, cacheTime = 0).document } catch(e: Exception) { null }
-                }
-                val specialDeferred = async {
-                    val url = if (page == 1) "$mainUrl/?s=special" else "$mainUrl/pagg/$page/?s=special"
-                    try { app.get(url, cacheTime = 0).document } catch(e: Exception) { null }
-                }
+                val movieDeferred = async { app.get("$mainUrl${if (page == 1) "" else "/pagg/$page"}/?s=movie", cacheTime = 0).document }
+                val specialDeferred = async { app.get("$mainUrl${if (page == 1) "" else "/pagg/$page"}/?s=special", cacheTime = 0).document }
 
-                val movieDoc = movieDeferred.await()
-                val specialDoc = specialDeferred.await()
-
-                val movieResults = movieDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
-                val specialResults = specialDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+                val movieResults = movieDeferred.await().select("div.listupd > article").mapNotNull { it.toSearchResult() }
+                val specialResults = specialDeferred.await().select("div.listupd > article").mapNotNull { it.toSearchResult() }
 
                 (movieResults + specialResults).distinctBy { it.name.trim().lowercase() }
             }
 
             return newHomePageResponse(
-                list = HomePageList(
-                    name = request.name,
-                    list = combinedResults,
-                    isHorizontalImages = false
-                ),
+                list = HomePageList(request.name, combinedResults, isHorizontalImages = false),
                 hasNext = combinedResults.isNotEmpty()
             )
-        } else {
-            val home = if (page == 1) {
-                coroutineScope {
-                    // PARALLEL FETCH: Grabs both the Homepage (for instant updates) and Directory (for pagination) simultaneously
-                    val homeDocDeferred = async {
-                        try {
-                            app.get("$mainUrl/", headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache"), cacheTime = 0).document
-                        } catch(e: Exception) { null }
-                    }
-                    val dirDocDeferred = async {
-                        try {
-                            app.get("$mainUrl/${request.data}1", headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache"), cacheTime = 0).document
-                        } catch(e: Exception) { null }
-                    }
-
-                    val homeDoc = homeDocDeferred.await()
-                    val dirDoc = dirDocDeferred.await()
-
-                    // Extract only the "Latest Release" section, ignoring "Hot Series"
-                    val containers = homeDoc?.select(".bixbox, .releases")
-                    val latestContainer = containers?.find {
-                        val headerTitle = it.selectFirst("h2, h3, .moxhead, .sec-title")?.text() ?: ""
-                        headerTitle.contains("Latest", ignoreCase = true) || headerTitle.contains("Recent", ignoreCase = true)
-                    } ?: homeDoc?.selectFirst(".releases.latesthome") ?: containers?.lastOrNull()
-
-                    val homeArticles = latestContainer?.select("article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
-                    val dirArticles = dirDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
-
-                    // SMART DEDUPLICATION: Trims junk tags and episode numbers from the title to perfectly match Homepage posts with Directory posts
-                    (homeArticles + dirArticles).distinctBy {
-                        var cleanName = it.name
-                        val junkRegex = Regex("(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\\(4K\\)|\\[4K\\]|\\(1080p\\)|\\[1080p\\]|4K|1080p|720p|Full Movie|Eps Full|Movie)")
-                        cleanName = cleanName.replace(junkRegex, "")
-                        cleanName = cleanName.replace(Regex("(?i)(Episode|Ep\\.?|Part|SP|Special)\\s*\\d+.*"), "")
-                        // Remove all non-alphanumeric characters for a foolproof match
-                        cleanName.replace(Regex("[^a-zA-Z0-9]"), "").lowercase()
-                    }
-                }
-            } else {
-                val url = "$mainUrl/${request.data}$page"
-                val document = app.get(
-                    url,
-                    headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache"),
-                    cacheTime = 0
-                ).document
-                document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
-            }
-
-            return newHomePageResponse(
-                list = HomePageList(
-                    name = request.name,
-                    list = home,
-                    isHorizontalImages = false
-                ),
-                hasNext = true
-            )
         }
+
+        val home = if (page == 1) {
+            coroutineScope {
+                val headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache")
+                val homeDocDeferred = async { app.get("$mainUrl/", headers = headers, cacheTime = 0).document }
+                val dirDocDeferred = async { app.get("$mainUrl/${request.data}1", headers = headers, cacheTime = 0).document }
+
+                val homeDoc = homeDocDeferred.await()
+                val dirDoc = dirDocDeferred.await()
+
+                val containers = homeDoc.select(".bixbox, .releases")
+                val latestContainer = containers.find {
+                    val headerTitle = it.selectFirst("h2, h3, .moxhead, .sec-title")?.text() ?: ""
+                    headerTitle.contains("Latest", ignoreCase = true) || headerTitle.contains("Recent", ignoreCase = true)
+                } ?: homeDoc.selectFirst(".releases.latesthome") ?: containers.lastOrNull()
+
+                val homeArticles = latestContainer?.select("article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+                val dirArticles = dirDoc.select("div.listupd > article").mapNotNull { it.toSearchResult() }
+
+                // Clean chained regex replacement 
+                (homeArticles + dirArticles).distinctBy {
+                    it.name.replace(junkRegex, "")
+                        .replace(epJunkRegex, "")
+                        .replace(nonAlphaNumericRegex, "")
+                        .lowercase()
+                }
+            }
+        } else {
+            app.get("$mainUrl/${request.data}$page", headers = defaultHeaders, cacheTime = 0)
+                .document.select("div.listupd > article")
+                .mapNotNull { it.toSearchResult() }
+        }
+
+        return newHomePageResponse(
+            list = HomePageList(request.name, home, isHorizontalImages = false),
+            hasNext = true // Assuming continuous pagination
+        )
     }
 
-    fun Element.toSearchResult(): SearchResponse? {
-        val aTag = this.selectFirst("div.bsx > a") ?: this.selectFirst("a[href]") ?: return null
-
-        var title = aTag.attr("title").trim()
-        if (title.isBlank()) title = this.select(".tt, .tt h2, h2, h3, h4").text().trim()
-        if (title.isBlank()) title = aTag.text().trim()
-        if (title.isBlank()) return null
+    private fun Element.toSearchResult(): SearchResponse? {
+        val aTag = this.selectFirst("div.bsx > a, a[href]") ?: return null
+        
+        val title = aTag.attr("title").takeIf { it.isNotBlank() }
+            ?: this.selectFirst(".tt, .tt h2, h2, h3, h4")?.text()?.takeIf { it.isNotBlank() }
+            ?: aTag.text().takeIf { it.isNotBlank() } ?: return null
 
         val href = fixUrlNull(aTag.attr("href")) ?: return null
-        val posterUrl = fixUrlNull(this.selectFirst("img")?.getImageAttr())
+        val posterUrl = fixUrlNull(this.getImageAttr())
 
-        return newMovieSearchResponse(title, href, TvType.Anime) {
+        return newMovieSearchResponse(title.trim(), href, TvType.Anime) {
             this.posterUrl = posterUrl
         }
     }
 
-    private fun Element.getImageAttr(): String {
-        return when {
-            this.hasAttr("data-src") -> this.attr("data-src")
-            this.hasAttr("src") -> this.attr("src")
-            else -> this.attr("src")
-        }
+    // Simplified fallback chain using takeIf
+    private fun Element.getImageAttr(): String? {
+        return attr("data-src").takeIf { it.isNotBlank() }
+            ?: selectFirst("img")?.attr("data-src")?.takeIf { it.isNotBlank() }
+            ?: attr("src").takeIf { it.isNotBlank() }
+            ?: selectFirst("img")?.attr("src")
     }
 
-    override suspend fun search(query: String): List<SearchResponse> {
-        val searchResponse = mutableListOf<SearchResponse>()
-        for (i in 1..3) {
-            val document = app.get("${mainUrl}/pagg/$i/?s=$query").document
-            val results = document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
-            if (!searchResponse.containsAll(results)) {
-                searchResponse.addAll(results)
-            } else {
-                break
+    // Parallelized search execution
+    override suspend fun search(query: String): List<SearchResponse> = coroutineScope {
+        (1..3).map { page ->
+            async {
+                try {
+                    val url = "$mainUrl/pagg/$page/?s=$query"
+                    app.get(url).document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
+                } catch (e: Exception) {
+                    emptyList()
+                }
             }
-            if (results.isEmpty()) break
-        }
-        return searchResponse
+        }.awaitAll().flatten().distinctBy { it.url }
     }
 
-    private fun getEpisodesElements(document: org.jsoup.nodes.Document): org.jsoup.select.Elements {
-        var eps = document.select("table tbody tr:not(:has(th)), div.episodelist ul li, div.eplister ul li, ul.eplister li, .ep_list li, .episodelist li, .eplister li, #episodelist li, .lsteps li, .list1 li")
-        if (eps.isEmpty()) {
-            eps = document.select("div.episodelist a[href], div.eplister a[href], .ep_list a[href], .episodelist a[href], .eplister a[href], #episodelist a[href], .lsteps a[href], .list1 a[href]")
-        }
-        if (eps.isEmpty()) {
-            eps = document.select("div.listupd article, div.bixbox article, div.related article")
-        }
-        return eps
+    // Simplified element retrieval with takeIf chains
+    private fun getEpisodesElements(document: Document): Elements {
+        return document.select("table tbody tr:not(:has(th)), div.episodelist ul li, div.eplister ul li, ul.eplister li, .ep_list li, .episodelist li, .eplister li, #episodelist li, .lsteps li, .list1 li").takeIf { it.isNotEmpty() }
+            ?: document.select("div.episodelist a[href], div.eplister a[href], .ep_list a[href], .episodelist a[href], .eplister a[href], #episodelist a[href], .lsteps a[href], .list1 a[href]").takeIf { it.isNotEmpty() }
+            ?: document.select("div.listupd article, div.bixbox article, div.related article")
     }
 
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
-
         val isEpisodePage = document.selectFirst(".infox, .tsinfo, .anime-info") == null
 
         if (isEpisodePage) {
             var seriesUrl = document.select("div.ts-breadcrumb a").toList().findLast {
                 val h = it.attr("href")
                 h.isNotBlank() && h != mainUrl && h != "$mainUrl/" && !h.endsWith("/anime/") && !h.endsWith("/movie/") && !h.endsWith("/series/")
-            }?.attr("href")
-
-            if (seriesUrl.isNullOrBlank()) {
-                seriesUrl = document.select(".naveps a").find { it.text().contains("All", ignoreCase = true) }?.attr("href")
-            }
+            }?.attr("href") ?: document.selectFirst(".naveps a:contains(All)")?.attr("href")
 
             if (!seriesUrl.isNullOrBlank() && fixUrl(seriesUrl) != url) {
                 return load(fixUrl(seriesUrl))
@@ -188,7 +157,6 @@ open class DonghuastreamProvider : MainAPI() {
             val titleRaw = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
             val title = titleRaw.substringBefore(" Episode").substringBefore(" Movie").trim()
             val poster = document.selectFirst("meta[property=og:image]")?.attr("content") ?: ""
-
             val epElements = getEpisodesElements(document)
 
             if (epElements.isNotEmpty()) {
@@ -204,10 +172,8 @@ open class DonghuastreamProvider : MainAPI() {
         }
 
         val title = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
-        var poster = document.selectFirst("div.ime > img")?.attr("data-src") ?: ""
-        if (poster.isEmpty()) {
-            poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim() ?: ""
-        }
+        val poster = document.selectFirst("div.ime > img")?.attr("data-src")?.takeIf { it.isNotBlank() } 
+            ?: document.selectFirst("meta[property=og:image]")?.attr("content")?.trim() ?: ""
         val description = document.selectFirst("div.entry-content")?.text()?.trim()
         val type = document.selectFirst(".spe")?.text() ?: ""
         val tvtag = if (type.contains("Movie", ignoreCase = true)) TvType.Movie else TvType.TvSeries
@@ -216,7 +182,6 @@ open class DonghuastreamProvider : MainAPI() {
 
         return if (tvtag == TvType.TvSeries || epElements.size > 1) {
             val episodes = parseEpisodes(epElements)
-
             newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
                 this.plot = description
@@ -230,41 +195,41 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    private fun parseEpisodes(epElements: org.jsoup.select.Elements): List<Episode> {
+    private fun parseEpisodes(epElements: Elements): List<Episode> {
         return epElements.mapNotNull { info ->
             val aTag = info.selectFirst("a[href]") ?: info.takeIf { it.tagName() == "a" && it.hasAttr("href") }
             val href1 = aTag?.attr("href") ?: return@mapNotNull null
 
-            var rawTitle = info.selectFirst(".epl-title, .ep-title, .title, h2, h3")?.text()?.trim() ?: ""
-            if (rawTitle.isEmpty()) rawTitle = aTag.text().trim()
-            if (rawTitle.isEmpty()) rawTitle = info.text().trim()
-
-            var episodeNum: Int? = null
-            var epName: String
+            val rawTitle = info.selectFirst(".epl-title, .ep-title, .title, h2, h3")?.text()?.trim()?.takeIf { it.isNotBlank() }
+                ?: aTag.text().trim().takeIf { it.isNotBlank() }
+                ?: info.text().trim()
 
             val fullText = info.text()
-            val dateMatch = Regex("""([a-zA-Z]+\s+\d{1,2},\s+\d{4})""").find(fullText)?.value?.trim()
+            val dateMatch = dateRegex.find(fullText)?.value?.trim()
             val isFullMovie = rawTitle.contains("Full Movie", ignoreCase = true) ||
                               rawTitle.contains("Eps Full", ignoreCase = true) ||
-                              Regex("""(?i)\bfull\b""").containsMatchIn(rawTitle)
+                              fullMovieRegex.containsMatchIn(rawTitle)
 
-            val trueEpMatch = Regex("""(?i)(?:Ep|Eps|Episode|Ep\.|Part|SP|Special)\s*(\d+(?:\s*[-~]\s*\d+)?)""").findAll(rawTitle).firstOrNull()
+            val trueEpMatch = epNumRegex.findAll(rawTitle).firstOrNull()
             val matchStr = trueEpMatch?.groupValues?.get(1)?.trim()
+
+            var episodeNum: Int? = null
+            val epName: String
 
             if (isFullMovie && matchStr == null) {
                 episodeNum = 0
                 epName = if (dateMatch != null) "Full Movie: $dateMatch" else "Full Movie"
             } else if (matchStr != null) {
-                episodeNum = Regex("""\d+""").find(matchStr)?.value?.toIntOrNull()
+                episodeNum = digitsRegex.find(matchStr)?.value?.toIntOrNull()
                 epName = if (dateMatch != null) "Episode $matchStr: $dateMatch" else "Episode $matchStr"
             } else {
-                val rangeMatch = Regex("""\b(\d+[-~]\d+)\b""").find(rawTitle)
+                val rangeMatch = rangeRegex.find(rawTitle)
                 if (rangeMatch != null) {
                     val rawRange = rangeMatch.groupValues[1]
-                    episodeNum = Regex("""\d+""").find(rawRange)?.value?.toIntOrNull()
+                    episodeNum = digitsRegex.find(rawRange)?.value?.toIntOrNull()
                     epName = if (dateMatch != null) "Episode $rawRange: $dateMatch" else "Episode $rawRange"
                 } else {
-                    val numbers = Regex("""\d+""").findAll(rawTitle).map { it.value }.toList()
+                    val numbers = digitsRegex.findAll(rawTitle).map { it.value }.toList()
                     episodeNum = numbers.lastOrNull { num ->
                         num != "4" && num != "1080" && num != "720" && num != "2160" && !(num.length == 4 && num.startsWith("20"))
                     }?.toIntOrNull()
@@ -277,11 +242,7 @@ open class DonghuastreamProvider : MainAPI() {
                 }
             }
 
-            val posterr = info.selectFirst("img")?.let {
-                it.attr("data-src").takeIf { src -> src.isNotBlank() } ?: it.attr("src")
-            } ?: ""
-
-            // Broadened the selector just in case it's named slightly differently
+            val posterr = info.selectFirst("img")?.getImageAttr() ?: ""
             val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim()
 
             newEpisode(href1) {
@@ -290,10 +251,7 @@ open class DonghuastreamProvider : MainAPI() {
                 this.posterUrl = posterr
 
                 if (!dateText.isNullOrBlank()) {
-                    // 1. Try to properly parse the Date format AnimeKhor uses (Month dd, yyyy)
                     this.addDate(dateText, format = "MMMM d, yyyy")
-
-                    // 2. Failsafe: Guarantee it appears on your screen by setting it as the description
                     this.description = dateText
                 }
             }
@@ -313,10 +271,8 @@ open class DonghuastreamProvider : MainAPI() {
             var finalUrl = iframeUrl
             var extReferer = iframeUrl
 
-            // Guard so we never mangle ok.ru URLs through the Dailymotion rewriter
-            if (!finalUrl.contains("ok.ru", ignoreCase = true) &&
-                finalUrl.contains("dailymotion", ignoreCase = true)) {
-                val videoIdMatch = Regex("""[?&]video=([a-zA-Z0-9_-]+)""").find(finalUrl)
+            if (!finalUrl.contains("ok.ru", ignoreCase = true) && finalUrl.contains("dailymotion", ignoreCase = true)) {
+                val videoIdMatch = videoIdRegex.find(finalUrl)
                 if (videoIdMatch != null) {
                     finalUrl = "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
                     extReferer = mainUrl
@@ -324,15 +280,9 @@ open class DonghuastreamProvider : MainAPI() {
             }
 
             when {
-                "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> {
-                    OkRuCustom().getUrl(finalUrl, extReferer, subtitleCallback, callback)
-                }
-                "rumble.com" in finalUrl -> {
-                    Rumble().getUrl(finalUrl, finalUrl, subtitleCallback, callback)
-                }
-                "play.streamplay.co.in" in finalUrl -> {
-                    PlayStreamplay().getUrl(finalUrl, finalUrl, subtitleCallback, callback)
-                }
+                "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> OkRuCustom().getUrl(finalUrl, extReferer, subtitleCallback, callback)
+                "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, finalUrl, subtitleCallback, callback)
+                "play.streamplay.co.in" in finalUrl -> PlayStreamplay().getUrl(finalUrl, finalUrl, subtitleCallback, callback)
                 finalUrl.endsWith(".mp4") -> {
                     callback(
                         newExtractorLink(label, label, finalUrl, INFER_TYPE) {
@@ -341,9 +291,7 @@ open class DonghuastreamProvider : MainAPI() {
                         }
                     )
                 }
-                else -> {
-                    loadExtractor(finalUrl, referer = extReferer, subtitleCallback, callback)
-                }
+                else -> loadExtractor(finalUrl, referer = extReferer, subtitleCallback, callback)
             }
         }
 
@@ -357,16 +305,14 @@ open class DonghuastreamProvider : MainAPI() {
                 continue
             }
 
-            val iframeUrl = Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)
-            if (!iframeUrl.isNullOrEmpty()) {
-                invokeExtractor(iframeUrl, label)
+            Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)?.let {
+                invokeExtractor(it, label)
             }
         }
 
         if (options.isEmpty()) {
-            val directIframe = doc.selectFirst(".player-area iframe, .playcon iframe")?.attr("src")?.let(::httpsify)
-            if (!directIframe.isNullOrEmpty()) {
-                invokeExtractor(directIframe, "Server")
+            doc.selectFirst(".player-area iframe, .playcon iframe")?.attr("src")?.let(::httpsify)?.let {
+                invokeExtractor(it, "Server")
             }
         }
 
