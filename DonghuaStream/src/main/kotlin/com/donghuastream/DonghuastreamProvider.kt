@@ -38,6 +38,10 @@ open class DonghuastreamProvider : MainAPI() {
     private val videoIdRegex = Regex("""[?&]video=([a-zA-Z0-9_-]+)""")
     private val qualityRegex = Regex("""(?i)(4K|1080p|720p|2160p|HD|SD)""")
     private val titleCleanRegex = Regex("(?i)\\s*(Episode|Movie).*")
+    
+    // NEW: Robust Date Regexes
+    private val dateRegex = Regex("""([a-zA-Z]{3,}\s+\d{1,2},\s+\d{4}|\d{1,2}\s+[a-zA-Z]{3,}\s+\d{4}|\d{4}-\d{2}-\d{2})""")
+    private val relativeDateRegex = Regex("""(?i)\d+\s+(mins?|hours?|days?|weeks?|months?|years?)\s+ago""")
 
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update&page=" to "Recently Updated",
@@ -231,7 +235,6 @@ open class DonghuastreamProvider : MainAPI() {
             var episodeNum: Int? = null
             val epName: String
 
-            // Keep names clean and format-free.
             if (isFullMovie && matchStr == null) {
                 episodeNum = 0
                 epName = "Full Movie"
@@ -258,18 +261,26 @@ open class DonghuastreamProvider : MainAPI() {
 
             val posterr = info.selectFirst("img")?.getImageAttr()?.let { fixUrlNull(it) } ?: ""
             
-            // ANIMEKHOR DATE LOGIC IMPLEMENTATION
-            // Extracts purely via CSS class and applies it natively without injecting it into the title string.
-            val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim()
+            // --- UPDATED LAYERED DATE EXTRACTION ---
+            // 1. Broaden CSS to catch standard Theme spans
+            val cssDate = info.selectFirst(".epl-date, .date, .time, .rightoff, .epdate, .published, .released")?.text()?.trim()
+            val fullText = info.text()
+            
+            // 2. Cascade: CSS -> Exact Regex (October 12, 2023) -> Relative Regex (2 hours ago)
+            val extractedDate = cssDate.takeIf { !it.isNullOrBlank() } 
+                ?: dateRegex.find(fullText)?.value?.trim()
+                ?: relativeDateRegex.find(fullText)?.value?.trim()
 
             newEpisode(href) {
                 this.name = epName
                 this.episode = episodeNum
                 this.posterUrl = posterr
 
-                if (!dateText.isNullOrBlank()) {
-                    this.addDate(dateText, format = "MMMM d, yyyy")
-                    this.description = dateText
+                if (!extractedDate.isNullOrBlank()) {
+                    // Try to map native format for sorting. Fails silently if it's "2 hours ago".
+                    this.addDate(extractedDate, format = "MMMM d, yyyy")
+                    // Bind strictly to description so the UI is guaranteed to render it.
+                    this.description = extractedDate
                 }
             }
         }.reversed()
