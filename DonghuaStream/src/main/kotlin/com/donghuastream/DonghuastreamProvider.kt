@@ -1,7 +1,9 @@
 package com.donghuastream
 
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -9,6 +11,7 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
+import java.net.URLEncoder
 
 open class DonghuastreamProvider : MainAPI() {
     override var mainUrl = "https://donghuastream.org"
@@ -24,16 +27,17 @@ open class DonghuastreamProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
-    // PRE-COMPILED REGEXES (Huge performance boost over compiling inside loops)
+    // PRE-COMPILED REGEXES
     private val junkRegex = Regex("(?i)(English Sub|Multiple Subtitles|Subtitles|Good Sub|Download Link|Download Linl|\\(4K\\)|\\[4K\\]|\\(1080p\\)|\\[1080p\\]|4K|1080p|720p|Full Movie|Eps Full|Movie)")
     private val epJunkRegex = Regex("(?i)(Episode|Ep\\.?|Part|SP|Special)\\s*\\d+.*")
     private val nonAlphaNumericRegex = Regex("[^a-zA-Z0-9]")
-    private val dateRegex = Regex("""([a-zA-Z]+\s+\d{1,2},\s+\d{4})""")
     private val fullMovieRegex = Regex("""(?i)\bfull\b""")
     private val epNumRegex = Regex("""(?i)(?:Ep|Eps|Episode|Ep\.|Part|SP|Special)\s*(\d+(?:\s*[-~]\s*\d+)?)""")
     private val rangeRegex = Regex("""\b(\d+[-~]\d+)\b""")
     private val digitsRegex = Regex("""\d+""")
     private val videoIdRegex = Regex("""[?&]video=([a-zA-Z0-9_-]+)""")
+    private val qualityRegex = Regex("""(?i)(4K|1080p|720p|2160p|HD|SD)""")
+    private val titleCleanRegex = Regex("(?i)\\s*(Episode|Movie).*")
 
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update&page=" to "Recently Updated",
@@ -43,11 +47,19 @@ open class DonghuastreamProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (request.name == "Special Edition") {
             val combinedResults = coroutineScope {
-                val movieDeferred = async { app.get("$mainUrl${if (page == 1) "" else "/pagg/$page"}/?s=movie", cacheTime = 0).document }
-                val specialDeferred = async { app.get("$mainUrl${if (page == 1) "" else "/pagg/$page"}/?s=special", cacheTime = 0).document }
+                val movieDeferred = async { 
+                    try {
+                        app.get("$mainUrl${if (page == 1) "" else "/pagg/$page"}/?s=movie", headers = defaultHeaders, cacheTime = 0).document 
+                    } catch (e: CancellationException) { throw e } catch (e: Exception) { null }
+                }
+                val specialDeferred = async { 
+                    try {
+                        app.get("$mainUrl${if (page == 1) "" else "/pagg/$page"}/?s=special", headers = defaultHeaders, cacheTime = 0).document 
+                    } catch (e: CancellationException) { throw e } catch (e: Exception) { null }
+                }
 
-                val movieResults = movieDeferred.await().select("div.listupd > article").mapNotNull { it.toSearchResult() }
-                val specialResults = specialDeferred.await().select("div.listupd > article").mapNotNull { it.toSearchResult() }
+                val movieResults = movieDeferred.await()?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
+                val specialResults = specialDeferred.await()?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
 
                 (movieResults + specialResults).distinctBy { it.name.trim().lowercase() }
             }
@@ -61,22 +73,27 @@ open class DonghuastreamProvider : MainAPI() {
         val home = if (page == 1) {
             coroutineScope {
                 val headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache")
-                val homeDocDeferred = async { app.get("$mainUrl/", headers = headers, cacheTime = 0).document }
-                val dirDocDeferred = async { app.get("$mainUrl/${request.data}1", headers = headers, cacheTime = 0).document }
+                val homeDocDeferred = async { 
+                    try { app.get("$mainUrl/", headers = headers, cacheTime = 0).document } 
+                    catch (e: CancellationException) { throw e } catch (e: Exception) { null }
+                }
+                val dirDocDeferred = async { 
+                    try { app.get("$mainUrl/${request.data}1", headers = headers, cacheTime = 0).document } 
+                    catch (e: CancellationException) { throw e } catch (e: Exception) { null }
+                }
 
                 val homeDoc = homeDocDeferred.await()
                 val dirDoc = dirDocDeferred.await()
 
-                val containers = homeDoc.select(".bixbox, .releases")
-                val latestContainer = containers.find {
+                val containers = homeDoc?.select(".bixbox, .releases")
+                val latestContainer = containers?.find {
                     val headerTitle = it.selectFirst("h2, h3, .moxhead, .sec-title")?.text() ?: ""
                     headerTitle.contains("Latest", ignoreCase = true) || headerTitle.contains("Recent", ignoreCase = true)
-                } ?: homeDoc.selectFirst(".releases.latesthome") ?: containers.lastOrNull()
+                } ?: homeDoc?.selectFirst(".releases.latesthome") ?: containers?.lastOrNull()
 
                 val homeArticles = latestContainer?.select("article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
-                val dirArticles = dirDoc.select("div.listupd > article").mapNotNull { it.toSearchResult() }
+                val dirArticles = dirDoc?.select("div.listupd > article")?.mapNotNull { it.toSearchResult() } ?: emptyList()
 
-                // Clean chained regex replacement 
                 (homeArticles + dirArticles).distinctBy {
                     it.name.replace(junkRegex, "")
                         .replace(epJunkRegex, "")
@@ -92,7 +109,7 @@ open class DonghuastreamProvider : MainAPI() {
 
         return newHomePageResponse(
             list = HomePageList(request.name, home, isHorizontalImages = false),
-            hasNext = true // Assuming continuous pagination
+            hasNext = home.isNotEmpty()
         )
     }
 
@@ -111,7 +128,6 @@ open class DonghuastreamProvider : MainAPI() {
         }
     }
 
-    // Simplified fallback chain using takeIf
     private fun Element.getImageAttr(): String? {
         return attr("data-src").takeIf { it.isNotBlank() }
             ?: selectFirst("img")?.attr("data-src")?.takeIf { it.isNotBlank() }
@@ -119,13 +135,15 @@ open class DonghuastreamProvider : MainAPI() {
             ?: selectFirst("img")?.attr("src")
     }
 
-    // Parallelized search execution
     override suspend fun search(query: String): List<SearchResponse> = coroutineScope {
+        val encoded = URLEncoder.encode(query, "UTF-8")
         (1..3).map { page ->
             async {
                 try {
-                    val url = "$mainUrl/pagg/$page/?s=$query"
-                    app.get(url).document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
+                    val url = "$mainUrl/pagg/$page/?s=$encoded"
+                    app.get(url, headers = defaultHeaders).document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
+                } catch (e: CancellationException) { 
+                    throw e 
                 } catch (e: Exception) {
                     emptyList()
                 }
@@ -133,15 +151,13 @@ open class DonghuastreamProvider : MainAPI() {
         }.awaitAll().flatten().distinctBy { it.url }
     }
 
-    // Simplified element retrieval with takeIf chains
     private fun getEpisodesElements(document: Document): Elements {
         return document.select("table tbody tr:not(:has(th)), div.episodelist ul li, div.eplister ul li, ul.eplister li, .ep_list li, .episodelist li, .eplister li, #episodelist li, .lsteps li, .list1 li").takeIf { it.isNotEmpty() }
-            ?: document.select("div.episodelist a[href], div.eplister a[href], .ep_list a[href], .episodelist a[href], .eplister a[href], #episodelist a[href], .lsteps a[href], .list1 a[href]").takeIf { it.isNotEmpty() }
-            ?: document.select("div.listupd article, div.bixbox article, div.related article")
+            ?: document.select("div.episodelist a[href], div.eplister a[href], .ep_list a[href], .episodelist a[href], .eplister a[href], #episodelist a[href], .lsteps a[href], .list1 a[href]")
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val document = app.get(url).document
+        val document = app.get(url, headers = defaultHeaders).document
         val isEpisodePage = document.selectFirst(".infox, .tsinfo, .anime-info") == null
 
         if (isEpisodePage) {
@@ -155,7 +171,7 @@ open class DonghuastreamProvider : MainAPI() {
             }
 
             val titleRaw = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
-            val title = titleRaw.substringBefore(" Episode").substringBefore(" Movie").trim()
+            val title = titleRaw.replace(titleCleanRegex, "").trim()
             val poster = document.selectFirst("meta[property=og:image]")?.attr("content") ?: ""
             val epElements = getEpisodesElements(document)
 
@@ -188,7 +204,7 @@ open class DonghuastreamProvider : MainAPI() {
             }
         } else {
             val href = epElements.firstOrNull()?.selectFirst("a[href]")?.attr("href") ?: url
-            newMovieLoadResponse(title, url, TvType.Movie, href) {
+            newMovieLoadResponse(title, url, TvType.Movie, fixUrl(href)) {
                 this.posterUrl = poster
                 this.plot = description
             }
@@ -199,13 +215,12 @@ open class DonghuastreamProvider : MainAPI() {
         return epElements.mapNotNull { info ->
             val aTag = info.selectFirst("a[href]") ?: info.takeIf { it.tagName() == "a" && it.hasAttr("href") }
             val href1 = aTag?.attr("href") ?: return@mapNotNull null
+            val href = fixUrl(href1)
 
             val rawTitle = info.selectFirst(".epl-title, .ep-title, .title, h2, h3")?.text()?.trim()?.takeIf { it.isNotBlank() }
                 ?: aTag.text().trim().takeIf { it.isNotBlank() }
                 ?: info.text().trim()
 
-            val fullText = info.text()
-            val dateMatch = dateRegex.find(fullText)?.value?.trim()
             val isFullMovie = rawTitle.contains("Full Movie", ignoreCase = true) ||
                               rawTitle.contains("Eps Full", ignoreCase = true) ||
                               fullMovieRegex.containsMatchIn(rawTitle)
@@ -216,36 +231,38 @@ open class DonghuastreamProvider : MainAPI() {
             var episodeNum: Int? = null
             val epName: String
 
+            // Keep names clean and format-free.
             if (isFullMovie && matchStr == null) {
                 episodeNum = 0
-                epName = if (dateMatch != null) "Full Movie: $dateMatch" else "Full Movie"
+                epName = "Full Movie"
             } else if (matchStr != null) {
                 episodeNum = digitsRegex.find(matchStr)?.value?.toIntOrNull()
-                epName = if (dateMatch != null) "Episode $matchStr: $dateMatch" else "Episode $matchStr"
+                epName = "Episode $matchStr"
             } else {
                 val rangeMatch = rangeRegex.find(rawTitle)
                 if (rangeMatch != null) {
                     val rawRange = rangeMatch.groupValues[1]
                     episodeNum = digitsRegex.find(rawRange)?.value?.toIntOrNull()
-                    epName = if (dateMatch != null) "Episode $rawRange: $dateMatch" else "Episode $rawRange"
+                    epName = "Episode $rawRange"
                 } else {
-                    val numbers = digitsRegex.findAll(rawTitle).map { it.value }.toList()
+                    val cleanedTitle = rawTitle.replace(qualityRegex, "")
+                    val numbers = digitsRegex.findAll(cleanedTitle).map { it.value }.toList()
+                    
                     episodeNum = numbers.lastOrNull { num ->
-                        num != "4" && num != "1080" && num != "720" && num != "2160" && !(num.length == 4 && num.startsWith("20"))
+                        !(num.length == 4 && num.startsWith("20"))
                     }?.toIntOrNull()
 
-                    epName = if (episodeNum != null) {
-                        if (dateMatch != null) "Episode $episodeNum: $dateMatch" else "Episode $episodeNum"
-                    } else {
-                        if (dateMatch != null) "Episode: $dateMatch" else "Episode"
-                    }
+                    epName = if (episodeNum != null) "Episode $episodeNum" else "Episode"
                 }
             }
 
-            val posterr = info.selectFirst("img")?.getImageAttr() ?: ""
+            val posterr = info.selectFirst("img")?.getImageAttr()?.let { fixUrlNull(it) } ?: ""
+            
+            // ANIMEKHOR DATE LOGIC IMPLEMENTATION
+            // Extracts purely via CSS class and applies it natively without injecting it into the title string.
             val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim()
 
-            newEpisode(href1) {
+            newEpisode(href) {
                 this.name = epName
                 this.episode = episodeNum
                 this.posterUrl = posterr
@@ -266,6 +283,12 @@ open class DonghuastreamProvider : MainAPI() {
     ): Boolean {
         val doc = app.get(data, headers = defaultHeaders).document
         val options = doc.select("option[data-index]")
+        
+        var found = false
+        val wrappedCallback: (ExtractorLink) -> Unit = {
+            found = true
+            callback(it)
+        }
 
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl
@@ -280,18 +303,18 @@ open class DonghuastreamProvider : MainAPI() {
             }
 
             when {
-                "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> OkRuCustom().getUrl(finalUrl, extReferer, subtitleCallback, callback)
-                "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, finalUrl, subtitleCallback, callback)
-                "play.streamplay.co.in" in finalUrl -> PlayStreamplay().getUrl(finalUrl, finalUrl, subtitleCallback, callback)
+                "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> OkRuCustom().getUrl(finalUrl, extReferer, subtitleCallback, wrappedCallback)
+                "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, finalUrl, subtitleCallback, wrappedCallback)
+                "play.streamplay.co.in" in finalUrl -> PlayStreamplay().getUrl(finalUrl, finalUrl, subtitleCallback, wrappedCallback)
                 finalUrl.endsWith(".mp4") -> {
-                    callback(
+                    wrappedCallback(
                         newExtractorLink(label, label, finalUrl, INFER_TYPE) {
                             this.referer = mainUrl
                             this.quality = getQualityFromName(label)
                         }
                     )
                 }
-                else -> loadExtractor(finalUrl, referer = extReferer, subtitleCallback, callback)
+                else -> loadExtractor(finalUrl, referer = extReferer, subtitleCallback, wrappedCallback)
             }
         }
 
@@ -310,12 +333,12 @@ open class DonghuastreamProvider : MainAPI() {
             }
         }
 
-        if (options.isEmpty()) {
+        if (!found) {
             doc.selectFirst(".player-area iframe, .playcon iframe")?.attr("src")?.let(::httpsify)?.let {
                 invokeExtractor(it, "Server")
             }
         }
 
-        return true
+        return found
     }
 }
