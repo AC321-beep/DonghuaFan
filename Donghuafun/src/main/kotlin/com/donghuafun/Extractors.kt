@@ -11,7 +11,6 @@ class DonghuaFunExtractor : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
-        // Bounds the quality-parse step so a slow M3U8 host can't stall the UI
         private const val M3U8_PARSE_TIMEOUT_MS = 6_000L
 
         private val GANJING_HEADERS = mapOf(
@@ -29,11 +28,6 @@ class DonghuaFunExtractor : ExtractorApi() {
             "Accept" to "*/*"
         )
 
-        /**
-         * Picks the correct Origin/Referer headers for the actual stream host.
-         * A GanjingWorld-only header set silently delays/rejects M3U8 requests
-         * on non-Ganjing CDNs.
-         */
         private fun headersFor(url: String): Pair<Map<String, String>, String> = when {
             url.contains("ganjingworld.com", ignoreCase = true) ->
                 GANJING_HEADERS to "https://www.ganjingworld.com/"
@@ -58,11 +52,14 @@ class DonghuaFunExtractor : ExtractorApi() {
 
         val (headers, chosenReferer) = headersFor(m3u8Url)
 
-        // Bounded playlist parse — fallback link fires fast if host is slow
+        // FIX: capture this.name into a local val. Inside withTimeoutOrNull the
+        // receiver is CoroutineScope, so `this.name` no longer resolves.
+        val extractorName = this.name
+
         val extractedLinks = try {
             withTimeoutOrNull(M3U8_PARSE_TIMEOUT_MS) {
                 M3u8Helper.generateM3u8(
-                    this.name,
+                    extractorName,
                     m3u8Url,
                     chosenReferer,
                     headers = headers
@@ -75,10 +72,9 @@ class DonghuaFunExtractor : ExtractorApi() {
         if (!extractedLinks.isNullOrEmpty()) {
             extractedLinks.forEach(callback)
         } else {
-            // Immediate fallback with the correct headers for this host
             callback.invoke(
                 newExtractorLink(
-                    this.name,
+                    extractorName,
                     "DonghuaFun",
                     m3u8Url,
                     ExtractorLinkType.M3U8
@@ -100,7 +96,6 @@ class GanjingWorld : ExtractorApi() {
     companion object {
         private const val FETCH_TIMEOUT_MS = 12_000L
 
-        // Hoisted regexes — never rebuilt per call
         private val RE_M3U8 = Regex("""(https?:\\?/\\?/[^"'\s<>]+?\.m3u8[^"'\s<>]*)""")
         private val RE_MP4 = Regex("""(https?:\\?/\\?/[^"'\s<>]+?\.mp4[^"'\s<>]*)""")
 
@@ -128,7 +123,6 @@ class GanjingWorld : ExtractorApi() {
         val m3u8Match = RE_M3U8.find(html)?.value?.replace("\\/", "/")
 
         if (m3u8Match != null) {
-            // VERDICT FIX: Added fallback so the link isn't lost if parsing times out
             val extracted = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
                 M3u8Helper.generateM3u8(
                     name,
@@ -175,7 +169,6 @@ class Rumble : ExtractorApi() {
     companion object {
         private const val FETCH_TIMEOUT_MS = 12_000L
 
-        // Hoisted regexes
         private val RE_VIDEO_URL = Regex(
             """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*"""
         )
@@ -212,7 +205,6 @@ class Rumble : ExtractorApi() {
             }
         } ?: return
 
-        // LinkedHashSet keeps insertion order (highest quality typically first)
         val scrapedUrls = LinkedHashSet<String>()
 
         RE_VIDEO_URL.findAll(html).forEach { match ->
@@ -222,7 +214,6 @@ class Rumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
-                    // VERDICT FIX: Added fallback if M3u8Helper times out
                     val extracted = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
                         M3u8Helper.generateM3u8(name, cleanUrl, url)
                     }
