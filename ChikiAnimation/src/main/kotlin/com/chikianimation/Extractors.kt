@@ -1,5 +1,6 @@
 package com.chikianimation
 
+import android.util.Log
 import android.util.Base64
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
