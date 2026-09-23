@@ -11,8 +11,6 @@ class DonghuaFunExtractor : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
-        private const val M3U8_PARSE_TIMEOUT_MS = 6_000L
-
         private val GANJING_HEADERS = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Origin" to "https://www.ganjingworld.com",
@@ -51,40 +49,22 @@ class DonghuaFunExtractor : ExtractorApi() {
         }
 
         val (headers, chosenReferer) = headersFor(m3u8Url)
-
-        // FIX: capture this.name into a local val. Inside withTimeoutOrNull the
-        // receiver is CoroutineScope, so `this.name` no longer resolves.
         val extractorName = this.name
 
-        val extractedLinks = try {
-            withTimeoutOrNull(M3U8_PARSE_TIMEOUT_MS) {
-                M3u8Helper.generateM3u8(
-                    extractorName,
-                    m3u8Url,
-                    chosenReferer,
-                    headers = headers
-                )
+        // FIX: Pass the Master M3U8 directly to retain separated audio tracks.
+        // ExoPlayer will automatically populate 1080p/720p qualities internally.
+        callback.invoke(
+            newExtractorLink(
+                extractorName,
+                "DonghuaFun (Auto)",
+                m3u8Url,
+                ExtractorLinkType.M3U8
+            ) {
+                this.quality = Qualities.Unknown.value
+                this.referer = chosenReferer
+                this.headers = headers
             }
-        } catch (e: Exception) {
-            null
-        }
-
-        if (!extractedLinks.isNullOrEmpty()) {
-            extractedLinks.forEach(callback)
-        } else {
-            callback.invoke(
-                newExtractorLink(
-                    extractorName,
-                    "DonghuaFun",
-                    m3u8Url,
-                    ExtractorLinkType.M3U8
-                ) {
-                    this.quality = Qualities.Unknown.value
-                    this.referer = chosenReferer
-                    this.headers = headers
-                }
-            )
-        }
+        )
     }
 }
 
@@ -123,25 +103,14 @@ class GanjingWorld : ExtractorApi() {
         val m3u8Match = RE_M3U8.find(html)?.value?.replace("\\/", "/")
 
         if (m3u8Match != null) {
-            val extracted = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-                M3u8Helper.generateM3u8(
-                    name,
-                    m3u8Match,
-                    mainUrl,
-                    headers = GANJING_HEADERS
-                )
-            }
-            if (!extracted.isNullOrEmpty()) {
-                extracted.forEach(callback)
-            } else {
-                callback.invoke(
-                    newExtractorLink(name, name, m3u8Match, ExtractorLinkType.M3U8) {
-                        this.referer = referer ?: mainUrl
-                        this.headers = GANJING_HEADERS
-                        this.quality = Qualities.Unknown.value
-                    }
-                )
-            }
+            // FIX: Pass Master M3U8 directly to retain separated audio
+            callback.invoke(
+                newExtractorLink(name, "$name (Auto)", m3u8Match, ExtractorLinkType.M3U8) {
+                    this.referer = referer ?: mainUrl
+                    this.headers = GANJING_HEADERS
+                    this.quality = Qualities.Unknown.value
+                }
+            )
         } else {
             val videoMatch = RE_MP4.find(html)?.value?.replace("\\/", "/")
             if (videoMatch != null) {
@@ -184,7 +153,6 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Fast path: caller already handed us a direct file.
         if (url.endsWith(".mp4", ignoreCase = true) || url.endsWith(".m3u8", ignoreCase = true)) {
             val linkType = if (url.endsWith(".m3u8", ignoreCase = true))
                 ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
@@ -214,19 +182,13 @@ class Rumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
-                    val extracted = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-                        M3u8Helper.generateM3u8(name, cleanUrl, url)
-                    }
-                    if (!extracted.isNullOrEmpty()) {
-                        extracted.forEach(callback)
-                    } else {
-                        callback.invoke(
-                            newExtractorLink(name, name, cleanUrl, ExtractorLinkType.M3U8) {
-                                this.referer = url
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                    }
+                    // FIX: Pass Master M3U8 directly for faster extraction and native ExoPlayer quality switching
+                    callback.invoke(
+                        newExtractorLink(name, "$name (Auto)", cleanUrl, ExtractorLinkType.M3U8) {
+                            this.referer = url
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
                 } else if (cleanUrl.contains(".mp4", ignoreCase = true)) {
                     val startIndex = maxOf(0, match.range.first - 250)
                     val precedingText = html.substring(startIndex, match.range.first)
