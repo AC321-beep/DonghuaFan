@@ -17,7 +17,22 @@ class AnimekhorProvider : MainAPI() {
     override val hasMainPage = true
     override var lang = "zh"
     override val hasDownloadSupport = true
-    override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
+    override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
+
+    // ---- Browser-mimic headers ----
+    // Cloudflare silently blocks requests whose headers don't look like a real
+    // browser (it isn't a captcha — a browser passes automatically, OkHttp
+    // doesn't). Sending these on every request keeps us off the bot list.
+    private val defaultHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "Referer" to mainUrl,
+        "Origin" to mainUrl
+    )
+
+    // The site wraps <article> inside intermediate containers (excstf,
+    // popconslide, tab-pane), so descendant selectors are required — the old
+    // direct-child selector `div.listupd > article` now matches nothing.
+    private val cardSelector = "div.listupd article, div.listupd .bsx, div.bsx, article.bs"
 
     override val mainPage = mainPageOf(
         "anime/?status=ongoing&type=&order=update" to "Recently Updated",
@@ -29,26 +44,9 @@ class AnimekhorProvider : MainAPI() {
         "anime/?status=completed&order=update" to "Completed"
     )
 
-    // ---------------------------------------------------------------------
-    // Helpers
-    // ---------------------------------------------------------------------
-
-    /**
-     * Broad, layout-agnostic selector. The site has been observed wrapping
-     * <article> elements inside intermediate divs (excstf, popconslide,
-     * tab-pane, etc). The descendant selector covers all of those, while
-     * `div.bsx` / `article.bs` act as final fallbacks if the wrapping class
-     * changes again.
-     */
-    private val cardSelector = "div.listupd article, div.listupd .bsx, div.bsx, article.bs"
-
-    // ---------------------------------------------------------------------
-    // Main page
-    // ---------------------------------------------------------------------
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$mainUrl/${request.data.replace("anime/?", "anime/page/$page/?")}"
-        val document = app.get(url).document
+        val document = app.get(url, headers = defaultHeaders).document
         val home = document
             .select(cardSelector)
             .mapNotNull { it.toSearchResult() }
@@ -57,14 +55,14 @@ class AnimekhorProvider : MainAPI() {
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
-        val linkElement = this.selectFirst("a[href]") ?: return null
+        val linkElement = this.selectFirst("a") ?: return null
 
-        val title = linkElement.attr("title")
-            .ifBlank { this.selectFirst("h2[itemprop=headline]")?.text().orEmpty() }
-            .ifBlank { this.selectFirst(".tt h2")?.text().orEmpty() }
-            .ifBlank { this.selectFirst(".tt")?.text().orEmpty() }
-            .trim()
-            .takeIf { it.isNotEmpty() }
+        // Prefer the h2[itemprop=headline] so the duplicated raw text sitting
+        // before the h2 inside .tt doesn't get prepended to the title.
+        val title = linkElement.attr("title").takeIf { it.isNotBlank() }
+            ?: this.selectFirst("h2[itemprop=headline]")?.text()?.takeIf { it.isNotBlank() }
+            ?: this.selectFirst(".tt h2")?.text()?.takeIf { it.isNotBlank() }
+            ?: this.selectFirst(".tt")?.text()?.takeIf { it.isNotBlank() }
             ?: return null
 
         val href = fixUrlNull(linkElement.attr("href")) ?: return null
@@ -74,28 +72,23 @@ class AnimekhorProvider : MainAPI() {
                 img.attr("data-src")
                     .ifBlank { img.attr("src") }
                     .ifBlank { img.attr("data-lazy-src") }
-                    .ifBlank { img.attr("data-original") }
             }
         )
 
-        return newMovieSearchResponse(title, href, TvType.Movie) {
+        return newMovieSearchResponse(title.trim(), href, TvType.Movie) {
             this.posterUrl = posterUrl
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Search
-    // ---------------------------------------------------------------------
-
     override suspend fun search(query: String): List<SearchResponse> {
         val results = coroutineScope {
-            (1..3).map { page ->
+            (1..2).map { page ->
                 async {
                     try {
-                        val document = app.get("$mainUrl/page/$page/?s=$query").document
-                        document
-                            .select(cardSelector)
-                            .mapNotNull { it.toSearchResult() }
+                        val document = app
+                            .get("$mainUrl/page/$page/?s=$query", headers = defaultHeaders)
+                            .document
+                        document.select(cardSelector).mapNotNull { it.toSearchResult() }
                     } catch (e: Exception) {
                         emptyList()
                     }
@@ -105,114 +98,52 @@ class AnimekhorProvider : MainAPI() {
         return results.distinctBy { it.url }
     }
 
-    // ---------------------------------------------------------------------
-    // Load (series / movie)
-    // ---------------------------------------------------------------------
-
     override suspend fun load(url: String): LoadResponse {
-        val document = app.get(url).document
+        val document = app.get(url, headers = defaultHeaders).document
+        val title = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
+        val poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim() ?: ""
+        val description = document.selectFirst("div.entry-content")?.text()?.trim()
+        val type = document.selectFirst(".spe")?.text()
+        val tvtag = if (type?.contains("Movie", ignoreCase = true) == true) TvType.Movie else TvType.TvSeries
 
-        val title = document
-            .selectFirst("h1.entry-title")
-            ?.text()?.trim()
-            ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
-            ?: ""
-
-        val poster = document
-            .selectFirst("meta[property=og:image]")?.attr("content")?.trim()
-            ?: document.selectFirst("div.thumb img, .poster img, img.ts-post-image")
-                ?.let { it.attr("data-src").ifBlank { it.attr("src") } }
-                ?.trim()
-                ?: ""
-
-        val description = document
-            .selectFirst("div.entry-content, div[itemprop=description], .desc")
-            ?.text()?.trim()
-
-        val typeText = document.selectFirst(".spe")?.text().orEmpty()
-        val isMovie = typeText.contains("Movie", ignoreCase = true)
-
-        if (isMovie) {
-            val href = document
-                .selectFirst(".eplister li > a, .episodelist li > a")
-                ?.attr("href")
-                ?.takeIf { it.isNotBlank() }
-                ?: url
-
+        if (tvtag == TvType.Movie) {
+            val href = document.selectFirst(".eplister li > a, .episodelist li > a")?.attr("href") ?: url
             return newMovieLoadResponse(title, url, TvType.Movie, href) {
                 this.posterUrl = poster
                 this.plot = description
             }
-        }
-
-        // ----- TV series / anime -----
-        var epListElements = document.select(".episodelist li, .eplister li")
-
-        if (epListElements.isEmpty()) {
-            // Sometimes the episode list is on a separate page
-            val epPage = document
-                .selectFirst(".episodelist li > a, .eplister li > a, a.ep-link")
-                ?.attr("href")
-                .orEmpty()
-
-            if (epPage.isNotBlank()) {
-                runCatching {
-                    val doc = app.get(epPage).document
+        } else {
+            var epListElements = document.select(".episodelist li, .eplister li")
+            if (epListElements.isEmpty()) {
+                val epPage = document.selectFirst(".episodelist li > a, .eplister li > a")?.attr("href") ?: ""
+                if (epPage.isNotBlank()) {
+                    val doc = app.get(epPage, headers = defaultHeaders).document
                     epListElements = doc.select(".episodelist li, .eplister li")
                 }
             }
-        }
 
-        val episodes = epListElements.mapNotNull { info ->
-            val a = info.selectFirst("a[href]") ?: return@mapNotNull null
-            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val episodes = epListElements.mapNotNull { info ->
+                val href = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
+                val episodeText = info.selectFirst(".epl-title")?.text() ?: info.selectFirst("a span")?.text() ?: ""
+                val dateText = info.selectFirst(".epl-date, .date, .time")?.text()?.trim()
+                val parsedEpisode = if (episodeText.contains("-")) episodeText.substringAfter("-").substringBeforeLast("-").trim() else episodeText.trim()
 
-            val episodeText = info.selectFirst(".epl-title")?.text()
-                ?: info.selectFirst("a span")?.text()
-                ?: a.text()
-                ?: ""
-
-            val dateText = info
-                .selectFirst(".epl-date, .date, .time, span.epl-date")
-                ?.text()?.trim()
-
-            // Extract just the episode number if possible
-            val parsedEpisode = when {
-                episodeText.contains("Episode", ignoreCase = true) -> {
-                    episodeText.substringAfter("Episode", "").trim()
-                        .substringBefore(" ").trim()
-                        .ifBlank { episodeText.trim() }
-                }
-                episodeText.contains("-") -> {
-                    episodeText.substringAfter("-")
-                        .substringBeforeLast("-")
-                        .trim()
-                        .ifBlank { episodeText.trim() }
-                }
-                else -> episodeText.trim()
-            }
-
-            newEpisode(href) {
-                this.name = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText.trim()
-                this.posterUrl = poster
-                if (!dateText.isNullOrBlank()) {
-                    runCatching {
+                newEpisode(href) {
+                    this.name = parsedEpisode.takeIf { it.isNotEmpty() } ?: episodeText
+                    this.posterUrl = poster
+                    if (!dateText.isNullOrBlank()) {
                         this.addDate(dateText, format = "MMMM d, yyyy")
+                        this.description = dateText
                     }
-                    this.description = dateText
                 }
-            }
-        }.distinctBy { it.data }.reversed()
+            }.distinctBy { it.data }.reversed()
 
-        return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
-            this.posterUrl = poster
-            this.plot = description
+            return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
+                this.posterUrl = poster
+                this.plot = description
+            }
         }
     }
-
-    // ---------------------------------------------------------------------
-    // Load links
-    // ---------------------------------------------------------------------
 
     override suspend fun loadLinks(
         data: String,
@@ -220,147 +151,98 @@ class AnimekhorProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data).document
+        val document = app.get(data, headers = defaultHeaders).document
 
-        // Iframe URL dedup
         val extractedIframeUrls = ConcurrentHashMap.newKeySet<String>()
-        // Final stream URL dedup (prevents identical resolutions showing twice)
         val yieldedStreamUrls = ConcurrentHashMap.newKeySet<String>()
 
-        suspend fun invokeExtractor(iframeUrl: String) {
+        suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl.trim()
-            if (finalUrl.isEmpty()) return
 
-            finalUrl = when {
-                finalUrl.startsWith("//") -> "https:$finalUrl"
-                finalUrl.startsWith("/") -> "https://ok.ru$finalUrl"
-                !finalUrl.startsWith("http") -> "https://$finalUrl"
-                else -> finalUrl
+            if (finalUrl.startsWith("//")) {
+                finalUrl = "https:$finalUrl"
+            } else if (finalUrl.startsWith("/")) {
+                finalUrl = "https://ok.ru$finalUrl"
+            } else if (!finalUrl.startsWith("http")) {
+                finalUrl = "https://$finalUrl"
             }
 
-            // Normalize ok.ru embed URLs
             if (finalUrl.contains("ok.ru") || finalUrl.contains("odnoklassniki.ru")) {
-                val okId = Regex("""/video(?:embed)?/(\d+)""")
-                    .find(finalUrl)?.groupValues?.getOrNull(1)
-                    ?: finalUrl.substringAfterLast("/")
-                if (okId.isNotBlank()) {
-                    finalUrl = "https://ok.ru/videoembed/$okId"
-                }
+                val okId = Regex("""/video(?:embed)?/(\d+)""").find(finalUrl)?.groupValues?.get(1) ?: finalUrl.substringAfterLast("/")
+                finalUrl = "https://ok.ru/videoembed/$okId"
             }
 
-            // Hydrax → AbyssPlayer migration
             if (finalUrl.contains("playhydrax.com")) {
                 finalUrl = finalUrl.replace("playhydrax.com", "abyssplayer.com")
             }
 
-            // Strip query params for dedup purposes
             val dedupUrl = finalUrl.substringBefore("?")
             if (!extractedIframeUrls.add(dedupUrl)) return
 
             val trackingCallback: (ExtractorLink) -> Unit = { link ->
-                val key = link.url.substringBefore("?")
-                if (yieldedStreamUrls.add(key)) {
+                if (yieldedStreamUrls.add(link.url)) {
                     callback(link)
                 }
             }
 
             try {
-                val handled = when {
-                    "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> {
-                        OkRuCustom().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true
-                    }
-                    "p2pstream" in finalUrl -> {
-                        P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true
-                    }
-                    "upns.live" in finalUrl -> {
-                        UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true
-                    }
-                    "emturbovid" in finalUrl -> {
-                        Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true
-                    }
-                    "bysekoze.com" in finalUrl -> {
-                        Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true
-                    }
-                    "rumble.com" in finalUrl -> {
-                        Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true
-                    }
-                    "abyssplayer.com" in finalUrl -> {
-                        AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true
-                    }
+                val isHandled = when {
+                    "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> { OkRuCustom().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
+                    "p2pstream" in finalUrl -> { P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
+                    "upns.live" in finalUrl -> { UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
+                    "emturbovid" in finalUrl -> { Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
+                    "bysekoze.com" in finalUrl -> { Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
+                    "rumble.com" in finalUrl -> { Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
+                    "abyssplayer.com" in finalUrl -> { AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
                     else -> false
                 }
 
-                if (!handled) {
+                if (!isHandled) {
                     loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, trackingCallback)
                 }
-            } catch (_: Exception) {
-                // Fails silently per server
+            } catch (e: Exception) {
+                // Fails silently
             }
         }
 
-        // 1) Raw URL scan for known hosts in HTML
         val rawHtml = document.html()
-        val globalUrlRegex = Regex(
-            """https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com|abyssplayer\.com|playhydrax\.com|rumble\.com)[^"'\s<>\\]+"""
-        )
+        val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com|abyssplayer\.com|playhydrax\.com)[^"'\s<>]+""")
         globalUrlRegex.findAll(rawHtml).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
-            invokeExtractor(cleanUrl)
+            invokeExtractor(cleanUrl, "Raw Source")
         }
 
-        // 2) Server dropdown / list
-        val serverElements = document.select(
-            ".mobius option, select.mirror option, .server-list li a[data-embed], " +
-            ".server-list li a[data-em], .eplister .mirror option, #server-list option"
-        )
-
+        val serverElements = document.select(".mobius option, select.mirror option, .server-list li a[data-embed], .server-list li a[data-em]")
         coroutineScope {
             serverElements.map { server ->
                 async {
-                    val rawData = server.attr("value")
-                        .ifBlank { server.attr("data-em") }
-                        .ifBlank { server.attr("data-embed") }
-                        .trim()
-
-                    if (rawData.isBlank()) return@async
-
-                    val iframeSrc: String = when {
-                        rawData.startsWith("http") || rawData.startsWith("//") -> rawData
-
-                        rawData.startsWith("<iframe", ignoreCase = true) ->
-                            Jsoup.parse(rawData).selectFirst("iframe")?.attr("src").orEmpty()
-
-                        else -> {
-                            // Try base64 decode
-                            runCatching {
+                    val rawData = server.attr("value").ifBlank { server.attr("data-em").ifBlank { server.attr("data-embed") } }.trim()
+                    if (rawData.isNotBlank()) {
+                        var iframeSrc = ""
+                        if (rawData.startsWith("http") || rawData.startsWith("//")) {
+                            iframeSrc = rawData
+                        } else if (rawData.startsWith("<iframe", ignoreCase = true)) {
+                            iframeSrc = Jsoup.parse(rawData).selectFirst("iframe")?.attr("src") ?: ""
+                        } else {
+                            try {
                                 val decoded = String(Base64.decode(rawData, Base64.DEFAULT))
-                                if (decoded.contains("<iframe", ignoreCase = true)) {
-                                    Jsoup.parse(decoded).selectFirst("iframe")?.attr("src").orEmpty()
-                                } else {
-                                    decoded
-                                }
-                            }.getOrDefault("")
+                                iframeSrc = if (decoded.contains("<iframe", ignoreCase = true)) Jsoup.parse(decoded).selectFirst("iframe")?.attr("src") ?: decoded else decoded
+                            } catch (e: Exception) {
+                                // Fails silently
+                            }
                         }
+                        if (iframeSrc.isNotBlank()) invokeExtractor(iframeSrc, server.text().trim())
                     }
-
-                    if (iframeSrc.isNotBlank()) invokeExtractor(iframeSrc)
                 }
             }.awaitAll()
         }
 
-        // 3) Direct iframes on the page
-        document.select("#embed_holder iframe, .playerx iframe, .video-content iframe, iframe[src]")
-            .forEach { iframe ->
-                val src = iframe.attr("src")
-                if (src.isNotBlank() &&
-                    !src.contains("youtube", true) &&
-                    !src.contains("disqus", true) &&
-                    !src.contains("googletagmanager", true) &&
-                    !src.contains("google-analytics", true)
-                ) {
-                    invokeExtractor(src)
-                }
+        document.select("#embed_holder iframe, .playerx iframe, .video-content iframe").forEach { iframe ->
+            val src = iframe.attr("src")
+            if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
+                invokeExtractor(src, "Direct Server")
             }
+        }
 
         return true
     }
