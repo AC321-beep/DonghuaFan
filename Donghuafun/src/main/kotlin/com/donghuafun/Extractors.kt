@@ -52,7 +52,6 @@ class DonghuaFunExtractor : ExtractorApi() {
         val extractorName = this.name
 
         // Pass the Master M3U8 directly to retain separated audio tracks.
-        // ExoPlayer populates 1080p/720p qualities internally.
         callback.invoke(
             newExtractorLink(
                 extractorName,
@@ -103,7 +102,6 @@ class GanjingWorld : ExtractorApi() {
         val m3u8Match = RE_M3U8.find(html)?.value?.replace("\\/", "/")
 
         if (m3u8Match != null) {
-            // Pass Master M3U8 directly to retain separated audio
             callback.invoke(
                 newExtractorLink(name, "$name (Auto)", m3u8Match, ExtractorLinkType.M3U8) {
                     this.referer = referer ?: mainUrl
@@ -115,12 +113,7 @@ class GanjingWorld : ExtractorApi() {
             val videoMatch = RE_MP4.find(html)?.value?.replace("\\/", "/")
             if (videoMatch != null) {
                 callback.invoke(
-                    newExtractorLink(
-                        name,
-                        name,
-                        videoMatch,
-                        ExtractorLinkType.VIDEO
-                    ) {
+                    newExtractorLink(name, name, videoMatch, ExtractorLinkType.VIDEO) {
                         this.referer = referer ?: mainUrl
                         this.quality = Qualities.Unknown.value
                     }
@@ -138,10 +131,13 @@ class Rumble : ExtractorApi() {
     companion object {
         private const val FETCH_TIMEOUT_MS = 12_000L
 
-        // NOTE: No RE_JSON_BLOB regex anymore. The blob boundary is optional —
-        // a regex requires "evt":{ to exist or fails entirely. substringAfter /
-        // substringBefore are tolerant: if the delimiter is absent they return
-        // the whole string, which is exactly what we want as a fallback.
+        // Short timeout for the split attempt. Auto is already emitted before
+        // this runs, so the user is never waiting on it. Bounded so a slow
+        // master can't hold the semaphore permit for long.
+        private const val SPLIT_TIMEOUT_MS = 2_500L
+
+        // Tolerant JSON blob extraction (no regex — substringAfter/BEFORE never
+        // fail and always return something usable).
 
         private val RE_VIDEO_URL = Regex(
             """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*"""
@@ -158,7 +154,7 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Fast path
+        // Fast path: caller already handed us a direct file.
         if (url.endsWith(".mp4", ignoreCase = true) || url.endsWith(".m3u8", ignoreCase = true)) {
             val linkType = if (url.endsWith(".m3u8", ignoreCase = true))
                 ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
@@ -178,8 +174,8 @@ class Rumble : ExtractorApi() {
         } ?: return
 
         // Tolerant JSON blob extraction:
-        // - If "{"mp4" is present → slice from there up to "evt":{ (or end if absent)
-        // - If "{"mp4" is missing → scan the whole HTML (regex still filters junk)
+        //   - If "{"mp4" is present → slice from there up to "evt":{ (or end if absent)
+        //   - If "{"mp4" is missing → scan the whole HTML (regex still filters junk)
         val afterMp4 = html.substringAfter("{\"mp4", "")
         val scriptData = if (afterMp4.isEmpty()) {
             html
@@ -199,12 +195,30 @@ class Rumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
+                    // ---- STAGE 1: Emit "Auto" immediately ----
+                    // No waiting, no parsing. Visible in the UI within ~100 ms
+                    // of the page fetch. The user can start playback right away.
                     callback.invoke(
                         newExtractorLink(name, "$name (Auto)", cleanUrl, ExtractorLinkType.M3U8) {
                             this.referer = url
                             this.quality = Qualities.Unknown.value
                         }
                     )
+
+                    // ---- STAGE 2: Try to split into variants (background, bounded) ----
+                    // Auto is already on screen, so the user is never blocked by this.
+                    // If the split fails or times out, we still have Auto. If it
+                    // succeeds, the quality entries pop into the UI ~1–2 s later.
+                    val variants = try {
+                        withTimeoutOrNull(SPLIT_TIMEOUT_MS) {
+                            M3u8Helper.generateM3u8(name, cleanUrl, url)
+                        }
+                    } catch (e: Exception) {
+                        null
+                    }
+
+                    variants?.forEach(callback)
+
                 } else if (cleanUrl.contains(".mp4", ignoreCase = true)) {
                     val startIndex = maxOf(0, match.range.first - 250)
                     val precedingText = scriptData.substring(startIndex, match.range.first)
