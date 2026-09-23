@@ -7,11 +7,15 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
 import java.net.URLEncoder
+import java.util.concurrent.atomic.AtomicBoolean
 
 open class DonghuastreamProvider : MainAPI() {
     override var mainUrl = "https://donghuastream.org"
@@ -38,8 +42,8 @@ open class DonghuastreamProvider : MainAPI() {
     private val videoIdRegex = Regex("""[?&]video=([a-zA-Z0-9_-]+)""")
     private val qualityRegex = Regex("""(?i)(4K|1080p|720p|2160p|HD|SD)""")
     private val titleCleanRegex = Regex("(?i)\\s*(Episode|Movie).*")
-    
-    // NEW: Robust Date Regexes
+
+    // Robust Date Regexes
     private val dateRegex = Regex("""([a-zA-Z]{3,}\s+\d{1,2},\s+\d{4}|\d{1,2}\s+[a-zA-Z]{3,}\s+\d{4}|\d{4}-\d{2}-\d{2})""")
     private val relativeDateRegex = Regex("""(?i)\d+\s+(mins?|hours?|days?|weeks?|months?|years?)\s+ago""")
 
@@ -51,14 +55,14 @@ open class DonghuastreamProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         if (request.name == "Special Edition") {
             val combinedResults = coroutineScope {
-                val movieDeferred = async { 
+                val movieDeferred = async {
                     try {
-                        app.get("$mainUrl${if (page == 1) "" else "/pagg/$page"}/?s=movie", headers = defaultHeaders, cacheTime = 0).document 
+                        app.get("$mainUrl${if (page == 1) "" else "/pagg/$page"}/?s=movie", headers = defaultHeaders, cacheTime = 0).document
                     } catch (e: CancellationException) { throw e } catch (e: Exception) { null }
                 }
-                val specialDeferred = async { 
+                val specialDeferred = async {
                     try {
-                        app.get("$mainUrl${if (page == 1) "" else "/pagg/$page"}/?s=special", headers = defaultHeaders, cacheTime = 0).document 
+                        app.get("$mainUrl${if (page == 1) "" else "/pagg/$page"}/?s=special", headers = defaultHeaders, cacheTime = 0).document
                     } catch (e: CancellationException) { throw e } catch (e: Exception) { null }
                 }
 
@@ -77,12 +81,12 @@ open class DonghuastreamProvider : MainAPI() {
         val home = if (page == 1) {
             coroutineScope {
                 val headers = defaultHeaders + mapOf("Cache-Control" to "no-cache", "Pragma" to "no-cache")
-                val homeDocDeferred = async { 
-                    try { app.get("$mainUrl/", headers = headers, cacheTime = 0).document } 
+                val homeDocDeferred = async {
+                    try { app.get("$mainUrl/", headers = headers, cacheTime = 0).document }
                     catch (e: CancellationException) { throw e } catch (e: Exception) { null }
                 }
-                val dirDocDeferred = async { 
-                    try { app.get("$mainUrl/${request.data}1", headers = headers, cacheTime = 0).document } 
+                val dirDocDeferred = async {
+                    try { app.get("$mainUrl/${request.data}1", headers = headers, cacheTime = 0).document }
                     catch (e: CancellationException) { throw e } catch (e: Exception) { null }
                 }
 
@@ -119,7 +123,7 @@ open class DonghuastreamProvider : MainAPI() {
 
     private fun Element.toSearchResult(): SearchResponse? {
         val aTag = this.selectFirst("div.bsx > a, a[href]") ?: return null
-        
+
         val title = aTag.attr("title").takeIf { it.isNotBlank() }
             ?: this.selectFirst(".tt, .tt h2, h2, h3, h4")?.text()?.takeIf { it.isNotBlank() }
             ?: aTag.text().takeIf { it.isNotBlank() } ?: return null
@@ -146,8 +150,8 @@ open class DonghuastreamProvider : MainAPI() {
                 try {
                     val url = "$mainUrl/pagg/$page/?s=$encoded"
                     app.get(url, headers = defaultHeaders).document.select("div.listupd > article").mapNotNull { it.toSearchResult() }
-                } catch (e: CancellationException) { 
-                    throw e 
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     emptyList()
                 }
@@ -192,7 +196,7 @@ open class DonghuastreamProvider : MainAPI() {
         }
 
         val title = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
-        val poster = document.selectFirst("div.ime > img")?.attr("data-src")?.takeIf { it.isNotBlank() } 
+        val poster = document.selectFirst("div.ime > img")?.attr("data-src")?.takeIf { it.isNotBlank() }
             ?: document.selectFirst("meta[property=og:image]")?.attr("content")?.trim() ?: ""
         val description = document.selectFirst("div.entry-content")?.text()?.trim()
         val type = document.selectFirst(".spe")?.text() ?: ""
@@ -250,7 +254,7 @@ open class DonghuastreamProvider : MainAPI() {
                 } else {
                     val cleanedTitle = rawTitle.replace(qualityRegex, "")
                     val numbers = digitsRegex.findAll(cleanedTitle).map { it.value }.toList()
-                    
+
                     episodeNum = numbers.lastOrNull { num ->
                         !(num.length == 4 && num.startsWith("20"))
                     }?.toIntOrNull()
@@ -260,14 +264,12 @@ open class DonghuastreamProvider : MainAPI() {
             }
 
             val posterr = info.selectFirst("img")?.getImageAttr()?.let { fixUrlNull(it) } ?: ""
-            
-            // --- UPDATED LAYERED DATE EXTRACTION ---
-            // 1. Broaden CSS to catch standard Theme spans
+
+            // --- LAYERED DATE EXTRACTION ---
             val cssDate = info.selectFirst(".epl-date, .date, .time, .rightoff, .epdate, .published, .released")?.text()?.trim()
             val fullText = info.text()
-            
-            // 2. Cascade: CSS -> Exact Regex (October 12, 2023) -> Relative Regex (2 hours ago)
-            val extractedDate = cssDate.takeIf { !it.isNullOrBlank() } 
+
+            val extractedDate = cssDate.takeIf { !it.isNullOrBlank() }
                 ?: dateRegex.find(fullText)?.value?.trim()
                 ?: relativeDateRegex.find(fullText)?.value?.trim()
 
@@ -277,9 +279,7 @@ open class DonghuastreamProvider : MainAPI() {
                 this.posterUrl = posterr
 
                 if (!extractedDate.isNullOrBlank()) {
-                    // Try to map native format for sorting. Fails silently if it's "2 hours ago".
                     this.addDate(extractedDate, format = "MMMM d, yyyy")
-                    // Bind strictly to description so the UI is guaranteed to render it.
                     this.description = extractedDate
                 }
             }
@@ -292,20 +292,34 @@ open class DonghuastreamProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val doc = app.get(data, headers = defaultHeaders).document
+        // Timeout on the episode page fetch — a hung page no longer blocks the UI
+        val doc = withTimeoutOrNull(15_000L) {
+            try { app.get(data, headers = defaultHeaders).document } catch (e: Exception) { null }
+        } ?: return false
+
         val options = doc.select("option[data-index]")
-        
-        var found = false
-        val wrappedCallback: (ExtractorLink) -> Unit = {
-            found = true
-            callback(it)
+
+        val found = AtomicBoolean(false)
+        val callbackLock = Any()
+        val subtitleLock = Any()
+        val semaphore = Semaphore(4)  // cap parallel extractor calls
+
+        fun emitLink(link: ExtractorLink) {
+            found.set(true)
+            synchronized(callbackLock) { callback(link) }
+        }
+
+        fun emitSubtitle(sub: SubtitleFile) {
+            synchronized(subtitleLock) { subtitleCallback(sub) }
         }
 
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl
             var extReferer = iframeUrl
 
-            if (!finalUrl.contains("ok.ru", ignoreCase = true) && finalUrl.contains("dailymotion", ignoreCase = true)) {
+            if (!finalUrl.contains("ok.ru", ignoreCase = true) &&
+                finalUrl.contains("dailymotion", ignoreCase = true)
+            ) {
                 val videoIdMatch = videoIdRegex.find(finalUrl)
                 if (videoIdMatch != null) {
                     finalUrl = "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
@@ -313,43 +327,73 @@ open class DonghuastreamProvider : MainAPI() {
                 }
             }
 
+            val wrappedCallback: (ExtractorLink) -> Unit = { emitLink(it) }
+            val wrappedSubtitle: (SubtitleFile) -> Unit = { emitSubtitle(it) }
+
             when {
-                "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> OkRuCustom().getUrl(finalUrl, extReferer, subtitleCallback, wrappedCallback)
-                "rumble.com" in finalUrl -> Rumble().getUrl(finalUrl, finalUrl, subtitleCallback, wrappedCallback)
-                "play.streamplay.co.in" in finalUrl -> PlayStreamplay().getUrl(finalUrl, finalUrl, subtitleCallback, wrappedCallback)
-                finalUrl.endsWith(".mp4") -> {
+                "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl ->
+                    OkRuCustom().getUrl(finalUrl, extReferer, wrappedSubtitle, wrappedCallback)
+
+                "rumble.com" in finalUrl ->
+                    Rumble().getUrl(finalUrl, finalUrl, wrappedSubtitle, wrappedCallback)
+
+                "play.streamplay.co.in" in finalUrl ->
+                    PlayStreamplay().getUrl(finalUrl, finalUrl, wrappedSubtitle, wrappedCallback)
+
+                finalUrl.endsWith(".mp4") ->
                     wrappedCallback(
                         newExtractorLink(label, label, finalUrl, INFER_TYPE) {
                             this.referer = mainUrl
                             this.quality = getQualityFromName(label)
                         }
                     )
-                }
-                else -> loadExtractor(finalUrl, referer = extReferer, subtitleCallback, wrappedCallback)
+
+                else ->
+                    loadExtractor(finalUrl, referer = extReferer, wrappedSubtitle, wrappedCallback)
             }
         }
 
-        for (option in options) {
+        // Decode all mirror options first (CPU-only, fast)
+        val decoded = options.mapNotNull { option ->
             val base64 = option.attr("value")
-            if (base64.isBlank()) continue
+            if (base64.isBlank()) return@mapNotNull null
             val label = option.text().trim()
-            val decodedHtml = try {
-                base64Decode(base64)
+            val src = try {
+                Jsoup.parse(base64Decode(base64)).selectFirst("iframe")?.attr("src")
             } catch (_: Exception) {
-                continue
+                null
             }
-
-            Jsoup.parse(decodedHtml).selectFirst("iframe")?.attr("src")?.let(::httpsify)?.let {
-                invokeExtractor(it, label)
-            }
+            src?.let { httpsify(it) to label }
         }
 
-        if (!found) {
-            doc.selectFirst(".player-area iframe, .playcon iframe")?.attr("src")?.let(::httpsify)?.let {
-                invokeExtractor(it, "Server")
-            }
+        // Fallback: no mirrors → use the default player iframe
+        val finalSources = if (decoded.isEmpty()) {
+            doc.selectFirst(".player-area iframe, .playcon iframe")
+                ?.attr("src")
+                ?.let(::httpsify)
+                ?.let { listOf(it to "Server") }
+                ?: emptyList()
+        } else decoded
+
+        // Fire all extractors in parallel — links stream to the UI as they resolve
+        coroutineScope {
+            finalSources.map { (url, label) ->
+                async {
+                    semaphore.withPermit {
+                        try {
+                            withTimeoutOrNull(20_000L) {
+                                invokeExtractor(url, label)
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            // swallow — one bad extractor doesn't kill the rest
+                        }
+                    }
+                }
+            }.awaitAll()
         }
 
-        return found
+        return found.get()
     }
 }
