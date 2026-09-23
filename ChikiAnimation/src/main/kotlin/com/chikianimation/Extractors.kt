@@ -60,7 +60,6 @@ class SkylineAI : ExtractorApi() {
             return
         }
 
-        // Subtitles parsing
         org.jsoup.Jsoup.parse(page).select("track").forEach { track ->
             val src = track.attr("src")
             val label = track.attr("label").ifBlank { "Subtitle" }
@@ -80,7 +79,6 @@ class SkylineAI : ExtractorApi() {
             }
         }
 
-        // Video parsing
         val vid = Regex("const[ \\t]+VID_SRC[ \\t]*=[ \\t]*[\"']([^\"']+)[\"']").find(page)
         if (vid != null && vid.groupValues[1].isNotBlank()) {
             val su = vid.groupValues[1].replace("\\/", "/")
@@ -98,7 +96,6 @@ class SkylineAI : ExtractorApi() {
             return
         }
 
-        // Generic fallback scan
         val streamRegex = Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
         streamRegex.findAll(page).forEach { match ->
             val su = match.groupValues[1].replace("\\/", "/")
@@ -132,7 +129,7 @@ class SkylineAI : ExtractorApi() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  GalaxyDonghua — merged pipeline from archive code + latest decryptDcx
+//  GalaxyDonghua — merged pipeline with corrected sources URL
 // ═══════════════════════════════════════════════════════════════════════════
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
@@ -142,15 +139,11 @@ class GalaxyDonghua : ExtractorApi() {
     companion object {
         private const val TAG = "GalaxyDBG"
         private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        private const val FETCH_TIMEOUT_MS = 15_000L
 
         private const val BASE36_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
         private const val BASE62_CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
         private const val PBKDF2_ITERS = 10_000
         private const val PBKDF2_LEN = 48
-
-        private val RE_M3U8 = Regex("""(https?:\\?/\\?/[^"'\s<>]+?\.m3u8[^"'\s<>]*)""")
-        private val RE_MP4 = Regex("""(https?:\\?/\\?/[^"'\s<>]+?\.mp4[^"'\s<>]*)""")
 
         @Volatile private var cachedPlayerJs: String? = null
         @Volatile private var cachedCryptoJs: String? = null
@@ -184,7 +177,7 @@ class GalaxyDonghua : ExtractorApi() {
             Log.e(TAG, "[STEP 2 ERR] ${e.message}"); return
         }
 
-        // ─── STEP 3: VID_SRC direct (SkylineAI-style) ───
+        // ─── STEP 3: VID_SRC direct ───
         val vid = Regex("""const[ \t]+VID_SRC[ \t]*=[ \t]*["']([^"']+)["']""").find(page)
         if (vid != null && vid.groupValues[1].isNotBlank()) {
             val su = vid.groupValues[1].replace("\\/", "/")
@@ -199,23 +192,21 @@ class GalaxyDonghua : ExtractorApi() {
             return
         }
 
-        // ─── STEP 4: Collect all <script src=...> URLs ───
+        // ─── STEP 4: script srcs ───
         val allSrcs = Regex("""<script[^>]+src\s*=\s*["']([^"']+)["']""")
             .findAll(page).map { it.groupValues[1] }.distinct().toList()
-        Log.e(TAG, "[JS] script srcs: $allSrcs")
 
-        // ─── STEP 5: Fetch player JS (contains dcx) + crypto-js ───
+        // ─── STEP 5: player JS + crypto-js ───
         val playerJs = fetchPlayerJs(allSrcs, gxBase, headers)
         val cryptoJs = getCryptoJs(allSrcs, gxBase, headers)
-        Log.e(TAG, "[JS] playerJs=${playerJs?.length ?: 0}B, cryptoJs=${cryptoJs.length}B")
 
-        // ─── STEP 6: Build candidate target URLs ───
+        // ─── STEP 6: candidates ───
         val candidates = Regex("""data-url=["']([^"']+)["']""").findAll(page)
             .map { it.groupValues[1] }
             .map { if (it.startsWith("/")) gxBase + it else it }
             .distinct().toList().ifEmpty { listOf(url) }
 
-        // ─── STEP 7-14: Iterate candidates ───
+        // ─── STEP 7-14: iterate candidates ───
         var ok = false
         for ((i, target) in candidates.withIndex()) {
             Log.e(TAG, "[STEP 7] Candidate [$i]: $target")
@@ -227,11 +218,8 @@ class GalaxyDonghua : ExtractorApi() {
                 Log.e(TAG, "[STEP 8 ERR] ${e.message}"); continue
             }
 
-            val tokens = decodeGdTokens(sp)
-            if (tokens == null) {
-                Log.e(TAG, "[TOK] decodeGdTokens returned null"); continue
-            }
-            Log.e(TAG, "[TOK] PD=${tokens.pd.take(20)}… PS.len=${tokens.ps.length} QSX.len=${tokens.qsx.length} UT.len=${tokens.utekmek.length} APX.len=${tokens.apx.length}")
+            val tokens = decodeGdTokens(sp) ?: continue
+            Log.e(TAG, "[TOK] PD=${tokens.pd.take(20)}… PS.len=${tokens.ps.length} QSX.len=${tokens.qsx.length} UT.len=${tokens.utekmek.length}")
 
             val json = fetchAndDecryptApi(tokens, headers, gxBase, target, playerJs, cryptoJs)
             if (json != null) {
@@ -243,10 +231,6 @@ class GalaxyDonghua : ExtractorApi() {
         }
         if (!ok) Log.e(TAG, "[STEP 15 CRITICAL] All candidates failed.")
     }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  JS file fetchers
-    // ═══════════════════════════════════════════════════════════════════════════
 
     private suspend fun fetchPlayerJs(
         srcs: List<String>, gxBase: String, headers: Map<String, String>
@@ -268,7 +252,6 @@ class GalaxyDonghua : ExtractorApi() {
             val text = try { app.get(abs, headers = headers).text } catch (_: Exception) { continue }
             if (text.length < 2_000) continue
             if (Regex("""\bdcx\s*[=(]""").containsMatchIn(text)) {
-                Log.e(TAG, "[JS] playerJs matched: $abs (${text.length}B)")
                 cachedPlayerJs = text
                 return text
             }
@@ -297,7 +280,7 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  API call + decryption chain
+    //  API call + decryption chain — FIXED sources URL
     // ═══════════════════════════════════════════════════════════════════════════
 
     private suspend fun fetchAndDecryptApi(
@@ -338,7 +321,7 @@ class GalaxyDonghua : ExtractorApi() {
             "sec-ch-ua-platform" to "\"Windows\""
         )
 
-        // Config warm-up (may populate server-side session)
+        // ─── Config warm-up (matches working pattern) ───
         val configUrl = "$gxBase/api-config/${tokens.qsx}?p=${tokens.ps}&_=$now"
         Log.e(TAG, "[STEP 13-pre] GET $configUrl")
         try {
@@ -355,8 +338,11 @@ class GalaxyDonghua : ExtractorApi() {
             Log.e(TAG, "[STEP 13-pre ERR] ${e.message}")
         }
 
-        // Sources POST
-        val sourcesUrl = apiRoot.trimEnd('/') + "/?p=" + tokens.ps
+        // ═══════════════════════════════════════════════════════════════════════
+        //  FIX: include {qsx} in the sources URL path — mirrors the config
+        //       pattern that actually works.
+        // ═══════════════════════════════════════════════════════════════════════
+        val sourcesUrl = apiRoot.trimEnd('/') + "/" + tokens.qsx + "?p=" + tokens.ps
         val bodyText = tokens.qsx + "-," + tokens.utekmek
 
         Log.e(TAG, "[STEP 13] POST $sourcesUrl")
@@ -389,13 +375,14 @@ class GalaxyDonghua : ExtractorApi() {
         if (respBody.isBlank()) return null
 
         // ─── Decryption chain ───
+
         // 1. Plain JSON
         if (respBody.trimStart().startsWith("{") && respBody.contains("\"file\"")) {
             Log.e(TAG, "[DEC] plain JSON")
             return respBody
         }
 
-        // 2. Rhino JS execution of the real dcx()
+        // 2. Rhino (executes the real dcx() from player JS)
         if (playerJs != null && cryptoJs.isNotEmpty()) {
             val r = GdRhino.tryDecrypt(playerJs, cryptoJs, respBody, tokens.toGlobalMap())
             if (r != null && r.trimStart().startsWith("{")) {
@@ -405,7 +392,7 @@ class GalaxyDonghua : ExtractorApi() {
             Log.e(TAG, "[DEC] Rhino returned null")
         }
 
-        // 3. Latest: PBEKeySpec-based static decryptor
+        // 3. Static decryptor — PBEKeySpec (JDK standard PBKDF2)
         val plain1 = decryptDcx(respBody, tokens.pd)
         if (plain1 != null && plain1.trimStart().startsWith("{")) {
             Log.e(TAG, "[DEC] PBEKeySpec OK — ${plain1.length}B")
@@ -413,7 +400,7 @@ class GalaxyDonghua : ExtractorApi() {
         }
         Log.e(TAG, "[DEC] PBEKeySpec failed")
 
-        // 4. Archive: manual PBKDF2-based static decryptor (fallback)
+        // 4. Static decryptor — manual PBKDF2 (redundancy)
         val plain2 = decryptGdPayload(respBody, tokens.pd)
         if (plain2 != null && plain2.trimStart().startsWith("{")) {
             Log.e(TAG, "[DEC] manual PBKDF2 OK — ${plain2.length}B")
@@ -425,12 +412,11 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  Decryptor #1 — LATEST (PBEKeySpec — JDK standard PBKDF2)
+    //  Decryptor #1 — PBEKeySpec (JDK standard PBKDF2)
     // ═══════════════════════════════════════════════════════════════════════════
 
     private fun decryptDcx(encryptedBase64: String, password: String): String? {
         return try {
-            // Response may use ,, or , as padding substitutes (see archive notes)
             var s = encryptedBase64.trim().replace(",,", "==").replace(",", "=")
             while (s.length % 4 != 0) s += "="
 
@@ -443,7 +429,6 @@ class GalaxyDonghua : ExtractorApi() {
             val salt = data.copyOfRange(0, 16)
             val ciphertext = data.copyOfRange(16, data.size)
 
-            // PBKDF2-HMAC-SHA256, 10 000 iter, 48 bytes = 384 bits
             val keySpec = PBEKeySpec(password.toCharArray(), salt, PBKDF2_ITERS, PBKDF2_LEN * 8)
             val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
             val derived = factory.generateSecret(keySpec).encoded
@@ -461,7 +446,7 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  Decryptor #2 — ARCHIVE (manual PBKDF2 — same algorithm, different impl)
+    //  Decryptor #2 — manual PBKDF2 (redundancy)
     // ═══════════════════════════════════════════════════════════════════════════
 
     private fun decryptGdPayload(b64: String, pd: String): String? {
@@ -624,11 +609,6 @@ class GalaxyDonghua : ExtractorApi() {
             }
         }
 
-        Log.e(TAG, "[TOK] decoded JSFuck length=${jsFuck.length}")
-        if (jsFuck.isNotEmpty()) {
-            Log.e(TAG, "[TOK] JSFuck head: ${jsFuck.take(200)}")
-        }
-
         fun pick(n: String) = extractSmartJs(n, jsFuck).ifBlank { extractHtmlFallback(n, page) }
 
         val t = GdTokens(
@@ -760,7 +740,7 @@ class GalaxyDonghua : ExtractorApi() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Rhino — execute the real dcx() JS function
+//  Rhino — execute the real dcx() JS function (kept, but not primary)
 // ═══════════════════════════════════════════════════════════════════════════
 object GdRhino {
     private const val TAG = "GdRhino"
