@@ -33,21 +33,21 @@ class DonghuaFunProvider : MainAPI() {
 
         private val RE_ID = Regex("""/id/(\d+)\.html""")
         private val RE_EP_NUM = Regex("""(\d+)""")
-        
+
         private val RE_DM_IFRAME = Regex("""<iframe[^>]+src=['"]([^'"]*dailymotion[^'"]*)['"]""", RegexOption.IGNORE_CASE)
         private val RE_DM_TOKEN = Regex("""[?&]video=([^&"']+)""")
         private val RE_PLAYER_JSON = Regex("""var\s+player_aaaa\s*=\s*(\{.*?\})\s*;""", RegexOption.DOT_MATCHES_ALL)
-        
+
         private val RE_URL = Regex(""""url"\s*:\s*"([^"]+)"""")
         private val RE_FROM = Regex(""""from"\s*:\s*"([^"]+)"""")
         private val RE_ENCRYPT = Regex(""""encrypt"\s*:\s*(\d+)""")
         private val RE_SUB_RAW = Regex(""""(?:subt|vtt|zimu|subtitle|sub)"\s*:\s*"([^"]+)"""", RegexOption.IGNORE_CASE)
         private val RE_SUB_CONFIG = Regex("""subtitle:\s*\{\s*url:\s*['"]([^'"]+)['"]""", RegexOption.IGNORE_CASE)
-        
+
         private val RE_TRACK_SRC = Regex("""<track[^>]+src=['"]([^'"]+)['"][^>]*>""", RegexOption.IGNORE_CASE)
-        private val RE_ATTR_LABEL   = Regex("""label\s*=\s*['"]([^'"]*)['"]""",   RegexOption.IGNORE_CASE)
+        private val RE_ATTR_LABEL = Regex("""label\s*=\s*['"]([^'"]*)['"]""", RegexOption.IGNORE_CASE)
         private val RE_ATTR_SRCLANG = Regex("""srclang\s*=\s*['"]([^'"]*)['"]""", RegexOption.IGNORE_CASE)
-        private val RE_ATTR_LANG    = Regex("""lang\s*=\s*['"]([^'"]*)['"]""",    RegexOption.IGNORE_CASE)
+        private val RE_ATTR_LANG = Regex("""lang\s*=\s*['"]([^'"]*)['"]""", RegexOption.IGNORE_CASE)
 
         private val RE_LANG_INDO = Regex("""\b(indonesia|indo|bahasa|id)\b""")
         private val RE_LANG_ENG = Regex("""\b(english|eng|rum)\b""")
@@ -55,7 +55,7 @@ class DonghuaFunProvider : MainAPI() {
         private val RE_RES_CLEAN = Regex("""\b\d{3,4}p\b""", RegexOption.IGNORE_CASE)
         private val RE_4K_CLEAN = Regex("""\b4k\b""", RegexOption.IGNORE_CASE)
         private val RE_SQUARE_CLEAN = Regex("""\[.*?]""")
-        private val RE_ROUND_CLEAN  = Regex("""\(.*?\)""")
+        private val RE_ROUND_CLEAN = Regex("""\(.*?\)""")
     }
 
     private fun detailUrlToId(url: String): String =
@@ -238,23 +238,18 @@ class DonghuaFunProvider : MainAPI() {
         val subtitleLock = Any()
         val semaphore = Semaphore(MAX_CONCURRENT_SOURCES)
 
+        // FIX: ExtractorLink is a data class. Use .copy() instead of newExtractorLink
+        // inside synchronized — newExtractorLink is suspend, copy() is not.
         fun emit(link: ExtractorLink, tabName: String, fromName: String) {
             val finalName = buildFinalName(link, tabName, fromName)
             val uniqueKey = "$finalName-${link.quality}"
 
             if (!seenCombos.add(uniqueKey)) return
 
+            val renamed = link.copy(name = finalName)
+
             synchronized(callbackLock) {
-                callback.invoke(
-                    newExtractorLink(
-                        link.source, finalName, link.url, link.type ?: ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = link.referer
-                        this.quality = link.quality
-                        if (link.headers != null) this.headers = link.headers!!
-                        this.extractorData = link.extractorData
-                    }
-                )
+                callback.invoke(renamed)
             }
             linkFound.set(true)
         }
@@ -275,7 +270,7 @@ class DonghuaFunProvider : MainAPI() {
                         } ?: return@withPermit
 
                         val html = response.text
-                        
+
                         val dailymotionToken = RE_DM_IFRAME.findAll(html)
                             .mapNotNull { m -> RE_DM_TOKEN.find(m.groupValues[1])?.groupValues?.get(1) }
                             .firstOrNull()
@@ -341,7 +336,7 @@ class DonghuaFunProvider : MainAPI() {
                                 val videoIdMatch = RE_DM_TOKEN.find(rawUrl)
                                 val normalizedUrl = if (videoIdMatch != null) "https://www.dailymotion.com/video/${videoIdMatch.groupValues[1]}"
                                 else if (rawUrl.startsWith("http")) rawUrl else "https://www.dailymotion.com/video/$rawUrl"
-                                
+
                                 withTimeoutOrNull(EXTRACTOR_TIMEOUT_MS) {
                                     loadExtractor(normalizedUrl, mainUrl, subtitleCallback, collectionCallback)
                                 }
@@ -366,11 +361,13 @@ class DonghuaFunProvider : MainAPI() {
                                     val hostName = from.ifEmpty { "Server ${serverCounter.getAndIncrement()}" }
                                         .replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
 
-                                    emit(newExtractorLink(name, hostName, rawUrl, ExtractorLinkType.VIDEO) {
+                                    // newExtractorLink is suspend — safe here inside async, outside synchronized
+                                    val fallbackLink = newExtractorLink(name, hostName, rawUrl, ExtractorLinkType.VIDEO) {
                                         this.headers = mapOf("User-Agent" to USER_AGENT, "Referer" to "https://donghuafun.com/", "Origin" to "https://donghuafun.com")
                                         this.referer = "https://donghuafun.com/"
                                         this.quality = Qualities.Unknown.value
-                                    }, tabName, from)
+                                    }
+                                    emit(fallbackLink, tabName, from)
                                 }
                             }
                         }
