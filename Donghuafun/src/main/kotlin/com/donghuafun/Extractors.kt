@@ -2,6 +2,7 @@ package com.donghuafun
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.URLDecoder
 
 class DonghuaFunExtractor : ExtractorApi() {
@@ -10,7 +11,9 @@ class DonghuaFunExtractor : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
-        // Hoisted — was rebuilt on every call
+        // Bounds the quality-parse step so a slow M3U8 host can't stall the UI
+        private const val M3U8_PARSE_TIMEOUT_MS = 6_000L
+
         private val GANJING_HEADERS = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Origin" to "https://www.ganjingworld.com",
@@ -25,6 +28,19 @@ class DonghuaFunExtractor : ExtractorApi() {
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept" to "*/*"
         )
+
+        /**
+         * Picks the correct Origin/Referer headers for the actual stream host.
+         * A GanjingWorld-only header set silently delays/rejects M3U8 requests
+         * on non-Ganjing CDNs.
+         */
+        private fun headersFor(url: String): Pair<Map<String, String>, String> = when {
+            url.contains("ganjingworld.com", ignoreCase = true) ->
+                GANJING_HEADERS to "https://www.ganjingworld.com/"
+            url.contains("donghuafun.com", ignoreCase = true) ->
+                WEB_SPOOF_HEADERS to "https://play.donghuafun.com/"
+            else -> DIRECT_HEADERS to ""
+        }
     }
 
     override suspend fun getUrl(
@@ -40,57 +56,36 @@ class DonghuaFunExtractor : ExtractorApi() {
             rawUrl
         }
 
+        val (headers, chosenReferer) = headersFor(m3u8Url)
+
+        // Bounded playlist parse — fallback link fires fast if host is slow
         val extractedLinks = try {
-            M3u8Helper.generateM3u8(
-                this.name,
-                m3u8Url,
-                "https://www.ganjingworld.com/",
-                headers = GANJING_HEADERS
-            )
+            withTimeoutOrNull(M3U8_PARSE_TIMEOUT_MS) {
+                M3u8Helper.generateM3u8(
+                    this.name,
+                    m3u8Url,
+                    chosenReferer,
+                    headers = headers
+                )
+            }
         } catch (e: Exception) {
-            emptyList()
+            null
         }
 
-        if (extractedLinks.isNotEmpty()) {
+        if (!extractedLinks.isNullOrEmpty()) {
             extractedLinks.forEach(callback)
         } else {
-            // Three spoof fallbacks — kept intact, they handle real geo/CORS edge cases
+            // Immediate fallback with the correct headers for this host
             callback.invoke(
                 newExtractorLink(
                     this.name,
-                    "DonghuaFun (Ganjing Spoof)",
+                    "DonghuaFun",
                     m3u8Url,
                     ExtractorLinkType.M3U8
                 ) {
                     this.quality = Qualities.Unknown.value
-                    this.referer = "https://www.ganjingworld.com/"
-                    this.headers = GANJING_HEADERS
-                }
-            )
-
-            callback.invoke(
-                newExtractorLink(
-                    this.name,
-                    "DonghuaFun (Direct)",
-                    m3u8Url,
-                    ExtractorLinkType.M3U8
-                ) {
-                    this.quality = Qualities.Unknown.value
-                    this.referer = ""
-                    this.headers = DIRECT_HEADERS
-                }
-            )
-
-            callback.invoke(
-                newExtractorLink(
-                    this.name,
-                    "DonghuaFun (Web Spoof)",
-                    m3u8Url,
-                    ExtractorLinkType.M3U8
-                ) {
-                    this.quality = Qualities.Unknown.value
-                    this.referer = "https://play.donghuafun.com/"
-                    this.headers = WEB_SPOOF_HEADERS
+                    this.referer = chosenReferer
+                    this.headers = headers
                 }
             )
         }
@@ -103,9 +98,12 @@ class GanjingWorld : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
-        // Precompiled regexes — were rebuilt on every call
+        private const val FETCH_TIMEOUT_MS = 12_000L
+
+        // Hoisted regexes — never rebuilt per call
         private val RE_M3U8 = Regex("""(https?:\\?/\\?/[^"'\s<>]+?\.m3u8[^"'\s<>]*)""")
         private val RE_MP4 = Regex("""(https?:\\?/\\?/[^"'\s<>]+?\.mp4[^"'\s<>]*)""")
+
         private val GANJING_HEADERS = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Origin" to "https://www.ganjingworld.com",
@@ -119,21 +117,37 @@ class GanjingWorld : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val html = try {
-            app.get(url, referer = referer ?: mainUrl).text
-        } catch (e: Exception) {
-            return
-        }
+        val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+            try {
+                app.get(url, referer = referer ?: mainUrl).text
+            } catch (e: Exception) {
+                null
+            }
+        } ?: return
 
         val m3u8Match = RE_M3U8.find(html)?.value?.replace("\\/", "/")
 
         if (m3u8Match != null) {
-            M3u8Helper.generateM3u8(
-                name,
-                m3u8Match,
-                mainUrl,
-                headers = GANJING_HEADERS
-            ).forEach(callback)
+            // VERDICT FIX: Added fallback so the link isn't lost if parsing times out
+            val extracted = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                M3u8Helper.generateM3u8(
+                    name,
+                    m3u8Match,
+                    mainUrl,
+                    headers = GANJING_HEADERS
+                )
+            }
+            if (!extracted.isNullOrEmpty()) {
+                extracted.forEach(callback)
+            } else {
+                callback.invoke(
+                    newExtractorLink(name, name, m3u8Match, ExtractorLinkType.M3U8) {
+                        this.referer = referer ?: mainUrl
+                        this.headers = GANJING_HEADERS
+                        this.quality = Qualities.Unknown.value
+                    }
+                )
+            }
         } else {
             val videoMatch = RE_MP4.find(html)?.value?.replace("\\/", "/")
             if (videoMatch != null) {
@@ -159,7 +173,9 @@ class Rumble : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
-        // Precompiled — biggest win, was rebuilt per call AND per loop iteration
+        private const val FETCH_TIMEOUT_MS = 12_000L
+
+        // Hoisted regexes
         private val RE_VIDEO_URL = Regex(
             """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*"""
         )
@@ -175,21 +191,28 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Early exit — if the caller already handed us a direct file, skip the network call
-        if (url.endsWith(".mp4") || url.endsWith(".m3u8")) {
-            callback(newExtractorLink(name, name, url, ExtractorLinkType.VIDEO) {
-                this.referer = referer ?: mainUrl
-            })
+        // Fast path: caller already handed us a direct file.
+        if (url.endsWith(".mp4", ignoreCase = true) || url.endsWith(".m3u8", ignoreCase = true)) {
+            val linkType = if (url.endsWith(".m3u8", ignoreCase = true))
+                ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+
+            callback(
+                newExtractorLink(name, name, url, linkType) {
+                    this.referer = referer ?: mainUrl
+                }
+            )
             return
         }
 
-        val html = try {
-            app.get(url, referer = referer ?: mainUrl).text
-        } catch (e: Exception) {
-            return
-        }
+        val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+            try {
+                app.get(url, referer = referer ?: mainUrl).text
+            } catch (e: Exception) {
+                null
+            }
+        } ?: return
 
-        // LinkedHashSet keeps insertion order → highest quality listed first
+        // LinkedHashSet keeps insertion order (highest quality typically first)
         val scrapedUrls = LinkedHashSet<String>()
 
         RE_VIDEO_URL.findAll(html).forEach { match ->
@@ -199,8 +222,20 @@ class Rumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
-                    M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
-
+                    // VERDICT FIX: Added fallback if M3u8Helper times out
+                    val extracted = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                        M3u8Helper.generateM3u8(name, cleanUrl, url)
+                    }
+                    if (!extracted.isNullOrEmpty()) {
+                        extracted.forEach(callback)
+                    } else {
+                        callback.invoke(
+                            newExtractorLink(name, name, cleanUrl, ExtractorLinkType.M3U8) {
+                                this.referer = url
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                    }
                 } else if (cleanUrl.contains(".mp4", ignoreCase = true)) {
                     val startIndex = maxOf(0, match.range.first - 250)
                     val precedingText = html.substring(startIndex, match.range.first)
@@ -208,8 +243,10 @@ class Rumble : ExtractorApi() {
                     val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull()
                         ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
 
-                    val qualityInt = qMatch?.groupValues?.get(1)?.toIntOrNull() ?: Qualities.Unknown.value
-                    val displayLabel = if (qualityInt != Qualities.Unknown.value) "$name ${qualityInt}p" else name
+                    val qualityInt = qMatch?.groupValues?.get(1)?.toIntOrNull()
+                        ?: Qualities.Unknown.value
+                    val displayLabel = if (qualityInt != Qualities.Unknown.value)
+                        "$name ${qualityInt}p" else name
 
                     callback(
                         newExtractorLink(
