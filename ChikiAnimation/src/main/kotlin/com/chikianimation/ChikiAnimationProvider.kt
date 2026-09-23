@@ -9,6 +9,7 @@ import org.jsoup.nodes.Element
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.Collections
 
@@ -234,11 +235,14 @@ class ChikiAnimationProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // Timeout on the episode page fetch — a hung page no longer blocks the loader
         val document = try {
-            app.get(data, headers = defaultHeaders).document
+            withTimeoutOrNull(15_000L) {
+                app.get(data, headers = defaultHeaders).document
+            }
         } catch (e: Exception) {
-            return false
-        }
+            null
+        } ?: return false
 
         val emittedUrls = Collections.synchronizedSet(mutableSetOf<String>())
         val processedUrls = Collections.synchronizedSet(mutableSetOf<String>())
@@ -276,15 +280,6 @@ class ChikiAnimationProvider : MainAPI() {
 
         /**
          * Resolve a public Google Drive file id into a directly playable URL.
-         *
-         * Verified flow (from working logcat):
-         *   1. GET /download?id=<id>&export=download&authuser=0 (no redirects)
-         *      - small file: 302 → *.googleusercontent.com / *.googlevideo.com
-         *      - large file: 200 text/html confirmation page with a hidden uuid
-         *   2. GET /download?id=<id>&export=download&confirm=t&uuid=<uuid>
-         *      - returns 200 video/mp4 directly, or 302 to the CDN
-         *
-         * Returned URL is already playable — no extractor needed.
          */
         suspend fun resolveGdriveStream(fileId: String): String? {
             val initialUrl =
@@ -301,14 +296,12 @@ class ChikiAnimationProvider : MainAPI() {
                 return null
             }
 
-            // Small file — direct redirect to the stream CDN
             if (resp1.code in 300..399) {
                 val loc = resp1.headers["Location"] ?: resp1.headers["location"] ?: return null
                 return if (loc.startsWith("http")) loc
                        else "https://drive.usercontent.google.com$loc"
             }
 
-            // Large file — parse the uuid from the confirmation form
             val html = try { resp1.text } catch (_: Exception) { "" }
             if (html.isBlank()) return null
 
@@ -333,7 +326,6 @@ class ChikiAnimationProvider : MainAPI() {
                 return confirmUrl
             }
 
-            // If Google still 302s, use the redirect target
             if (resp2.code in 300..399) {
                 val loc = resp2.headers["Location"] ?: resp2.headers["location"]
                 if (!loc.isNullOrBlank()) {
@@ -342,7 +334,6 @@ class ChikiAnimationProvider : MainAPI() {
                 }
             }
 
-            // 200 video/mp4 — this URL is the stream
             return confirmUrl
         }
 
@@ -394,9 +385,31 @@ class ChikiAnimationProvider : MainAPI() {
                 }
 
                 // 2) Chiki-specific custom extractors
+
+                // GalaxyDonghua — full POST + dcx() decryption flow
+                if (cleanUrl.contains("galaxydonghua.xyz", true)) {
+                    val before = emitCount.get()
+                    try {
+                        // Pass chikianimation.com as referer — the embed's form validation
+                        // requires exactly this value in the POST body
+                        GalaxyDonghua().getUrl(
+                            cleanUrl,
+                            "$mainUrl/",
+                            subtitleCallback,
+                            countingCallback
+                        )
+                    } catch (_: Exception) {}
+                    if (emitCount.get() > before) {
+                        foundFlag.set(1)
+                        return
+                    }
+                }
+
                 if (cleanUrl.contains("skylineai.cloud", true)) {
                     val before = emitCount.get()
-                    SkylineAI().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
+                    try {
+                        SkylineAI().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
+                    } catch (_: Exception) {}
                     if (emitCount.get() > before) {
                         foundFlag.set(1)
                         return
@@ -405,7 +418,9 @@ class ChikiAnimationProvider : MainAPI() {
 
                 if (cleanUrl.contains("ghbrisk.com", true)) {
                     val before = emitCount.get()
-                    Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
+                    try {
+                        Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
+                    } catch (_: Exception) {}
                     if (emitCount.get() > before) {
                         foundFlag.set(1)
                         return
