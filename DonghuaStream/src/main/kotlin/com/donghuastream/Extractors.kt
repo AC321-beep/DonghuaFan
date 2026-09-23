@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.withTimeoutOrNull
 
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
@@ -44,7 +45,7 @@ class Rumble : ExtractorApi() {
             try { app.get(url, referer = referer ?: mainUrl).text } catch (e: Exception) { null }
         } ?: return
 
-        // Optional: JSON blob targeting (from our earlier work)
+        // Optional: JSON blob targeting
         val afterMp4 = html.substringAfter("{\"mp4", "")
         val scriptData = if (afterMp4.isEmpty()) html else afterMp4.substringBefore("\"evt\":{")
 
@@ -53,9 +54,7 @@ class Rumble : ExtractorApi() {
         RE_VIDEO_URL.findAll(scriptData).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
 
-            // Domain filter (optional but useful)
             if (!cleanUrl.contains("rumble.com", ignoreCase = true)) return@forEach
-
             if (JUNK_KEYWORDS.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
 
             if (scrapedUrls.add(cleanUrl)) {
@@ -111,7 +110,8 @@ open class PlayStreamplay : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
-        // Precompiled headers — was rebuilt on every call
+        private const val FETCH_TIMEOUT_MS = 12_000L
+
         private val STREAMPLAY_HEADERS = mapOf(
             "pragma" to "no-cache",
             "priority" to "u=0, i",
@@ -137,11 +137,13 @@ open class PlayStreamplay : ExtractorApi() {
     ) {
         val fixedUrl = if (url.startsWith("//")) "https:$url" else url
 
-        val doc = try {
-            app.get(fixedUrl, timeout = 10000).document
-        } catch (e: Exception) {
-            return
-        }
+        val doc = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+            try {
+                app.get(fixedUrl, timeout = 10000).document
+            } catch (e: Exception) {
+                null
+            }
+        } ?: return
 
         val packedScript = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return
         val packedCode = RE_EVAL_BLOCK.find(packedScript)?.value ?: return
@@ -154,10 +156,12 @@ open class PlayStreamplay : ExtractorApi() {
             }
 
         val apiUrl = "$mainUrl/api/?$token"
-        val response = try {
-            app.get(apiUrl, timeout = 10000).parsedSafe<Response>()
-        } catch (e: Exception) {
-            null
+        val response = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+            try {
+                app.get(apiUrl, timeout = 10000).parsedSafe<Response>()
+            } catch (e: Exception) {
+                null
+            }
         } ?: return
 
         val m3u8Url = response.sources.firstOrNull { it.file.isNotBlank() }?.file
@@ -217,6 +221,8 @@ class OkRuCustom : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
+        private const val FETCH_TIMEOUT_MS = 12_000L
+
         // Precompiled regexes
         private val RE_VIDEO_ID = Regex("""/video(?:embed)?/(\d+)""")
         private val RE_MID_PARAM = Regex("""[?&]mid=(\d+)""")
@@ -234,7 +240,12 @@ class OkRuCustom : ExtractorApi() {
         )
     }
 
-    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
         try {
             // Multi-pattern id extraction — handles /video/, /videoembed/, ?mid=, and bare-id URLs
             val id = RE_VIDEO_ID.find(url)?.groupValues?.get(1)
@@ -243,8 +254,14 @@ class OkRuCustom : ExtractorApi() {
             if (id.isBlank() || !id.all { it.isDigit() }) return
 
             val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id"
-            // parsedSafe uses Jackson — faster and more lenient than org.json
-            val json = app.post(apiUrl).parsedSafe<OkRuResponse>() ?: return
+
+            val json = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                try {
+                    app.post(apiUrl).parsedSafe<OkRuResponse>()
+                } catch (e: Exception) {
+                    null
+                }
+            } ?: return
 
             // 1. MP4 variants first (fastest playback)
             json.videos?.forEach { video ->
@@ -269,16 +286,28 @@ class OkRuCustom : ExtractorApi() {
                 )
             }
 
-            // 2. HLS fallback
+            // 2. HLS fallback — track success so DASH can run if HLS parse yields nothing
             val hlsUrl = json.hlsManifestUrl.orEmpty()
+            var hlsSucceeded = false
+
             if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
-                M3u8Helper.generateM3u8(
-                    "$name HLS",
-                    hlsUrl.replace("\\u0026", "&").replace("\\/", "/"),
-                    url
-                ).forEach(callback)
-            } else {
-                // 3. DASH last resort
+                val cleanHls = hlsUrl.replace("\\u0026", "&").replace("\\/", "/")
+                val hlsLinks = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                    try {
+                        M3u8Helper.generateM3u8("$name HLS", cleanHls, url)
+                    } catch (e: Exception) {
+                        emptyList()
+                    }
+                } ?: emptyList()
+
+                if (hlsLinks.isNotEmpty()) {
+                    hlsLinks.forEach(callback)
+                    hlsSucceeded = true
+                }
+            }
+
+            // 3. DASH fallback — runs if HLS was missing OR failed to parse
+            if (!hlsSucceeded) {
                 val dashUrl = json.dashManifestUrl.orEmpty()
                 if (dashUrl.isNotBlank() && !dashUrl.contains("usr_login")) {
                     callback(
@@ -292,7 +321,7 @@ class OkRuCustom : ExtractorApi() {
                 }
             }
         } catch (e: Exception) {
-            
+            // swallow — extractor failure must not crash the provider
         }
     }
 
