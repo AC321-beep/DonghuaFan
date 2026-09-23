@@ -29,8 +29,9 @@ class AnimekhorProvider : MainAPI() {
         "anime/?status=completed&order=update" to "Completed"
     )
 
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val document = app.get("$mainUrl/${request.data}&page=$page").document
+   override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val url = "$mainUrl/${request.data.replace("anime/?", "anime/page/$page/?")}"
+        val document = app.get(url).document
         val home = document.select("div.listupd > article, div.bsx").mapNotNull { it.toSearchResult() }.distinctBy { it.url }
         return newHomePageResponse(request.name, home)
     }
