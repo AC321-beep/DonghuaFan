@@ -131,9 +131,9 @@ class GalaxyDonghua : ExtractorApi() {
     override val requiresReferer = true
 
     companion object {
+        private const val TAG = "GalaxyDBG"
         private const val FETCH_TIMEOUT_MS = 15_000L
 
-        // Challenge page → form
         private val RE_FORM_ACTION = Regex(
             """<form[^>]*id=["']frmValidation["'][^>]*action=["']([^"']+)["']""",
             RegexOption.IGNORE_CASE
@@ -143,11 +143,9 @@ class GalaxyDonghua : ExtractorApi() {
             RegexOption.IGNORE_CASE
         )
 
-        // globalThis.js globals
         private fun globalRegex(name: String) =
             Regex("""(?:window\.)?$name\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
 
-        // Fallback URL patterns
         private val RE_M3U8 = Regex("""(https?:\\?/\\?/[^"'\s<>]+?\.m3u8[^"'\s<>]*)""")
         private val RE_MP4 = Regex("""(https?:\\?/\\?/[^"'\s<>]+?\.mp4[^"'\s<>]*)""")
     }
@@ -158,8 +156,14 @@ class GalaxyDonghua : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        android.util.Log.e(TAG, "========== GalaxyDonghua START ==========")
+        android.util.Log.e(TAG, "input url: $url")
+        android.util.Log.e(TAG, "input referer: $referer")
+
         val fixedUrl = if (url.startsWith("//")) "https:$url" else url
         val chikiReferer = referer ?: "https://chikianimation.com/"
+        android.util.Log.e(TAG, "fixedUrl: $fixedUrl")
+        android.util.Log.e(TAG, "chikiReferer: $chikiReferer")
 
         val headers = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -169,89 +173,171 @@ class GalaxyDonghua : ExtractorApi() {
             "Accept-Language" to "en-US,en;q=0.9"
         )
 
-        // ---- Stage 1: GET the challenge page ----
-        val initialHtml = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-            try { app.get(fixedUrl, referer = chikiReferer, headers = headers).text }
-            catch (e: Exception) { null }
-        } ?: return
+        // ---- Stage 1: GET challenge page ----
+        android.util.Log.e(TAG, "STAGE 1: GET challenge page")
+        val initialHtml = try {
+            withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                app.get(fixedUrl, referer = chikiReferer, headers = headers).text
+            }
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "STAGE 1 exception: ${e.message}", e)
+            null
+        }
 
-        // ---- Stage 2: Extract form + POST back ----
+        if (initialHtml == null) {
+            android.util.Log.e(TAG, "STAGE 1 FAILED: null response")
+            return
+        }
+        android.util.Log.e(TAG, "STAGE 1 OK: got ${initialHtml.length} bytes")
+        android.util.Log.e(TAG, "STAGE 1 snippet: ${initialHtml.take(300)}")
+
+        // ---- Stage 2: Extract form + POST ----
+        android.util.Log.e(TAG, "STAGE 2: extract form + POST")
         val formAction = RE_FORM_ACTION.find(initialHtml)?.groupValues?.get(1)
         val refererValue = RE_REFERER_FIELD.find(initialHtml)?.groupValues?.get(1) ?: chikiReferer
+        android.util.Log.e(TAG, "formAction: $formAction")
+        android.util.Log.e(TAG, "refererValue from form: $refererValue")
 
-        val playerHtml = if (formAction != null) {
+        val playerHtml: String = if (formAction != null) {
             val postUrl = if (formAction.startsWith("http")) formAction
                           else "$mainUrl${if (formAction.startsWith("/")) "" else "/"}$formAction"
-
-            withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-                try {
+            android.util.Log.e(TAG, "postUrl: $postUrl")
+            try {
+                withTimeoutOrNull(FETCH_TIMEOUT_MS) {
                     app.post(
                         postUrl,
                         data = mapOf("referer" to refererValue),
                         referer = fixedUrl,
                         headers = headers
                     ).text
-                } catch (e: Exception) { null }
-            } ?: initialHtml
-        } else initialHtml
+                } ?: initialHtml.also { android.util.Log.e(TAG, "STAGE 2 POST timed out, using initialHtml") }
+            } catch (e: Exception) {
+                android.util.Log.e(TAG, "STAGE 2 POST exception: ${e.message}", e)
+                initialHtml
+            }
+        } else {
+            android.util.Log.e(TAG, "STAGE 2: no form found, using initialHtml")
+            initialHtml
+        }
 
-        // ---- Stage 3: Load globalThis.js for pd, apx, qsx, ps, utekmek ----
-        val globalsJs = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-            try {
+        android.util.Log.e(TAG, "STAGE 2 result: ${playerHtml.length} bytes")
+        android.util.Log.e(TAG, "STAGE 2 has kaken: ${playerHtml.contains("kaken")}")
+        android.util.Log.e(TAG, "STAGE 2 has player_aaaa: ${playerHtml.contains("player_aaaa")}")
+        android.util.Log.e(TAG, "STAGE 2 still has frmValidation: ${playerHtml.contains("frmValidation")}")
+        android.util.Log.e(TAG, "STAGE 2 snippet: ${playerHtml.take(500)}")
+
+        // ---- Stage 3: Load globalThis.js ----
+        android.util.Log.e(TAG, "STAGE 3: GET globalThis.js")
+        val globalsJs = try {
+            withTimeoutOrNull(FETCH_TIMEOUT_MS) {
                 app.get("$mainUrl/assets/vendor/globalThis.js", referer = fixedUrl).text
-            } catch (e: Exception) { null }
-        } ?: return
+            }
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "STAGE 3 exception: ${e.message}", e)
+            null
+        }
 
-        val pd = globalRegex("pd").find(globalsJs)?.groupValues?.get(1) ?: return
-        val apxB64 = globalRegex("apx").find(globalsJs)?.groupValues?.get(1) ?: return
+        if (globalsJs == null) {
+            android.util.Log.e(TAG, "STAGE 3 FAILED: null response")
+            return
+        }
+        android.util.Log.e(TAG, "STAGE 3 OK: ${globalsJs.length} bytes")
+        android.util.Log.e(TAG, "STAGE 3 full content:\n$globalsJs")
+
+        val pd = globalRegex("pd").find(globalsJs)?.groupValues?.get(1)
+        val apxB64 = globalRegex("apx").find(globalsJs)?.groupValues?.get(1)
         val qsx = globalRegex("qsx").find(globalsJs)?.groupValues?.get(1) ?: ""
         val ps = globalRegex("ps").find(globalsJs)?.groupValues?.get(1) ?: ""
         val utekmek = globalRegex("utekmek").find(globalsJs)?.groupValues?.get(1) ?: ""
 
-        // apx is base64-encoded API base URL
+        android.util.Log.e(TAG, "parsed pd: $pd")
+        android.util.Log.e(TAG, "parsed apxB64: $apxB64")
+        android.util.Log.e(TAG, "parsed qsx: $qsx")
+        android.util.Log.e(TAG, "parsed ps: $ps")
+        android.util.Log.e(TAG, "parsed utekmek: $utekmek")
+
+        if (pd == null || apxB64 == null) {
+            android.util.Log.e(TAG, "STAGE 3 FAILED: pd=$pd, apx=$apxB64 — regex may not match")
+            return
+        }
+
         val apiBase = try {
             String(Base64.decode(apxB64, Base64.DEFAULT))
-        } catch (e: Exception) { return }
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "STAGE 3 base64 decode failed: ${e.message}", e)
+            return
+        }
+        android.util.Log.e(TAG, "apiBase (decoded apx): $apiBase")
 
         // ---- Stage 4: POST sources API ----
         val sourcesUrl = "$apiBase$qsx?$ps"
-        val sourcesRaw = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-            try {
+        android.util.Log.e(TAG, "STAGE 4: POST $sourcesUrl")
+        android.util.Log.e(TAG, "STAGE 4 body: utekmek=$utekmek")
+
+        val sourcesRaw = try {
+            withTimeoutOrNull(FETCH_TIMEOUT_MS) {
                 app.post(
                     sourcesUrl,
                     data = mapOf("utekmek" to utekmek),
                     referer = fixedUrl,
                     headers = headers + mapOf("X-Requested-With" to "XMLHttpRequest")
                 ).text
-            } catch (e: Exception) { null }
-        } ?: return
+            }
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "STAGE 4 exception: ${e.message}", e)
+            null
+        }
 
-        // ---- Stage 5: Decrypt if needed, parse JSON ----
-        val sourcesJson = try {
-            if (sourcesRaw.trim().startsWith("{")) sourcesRaw
-            else decryptDcx(sourcesRaw, pd)
-        } catch (e: Exception) { null }
+        if (sourcesRaw == null) {
+            android.util.Log.e(TAG, "STAGE 4 FAILED: null response")
+        } else {
+            android.util.Log.e(TAG, "STAGE 4 OK: ${sourcesRaw.length} bytes")
+            android.util.Log.e(TAG, "STAGE 4 response:\n$sourcesRaw")
+        }
 
-        if (sourcesJson != null && emitFromJson(sourcesJson, fixedUrl, callback)) return
+        // ---- Stage 5: Decrypt if needed ----
+        if (sourcesRaw != null) {
+            val sourcesJson = try {
+                if (sourcesRaw.trim().startsWith("{")) {
+                    android.util.Log.e(TAG, "STAGE 5: response is plain JSON")
+                    sourcesRaw
+                } else {
+                    android.util.Log.e(TAG, "STAGE 5: response is encrypted, decrypting")
+                    decryptDcx(sourcesRaw, pd).also {
+                        android.util.Log.e(TAG, "STAGE 5 decrypted:\n$it")
+                    }
+                }
+            } catch (e: Exception) {
+                android.util.Log.e(TAG, "STAGE 5 decrypt failed: ${e.message}", e)
+                null
+            }
 
-        // ---- Stage 6: Fallback — regex scan player HTML ----
+            if (sourcesJson != null && emitFromJson(sourcesJson, fixedUrl, callback)) {
+                android.util.Log.e(TAG, "STAGE 5 SUCCESS: emitted from JSON")
+                return
+            }
+            android.util.Log.e(TAG, "STAGE 5 FAILED: could not emit from JSON")
+        }
+
+        // ---- Stage 6: Fallback regex ----
+        android.util.Log.e(TAG, "STAGE 6: fallback regex on playerHtml")
         RE_M3U8.find(playerHtml)?.value?.replace("\\/", "/")?.let { m3u8 ->
+            android.util.Log.e(TAG, "STAGE 6: found m3u8: $m3u8")
             emitM3u8(m3u8, fixedUrl, callback)
             return
         }
         RE_MP4.find(playerHtml)?.value?.replace("\\/", "/")?.let { mp4 ->
+            android.util.Log.e(TAG, "STAGE 6: found mp4: $mp4")
             callback(newExtractorLink(name, name, mp4, ExtractorLinkType.VIDEO) {
                 this.referer = fixedUrl
                 this.quality = Qualities.Unknown.value
             })
+            return
         }
+        android.util.Log.e(TAG, "STAGE 6 FAILED: no media URL in playerHtml")
+        android.util.Log.e(TAG, "========== GalaxyDonghua END (no links) ==========")
     }
 
-    /**
-     * Replicates dcx() from player-v4.6.6.min.js:
-     *   AES-256-CBC with PBKDF2(password=pd, salt=first16 bytes, iter=10000, SHA256)
-     *   key = derived[0..32], iv = derived[32..48]
-     */
     private fun decryptDcx(encryptedBase64: String, password: String): String {
         val data = Base64.decode(encryptedBase64, Base64.DEFAULT)
         if (data.size < 20) return encryptedBase64
@@ -259,7 +345,7 @@ class GalaxyDonghua : ExtractorApi() {
         val salt = data.copyOfRange(0, 16)
         val ciphertext = data.copyOfRange(16, data.size)
 
-        val keySpec = PBEKeySpec(password.toCharArray(), salt, 10_000, 384)  // 48 bytes
+        val keySpec = PBEKeySpec(password.toCharArray(), salt, 10_000, 384)
         val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
         val derived = factory.generateSecret(keySpec).encoded
 
@@ -278,11 +364,21 @@ class GalaxyDonghua : ExtractorApi() {
     ): Boolean {
         val sources = try {
             JSONObject(jsonText).optJSONArray("sources")
-        } catch (e: Exception) { null } ?: return false
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "emitFromJson: JSON parse failed: ${e.message}")
+            null
+        }
+
+        if (sources == null) {
+            android.util.Log.e(TAG, "emitFromJson: no 'sources' array in JSON")
+            return false
+        }
+        android.util.Log.e(TAG, "emitFromJson: ${sources.length()} sources")
 
         var emitted = false
         for (i in 0 until sources.length()) {
             val file = sources.optJSONObject(i)?.optString("file").orEmpty()
+            android.util.Log.e(TAG, "  source[$i].file = $file")
             if (file.isBlank()) continue
 
             val clean = file.replace("\\/", "/")
@@ -303,11 +399,15 @@ class GalaxyDonghua : ExtractorApi() {
     private suspend fun emitM3u8(m3u8: String, referer: String, callback: (ExtractorLink) -> Unit) {
         val links = try {
             M3u8Helper.generateM3u8(name, m3u8, referer)
-        } catch (e: Exception) { emptyList() }
-
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "M3u8Helper failed: ${e.message}")
+            emptyList()
+        }
         if (links.isNotEmpty()) {
+            android.util.Log.e(TAG, "emitted ${links.size} m3u8 variants")
             links.forEach(callback)
         } else {
+            android.util.Log.e(TAG, "M3u8Helper returned empty, emitting raw m3u8")
             callback(newExtractorLink(name, name, m3u8, ExtractorLinkType.M3U8) {
                 this.referer = referer
                 this.quality = Qualities.Unknown.value
