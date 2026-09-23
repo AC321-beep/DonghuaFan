@@ -14,14 +14,15 @@ class Rumble : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
-        // Precompiled once — was rebuilt on every call
+        private const val FETCH_TIMEOUT_MS = 12_000L
+        private const val SPLIT_TIMEOUT_MS = 2_500L
+
         private val RE_VIDEO_URL = Regex(
             """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*"""
         )
         private val RE_QUALITY_H = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""")
         private val RE_QUALITY_BRACE = Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
 
-        // Quarantine keywords — kept as individual checks (faster than regex)
         private val JUNK_KEYWORDS = listOf("/assets/", "loop", "preview", "tracker", "thumb")
     }
 
@@ -31,32 +32,51 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Early exit if a caller already passes a direct file
-        if (url.endsWith(".mp4") || url.endsWith(".m3u8")) {
-            callback(newExtractorLink(name, name, url, INFER_TYPE) { this.referer = url })
+        // Fast path
+        if (url.endsWith(".mp4", ignoreCase = true) || url.endsWith(".m3u8", ignoreCase = true)) {
+            val linkType = if (url.endsWith(".m3u8", ignoreCase = true))
+                ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            callback(newExtractorLink(name, name, url, linkType) { this.referer = url })
             return
         }
 
-        val html = try {
-            app.get(url, referer = referer ?: mainUrl).text
-        } catch (e: Exception) {
-            return
-        }
+        val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+            try { app.get(url, referer = referer ?: mainUrl).text } catch (e: Exception) { null }
+        } ?: return
 
-        // LinkedHashSet keeps insertion order → highest quality listed first
+        // Optional: JSON blob targeting (from our earlier work)
+        val afterMp4 = html.substringAfter("{\"mp4", "")
+        val scriptData = if (afterMp4.isEmpty()) html else afterMp4.substringBefore("\"evt\":{")
+
         val scrapedUrls = LinkedHashSet<String>()
 
-        RE_VIDEO_URL.findAll(html).forEach { match ->
+        RE_VIDEO_URL.findAll(scriptData).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
 
-            // Quarantine filter — do not remove, prevents ExoPlayer crashes
+            // Domain filter (optional but useful)
+            if (!cleanUrl.contains("rumble.com", ignoreCase = true)) return@forEach
+
             if (JUNK_KEYWORDS.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
 
             if (scrapedUrls.add(cleanUrl)) {
-                if (cleanUrl.contains(".m3u8")) {
-                    M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
-                } else if (cleanUrl.contains(".mp4")) {
-                    val precedingText = html.substring(
+                if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
+                    // ---- HYBRID: Auto first, then split ----
+                    callback(
+                        newExtractorLink(name, "$name (Auto)", cleanUrl, ExtractorLinkType.M3U8) {
+                            this.referer = url
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+
+                    val variants = try {
+                        withTimeoutOrNull(SPLIT_TIMEOUT_MS) {
+                            M3u8Helper.generateM3u8(name, cleanUrl, url)
+                        }
+                    } catch (e: Exception) { null }
+                    variants?.forEach(callback)
+
+                } else if (cleanUrl.contains(".mp4", ignoreCase = true)) {
+                    val precedingText = scriptData.substring(
                         Math.max(0, match.range.first - 150),
                         match.range.first
                     )
