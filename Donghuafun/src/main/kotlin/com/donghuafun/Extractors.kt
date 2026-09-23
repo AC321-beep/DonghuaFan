@@ -51,8 +51,8 @@ class DonghuaFunExtractor : ExtractorApi() {
         val (headers, chosenReferer) = headersFor(m3u8Url)
         val extractorName = this.name
 
-        // FIX: Pass the Master M3U8 directly to retain separated audio tracks.
-        // ExoPlayer will automatically populate 1080p/720p qualities internally.
+        // Pass the Master M3U8 directly to retain separated audio tracks.
+        // ExoPlayer populates 1080p/720p qualities internally.
         callback.invoke(
             newExtractorLink(
                 extractorName,
@@ -103,7 +103,7 @@ class GanjingWorld : ExtractorApi() {
         val m3u8Match = RE_M3U8.find(html)?.value?.replace("\\/", "/")
 
         if (m3u8Match != null) {
-            // FIX: Pass Master M3U8 directly to retain separated audio
+            // Pass Master M3U8 directly to retain separated audio
             callback.invoke(
                 newExtractorLink(name, "$name (Auto)", m3u8Match, ExtractorLinkType.M3U8) {
                     this.referer = referer ?: mainUrl
@@ -138,6 +138,15 @@ class Rumble : ExtractorApi() {
     companion object {
         private const val FETCH_TIMEOUT_MS = 12_000L
 
+        // JSON blob targeting: Rumble embeds all video sources inside one
+        // <script> block as a JSON object starting with {"mp4 and ending
+        // before "evt":{. Scope the URL regex to this slice to avoid
+        // false positives from ads/thumbnails/trackers.
+        private val RE_JSON_BLOB = Regex(
+            """\{\"mp4".*?\"evt":\{""",
+            RegexOption.DOT_MATCHES_ALL
+        )
+
         private val RE_VIDEO_URL = Regex(
             """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*"""
         )
@@ -153,6 +162,7 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        // Fast path: caller already handed us a direct file.
         if (url.endsWith(".mp4", ignoreCase = true) || url.endsWith(".m3u8", ignoreCase = true)) {
             val linkType = if (url.endsWith(".m3u8", ignoreCase = true))
                 ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
@@ -173,16 +183,23 @@ class Rumble : ExtractorApi() {
             }
         } ?: return
 
+        // JSON blob targeting: extract only the mp4 JSON payload.
+        // Regex then runs on a few KB instead of the full 200+ KB page.
+        val scriptData = RE_JSON_BLOB.find(html)?.value ?: return
+
         val scrapedUrls = LinkedHashSet<String>()
 
-        RE_VIDEO_URL.findAll(html).forEach { match ->
+        RE_VIDEO_URL.findAll(scriptData).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
+
+            // Domain filter: only accept URLs actually hosted on Rumble's CDN.
+            if (!cleanUrl.contains("rumble.com", ignoreCase = true)) return@forEach
 
             if (JUNK_KEYWORDS.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
-                    // FIX: Pass Master M3U8 directly for faster extraction and native ExoPlayer quality switching
+                    // Pass Master M3U8 directly for native ExoPlayer quality switching
                     callback.invoke(
                         newExtractorLink(name, "$name (Auto)", cleanUrl, ExtractorLinkType.M3U8) {
                             this.referer = url
@@ -191,7 +208,7 @@ class Rumble : ExtractorApi() {
                     )
                 } else if (cleanUrl.contains(".mp4", ignoreCase = true)) {
                     val startIndex = maxOf(0, match.range.first - 250)
-                    val precedingText = html.substring(startIndex, match.range.first)
+                    val precedingText = scriptData.substring(startIndex, match.range.first)
 
                     val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull()
                         ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
