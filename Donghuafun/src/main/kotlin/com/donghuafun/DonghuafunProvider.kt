@@ -32,6 +32,11 @@ class DonghuaFunProvider : MainAPI() {
         private const val EXTRACTOR_TIMEOUT_MS = 15_000L
         private const val MAX_CONCURRENT_SOURCES = 4
 
+        // ---- Main-page cache ----
+        // The four categories share only two unique URLs (by/time.html and by/hits.html),
+        // so most tab switches hit the cache and filter in-memory instead of re-fetching.
+        private const val MAIN_PAGE_CACHE_TTL_MS = 5 * 60_000L
+
         private val RE_ID = Regex("""/id/(\d+)\.html""")
         private val RE_EP_NUM = Regex("""(\d+)""")
 
@@ -57,7 +62,31 @@ class DonghuaFunProvider : MainAPI() {
         private val RE_4K_CLEAN = Regex("""\b4k\b""", RegexOption.IGNORE_CASE)
         private val RE_SQUARE_CLEAN = Regex("""\[.*?]""")
         private val RE_ROUND_CLEAN = Regex("""\(.*?\)""")
+
+        // Category filter keywords (shared by parseShowCards and filterByCategory)
+        private val TRAILER_KEYWORDS = listOf(
+            "trailer", "coming soon", "not yet aired",
+            "upcoming", "releasing soon", "0 episode"
+        )
+        private val MOVIE_KEYWORDS = listOf(
+            "movie", "film", "剧场版", "电影", "劇場版", "映画"
+        )
+
+        /**
+         * Main-page cache: URL -> (raw cards + container text, timestamp).
+         * Keyed by request.data. Three categories share the same URL, so the cache
+         * serves all of them from a single fetch.
+         */
+        private val mainPageCache =
+            ConcurrentHashMap<String, Pair<List<CachedCard>, Long>>()
     }
+
+    /**
+     * Raw card data + the text of the surrounding container at parse time.
+     * Keeping the container text lets the cache-filter reproduce the exact
+     * same category logic that parseShowCards applies on a fresh fetch.
+     */
+    private data class CachedCard(val response: SearchResponse, val containerText: String)
 
     private fun detailUrlToId(url: String): String =
         RE_ID.find(url)?.groupValues?.get(1) ?: ""
@@ -78,8 +107,19 @@ class DonghuaFunProvider : MainAPI() {
         val startPage = (page - 1) * maxPagesToSearch + 1
         val endPage = startPage + maxPagesToSearch - 1
 
-        val items = mutableListOf<SearchResponse>()
-        var hasNextPage = false
+        // ---- Cache lookup (only page 1) ----
+        // Page 2+ always fetches fresh: the user is paginating forward and
+        // expects new content, not the cached first page.
+        if (page == 1) {
+            val cached = mainPageCache[request.data]
+            if (cached != null && System.currentTimeMillis() - cached.second < MAIN_PAGE_CACHE_TTL_MS) {
+                val filtered = filterByCategory(cached.first, request.name)
+                return newHomePageResponse(request.name, filtered, cached.first.isNotEmpty())
+            }
+        }
+
+        val items = mutableListOf<CachedCard>()
+        val hasNextPage = AtomicBoolean(false)
 
         coroutineScope {
             (startPage..endPage).map { p ->
@@ -91,15 +131,23 @@ class DonghuaFunProvider : MainAPI() {
                     if (doc != null) {
                         val elements = doc.select("a[href*='/vod/detail/id/']")
                         if (elements.isNotEmpty()) {
-                            hasNextPage = true
-                            parseShowCards(doc, isComingSoon, isRecentlyUpdated, isMovie)
+                            hasNextPage.set(true)
+                            parseShowCardsRaw(doc)   // ← raw, unfiltered — safe to cache
                         } else emptyList()
                     } else emptyList()
                 }
             }.awaitAll().forEach { items.addAll(it) }
         }
 
-        return newHomePageResponse(request.name, items.distinctBy { it.url }, hasNextPage)
+        val distinct = items.distinctBy { it.response.url }
+
+        // ---- Cache store (only page 1) ----
+        if (page == 1) {
+            mainPageCache[request.data] = distinct to System.currentTimeMillis()
+        }
+
+        val filtered = filterByCategory(distinct, request.name)
+        return newHomePageResponse(request.name, filtered, hasNextPage.get())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -224,7 +272,7 @@ class DonghuaFunProvider : MainAPI() {
         }.trim()
     }
 
-  @Suppress("DEPRECATION", "DEPRECATION_ERROR")
+    @Suppress("DEPRECATION", "DEPRECATION_ERROR")
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -240,7 +288,7 @@ class DonghuaFunProvider : MainAPI() {
         val semaphore = Semaphore(MAX_CONCURRENT_SOURCES)
 
         coroutineScope {
-            val scope = this // Capture the current coroutine scope
+            val scope = this
 
             fun emitSubtitle(sub: SubtitleFile) = synchronized(subtitleLock) { subtitleCallback.invoke(sub) }
 
@@ -248,17 +296,17 @@ class DonghuaFunProvider : MainAPI() {
                 val finalName = buildFinalName(link, tabName, fromName)
                 val uniqueKey = "$finalName-${link.quality}"
 
-                // Deduplicate synchronously upfront
                 if (!seenCombos.add(uniqueKey)) return
-                
+
                 linkFound.set(true)
 
-                // Launch a quick coroutine to safely call the suspend function newExtractorLink
+                // newExtractorLink is suspend — must be called from a coroutine context.
+                // The enclosing coroutineScope waits for launched jobs before returning.
                 scope.launch {
                     val renamedLink = newExtractorLink(
-                        link.source, 
-                        finalName, 
-                        link.url, 
+                        link.source,
+                        finalName,
+                        link.url,
                         link.type ?: ExtractorLinkType.VIDEO
                     ) {
                         this.referer = link.referer
@@ -267,7 +315,6 @@ class DonghuaFunProvider : MainAPI() {
                         this.extractorData = link.extractorData
                     }
 
-                    // Keep the lock strictly around the callback invocation
                     synchronized(callbackLock) {
                         callback.invoke(renamedLink)
                     }
@@ -378,7 +425,6 @@ class DonghuaFunProvider : MainAPI() {
                                     val hostName = from.ifEmpty { "Server ${serverCounter.getAndIncrement()}" }
                                         .replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
 
-                                    // Launching a coroutine here too since newExtractorLink is a suspend function
                                     scope.launch {
                                         val fallbackLink = newExtractorLink(name, hostName, rawUrl, ExtractorLinkType.VIDEO) {
                                             this.headers = mapOf("User-Agent" to USER_AGENT, "Referer" to "https://donghuafun.com/", "Origin" to "https://donghuafun.com")
@@ -397,7 +443,60 @@ class DonghuaFunProvider : MainAPI() {
         return linkFound.get()
     }
 
-    private fun parseShowCards(doc: Document, isComingSoon: Boolean = false, isRecentlyUpdated: Boolean = false, isMovie: Boolean = false): List<SearchResponse> {
+    /**
+     * Raw parse: no category filter, no name-only fallback.
+     * Returns each card paired with the text of its container so the category
+     * filter can be applied later, from cache, with identical precision.
+     */
+    private fun parseShowCardsRaw(doc: Document): List<CachedCard> {
+        return doc.select("a[href*='/vod/detail/id/']")
+            .distinctBy { it.attr("href") }
+            .mapNotNull { a ->
+                val parent1 = a.parent()
+                val parent2 = a.parent()?.parent()
+                val parent3 = a.parent()?.parent()?.parent()
+                val container = when {
+                    parent3 != null && parent3.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent3
+                    parent2 != null && parent2.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent2
+                    parent1 != null && parent1.select("a[href*='/vod/detail/id/']").distinctBy { it.attr("href") }.size == 1 -> parent1
+                    else -> a
+                }
+
+                val href = fixUrl(a.attr("href"))
+                val title = a.attr("title").ifEmpty { a.selectFirst("img")?.attr("alt") ?: a.text() }.trim()
+                if (title.isEmpty()) return@mapNotNull null
+                val poster = a.selectFirst("img")?.let { it.attr("data-src").ifEmpty { it.attr("src") } }?.takeUnless { it.startsWith("data:") }?.let { fixUrl(it) }
+                val response = newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
+                CachedCard(response, container.text())
+            }
+    }
+
+    /**
+     * In-memory category filter — same keyword logic as parseShowCards, but
+     * applied to cached cards using the pre-captured container text.
+     */
+    private fun filterByCategory(cached: List<CachedCard>, categoryName: String): List<SearchResponse> {
+        return cached.filter { card ->
+            val text = card.containerText
+            val containsTrailer = TRAILER_KEYWORDS.any { text.contains(it, ignoreCase = true) }
+            when (categoryName) {
+                "Coming Soon" -> containsTrailer
+                "Recently Updated" -> !containsTrailer
+                "Movies" -> MOVIE_KEYWORDS.any { text.contains(it, ignoreCase = true) } && !containsTrailer
+                else -> true
+            }
+        }.map { it.response }
+    }
+
+    /**
+     * Filtering parse — used by search() where caching isn't involved.
+     */
+    private fun parseShowCards(
+        doc: Document,
+        isComingSoon: Boolean = false,
+        isRecentlyUpdated: Boolean = false,
+        isMovie: Boolean = false
+    ): List<SearchResponse> {
         return doc.select("a[href*='/vod/detail/id/']")
             .distinctBy { it.attr("href") }
             .filter { a ->
@@ -411,10 +510,8 @@ class DonghuaFunProvider : MainAPI() {
                     else -> a
                 }
                 val cardText = container.text()
-                val keywords = listOf("trailer", "coming soon", "not yet aired", "upcoming", "releasing soon", "0 episode")
-                val containsTrailerKeyword = keywords.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
-                val movieKeywords = listOf("movie", "film", "剧场版", "电影", "劇場版", "映画")
-                val containsMovieKeyword = movieKeywords.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
+                val containsTrailerKeyword = TRAILER_KEYWORDS.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
+                val containsMovieKeyword = MOVIE_KEYWORDS.any { keyword -> cardText.contains(keyword, ignoreCase = true) }
 
                 when {
                     isComingSoon -> containsTrailerKeyword
