@@ -135,10 +135,13 @@ class SkylineAI : ExtractorApi() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  GalaxyDonghua — with the confirmed-correct API request
-//  (URL: atob(apx).replace('-config','') + '?p='+ps
-//   Body: window.kaken
-//   Content-Type: text/plain)
+//  GalaxyDonghua — final working version
+//   • URL: atob(apx).replace('-config', '') + '?p=' + ps
+//   • Method: POST
+//   • Content-Type: text/plain
+//   • Body: window.kaken
+//   • Decryption: PBEKeySpec (PBKDF2-HMAC-SHA256, 10k iter, 48 bytes)
+//   • Emits streams with normalized URLs (\/ → /)
 // ═══════════════════════════════════════════════════════════════════════════
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
@@ -294,11 +297,7 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  API call — EXACTLY matches the site's loadSources() function
-    //    url: atob(window.apx).replace('-config', '') + '?p=' + window.ps
-    //    method: POST
-    //    contentType: text/plain
-    //    data: window.kaken
+    //  API call — mirrors the site's loadSources() exactly
     // ═══════════════════════════════════════════════════════════════════════════
     private suspend fun fetchAndDecryptApi(
         tokens: GdTokens,
@@ -322,7 +321,6 @@ class GalaxyDonghua : ExtractorApi() {
         Log.e(TAG, "[API] POST $sourcesUrl")
         Log.e(TAG, "[API] body = kaken (len=${tokens.kaken.length})")
 
-        // jQuery defaults + site headers (matches 0x566 = text/plain)
         val apiHeaders = mutableMapOf(
             "User-Agent" to UA,
             "Accept" to "text/plain, */*; q=0.01",
@@ -338,9 +336,8 @@ class GalaxyDonghua : ExtractorApi() {
             "X-Requested-With" to "XMLHttpRequest"
         )
 
-        // ─── Config warm-up (proven to work) ───
+        // Config warm-up
         val configUrl = "$gxBase/api-config/${tokens.qsx}?p=${tokens.ps}&_=${System.currentTimeMillis()}"
-        Log.e(TAG, "[CONF] GET $configUrl")
         try {
             withContext(Dispatchers.IO) {
                 val req = Request.Builder().url(configUrl).get().apply {
@@ -355,10 +352,9 @@ class GalaxyDonghua : ExtractorApi() {
             Log.e(TAG, "[CONF ERR] ${e.message}")
         }
 
-        // ─── The sources request — EXACTLY as the site sends it ───
+        // The sources request
         val respBody = try {
             withContext(Dispatchers.IO) {
-                // Body is the kaken token (matches window.kaken from 0x5af)
                 val body = tokens.kaken.toByteArray(Charsets.UTF_8)
                     .toRequestBody("text/plain".toMediaTypeOrNull())
 
@@ -385,14 +381,12 @@ class GalaxyDonghua : ExtractorApi() {
             return null
         }
 
-        // ─── Decrypt chain ───
-        // 1. Plain JSON
+        // Decrypt chain
         if (respBody.trimStart().startsWith("{") && respBody.contains("\"file\"")) {
             Log.e(TAG, "[DEC] plain JSON")
             return respBody
         }
 
-        // 2. Rhino JS execution of the real dcx()
         if (playerJs != null && cryptoJs.isNotEmpty()) {
             val r = GdRhino.tryDecrypt(playerJs, cryptoJs, respBody, tokens.toGlobalMap())
             if (r != null && r.trimStart().startsWith("{")) {
@@ -402,7 +396,6 @@ class GalaxyDonghua : ExtractorApi() {
             Log.e(TAG, "[DEC] Rhino null")
         }
 
-        // 3. PBEKeySpec static decryptor
         val p1 = decryptDcx(respBody, tokens.pd)
         if (p1 != null && p1.trimStart().startsWith("{")) {
             Log.e(TAG, "[DEC] PBEKeySpec OK (${p1.length}B)")
@@ -410,7 +403,6 @@ class GalaxyDonghua : ExtractorApi() {
         }
         Log.e(TAG, "[DEC] PBEKeySpec null")
 
-        // 4. Manual PBKDF2 fallback
         val p2 = decryptGdPayload(respBody, tokens.pd)
         if (p2 != null && p2.trimStart().startsWith("{")) {
             Log.e(TAG, "[DEC] manual PBKDF2 OK (${p2.length}B)")
@@ -422,7 +414,7 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  Decryptor #1 — PBEKeySpec (JDK standard PBKDF2)
+    //  Decryptor #1 — PBEKeySpec (primary)
     // ═══════════════════════════════════════════════════════════════════════════
     private fun decryptDcx(encryptedBase64: String, password: String): String? {
         return try {
@@ -717,23 +709,42 @@ class GalaxyDonghua : ExtractorApi() {
 
         var emitted = 0
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
-            val abs = fixStreamUrl(m.groupValues[1], baseURL) ?: continue
-            val isM3u8 = abs.contains(".m3u8") || abs.contains("hls", true)
-            if (!isM3u8 && !abs.contains(".mp4")) continue
+            val raw = m.groupValues[1]
+            // Normalize escaped slashes BEFORE type detection
+            val normalized = raw.replace("\\/", "/")
+
+            val abs = fixStreamUrl(normalized, baseURL) ?: continue
+            val isSub = abs.contains(".vtt", true) || abs.contains(".srt", true)
+            val isM3u8 = abs.contains(".m3u8", true) || abs.contains("hls", true) ||
+                         (!isSub && !abs.contains(".mp4", true))
+            if (!isSub && !isM3u8 && !abs.contains(".mp4", true)) continue
+
             Log.e(TAG, "[EMIT] $abs")
-            callback.invoke(newExtractorLink(this.name, this.name, abs,
-                if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                this.referer = gxBase
-                this.quality = Qualities.Unknown.value
-                this.headers = ph
-            })
+
+            if (isSub) {
+                subtitleCallback.invoke(SubtitleFile("Subtitle", abs))
+            } else {
+                callback.invoke(newExtractorLink(this.name, this.name, abs,
+                    if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                    this.referer = gxBase
+                    this.quality = Qualities.Unknown.value
+                    this.headers = ph
+                })
+            }
             emitted++
         }
         Log.e(TAG, "[EMIT] emitted=$emitted")
     }
 
+    /**
+     * FIX: normalize escaped slashes BEFORE deciding whether the URL is
+     * absolute. The API returns URLs like "https:\/\/galaxydonghua.xyz\/hls\/..."
+     * which don't startWith("https://") until we strip the backslashes.
+     */
     private fun fixStreamUrl(url: String, base: String): String? {
-        val u = url.trim(); if (u.isBlank()) return null
+        // Normalize \/ → / FIRST (the API escapes all forward slashes)
+        val u = url.trim().replace("\\/", "/")
+        if (u.isBlank()) return null
         if (u.startsWith("http://") || u.startsWith("https://")) return u
         if (u.startsWith("//")) return "https:$u"
         val host = try { val uri = URI(base); "${uri.scheme}://${uri.host}" } catch (_: Exception) { null }
