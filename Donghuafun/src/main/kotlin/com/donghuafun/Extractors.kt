@@ -138,14 +138,10 @@ class Rumble : ExtractorApi() {
     companion object {
         private const val FETCH_TIMEOUT_MS = 12_000L
 
-        // JSON blob targeting: Rumble embeds all video sources inside one
-        // <script> block as a JSON object starting with {"mp4 and ending
-        // before "evt":{. Scope the URL regex to this slice to avoid
-        // false positives from ads/thumbnails/trackers.
-        private val RE_JSON_BLOB = Regex(
-            """\{\"mp4".*?\"evt":\{""",
-            RegexOption.DOT_MATCHES_ALL
-        )
+        // NOTE: No RE_JSON_BLOB regex anymore. The blob boundary is optional —
+        // a regex requires "evt":{ to exist or fails entirely. substringAfter /
+        // substringBefore are tolerant: if the delimiter is absent they return
+        // the whole string, which is exactly what we want as a fallback.
 
         private val RE_VIDEO_URL = Regex(
             """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*"""
@@ -162,16 +158,14 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Fast path: caller already handed us a direct file.
+        // Fast path
         if (url.endsWith(".mp4", ignoreCase = true) || url.endsWith(".m3u8", ignoreCase = true)) {
             val linkType = if (url.endsWith(".m3u8", ignoreCase = true))
                 ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
 
-            callback(
-                newExtractorLink(name, name, url, linkType) {
-                    this.referer = referer ?: mainUrl
-                }
-            )
+            callback(newExtractorLink(name, name, url, linkType) {
+                this.referer = referer ?: mainUrl
+            })
             return
         }
 
@@ -183,23 +177,28 @@ class Rumble : ExtractorApi() {
             }
         } ?: return
 
-        // JSON blob targeting: extract only the mp4 JSON payload.
-        // Regex then runs on a few KB instead of the full 200+ KB page.
-        val scriptData = RE_JSON_BLOB.find(html)?.value ?: return
+        // Tolerant JSON blob extraction:
+        // - If "{"mp4" is present → slice from there up to "evt":{ (or end if absent)
+        // - If "{"mp4" is missing → scan the whole HTML (regex still filters junk)
+        val afterMp4 = html.substringAfter("{\"mp4", "")
+        val scriptData = if (afterMp4.isEmpty()) {
+            html
+        } else {
+            afterMp4.substringBefore("\"evt\":{")
+        }
 
         val scrapedUrls = LinkedHashSet<String>()
 
         RE_VIDEO_URL.findAll(scriptData).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
 
-            // Domain filter: only accept URLs actually hosted on Rumble's CDN.
+            // Domain filter — only accept Rumble CDN URLs
             if (!cleanUrl.contains("rumble.com", ignoreCase = true)) return@forEach
 
             if (JUNK_KEYWORDS.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
 
             if (scrapedUrls.add(cleanUrl)) {
                 if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
-                    // Pass Master M3U8 directly for native ExoPlayer quality switching
                     callback.invoke(
                         newExtractorLink(name, "$name (Auto)", cleanUrl, ExtractorLinkType.M3U8) {
                             this.referer = url
@@ -219,12 +218,7 @@ class Rumble : ExtractorApi() {
                         "$name ${qualityInt}p" else name
 
                     callback(
-                        newExtractorLink(
-                            name,
-                            displayLabel,
-                            cleanUrl,
-                            ExtractorLinkType.VIDEO
-                        ) {
+                        newExtractorLink(name, displayLabel, cleanUrl, ExtractorLinkType.VIDEO) {
                             this.referer = url
                             this.quality = qualityInt
                         }
