@@ -12,6 +12,7 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.mozilla.javascript.Context
@@ -60,6 +61,7 @@ class SkylineAI : ExtractorApi() {
             return
         }
 
+        // Subtitles parsing
         org.jsoup.Jsoup.parse(page).select("track").forEach { track ->
             val src = track.attr("src")
             val label = track.attr("label").ifBlank { "Subtitle" }
@@ -71,15 +73,18 @@ class SkylineAI : ExtractorApi() {
         Regex("""\{([^}]+)\}""").findAll(page).forEach { match ->
             val block = match.groupValues[1]
             if (block.contains(".vtt", true) || block.contains(".srt", true)) {
-                val file = Regex("""(?:file|src|url)["']?\s*:\s*["']([^"']+\.(?:vtt|srt)[^"']*)["']""").find(block)?.groupValues?.get(1)
+                val file = Regex("""(?:file|src|url)["']?\s*:\s*["']([^"']+\.(?:vtt|srt)[^"']*)["']""")
+                    .find(block)?.groupValues?.get(1)
                 if (file != null) {
-                    val label = Regex("""label["']?\s*:\s*["']([^"']+)["']""").find(block)?.groupValues?.get(1) ?: "Subtitle"
+                    val label = Regex("""label["']?\s*:\s*["']([^"']+)["']""")
+                        .find(block)?.groupValues?.get(1) ?: "Subtitle"
                     subtitleCallback.invoke(SubtitleFile(label, fixUrl(file, baseHost)))
                 }
             }
         }
 
-        val vid = Regex("const[ \\t]+VID_SRC[ \\t]*=[ \\t]*[\"']([^\"']+)[\"']").find(page)
+        // Video parsing
+        val vid = Regex("""const[ \t]+VID_SRC[ \t]*=[ \t]*["']([^"']+)["']""").find(page)
         if (vid != null && vid.groupValues[1].isNotBlank()) {
             val su = vid.groupValues[1].replace("\\/", "/")
             val isM3u8 = su.contains(".m3u8") || su.contains("hls")
@@ -96,6 +101,7 @@ class SkylineAI : ExtractorApi() {
             return
         }
 
+        // Generic fallback scan
         val streamRegex = Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
         streamRegex.findAll(page).forEach { match ->
             val su = match.groupValues[1].replace("\\/", "/")
@@ -129,7 +135,10 @@ class SkylineAI : ExtractorApi() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  GalaxyDonghua — merged pipeline with corrected sources URL
+//  GalaxyDonghua — with the confirmed-correct API request
+//  (URL: atob(apx).replace('-config','') + '?p='+ps
+//   Body: window.kaken
+//   Content-Type: text/plain)
 // ═══════════════════════════════════════════════════════════════════════════
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
@@ -168,7 +177,7 @@ class GalaxyDonghua : ExtractorApi() {
             "Sec-Fetch-Site" to "cross-site"
         )
 
-        // ─── STEP 2: GET the challenge/player page ───
+        // ─── STEP 2: GET the embed page ───
         val page = try {
             val r = app.get(url, headers = headers)
             Log.e(TAG, "[STEP 2] GET $url | ${r.code} | ${r.text.length}B")
@@ -177,7 +186,7 @@ class GalaxyDonghua : ExtractorApi() {
             Log.e(TAG, "[STEP 2 ERR] ${e.message}"); return
         }
 
-        // ─── STEP 3: VID_SRC direct ───
+        // ─── STEP 3: VID_SRC direct (SkylineAI-style) ───
         val vid = Regex("""const[ \t]+VID_SRC[ \t]*=[ \t]*["']([^"']+)["']""").find(page)
         if (vid != null && vid.groupValues[1].isNotBlank()) {
             val su = vid.groupValues[1].replace("\\/", "/")
@@ -192,21 +201,23 @@ class GalaxyDonghua : ExtractorApi() {
             return
         }
 
-        // ─── STEP 4: script srcs ───
+        // ─── STEP 4: collect script srcs ───
         val allSrcs = Regex("""<script[^>]+src\s*=\s*["']([^"']+)["']""")
             .findAll(page).map { it.groupValues[1] }.distinct().toList()
+        Log.e(TAG, "[JS] script srcs: $allSrcs")
 
-        // ─── STEP 5: player JS + crypto-js ───
+        // ─── STEP 5: player JS + crypto-js (for Rhino fallback) ───
         val playerJs = fetchPlayerJs(allSrcs, gxBase, headers)
         val cryptoJs = getCryptoJs(allSrcs, gxBase, headers)
+        Log.e(TAG, "[JS] playerJs=${playerJs?.length ?: 0}B, cryptoJs=${cryptoJs.length}B")
 
-        // ─── STEP 6: candidates ───
+        // ─── STEP 6: candidate embed URLs ───
         val candidates = Regex("""data-url=["']([^"']+)["']""").findAll(page)
             .map { it.groupValues[1] }
             .map { if (it.startsWith("/")) gxBase + it else it }
             .distinct().toList().ifEmpty { listOf(url) }
 
-        // ─── STEP 7-14: iterate candidates ───
+        // ─── STEP 7-14: iterate ───
         var ok = false
         for ((i, target) in candidates.withIndex()) {
             Log.e(TAG, "[STEP 7] Candidate [$i]: $target")
@@ -218,8 +229,11 @@ class GalaxyDonghua : ExtractorApi() {
                 Log.e(TAG, "[STEP 8 ERR] ${e.message}"); continue
             }
 
-            val tokens = decodeGdTokens(sp) ?: continue
-            Log.e(TAG, "[TOK] PD=${tokens.pd.take(20)}… PS.len=${tokens.ps.length} QSX.len=${tokens.qsx.length} UT.len=${tokens.utekmek.length}")
+            val tokens = decodeGdTokens(sp) ?: run {
+                Log.e(TAG, "[TOK] decode returned null"); null
+            } ?: continue
+
+            Log.e(TAG, "[TOK] PD=${tokens.pd.take(20)}… PS.len=${tokens.ps.length} QSX.len=${tokens.qsx.length} KAKEN.len=${tokens.kaken.length} UT.len=${tokens.utekmek.length}")
 
             val json = fetchAndDecryptApi(tokens, headers, gxBase, target, playerJs, cryptoJs)
             if (json != null) {
@@ -280,9 +294,12 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  API call + decryption chain — FIXED sources URL
+    //  API call — EXACTLY matches the site's loadSources() function
+    //    url: atob(window.apx).replace('-config', '') + '?p=' + window.ps
+    //    method: POST
+    //    contentType: text/plain
+    //    data: window.kaken
     // ═══════════════════════════════════════════════════════════════════════════
-
     private suspend fun fetchAndDecryptApi(
         tokens: GdTokens,
         headers: Map<String, String>,
@@ -297,116 +314,109 @@ class GalaxyDonghua : ExtractorApi() {
                 tokens.apx.replace(",,", "==").replace(",", "="),
                 Base64.DEFAULT), Charsets.UTF_8).trim()
         } catch (_: Exception) { "" }
+        Log.e(TAG, "[CONF] apxDecoded=$apxDecoded")
 
-        val apiRoot = if (apxDecoded.startsWith("http"))
-            apxDecoded.replace("api-config/", "api/")
-        else "$gxBase/api/"
+        // Exact URL: atob(apx).replace('-config', '') + '?p=' + ps
+        val sourcesBase = apxDecoded.replace("-config", "").trimEnd('/')
+        val sourcesUrl = "$sourcesBase/?p=${tokens.ps}"
+        Log.e(TAG, "[API] POST $sourcesUrl")
+        Log.e(TAG, "[API] body = kaken (len=${tokens.kaken.length})")
 
-        val now = System.currentTimeMillis()
-
-        fun chromeHeaders(): MutableMap<String, String> = mutableMapOf(
+        // jQuery defaults + site headers (matches 0x566 = text/plain)
+        val apiHeaders = mutableMapOf(
             "User-Agent" to UA,
             "Accept" to "text/plain, */*; q=0.01",
             "Accept-Language" to "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
             "Cache-Control" to "no-cache",
+            "Content-Type" to "text/plain",
             "Pragma" to "no-cache",
             "Origin" to gxBase,
             "priority" to "u=1, i",
             "Sec-Fetch-Dest" to "empty",
             "Sec-Fetch-Mode" to "cors",
             "Sec-Fetch-Site" to "same-origin",
-            "X-Requested-With" to "XMLHttpRequest",
-            "sec-ch-ua" to "\"Google Chrome\";v=\"124\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"124\"",
-            "sec-ch-ua-mobile" to "?0",
-            "sec-ch-ua-platform" to "\"Windows\""
+            "X-Requested-With" to "XMLHttpRequest"
         )
 
-        // ─── Config warm-up (matches working pattern) ───
-        val configUrl = "$gxBase/api-config/${tokens.qsx}?p=${tokens.ps}&_=$now"
-        Log.e(TAG, "[STEP 13-pre] GET $configUrl")
+        // ─── Config warm-up (proven to work) ───
+        val configUrl = "$gxBase/api-config/${tokens.qsx}?p=${tokens.ps}&_=${System.currentTimeMillis()}"
+        Log.e(TAG, "[CONF] GET $configUrl")
         try {
             withContext(Dispatchers.IO) {
                 val req = Request.Builder().url(configUrl).get().apply {
-                    chromeHeaders().forEach { (k, v) -> addHeader(k, v) }
+                    apiHeaders.forEach { (k, v) -> addHeader(k, v) }
                 }.build()
-                app.baseClient.newCall(req).execute().use { resp ->
-                    val b = resp.body?.string()?.trim() ?: ""
-                    Log.e(TAG, "[STEP 13-pre RES] ${resp.code} | ${b.length}B | head=${b.take(60)}")
+                app.baseClient.newCall(req).execute().use { r ->
+                    val b = r.body?.string()?.trim() ?: ""
+                    Log.e(TAG, "[CONF RES] ${r.code} | ${b.length}B")
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "[STEP 13-pre ERR] ${e.message}")
+            Log.e(TAG, "[CONF ERR] ${e.message}")
         }
 
-        // ═══════════════════════════════════════════════════════════════════════
-        //  FIX: include {qsx} in the sources URL path — mirrors the config
-        //       pattern that actually works.
-        // ═══════════════════════════════════════════════════════════════════════
-        val sourcesUrl = apiRoot.trimEnd('/') + "/" + tokens.qsx + "?p=" + tokens.ps
-        val bodyText = tokens.qsx + "-," + tokens.utekmek
-
-        Log.e(TAG, "[STEP 13] POST $sourcesUrl")
-        Log.e(TAG, "[STEP 13] body.len=${bodyText.length} head=${bodyText.take(60)}…")
-
-        val (code, respBody, respHdr) = try {
+        // ─── The sources request — EXACTLY as the site sends it ───
+        val respBody = try {
             withContext(Dispatchers.IO) {
-                val rawBytes = bodyText.toByteArray(Charsets.UTF_8)
-                val body = rawBytes.toRequestBody(null)
-                val hdrs = chromeHeaders().apply { put("Content-Type", "text/plain") }
+                // Body is the kaken token (matches window.kaken from 0x5af)
+                val body = tokens.kaken.toByteArray(Charsets.UTF_8)
+                    .toRequestBody("text/plain".toMediaTypeOrNull())
+
                 val req = Request.Builder().url(sourcesUrl).post(body).apply {
-                    hdrs.forEach { (k, v) -> addHeader(k, v) }
+                    apiHeaders.forEach { (k, v) -> addHeader(k, v) }
                 }.build()
-                Log.e(TAG, "[STEP 13] OkHttp sends URL: ${req.url}")
-                app.baseClient.newCall(req).execute().use { resp ->
-                    val b = resp.body?.string()?.trim() ?: ""
-                    val h = resp.headers.names().joinToString("; ") { n -> "$n=${resp.header(n)}" }
-                    Triple(resp.code, b, h)
+
+                Log.e(TAG, "[API] → ${req.url}")
+
+                app.baseClient.newCall(req).execute().use { r ->
+                    val b = r.body?.string()?.trim() ?: ""
+                    Log.e(TAG, "[API RES] code=${r.code} len=${b.length}")
+                    Log.e(TAG, "[API RES] head=${b.take(200)}")
+                    b
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "[STEP 13 ERR] ${e.message}")
-            Triple(0, "", "")
+            Log.e(TAG, "[API ERR] ${e.message}")
+            return null
         }
 
-        Log.e(TAG, "[STEP 13 RES] code=$code len=${respBody.length}")
-        Log.e(TAG, "[STEP 13 RES] headers=$respHdr")
-        Log.e(TAG, "[STEP 13 RES] head=${respBody.take(200)}")
+        if (respBody.length < 60) {
+            Log.e(TAG, "[API] response too short (${respBody.length}B) — likely error")
+            return null
+        }
 
-        if (respBody.isBlank()) return null
-
-        // ─── Decryption chain ───
-
+        // ─── Decrypt chain ───
         // 1. Plain JSON
         if (respBody.trimStart().startsWith("{") && respBody.contains("\"file\"")) {
             Log.e(TAG, "[DEC] plain JSON")
             return respBody
         }
 
-        // 2. Rhino (executes the real dcx() from player JS)
+        // 2. Rhino JS execution of the real dcx()
         if (playerJs != null && cryptoJs.isNotEmpty()) {
             val r = GdRhino.tryDecrypt(playerJs, cryptoJs, respBody, tokens.toGlobalMap())
             if (r != null && r.trimStart().startsWith("{")) {
-                Log.e(TAG, "[DEC] Rhino OK — ${r.length}B")
+                Log.e(TAG, "[DEC] Rhino OK (${r.length}B)")
                 return r
             }
-            Log.e(TAG, "[DEC] Rhino returned null")
+            Log.e(TAG, "[DEC] Rhino null")
         }
 
-        // 3. Static decryptor — PBEKeySpec (JDK standard PBKDF2)
-        val plain1 = decryptDcx(respBody, tokens.pd)
-        if (plain1 != null && plain1.trimStart().startsWith("{")) {
-            Log.e(TAG, "[DEC] PBEKeySpec OK — ${plain1.length}B")
-            return plain1
+        // 3. PBEKeySpec static decryptor
+        val p1 = decryptDcx(respBody, tokens.pd)
+        if (p1 != null && p1.trimStart().startsWith("{")) {
+            Log.e(TAG, "[DEC] PBEKeySpec OK (${p1.length}B)")
+            return p1
         }
-        Log.e(TAG, "[DEC] PBEKeySpec failed")
+        Log.e(TAG, "[DEC] PBEKeySpec null")
 
-        // 4. Static decryptor — manual PBKDF2 (redundancy)
-        val plain2 = decryptGdPayload(respBody, tokens.pd)
-        if (plain2 != null && plain2.trimStart().startsWith("{")) {
-            Log.e(TAG, "[DEC] manual PBKDF2 OK — ${plain2.length}B")
-            return plain2
+        // 4. Manual PBKDF2 fallback
+        val p2 = decryptGdPayload(respBody, tokens.pd)
+        if (p2 != null && p2.trimStart().startsWith("{")) {
+            Log.e(TAG, "[DEC] manual PBKDF2 OK (${p2.length}B)")
+            return p2
         }
-        Log.e(TAG, "[DEC] manual PBKDF2 failed")
+        Log.e(TAG, "[DEC] manual PBKDF2 null")
 
         return null
     }
@@ -414,7 +424,6 @@ class GalaxyDonghua : ExtractorApi() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  Decryptor #1 — PBEKeySpec (JDK standard PBKDF2)
     // ═══════════════════════════════════════════════════════════════════════════
-
     private fun decryptDcx(encryptedBase64: String, password: String): String? {
         return try {
             var s = encryptedBase64.trim().replace(",,", "==").replace(",", "=")
@@ -448,7 +457,6 @@ class GalaxyDonghua : ExtractorApi() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  Decryptor #2 — manual PBKDF2 (redundancy)
     // ═══════════════════════════════════════════════════════════════════════════
-
     private fun decryptGdPayload(b64: String, pd: String): String? {
         var s = b64.trim().replace(",,", "==").replace(",", "=")
         while (s.length % 4 != 0) s += "="
@@ -499,7 +507,6 @@ class GalaxyDonghua : ExtractorApi() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  Token extraction (JSFuck / Hieroglyphy decoding)
     // ═══════════════════════════════════════════════════════════════════════════
-
     private data class GdTokens(
         val pd: String, val ps: String, val qsx: String,
         val kaken: String, val apx: String,
@@ -692,7 +699,6 @@ class GalaxyDonghua : ExtractorApi() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  Emit streams from JSON
     // ═══════════════════════════════════════════════════════════════════════════
-
     private suspend fun emitStreams(
         json: String, gxBase: String,
         callback: (ExtractorLink) -> Unit,
@@ -740,7 +746,7 @@ class GalaxyDonghua : ExtractorApi() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Rhino — execute the real dcx() JS function (kept, but not primary)
+//  Rhino — executes the site's real dcx() JS function
 // ═══════════════════════════════════════════════════════════════════════════
 object GdRhino {
     private const val TAG = "GdRhino"
@@ -801,8 +807,7 @@ object GdRhino {
             }
 
             val fn = (scope.get("dcx", scope) as? Function) ?: run {
-                Log.e(TAG, "dcx not defined")
-                null
+                Log.e(TAG, "dcx not defined"); null
             } ?: return null
 
             val result = try {
