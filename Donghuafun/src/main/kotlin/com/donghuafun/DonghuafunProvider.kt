@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
@@ -223,7 +224,7 @@ class DonghuaFunProvider : MainAPI() {
         }.trim()
     }
 
-    @Suppress("DEPRECATION", "DEPRECATION_ERROR")
+  @Suppress("DEPRECATION", "DEPRECATION_ERROR")
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -238,25 +239,41 @@ class DonghuaFunProvider : MainAPI() {
         val subtitleLock = Any()
         val semaphore = Semaphore(MAX_CONCURRENT_SOURCES)
 
-        // FIX: ExtractorLink is a data class. Use .copy() instead of newExtractorLink
-        // inside synchronized — newExtractorLink is suspend, copy() is not.
-        fun emit(link: ExtractorLink, tabName: String, fromName: String) {
-            val finalName = buildFinalName(link, tabName, fromName)
-            val uniqueKey = "$finalName-${link.quality}"
-
-            if (!seenCombos.add(uniqueKey)) return
-
-            val renamed = link.copy(name = finalName)
-
-            synchronized(callbackLock) {
-                callback.invoke(renamed)
-            }
-            linkFound.set(true)
-        }
-
-        fun emitSubtitle(sub: SubtitleFile) = synchronized(subtitleLock) { subtitleCallback.invoke(sub) }
-
         coroutineScope {
+            val scope = this // Capture the current coroutine scope
+
+            fun emitSubtitle(sub: SubtitleFile) = synchronized(subtitleLock) { subtitleCallback.invoke(sub) }
+
+            fun emit(link: ExtractorLink, tabName: String, fromName: String) {
+                val finalName = buildFinalName(link, tabName, fromName)
+                val uniqueKey = "$finalName-${link.quality}"
+
+                // Deduplicate synchronously upfront
+                if (!seenCombos.add(uniqueKey)) return
+                
+                linkFound.set(true)
+
+                // Launch a quick coroutine to safely call the suspend function newExtractorLink
+                scope.launch {
+                    val renamedLink = newExtractorLink(
+                        link.source, 
+                        finalName, 
+                        link.url, 
+                        link.type ?: ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = link.referer
+                        this.quality = link.quality
+                        if (link.headers != null) this.headers = link.headers!!
+                        this.extractorData = link.extractorData
+                    }
+
+                    // Keep the lock strictly around the callback invocation
+                    synchronized(callbackLock) {
+                        callback.invoke(renamedLink)
+                    }
+                }
+            }
+
             uniqueSources.map { source ->
                 async {
                     semaphore.withPermit {
@@ -361,13 +378,15 @@ class DonghuaFunProvider : MainAPI() {
                                     val hostName = from.ifEmpty { "Server ${serverCounter.getAndIncrement()}" }
                                         .replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
 
-                                    // newExtractorLink is suspend — safe here inside async, outside synchronized
-                                    val fallbackLink = newExtractorLink(name, hostName, rawUrl, ExtractorLinkType.VIDEO) {
-                                        this.headers = mapOf("User-Agent" to USER_AGENT, "Referer" to "https://donghuafun.com/", "Origin" to "https://donghuafun.com")
-                                        this.referer = "https://donghuafun.com/"
-                                        this.quality = Qualities.Unknown.value
+                                    // Launching a coroutine here too since newExtractorLink is a suspend function
+                                    scope.launch {
+                                        val fallbackLink = newExtractorLink(name, hostName, rawUrl, ExtractorLinkType.VIDEO) {
+                                            this.headers = mapOf("User-Agent" to USER_AGENT, "Referer" to "https://donghuafun.com/", "Origin" to "https://donghuafun.com")
+                                            this.referer = "https://donghuafun.com/"
+                                            this.quality = Qualities.Unknown.value
+                                        }
+                                        emit(fallbackLink, tabName, from)
                                     }
-                                    emit(fallbackLink, tabName, from)
                                 }
                             }
                         }
