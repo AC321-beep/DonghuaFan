@@ -4,6 +4,6 @@ cloudstream {
    status = 1
    tvTypes = listOf("Anime", "Movie")
    language = "zh"
-   version = 4
+   version = 5
    iconUrl = "https://www.google.com/s2/favicons?domain=chikianimation.com&sz=256"
 }
