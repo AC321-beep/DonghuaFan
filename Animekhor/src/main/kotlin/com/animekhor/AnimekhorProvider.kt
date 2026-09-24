@@ -6,9 +6,12 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
+import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 
 class AnimekhorProvider : MainAPI() {
@@ -18,6 +21,10 @@ class AnimekhorProvider : MainAPI() {
     override var lang = "zh"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
+
+    private companion object {
+        const val PAGE_FETCH_TIMEOUT_MS = 15_000L
+    }
 
     // ---- Browser-mimic headers ----
     // Cloudflare silently blocks requests whose headers don't look like a real
@@ -85,11 +92,14 @@ class AnimekhorProvider : MainAPI() {
             (1..2).map { page ->
                 async {
                     try {
+                        val encoded = URLEncoder.encode(query, "UTF-8")
                         val document = app
-                            .get("$mainUrl/page/$page/?s=$query", headers = defaultHeaders)
+                            .get("$mainUrl/page/$page/?s=$encoded", headers = defaultHeaders)
                             .document
                         document.select(cardSelector).mapNotNull { it.toSearchResult() }
-                    } catch (e: Exception) {
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
                         emptyList()
                     }
                 }
@@ -151,10 +161,35 @@ class AnimekhorProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data, headers = defaultHeaders).document
+        // 1) Fetch the episode page, bounded by a timeout
+        val document = try {
+            withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
+                app.get(data, headers = defaultHeaders).document
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        } ?: return false
 
+        // Dedup state — shared across every extractor, thread-safe
         val extractedIframeUrls = ConcurrentHashMap.newKeySet<String>()
         val yieldedStreamUrls = ConcurrentHashMap.newKeySet<String>()
+        val yieldedSubtitleUrls = ConcurrentHashMap.newKeySet<String>()
+
+        // Video dedup — the first occurrence of each URL wins
+        val trackingCallback: (ExtractorLink) -> Unit = { link ->
+            if (yieldedStreamUrls.add(link.url)) {
+                callback(link)
+            }
+        }
+
+        // Subtitle dedup — same URL emitted by two extractors reaches the UI once
+        val trackingSubtitleCallback: (SubtitleFile) -> Unit = { sub ->
+            if (yieldedSubtitleUrls.add(sub.url)) {
+                subtitleCallback(sub)
+            }
+        }
 
         suspend fun invokeExtractor(iframeUrl: String, label: String) {
             var finalUrl = iframeUrl.trim()
@@ -179,69 +214,87 @@ class AnimekhorProvider : MainAPI() {
             val dedupUrl = finalUrl.substringBefore("?")
             if (!extractedIframeUrls.add(dedupUrl)) return
 
-            val trackingCallback: (ExtractorLink) -> Unit = { link ->
-                if (yieldedStreamUrls.add(link.url)) {
-                    callback(link)
-                }
-            }
-
             try {
                 val isHandled = when {
-                    "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> { OkRuCustom().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
-                    "p2pstream" in finalUrl -> { P2pstream().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
-                    "upns.live" in finalUrl -> { UpnsLive().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
-                    "emturbovid" in finalUrl -> { Emturbovid().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
-                    "bysekoze.com" in finalUrl -> { Bysekoze().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
-                    "rumble.com" in finalUrl -> { Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
-                    "abyssplayer.com" in finalUrl -> { AbyssPlayer().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback); true }
+                    "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> { OkRuCustom().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
+                    "p2pstream" in finalUrl -> { P2pstream().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
+                    "upns.live" in finalUrl -> { UpnsLive().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
+                    "emturbovid" in finalUrl -> { Emturbovid().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
+                    "bysekoze.com" in finalUrl -> { Bysekoze().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
+                    "rumble.com" in finalUrl -> { Rumble().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
+                    "abyssplayer.com" in finalUrl -> { AbyssPlayer().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
                     else -> false
                 }
 
                 if (!isHandled) {
-                    loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, trackingCallback)
+                    loadExtractor(finalUrl, referer = mainUrl, trackingSubtitleCallback, trackingCallback)
                 }
-            } catch (e: Exception) {
-                // Fails silently
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Fails silently — one bad extractor doesn't kill the rest
             }
         }
 
+        // 2) Collect every candidate source first (CPU-only, fast)
         val rawHtml = document.html()
         val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com|abyssplayer\.com|playhydrax\.com)[^"'\s<>]+""")
-        globalUrlRegex.findAll(rawHtml).forEach { match ->
-            val cleanUrl = match.value.replace("\\/", "/")
-            invokeExtractor(cleanUrl, "Raw Source")
-        }
+        val rawMatches = globalUrlRegex.findAll(rawHtml)
+            .map { it.value.replace("\\/", "/") }
+            .toList()
 
-        val serverElements = document.select(".mobius option, select.mirror option, .server-list li a[data-embed], .server-list li a[data-em]")
+        val serverElements = document.select(
+            ".mobius option, select.mirror option, .server-list li a[data-embed], .server-list li a[data-em]"
+        )
+
+        val directIframeSrcs = document
+            .select("#embed_holder iframe, .playerx iframe, .video-content iframe")
+            .mapNotNull { iframe ->
+                val src = iframe.attr("src")
+                if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) src else null
+            }
+
+        // 3) Fan out every source in parallel
         coroutineScope {
+            // Raw HTML matches
+            rawMatches.map { cleanUrl ->
+                async { invokeExtractor(cleanUrl, "Raw Source") }
+            }.awaitAll()
+
+            // Server option entries — value, data-em, or data-embed (base64 or raw iframe)
             serverElements.map { server ->
                 async {
-                    val rawData = server.attr("value").ifBlank { server.attr("data-em").ifBlank { server.attr("data-embed") } }.trim()
-                    if (rawData.isNotBlank()) {
-                        var iframeSrc = ""
-                        if (rawData.startsWith("http") || rawData.startsWith("//")) {
-                            iframeSrc = rawData
-                        } else if (rawData.startsWith("<iframe", ignoreCase = true)) {
-                            iframeSrc = Jsoup.parse(rawData).selectFirst("iframe")?.attr("src") ?: ""
-                        } else {
-                            try {
-                                val decoded = String(Base64.decode(rawData, Base64.DEFAULT))
-                                iframeSrc = if (decoded.contains("<iframe", ignoreCase = true)) Jsoup.parse(decoded).selectFirst("iframe")?.attr("src") ?: decoded else decoded
-                            } catch (e: Exception) {
-                                // Fails silently
-                            }
+                    val rawData = server.attr("value")
+                        .ifBlank { server.attr("data-em").ifBlank { server.attr("data-embed") } }
+                        .trim()
+                    if (rawData.isBlank()) return@async
+
+                    val iframeSrc = when {
+                        rawData.startsWith("http") || rawData.startsWith("//") -> rawData
+                        rawData.startsWith("<iframe", ignoreCase = true) ->
+                            Jsoup.parse(rawData).selectFirst("iframe")?.attr("src") ?: ""
+                        else -> try {
+                            val decoded = String(Base64.decode(rawData, Base64.DEFAULT))
+                            if (decoded.contains("<iframe", ignoreCase = true)) {
+                                Jsoup.parse(decoded).selectFirst("iframe")?.attr("src") ?: decoded
+                            } else decoded
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            ""
                         }
-                        if (iframeSrc.isNotBlank()) invokeExtractor(iframeSrc, server.text().trim())
+                    }
+
+                    if (iframeSrc.isNotBlank()) {
+                        invokeExtractor(iframeSrc, server.text().trim())
                     }
                 }
             }.awaitAll()
-        }
 
-        document.select("#embed_holder iframe, .playerx iframe, .video-content iframe").forEach { iframe ->
-            val src = iframe.attr("src")
-            if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
-                invokeExtractor(src, "Direct Server")
-            }
+            // Direct iframes in the page body
+            directIframeSrcs.map { src ->
+                async { invokeExtractor(src, "Direct Server") }
+            }.awaitAll()
         }
 
         return true
