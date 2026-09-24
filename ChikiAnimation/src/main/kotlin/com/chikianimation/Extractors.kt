@@ -10,22 +10,17 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.mozilla.javascript.Context
-import org.mozilla.javascript.Function
-import org.mozilla.javascript.ScriptableObject
-import java.net.URI
 import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
+import org.mozilla.javascript.Context
+import org.mozilla.javascript.Function
+import org.mozilla.javascript.ScriptableObject
+import java.net.URI
 import kotlin.math.abs
 
 class Ghbrisk : Filesim() {
@@ -62,7 +57,6 @@ class SkylineAI : ExtractorApi() {
             return
         }
 
-        // Subtitles parsing
         org.jsoup.Jsoup.parse(page).select("track").forEach { track ->
             val src = track.attr("src")
             val label = track.attr("label").ifBlank { "Subtitle" }
@@ -84,7 +78,6 @@ class SkylineAI : ExtractorApi() {
             }
         }
 
-        // Video parsing
         val vid = Regex("""const[ \t]+VID_SRC[ \t]*=[ \t]*["']([^"']+)["']""").find(page)
         if (vid != null && vid.groupValues[1].isNotBlank()) {
             val su = vid.groupValues[1].replace("\\/", "/")
@@ -102,7 +95,6 @@ class SkylineAI : ExtractorApi() {
             return
         }
 
-        // Generic fallback scan
         val streamRegex = Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
         streamRegex.findAll(page).forEach { match ->
             val su = match.groupValues[1].replace("\\/", "/")
@@ -136,13 +128,7 @@ class SkylineAI : ExtractorApi() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  GalaxyDonghua — final working version
-//   • URL: atob(apx).replace('-config', '') + '?p=' + ps
-//   • Method: POST
-//   • Content-Type: text/plain
-//   • Body: window.kaken
-//   • Decryption: PBEKeySpec (PBKDF2-HMAC-SHA256, 10k iter, 48 bytes)
-//   • Emits streams with normalized URLs (\/ → /)
+//  GalaxyDonghua Extractor
 // ═══════════════════════════════════════════════════════════════════════════
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
@@ -181,10 +167,13 @@ class GalaxyDonghua : ExtractorApi() {
             "Sec-Fetch-Site" to "cross-site"
         )
 
-        // ─── STEP 2: GET the embed page ───
+        val globalCookies = mutableMapOf<String, String>()
+
+        // ─── STEP 2: GET the embed page & capture cookies ───
         val page = try {
             val r = app.get(url, headers = headers)
-            Log.e(TAG, "[STEP 2] GET $url | ${r.code} | ${r.text.length}B")
+            globalCookies.putAll(r.cookies)
+            Log.e(TAG, "[STEP 2] GET $url | ${r.code} | ${r.text.length}B | cookies=${r.cookies.size}")
             r.text
         } catch (e: Exception) {
             Log.e(TAG, "[STEP 2 ERR] ${e.message}"); return
@@ -208,12 +197,10 @@ class GalaxyDonghua : ExtractorApi() {
         // ─── STEP 4: collect script srcs ───
         val allSrcs = Regex("""<script[^>]+src\s*=\s*["']([^"']+)["']""")
             .findAll(page).map { it.groupValues[1] }.distinct().toList()
-        Log.e(TAG, "[JS] script srcs: $allSrcs")
 
         // ─── STEP 5: player JS + crypto-js (for Rhino fallback) ───
         val playerJs = fetchPlayerJs(allSrcs, gxBase, headers)
         val cryptoJs = getCryptoJs(allSrcs, gxBase, headers)
-        Log.e(TAG, "[JS] playerJs=${playerJs?.length ?: 0}B, cryptoJs=${cryptoJs.length}B")
 
         // ─── STEP 6: candidate embed URLs ───
         val candidates = Regex("""data-url=["']([^"']+)["']""").findAll(page)
@@ -227,22 +214,19 @@ class GalaxyDonghua : ExtractorApi() {
             Log.e(TAG, "[STEP 7] Candidate [$i]: $target")
             val sp = try {
                 val r = app.get(target, headers = headers)
-                Log.e(TAG, "[STEP 8] ${r.code} | ${r.text.length}B")
+                globalCookies.putAll(r.cookies)
+                Log.e(TAG, "[STEP 8] ${r.code} | ${r.text.length}B | cookies=${r.cookies.size}")
                 r.text
             } catch (e: Exception) {
                 Log.e(TAG, "[STEP 8 ERR] ${e.message}"); continue
             }
 
-            val tokens = decodeGdTokens(sp) ?: run {
-                Log.e(TAG, "[TOK] decode returned null"); null
-            } ?: continue
+            val tokens = decodeGdTokens(sp) ?: continue
 
-            Log.e(TAG, "[TOK] PD=${tokens.pd.take(20)}… PS.len=${tokens.ps.length} QSX.len=${tokens.qsx.length} KAKEN.len=${tokens.kaken.length} UT.len=${tokens.utekmek.length}")
-
-            val apiResult = fetchAndDecryptApi(tokens, headers, gxBase, target, playerJs, cryptoJs)
-            if (apiResult != null) {
-                Log.e(TAG, "[STEP 14] Decrypted OK — ${apiResult.json.length}B")
-                emitStreams(apiResult.json, gxBase, target, apiResult.cookies, callback, subtitleCallback)
+            val json = fetchAndDecryptApi(tokens, headers, gxBase, target, playerJs, cryptoJs, globalCookies)
+            if (json != null) {
+                Log.e(TAG, "[STEP 14] Decrypted OK — ${json.length}B")
+                emitStreams(json, gxBase, target, globalCookies, callback, subtitleCallback)
                 ok = true
                 break
             }
@@ -250,9 +234,7 @@ class GalaxyDonghua : ExtractorApi() {
         if (!ok) Log.e(TAG, "[STEP 15 CRITICAL] All candidates failed.")
     }
 
-    private suspend fun fetchPlayerJs(
-        srcs: List<String>, gxBase: String, headers: Map<String, String>
-    ): String? {
+    private suspend fun fetchPlayerJs(srcs: List<String>, gxBase: String, headers: Map<String, String>): String? {
         cachedPlayerJs?.let { if (it.isNotEmpty()) return it }
         val exactPatterns = listOf(
             Regex("/player-v[0-9][^/]*\\.min\\.js", RegexOption.IGNORE_CASE),
@@ -278,9 +260,7 @@ class GalaxyDonghua : ExtractorApi() {
         return null
     }
 
-    private suspend fun getCryptoJs(
-        srcs: List<String>, gxBase: String, headers: Map<String, String>
-    ): String {
+    private suspend fun getCryptoJs(srcs: List<String>, gxBase: String, headers: Map<String, String>): String {
         cachedCryptoJs?.let { return it }
         val fromSite = srcs.firstOrNull { it.contains("crypto-js", true) }
         val url = if (fromSite != null) absolutize(fromSite, gxBase)
@@ -297,8 +277,6 @@ class GalaxyDonghua : ExtractorApi() {
         else -> base.trimEnd('/') + "/" + src
     }
 
-    private data class ApiResult(val json: String, val cookies: String)
-
     // ═══════════════════════════════════════════════════════════════════════════
     //  API call — mirrors the site's loadSources() exactly
     // ═══════════════════════════════════════════════════════════════════════════
@@ -308,13 +286,12 @@ class GalaxyDonghua : ExtractorApi() {
         gxBase: String,
         embedUrl: String,
         playerJs: String?,
-        cryptoJs: String
-    ): ApiResult? {
+        cryptoJs: String,
+        globalCookies: MutableMap<String, String>
+    ): String? {
 
         val apxDecoded = try {
-            String(Base64.decode(
-                tokens.apx.replace(",,", "==").replace(",", "="),
-                Base64.DEFAULT), Charsets.UTF_8).trim()
+            String(Base64.decode(tokens.apx.replace(",,", "==").replace(",", "="), Base64.DEFAULT), Charsets.UTF_8).trim()
         } catch (_: Exception) { "" }
         Log.e(TAG, "[CONF] apxDecoded=$apxDecoded")
 
@@ -325,165 +302,110 @@ class GalaxyDonghua : ExtractorApi() {
         val apiHeaders = mutableMapOf(
             "User-Agent" to UA,
             "Accept" to "text/plain, */*; q=0.01",
-            "Accept-Language" to "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Accept-Language" to "en-US,en;q=0.9",
             "Cache-Control" to "no-cache",
             "Content-Type" to "text/plain",
-            "Pragma" to "no-cache",
             "Origin" to gxBase,
-            "priority" to "u=1, i",
+            "Referer" to embedUrl,
             "Sec-Fetch-Dest" to "empty",
             "Sec-Fetch-Mode" to "cors",
             "Sec-Fetch-Site" to "same-origin",
             "X-Requested-With" to "XMLHttpRequest"
         )
 
-        val collectedCookies = mutableListOf<String>()
+        val currentCookieStr = globalCookies.map { "${it.key}=${it.value}" }.joinToString("; ")
+        if (currentCookieStr.isNotEmpty()) apiHeaders["Cookie"] = currentCookieStr
 
-        // Config warm-up (Capture cookies here)
+        // Config warm-up (Collects API Cookies)
         val configUrl = "$gxBase/api-config/${tokens.qsx}?p=${tokens.ps}&_=${System.currentTimeMillis()}"
         try {
-            withContext(Dispatchers.IO) {
-                val req = Request.Builder().url(configUrl).get().apply {
-                    apiHeaders.forEach { (k, v) -> addHeader(k, v) }
-                }.build()
-                app.baseClient.newCall(req).execute().use { r ->
-                    r.headers("Set-Cookie").forEach { collectedCookies.add(it.substringBefore(";")) }
-                    val b = r.body?.string()?.trim() ?: ""
-                    Log.e(TAG, "[CONF RES] ${r.code} | ${b.length}B")
-                }
-            }
+            val rConf = app.get(configUrl, headers = apiHeaders)
+            globalCookies.putAll(rConf.cookies)
+            Log.e(TAG, "[CONF RES] ${rConf.code} | cookies=${rConf.cookies.size}")
         } catch (e: Exception) {
             Log.e(TAG, "[CONF ERR] ${e.message}")
         }
 
-        // The sources request (Capture cookies here)
+        val updatedCookieStr = globalCookies.map { "${it.key}=${it.value}" }.joinToString("; ")
+        if (updatedCookieStr.isNotEmpty()) apiHeaders["Cookie"] = updatedCookieStr
+
         val respBody = try {
-            withContext(Dispatchers.IO) {
-                val body = tokens.kaken.toByteArray(Charsets.UTF_8)
-                    .toRequestBody("text/plain".toMediaTypeOrNull())
-
-                val req = Request.Builder().url(sourcesUrl).post(body).apply {
-                    apiHeaders.forEach { (k, v) -> addHeader(k, v) }
-                }.build()
-
-                Log.e(TAG, "[API] → ${req.url}")
-
-                app.baseClient.newCall(req).execute().use { r ->
-                    r.headers("Set-Cookie").forEach { collectedCookies.add(it.substringBefore(";")) }
-                    val b = r.body?.string()?.trim() ?: ""
-                    Log.e(TAG, "[API RES] code=${r.code} len=${b.length}")
-                    Log.e(TAG, "[API RES] head=${b.take(200)}")
-                    b
-                }
-            }
+            val rApi = app.post(
+                url = sourcesUrl,
+                headers = apiHeaders,
+                requestBody = tokens.kaken.toRequestBody("text/plain".toMediaTypeOrNull())
+            )
+            globalCookies.putAll(rApi.cookies)
+            Log.e(TAG, "[API RES] code=${rApi.code} len=${rApi.text.length} cookies=${rApi.cookies.size}")
+            rApi.text.trim()
         } catch (e: Exception) {
             Log.e(TAG, "[API ERR] ${e.message}")
             return null
         }
 
-        if (respBody.length < 60) {
-            Log.e(TAG, "[API] response too short (${respBody.length}B) — likely error")
-            return null
-        }
+        if (respBody.length < 60) return null
 
-        val finalCookieStr = collectedCookies.distinct().joinToString("; ")
-        if (finalCookieStr.isNotEmpty()) Log.e(TAG, "[COOKIE] Captured manually: $finalCookieStr")
-
-        // Decrypt chain
-        if (respBody.trimStart().startsWith("{") && respBody.contains("\"file\"")) {
-            Log.e(TAG, "[DEC] plain JSON")
-            return ApiResult(respBody, finalCookieStr)
-        }
+        if (respBody.trimStart().startsWith("{") && respBody.contains("\"file\"")) return respBody
 
         if (playerJs != null && cryptoJs.isNotEmpty()) {
             val r = GdRhino.tryDecrypt(playerJs, cryptoJs, respBody, tokens.toGlobalMap())
             if (r != null && r.trimStart().startsWith("{")) {
                 Log.e(TAG, "[DEC] Rhino OK (${r.length}B)")
-                return ApiResult(r, finalCookieStr)
+                return r
             }
-            Log.e(TAG, "[DEC] Rhino null")
         }
 
         val p1 = decryptDcx(respBody, tokens.pd)
         if (p1 != null && p1.trimStart().startsWith("{")) {
             Log.e(TAG, "[DEC] PBEKeySpec OK (${p1.length}B)")
-            return ApiResult(p1, finalCookieStr)
+            return p1
         }
-        Log.e(TAG, "[DEC] PBEKeySpec null")
 
         val p2 = decryptGdPayload(respBody, tokens.pd)
         if (p2 != null && p2.trimStart().startsWith("{")) {
             Log.e(TAG, "[DEC] manual PBKDF2 OK (${p2.length}B)")
-            return ApiResult(p2, finalCookieStr)
+            return p2
         }
-        Log.e(TAG, "[DEC] manual PBKDF2 null")
 
         return null
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  Decryptor #1 — PBEKeySpec (primary)
+    //  Decryptors
     // ═══════════════════════════════════════════════════════════════════════════
     private fun decryptDcx(encryptedBase64: String, password: String): String? {
         return try {
             var s = encryptedBase64.trim().replace(",,", "==").replace(",", "=")
             while (s.length % 4 != 0) s += "="
-
             val data = Base64.decode(s, Base64.DEFAULT)
-            if (data.size < 32) {
-                Log.e(TAG, "[DEC/dcx] too short: ${data.size}B")
-                return null
-            }
-
+            if (data.size < 32) return null
             val salt = data.copyOfRange(0, 16)
             val ciphertext = data.copyOfRange(16, data.size)
-
             val keySpec = PBEKeySpec(password.toCharArray(), salt, PBKDF2_ITERS, PBKDF2_LEN * 8)
-            val factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
-            val derived = factory.generateSecret(keySpec).encoded
-
+            val derived = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(keySpec).encoded
             val aesKey = derived.copyOfRange(0, 32)
             val iv = derived.copyOfRange(32, 48)
-
             val cipher = Cipher.getInstance("AES/CBC/PKCS5Padding")
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(aesKey, "AES"), IvParameterSpec(iv))
             String(cipher.doFinal(ciphertext), Charsets.UTF_8)
-        } catch (e: Exception) {
-            Log.e(TAG, "[DEC/dcx] ${e::class.java.simpleName}: ${e.message}")
-            null
-        }
+        } catch (_: Exception) { null }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  Decryptor #2 — manual PBKDF2 (redundancy)
-    // ═══════════════════════════════════════════════════════════════════════════
     private fun decryptGdPayload(b64: String, pd: String): String? {
         var s = b64.trim().replace(",,", "==").replace(",", "=")
         while (s.length % 4 != 0) s += "="
-        val raw = try {
-            Base64.decode(s, Base64.DEFAULT)
-        } catch (e: Exception) {
-            Log.e(TAG, "[DEC/gd] b64: ${e.message}"); return null
-        }
-        if (raw.size < 32 || (raw.size - 16) % 16 != 0) {
-            Log.e(TAG, "[DEC/gd] bad length raw=${raw.size}"); return null
-        }
+        val raw = try { Base64.decode(s, Base64.DEFAULT) } catch (_: Exception) { return null }
+        if (raw.size < 32 || (raw.size - 16) % 16 != 0) return null
         val salt = raw.copyOfRange(0, 16)
         val ct = raw.copyOfRange(16, raw.size)
-        val derived = try {
-            pbkdf2Hmac(pd.toByteArray(Charsets.UTF_8), salt, PBKDF2_ITERS, PBKDF2_LEN, "HmacSHA256")
-        } catch (e: Exception) {
-            Log.e(TAG, "[DEC/gd] KDF: ${e.message}"); return null
-        }
+        val derived = try { pbkdf2Hmac(pd.toByteArray(Charsets.UTF_8), salt, PBKDF2_ITERS, PBKDF2_LEN, "HmacSHA256") } catch (_: Exception) { return null }
         val key = derived.copyOfRange(0, 32)
         val iv = derived.copyOfRange(32, 48)
         return try {
             val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
             c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
             String(c.doFinal(ct), Charsets.UTF_8)
-        } catch (e: Exception) {
-            Log.e(TAG, "[DEC/gd] AES: ${e.message}"); null
-        }
+        } catch (_: Exception) { null }
     }
 
     private fun pbkdf2Hmac(pw: ByteArray, salt: ByteArray, iters: Int, dkLen: Int, algo: String): ByteArray {
@@ -508,8 +430,7 @@ class GalaxyDonghua : ExtractorApi() {
     //  Token extraction (JSFuck / Hieroglyphy decoding)
     // ═══════════════════════════════════════════════════════════════════════════
     private data class GdTokens(
-        val pd: String, val ps: String, val qsx: String,
-        val kaken: String, val apx: String,
+        val pd: String, val ps: String, val qsx: String, val kaken: String, val apx: String,
         val utekmek: String = "", val localKey: String = "", val unpackedJs: String = ""
     ) {
         fun toGlobalMap(): Map<String, String> = mapOf(
@@ -558,17 +479,13 @@ class GalaxyDonghua : ExtractorApi() {
 
     private fun decodeGdTokens(page: String): GdTokens? {
         fun extractSmartJs(n: String, text: String): String {
-            Regex("""(?:var\s+|let\s+|const\s+)?\b${Regex.escape(n)}\b\s*=\s*atob\s*\(\s*["']([^"']+)["']\s*\)""")
-                .find(text)?.let { return it.groupValues[1].trim() }
-            Regex("""(?:var\s+|let\s+|const\s+)?\b${Regex.escape(n)}\b\s*=\s*["']([^"']+)["']""")
-                .find(text)?.let { return it.groupValues[1].trim() }
-            Regex("""["']?${Regex.escape(n)}["']?\s*:\s*["']([^"']+)["']""")
-                .find(text)?.let { return it.groupValues[1].trim() }
+            Regex("""(?:var\s+|let\s+|const\s+)?\b${Regex.escape(n)}\b\s*=\s*atob\s*\(\s*["']([^"']+)["']\s*\)""").find(text)?.let { return it.groupValues[1].trim() }
+            Regex("""(?:var\s+|let\s+|const\s+)?\b${Regex.escape(n)}\b\s*=\s*["']([^"']+)["']""").find(text)?.let { return it.groupValues[1].trim() }
+            Regex("""["']?${Regex.escape(n)}["']?\s*:\s*["']([^"']+)["']""").find(text)?.let { return it.groupValues[1].trim() }
             return ""
         }
         fun extractHtmlFallback(n: String, text: String): String {
-            Regex("[\"']?$n[\"']?[ \t]*\\]?[ \t]*[:=][ \t]*(?:atob[ \t]*\\([ \t]*)?[\"']([^\"']+)[\"']")
-                .find(text)?.let { return it.groupValues[1].trim() }
+            Regex("[\"']?$n[\"']?[ \t]*\\]?[ \t]*[:=][ \t]*(?:atob[ \t]*\\([ \t]*)?[\"']([^\"']+)[\"']").find(text)?.let { return it.groupValues[1].trim() }
             return ""
         }
 
@@ -580,8 +497,7 @@ class GalaxyDonghua : ExtractorApi() {
                 ?: Regex("\\)[ \t]*\\([ \t]*'_'[ \t]*\\)").find(page, jStart)
             if (endMatch != null) {
                 val raw = page.substring(jStart, endMatch.range.last + 1)
-                    .replace(" ", "").replace("\u00a0", "").replace("\u3000", "")
-                    .replace("\t", "").replace("\n", "").replace("\r", "")
+                    .replace(Regex("[ \u00a0\u3000\t\n\r]"), "")
                 val bStart = raw.indexOf("(ﾟεﾟ+")
                 if (bStart >= 0) {
                     val bodyStart = raw.indexOf("*/", bStart).let { if (it >= 0) it + 2 else bStart + 5 }
@@ -591,13 +507,20 @@ class GalaxyDonghua : ExtractorApi() {
                     val segs = body.split("(ﾟДﾟ)[ﾟεﾟ]")
                     val sb = StringBuilder()
                     for (i in 1 until segs.size) {
-                        val s = stripConstants(segs[i]).trim().trimStart('+').trimEnd('+')
+                        val s = segs[i]
+                            .replace("(c^_^o)", "0")
+                            .replace("(o^_^o)", "3")
+                            .replace("(ﾟΘﾟ)", "1")
+                            .replace("(ﾟｰﾟ)", "4")
+                            .replace("c^_^o", "0")
+                            .replace("o^_^o", "3")
+                            .replace("ﾟΘﾟ", "1")
+                            .replace("ﾟｰﾟ", "4")
+                            .trim().trimStart('+').trimEnd('+')
                         val digits = StringBuilder()
-                        for (term in splitTopLevelTerms(s)) {
-                            val t = term.trim()
-                            val rv = if (t.startsWith("-")) -(evalArithmetic(t.substring(1)) ?: 0)
-                                     else evalArithmetic(t.trimStart('+')) ?: 0
-                            val v = abs(rv); if (v in 0..7) digits.append(v)
+                        for (term in s.split(Regex("(?<=[^+\\-(*/])\\+|-(?=[^+*/\\-])")).filter { it.isNotBlank() }) {
+                            val v = abs(evalArithmetic(term.trimStart('+')) ?: 0)
+                            if (v in 0..7) digits.append(v)
                         }
                         if (digits.isNotEmpty()) sb.append(digits.toString().toInt(8).toChar())
                     }
@@ -629,30 +552,6 @@ class GalaxyDonghua : ExtractorApi() {
         return t
     }
 
-    private fun stripConstants(s: String): String {
-        var t = s
-        for ((k, v) in listOf(
-            "(c^_^o)" to "0", "(o^_^o)" to "3", "(ﾟΘﾟ)" to "1", "(ﾟｰﾟ)" to "4",
-            "c^_^o" to "0", "o^_^o" to "3", "ﾟΘﾟ" to "1", "ﾟｰﾟ" to "4"
-        )) t = t.replace(k, v)
-        return t
-    }
-
-    private fun splitTopLevelTerms(s: String): List<String> {
-        val terms = mutableListOf<String>(); var depth = 0; var cur = StringBuilder()
-        for (ch in s) when (ch) {
-            '(' -> { depth++; cur.append(ch) }
-            ')' -> { depth--; cur.append(ch) }
-            '+', '-' -> if (depth == 0) {
-                if (cur.isNotBlank()) terms.add(cur.toString())
-                cur = StringBuilder().append(ch)
-            } else cur.append(ch)
-            else -> cur.append(ch)
-        }
-        if (cur.isNotBlank()) terms.add(cur.toString())
-        return terms.filter { it != "+" && it != "-" }
-    }
-
     private fun evalArithmetic(s: String): Int? {
         val clean = s.filter { it != ' ' }
         val values = mutableListOf<Int>(); val ops = mutableListOf<Char>(); var i = 0
@@ -669,8 +568,7 @@ class GalaxyDonghua : ExtractorApi() {
                     while (ops.isNotEmpty() && ops.last() != '(') {
                         if (values.size < 2) return null
                         val b = values.removeAt(values.lastIndex); val a = values.removeAt(values.lastIndex)
-                        val op = ops.removeAt(ops.lastIndex)
-                        values.add(if (op == '+') a + b else a - b)
+                        values.add(if (ops.removeAt(ops.lastIndex) == '+') a + b else a - b)
                     }
                     if (ops.isEmpty()) return null
                     ops.removeAt(ops.lastIndex); i++
@@ -679,8 +577,7 @@ class GalaxyDonghua : ExtractorApi() {
                     while (ops.isNotEmpty() && ops.last() != '(') {
                         if (values.size < 2) return null
                         val b = values.removeAt(values.lastIndex); val a = values.removeAt(values.lastIndex)
-                        val op = ops.removeAt(ops.lastIndex)
-                        values.add(if (op == '+') a + b else a - b)
+                        values.add(if (ops.removeAt(ops.lastIndex) == '+') a + b else a - b)
                     }
                     ops.add(c); i++
                 }
@@ -690,58 +587,76 @@ class GalaxyDonghua : ExtractorApi() {
         while (ops.isNotEmpty()) {
             if (ops.last() == '(' || values.size < 2) return null
             val b = values.removeAt(values.lastIndex); val a = values.removeAt(values.lastIndex)
-            val op = ops.removeAt(ops.lastIndex)
-            values.add(if (op == '+') a + b else a - b)
+            values.add(if (ops.removeAt(ops.lastIndex) == '+') a + b else a - b)
         }
         return values.firstOrNull()
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  Helper: pad `,,` → `==` only in the path, leave the query string alone
+    // ═══════════════════════════════════════════════════════════════════════════
+    private fun padPathOnly(url: String): String {
+        val q = url.indexOf('?')
+        val path = if (q >= 0) url.substring(0, q) else url
+        val query = if (q >= 0) url.substring(q) else ""
+        return path.replace(",,", "==").replace(",", "=") + query
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  Emit streams from JSON
     // ═══════════════════════════════════════════════════════════════════════════
     private suspend fun emitStreams(
-        json: String, gxBase: String, fallbackEmbedUrl: String, manualCookies: String,
-        callback: (ExtractorLink) -> Unit,
-        subtitleCallback: (SubtitleFile) -> Unit
+        json: String, gxBase: String, fallbackEmbedUrl: String, globalCookies: Map<String, String>,
+        callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit
     ) {
-        Log.e(TAG, "[EMIT] JSON length=${json.length}")
-        if (!json.trimStart().startsWith("{")) {
-            Log.e(TAG, "[EMIT] REFUSING (not JSON)")
-            return
-        }
-        Log.e(TAG, "[EMIT] head=${json.take(220)}")
+        if (!json.trimStart().startsWith("{")) return
 
         val baseURL = Regex("[\"']baseUrl[\"'][ \t]*:[ \t]*[\"']([^\"']+)[\"']")
             .find(json)?.groupValues?.get(1) ?: gxBase
 
         val dynamicEmbedUrl = Regex("[\"']embed_url[\"'][ \t]*:[ \t]*[\"']([^\"']+)[\"']")
             .find(json)?.groupValues?.get(1)?.replace("\\/", "/") ?: fallbackEmbedUrl
-            
+
         Log.e(TAG, "[EMIT] Dynamic Referer: $dynamicEmbedUrl")
 
         var activeReferer = dynamicEmbedUrl
+
+        // ─── NEW: Visit the fresh embed_url and log what it returns ───
+        try {
+            val r = app.get(dynamicEmbedUrl, headers = mapOf(
+                "User-Agent" to UA,
+                "Referer" to fallbackEmbedUrl,
+                "Origin" to gxBase,
+                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            ))
+            Log.e(TAG, "[EMIT] fresh embed GET: ${r.code} | ${r.text.length}B | cookies=${r.cookies.size}")
+            val freshHtml = r.text
+            val freshM3u8 = Regex("""https?://[^\s"'<>\\]+?\.m3u8[^\s"'<>\\]*""").find(freshHtml)?.value
+            Log.e(TAG, "[EMIT] m3u8 in fresh page: $freshM3u8")
+            val freshVid = Regex("""VID_SRC[ \t]*=[ \t]*["']([^"']+)["']""").find(freshHtml)?.groupValues?.get(1)
+            Log.e(TAG, "[EMIT] VID_SRC in fresh page: $freshVid")
+        } catch (e: Exception) {
+            Log.e(TAG, "[EMIT] fresh embed GET failed: ${e.message}")
+        }
+
+        // Kitchen-sink headers for the probe
         val ph = mutableMapOf(
-            "User-Agent" to UA, 
-            "Referer" to activeReferer
+            "User-Agent" to UA,
+            "Referer" to activeReferer,
+            "Accept" to "*/*",
+            "Origin" to gxBase,
+            "Sec-Fetch-Site" to "same-origin",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Dest" to "empty",
+            "Accept-Language" to "en-US,en;q=0.9"
         )
-        
-        // 1. Inject Manual Cookies
-        if (manualCookies.isNotEmpty()) {
-            ph["Cookie"] = manualCookies
-            Log.e(TAG, "[EMIT] Using Manual Cookies: $manualCookies")
+
+        val cookieStr = globalCookies.map { "${it.key}=${it.value}" }.joinToString("; ")
+        if (cookieStr.isNotEmpty()) {
+            ph["Cookie"] = cookieStr
+            Log.e(TAG, "[EMIT] Injected Global Cookies: $cookieStr")
         } else {
-            // 2. Fallback: CookieJar
-            try {
-                gxBase.toHttpUrlOrNull()?.let { httpUrl ->
-                    val cookies = app.baseClient.cookieJar.loadForRequest(httpUrl)
-                    if (cookies.isNotEmpty()) {
-                        ph["Cookie"] = cookies.joinToString("; ") { "${it.name}=${it.value}" }
-                        Log.e(TAG, "[EMIT] Using OkHttp CookieJar: ${ph["Cookie"]}")
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "[EMIT] Cookie injection fallback failed: ${e.message}")
-            }
+            Log.e(TAG, "[EMIT] WARNING: No cookies captured across requests!")
         }
 
         // ═══════════════════════════════════════════════════════════════════════════
@@ -750,7 +665,7 @@ class GalaxyDonghua : ExtractorApi() {
         var paddedSelected = false
         val firstRaw = Regex("""["']file["']\s*:\s*["']([^"']+)["']""")
             .find(json)?.groupValues?.get(1)?.replace("\\/", "/")
-            
+
         if (firstRaw != null) {
             val firstAbs = fixStreamUrl(firstRaw, baseURL)
             if (firstAbs != null && !firstAbs.contains(".vtt", true)) {
@@ -758,7 +673,7 @@ class GalaxyDonghua : ExtractorApi() {
                 Log.e(TAG, "[EMIT] PROBE primary: code=$code referer=$activeReferer")
 
                 if (code !in 200..299) {
-                    // Test 1: Try fallbackEmbedUrl as Referer
+                    // Test 1: fallback embed URL as Referer
                     if (dynamicEmbedUrl != fallbackEmbedUrl) {
                         val h1 = ph.toMutableMap().apply { put("Referer", fallbackEmbedUrl) }
                         val c1 = try { app.get(firstAbs, headers = h1).code } catch (_: Exception) { -1 }
@@ -770,34 +685,34 @@ class GalaxyDonghua : ExtractorApi() {
                         }
                     }
 
-                    // Test 2: Try with Origin added back
+                    // Test 2: without Origin
                     if (code !in 200..299) {
-                        val h2 = ph.toMutableMap().apply { put("Origin", gxBase) }
+                        val h2 = ph.toMutableMap().apply { remove("Origin") }
                         val c2 = try { app.get(firstAbs, headers = h2).code } catch (_: Exception) { -1 }
-                        Log.e(TAG, "[EMIT] PROBE test [with Origin]: code=$c2")
+                        Log.e(TAG, "[EMIT] PROBE test [without Origin]: code=$c2")
                         if (c2 in 200..299) {
-                            ph["Origin"] = gxBase
+                            ph.remove("Origin")
                             code = c2
                         }
                     }
 
-                    // Test 3: Try without Cookies
+                    // Test 3: without Cookie header
                     if (code !in 200..299 && ph.containsKey("Cookie")) {
                         val h3 = ph.toMutableMap().apply { remove("Cookie") }
                         val c3 = try { app.get(firstAbs, headers = h3).code } catch (_: Exception) { -1 }
-                        Log.e(TAG, "[EMIT] PROBE test [without Cookie]: code=$c3")
+                        Log.e(TAG, "[EMIT] PROBE test [without Cookie header]: code=$c3")
                         if (c3 in 200..299) {
                             ph.remove("Cookie")
                             code = c3
                         }
                     }
 
-                    // Test 4: Try with `,,` normalized to base64 `==`
+                    // Test 4: base64 padding in PATH ONLY (query string untouched)
                     if (code !in 200..299) {
-                        val paddedUrl = firstAbs.replace(",,", "==").replace(",", "=")
+                        val paddedUrl = padPathOnly(firstAbs)
                         if (paddedUrl != firstAbs) {
                             val c4 = try { app.get(paddedUrl, headers = ph).code } catch (_: Exception) { -1 }
-                            Log.e(TAG, "[EMIT] PROBE test [padded ==]: code=$c4")
+                            Log.e(TAG, "[EMIT] PROBE test [padded path-only]: code=$c4")
                             if (c4 in 200..299) {
                                 paddedSelected = true
                                 code = c4
@@ -810,12 +725,11 @@ class GalaxyDonghua : ExtractorApi() {
 
         var emitted = 0
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
-            val raw = m.groupValues[1]
-            val normalized = raw.replace("\\/", "/")
+            val raw = m.groupValues[1].replace("\\/", "/")
+            var abs = fixStreamUrl(raw, baseURL) ?: continue
 
-            var abs = fixStreamUrl(normalized, baseURL) ?: continue
             if (paddedSelected) {
-                abs = abs.replace(",,", "==").replace(",", "=")
+                abs = padPathOnly(abs)
             }
 
             val isSub = abs.contains(".vtt", true) || abs.contains(".srt", true)
@@ -843,7 +757,7 @@ class GalaxyDonghua : ExtractorApi() {
     private fun fixStreamUrl(url: String, base: String): String? {
         val u = url.trim().replace("\\/", "/")
         if (u.isBlank()) return null
-        if (u.startsWith("http://") || u.startsWith("https://")) return u
+        if (u.startsWith("http")) return u
         if (u.startsWith("//")) return "https:$u"
         val host = try { val uri = URI(base); "${uri.scheme}://${uri.host}" } catch (_: Exception) { null }
         return if (u.startsWith("/")) (host ?: base.trimEnd('/')) + u
@@ -855,26 +769,19 @@ class GalaxyDonghua : ExtractorApi() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Rhino — executes the site's real dcx() JS function
+//  GdRhino Fallback Object
 // ═══════════════════════════════════════════════════════════════════════════
 object GdRhino {
-    private const val TAG = "GdRhino"
-
     private val RESERVED_KEY_REGEX = Regex(
         """([{,]\s*)(class|enum|if|for|while|do|else|switch|case|default|in|instanceof|typeof|new|void|this|null|true|false|function|return|delete|throw|try|catch|finally|break|continue|var|let|const|with|debugger|yield|implements|interface|package|private|protected|public|static|super|extends|import|export)\s*:"""
     )
 
-    fun tryDecrypt(
-        playerJs: String, cryptoJs: String, ciphertext: String, globals: Map<String, String>
-    ): String? {
+    fun tryDecrypt(playerJs: String, cryptoJs: String, ciphertext: String, globals: Map<String, String>): String? {
         evalAndCall(playerJs, cryptoJs, ciphertext, globals, preprocess = false)?.let { return it }
         return evalAndCall(playerJs, cryptoJs, ciphertext, globals, preprocess = true)
     }
 
-    private fun evalAndCall(
-        playerJs: String, cryptoJs: String, ciphertext: String,
-        globals: Map<String, String>, preprocess: Boolean
-    ): String? {
+    private fun evalAndCall(playerJs: String, cryptoJs: String, ciphertext: String, globals: Map<String, String>, preprocess: Boolean): String? {
         val ctx = Context.enter()
         try {
             ctx.optimizationLevel = -1
@@ -898,9 +805,7 @@ object GdRhino {
 
             if (cryptoJs.isNotBlank()) try {
                 ctx.evaluateString(scope, cryptoJs, "cryptojs", 1, null)
-            } catch (e: Throwable) {
-                Log.e(TAG, "cryptojs: ${e.message}")
-            }
+            } catch (_: Throwable) {}
 
             for ((k, v) in globals) ScriptableObject.putProperty(scope, k, v)
 
@@ -910,19 +815,14 @@ object GdRhino {
 
             try {
                 ctx.evaluateString(scope, js, "player", 1, null)
-            } catch (e: Throwable) {
-                Log.e(TAG, "eval: ${e.message}")
+            } catch (_: Throwable) {
                 return null
             }
 
-            val fn = (scope.get("dcx", scope) as? Function) ?: run {
-                Log.e(TAG, "dcx not defined"); null
-            } ?: return null
-
+            val fn = (scope.get("dcx", scope) as? Function) ?: return null
             val result = try {
                 fn.call(ctx, scope, scope, arrayOf<Any>(ciphertext))
-            } catch (e: Throwable) {
-                Log.e(TAG, "dcx: ${e.message}")
+            } catch (_: Throwable) {
                 return null
             }
 
