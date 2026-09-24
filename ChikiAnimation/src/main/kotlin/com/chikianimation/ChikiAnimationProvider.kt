@@ -6,7 +6,6 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
-import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -22,15 +21,6 @@ class ChikiAnimationProvider : MainAPI() {
     override var lang = "zh"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
-
-    companion object {
-        // Hosts we never try to extract from — ads, trackers, social widgets
-        private val BLACKLIST_HOSTS = setOf(
-            "youtube", "disqus", "googlesyndication", "doubleclick"
-        )
-
-        private const val NO_MIRRORS_TIMEOUT_MS = 15_000L
-    }
 
     private val defaultUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -245,16 +235,14 @@ class ChikiAnimationProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // ─── 1) Fetch the episode page (bounded by a 15 s timeout) ───
         val document = try {
-            withTimeoutOrNull(NO_MIRRORS_TIMEOUT_MS) {
+            withTimeoutOrNull(15_000L) {
                 app.get(data, headers = defaultHeaders).document
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             null
         } ?: return false
 
-        // ─── 2) Shared dedup state and the counting callback ───
         val emittedUrls = Collections.synchronizedSet(mutableSetOf<String>())
         val processedUrls = Collections.synchronizedSet(mutableSetOf<String>())
         val processedDmIds = Collections.synchronizedSet(mutableSetOf<String>())
@@ -268,7 +256,6 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // ─── 3) Small utilities ───
         fun getIframeSrc(iframe: Element): String {
             val src = iframe.attr("src")
             if (src.isNotBlank()) return src
@@ -289,7 +276,6 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // ─── 4) Google Drive resolver ───
         suspend fun resolveGdriveStream(fileId: String): String? {
             val initialUrl =
                 "https://drive.usercontent.google.com/download?id=$fileId&export=download&authuser=0"
@@ -369,102 +355,27 @@ class ChikiAnimationProvider : MainAPI() {
             return emitCount.get() > before
         }
 
-        // ─── 5) Dailymotion handler ───
-        // Geo embed URLs are handled via the geo API; standard Dailymotion URLs
-        // pass straight through to loadExtractor.
-        suspend fun handleDailymotion(cleanUrl: String, ref: String): Boolean {
-            val videoId = Regex("(?:video/|dai\\.ly/|embed/video/|video=)([a-zA-Z0-9_-]+)")
-                .find(cleanUrl)?.groupValues?.get(1) ?: return false
-            if (!processedDmIds.add(videoId)) return false
-
-            val before = emitCount.get()
-            val isGeo = cleanUrl.contains("geo.dailymotion.com/player", true)
-
-            if (isGeo) {
-                try {
-                    val apiUrl = "https://geo.dailymotion.com/videos/$videoId"
-                    val reqHeaders = mapOf(
-                        "User-Agent" to defaultUserAgent,
-                        "Referer" to cleanUrl,
-                        "Accept" to "application/json",
-                        "x-dm-geo-embedder" to mainUrl
-                    )
-                    val apiRes = app.get(apiUrl, headers = reqHeaders).text
-
-                    val streamUrl = Regex("[\"']url[\"']\\s*:\\s*[\"']([^\"']+\\.m3u8[^\"']*)[\"']")
-                        .find(apiRes)?.groupValues?.get(1)
-
-                    if (!streamUrl.isNullOrBlank()) {
-                        val m3u8Url = streamUrl.replace("\\/", "/")
-                        countingCallback(newExtractorLink(
-                            "Dailymotion", "Dailymotion", m3u8Url, ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = cleanUrl
-                            this.headers = mapOf(
-                                "User-Agent" to defaultUserAgent,
-                                "Origin" to "https://geo.dailymotion.com",
-                                "Referer" to cleanUrl
-                            )
-                            this.quality = Qualities.Unknown.value
-                        })
-                    }
-                } catch (_: Exception) {}
-            }
-
-            if (emitCount.get() == before) {
-                val extractorUrl =
-                    if (isGeo) "https://www.dailymotion.com/embed/video/$videoId"
-                    else cleanUrl
-                try {
-                    loadExtractor(extractorUrl, ref, subtitleCallback, countingCallback)
-                } catch (_: Exception) {}
-            }
-
-            return emitCount.get() > before
-        }
-
-        // ─── 6) Generic built-in extractor + direct-media fallbacks ───
-        suspend fun tryGeneric(cleanUrl: String, ref: String): Boolean {
-            val before = emitCount.get()
-
-            try {
-                loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
-            } catch (_: Exception) {}
-            if (emitCount.get() > before) return true
-
-            when {
-                cleanUrl.contains(".m3u8", true) -> {
-                    try {
-                        M3u8Helper.generateM3u8("Generic HLS", cleanUrl, ref)
-                            .forEach { countingCallback(it) }
-                    } catch (_: Exception) {}
-                }
-                cleanUrl.contains(".mp4", true) -> {
-                    countingCallback(newExtractorLink(
-                        "Generic MP4", "Generic MP4", cleanUrl, ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = ref
-                        this.quality = Qualities.Unknown.value
-                    })
-                }
-            }
-            return emitCount.get() > before
-        }
-
-        // ─── 7) Main dispatcher — try every extractor in order ───
         suspend fun handleUrl(rawUrl: String, ref: String) {
             val cleanUrl = try { fixUrl(rawUrl) } catch (_: Exception) { return }
             if (!cleanUrl.startsWith("http")) return
             if (!processedUrls.add(cleanUrl)) return
-            if (BLACKLIST_HOSTS.any { cleanUrl.contains(it, true) }) return
+
+            if (cleanUrl.contains("youtube", true) ||
+                cleanUrl.contains("disqus", true) ||
+                cleanUrl.contains("googlesyndication", true) ||
+                cleanUrl.contains("doubleclick", true)
+            ) return
 
             try {
+                // 1) Google Drive
                 if (cleanUrl.contains("drive.google.com", true) ||
                     cleanUrl.contains("drive.usercontent.google.com", true)
                 ) {
-                    if (handleGoogleDrive(cleanUrl)) return
+                    val before = emitCount.get()
+                    if (handleGoogleDrive(cleanUrl) && emitCount.get() > before) return
                 }
 
+                // 2) Site-specific extractors
                 if (cleanUrl.contains("galaxydonghua.xyz", true)) {
                     val before = emitCount.get()
                     try {
@@ -489,17 +400,91 @@ class ChikiAnimationProvider : MainAPI() {
                     if (emitCount.get() > before) return
                 }
 
-                if (cleanUrl.contains("dailymotion.com", true) ||
-                    cleanUrl.contains("dai.ly", true)
+                // 3) Dailymotion
+                if (cleanUrl.contains("geo.dailymotion.com/player", true)) {
+                    val videoId = Regex("video=([a-zA-Z0-9_-]+)").find(cleanUrl)?.groupValues?.get(1)
+                    if (videoId != null && processedDmIds.add(videoId)) {
+                        val before = emitCount.get()
+                        try {
+                            val apiUrl = "https://geo.dailymotion.com/videos/$videoId"
+                            val reqHeaders = mapOf(
+                                "User-Agent" to defaultUserAgent,
+                                "Referer" to cleanUrl,
+                                "Accept" to "application/json",
+                                "x-dm-geo-embedder" to mainUrl
+                            )
+                            val apiRes = app.get(apiUrl, headers = reqHeaders).text
+
+                            val streamUrl = Regex("[\"']url[\"']\\s*:\\s*[\"']([^\"']+\\.m3u8[^\"']*)[\"']")
+                                .find(apiRes)?.groupValues?.get(1)
+
+                            if (!streamUrl.isNullOrBlank()) {
+                                val m3u8Url = streamUrl.replace("\\/", "/")
+                                countingCallback(
+                                    newExtractorLink(
+                                        "Dailymotion", "Dailymotion", m3u8Url, ExtractorLinkType.M3U8
+                                    ) {
+                                        this.referer = cleanUrl
+                                        this.headers = mapOf(
+                                            "User-Agent" to defaultUserAgent,
+                                            "Origin" to "https://geo.dailymotion.com",
+                                            "Referer" to cleanUrl
+                                        )
+                                        this.quality = Qualities.Unknown.value
+                                    }
+                                )
+                            }
+                        } catch (_: Exception) {}
+
+                        if (emitCount.get() == before) {
+                            try {
+                                loadExtractor(
+                                    "https://www.dailymotion.com/embed/video/$videoId",
+                                    ref, subtitleCallback, countingCallback
+                                )
+                            } catch (_: Exception) {}
+                        }
+                        if (emitCount.get() > before) return
+                    }
+                } else if (cleanUrl.contains("dailymotion.com", true) ||
+                           cleanUrl.contains("dai.ly", true)
                 ) {
-                    if (handleDailymotion(cleanUrl, ref)) return
+                    val videoId = Regex("(?:video/|dai\\.ly/|embed/video/)([a-zA-Z0-9_-]+)")
+                        .find(cleanUrl)?.groupValues?.get(1)
+                    if (videoId == null || processedDmIds.add(videoId)) {
+                        val before = emitCount.get()
+                        try {
+                            loadExtractor(cleanUrl, ref, subtitleCallback, countingCallback)
+                        } catch (_: Exception) {}
+                        if (emitCount.get() > before) return
+                    }
                 }
 
-                tryGeneric(cleanUrl, ref)
+                // 4) Generic built-in extractor pass
+                val beforeGeneric = emitCount.get()
+                try {
+                    loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
+                } catch (_: Exception) {}
+                if (emitCount.get() > beforeGeneric) return
+
+                // 5) Direct media fallbacks
+                if (cleanUrl.contains(".m3u8", true)) {
+                    try {
+                        M3u8Helper.generateM3u8("Generic HLS", cleanUrl, ref)
+                            .forEach { countingCallback(it) }
+                    } catch (_: Exception) {}
+                    if (emitCount.get() > beforeGeneric) return
+                } else if (cleanUrl.contains(".mp4", true)) {
+                    countingCallback(
+                        newExtractorLink("Generic MP4", "Generic MP4", cleanUrl, ExtractorLinkType.VIDEO) {
+                            this.referer = ref
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                }
             } catch (_: Exception) {}
         }
 
-        // ─── 8) HTML → URLs ───
         suspend fun processDecodedHtml(decoded: String, ref: String) {
             Jsoup.parse(decoded).select("iframe").forEach { iframe ->
                 val src = getIframeSrc(iframe)
@@ -510,35 +495,6 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // ─── 9) Mirror + server-item handlers ───
-        suspend fun processMirrorOption(value: String, ref: String) {
-            if (value.isBlank()) return
-            if (value.startsWith("http") || value.startsWith("//")) {
-                handleUrl(value, ref)
-            } else {
-                val decoded = safeBase64Decode(value)
-                if (!decoded.isNullOrBlank()) processDecodedHtml(decoded, ref)
-            }
-        }
-
-        suspend fun processServerItem(el: Element, ref: String) {
-            val videoAttr = el.attr("data-video")
-                .ifBlank { el.attr("data-src") }
-                .ifBlank { el.attr("data-embed") }
-            if (videoAttr.isBlank()) return
-
-            if (videoAttr.startsWith("http") || videoAttr.startsWith("//")) {
-                handleUrl(videoAttr, ref)
-                return
-            }
-            if (videoAttr.length <= 20) return
-
-            val decoded = safeBase64Decode(videoAttr) ?: return
-            if (decoded.startsWith("http")) handleUrl(decoded, ref)
-            else processDecodedHtml(decoded, ref)
-        }
-
-        // ─── 10) Fan out every mirror option + server item in parallel ───
         val mirrorOptions = document.select(
             "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
         )
@@ -546,21 +502,50 @@ class ChikiAnimationProvider : MainAPI() {
             ".server_list li, ul.episodes li, .mirror_link, .mirrors li"
         )
 
-        val jobs = mutableListOf<Deferred<Unit>>()
+        val extractionJobs = mutableListOf<kotlinx.coroutines.Deferred<Unit>>()
+
         coroutineScope {
             for (option in mirrorOptions) {
                 val value = option.attr("value").trim()
                 if (value.isNotBlank()) {
-                    jobs.add(async { processMirrorOption(value, data) })
+                    val job = async {
+                        if (value.startsWith("http") || value.startsWith("//")) {
+                            handleUrl(value, data)
+                        } else {
+                            val decoded = safeBase64Decode(value)
+                            if (!decoded.isNullOrBlank()) processDecodedHtml(decoded, data)
+                        }
+                        Unit
+                    }
+                    extractionJobs.add(job)
                 }
             }
+
             for (el in serverListItems) {
-                jobs.add(async { processServerItem(el, data) })
+                var videoAttr = el.attr("data-video")
+                if (videoAttr.isBlank()) videoAttr = el.attr("data-src")
+                if (videoAttr.isBlank()) videoAttr = el.attr("data-embed")
+
+                if (videoAttr.isNotBlank()) {
+                    val job = async {
+                        if (videoAttr.startsWith("http") || videoAttr.startsWith("//")) {
+                            handleUrl(videoAttr, data)
+                        } else if (videoAttr.length > 20) {
+                            val decoded = safeBase64Decode(videoAttr)
+                            if (!decoded.isNullOrBlank()) {
+                                if (decoded.startsWith("http")) handleUrl(decoded, data)
+                                else processDecodedHtml(decoded, data)
+                            }
+                        }
+                        Unit
+                    }
+                    extractionJobs.add(job)
+                }
             }
-            jobs.awaitAll()
+
+            extractionJobs.awaitAll()
         }
 
-        // ─── 11) Fallback: scan raw iframes if nothing was emitted ───
         if (emitCount.get() == 0) {
             document.select("iframe").forEach { iframe ->
                 val src = getIframeSrc(iframe)
