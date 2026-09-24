@@ -1,7 +1,6 @@
 package com.chikianimation
 
 import android.util.Base64
-import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.utils.*
@@ -236,11 +235,6 @@ class ChikiAnimationProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // ═══════════════════════════════════════════════════════════════════
-        // VERIFY_1 — entry into loadLinks
-        // ═══════════════════════════════════════════════════════════════════
-        Log.e("VERIFY_1", "loadLinks ENTERED data=$data")
-
         val document = try {
             withTimeoutOrNull(15_000L) {
                 app.get(data, headers = defaultHeaders).document
@@ -383,18 +377,10 @@ class ChikiAnimationProvider : MainAPI() {
 
                 // 2) Site-specific extractors
                 if (cleanUrl.contains("galaxydonghua.xyz", true)) {
-                    // ═══════════════════════════════════════════════════════
-                    // VERIFY_2 — before/after GalaxyDonghua call
-                    // ═══════════════════════════════════════════════════════
-                    Log.e("VERIFY_2", "About to call GalaxyDonghua().getUrl($cleanUrl)")
-
                     val before = emitCount.get()
                     try {
                         GalaxyDonghua().getUrl(cleanUrl, "$mainUrl/", subtitleCallback, countingCallback)
-                        Log.e("VERIFY_2", "GalaxyDonghua returned OK, emitted=${emitCount.get() - before}")
-                    } catch (e: Exception) {
-                        Log.e("VERIFY_2", "GalaxyDonghua THREW: ${e::class.java.simpleName}: ${e.message}", e)
-                    }
+                    } catch (_: Exception) {}
                     if (emitCount.get() > before) return
                 }
 
