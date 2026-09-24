@@ -1,7 +1,6 @@
 package com.chikianimation
 
 import android.util.Base64
-import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.utils.*
@@ -236,39 +235,24 @@ class ChikiAnimationProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        Log.e("ChikiDBG", "========== loadLinks START ==========")
-        Log.e("ChikiDBG", "data (episode URL): $data")
-
-        // Timeout on the episode page fetch — a hung page no longer blocks the loader
         val document = try {
             withTimeoutOrNull(15_000L) {
                 app.get(data, headers = defaultHeaders).document
             }
         } catch (e: Exception) {
-            Log.e("ChikiDBG", "episode page fetch exception: ${e.message}", e)
             null
-        }
-
-        if (document == null) {
-            Log.e("ChikiDBG", "episode page fetch FAILED (null or timeout)")
-            return false
-        }
-        Log.e("ChikiDBG", "episode page fetched: ${document.title()}")
+        } ?: return false
 
         val emittedUrls = Collections.synchronizedSet(mutableSetOf<String>())
         val processedUrls = Collections.synchronizedSet(mutableSetOf<String>())
         val processedDmIds = Collections.synchronizedSet(mutableSetOf<String>())
         val processedGdriveIds = Collections.synchronizedSet(mutableSetOf<String>())
         val emitCount = AtomicInteger(0)
-        val foundFlag = AtomicInteger(0)
 
         val countingCallback: (ExtractorLink) -> Unit = { link ->
             if (emittedUrls.add(link.url)) {
-                Log.e("ChikiDBG", "EMIT link: name=${link.name}, url=${link.url.take(80)}")
                 emitCount.incrementAndGet()
                 callback.invoke(link)
-            } else {
-                Log.e("ChikiDBG", "SKIP duplicate link: ${link.url.take(80)}")
             }
         }
 
@@ -371,102 +355,54 @@ class ChikiAnimationProvider : MainAPI() {
             return emitCount.get() > before
         }
 
-        suspend fun handleUrl(rawUrl: String, ref: String, depth: Int = 0) {
-            if (depth > 1) return
+        suspend fun handleUrl(rawUrl: String, ref: String) {
             val cleanUrl = try { fixUrl(rawUrl) } catch (_: Exception) { return }
             if (!cleanUrl.startsWith("http")) return
-            if (!processedUrls.add(cleanUrl)) {
-                Log.e("ChikiDBG", "handleUrl SKIP (already processed): ${cleanUrl.take(100)}")
-                return
-            }
-
-            Log.e("ChikiDBG", "handleUrl → ${cleanUrl.take(120)}")
+            if (!processedUrls.add(cleanUrl)) return
 
             if (cleanUrl.contains("youtube", true) ||
                 cleanUrl.contains("disqus", true) ||
                 cleanUrl.contains("googlesyndication", true) ||
                 cleanUrl.contains("doubleclick", true)
-            ) {
-                Log.e("ChikiDBG", "  → skipped (blocked host)")
-                return
-            }
+            ) return
 
             try {
                 // 1) Google Drive
                 if (cleanUrl.contains("drive.google.com", true) ||
                     cleanUrl.contains("drive.usercontent.google.com", true)
                 ) {
-                    Log.e("ChikiDBG", "  → Google Drive branch")
                     val before = emitCount.get()
-                    if (handleGoogleDrive(cleanUrl) && emitCount.get() > before) {
-                        Log.e("ChikiDBG", "  → Drive emitted ${emitCount.get() - before} link(s)")
-                        foundFlag.set(1)
-                        return
-                    }
-                    Log.e("ChikiDBG", "  → Drive produced nothing")
+                    if (handleGoogleDrive(cleanUrl) && emitCount.get() > before) return
                 }
 
-                // 2) Chiki-specific custom extractors
-
-                // GalaxyDonghua
+                // 2) Site-specific extractors
                 if (cleanUrl.contains("galaxydonghua.xyz", true)) {
-                    Log.e("ChikiDBG", "  → GalaxyDonghua branch, passing referer=$mainUrl/")
                     val before = emitCount.get()
                     try {
-                        GalaxyDonghua().getUrl(
-                            cleanUrl,
-                            "$mainUrl/",
-                            subtitleCallback,
-                            countingCallback
-                        )
-                    } catch (e: Exception) {
-                        Log.e("ChikiDBG", "  → GalaxyDonghua threw: ${e.message}", e)
-                    }
-                    val diff = emitCount.get() - before
-                    Log.e("ChikiDBG", "  → GalaxyDonghua emitted $diff link(s)")
-                    if (emitCount.get() > before) {
-                        foundFlag.set(1)
-                        return
-                    }
+                        GalaxyDonghua().getUrl(cleanUrl, "$mainUrl/", subtitleCallback, countingCallback)
+                    } catch (_: Exception) {}
+                    if (emitCount.get() > before) return
                 }
 
                 if (cleanUrl.contains("skylineai.cloud", true)) {
-                    Log.e("ChikiDBG", "  → SkylineAI branch")
                     val before = emitCount.get()
                     try {
                         SkylineAI().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
-                    } catch (e: Exception) {
-                        Log.e("ChikiDBG", "  → SkylineAI threw: ${e.message}", e)
-                    }
-                    val diff = emitCount.get() - before
-                    Log.e("ChikiDBG", "  → SkylineAI emitted $diff link(s)")
-                    if (emitCount.get() > before) {
-                        foundFlag.set(1)
-                        return
-                    }
+                    } catch (_: Exception) {}
+                    if (emitCount.get() > before) return
                 }
 
                 if (cleanUrl.contains("ghbrisk.com", true)) {
-                    Log.e("ChikiDBG", "  → Ghbrisk branch")
                     val before = emitCount.get()
                     try {
                         Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
-                    } catch (e: Exception) {
-                        Log.e("ChikiDBG", "  → Ghbrisk threw: ${e.message}", e)
-                    }
-                    val diff = emitCount.get() - before
-                    Log.e("ChikiDBG", "  → Ghbrisk emitted $diff link(s)")
-                    if (emitCount.get() > before) {
-                        foundFlag.set(1)
-                        return
-                    }
+                    } catch (_: Exception) {}
+                    if (emitCount.get() > before) return
                 }
 
-                // 3) Dailymotion geo embed
+                // 3) Dailymotion
                 if (cleanUrl.contains("geo.dailymotion.com/player", true)) {
-                    Log.e("ChikiDBG", "  → GeoDailymotion branch")
                     val videoId = Regex("video=([a-zA-Z0-9_-]+)").find(cleanUrl)?.groupValues?.get(1)
-                    Log.e("ChikiDBG", "  → DM videoId=$videoId")
                     if (videoId != null && processedDmIds.add(videoId)) {
                         val before = emitCount.get()
                         try {
@@ -484,7 +420,6 @@ class ChikiAnimationProvider : MainAPI() {
 
                             if (!streamUrl.isNullOrBlank()) {
                                 val m3u8Url = streamUrl.replace("\\/", "/")
-                                Log.e("ChikiDBG", "  → DM API m3u8: $m3u8Url")
                                 countingCallback(
                                     newExtractorLink(
                                         "Dailymotion", "Dailymotion", m3u8Url, ExtractorLinkType.M3U8
@@ -499,12 +434,9 @@ class ChikiAnimationProvider : MainAPI() {
                                     }
                                 )
                             }
-                        } catch (e: Exception) {
-                            Log.e("ChikiDBG", "  → DM API threw: ${e.message}")
-                        }
+                        } catch (_: Exception) {}
 
                         if (emitCount.get() == before) {
-                            Log.e("ChikiDBG", "  → DM API failed, falling back to embed URL")
                             try {
                                 loadExtractor(
                                     "https://www.dailymotion.com/embed/video/$videoId",
@@ -512,10 +444,7 @@ class ChikiAnimationProvider : MainAPI() {
                                 )
                             } catch (_: Exception) {}
                         }
-                        if (emitCount.get() > before) {
-                            foundFlag.set(1)
-                            return
-                        }
+                        if (emitCount.get() > before) return
                     }
                 } else if (cleanUrl.contains("dailymotion.com", true) ||
                            cleanUrl.contains("dai.ly", true)
@@ -527,24 +456,16 @@ class ChikiAnimationProvider : MainAPI() {
                         try {
                             loadExtractor(cleanUrl, ref, subtitleCallback, countingCallback)
                         } catch (_: Exception) {}
-                        if (emitCount.get() > before) {
-                            foundFlag.set(1)
-                            return
-                        }
+                        if (emitCount.get() > before) return
                     }
                 }
 
                 // 4) Generic built-in extractor pass
-                Log.e("ChikiDBG", "  → generic loadExtractor fallback")
                 val beforeGeneric = emitCount.get()
                 try {
                     loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
                 } catch (_: Exception) {}
-                if (emitCount.get() > beforeGeneric) {
-                    Log.e("ChikiDBG", "  → generic extractor emitted ${emitCount.get() - beforeGeneric} link(s)")
-                    foundFlag.set(1)
-                    return
-                }
+                if (emitCount.get() > beforeGeneric) return
 
                 // 5) Direct media fallbacks
                 if (cleanUrl.contains(".m3u8", true)) {
@@ -552,10 +473,7 @@ class ChikiAnimationProvider : MainAPI() {
                         M3u8Helper.generateM3u8("Generic HLS", cleanUrl, ref)
                             .forEach { countingCallback(it) }
                     } catch (_: Exception) {}
-                    if (emitCount.get() > beforeGeneric) {
-                        foundFlag.set(1)
-                        return
-                    }
+                    if (emitCount.get() > beforeGeneric) return
                 } else if (cleanUrl.contains(".mp4", true)) {
                     countingCallback(
                         newExtractorLink("Generic MP4", "Generic MP4", cleanUrl, ExtractorLinkType.VIDEO) {
@@ -563,24 +481,14 @@ class ChikiAnimationProvider : MainAPI() {
                             this.quality = Qualities.Unknown.value
                         }
                     )
-                    if (emitCount.get() > beforeGeneric) {
-                        foundFlag.set(1)
-                        return
-                    }
                 }
-            } catch (e: Exception) {
-                Log.e("ChikiDBG", "handleUrl exception: ${e.message}", e)
-            }
+            } catch (_: Exception) {}
         }
 
         suspend fun processDecodedHtml(decoded: String, ref: String) {
-            Log.e("ChikiDBG", "processDecodedHtml: ${decoded.length} bytes")
             Jsoup.parse(decoded).select("iframe").forEach { iframe ->
                 val src = getIframeSrc(iframe)
-                if (src.isNotBlank()) {
-                    Log.e("ChikiDBG", "  iframe src: ${src.take(100)}")
-                    handleUrl(src, ref)
-                }
+                if (src.isNotBlank()) handleUrl(src, ref)
             }
             Regex("https?://[^\\s\"'<>\\\\)]+").findAll(decoded).forEach { m ->
                 handleUrl(m.value, ref)
@@ -594,28 +502,18 @@ class ChikiAnimationProvider : MainAPI() {
             ".server_list li, ul.episodes li, .mirror_link, .mirrors li"
         )
 
-        Log.e("ChikiDBG", "mirrorOptions count: ${mirrorOptions.size}")
-        Log.e("ChikiDBG", "serverListItems count: ${serverListItems.size}")
-
         val extractionJobs = mutableListOf<kotlinx.coroutines.Deferred<Unit>>()
 
         coroutineScope {
             for (option in mirrorOptions) {
                 val value = option.attr("value").trim()
-                val label = option.text().trim()
-                Log.e("ChikiDBG", "mirror option: label='$label' valueLen=${value.length}")
                 if (value.isNotBlank()) {
                     val job = async {
                         if (value.startsWith("http") || value.startsWith("//")) {
                             handleUrl(value, data)
                         } else {
                             val decoded = safeBase64Decode(value)
-                            if (!decoded.isNullOrBlank()) {
-                                Log.e("ChikiDBG", "  decoded base64 (${decoded.length} bytes)")
-                                processDecodedHtml(decoded, data)
-                            } else {
-                                Log.e("ChikiDBG", "  base64 decode FAILED for option value")
-                            }
+                            if (!decoded.isNullOrBlank()) processDecodedHtml(decoded, data)
                         }
                         Unit
                     }
@@ -635,11 +533,8 @@ class ChikiAnimationProvider : MainAPI() {
                         } else if (videoAttr.length > 20) {
                             val decoded = safeBase64Decode(videoAttr)
                             if (!decoded.isNullOrBlank()) {
-                                if (decoded.startsWith("http")) {
-                                    handleUrl(decoded, data)
-                                } else {
-                                    processDecodedHtml(decoded, data)
-                                }
+                                if (decoded.startsWith("http")) handleUrl(decoded, data)
+                                else processDecodedHtml(decoded, data)
                             }
                         }
                         Unit
@@ -651,20 +546,13 @@ class ChikiAnimationProvider : MainAPI() {
             extractionJobs.awaitAll()
         }
 
-        Log.e("ChikiDBG", "all extraction jobs done. emitCount=${emitCount.get()} foundFlag=${foundFlag.get()}")
-
-        if (foundFlag.get() == 0) {
-            Log.e("ChikiDBG", "no links from mirrors, scanning document iframes as fallback")
+        if (emitCount.get() == 0) {
             document.select("iframe").forEach { iframe ->
                 val src = getIframeSrc(iframe)
-                if (src.isNotBlank()) {
-                    Log.e("ChikiDBG", "  fallback iframe: ${src.take(100)}")
-                    handleUrl(src, data)
-                }
+                if (src.isNotBlank()) handleUrl(src, data)
             }
         }
 
-        Log.e("ChikiDBG", "========== loadLinks END: emitted ${emitCount.get()} links ==========")
         return emitCount.get() > 0
     }
 }
