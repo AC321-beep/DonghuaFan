@@ -148,9 +148,6 @@ class GalaxyDonghua : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // ═══════════════════════════════════════════════════════════════════
-        // VERIFY_3 — entry into GalaxyDonghua.getUrl
-        // ═══════════════════════════════════════════════════════════════════
         Log.e("VERIFY_3", "GalaxyDonghua.getUrl ENTERED url=$url")
 
         val gxBase = embedHost(url)
@@ -541,15 +538,12 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  Emit streams from JSON — VERIFY_4 entry checkpoint + per-entry logs
+    //  Emit streams from JSON — subtitle labels are now unique per track
     // ═══════════════════════════════════════════════════════════════════════════
     private suspend fun emitStreams(
         json: String, gxBase: String, fallbackEmbedUrl: String, globalCookies: Map<String, String>,
         callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit
     ) {
-        // ═══════════════════════════════════════════════════════════════════
-        // VERIFY_4 — entry into emitStreams
-        // ═══════════════════════════════════════════════════════════════════
         Log.e("VERIFY_4", "emitStreams ENTERED jsonLen=${json.length}")
 
         if (!json.trimStart().startsWith("{")) return
@@ -573,37 +567,18 @@ class GalaxyDonghua : ExtractorApi() {
         val cookieStr = globalCookies.map { "${it.key}=${it.value}" }.joinToString("; ")
         if (cookieStr.isNotEmpty()) ph["Cookie"] = cookieStr
 
-        var subCount = 0
+        var subIndex = 0
         var vidCount = 0
 
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
             val raw = m.groupValues[1]
-            val abs = fixStreamUrl(raw.replace("\\/", "/"), baseURL)
-            Log.e("VERIFY_4", "RAW='$raw'")
-            Log.e("VERIFY_4", "ABS='$abs'")
-
-            if (abs == null) {
-                Log.e("VERIFY_4", "  -> fixStreamUrl returned null, skipping")
-                continue
-            }
+            val abs = fixStreamUrl(raw.replace("\\/", "/"), baseURL) ?: continue
 
             val isSub = abs.contains(".vtt", true) || abs.contains(".srt", true)
-            Log.e("VERIFY_4", "  isSub=$isSub")
-
             if (isSub) {
-                subCount++
-                try {
-                    val probe = app.get(abs, headers = ph)
-                    Log.e("VERIFY_4", "  PROBE code=${probe.code} ctype='${probe.headers["Content-Type"]}'")
-                    Log.e("VERIFY_4", "  PROBE finalUrl='${probe.url}'")
-                    Log.e("VERIFY_4", "  PROBE bodyLen=${probe.text.length}")
-                    Log.e("VERIFY_4", "  PROBE bodyHead='${probe.text.take(80).replace("\n", "\\n")}'")
-                } catch (e: Exception) {
-                    Log.e("VERIFY_4", "  PROBE EXCEPTION: ${e::class.java.simpleName}: ${e.message}")
-                }
-
-                Log.e("VERIFY_4", "  EMIT SubtitleFile(lang='Subtitle', url='$abs')")
-                subtitleCallback.invoke(SubtitleFile("Subtitle", abs))
+                subIndex++
+                Log.e("VERIFY_4", "  EMIT SubtitleFile(lang='Subtitle $subIndex', url='$abs')")
+                subtitleCallback.invoke(SubtitleFile("Subtitle $subIndex", abs))
                 continue
             }
 
@@ -621,7 +596,7 @@ class GalaxyDonghua : ExtractorApi() {
             })
         }
 
-        Log.e("VERIFY_4", "=== emitStreams end: $vidCount videos, $subCount subtitles ===")
+        Log.e("VERIFY_4", "=== emitStreams end: $vidCount videos, $subIndex subtitles ===")
     }
 
     private fun fixStreamUrl(url: String, base: String): String? {
