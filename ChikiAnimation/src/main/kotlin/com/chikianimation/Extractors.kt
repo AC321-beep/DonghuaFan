@@ -9,9 +9,15 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URI
+import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.SecretKeyFactory
@@ -130,9 +136,9 @@ class SkylineAI : ExtractorApi() {
 //   • Method: POST / text/plain, body = window.kaken
 //   • Decryption: PBEKeySpec (PBKDF2-HMAC-SHA256, 10k iter, 48 bytes)
 //   • Referer for /hls/ MUST be the dynamic embed_url from the API JSON
-//     (the pre-token /embed/<short-id> referer gets a 404)
-//   • /subtitle/ is NOT gated: it 302-redirects to a public
-//     /uploads/subtitles/tmp/*.cache file. Raw URL works as-is.
+//   • /subtitle/ is public: 302 → /uploads/subtitles/tmp/*.cache
+//   • Subtitle labels: real language names, sniffed from the VTT body;
+//     first 4 completions emitted synchronously, rest stream in as they land.
 // ═══════════════════════════════════════════════════════════════════════════
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
@@ -506,7 +512,51 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    //  Language sniffer for the VTT body
+    // ═══════════════════════════════════════════════════════════════════════════
+    private fun detectLanguage(vtt: String): String? {
+        val sample = vtt.lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .filterNot { it.startsWith("WEBVTT") }
+            .filterNot { it.contains("-->") }
+            .firstOrNull { line ->
+                !line.all { c -> c.isDigit() || c == ':' || c == '.' || c == ',' || c == '-' || c == ' ' }
+            } ?: return null
+
+        return when {
+            sample.any { it.code in 0x0600..0x06FF } -> "Arabic"
+            sample.any { it.code in 0x0980..0x09FF } -> "Bengali"
+            sample.any { it.code in 0x0E00..0x0E7F } -> "Thai"
+            sample.any { it.code in 0x1000..0x109F } -> "Burmese"
+            sample.any { it.code in 0x1780..0x17FF } -> "Khmer"
+            sample.any { it.code in 0x0D80..0x0DFF } -> "Sinhala"
+            sample.any { it.code in 0x0900..0x097F } -> "Hindi"
+            sample.any { it.code in 0x0400..0x04FF } -> "Russian"
+            sample.any { it.code in 0x0370..0x03FF } -> "Greek"
+            sample.any { it.code in 0x0590..0x05FF } -> "Hebrew"
+            sample.any { it.code in 0x0E80..0x0EFF } -> "Lao"
+            sample.any { it.code in 0x10A0..0x10FF } -> "Georgian"
+            sample.any { it.code in 0x0530..0x058F } -> "Armenian"
+            sample.any { it.code in 0x3040..0x30FF } -> "Japanese"
+            sample.any { it.code in 0x4E00..0x9FFF } -> "Chinese"
+            sample.any { it.code in 0xAC00..0xD7AF } -> "Korean"
+            sample.any { it in "ăâđêôơưĂÂĐÊÔƠƯ" } -> "Vietnamese"
+            sample.any { it in "łŁęĘąĄśŚćĆźŹżŻ" } -> "Polish"
+            sample.any { it in "ıİşŞğĞ" } -> "Turkish"
+            sample.contains('ß') || sample.contains('ẞ') -> "German"
+            sample.any { it in "ãÃõÕ" } -> "Portuguese"
+            sample.any { it in "ñÑ¿¡" } -> "Spanish"
+            sample.any { it in "àâçéèêëîïôùûüÿœæÀÂÇÉÈÊËÎÏÔÙÛŒÆ" } -> "French"
+            else -> null
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     //  Emit streams from JSON
+    //   • Videos emitted immediately
+    //   • Subtitles fetched in parallel; first 4 completions emitted
+    //     synchronously, remaining 16 stream in via a background coroutine
     // ═══════════════════════════════════════════════════════════════════════════
     private suspend fun emitStreams(
         json: String, gxBase: String, fallbackEmbedUrl: String, globalCookies: Map<String, String>,
@@ -533,7 +583,9 @@ class GalaxyDonghua : ExtractorApi() {
         val cookieStr = globalCookies.map { "${it.key}=${it.value}" }.joinToString("; ")
         if (cookieStr.isNotEmpty()) ph["Cookie"] = cookieStr
 
-        var subIndex = 0
+        // Sort JSON entries into video URLs and subtitle URLs
+        val videoUrls = mutableListOf<Pair<String, Boolean>>() // url to isM3u8
+        val subUrls = mutableListOf<String>()
 
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
             val raw = m.groupValues[1]
@@ -541,21 +593,68 @@ class GalaxyDonghua : ExtractorApi() {
 
             val isSub = abs.contains(".vtt", true) || abs.contains(".srt", true)
             if (isSub) {
-                subIndex++
-                subtitleCallback.invoke(SubtitleFile("Subtitle $subIndex", abs))
+                subUrls.add(abs)
                 continue
             }
-
             val isM3u8 = abs.contains(".m3u8", true) || abs.contains("hls", true) ||
                          !abs.contains(".mp4", true)
-            if (!isM3u8 && !abs.contains(".mp4", true)) continue
+            if (isM3u8 || abs.contains(".mp4", true)) videoUrls.add(abs to isM3u8)
+        }
 
-            callback.invoke(newExtractorLink(this.name, this.name, abs,
+        // Emit videos immediately
+        for ((url, isM3u8) in videoUrls) {
+            callback.invoke(newExtractorLink(this.name, this.name, url,
                 if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
                 this.referer = dynamicEmbedUrl
                 this.quality = Qualities.Unknown.value
                 this.headers = ph
             })
+        }
+
+        if (subUrls.isEmpty()) return
+
+        // ─── Subtitle fan-out with completion-order emission ───
+        val sniffHeaders = ph + mapOf("Range" to "bytes=0-400")
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val channel = Channel<Pair<String, String>>(Channel.UNLIMITED)
+        val pending = AtomicInteger(subUrls.size)
+
+        // Fan out: each fetch sends (label, url) to the channel as soon as it finishes.
+        // The last one to finish closes the channel.
+        subUrls.forEachIndexed { idx, url ->
+            scope.launch {
+                try {
+                    val label = try {
+                        val resp = app.get(url, headers = sniffHeaders)
+                        detectLanguage(resp.text) ?: "Subtitle ${idx + 1}"
+                    } catch (_: Exception) {
+                        "Subtitle ${idx + 1}"
+                    }
+                    channel.send(label to url)
+                } finally {
+                    if (pending.decrementAndGet() == 0) channel.close()
+                }
+            }
+        }
+
+        // Fast path: emit the first 4 completions synchronously
+        val fastCount = minOf(4, subUrls.size)
+        repeat(fastCount) {
+            try {
+                val (label, url) = channel.receive()
+                subtitleCallback.invoke(SubtitleFile(label, url))
+            } catch (_: Exception) {}
+        }
+
+        // Background path: remaining subtitles stream in as they finish
+        if (subUrls.size > fastCount) {
+            scope.launch {
+                for ((label, url) in channel) {
+                    try {
+                        subtitleCallback.invoke(SubtitleFile(label, url))
+                    } catch (_: Exception) {}
+                }
+            }
         }
     }
 
