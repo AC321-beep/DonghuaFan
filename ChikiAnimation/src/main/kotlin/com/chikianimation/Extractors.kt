@@ -747,6 +747,7 @@ class GalaxyDonghua : ExtractorApi() {
         // ═══════════════════════════════════════════════════════════════════════════
         //  PROBE VERIFICATION & AUTO-ADAPTATION
         // ═══════════════════════════════════════════════════════════════════════════
+        var paddedSelected = false
         val firstRaw = Regex("""["']file["']\s*:\s*["']([^"']+)["']""")
             .find(json)?.groupValues?.get(1)?.replace("\\/", "/")
             
@@ -756,7 +757,6 @@ class GalaxyDonghua : ExtractorApi() {
                 var code = try { app.get(firstAbs, headers = ph).code } catch (e: Exception) { -1 }
                 Log.e(TAG, "[EMIT] PROBE primary: code=$code referer=$activeReferer")
 
-                // If primary probe does not get HTTP 200..299, test alternative configurations
                 if (code !in 200..299) {
                     // Test 1: Try fallbackEmbedUrl as Referer
                     if (dynamicEmbedUrl != fallbackEmbedUrl) {
@@ -791,6 +791,19 @@ class GalaxyDonghua : ExtractorApi() {
                             code = c3
                         }
                     }
+
+                    // Test 4: Try with `,,` normalized to base64 `==`
+                    if (code !in 200..299) {
+                        val paddedUrl = firstAbs.replace(",,", "==").replace(",", "=")
+                        if (paddedUrl != firstAbs) {
+                            val c4 = try { app.get(paddedUrl, headers = ph).code } catch (_: Exception) { -1 }
+                            Log.e(TAG, "[EMIT] PROBE test [padded ==]: code=$c4")
+                            if (c4 in 200..299) {
+                                paddedSelected = true
+                                code = c4
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -800,7 +813,11 @@ class GalaxyDonghua : ExtractorApi() {
             val raw = m.groupValues[1]
             val normalized = raw.replace("\\/", "/")
 
-            val abs = fixStreamUrl(normalized, baseURL) ?: continue
+            var abs = fixStreamUrl(normalized, baseURL) ?: continue
+            if (paddedSelected) {
+                abs = abs.replace(",,", "==").replace(",", "=")
+            }
+
             val isSub = abs.contains(".vtt", true) || abs.contains(".srt", true)
             val isM3u8 = abs.contains(".m3u8", true) || abs.contains("hls", true) ||
                          (!isSub && !abs.contains(".mp4", true))
