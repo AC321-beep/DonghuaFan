@@ -52,12 +52,27 @@ class AnimekhorProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = "$mainUrl/${request.data.replace("anime/?", "anime/page/$page/?")}"
-        val document = app.get(url, headers = defaultHeaders).document
-        val home = document
-            .select(cardSelector)
-            .mapNotNull { it.toSearchResult() }
-            .distinctBy { it.url }
+        // Page 1: base URL as-is.
+        // Page 2+: insert /page/N/ after the archive slug.
+        val url = if (page <= 1) {
+            "$mainUrl/${request.data}"
+        } else {
+            "$mainUrl/${request.data.replace("anime/?", "anime/page/$page/?")}"
+        }
+
+        val home: List<SearchResponse> = try {
+            withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
+                app.get(url, headers = defaultHeaders).document
+                    .select(cardSelector)
+                    .mapNotNull { it.toSearchResult() }
+                    .distinctBy { it.url }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        } ?: emptyList()
+
         return newHomePageResponse(request.name, home)
     }
 
