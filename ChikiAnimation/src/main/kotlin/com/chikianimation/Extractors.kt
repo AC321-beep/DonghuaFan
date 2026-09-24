@@ -169,6 +169,29 @@ class GalaxyDonghua : ExtractorApi() {
             return
         }
 
+        // ─── SkylineAI-style subtitle extraction on the embed page HTML ───
+        org.jsoup.Jsoup.parse(page).select("track").forEach { track ->
+            val src = track.attr("src")
+            val label = track.attr("label").ifBlank { "Subtitle" }
+            if (src.isNotBlank() && (src.contains(".vtt", true) || src.contains(".srt", true))) {
+                subtitleCallback.invoke(SubtitleFile(label, fixStreamUrl(src, gxBase) ?: return@forEach))
+            }
+        }
+
+        Regex("""\{([^}]+)\}""").findAll(page).forEach { match ->
+            val block = match.groupValues[1]
+            if (block.contains(".vtt", true) || block.contains(".srt", true)) {
+                val file = Regex("""(?:file|src|url)["']?\s*:\s*["']([^"']+\.(?:vtt|srt)[^"']*)["']""")
+                    .find(block)?.groupValues?.get(1)
+                if (file != null) {
+                    val label = Regex("""label["']?\s*:\s*["']([^"']+)["']""")
+                        .find(block)?.groupValues?.get(1) ?: "Subtitle"
+                    val resolved = fixStreamUrl(file, gxBase)
+                    if (resolved != null) subtitleCallback.invoke(SubtitleFile(label, resolved))
+                }
+            }
+        }
+
         val vid = Regex("""const[ \t]+VID_SRC[ \t]*=[ \t]*["']([^"']+)["']""").find(page)
         if (vid != null && vid.groupValues[1].isNotBlank()) {
             val su = vid.groupValues[1].replace("\\/", "/")
@@ -499,7 +522,11 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  Emit streams — subtitles get "Subtitle 1", "Subtitle 2", … as unique labels
+    //  Emit streams from JSON
+    //   • Subtitles: SkylineAI-style extraction on the decrypted JSON string
+    //     (Jsoup <track> parse + JSON-block regex; labels from `label` field
+    //     if present, else "Subtitle")
+    //   • Videos: emitted from the same JSON, subtitle URLs skipped
     // ═══════════════════════════════════════════════════════════════════════════
     private suspend fun emitStreams(
         json: String, gxBase: String, fallbackEmbedUrl: String, globalCookies: Map<String, String>,
@@ -526,18 +553,38 @@ class GalaxyDonghua : ExtractorApi() {
         val cookieStr = globalCookies.map { "${it.key}=${it.value}" }.joinToString("; ")
         if (cookieStr.isNotEmpty()) ph["Cookie"] = cookieStr
 
-        var subIndex = 0
+        // ─── SkylineAI-style subtitle extraction on the JSON string ───
+        org.jsoup.Jsoup.parse(json).select("track").forEach { track ->
+            val src = track.attr("src")
+            val label = track.attr("label").ifBlank { "Subtitle" }
+            if (src.isNotBlank() && (src.contains(".vtt", true) || src.contains(".srt", true))) {
+                val resolved = fixStreamUrl(src, baseURL)
+                if (resolved != null) subtitleCallback.invoke(SubtitleFile(label, resolved))
+            }
+        }
 
+        Regex("""\{([^}]+)\}""").findAll(json).forEach { match ->
+            val block = match.groupValues[1]
+            if (block.contains(".vtt", true) || block.contains(".srt", true)) {
+                val file = Regex("""(?:file|src|url)["']?\s*:\s*["']([^"']+\.(?:vtt|srt)[^"']*)["']""")
+                    .find(block)?.groupValues?.get(1)
+                if (file != null) {
+                    val label = Regex("""label["']?\s*:\s*["']([^"']+)["']""")
+                        .find(block)?.groupValues?.get(1) ?: "Subtitle"
+                    val resolved = fixStreamUrl(file, baseURL)
+                    if (resolved != null) subtitleCallback.invoke(SubtitleFile(label, resolved))
+                }
+            }
+        }
+
+        // ─── Video emission ───
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
             val raw = m.groupValues[1]
             val abs = fixStreamUrl(raw.replace("\\/", "/"), baseURL) ?: continue
 
+            // Subtitles were handled above
             val isSub = abs.contains(".vtt", true) || abs.contains(".srt", true)
-            if (isSub) {
-                subIndex++
-                subtitleCallback.invoke(SubtitleFile("Subtitle $subIndex", abs))
-                continue
-            }
+            if (isSub) continue
 
             val isM3u8 = abs.contains(".m3u8", true) || abs.contains("hls", true) ||
                          !abs.contains(".mp4", true)
