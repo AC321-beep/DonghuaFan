@@ -127,13 +127,6 @@ class SkylineAI : ExtractorApi() {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  GalaxyDonghua Extractor
-//   • URL: atob(apx).replace('-config', '') + '?p=' + ps
-//   • Method: POST / text/plain, body = window.kaken
-//   • Decryption: PBEKeySpec (PBKDF2-HMAC-SHA256, 10k iter, 48 bytes)
-//   • Referer for /hls/ MUST be the dynamic embed_url from the API JSON
-//     (the pre-token /embed/<short-id> referer gets a 404)
-//   • /subtitle/ is NOT gated: it 302-redirects to a public
-//     /uploads/subtitles/tmp/*.cache file. Raw URL works as-is.
 // ═══════════════════════════════════════════════════════════════════════════
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
@@ -155,6 +148,11 @@ class GalaxyDonghua : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        // ═══════════════════════════════════════════════════════════════════
+        // VERIFY_3 — entry into GalaxyDonghua.getUrl
+        // ═══════════════════════════════════════════════════════════════════
+        Log.e("VERIFY_3", "GalaxyDonghua.getUrl ENTERED url=$url")
+
         val gxBase = embedHost(url)
         val headers = mapOf(
             "User-Agent" to UA,
@@ -169,19 +167,20 @@ class GalaxyDonghua : ExtractorApi() {
 
         val globalCookies = mutableMapOf<String, String>()
 
-        // GET the embed page
         val page = try {
             val r = app.get(url, headers = headers)
             globalCookies.putAll(r.cookies)
+            Log.e("VERIFY_3", "embed GET code=${r.code} len=${r.text.length}")
             r.text
         } catch (e: Exception) {
+            Log.e("VERIFY_3", "embed GET EXCEPTION: ${e.message}")
             return
         }
 
-        // VID_SRC short-circuit (some pages embed the stream directly)
         val vid = Regex("""const[ \t]+VID_SRC[ \t]*=[ \t]*["']([^"']+)["']""").find(page)
         if (vid != null && vid.groupValues[1].isNotBlank()) {
             val su = vid.groupValues[1].replace("\\/", "/")
+            Log.e("VERIFY_3", "VID_SRC short-circuit: $su")
             val isM3u8 = su.contains(".m3u8") || su.contains("hls")
             callback.invoke(newExtractorLink(this.name, this.name, su,
                 if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
@@ -192,27 +191,40 @@ class GalaxyDonghua : ExtractorApi() {
             return
         }
 
-        // Candidate embed URLs
         val candidates = Regex("""data-url=["']([^"']+)["']""").findAll(page)
             .map { it.groupValues[1] }
             .map { if (it.startsWith("/")) gxBase + it else it }
             .distinct().toList().ifEmpty { listOf(url) }
 
-        for (target in candidates) {
+        Log.e("VERIFY_3", "candidates size=${candidates.size}")
+
+        for ((idx, target) in candidates.withIndex()) {
+            Log.e("VERIFY_3", "candidate[$idx] = $target")
             val sp = try {
                 val r = app.get(target, headers = headers)
                 globalCookies.putAll(r.cookies)
+                Log.e("VERIFY_3", "  target GET code=${r.code} len=${r.text.length}")
                 r.text
             } catch (e: Exception) {
+                Log.e("VERIFY_3", "  target GET EXCEPTION: ${e.message}")
                 continue
             }
 
-            val tokens = decodeGdTokens(sp) ?: continue
+            val tokens = decodeGdTokens(sp)
+            Log.e("VERIFY_3", "  decodeGdTokens=${if (tokens == null) "null" else "ok"}")
+            if (tokens == null) continue
 
-            val json = fetchAndDecryptApi(tokens, gxBase, target, globalCookies) ?: continue
+            val json = fetchAndDecryptApi(tokens, gxBase, target, globalCookies)
+            Log.e("VERIFY_3", "  fetchAndDecryptApi=${if (json == null) "null" else "ok len=${json.length}"}")
+            if (json == null) continue
+
+            Log.e("VERIFY_3", "  calling emitStreams")
             emitStreams(json, gxBase, target, globalCookies, callback, subtitleCallback)
+            Log.e("VERIFY_3", "  emitStreams returned")
             return
         }
+
+        Log.e("VERIFY_3", "getUrl fell through (no emit)")
     }
 
     private fun absolutize(src: String, base: String): String = when {
@@ -222,9 +234,6 @@ class GalaxyDonghua : ExtractorApi() {
         else -> base.trimEnd('/') + "/" + src
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  API call — mirrors the site's loadSources() exactly
-    // ═══════════════════════════════════════════════════════════════════════════
     private suspend fun fetchAndDecryptApi(
         tokens: GdTokens,
         gxBase: String,
@@ -256,7 +265,6 @@ class GalaxyDonghua : ExtractorApi() {
         val cookieStr = globalCookies.map { "${it.key}=${it.value}" }.joinToString("; ")
         if (cookieStr.isNotEmpty()) apiHeaders["Cookie"] = cookieStr
 
-        // Config warm-up
         val configUrl = "$gxBase/api-config/${tokens.qsx}?p=${tokens.ps}&_=${System.currentTimeMillis()}"
         try {
             val rConf = app.get(configUrl, headers = apiHeaders)
@@ -275,25 +283,34 @@ class GalaxyDonghua : ExtractorApi() {
             globalCookies.putAll(rApi.cookies)
             rApi.text.trim()
         } catch (e: Exception) {
+            Log.e("VERIFY_3", "  API POST EXCEPTION: ${e.message}")
             return null
         }
 
+        Log.e("VERIFY_3", "  API POST respLen=${respBody.length}")
         if (respBody.length < 60) return null
 
-        if (respBody.trimStart().startsWith("{") && respBody.contains("\"file\"")) return respBody
+        if (respBody.trimStart().startsWith("{") && respBody.contains("\"file\"")) {
+            Log.e("VERIFY_3", "  plain JSON path")
+            return respBody
+        }
 
         val p1 = decryptDcx(respBody, tokens.pd)
-        if (p1 != null && p1.trimStart().startsWith("{")) return p1
+        if (p1 != null && p1.trimStart().startsWith("{")) {
+            Log.e("VERIFY_3", "  decryptDcx OK len=${p1.length}")
+            return p1
+        }
 
         val p2 = decryptGdPayload(respBody, tokens.pd)
-        if (p2 != null && p2.trimStart().startsWith("{")) return p2
+        if (p2 != null && p2.trimStart().startsWith("{")) {
+            Log.e("VERIFY_3", "  decryptGdPayload OK len=${p2.length}")
+            return p2
+        }
 
+        Log.e("VERIFY_3", "  all decryptors failed")
         return null
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  Decryptors
-    // ═══════════════════════════════════════════════════════════════════════════
     private fun decryptDcx(encryptedBase64: String, password: String): String? {
         return try {
             var s = encryptedBase64.trim().replace(",,", "==").replace(",", "=")
@@ -347,9 +364,6 @@ class GalaxyDonghua : ExtractorApi() {
         return out.copyOfRange(0, dkLen)
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    //  Token extraction (JSFuck / Hieroglyphy decoding)
-    // ═══════════════════════════════════════════════════════════════════════════
     private data class GdTokens(
         val pd: String, val ps: String, val qsx: String,
         val kaken: String, val apx: String
@@ -527,18 +541,18 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  Emit streams from JSON — with debug logging
+    //  Emit streams from JSON — VERIFY_4 entry checkpoint + per-entry logs
     // ═══════════════════════════════════════════════════════════════════════════
     private suspend fun emitStreams(
         json: String, gxBase: String, fallbackEmbedUrl: String, globalCookies: Map<String, String>,
         callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit
     ) {
-        val TAG = "ChikiSubDBG"
-        Log.e(TAG, "=== emitStreams start ===")
-        if (!json.trimStart().startsWith("{")) {
-            Log.e(TAG, "JSON is not object: ${json.take(50)}")
-            return
-        }
+        // ═══════════════════════════════════════════════════════════════════
+        // VERIFY_4 — entry into emitStreams
+        // ═══════════════════════════════════════════════════════════════════
+        Log.e("VERIFY_4", "emitStreams ENTERED jsonLen=${json.length}")
+
+        if (!json.trimStart().startsWith("{")) return
 
         val baseURL = Regex("[\"']baseUrl[\"'][ \t]*:[ \t]*[\"']([^\"']+)[\"']")
             .find(json)?.groupValues?.get(1) ?: gxBase
@@ -565,32 +579,30 @@ class GalaxyDonghua : ExtractorApi() {
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
             val raw = m.groupValues[1]
             val abs = fixStreamUrl(raw.replace("\\/", "/"), baseURL)
-            Log.e(TAG, "RAW='$raw'")
-            Log.e(TAG, "ABS='$abs'")
+            Log.e("VERIFY_4", "RAW='$raw'")
+            Log.e("VERIFY_4", "ABS='$abs'")
 
             if (abs == null) {
-                Log.e(TAG, "  -> fixStreamUrl returned null, skipping")
+                Log.e("VERIFY_4", "  -> fixStreamUrl returned null, skipping")
                 continue
             }
 
             val isSub = abs.contains(".vtt", true) || abs.contains(".srt", true)
-            Log.e(TAG, "  isSub=$isSub")
+            Log.e("VERIFY_4", "  isSub=$isSub")
 
             if (isSub) {
                 subCount++
-
-                // Probe: pre-fetch the subtitle URL with OkHttp
                 try {
                     val probe = app.get(abs, headers = ph)
-                    Log.e(TAG, "  PROBE code=${probe.code} ctype='${probe.headers["Content-Type"]}'")
-                    Log.e(TAG, "  PROBE finalUrl='${probe.url}'")
-                    Log.e(TAG, "  PROBE bodyLen=${probe.text.length}")
-                    Log.e(TAG, "  PROBE bodyHead='${probe.text.take(80).replace("\n", "\\n")}'")
+                    Log.e("VERIFY_4", "  PROBE code=${probe.code} ctype='${probe.headers["Content-Type"]}'")
+                    Log.e("VERIFY_4", "  PROBE finalUrl='${probe.url}'")
+                    Log.e("VERIFY_4", "  PROBE bodyLen=${probe.text.length}")
+                    Log.e("VERIFY_4", "  PROBE bodyHead='${probe.text.take(80).replace("\n", "\\n")}'")
                 } catch (e: Exception) {
-                    Log.e(TAG, "  PROBE EXCEPTION: ${e::class.java.simpleName}: ${e.message}")
+                    Log.e("VERIFY_4", "  PROBE EXCEPTION: ${e::class.java.simpleName}: ${e.message}")
                 }
 
-                Log.e(TAG, "  EMIT SubtitleFile(lang='Subtitle', url='$abs')")
+                Log.e("VERIFY_4", "  EMIT SubtitleFile(lang='Subtitle', url='$abs')")
                 subtitleCallback.invoke(SubtitleFile("Subtitle", abs))
                 continue
             }
@@ -600,7 +612,7 @@ class GalaxyDonghua : ExtractorApi() {
             if (!isM3u8 && !abs.contains(".mp4", true)) continue
 
             vidCount++
-            Log.e(TAG, "  EMIT video: $abs (m3u8=$isM3u8)")
+            Log.e("VERIFY_4", "  EMIT video: $abs (m3u8=$isM3u8)")
             callback.invoke(newExtractorLink(this.name, this.name, abs,
                 if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
                 this.referer = dynamicEmbedUrl
@@ -609,7 +621,7 @@ class GalaxyDonghua : ExtractorApi() {
             })
         }
 
-        Log.e(TAG, "=== emitStreams end: $vidCount videos, $subCount subtitles ===")
+        Log.e("VERIFY_4", "=== emitStreams end: $vidCount videos, $subCount subtitles ===")
     }
 
     private fun fixStreamUrl(url: String, base: String): String? {
