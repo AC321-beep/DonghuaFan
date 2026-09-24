@@ -222,7 +222,12 @@ class GalaxyDonghua : ExtractorApi() {
                 Log.e(TAG, "[STEP 8 ERR] ${e.message}"); continue
             }
 
-            val tokens = decodeGdTokens(sp) ?: continue
+            val tokens = decodeGdTokens(sp) ?: run {
+                Log.e(TAG, "[TOK] decode returned null")
+                null
+            } ?: continue
+
+            Log.e(TAG, "[TOK] PD=${tokens.pd.take(20)}… PS.len=${tokens.ps.length} QSX.len=${tokens.qsx.length} KAKEN.len=${tokens.kaken.length} UT.len=${tokens.utekmek.length}")
 
             val json = fetchAndDecryptApi(tokens, headers, gxBase, target, playerJs, cryptoJs, globalCookies)
             if (json != null) {
@@ -317,7 +322,6 @@ class GalaxyDonghua : ExtractorApi() {
         val currentCookieStr = globalCookies.map { "${it.key}=${it.value}" }.joinToString("; ")
         if (currentCookieStr.isNotEmpty()) apiHeaders["Cookie"] = currentCookieStr
 
-        // Config warm-up (Collects API Cookies)
         val configUrl = "$gxBase/api-config/${tokens.qsx}?p=${tokens.ps}&_=${System.currentTimeMillis()}"
         try {
             val rConf = app.get(configUrl, headers = apiHeaders)
@@ -478,6 +482,32 @@ class GalaxyDonghua : ExtractorApi() {
         return Regex("\\b(?:$alt)\\b").replace(payload) { m -> map[m.value] ?: m.value }
     }
 
+    // ─── Paren-aware splitter (RESTORED — the Gemini regex replacement broke token decoding) ───
+    private fun splitTopLevelTerms(s: String): List<String> {
+        val terms = mutableListOf<String>(); var depth = 0; var cur = StringBuilder()
+        for (ch in s) when (ch) {
+            '(' -> { depth++; cur.append(ch) }
+            ')' -> { depth--; cur.append(ch) }
+            '+', '-' -> if (depth == 0) {
+                if (cur.isNotBlank()) terms.add(cur.toString())
+                cur = StringBuilder().append(ch)
+            } else cur.append(ch)
+            else -> cur.append(ch)
+        }
+        if (cur.isNotBlank()) terms.add(cur.toString())
+        return terms.filter { it != "+" && it != "-" }
+    }
+
+    // ─── Constant substitution (RESTORED as its own function) ───
+    private fun stripConstants(s: String): String {
+        var t = s
+        for ((k, v) in listOf(
+            "(c^_^o)" to "0", "(o^_^o)" to "3", "(ﾟΘﾟ)" to "1", "(ﾟｰﾟ)" to "4",
+            "c^_^o" to "0", "o^_^o" to "3", "ﾟΘﾟ" to "1", "ﾟｰﾟ" to "4"
+        )) t = t.replace(k, v)
+        return t
+    }
+
     private fun decodeGdTokens(page: String): GdTokens? {
         fun extractSmartJs(n: String, text: String): String {
             Regex("""(?:var\s+|let\s+|const\s+)?\b${Regex.escape(n)}\b\s*=\s*atob\s*\(\s*["']([^"']+)["']\s*\)""").find(text)?.let { return it.groupValues[1].trim() }
@@ -498,7 +528,8 @@ class GalaxyDonghua : ExtractorApi() {
                 ?: Regex("\\)[ \t]*\\([ \t]*'_'[ \t]*\\)").find(page, jStart)
             if (endMatch != null) {
                 val raw = page.substring(jStart, endMatch.range.last + 1)
-                    .replace(Regex("[ \u00a0\u3000\t\n\r]"), "")
+                    .replace(" ", "").replace("\u00a0", "").replace("\u3000", "")
+                    .replace("\t", "").replace("\n", "").replace("\r", "")
                 val bStart = raw.indexOf("(ﾟεﾟ+")
                 if (bStart >= 0) {
                     val bodyStart = raw.indexOf("*/", bStart).let { if (it >= 0) it + 2 else bStart + 5 }
@@ -508,20 +539,13 @@ class GalaxyDonghua : ExtractorApi() {
                     val segs = body.split("(ﾟДﾟ)[ﾟεﾟ]")
                     val sb = StringBuilder()
                     for (i in 1 until segs.size) {
-                        val s = segs[i]
-                            .replace("(c^_^o)", "0")
-                            .replace("(o^_^o)", "3")
-                            .replace("(ﾟΘﾟ)", "1")
-                            .replace("(ﾟｰﾟ)", "4")
-                            .replace("c^_^o", "0")
-                            .replace("o^_^o", "3")
-                            .replace("ﾟΘﾟ", "1")
-                            .replace("ﾟｰﾟ", "4")
-                            .trim().trimStart('+').trimEnd('+')
+                        val s = stripConstants(segs[i]).trim().trimStart('+').trimEnd('+')
                         val digits = StringBuilder()
-                        for (term in s.split(Regex("(?<=[^+\\-(*/])\\+|-(?=[^+*/\\-])")).filter { it.isNotBlank() }) {
-                            val v = abs(evalArithmetic(term.trimStart('+')) ?: 0)
-                            if (v in 0..7) digits.append(v)
+                        for (term in splitTopLevelTerms(s)) {
+                            val t = term.trim()
+                            val rv = if (t.startsWith("-")) -(evalArithmetic(t.substring(1)) ?: 0)
+                                     else evalArithmetic(t.trimStart('+')) ?: 0
+                            val v = abs(rv); if (v in 0..7) digits.append(v)
                         }
                         if (digits.isNotEmpty()) sb.append(digits.toString().toInt(8).toChar())
                     }
@@ -622,7 +646,7 @@ class GalaxyDonghua : ExtractorApi() {
 
         var activeReferer = dynamicEmbedUrl
 
-        // ─── NEW: Visit the fresh embed_url and log what it returns ───
+        // ─── Visit the fresh embed_url and log what it returns ───
         try {
             val r = app.get(dynamicEmbedUrl, headers = mapOf(
                 "User-Agent" to UA,
@@ -708,7 +732,7 @@ class GalaxyDonghua : ExtractorApi() {
                         }
                     }
 
-                    // Test 4: base64 padding in PATH ONLY (query string untouched)
+                    // Test 4: base64 padding in PATH ONLY
                     if (code !in 200..299) {
                         val paddedUrl = padPathOnly(firstAbs)
                         if (paddedUrl != firstAbs) {
