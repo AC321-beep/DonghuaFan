@@ -26,20 +26,15 @@ class AnimekhorProvider : MainAPI() {
         const val PAGE_FETCH_TIMEOUT_MS = 15_000L
     }
 
-    // ---- Browser-mimic headers ----
-    // Cloudflare silently blocks requests whose headers don't look like a real
-    // browser (it isn't a captcha — a browser passes automatically, OkHttp
-    // doesn't). Sending these on every request keeps us off the bot list.
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         "Referer" to mainUrl,
         "Origin" to mainUrl
     )
 
-    // The site wraps <article> inside intermediate containers (excstf,
-    // popconslide, tab-pane), so descendant selectors are required — the old
-    // direct-child selector `div.listupd > article` now matches nothing.
-    private val cardSelector = "div.listupd article, div.listupd .bsx, div.bsx, article.bs"
+    // Sample's selector — the site's card grid is inside .listupd (possibly nested
+    // inside intermediate wrappers), and the fallback div.bsx catches every card.
+    private val cardSelector = "div.listupd > article, div.bsx"
 
     override val mainPage = mainPageOf(
         "anime/?status=ongoing&type=&order=update" to "Recently Updated",
@@ -52,13 +47,7 @@ class AnimekhorProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Page 1: base URL as-is.
-        // Page 2+: insert /page/N/ after the archive slug.
-        val url = if (page <= 1) {
-            "$mainUrl/${request.data}"
-        } else {
-            "$mainUrl/${request.data.replace("anime/?", "anime/page/$page/?")}"
-        }
+        val url = "$mainUrl/${request.data}&page=$page"
 
         val home: List<SearchResponse> = try {
             withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
@@ -78,38 +67,27 @@ class AnimekhorProvider : MainAPI() {
 
     private fun Element.toSearchResult(): SearchResponse? {
         val linkElement = this.selectFirst("a") ?: return null
-
-        // Prefer the h2[itemprop=headline] so the duplicated raw text sitting
-        // before the h2 inside .tt doesn't get prepended to the title.
-        val title = linkElement.attr("title").takeIf { it.isNotBlank() }
-            ?: this.selectFirst("h2[itemprop=headline]")?.text()?.takeIf { it.isNotBlank() }
-            ?: this.selectFirst(".tt h2")?.text()?.takeIf { it.isNotBlank() }
-            ?: this.selectFirst(".tt")?.text()?.takeIf { it.isNotBlank() }
-            ?: return null
-
+        val title = linkElement.attr("title").ifEmpty { this.selectFirst(".tt")?.text() ?: "" }
+            .takeIf { it.isNotBlank() } ?: return null
         val href = fixUrlNull(linkElement.attr("href")) ?: return null
 
         val posterUrl = fixUrlNull(
             this.selectFirst("img")?.let { img ->
-                img.attr("data-src")
-                    .ifBlank { img.attr("src") }
-                    .ifBlank { img.attr("data-lazy-src") }
+                img.attr("data-src").ifEmpty { img.attr("src") }.ifEmpty { img.attr("data-lazy-src") }
             }
         )
 
-        return newMovieSearchResponse(title.trim(), href, TvType.Movie) {
-            this.posterUrl = posterUrl
-        }
+        return newMovieSearchResponse(title, href, TvType.Movie) { this.posterUrl = posterUrl }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        val encoded = URLEncoder.encode(query, "UTF-8")
         val results = coroutineScope {
             (1..2).map { page ->
                 async {
                     try {
-                        val encoded = URLEncoder.encode(query, "UTF-8")
                         val document = app
-                            .get("$mainUrl/page/$page/?s=$encoded", headers = defaultHeaders)
+                            .get("$mainUrl/?s=$encoded&page=$page", headers = defaultHeaders)
                             .document
                         document.select(cardSelector).mapNotNull { it.toSearchResult() }
                     } catch (e: CancellationException) {
@@ -176,7 +154,6 @@ class AnimekhorProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // 1) Fetch the episode page, bounded by a timeout
         val document = try {
             withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
                 app.get(data, headers = defaultHeaders).document
@@ -187,19 +164,16 @@ class AnimekhorProvider : MainAPI() {
             null
         } ?: return false
 
-        // Dedup state — shared across every extractor, thread-safe
         val extractedIframeUrls = ConcurrentHashMap.newKeySet<String>()
         val yieldedStreamUrls = ConcurrentHashMap.newKeySet<String>()
         val yieldedSubtitleUrls = ConcurrentHashMap.newKeySet<String>()
 
-        // Video dedup — the first occurrence of each URL wins
         val trackingCallback: (ExtractorLink) -> Unit = { link ->
             if (yieldedStreamUrls.add(link.url)) {
                 callback(link)
             }
         }
 
-        // Subtitle dedup — same URL emitted by two extractors reaches the UI once
         val trackingSubtitleCallback: (SubtitleFile) -> Unit = { sub ->
             if (yieldedSubtitleUrls.add(sub.url)) {
                 subtitleCallback(sub)
@@ -218,7 +192,8 @@ class AnimekhorProvider : MainAPI() {
             }
 
             if (finalUrl.contains("ok.ru") || finalUrl.contains("odnoklassniki.ru")) {
-                val okId = Regex("""/video(?:embed)?/(\d+)""").find(finalUrl)?.groupValues?.get(1) ?: finalUrl.substringAfterLast("/")
+                val okId = Regex("""/video(?:embed)?/(\d+)""").find(finalUrl)?.groupValues?.get(1)
+                    ?: finalUrl.substringAfterLast("/")
                 finalUrl = "https://ok.ru/videoembed/$okId"
             }
 
@@ -251,7 +226,6 @@ class AnimekhorProvider : MainAPI() {
             }
         }
 
-        // 2) Collect every candidate source first (CPU-only, fast)
         val rawHtml = document.html()
         val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com|abyssplayer\.com|playhydrax\.com)[^"'\s<>]+""")
         val rawMatches = globalUrlRegex.findAll(rawHtml)
@@ -269,14 +243,13 @@ class AnimekhorProvider : MainAPI() {
                 if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) src else null
             }
 
-        // 3) Fan out every source in parallel
         coroutineScope {
-            // Raw HTML matches
+            // Raw HTML scan — parallel
             rawMatches.map { cleanUrl ->
                 async { invokeExtractor(cleanUrl, "Raw Source") }
             }.awaitAll()
 
-            // Server option entries — value, data-em, or data-embed (base64 or raw iframe)
+            // Server options (value / data-em / data-embed) — parallel
             serverElements.map { server ->
                 async {
                     val rawData = server.attr("value")
@@ -306,7 +279,7 @@ class AnimekhorProvider : MainAPI() {
                 }
             }.awaitAll()
 
-            // Direct iframes in the page body
+            // Direct iframes — parallel
             directIframeSrcs.map { src ->
                 async { invokeExtractor(src, "Direct Server") }
             }.awaitAll()
