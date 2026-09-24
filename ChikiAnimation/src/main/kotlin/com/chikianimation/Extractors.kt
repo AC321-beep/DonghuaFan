@@ -1,6 +1,7 @@
 package com.chikianimation
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.Filesim
@@ -526,18 +527,22 @@ class GalaxyDonghua : ExtractorApi() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    //  Emit streams from JSON
+    //  Emit streams from JSON — with debug logging
     // ═══════════════════════════════════════════════════════════════════════════
     private suspend fun emitStreams(
         json: String, gxBase: String, fallbackEmbedUrl: String, globalCookies: Map<String, String>,
         callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit
     ) {
-        if (!json.trimStart().startsWith("{")) return
+        val TAG = "ChikiSubDBG"
+        Log.e(TAG, "=== emitStreams start ===")
+        if (!json.trimStart().startsWith("{")) {
+            Log.e(TAG, "JSON is not object: ${json.take(50)}")
+            return
+        }
 
         val baseURL = Regex("[\"']baseUrl[\"'][ \t]*:[ \t]*[\"']([^\"']+)[\"']")
             .find(json)?.groupValues?.get(1) ?: gxBase
 
-        // The API mints a fresh embed_url; using it as Referer is required for /hls/.
         val dynamicEmbedUrl = Regex("[\"']embed_url[\"'][ \t]*:[ \t]*[\"']([^\"']+)[\"']")
             .find(json)?.groupValues?.get(1)?.replace("\\/", "/") ?: fallbackEmbedUrl
 
@@ -551,18 +556,41 @@ class GalaxyDonghua : ExtractorApi() {
             "Sec-Fetch-Dest" to "empty",
             "Accept-Language" to "en-US,en;q=0.9"
         )
-
         val cookieStr = globalCookies.map { "${it.key}=${it.value}" }.joinToString("; ")
         if (cookieStr.isNotEmpty()) ph["Cookie"] = cookieStr
 
+        var subCount = 0
+        var vidCount = 0
+
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
-            val raw = m.groupValues[1].replace("\\/", "/")
-            val abs = fixStreamUrl(raw, baseURL) ?: continue
+            val raw = m.groupValues[1]
+            val abs = fixStreamUrl(raw.replace("\\/", "/"), baseURL)
+            Log.e(TAG, "RAW='$raw'")
+            Log.e(TAG, "ABS='$abs'")
+
+            if (abs == null) {
+                Log.e(TAG, "  -> fixStreamUrl returned null, skipping")
+                continue
+            }
 
             val isSub = abs.contains(".vtt", true) || abs.contains(".srt", true)
+            Log.e(TAG, "  isSub=$isSub")
+
             if (isSub) {
-                // /subtitle/ answers 302 → public /uploads/…cache file.
-                // No headers needed; the player's OkHttp follows the redirect.
+                subCount++
+
+                // Probe: pre-fetch the subtitle URL with OkHttp
+                try {
+                    val probe = app.get(abs, headers = ph)
+                    Log.e(TAG, "  PROBE code=${probe.code} ctype='${probe.headers["Content-Type"]}'")
+                    Log.e(TAG, "  PROBE finalUrl='${probe.url}'")
+                    Log.e(TAG, "  PROBE bodyLen=${probe.text.length}")
+                    Log.e(TAG, "  PROBE bodyHead='${probe.text.take(80).replace("\n", "\\n")}'")
+                } catch (e: Exception) {
+                    Log.e(TAG, "  PROBE EXCEPTION: ${e::class.java.simpleName}: ${e.message}")
+                }
+
+                Log.e(TAG, "  EMIT SubtitleFile(lang='Subtitle', url='$abs')")
                 subtitleCallback.invoke(SubtitleFile("Subtitle", abs))
                 continue
             }
@@ -571,6 +599,8 @@ class GalaxyDonghua : ExtractorApi() {
                          !abs.contains(".mp4", true)
             if (!isM3u8 && !abs.contains(".mp4", true)) continue
 
+            vidCount++
+            Log.e(TAG, "  EMIT video: $abs (m3u8=$isM3u8)")
             callback.invoke(newExtractorLink(this.name, this.name, abs,
                 if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
                 this.referer = dynamicEmbedUrl
@@ -578,6 +608,8 @@ class GalaxyDonghua : ExtractorApi() {
                 this.headers = ph
             })
         }
+
+        Log.e(TAG, "=== emitStreams end: $vidCount videos, $subCount subtitles ===")
     }
 
     private fun fixStreamUrl(url: String, base: String): String? {
