@@ -9,9 +9,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URI
@@ -134,8 +131,8 @@ class SkylineAI : ExtractorApi() {
 //   • Decryption: PBEKeySpec (PBKDF2-HMAC-SHA256, 10k iter, 48 bytes)
 //   • Referer for /hls/ MUST be the dynamic embed_url from the API JSON
 //     (the pre-token /embed/<short-id> referer gets a 404)
-//   • Subtitles: /subtitle/ also requires those headers, and SubtitleFile
-//     has no headers field — so we pre-fetch and inline as data: URLs.
+//   • /subtitle/ is NOT gated: it 302-redirects to a public
+//     /uploads/subtitles/tmp/*.cache file. Raw URL works as-is.
 // ═══════════════════════════════════════════════════════════════════════════
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
@@ -540,8 +537,7 @@ class GalaxyDonghua : ExtractorApi() {
         val baseURL = Regex("[\"']baseUrl[\"'][ \t]*:[ \t]*[\"']([^\"']+)[\"']")
             .find(json)?.groupValues?.get(1) ?: gxBase
 
-        // The API mints a fresh embed_url; using it as Referer is required for /hls/
-        // and also for /subtitle/ (the two share the same access gate).
+        // The API mints a fresh embed_url; using it as Referer is required for /hls/.
         val dynamicEmbedUrl = Regex("[\"']embed_url[\"'][ \t]*:[ \t]*[\"']([^\"']+)[\"']")
             .find(json)?.groupValues?.get(1)?.replace("\\/", "/") ?: fallbackEmbedUrl
 
@@ -559,59 +555,28 @@ class GalaxyDonghua : ExtractorApi() {
         val cookieStr = globalCookies.map { "${it.key}=${it.value}" }.joinToString("; ")
         if (cookieStr.isNotEmpty()) ph["Cookie"] = cookieStr
 
-        // Collect video and subtitle URLs in one pass over the JSON.
-        val videoUrls = mutableListOf<Pair<String, Boolean>>() // url to isM3u8
-        val subUrls = mutableListOf<String>()
-
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
             val raw = m.groupValues[1].replace("\\/", "/")
             val abs = fixStreamUrl(raw, baseURL) ?: continue
 
             val isSub = abs.contains(".vtt", true) || abs.contains(".srt", true)
             if (isSub) {
-                subUrls.add(abs)
+                // /subtitle/ answers 302 → public /uploads/…cache file.
+                // No headers needed; the player's OkHttp follows the redirect.
+                subtitleCallback.invoke(SubtitleFile("Subtitle", abs))
                 continue
             }
+
             val isM3u8 = abs.contains(".m3u8", true) || abs.contains("hls", true) ||
                          !abs.contains(".mp4", true)
-            if (isM3u8 || abs.contains(".mp4", true)) {
-                videoUrls.add(abs to isM3u8)
-            }
-        }
+            if (!isM3u8 && !abs.contains(".mp4", true)) continue
 
-        // Emit video links
-        for ((url, isM3u8) in videoUrls) {
-            callback.invoke(newExtractorLink(this.name, this.name, url,
+            callback.invoke(newExtractorLink(this.name, this.name, abs,
                 if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
                 this.referer = dynamicEmbedUrl
                 this.quality = Qualities.Unknown.value
                 this.headers = ph
             })
-        }
-
-        if (subUrls.isEmpty()) return
-
-        // SubtitleFile has no headers field, and the /subtitle/ endpoint needs
-        // the same Referer/Origin gate as /hls/. So fetch each subtitle with the
-        // correct headers and inline it as a base64 data URL for the player.
-        coroutineScope {
-            val fetched = subUrls.map { subUrl ->
-                async {
-                    val body = try { app.get(subUrl, headers = ph).text } catch (_: Exception) { null }
-                    subUrl to body
-                }
-            }.awaitAll()
-
-            for ((subUrl, body) in fetched) {
-                if (!body.isNullOrBlank()) {
-                    val b64 = Base64.encodeToString(body.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-                    subtitleCallback.invoke(SubtitleFile("Subtitle", "data:text/vtt;base64,$b64"))
-                } else {
-                    // Fall back to raw URL — the player will likely 404, but the
-                    // track at least appears in the UI so users know it exists.
-                    subtitleCallback.invoke(SubtitleFile("Subtitle", subUrl))
-                }
-            }
         }
     }
 
