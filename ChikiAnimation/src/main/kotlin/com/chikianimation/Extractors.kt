@@ -13,11 +13,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.produce
 import kotlinx.coroutines.launch
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URI
-import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.SecretKeyFactory
@@ -137,8 +137,8 @@ class SkylineAI : ExtractorApi() {
 //   • Decryption: PBEKeySpec (PBKDF2-HMAC-SHA256, 10k iter, 48 bytes)
 //   • Referer for /hls/ MUST be the dynamic embed_url from the API JSON
 //   • /subtitle/ is public: 302 → /uploads/subtitles/tmp/*.cache
-//   • Subtitle labels: real language names, sniffed from the VTT body;
-//     first 4 completions emitted synchronously, rest stream in as they land.
+//   • Subtitle labels: real language names, sniffed from VTT body
+//     First 4 completions emit synchronously; the rest stream in.
 // ═══════════════════════════════════════════════════════════════════════════
 class GalaxyDonghua : ExtractorApi() {
     override var name = "GalaxyDonghua"
@@ -555,8 +555,8 @@ class GalaxyDonghua : ExtractorApi() {
     // ═══════════════════════════════════════════════════════════════════════════
     //  Emit streams from JSON
     //   • Videos emitted immediately
-    //   • Subtitles fetched in parallel; first 4 completions emitted
-    //     synchronously, remaining 16 stream in via a background coroutine
+    //   • Subtitles fetched in parallel; first 4 completions emit synchronously;
+    //     the rest stream in via a background coroutine as they finish
     // ═══════════════════════════════════════════════════════════════════════════
     private suspend fun emitStreams(
         json: String, gxBase: String, fallbackEmbedUrl: String, globalCookies: Map<String, String>,
@@ -583,9 +583,9 @@ class GalaxyDonghua : ExtractorApi() {
         val cookieStr = globalCookies.map { "${it.key}=${it.value}" }.joinToString("; ")
         if (cookieStr.isNotEmpty()) ph["Cookie"] = cookieStr
 
-        // Sort JSON entries into video URLs and subtitle URLs
-        val videoUrls = mutableListOf<Pair<String, Boolean>>() // url to isM3u8
-        val subUrls = mutableListOf<String>()
+        // ─── Split JSON entries into video URLs and subtitle URLs ───
+        val videoUrls = mutableListOf<Pair<String, Boolean>>()
+        val subUrls = linkedSetOf<String>()   // LinkedHashSet: preserves order + dedupes
 
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
             val raw = m.groupValues[1]
@@ -601,7 +601,7 @@ class GalaxyDonghua : ExtractorApi() {
             if (isM3u8 || abs.contains(".mp4", true)) videoUrls.add(abs to isM3u8)
         }
 
-        // Emit videos immediately
+        // ─── Emit videos first so playback starts as early as possible ───
         for ((url, isM3u8) in videoUrls) {
             callback.invoke(newExtractorLink(this.name, this.name, url,
                 if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
@@ -613,32 +613,28 @@ class GalaxyDonghua : ExtractorApi() {
 
         if (subUrls.isEmpty()) return
 
-        // ─── Subtitle fan-out with completion-order emission ───
+        // ─── Subtitle fan-out: fetch in parallel, emit in completion order ───
+        val subList = subUrls.toList()
         val sniffHeaders = ph + mapOf("Range" to "bytes=0-400")
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val channel = Channel<Pair<String, String>>(Channel.UNLIMITED)
-        val pending = AtomicInteger(subUrls.size)
 
-        // Fan out: each fetch sends (label, url) to the channel as soon as it finishes.
-        // The last one to finish closes the channel.
-        subUrls.forEachIndexed { idx, url ->
-            scope.launch {
-                try {
+        // produce{} auto-closes the channel when all its launched children complete
+        val channel = scope.produce<Pair<String, String>>(capacity = Channel.UNLIMITED) {
+            subList.forEachIndexed { idx, subUrl ->
+                launch {
                     val label = try {
-                        val resp = app.get(url, headers = sniffHeaders)
-                        detectLanguage(resp.text) ?: "Subtitle ${idx + 1}"
+                        val body = app.get(subUrl, headers = sniffHeaders).text
+                        detectLanguage(body) ?: "Subtitle ${idx + 1}"
                     } catch (_: Exception) {
                         "Subtitle ${idx + 1}"
                     }
-                    channel.send(label to url)
-                } finally {
-                    if (pending.decrementAndGet() == 0) channel.close()
+                    try { send(label to subUrl) } catch (_: Exception) {}
                 }
             }
         }
 
-        // Fast path: emit the first 4 completions synchronously
-        val fastCount = minOf(4, subUrls.size)
+        // Fast path: receive the first 4 completions synchronously
+        val fastCount = minOf(4, subList.size)
         repeat(fastCount) {
             try {
                 val (label, url) = channel.receive()
@@ -647,7 +643,7 @@ class GalaxyDonghua : ExtractorApi() {
         }
 
         // Background path: remaining subtitles stream in as they finish
-        if (subUrls.size > fastCount) {
+        if (subList.size > fastCount) {
             scope.launch {
                 for ((label, url) in channel) {
                     try {
