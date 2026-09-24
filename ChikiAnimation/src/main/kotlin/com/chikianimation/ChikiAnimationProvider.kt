@@ -6,9 +6,14 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.Collections
@@ -21,6 +26,13 @@ class ChikiAnimationProvider : MainAPI() {
     override var lang = "zh"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime, TvType.TvSeries)
+
+    companion object {
+        private const val PAGE_FETCH_TIMEOUT_MS = 15_000L
+        private const val EXTRACTOR_TIMEOUT_MS = 20_000L
+        private const val GRACE_AFTER_FIRST_EMIT_MS = 1_500L
+        private const val MAX_CONCURRENT_EXTRACTORS = 4
+    }
 
     private val defaultUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -55,7 +67,9 @@ class ChikiAnimationProvider : MainAPI() {
             document.select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
                 .mapNotNull { it.toSearchResult() }
                 .distinctBy { it.url }
-        } catch (e: Exception) {
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
             emptyList()
         }
         return newHomePageResponse(request.name, items, items.isNotEmpty())
@@ -119,6 +133,8 @@ class ChikiAnimationProvider : MainAPI() {
                     .select("div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx")
                     .mapNotNull { it.toSearchResult() }
                 allItems.addAll(docs)
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {}
         }
         return allItems.distinctBy { it.url }
@@ -127,7 +143,9 @@ class ChikiAnimationProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         val document = try {
             app.get(url, headers = defaultHeaders).document
-        } catch (e: Exception) {
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
             return null
         }
 
@@ -179,7 +197,9 @@ class ChikiAnimationProvider : MainAPI() {
                 epListElements = try {
                     app.get(fixUrl(epPage), headers = defaultHeaders).document
                         .select(".episodelist li, .eplister li")
-                } catch (e: Exception) {
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
                     org.jsoup.select.Elements()
                 }
             }
@@ -235,27 +255,36 @@ class ChikiAnimationProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // ─── 1) Fetch the episode page (bounded by a timeout) ───
         val document = try {
-            withTimeoutOrNull(15_000L) {
+            withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
                 app.get(data, headers = defaultHeaders).document
             }
-        } catch (e: Exception) {
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
             null
         } ?: return false
 
+        // ─── 2) Shared state ───
         val emittedUrls = Collections.synchronizedSet(mutableSetOf<String>())
         val processedUrls = Collections.synchronizedSet(mutableSetOf<String>())
         val processedDmIds = Collections.synchronizedSet(mutableSetOf<String>())
         val processedGdriveIds = Collections.synchronizedSet(mutableSetOf<String>())
         val emitCount = AtomicInteger(0)
 
+        // First successful link signals the picker to appear
+        val firstEmit = CompletableDeferred<Unit>()
+
         val countingCallback: (ExtractorLink) -> Unit = { link ->
             if (emittedUrls.add(link.url)) {
                 emitCount.incrementAndGet()
                 callback.invoke(link)
+                if (!firstEmit.isCompleted) firstEmit.complete(Unit)
             }
         }
 
+        // ─── 3) Small utilities ───
         fun getIframeSrc(iframe: Element): String {
             val src = iframe.attr("src")
             if (src.isNotBlank()) return src
@@ -276,6 +305,7 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
+        // ─── 4) Google Drive resolver ───
         suspend fun resolveGdriveStream(fileId: String): String? {
             val initialUrl =
                 "https://drive.usercontent.google.com/download?id=$fileId&export=download&authuser=0"
@@ -287,6 +317,8 @@ class ChikiAnimationProvider : MainAPI() {
                     allowRedirects = false,
                     headers = gdriveHeaders
                 )
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {
                 return null
             }
@@ -317,6 +349,8 @@ class ChikiAnimationProvider : MainAPI() {
                     allowRedirects = false,
                     headers = gdriveHeaders
                 )
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {
                 return confirmUrl
             }
@@ -355,6 +389,7 @@ class ChikiAnimationProvider : MainAPI() {
             return emitCount.get() > before
         }
 
+        // ─── 5) Main dispatcher — try every extractor in order ───
         suspend fun handleUrl(rawUrl: String, ref: String) {
             val cleanUrl = try { fixUrl(rawUrl) } catch (_: Exception) { return }
             if (!cleanUrl.startsWith("http")) return
@@ -380,6 +415,8 @@ class ChikiAnimationProvider : MainAPI() {
                     val before = emitCount.get()
                     try {
                         GalaxyDonghua().getUrl(cleanUrl, "$mainUrl/", subtitleCallback, countingCallback)
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (_: Exception) {}
                     if (emitCount.get() > before) return
                 }
@@ -388,6 +425,8 @@ class ChikiAnimationProvider : MainAPI() {
                     val before = emitCount.get()
                     try {
                         SkylineAI().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (_: Exception) {}
                     if (emitCount.get() > before) return
                 }
@@ -396,11 +435,13 @@ class ChikiAnimationProvider : MainAPI() {
                     val before = emitCount.get()
                     try {
                         Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (_: Exception) {}
                     if (emitCount.get() > before) return
                 }
 
-                // 3) Dailymotion
+                // 3) Dailymotion — two branches (geo embed + standard)
                 if (cleanUrl.contains("geo.dailymotion.com/player", true)) {
                     val videoId = Regex("video=([a-zA-Z0-9_-]+)").find(cleanUrl)?.groupValues?.get(1)
                     if (videoId != null && processedDmIds.add(videoId)) {
@@ -420,20 +461,20 @@ class ChikiAnimationProvider : MainAPI() {
 
                             if (!streamUrl.isNullOrBlank()) {
                                 val m3u8Url = streamUrl.replace("\\/", "/")
-                                countingCallback(
-                                    newExtractorLink(
-                                        "Dailymotion", "Dailymotion", m3u8Url, ExtractorLinkType.M3U8
-                                    ) {
-                                        this.referer = cleanUrl
-                                        this.headers = mapOf(
-                                            "User-Agent" to defaultUserAgent,
-                                            "Origin" to "https://geo.dailymotion.com",
-                                            "Referer" to cleanUrl
-                                        )
-                                        this.quality = Qualities.Unknown.value
-                                    }
-                                )
+                                countingCallback(newExtractorLink(
+                                    "Dailymotion", "Dailymotion", m3u8Url, ExtractorLinkType.M3U8
+                                ) {
+                                    this.referer = cleanUrl
+                                    this.headers = mapOf(
+                                        "User-Agent" to defaultUserAgent,
+                                        "Origin" to "https://geo.dailymotion.com",
+                                        "Referer" to cleanUrl
+                                    )
+                                    this.quality = Qualities.Unknown.value
+                                })
                             }
+                        } catch (e: CancellationException) {
+                            throw e
                         } catch (_: Exception) {}
 
                         if (emitCount.get() == before) {
@@ -442,6 +483,8 @@ class ChikiAnimationProvider : MainAPI() {
                                     "https://www.dailymotion.com/embed/video/$videoId",
                                     ref, subtitleCallback, countingCallback
                                 )
+                            } catch (e: CancellationException) {
+                                throw e
                             } catch (_: Exception) {}
                         }
                         if (emitCount.get() > before) return
@@ -455,6 +498,8 @@ class ChikiAnimationProvider : MainAPI() {
                         val before = emitCount.get()
                         try {
                             loadExtractor(cleanUrl, ref, subtitleCallback, countingCallback)
+                        } catch (e: CancellationException) {
+                            throw e
                         } catch (_: Exception) {}
                         if (emitCount.get() > before) return
                     }
@@ -464,6 +509,8 @@ class ChikiAnimationProvider : MainAPI() {
                 val beforeGeneric = emitCount.get()
                 try {
                     loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (_: Exception) {}
                 if (emitCount.get() > beforeGeneric) return
 
@@ -472,6 +519,8 @@ class ChikiAnimationProvider : MainAPI() {
                     try {
                         M3u8Helper.generateM3u8("Generic HLS", cleanUrl, ref)
                             .forEach { countingCallback(it) }
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (_: Exception) {}
                     if (emitCount.get() > beforeGeneric) return
                 } else if (cleanUrl.contains(".mp4", true)) {
@@ -482,6 +531,8 @@ class ChikiAnimationProvider : MainAPI() {
                         }
                     )
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {}
         }
 
@@ -495,6 +546,7 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
+        // ─── 6) Collect all sources first (CPU only) ───
         val mirrorOptions = document.select(
             "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
         )
@@ -502,55 +554,88 @@ class ChikiAnimationProvider : MainAPI() {
             ".server_list li, ul.episodes li, .mirror_link, .mirrors li"
         )
 
-        val extractionJobs = mutableListOf<kotlinx.coroutines.Deferred<Unit>>()
-
-        coroutineScope {
+        // Build a list of suspend lambdas to run — one per source
+        val sourceJobs: List<suspend () -> Unit> = buildList {
             for (option in mirrorOptions) {
                 val value = option.attr("value").trim()
-                if (value.isNotBlank()) {
-                    val job = async {
-                        if (value.startsWith("http") || value.startsWith("//")) {
-                            handleUrl(value, data)
-                        } else {
-                            val decoded = safeBase64Decode(value)
-                            if (!decoded.isNullOrBlank()) processDecodedHtml(decoded, data)
-                        }
-                        Unit
+                if (value.isBlank()) continue
+                add {
+                    if (value.startsWith("http") || value.startsWith("//")) {
+                        handleUrl(value, data)
+                    } else {
+                        val decoded = safeBase64Decode(value)
+                        if (!decoded.isNullOrBlank()) processDecodedHtml(decoded, data)
                     }
-                    extractionJobs.add(job)
                 }
             }
-
             for (el in serverListItems) {
-                var videoAttr = el.attr("data-video")
-                if (videoAttr.isBlank()) videoAttr = el.attr("data-src")
-                if (videoAttr.isBlank()) videoAttr = el.attr("data-embed")
-
-                if (videoAttr.isNotBlank()) {
-                    val job = async {
-                        if (videoAttr.startsWith("http") || videoAttr.startsWith("//")) {
-                            handleUrl(videoAttr, data)
-                        } else if (videoAttr.length > 20) {
-                            val decoded = safeBase64Decode(videoAttr)
-                            if (!decoded.isNullOrBlank()) {
-                                if (decoded.startsWith("http")) handleUrl(decoded, data)
-                                else processDecodedHtml(decoded, data)
-                            }
+                val videoAttr = el.attr("data-video")
+                    .ifBlank { el.attr("data-src") }
+                    .ifBlank { el.attr("data-embed") }
+                if (videoAttr.isBlank()) continue
+                add {
+                    if (videoAttr.startsWith("http") || videoAttr.startsWith("//")) {
+                        handleUrl(videoAttr, data)
+                    } else if (videoAttr.length > 20) {
+                        val decoded = safeBase64Decode(videoAttr)
+                        if (!decoded.isNullOrBlank()) {
+                            if (decoded.startsWith("http")) handleUrl(decoded, data)
+                            else processDecodedHtml(decoded, data)
                         }
-                        Unit
                     }
-                    extractionJobs.add(job)
                 }
             }
-
-            extractionJobs.awaitAll()
         }
 
-        if (emitCount.get() == 0) {
+        if (sourceJobs.isEmpty()) {
+            // Fallback: scan raw iframes
             document.select("iframe").forEach { iframe ->
                 val src = getIframeSrc(iframe)
                 if (src.isNotBlank()) handleUrl(src, data)
             }
+            return emitCount.get() > 0
+        }
+
+        // ─── 7) Fan out with semaphore + timeout, race for first emit ───
+        val semaphore = Semaphore(MAX_CONCURRENT_EXTRACTORS)
+
+        coroutineScope {
+            val jobs = sourceJobs.map { work ->
+                launch {
+                    try {
+                        withTimeoutOrNull(EXTRACTOR_TIMEOUT_MS) {
+                            semaphore.withPermit { work() }
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Exception) {
+                        // one bad extractor doesn't kill the rest
+                    }
+                }
+            }
+
+            val allDone = CompletableDeferred<Unit>()
+            val waiter = launch {
+                jobs.forEach { it.join() }
+                allDone.complete(Unit)
+            }
+
+            // Race: return when first link lands OR all jobs complete
+            select<Unit> {
+                firstEmit.onAwait { }
+                allDone.onAwait { }
+            }
+
+            // Grace window: let slower sources finish if they're close
+            if (firstEmit.isCompleted && !allDone.isCompleted) {
+                withTimeoutOrNull(GRACE_AFTER_FIRST_EMIT_MS) {
+                    jobs.forEach { it.join() }
+                }
+            }
+
+            // Cancel anything still running — coroutineScope exits cleanly
+            jobs.forEach { it.cancel() }
+            waiter.cancel()
         }
 
         return emitCount.get() > 0
