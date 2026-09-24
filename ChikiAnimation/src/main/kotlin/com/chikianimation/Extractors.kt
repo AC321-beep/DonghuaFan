@@ -12,6 +12,7 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -241,7 +242,8 @@ class GalaxyDonghua : ExtractorApi() {
             val json = fetchAndDecryptApi(tokens, headers, gxBase, target, playerJs, cryptoJs)
             if (json != null) {
                 Log.e(TAG, "[STEP 14] Decrypted OK — ${json.length}B")
-                emitStreams(json, gxBase, callback, subtitleCallback)
+                // Pass target (the embedUrl) into emitStreams
+                emitStreams(json, gxBase, target, callback, subtitleCallback)
                 ok = true
                 break
             }
@@ -692,7 +694,7 @@ class GalaxyDonghua : ExtractorApi() {
     //  Emit streams from JSON
     // ═══════════════════════════════════════════════════════════════════════════
     private suspend fun emitStreams(
-        json: String, gxBase: String,
+        json: String, gxBase: String, embedUrl: String,
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit
     ) {
@@ -705,7 +707,27 @@ class GalaxyDonghua : ExtractorApi() {
 
         val baseURL = Regex("[\"']baseUrl[\"'][ \t]*:[ \t]*[\"']([^\"']+)[\"']")
             .find(json)?.groupValues?.get(1) ?: gxBase
-        val ph = mapOf("User-Agent" to UA, "Referer" to gxBase, "Origin" to gxBase)
+
+        // Use the embedUrl for Referer and add Accept header for ExoPlayer compatibility
+        val ph = mutableMapOf(
+            "User-Agent" to UA, 
+            "Referer" to embedUrl, 
+            "Origin" to gxBase,
+            "Accept" to "*/*"
+        )
+        
+        // Inject OkHttp cookies into ExtractorLink headers for Cronet (ExoPlayer)
+        try {
+            gxBase.toHttpUrlOrNull()?.let { httpUrl ->
+                val cookies = app.baseClient.cookieJar.loadForRequest(httpUrl)
+                if (cookies.isNotEmpty()) {
+                    ph["Cookie"] = cookies.joinToString("; ") { "${it.name}=${it.value}" }
+                    Log.e(TAG, "[EMIT] Injected Cookies for ExoPlayer")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "[EMIT] Cookie injection failed: ${e.message}")
+        }
 
         var emitted = 0
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
@@ -726,7 +748,7 @@ class GalaxyDonghua : ExtractorApi() {
             } else {
                 callback.invoke(newExtractorLink(this.name, this.name, abs,
                     if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                    this.referer = gxBase
+                    this.referer = embedUrl // Ensure ExtractorLink referer matches the embedUrl
                     this.quality = Qualities.Unknown.value
                     this.headers = ph
                 })
