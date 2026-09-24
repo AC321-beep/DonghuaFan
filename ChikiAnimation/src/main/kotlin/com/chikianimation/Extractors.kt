@@ -239,11 +239,10 @@ class GalaxyDonghua : ExtractorApi() {
 
             Log.e(TAG, "[TOK] PD=${tokens.pd.take(20)}… PS.len=${tokens.ps.length} QSX.len=${tokens.qsx.length} KAKEN.len=${tokens.kaken.length} UT.len=${tokens.utekmek.length}")
 
-            val json = fetchAndDecryptApi(tokens, headers, gxBase, target, playerJs, cryptoJs)
-            if (json != null) {
-                Log.e(TAG, "[STEP 14] Decrypted OK — ${json.length}B")
-                // Pass target (the embedUrl) into emitStreams
-                emitStreams(json, gxBase, target, callback, subtitleCallback)
+            val apiResult = fetchAndDecryptApi(tokens, headers, gxBase, target, playerJs, cryptoJs)
+            if (apiResult != null) {
+                Log.e(TAG, "[STEP 14] Decrypted OK — ${apiResult.json.length}B")
+                emitStreams(apiResult.json, gxBase, target, apiResult.cookies, callback, subtitleCallback)
                 ok = true
                 break
             }
@@ -298,6 +297,8 @@ class GalaxyDonghua : ExtractorApi() {
         else -> base.trimEnd('/') + "/" + src
     }
 
+    private data class ApiResult(val json: String, val cookies: String)
+
     // ═══════════════════════════════════════════════════════════════════════════
     //  API call — mirrors the site's loadSources() exactly
     // ═══════════════════════════════════════════════════════════════════════════
@@ -308,7 +309,7 @@ class GalaxyDonghua : ExtractorApi() {
         embedUrl: String,
         playerJs: String?,
         cryptoJs: String
-    ): String? {
+    ): ApiResult? {
 
         val apxDecoded = try {
             String(Base64.decode(
@@ -317,11 +318,9 @@ class GalaxyDonghua : ExtractorApi() {
         } catch (_: Exception) { "" }
         Log.e(TAG, "[CONF] apxDecoded=$apxDecoded")
 
-        // Exact URL: atob(apx).replace('-config', '') + '?p=' + ps
         val sourcesBase = apxDecoded.replace("-config", "").trimEnd('/')
         val sourcesUrl = "$sourcesBase/?p=${tokens.ps}"
         Log.e(TAG, "[API] POST $sourcesUrl")
-        Log.e(TAG, "[API] body = kaken (len=${tokens.kaken.length})")
 
         val apiHeaders = mutableMapOf(
             "User-Agent" to UA,
@@ -338,7 +337,9 @@ class GalaxyDonghua : ExtractorApi() {
             "X-Requested-With" to "XMLHttpRequest"
         )
 
-        // Config warm-up
+        val collectedCookies = mutableListOf<String>()
+
+        // Config warm-up (Capture cookies here)
         val configUrl = "$gxBase/api-config/${tokens.qsx}?p=${tokens.ps}&_=${System.currentTimeMillis()}"
         try {
             withContext(Dispatchers.IO) {
@@ -346,6 +347,7 @@ class GalaxyDonghua : ExtractorApi() {
                     apiHeaders.forEach { (k, v) -> addHeader(k, v) }
                 }.build()
                 app.baseClient.newCall(req).execute().use { r ->
+                    r.headers("Set-Cookie").forEach { collectedCookies.add(it.substringBefore(";")) }
                     val b = r.body?.string()?.trim() ?: ""
                     Log.e(TAG, "[CONF RES] ${r.code} | ${b.length}B")
                 }
@@ -354,7 +356,7 @@ class GalaxyDonghua : ExtractorApi() {
             Log.e(TAG, "[CONF ERR] ${e.message}")
         }
 
-        // The sources request
+        // The sources request (Capture cookies here)
         val respBody = try {
             withContext(Dispatchers.IO) {
                 val body = tokens.kaken.toByteArray(Charsets.UTF_8)
@@ -367,6 +369,7 @@ class GalaxyDonghua : ExtractorApi() {
                 Log.e(TAG, "[API] → ${req.url}")
 
                 app.baseClient.newCall(req).execute().use { r ->
+                    r.headers("Set-Cookie").forEach { collectedCookies.add(it.substringBefore(";")) }
                     val b = r.body?.string()?.trim() ?: ""
                     Log.e(TAG, "[API RES] code=${r.code} len=${b.length}")
                     Log.e(TAG, "[API RES] head=${b.take(200)}")
@@ -383,17 +386,20 @@ class GalaxyDonghua : ExtractorApi() {
             return null
         }
 
+        val finalCookieStr = collectedCookies.distinct().joinToString("; ")
+        if (finalCookieStr.isNotEmpty()) Log.e(TAG, "[COOKIE] Captured manually: $finalCookieStr")
+
         // Decrypt chain
         if (respBody.trimStart().startsWith("{") && respBody.contains("\"file\"")) {
             Log.e(TAG, "[DEC] plain JSON")
-            return respBody
+            return ApiResult(respBody, finalCookieStr)
         }
 
         if (playerJs != null && cryptoJs.isNotEmpty()) {
             val r = GdRhino.tryDecrypt(playerJs, cryptoJs, respBody, tokens.toGlobalMap())
             if (r != null && r.trimStart().startsWith("{")) {
                 Log.e(TAG, "[DEC] Rhino OK (${r.length}B)")
-                return r
+                return ApiResult(r, finalCookieStr)
             }
             Log.e(TAG, "[DEC] Rhino null")
         }
@@ -401,14 +407,14 @@ class GalaxyDonghua : ExtractorApi() {
         val p1 = decryptDcx(respBody, tokens.pd)
         if (p1 != null && p1.trimStart().startsWith("{")) {
             Log.e(TAG, "[DEC] PBEKeySpec OK (${p1.length}B)")
-            return p1
+            return ApiResult(p1, finalCookieStr)
         }
         Log.e(TAG, "[DEC] PBEKeySpec null")
 
         val p2 = decryptGdPayload(respBody, tokens.pd)
         if (p2 != null && p2.trimStart().startsWith("{")) {
             Log.e(TAG, "[DEC] manual PBKDF2 OK (${p2.length}B)")
-            return p2
+            return ApiResult(p2, finalCookieStr)
         }
         Log.e(TAG, "[DEC] manual PBKDF2 null")
 
@@ -694,7 +700,7 @@ class GalaxyDonghua : ExtractorApi() {
     //  Emit streams from JSON
     // ═══════════════════════════════════════════════════════════════════════════
     private suspend fun emitStreams(
-        json: String, gxBase: String, embedUrl: String,
+        json: String, gxBase: String, fallbackEmbedUrl: String, manualCookies: String,
         callback: (ExtractorLink) -> Unit,
         subtitleCallback: (SubtitleFile) -> Unit
     ) {
@@ -708,31 +714,90 @@ class GalaxyDonghua : ExtractorApi() {
         val baseURL = Regex("[\"']baseUrl[\"'][ \t]*:[ \t]*[\"']([^\"']+)[\"']")
             .find(json)?.groupValues?.get(1) ?: gxBase
 
-        // Use the embedUrl for Referer and add Accept header for ExoPlayer compatibility
+        val dynamicEmbedUrl = Regex("[\"']embed_url[\"'][ \t]*:[ \t]*[\"']([^\"']+)[\"']")
+            .find(json)?.groupValues?.get(1)?.replace("\\/", "/") ?: fallbackEmbedUrl
+            
+        Log.e(TAG, "[EMIT] Dynamic Referer: $dynamicEmbedUrl")
+
+        var activeReferer = dynamicEmbedUrl
         val ph = mutableMapOf(
             "User-Agent" to UA, 
-            "Referer" to embedUrl, 
-            "Origin" to gxBase,
-            "Accept" to "*/*"
+            "Referer" to activeReferer
         )
         
-        // Inject OkHttp cookies into ExtractorLink headers for Cronet (ExoPlayer)
-        try {
-            gxBase.toHttpUrlOrNull()?.let { httpUrl ->
-                val cookies = app.baseClient.cookieJar.loadForRequest(httpUrl)
-                if (cookies.isNotEmpty()) {
-                    ph["Cookie"] = cookies.joinToString("; ") { "${it.name}=${it.value}" }
-                    Log.e(TAG, "[EMIT] Injected Cookies for ExoPlayer")
+        // 1. Inject Manual Cookies
+        if (manualCookies.isNotEmpty()) {
+            ph["Cookie"] = manualCookies
+            Log.e(TAG, "[EMIT] Using Manual Cookies: $manualCookies")
+        } else {
+            // 2. Fallback: CookieJar
+            try {
+                gxBase.toHttpUrlOrNull()?.let { httpUrl ->
+                    val cookies = app.baseClient.cookieJar.loadForRequest(httpUrl)
+                    if (cookies.isNotEmpty()) {
+                        ph["Cookie"] = cookies.joinToString("; ") { "${it.name}=${it.value}" }
+                        Log.e(TAG, "[EMIT] Using OkHttp CookieJar: ${ph["Cookie"]}")
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "[EMIT] Cookie injection fallback failed: ${e.message}")
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════════
+        //  PROBE VERIFICATION & AUTO-ADAPTATION
+        // ═══════════════════════════════════════════════════════════════════════════
+        val firstRaw = Regex("""["']file["']\s*:\s*["']([^"']+)["']""")
+            .find(json)?.groupValues?.get(1)?.replace("\\/", "/")
+            
+        if (firstRaw != null) {
+            val firstAbs = fixStreamUrl(firstRaw, baseURL)
+            if (firstAbs != null && !firstAbs.contains(".vtt", true)) {
+                var code = try { app.get(firstAbs, headers = ph).code } catch (e: Exception) { -1 }
+                Log.e(TAG, "[EMIT] PROBE primary: code=$code referer=$activeReferer")
+
+                // If primary probe does not get HTTP 200..299, test alternative configurations
+                if (code !in 200..299) {
+                    // Test 1: Try fallbackEmbedUrl as Referer
+                    if (dynamicEmbedUrl != fallbackEmbedUrl) {
+                        val h1 = ph.toMutableMap().apply { put("Referer", fallbackEmbedUrl) }
+                        val c1 = try { app.get(firstAbs, headers = h1).code } catch (_: Exception) { -1 }
+                        Log.e(TAG, "[EMIT] PROBE test [fallback Referer]: code=$c1")
+                        if (c1 in 200..299) {
+                            ph["Referer"] = fallbackEmbedUrl
+                            activeReferer = fallbackEmbedUrl
+                            code = c1
+                        }
+                    }
+
+                    // Test 2: Try with Origin added back
+                    if (code !in 200..299) {
+                        val h2 = ph.toMutableMap().apply { put("Origin", gxBase) }
+                        val c2 = try { app.get(firstAbs, headers = h2).code } catch (_: Exception) { -1 }
+                        Log.e(TAG, "[EMIT] PROBE test [with Origin]: code=$c2")
+                        if (c2 in 200..299) {
+                            ph["Origin"] = gxBase
+                            code = c2
+                        }
+                    }
+
+                    // Test 3: Try without Cookies
+                    if (code !in 200..299 && ph.containsKey("Cookie")) {
+                        val h3 = ph.toMutableMap().apply { remove("Cookie") }
+                        val c3 = try { app.get(firstAbs, headers = h3).code } catch (_: Exception) { -1 }
+                        Log.e(TAG, "[EMIT] PROBE test [without Cookie]: code=$c3")
+                        if (c3 in 200..299) {
+                            ph.remove("Cookie")
+                            code = c3
+                        }
+                    }
                 }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "[EMIT] Cookie injection failed: ${e.message}")
         }
 
         var emitted = 0
         for (m in Regex("""["']file["']\s*:\s*["']([^"']+)["']""").findAll(json)) {
             val raw = m.groupValues[1]
-            // Normalize escaped slashes BEFORE type detection
             val normalized = raw.replace("\\/", "/")
 
             val abs = fixStreamUrl(normalized, baseURL) ?: continue
@@ -741,14 +806,14 @@ class GalaxyDonghua : ExtractorApi() {
                          (!isSub && !abs.contains(".mp4", true))
             if (!isSub && !isM3u8 && !abs.contains(".mp4", true)) continue
 
-            Log.e(TAG, "[EMIT] $abs")
+            Log.e(TAG, "[EMIT] Target: $abs")
 
             if (isSub) {
                 subtitleCallback.invoke(SubtitleFile("Subtitle", abs))
             } else {
                 callback.invoke(newExtractorLink(this.name, this.name, abs,
                     if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                    this.referer = embedUrl // Ensure ExtractorLink referer matches the embedUrl
+                    this.referer = activeReferer
                     this.quality = Qualities.Unknown.value
                     this.headers = ph
                 })
@@ -758,13 +823,7 @@ class GalaxyDonghua : ExtractorApi() {
         Log.e(TAG, "[EMIT] emitted=$emitted")
     }
 
-    /**
-     * FIX: normalize escaped slashes BEFORE deciding whether the URL is
-     * absolute. The API returns URLs like "https:\/\/galaxydonghua.xyz\/hls\/..."
-     * which don't startWith("https://") until we strip the backslashes.
-     */
     private fun fixStreamUrl(url: String, base: String): String? {
-        // Normalize \/ → / FIRST (the API escapes all forward slashes)
         val u = url.trim().replace("\\/", "/")
         if (u.isBlank()) return null
         if (u.startsWith("http://") || u.startsWith("https://")) return u
