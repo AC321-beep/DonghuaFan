@@ -1,6 +1,5 @@
 plugins {
     id("com.android.library") 
-    // kotlin("android") is NOT needed. It's handled by the root project.
 }
 
 cloudstream {
@@ -8,22 +7,19 @@ cloudstream {
     authors = listOf("AC321-beep")   
     status = 1
     language = "en"
-    version = 4
+    version = 5
     iconUrl = "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/refs/heads/master/Adfree/Icon.png"
 }
 
 android {
-    namespace = "com.net.optimizer" 
-    
-    // minSdk, compileSdk, and compileOptions are REMOVED.
-    // The root build.gradle.kts automatically handles them for all modules.
+    namespace = "com.adfree" 
     
     buildTypes {
         release {
-            isMinifyEnabled = true // Keep this true for optimal performance
+            isMinifyEnabled = true 
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro" // Your custom rules
+                "proguard-rules.pro"
             )
         }
     }
