@@ -90,7 +90,7 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
 
         // ---- Section 3: Provider Checkboxes ----
         container.addView(TextView(context).apply {
-            text = "🎯 Enforce Blocking On Providers"
+            text = "🎯 Auto-Blocked Providers"
             textSize = 16f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.parseColor("#4FC3F7"))
@@ -98,42 +98,37 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
         })
 
         container.addView(TextView(context).apply {
-            text = "Apply stricter intent blocking for selected providers."
+            text = "Providers from known bad repos are blocked automatically. Uncheck any you want to allow."
             textSize = 12f
             setTextColor(Color.parseColor("#909090"))
             setPadding(0, 0, 0, 12)
         })
 
         val blockedSet = FilterStore.getBlockedProviders()
+        val unblockedSet = FilterStore.getManuallyUnblocked()
+
         val providers = try {
             APIHolder.allProviders.sortedBy { it.name }
         } catch (_: Throwable) { emptyList<MainAPI>() }
 
-        // Keep references to checkboxes so bulk buttons can toggle them
         val checkBoxes = mutableListOf<CheckBox>()
 
-        // Bulk actions
         val bulkRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             setPadding(0, 0, 0, 12)
         }
 
         bulkRow.addView(Button(context).apply {
-            text = "Select All"
-            setOnClickListener {
-                checkBoxes.forEach { it.isChecked = true }
-            }
+            text = "Block All"
+            setOnClickListener { checkBoxes.forEach { it.isChecked = true } }
         })
 
         bulkRow.addView(Button(context).apply {
-            text = "Deselect All"
-            setOnClickListener {
-                checkBoxes.forEach { it.isChecked = false }
-            }
+            text = "Allow All"
+            setOnClickListener { checkBoxes.forEach { it.isChecked = false } }
         })
         container.addView(bulkRow)
 
-        // Checkbox list
         providers.forEach { provider ->
             val cb = CheckBox(context).apply {
                 text = provider.name
@@ -141,7 +136,13 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
                 setTextColor(Color.parseColor("#E0E0E0"))
                 textSize = 15f
                 setOnCheckedChangeListener { _, checked ->
-                    if (checked) blockedSet.add(provider.name) else blockedSet.remove(provider.name)
+                    if (checked) {
+                        blockedSet.add(provider.name)
+                        unblockedSet.remove(provider.name)
+                    } else {
+                        blockedSet.remove(provider.name)
+                        unblockedSet.add(provider.name)
+                    }
                 }
             }
             checkBoxes.add(cb)
@@ -155,6 +156,7 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
                 FilterStore.setIntensity(intensitySpinner.selectedItemPosition)
                 FilterStore.setCustomBlockedHosts(customInput.text.toString().split("\n"))
                 FilterStore.updateBlockedProviders(blockedSet)
+                FilterStore.updateManuallyUnblocked(unblockedSet)
                 onApply()
             }
             .setNegativeButton("Cancel", null)
