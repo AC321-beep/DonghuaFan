@@ -9,20 +9,17 @@ object FilterStore {
     private const val KEY_ALWAYS = "always_allow_hosts"
     private const val KEY_CUSTOM_BLOCKED = "custom_blocked_hosts"
     private const val KEY_BLOCKED_PROVIDERS = "blocked_providers"
+    private const val KEY_INTENSITY = "blocking_intensity"
 
     @Volatile private var prefs: SharedPreferences? = null
     private val sessionAllowOnce = java.util.Collections.synchronizedSet(HashSet<String>())
 
-        private val HARDCODED_BLOCKED_HOSTS = setOf(
-        // Donation platforms
+    // Hardcoded known ad and donation platforms
+    private val HARDCODED_BLOCKED_HOSTS = setOf(
         "buymeacoffee.com", "developers.buymeacoffee.com",
         "patreon.com", "ko-fi.com", "paypal.me", "paypal.com",
-        // Repo-specific donation domains
         "cncverse.com", "phisher98.com",
-        // URL shorteners commonly used in ad redirects
-        "cutt.ly", "tinyurl.com", "rebrand.ly", "is.gd", "bit.ly",
-        "linkvertise.com",
-        // Common ad networks
+        "cutt.ly", "tinyurl.com", "rebrand.ly", "is.gd", "bit.ly", "linkvertise.com",
         "omg10.com", "propellerads.com", "propeller-tracking.com",
         "monetag.com", "adsterra.com", "hilltopads.com",
         "popads.net", "popcash.net", "ad-maven.com",
@@ -34,7 +31,7 @@ object FilterStore {
         "discord.com", "wikipedia.org"
     )
 
-    // Behavioral patterns (URL-shape based, not domain based)
+    // Behavioral patterns (URL-shape based)
     private val NON_MEDIA_PATTERNS = listOf(
         Regex("/(popunder|popunderinit)", RegexOption.IGNORE_CASE),
         Regex("/(redirect|go|visit|jump)/[a-zA-Z0-9]+", RegexOption.IGNORE_CASE),
@@ -43,7 +40,6 @@ object FilterStore {
         Regex("support|donate|patreon|buymeacoffee|ko-fi|cncverse", RegexOption.IGNORE_CASE)
     )
 
-    // Live merged set: hardcoded + user-added
     @Volatile private var mergedBlockedHosts: Set<String> = HARDCODED_BLOCKED_HOSTS
     @Volatile private var customBlockedHosts: Set<String> = emptySet()
 
@@ -81,10 +77,14 @@ object FilterStore {
             ?.apply()
     }
 
-    /**
-     * Efficient O(dots) lookup — no O(n) iteration over the blocklist.
-     * For "sub.example.com", performs only 2 HashSet lookups instead of 20+.
-     */
+    // --- Intensity Settings ---
+    fun getIntensity(): Int = prefs?.getInt(KEY_INTENSITY, 1) ?: 1
+
+    fun setIntensity(level: Int) {
+        prefs?.edit()?.putInt(KEY_INTENSITY, level.coerceIn(0, 2))?.apply()
+    }
+
+    // --- Efficient O(dots) Host Checking ---
     fun isHostBlocked(host: String?): Boolean {
         if (host.isNullOrBlank()) return false
         val h = host.lowercase().trim()
@@ -92,7 +92,6 @@ object FilterStore {
 
         if (h in blocked) return true
 
-        // Split on dots and test each suffix
         var idx = h.indexOf('.')
         while (idx >= 0 && idx < h.length - 1) {
             if (h.substring(idx + 1) in blocked) return true
