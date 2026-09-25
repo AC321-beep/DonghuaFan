@@ -5,14 +5,19 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
 import android.view.Gravity
+import android.widget.ArrayAdapter
+import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.Switch
+import android.widget.Spinner
 import android.widget.TextView
 import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.MainAPI
 
 class SettingsDialog(private val context: Context, private val onApply: () -> Unit) {
+
     fun show() {
         val container = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
@@ -20,97 +25,135 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
             setBackgroundColor(Color.parseColor("#121212"))
         }
 
+        // Header
         container.addView(TextView(context).apply {
-            text = "🛡️ Universal Ad & Donation Blocker"
+            text = "🛡️ Ad & Donation Blocker"
             textSize = 22f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
-            setPadding(0, 0, 0, 16)
+            setPadding(0, 0, 0, 8)
         })
 
-        val masterRow = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, 0, 0, 24)
-        }
-        
-        val masterLabel = TextView(context).apply {
-            text = "Aggressive Mode (Block All Unknown)"
-            setTextColor(Color.parseColor("#FFD700"))
+        // ---- Section 1: Intensity Spinner ----
+        container.addView(TextView(context).apply {
+            text = "🎚️ Blocking Intensity"
             textSize = 16f
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#4FC3F7"))
+            setPadding(0, 0, 0, 8)
+        })
+
+        val intensitySpinner = Spinner(context).apply {
+            adapter = ArrayAdapter(
+                context,
+                android.R.layout.simple_spinner_dropdown_item,
+                listOf(
+                    "Light — Ads only",
+                    "Medium — Ads + Donations (Recommended)",
+                    "Strict — Ads + Donations + Unknown Intents"
+                )
+            )
+            setSelection(FilterStore.getIntensity())
+            setBackgroundColor(Color.parseColor("#1E1E1E"))
+            setPadding(16, 16, 16, 16)
         }
-        
-        val masterToggle = Switch(context).apply {
-            isChecked = SystemInterceptor.policy.blockAllUnknown
-            setOnCheckedChangeListener { _, checked ->
-                SystemInterceptor.policy = SystemInterceptor.policy.copy(blockAllUnknown = checked)
-            }
-        }
-        
-        masterRow.addView(masterLabel)
-        masterRow.addView(masterToggle)
-        container.addView(masterRow)
+        container.addView(intensitySpinner)
+
+        // ---- Section 2: Custom Domains ----
+        container.addView(TextView(context).apply {
+            text = "🚫 Custom Blocked Domains"
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#FF6B6B"))
+            setPadding(0, 24, 0, 8)
+        })
 
         container.addView(TextView(context).apply {
-            text = "Select providers to enforce strict ad-voiding on:"
-            textSize = 14f
-            setTextColor(Color.parseColor("#B0B0B0"))
-            setPadding(0, 0, 0, 16)
+            text = "One domain per line. Blocked in addition to the built-in list."
+            textSize = 12f
+            setTextColor(Color.parseColor("#909090"))
+            setPadding(0, 0, 0, 12)
+        })
+
+        val customInput = EditText(context).apply {
+            setText(FilterStore.getCustomBlockedHosts().joinToString("\n"))
+            setTextColor(Color.WHITE)
+            hint = "ads.example.com\ntracker.site.net"
+            setHintTextColor(Color.parseColor("#606060"))
+            setBackgroundColor(Color.parseColor("#1E1E1E"))
+            setPadding(24, 24, 24, 24)
+            minLines = 3
+            maxLines = 6
+            gravity = Gravity.TOP or Gravity.START
+        }
+        container.addView(customInput)
+
+        // ---- Section 3: Provider Checkboxes ----
+        container.addView(TextView(context).apply {
+            text = "🎯 Enforce Blocking On Providers"
+            textSize = 16f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#4FC3F7"))
+            setPadding(0, 24, 0, 8)
+        })
+
+        container.addView(TextView(context).apply {
+            text = "Apply stricter intent blocking for selected providers."
+            textSize = 12f
+            setTextColor(Color.parseColor("#909090"))
+            setPadding(0, 0, 0, 12)
         })
 
         val blockedSet = FilterStore.getBlockedProviders()
-
         val providers = try {
-            val getApisMethod = APIHolder::class.java.methods.find {
-                it.name == "getAllProviders" || it.name == "getApis" || it.name == "apis"
-            }
-            val apis = if (getApisMethod != null) {
-                getApisMethod.isAccessible = true
-                (getApisMethod.invoke(APIHolder) as? Iterable<*>)?.filterIsInstance<MainAPI>() ?: emptyList()
-            } else {
-                APIHolder.allProviders
-            }
-            apis.sortedBy { it.name }
-        } catch (_: Throwable) { emptyList() }
+            APIHolder.allProviders.sortedBy { it.name }
+        } catch (_: Throwable) { emptyList<MainAPI>() }
 
-        if (providers.isEmpty()) {
-            container.addView(TextView(context).apply {
-                text = "No providers loaded yet. Try opening a repository first."
-                setTextColor(Color.parseColor("#FF5555"))
-                setPadding(0, 16, 0, 16)
-            })
-        } else {
-            providers.forEach { provider ->
-                val row = LinearLayout(context).apply { 
-                    orientation = LinearLayout.HORIZONTAL 
-                    gravity = Gravity.CENTER_VERTICAL
-                    setPadding(0, 16, 0, 16)
-                }
-                
-                val label = TextView(context).apply { 
-                    text = provider.name
-                    setTextColor(Color.parseColor("#E0E0E0"))
-                    textSize = 16f
-                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f) 
-                }
-                
-                val toggle = Switch(context).apply {
-                    isChecked = blockedSet.contains(provider.name)
-                    setOnCheckedChangeListener { _, checked ->
-                        if (checked) blockedSet.add(provider.name) else blockedSet.remove(provider.name)
-                    }
-                }
-                
-                row.addView(label)
-                row.addView(toggle)
-                container.addView(row)
-            }
+        // Keep references to checkboxes so bulk buttons can toggle them
+        val checkBoxes = mutableListOf<CheckBox>()
+
+        // Bulk actions
+        val bulkRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 0, 0, 12)
         }
 
+        bulkRow.addView(Button(context).apply {
+            text = "Select All"
+            setOnClickListener {
+                checkBoxes.forEach { it.isChecked = true }
+            }
+        })
+
+        bulkRow.addView(Button(context).apply {
+            text = "Deselect All"
+            setOnClickListener {
+                checkBoxes.forEach { it.isChecked = false }
+            }
+        })
+        container.addView(bulkRow)
+
+        // Checkbox list
+        providers.forEach { provider ->
+            val cb = CheckBox(context).apply {
+                text = provider.name
+                isChecked = blockedSet.contains(provider.name)
+                setTextColor(Color.parseColor("#E0E0E0"))
+                textSize = 15f
+                setOnCheckedChangeListener { _, checked ->
+                    if (checked) blockedSet.add(provider.name) else blockedSet.remove(provider.name)
+                }
+            }
+            checkBoxes.add(cb)
+            container.addView(cb)
+        }
+
+        // ---- Dialog ----
         AlertDialog.Builder(context, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setView(ScrollView(context).apply { addView(container) })
-            .setPositiveButton("Save Settings") { _, _ ->
+            .setPositiveButton("Save") { _, _ ->
+                FilterStore.setIntensity(intensitySpinner.selectedItemPosition)
+                FilterStore.setCustomBlockedHosts(customInput.text.toString().split("\n"))
                 FilterStore.updateBlockedProviders(blockedSet)
                 onApply()
             }
