@@ -1,4 +1,4 @@
-package com.net.optimizer
+package com.adfree
 
 import android.app.AlertDialog
 import android.content.Context
@@ -20,7 +20,6 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
             setBackgroundColor(Color.parseColor("#121212"))
         }
 
-        // Title
         container.addView(TextView(context).apply {
             text = "🛡️ Universal Ad & Donation Blocker"
             textSize = 22f
@@ -29,7 +28,6 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
             setPadding(0, 0, 0, 16)
         })
 
-        // Master Switch for Aggressive Blocking
         val masterRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -38,7 +36,7 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
         
         val masterLabel = TextView(context).apply {
             text = "Aggressive Mode (Block All Unknown)"
-            setTextColor(Color.parseColor("#FFD700")) // Gold
+            setTextColor(Color.parseColor("#FFD700"))
             textSize = 16f
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
         }
@@ -54,7 +52,6 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
         masterRow.addView(masterToggle)
         container.addView(masterRow)
 
-        // Provider List Header
         container.addView(TextView(context).apply {
             text = "Select providers to enforce strict ad-voiding on:"
             textSize = 14f
