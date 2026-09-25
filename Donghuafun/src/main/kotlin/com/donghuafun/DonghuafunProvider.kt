@@ -142,8 +142,11 @@ class DonghuaFunProvider : MainAPI() {
         val distinct = items.distinctBy { it.response.url }
 
         // ---- Cache store (only page 1) ----
+        // Prune expired entries before insert so the map doesn't grow unboundedly.
         if (page == 1) {
-            mainPageCache[request.data] = distinct to System.currentTimeMillis()
+            val now = System.currentTimeMillis()
+            mainPageCache.entries.removeIf { now - it.value.second >= MAIN_PAGE_CACHE_TTL_MS }
+            mainPageCache[request.data] = distinct to now
         }
 
         val filtered = filterByCategory(distinct, request.name)
@@ -264,6 +267,7 @@ class DonghuaFunProvider : MainAPI() {
             else -> ""
         }
 
+        // Only append the language suffix when it isn't already part of the name.
         return buildString {
             append(baseName)
             if (language.isNotEmpty() && !baseName.contains(language, ignoreCase = true)) {
@@ -283,6 +287,7 @@ class DonghuaFunProvider : MainAPI() {
         val serverCounter = AtomicInteger(1)
         val linkFound = AtomicBoolean(false)
         val seenCombos = ConcurrentHashMap.newKeySet<String>()
+        val seenSubtitleUrls = ConcurrentHashMap.newKeySet<String>()
         val callbackLock = Any()
         val subtitleLock = Any()
         val semaphore = Semaphore(MAX_CONCURRENT_SOURCES)
@@ -290,7 +295,12 @@ class DonghuaFunProvider : MainAPI() {
         coroutineScope {
             val scope = this
 
-            fun emitSubtitle(sub: SubtitleFile) = synchronized(subtitleLock) { subtitleCallback.invoke(sub) }
+            // Dedup subtitle URLs — the same VTT can arrive from the JSON sub
+            // field, a <track> tag, and the player-config regex simultaneously.
+            fun emitSubtitle(sub: SubtitleFile) {
+                if (!seenSubtitleUrls.add(sub.url)) return
+                synchronized(subtitleLock) { subtitleCallback.invoke(sub) }
+            }
 
             fun emit(link: ExtractorLink, tabName: String, fromName: String) {
                 val finalName = buildFinalName(link, tabName, fromName)
