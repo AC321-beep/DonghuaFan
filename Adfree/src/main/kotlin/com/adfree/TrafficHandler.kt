@@ -21,12 +21,11 @@ class TrafficHandler : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         val host = try { Uri.parse(url).host } catch (_: Throwable) { null }
         
+        // ONLY block if explicitly known to be an ad/donation
         if (FilterStore.isHostBlocked(host)) return null
         if (FilterStore.looksLikeAdPath(url)) return null
-        if (SystemInterceptor.policy.blockAllUnknown && (host == null || !FilterStore.isHostSafe(host))) {
-            return null
-        }
         
+        // REMOVED: blockAllUnknown check. Let media providers through!
         return getRealProvider(url)?.load(url)
     }
 
@@ -38,9 +37,10 @@ class TrafficHandler : MainAPI() {
         val wrappedCallback: (ExtractorLink) -> Unit = cb@{ link ->
             val host = try { Uri.parse(link.url).host } catch (_: Throwable) { null }
             
+            // ONLY block if explicitly known to be an ad/donation
             if (FilterStore.isHostBlocked(host) || FilterStore.looksLikeAdPath(link.url)) return@cb
-            if (SystemInterceptor.policy.blockAllUnknown && (host == null || !FilterStore.isHostSafe(host))) return@cb
             
+            // REMOVED: blockAllUnknown check here as well.
             callback(link)
         }
         
