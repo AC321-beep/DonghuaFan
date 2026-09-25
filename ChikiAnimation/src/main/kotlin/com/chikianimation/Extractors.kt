@@ -20,33 +20,21 @@ import javax.crypto.spec.PBEKeySpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.math.abs
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  File-level compiled-once regexes for the extractor side.
-//  (Uniquely named so it doesn't collide with the provider-side object.)
-// ═══════════════════════════════════════════════════════════════════════════
 private object ExtractorRx {
     val vttBlock   = Regex("""\{([^}]+)\}""")
     val vttFile    = Regex("""(?:file|src|url)["']?\s*:\s*["']([^"']+\.(?:vtt|srt)[^"']*)["']""")
     val vttLabel   = Regex("""label["']?\s*:\s*["']([^"']+)["']""")
-
     val vidSrc     = Regex("""const[ \t]+VID_SRC[ \t]*=[ \t]*["']([^"']+)["']""")
-
     val streamAny  = Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
-
     val dataUrl    = Regex("""data-url=["']([^"']+)["']""")
-
     val baseUrl    = Regex("""["']baseUrl["'][ \t]*:[ \t]*["']([^"']+)["']""")
     val embedUrl   = Regex("""["']embed_url["'][ \t]*:[ \t]*["']([^"']+)["']""")
     val fileField  = Regex("""["']file["']\s*:\s*["']([^"']+)["']""")
-
     val jsFuckStart = Regex("ﾟωﾟﾉ[ \t]*=")
     val jsFuckEnd1  = Regex("\\)[ \t]*\\([ \t]*ﾟΘﾟ[ \t]*\\)[ \t]*\\)[ \t]*\\([ \t]*'_'[ \t]*\\)")
     val jsFuckEnd2  = Regex("\\)[ \t]*\\([ \t]*'_'[ \t]*\\)")
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Shared base for "All Sub Player" frontends
-// ═══════════════════════════════════════════════════════════════════════════
 abstract class AllSubPlayerExtractor : ExtractorApi() {
     protected val userAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -135,18 +123,12 @@ abstract class AllSubPlayerExtractor : ExtractorApi() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Ghbrisk — unchanged
-// ═══════════════════════════════════════════════════════════════════════════
 class Ghbrisk : Filesim() {
     override var name = "Streamwish"
     override var mainUrl = "https://ghbrisk.com"
     override val requiresReferer = true
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  SkylineAI — simple All Sub Player variant
-// ═══════════════════════════════════════════════════════════════════════════
 class SkylineAI : AllSubPlayerExtractor() {
     override var name = "SkylineAI"
     override var mainUrl = "https://skylineai.cloud"
@@ -176,6 +158,11 @@ class SkylineAI : AllSubPlayerExtractor() {
             return
         }
 
+        val fallbackHeaders = mapOf(
+            "User-Agent" to userAgent,
+            "Referer" to baseHost,
+            "Origin" to baseHost
+        )
         ExtractorRx.streamAny.findAll(page).forEach { m ->
             val su = m.groupValues[1].replace("\\/", "/")
             val isM3u8 = su.contains(".m3u8") || su.contains("hls")
@@ -183,19 +170,12 @@ class SkylineAI : AllSubPlayerExtractor() {
                 if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
                 this.referer = baseHost
                 this.quality = Qualities.Unknown.value
-                this.headers = mapOf(
-                    "User-Agent" to userAgent,
-                    "Referer" to baseHost,
-                    "Origin" to baseHost
-                )
+                this.headers = fallbackHeaders
             })
         }
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  GalaxyDonghua — All Sub Player variant with encrypted JSON API
-// ═══════════════════════════════════════════════════════════════════════════
 class GalaxyDonghua : AllSubPlayerExtractor() {
     override var name = "GalaxyDonghua"
     override var mainUrl = "https://galaxydonghua.xyz"
@@ -575,17 +555,7 @@ class GalaxyDonghua : AllSubPlayerExtractor() {
             val raw = m.groupValues[1]
             val abs = resolveUrl(raw, baseURL) ?: return@forEach
             if (abs.contains(".vtt", true) || abs.contains(".srt", true)) return@forEach
-
-            val isM3u8 = abs.contains(".m3u8", true) || abs.contains("hls", true) ||
-                         !abs.contains(".mp4", true)
-            if (!isM3u8 && !abs.contains(".mp4", true)) return@forEach
-
-            callback.invoke(newExtractorLink(this.name, this.name, abs,
-                if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
-                this.referer = dynamicEmbedUrl
-                this.quality = Qualities.Unknown.value
-                this.headers = ph
-            })
+            emitVideo(abs, dynamicEmbedUrl, ph, callback)
         }
     }
 }
