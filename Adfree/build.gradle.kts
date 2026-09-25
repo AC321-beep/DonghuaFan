@@ -1,10 +1,10 @@
 plugins {
     id("com.android.library") 
-    // REMOVED: kotlin("android") - This is strictly blocked in AGP 9.0+
+    // kotlin("android") is NOT needed. It's handled by the root project.
 }
 
 cloudstream {
-    description = "Aim to piss Adsproviders"
+    description = "Aggressively blocks ads and donation popups across all providers."
     authors = listOf("AC321-beep")   
     status = 1
     language = "en"
@@ -15,19 +15,16 @@ cloudstream {
 android {
     namespace = "com.net.optimizer" 
     
-    // minSdk, compileSdk, and compileOptions are removed because your 
-    // root build.gradle.kts automatically handles them for all modules.
+    // minSdk, compileSdk, and compileOptions are REMOVED.
+    // The root build.gradle.kts automatically handles them for all modules.
     
     buildTypes {
         release {
-            isMinifyEnabled = true 
+            isMinifyEnabled = true // Keep this true for optimal performance
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
+                "proguard-rules.pro" // Your custom rules
             )
         }
     }
 }
-
-// REMOVED: The kotlin { jvmToolchain(8) } block. Your root file already sets jvmTarget.JVM_1_8.
-// REMOVED: The dependencies { ... } block. Your root file already securely imports the "pre-release" library.
