@@ -1,9 +1,8 @@
-package com.net.optimizer
+package com.adfree
 
 import android.content.Context
 import android.util.Log
 import com.lagradost.cloudstream3.APIHolder
-import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.actions.VideoClickActionHolder
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
@@ -24,7 +23,6 @@ class OptimizerPlugin : Plugin() {
         FilterStore.init(context)
         SystemInterceptor.inject(context)
         
-        // --- DYNAMIC BLOCKING ---
         sweepSharedPreferences(context)
         dynamicReflectionInjection()
         
@@ -45,17 +43,13 @@ class OptimizerPlugin : Plugin() {
         }
     }
 
-    /**
-     * 1. UNIVERSAL SHARED PREFERENCES SWEEPER
-     * Scans all preference files for donation/ad related keywords and neutralizes them.
-     */
     private fun sweepSharedPreferences(context: Context) {
         try {
             val prefsDir = File(context.applicationInfo.dataDir, "shared_prefs")
             if (!prefsDir.exists()) return
 
             val keywords = listOf("donation", "ad", "popup", "promo", "support", "cooldown")
-            val futureTimestamp = 4084108800000L // Jan 1, 2099
+            val futureTimestamp = 4084108800000L 
             val currentMonth = SimpleDateFormat("MMMM yyyy", Locale.US).format(Date())
 
             prefsDir.listFiles()?.forEach { file ->
@@ -68,25 +62,21 @@ class OptimizerPlugin : Plugin() {
                     prefs.all.forEach { (key, value) ->
                         when (value) {
                             is Long -> {
-                                // Force timestamps to the future
                                 if (key.contains("last_shown") || key.contains("time") || key.contains("date")) {
                                     editor.putLong(key, futureTimestamp)
                                 }
                             }
                             is Int -> {
-                                // Force cooldowns to max
                                 if (key.contains("cooldown") || key.contains("hours")) {
                                     editor.putInt(key, 999999)
                                 }
                             }
                             is Boolean -> {
-                                // Disable enabled/shown flags
                                 if (key.contains("enabled") || key.contains("show") || key.contains("launching")) {
                                     editor.putBoolean(key, false)
                                 }
                             }
                             is String -> {
-                                // Suppress "Goal Achieved" monthly popups
                                 if (key.contains("achieved_shown_month")) {
                                     editor.putString(key, currentMonth)
                                 }
@@ -101,11 +91,6 @@ class OptimizerPlugin : Plugin() {
         }
     }
 
-    /**
-     * 2. DYNAMIC REFLECTION INJECTION
-     * Scans all loaded providers for DonationManager, AdManager, or PopupManager classes
-     * and forcibly disables them.
-     */
     private fun dynamicReflectionInjection() {
         try {
             val providers = APIHolder.allProviders.toList()
@@ -114,14 +99,11 @@ class OptimizerPlugin : Plugin() {
                 while (clazz != null && clazz != Any::class.java) {
                     for (field in clazz.declaredFields) {
                         val typeName = field.type.name.lowercase()
-                        // Look for Donation, Ad, or Popup managers
                         if (typeName.contains("donation") || typeName.contains("admanager") || 
                             typeName.contains("popup") || typeName.contains("support")) {
                             
                             field.isAccessible = true
                             val instance = field.get(provider) ?: continue
-                            
-                            // Try to disable the manager
                             disableManagerInstance(instance)
                         }
                     }
@@ -137,7 +119,6 @@ class OptimizerPlugin : Plugin() {
         try {
             val clazz = instance.javaClass
             
-            // 1. Disable boolean flags (enabled, isLaunching, isDialogShowing, testMode)
             for (field in clazz.declaredFields) {
                 if (field.type == Boolean::class.javaPrimitiveType) {
                     field.isAccessible = true
@@ -149,7 +130,6 @@ class OptimizerPlugin : Plugin() {
                 }
             }
 
-            // 2. Force cooldown hours to max
             for (field in clazz.declaredFields) {
                 if (field.type == Int::class.javaPrimitiveType) {
                     field.isAccessible = true
@@ -159,7 +139,6 @@ class OptimizerPlugin : Plugin() {
                 }
             }
 
-            // 3. Look for nested DonationConfig objects and disable them
             for (field in clazz.declaredFields) {
                 if (field.type.name.contains("Config")) {
                     field.isAccessible = true
