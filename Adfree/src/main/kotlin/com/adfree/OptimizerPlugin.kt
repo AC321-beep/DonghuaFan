@@ -19,33 +19,37 @@ import java.util.Locale
 class OptimizerPlugin : Plugin() {
     private val TAG = "NetOpt"
 
+    companion object {
+        @Volatile private var currentInstance: OptimizerPlugin? = null
+
+        fun setInstance(p: OptimizerPlugin) { currentInstance = p }
+
+        fun refreshBlocklist(context: Context) {
+            currentInstance?.autoSelectKnownBadProviders(context)
+        }
+    }
+
     // ============================================================
     // KNOWN BAD REPOSITORY IDENTIFIERS
-    // Any provider whose package, class name, or origin repo
-    // matches one of these will be automatically blocked.
     // ============================================================
-
-    // Package name prefixes
     private val KNOWN_BAD_PACKAGES = listOf(
         "com.phisher98",
         "com.cncverse",
         "com.nivin"
     )
 
-    // GitHub usernames whose repositories inject ads/donations
     private val KNOWN_BAD_USERNAMES = listOf(
         "phisher98",
         "nivincnc"
     )
 
-    // GitHub repository names that inject ads/donations
     private val KNOWN_BAD_REPOS = listOf(
         "cloudstream-extensions-phisher",
         "cncverse-cloud-stream-extension"
     )
 
     // ============================================================
-    // FINGERPRINTS — detect donation/ad managers by behavior
+    // FINGERPRINTS
     // ============================================================
     private val DONATION_METHODS = setOf(
         "checkandshow", "shownow", "showdialog", "recordshown",
@@ -69,6 +73,7 @@ class OptimizerPlugin : Plugin() {
     private val SUSPICION_THRESHOLD = 2
 
     override fun load(context: Context) {
+        setInstance(this)
         Log.i(TAG, "Initializing Ad & Donation Blocker...")
 
         FilterStore.init(context)
@@ -97,9 +102,8 @@ class OptimizerPlugin : Plugin() {
     }
 
     // ============================================================
-    // AUTO-SELECTION VIA EVENT BUS
+    // EVENT BUS
     // ============================================================
-
     private fun registerAfterPluginsLoadedListener(context: Context) {
         try {
             val eventBusClass = Class.forName("com.lagradost.cloudstream3.event.EventBus")
@@ -116,6 +120,7 @@ class OptimizerPlugin : Plugin() {
             ) { _, method, _ ->
                 if (method.name == "invoke") {
                     Log.i(TAG, "afterPluginsLoadedEvent fired")
+                    SystemInterceptor.wrapAllProviders()
                     autoSelectKnownBadProviders(context)
                 }
                 null
@@ -126,40 +131,59 @@ class OptimizerPlugin : Plugin() {
         } catch (t: Throwable) {
             Log.w(TAG, "Event bus subscription failed, using delayed fallback", t)
             Handler(Looper.getMainLooper()).postDelayed({
+                SystemInterceptor.wrapAllProviders()
                 autoSelectKnownBadProviders(context)
             }, 5000L)
         }
     }
 
-    /**
-     * Scans CloudStream's Extensions directory and builds a map of
-     * pluginName -> repoFolderName (lowercased) for every installed .cs3 file.
-     */
-    private fun buildPluginRepoMap(context: Context): Map<String, String> {
-        val map = HashMap<String, String>()
+    // ============================================================
+    // REPO MAP + DISPLAY NAMES
+    // ============================================================
+    private fun buildPluginRepoMap(context: Context): Pair<Map<String, String>, Map<String, String>> {
+        val pluginToRepo = HashMap<String, String>()
+        val repoDisplay = HashMap<String, String>()
+
         try {
             val extDir = File(context.applicationInfo.dataDir, "files/Extensions")
-            if (!extDir.exists()) return map
+            if (!extDir.exists()) return Pair(pluginToRepo, repoDisplay)
 
             extDir.listFiles()?.forEach { repoFolder ->
                 if (!repoFolder.isDirectory) return@forEach
                 val repoUrl = repoFolder.name.lowercase()
 
+                // Try to read display name from any .json in the folder
+                try {
+                    val jsonFile = repoFolder.listFiles()?.firstOrNull {
+                        it.name.endsWith(".json", ignoreCase = true)
+                    }
+                    if (jsonFile != null && jsonFile.exists()) {
+                        val text = jsonFile.readText()
+                        val m = Regex("\"name\"\\s*:\\s*\"([^\"]+)\"").find(text)
+                        if (m != null) {
+                            repoDisplay[repoUrl] = m.groupValues[1].lowercase().trim()
+                        }
+                    }
+                } catch (_: Throwable) {}
+
+                if (!repoDisplay.containsKey(repoUrl)) {
+                    val afterHost = repoUrl.substringAfter("raw.githubusercontent.com", repoUrl)
+                    val username = Regex("^([a-z0-9-]+)").find(afterHost)?.groupValues?.get(1) ?: ""
+                    repoDisplay[repoUrl] = username
+                }
+
                 repoFolder.listFiles()?.forEach { pluginFile ->
                     if (!pluginFile.name.endsWith(".cs3")) return@forEach
-                    val pluginName = pluginFile.name
-                        .substringBefore(".")
-                        .lowercase()
-                        .trim()
-                    if (pluginName.isNotBlank()) {
-                        map[pluginName] = repoUrl
-                    }
+                    val raw = pluginFile.name.substringBefore(".").lowercase().trim()
+                    pluginToRepo[raw] = repoUrl
+                    pluginToRepo[raw.replace("provider", "")] = repoUrl
+                    pluginToRepo[raw.replace("-", "").replace(" ", "")] = repoUrl
                 }
             }
         } catch (t: Throwable) {
             Log.e(TAG, "Failed to build plugin-repo map", t)
         }
-        return map
+        return Pair(pluginToRepo, repoDisplay)
     }
 
     private fun isKnownBadRepo(repoUrl: String?): Boolean {
@@ -170,23 +194,24 @@ class OptimizerPlugin : Plugin() {
         return false
     }
 
-    /**
-     * Scans all loaded providers and auto-blocks any that match a known
-     * bad package prefix, origin repo, or fingerprint. Skips providers the
-     * user has manually unblocked.
-     */
+    // ============================================================
+    // AUTO-SELECT
+    // ============================================================
     private fun autoSelectKnownBadProviders(context: Context) {
         try {
             val providers = APIHolder.allProviders.toList()
             val blockedSet = FilterStore.getBlockedProviders()
             val unblockedSet = FilterStore.getManuallyUnblocked()
-            val repoMap = buildPluginRepoMap(context)
+            val customSources = FilterStore.getCustomSources()
+
+            val (pluginToRepo, repoDisplay) = buildPluginRepoMap(context)
 
             var added = 0
             var skipped = 0
 
             Log.i(TAG, "Auto-scan: ${providers.size} providers, " +
-                "${repoMap.size} repo entries, ${unblockedSet.size} user-unblocked")
+                "${pluginToRepo.size} plugin entries, ${repoDisplay.size} repos, " +
+                "${customSources.size} custom sources")
 
             for (provider in providers) {
                 if (provider is TrafficHandler) continue
@@ -198,22 +223,34 @@ class OptimizerPlugin : Plugin() {
 
                 val className = provider.javaClass.name.lowercase()
                 val providerName = provider.name.lowercase().trim()
-                val repoUrl = repoMap[providerName]
+                val normalised = providerName.replace("-", "").replace(" ", "")
 
-                val matchesPackage = KNOWN_BAD_PACKAGES.any { className.startsWith(it) }
-                val matchesRepo = isKnownBadRepo(repoUrl)
+                val repoUrl = pluginToRepo[providerName]
+                    ?: pluginToRepo[normalised]
+                    ?: pluginToRepo[normalised + "provider"]
+                    ?: ""
+
+                val displayName = repoDisplay[repoUrl] ?: ""
+
+                val matchesPackage = KNOWN_BAD_PACKAGES.any { className.startsWith(it) } ||
+                                     customSources.any { className.contains(it) }
+                val matchesRepo = isKnownBadRepo(repoUrl) ||
+                                  customSources.any { repoUrl.contains(it) }
+                val matchesDisplay = customSources.any { src ->
+                    displayName.contains(src.replace(" ", "")) ||
+                    src.replace(" ", "").contains(displayName)
+                } && displayName.isNotBlank()
                 val matchesFingerprint = hasSuspiciousField(provider)
 
-                if (matchesPackage || matchesRepo || matchesFingerprint) {
+                if (matchesPackage || matchesRepo || matchesDisplay || matchesFingerprint) {
                     if (blockedSet.add(provider.name)) {
                         added++
                         Log.i(TAG, "Auto-blocked: ${provider.name} " +
-                            "[pkg=$matchesPackage repo=$matchesRepo fp=$matchesFingerprint]")
+                            "[pkg=$matchesPackage repo=$matchesRepo display=$matchesDisplay fp=$matchesFingerprint]")
                     }
                 }
             }
 
-            // Remove anything the user has manually unblocked
             blockedSet.removeAll(unblockedSet)
             FilterStore.updateBlockedProviders(blockedSet)
 
@@ -271,7 +308,7 @@ class OptimizerPlugin : Plugin() {
     }
 
     // ============================================================
-    // SHARED PREFERENCES SWEEPER
+    // SHARED PREFS SWEEPER
     // ============================================================
     private fun sweepDonationPreferences(context: Context) {
         try {
@@ -322,7 +359,7 @@ class OptimizerPlugin : Plugin() {
     }
 
     // ============================================================
-    // REFLECTION INJECTION (fallback for locally-instantiated managers)
+    // REFLECTION INJECTION
     // ============================================================
     private fun dynamicReflectionInjection() {
         val visited = HashSet<Class<*>>()
