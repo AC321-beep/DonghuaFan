@@ -1,11 +1,11 @@
-package com.net.optimizer
+package com.adfree
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import android.net.Uri
 
 class TrafficHandler : MainAPI() {
-    override var name = "Default-Traffic-Relay" // Stealth name
+    override var name = "Default-Traffic-Relay" 
     override var mainUrl = "https://"
     override val supportedTypes = TvType.values().toSet()
     override val hasMainPage = false
@@ -21,13 +21,8 @@ class TrafficHandler : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         val host = try { Uri.parse(url).host } catch (_: Throwable) { null }
         
-        // 1. Block if host is explicitly blocked
         if (FilterStore.isHostBlocked(host)) return null
-        
-        // 2. Block if path looks like an ad
         if (FilterStore.looksLikeAdPath(url)) return null
-        
-        // 3. Block if policy says so and host is not safe
         if (SystemInterceptor.policy.blockAllUnknown && (host == null || !FilterStore.isHostSafe(host))) {
             return null
         }
@@ -43,7 +38,6 @@ class TrafficHandler : MainAPI() {
         val wrappedCallback: (ExtractorLink) -> Unit = cb@{ link ->
             val host = try { Uri.parse(link.url).host } catch (_: Throwable) { null }
             
-            // Apply the same aggressive filtering to extracted links
             if (FilterStore.isHostBlocked(host) || FilterStore.looksLikeAdPath(link.url)) return@cb
             if (SystemInterceptor.policy.blockAllUnknown && (host == null || !FilterStore.isHostSafe(host))) return@cb
             
