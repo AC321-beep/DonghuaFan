@@ -2,36 +2,36 @@ package com.net.optimizer
 
 import android.content.Context
 import android.content.SharedPreferences
-import android.util.Log
 import org.json.JSONArray
-import org.json.JSONObject
 
 object FilterStore {
-    private const val TAG = "NetOpt"
     private const val PREFS_NAME = "net_opt_config"
     private const val KEY_ALWAYS = "always_allow_hosts"
     private const val KEY_BLOCKED_PROVIDERS = "blocked_providers"
-    private const val KEY_BLOCKED_LOG = "blocked_attempts_log"
-
+    
     @Volatile private var prefs: SharedPreferences? = null
     private val sessionAllowOnce = java.util.Collections.synchronizedSet(HashSet<String>())
 
-    // Hardcoded rules (formerly AdBlockList)
+    // Generic blocklist for ads and donations
     private val BLOCKED_HOSTS = setOf(
-        "omg10.com", "omg1.com", "omg2.com", "omg3.com", "omg4.com", "omg5.com",
-        "propellerads.com", "propeller-tracking.com", "monetag.com", "adsterra.com",
-        "hilltopads.com", "popads.net", "popcash.net", "ad-maven.com", "bit.ly",
-        "linkvertise.com", "onclickperformance.com", "pushmonetization.com"
+        "buymeacoffee.com", "developers.buymeacoffee.com",
+        "patreon.com", "paypal.me", "paypal.com",
+        "cncverse.com", "phisher98.com",
+        "cutt.ly", "tinyurl.com", "rebrand.ly", "is.gd",
+        "omg10.com", "propellerads.com", "monetag.com", "adsterra.com",
+        "hilltopads.com", "popads.net", "popcash.net", "ad-maven.com"
     )
 
     private val SAFE_HOSTS = setOf(
         "cs.repo", "cloudstream.on.fleek.co", "github.com", "t.me", 
-        "discord.com", "patreon.com", "www.google.com", "wikipedia.org"
+        "discord.com", "wikipedia.org"
     )
 
+    // Catch donation, support, and ad paths
     private val NON_MEDIA_PATTERNS = listOf(
         Regex("/\\d+/(\\d{6,})"), Regex("/(popunder|popunderinit)"),
-        Regex("/(redirect|go|visit|jump)/[a-zA-Z0-9]+"), Regex("/watch\\?key="), Regex("click\\?")
+        Regex("/(redirect|go|visit|jump)/[a-zA-Z0-9]+"), Regex("/watch\\?key="), Regex("click\\?"),
+        Regex("support|donate|patreon|buymeacoffee|ko-fi|cncverse|upi|paypal", RegexOption.IGNORE_CASE)
     )
 
     fun init(context: Context) {
@@ -39,7 +39,6 @@ object FilterStore {
         prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
-    // --- Core Routing Logic ---
     fun isHostBlocked(host: String?): Boolean {
         if (host.isNullOrBlank()) return false
         val h = host.lowercase().trim()
@@ -58,7 +57,6 @@ object FilterStore {
         return NON_MEDIA_PATTERNS.any { it.containsMatchIn(url) }
     }
 
-    // --- Storage Logic ---
     private fun isAllowedByUser(host: String): Boolean {
         if (host in sessionAllowOnce) return true
         val always = getAlwaysAllow()
