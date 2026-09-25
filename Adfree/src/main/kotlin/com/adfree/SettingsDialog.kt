@@ -20,24 +20,50 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
             setBackgroundColor(Color.parseColor("#121212"))
         }
 
+        // Title
         container.addView(TextView(context).apply {
-            text = "⚙️ Network Optimization"
-            textSize = 24f
+            text = "🛡️ Universal Ad & Donation Blocker"
+            textSize = 22f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
             setPadding(0, 0, 0, 16)
         })
+
+        // Master Switch for Aggressive Blocking
+        val masterRow = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, 24)
+        }
         
+        val masterLabel = TextView(context).apply {
+            text = "Aggressive Mode (Block All Unknown)"
+            setTextColor(Color.parseColor("#FFD700")) // Gold
+            textSize = 16f
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        
+        val masterToggle = Switch(context).apply {
+            isChecked = SystemInterceptor.policy.blockAllUnknown
+            setOnCheckedChangeListener { _, checked ->
+                SystemInterceptor.policy = SystemInterceptor.policy.copy(blockAllUnknown = checked)
+            }
+        }
+        
+        masterRow.addView(masterLabel)
+        masterRow.addView(masterToggle)
+        container.addView(masterRow)
+
+        // Provider List Header
         container.addView(TextView(context).apply {
-            text = "Select which providers to enforce strict ad-voiding on."
+            text = "Select providers to enforce strict ad-voiding on:"
             textSize = 14f
             setTextColor(Color.parseColor("#B0B0B0"))
-            setPadding(0, 0, 0, 32)
+            setPadding(0, 0, 0, 16)
         })
 
         val blockedSet = FilterStore.getBlockedProviders()
 
-        // Robust reflection fetch to ensure we get providers even if CloudStream is still loading them
         val providers = try {
             val getApisMethod = APIHolder::class.java.methods.find {
                 it.name == "getAllProviders" || it.name == "getApis" || it.name == "apis"
