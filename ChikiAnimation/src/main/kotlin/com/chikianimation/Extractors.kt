@@ -21,32 +21,24 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.math.abs
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  File-level compiled-once regexes.
-//  Regex(pattern) compiles at construction — hoisting them out of the hot
-//  paths (getUrl / emitStreams / parseSubtitles) removes ~20 compilations
-//  per playback.
+//  File-level compiled-once regexes for the extractor side.
+//  (Uniquely named so it doesn't collide with the provider-side object.)
 // ═══════════════════════════════════════════════════════════════════════════
-private object Rx {
-    // Shared subtitle extraction
+private object ExtractorRx {
     val vttBlock   = Regex("""\{([^}]+)\}""")
     val vttFile    = Regex("""(?:file|src|url)["']?\s*:\s*["']([^"']+\.(?:vtt|srt)[^"']*)["']""")
     val vttLabel   = Regex("""label["']?\s*:\s*["']([^"']+)["']""")
 
-    // Shared VID_SRC short-circuit
     val vidSrc     = Regex("""const[ \t]+VID_SRC[ \t]*=[ \t]*["']([^"']+)["']""")
 
-    // SkylineAI fallback
     val streamAny  = Regex("""(https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)(?:\?[^\s"'<>\\]*)?)""")
 
-    // GalaxyDonghua – embed page candidates
     val dataUrl    = Regex("""data-url=["']([^"']+)["']""")
 
-    // GalaxyDonghua – decrypted JSON fields
     val baseUrl    = Regex("""["']baseUrl["'][ \t]*:[ \t]*["']([^"']+)["']""")
     val embedUrl   = Regex("""["']embed_url["'][ \t]*:[ \t]*["']([^"']+)["']""")
     val fileField  = Regex("""["']file["']\s*:\s*["']([^"']+)["']""")
 
-    // GalaxyDonghua – JSFuck decoder
     val jsFuckStart = Regex("ﾟωﾟﾉ[ \t]*=")
     val jsFuckEnd1  = Regex("\\)[ \t]*\\([ \t]*ﾟΘﾟ[ \t]*\\)[ \t]*\\)[ \t]*\\([ \t]*'_'[ \t]*\\)")
     val jsFuckEnd2  = Regex("\\)[ \t]*\\([ \t]*'_'[ \t]*\\)")
@@ -71,12 +63,6 @@ abstract class AllSubPlayerExtractor : ExtractorApi() {
         "Accept-Language" to "en-US,en;q=0.9"
     ) + extra
 
-    /**
-     * Extract subtitle URLs from an embed page or decrypted JSON blob.
-     *   Pass 1 (HTML only): <track src="…"> elements
-     *   Pass 2 (always):    { … "file"/"src"/"url": "*.vtt|*.srt" … } blocks
-     * The Jsoup pass is skipped when `html` has no `<` — JSON blobs never do.
-     */
     protected fun parseSubtitles(
         html: String,
         baseUrl: String,
@@ -94,11 +80,11 @@ abstract class AllSubPlayerExtractor : ExtractorApi() {
             }
         }
 
-        Rx.vttBlock.findAll(html).forEach { match ->
+        ExtractorRx.vttBlock.findAll(html).forEach { match ->
             val block = match.groupValues[1]
             if (block.contains(".vtt", true) || block.contains(".srt", true)) {
-                val file = Rx.vttFile.find(block)?.groupValues?.get(1) ?: return@forEach
-                val label = Rx.vttLabel.find(block)?.groupValues?.get(1) ?: "Subtitle"
+                val file = ExtractorRx.vttFile.find(block)?.groupValues?.get(1) ?: return@forEach
+                val label = ExtractorRx.vttLabel.find(block)?.groupValues?.get(1) ?: "Subtitle"
                 resolveUrl(file, baseUrl)?.let {
                     subtitleCallback.invoke(SubtitleFile(label, it))
                 }
@@ -106,14 +92,12 @@ abstract class AllSubPlayerExtractor : ExtractorApi() {
         }
     }
 
-    /** `const VID_SRC = "…"` — both sites expose the direct stream this way. */
     protected fun findVidSrc(html: String): String? =
-        Rx.vidSrc.find(html)?.groupValues?.get(1)
+        ExtractorRx.vidSrc.find(html)?.groupValues?.get(1)
             ?.replace("\\/", "/")
             ?.takeIf { it.isNotBlank() }
 
-    /** Emit a video link with the standard m3u8/mp4 type detection. */
-    protected fun emitVideo(
+    protected suspend fun emitVideo(
         url: String,
         referer: String,
         headers: Map<String, String>,
@@ -144,7 +128,6 @@ abstract class AllSubPlayerExtractor : ExtractorApi() {
         mainUrl
     }
 
-    /** `,,` → `==` and pad to a multiple of 4, for base64 in query paths. */
     protected fun normalizeBase64(input: String): String {
         var s = input.trim().replace(",,", "==").replace(",", "=")
         while (s.length % 4 != 0) s += "="
@@ -193,7 +176,7 @@ class SkylineAI : AllSubPlayerExtractor() {
             return
         }
 
-        Rx.streamAny.findAll(page).forEach { m ->
+        ExtractorRx.streamAny.findAll(page).forEach { m ->
             val su = m.groupValues[1].replace("\\/", "/")
             val isM3u8 = su.contains(".m3u8") || su.contains("hls")
             callback.invoke(newExtractorLink(name, "$name Fallback", su,
@@ -256,7 +239,7 @@ class GalaxyDonghua : AllSubPlayerExtractor() {
             return
         }
 
-        val candidates = Rx.dataUrl.findAll(page)
+        val candidates = ExtractorRx.dataUrl.findAll(page)
             .map { it.groupValues[1] }
             .map { if (it.startsWith("/")) gxBase + it else it }
             .distinct().toList().ifEmpty { listOf(url) }
@@ -310,7 +293,6 @@ class GalaxyDonghua : AllSubPlayerExtractor() {
         )
         cookieHeader(globalCookies)?.let { apiHeaders["Cookie"] = it }
 
-        // Config warm-up
         val configUrl = "$gxBase/api-config/${tokens.qsx}?p=${tokens.ps}&_=${System.currentTimeMillis()}"
         try {
             val rConf = app.get(configUrl, headers = apiHeaders)
@@ -469,11 +451,11 @@ class GalaxyDonghua : AllSubPlayerExtractor() {
         }
 
         var jsFuck = ""
-        val startMatch = Rx.jsFuckStart.find(page)
+        val startMatch = ExtractorRx.jsFuckStart.find(page)
         if (startMatch != null) {
             val jStart = startMatch.range.first
-            val endMatch = Rx.jsFuckEnd1.find(page, jStart)
-                ?: Rx.jsFuckEnd2.find(page, jStart)
+            val endMatch = ExtractorRx.jsFuckEnd1.find(page, jStart)
+                ?: ExtractorRx.jsFuckEnd2.find(page, jStart)
             if (endMatch != null) {
                 val raw = page.substring(jStart, endMatch.range.last + 1)
                     .replace(" ", "").replace("\u00a0", "").replace("\u3000", "")
@@ -571,11 +553,10 @@ class GalaxyDonghua : AllSubPlayerExtractor() {
     ) {
         if (!json.trimStart().startsWith("{")) return
 
-        val baseURL = Rx.baseUrl.find(json)?.groupValues?.get(1) ?: gxBase
-        val dynamicEmbedUrl = Rx.embedUrl.find(json)?.groupValues?.get(1)
+        val baseURL = ExtractorRx.baseUrl.find(json)?.groupValues?.get(1) ?: gxBase
+        val dynamicEmbedUrl = ExtractorRx.embedUrl.find(json)?.groupValues?.get(1)
             ?.replace("\\/", "/") ?: fallbackEmbedUrl
 
-        // JSON has no '<' — parseSubtitles skips the Jsoup pass and runs only the block regex
         parseSubtitles(json, baseURL, subtitleCallback)
 
         val ph = mutableMapOf(
@@ -590,7 +571,7 @@ class GalaxyDonghua : AllSubPlayerExtractor() {
         )
         cookieHeader(globalCookies)?.let { ph["Cookie"] = it }
 
-        Rx.fileField.findAll(json).forEach { m ->
+        ExtractorRx.fileField.findAll(json).forEach { m ->
             val raw = m.groupValues[1]
             val abs = resolveUrl(raw, baseURL) ?: return@forEach
             if (abs.contains(".vtt", true) || abs.contains(".srt", true)) return@forEach
