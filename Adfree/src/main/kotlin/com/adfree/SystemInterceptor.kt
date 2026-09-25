@@ -1,110 +1,48 @@
 package com.adfree
 
-import android.app.Activity
-import android.app.Application
-import android.content.Context
-import android.content.ContextWrapper
-import android.content.Intent
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.util.Log
-import com.lagradost.cloudstream3.APIHolder
-import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import android.net.Uri
 
-object SystemInterceptor {
-    private const val TAG = "NetOpt"
-    private val handler = Handler(Looper.getMainLooper())
+class TrafficHandler : MainAPI() {
+    override var name = "Default-Traffic-Relay"
+    override var mainUrl = "https://"
+    override val supportedTypes = TvType.values().toSet()
+    override val hasMainPage = false
+    override val hasQuickSearch = false
+    override var lang = "en"
 
-    fun inject(context: Context) {
-        startProviderSanitizer()
-
-        (context.applicationContext as? Application)?.registerActivityLifecycleCallbacks(
-            object : Application.ActivityLifecycleCallbacks {
-                override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
-                override fun onActivityStarted(a: Activity) {}
-                override fun onActivityResumed(a: Activity) {}
-                override fun onActivityPaused(a: Activity) {}
-                override fun onActivityStopped(a: Activity) {}
-                override fun onActivitySaveInstanceState(a: Activity, outState: Bundle) {}
-                override fun onActivityDestroyed(a: Activity) {}
-            }
-        )
-    }
-
-    private fun startProviderSanitizer() {
-        handler.post(object : Runnable {
-            override fun run() {
-                try {
-                    for (provider in APIHolder.allProviders.toList()) {
-                        wrapContext(provider)
-                    }
-                } catch (_: Throwable) {}
-                handler.postDelayed(this, 1500L)
-            }
-        })
-    }
-
-    private fun wrapContext(target: Any) {
-        var klass: Class<*>? = target.javaClass
-        while (klass != null && klass != Any::class.java) {
-            for (field in klass.declaredFields) {
-                if (Context::class.java.isAssignableFrom(field.type)) {
-                    try {
-                        field.isAccessible = true
-                        val current = field.get(target) as? Context ?: continue
-                        if (current !is SecureContext) {
-                            val providerName = (target as? MainAPI)?.name
-                            field.set(target, SecureContext(current, providerName))
-                        }
-                    } catch (_: Throwable) {}
-                }
-            }
-            klass = klass.superclass
+    private fun getRealProvider(url: String): MainAPI? {
+        return APIHolder.allProviders.firstOrNull { p ->
+            p !== this && p !is TrafficHandler && p.mainUrl.length > 8 && url.startsWith(p.mainUrl)
         }
     }
 
-    class SecureContext(base: Context, private val source: String?) : ContextWrapper(base) {
-        override fun startActivity(intent: Intent?) {
-            if (shouldBlockIntent(intent, source)) {
-                Log.i(TAG, "Blocked startActivity: ${intent?.data}")
-                return
-            }
-            try { super.startActivity(intent) } catch (_: Throwable) {}
-        }
+    override suspend fun load(url: String): LoadResponse? {
+        val host = try { Uri.parse(url).host } catch (_: Throwable) { null }
 
-        override fun startActivities(intents: Array<out Intent>?) {
-            if (intents == null) return
-            val safe = intents.filter { !shouldBlockIntent(it, source) }
-            if (safe.isEmpty()) return
-            try { super.startActivities(safe.toTypedArray()) } catch (_: Throwable) {}
-        }
+        if (FilterStore.isHostBlocked(host)) return null
+        if (FilterStore.looksLikeAdPath(url)) return null
+
+        return getRealProvider(url)?.load(url)
     }
 
-    private fun shouldBlockIntent(intent: Intent?, providerName: String?): Boolean {
-        if (intent == null) return false
-        val uri = intent.data ?: return false
-        val scheme = uri.scheme?.lowercase()
-        val host = uri.host
-        val url = uri.toString()
+    override suspend fun loadLinks(
+        data: String, isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val real = getRealProvider(data) ?: return false
 
-        // 1. Block non-HTTP schemes except safe ones
-        if (scheme != null && scheme != "http" && scheme != "https" &&
-            scheme != "market" && scheme != "content") {
-            return true
+        val wrapped: (ExtractorLink) -> Unit = cb@{ link ->
+            val host = try { Uri.parse(link.url).host } catch (_: Throwable) { null }
+            if (FilterStore.isHostBlocked(host) || FilterStore.looksLikeAdPath(link.url)) return@cb
+            callback(link)
         }
 
-        // 2. Block if host or URL matches the known blocklist
-        if (FilterStore.isHostBlocked(host)) return true
-        if (FilterStore.looksLikeAdPath(url)) return true
-
-        // 3. Block donation keywords anywhere in the URL
-        if (url.contains("buymeacoffee", true) || url.contains("donate", true) ||
-            url.contains("patreon", true) || url.contains("cncverse", true) ||
-            url.contains("paypal", true)) {
-            return true
-        }
-
-            return false
+        return real.loadLinks(data, isCasting, subtitleCallback, wrapped)
     }
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest) = null
+    override suspend fun search(query: String) = null
 }
