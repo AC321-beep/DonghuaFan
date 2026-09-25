@@ -17,7 +17,8 @@ object SystemInterceptor {
     private val handler = Handler(Looper.getMainLooper())
 
     fun inject(context: Context) {
-        startProviderSanitizer()
+        handler.post { wrapAllProviders() }
+        handler.postDelayed({ wrapAllProviders() }, 3000L)
 
         (context.applicationContext as? Application)?.registerActivityLifecycleCallbacks(
             object : Application.ActivityLifecycleCallbacks {
@@ -32,20 +33,25 @@ object SystemInterceptor {
         )
     }
 
-    private fun startProviderSanitizer() {
-        handler.post(object : Runnable {
-            override fun run() {
-                try {
-                    for (provider in APIHolder.allProviders.toList()) {
-                        wrapContext(provider)
-                    }
-                } catch (_: Throwable) {}
-                handler.postDelayed(this, 1500L)
+    /**
+     * Wraps every loaded provider's Context field with SecureContext.
+     * Idempotent: already-wrapped providers are skipped instantly.
+     */
+    fun wrapAllProviders() {
+        try {
+            val providers = APIHolder.allProviders.toList()
+            var wrapped = 0
+            for (provider in providers) {
+                if (wrapContext(provider)) wrapped++
             }
-        })
+            if (wrapped > 0) {
+                Log.i(TAG, "Wrapped $wrapped provider context(s)")
+            }
+        } catch (_: Throwable) {}
     }
 
-    private fun wrapContext(target: Any) {
+    private fun wrapContext(target: Any): Boolean {
+        var wrappedAny = false
         var klass: Class<*>? = target.javaClass
         while (klass != null && klass != Any::class.java) {
             for (field in klass.declaredFields) {
@@ -56,12 +62,14 @@ object SystemInterceptor {
                         if (current !is SecureContext) {
                             val providerName = (target as? MainAPI)?.name
                             field.set(target, SecureContext(current, providerName))
+                            wrappedAny = true
                         }
                     } catch (_: Throwable) {}
                 }
             }
             klass = klass.superclass
         }
+        return wrappedAny
     }
 
     class SecureContext(base: Context, private val source: String?) : ContextWrapper(base) {
@@ -93,6 +101,14 @@ object SystemInterceptor {
         // Level 0+: Always block explicit blocklist hits and known ad paths
         if (FilterStore.isHostBlocked(host)) return true
         if (FilterStore.looksLikeAdPath(url)) return true
+
+        // If the calling provider is in the block list, apply strict filtering:
+        // block any host that isn't explicitly safe.
+        if (providerName != null && FilterStore.getBlockedProviders().contains(providerName)) {
+            if (host == null || !FilterStore.isHostSafe(host)) {
+                return true
+            }
+        }
 
         // Level 1+: Also block donation keyword URLs
         if (intensity >= 1) {
