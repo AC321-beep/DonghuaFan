@@ -17,12 +17,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.Collections
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  File-level compiled-once regexes for the provider side.
-//  (Uniquely named so it doesn't collide with the extractor-side object.)
-// ═══════════════════════════════════════════════════════════════════════════
 private object ProviderRx {
-    // Episode number parsing
     val seasonNum  = Regex("(?i)(?:season\\s*(\\d+)|s(\\d+))")
     val episodeNum = Regex("(?i)(?:episode|ep)\\s*(\\d+)")
     val rangeTo    = Regex("(\\d+)\\s*(?:to|-)\\s*\\d+")
@@ -30,20 +25,14 @@ private object ProviderRx {
     val rangeDash  = Regex("(\\d+)-(\\d+)")
     val digits     = Regex("\\d+")
     val episodePre = Regex("(?i)^\\s*Episode\\s*")
-
-    // Google Drive
     val gdriveFileId  = Regex("/file/d/([a-zA-Z0-9_-]{10,})")
     val gdriveQueryId = Regex("[?&]id=([a-zA-Z0-9_-]{10,})")
     val gdriveUuid1   = Regex("""<input[^>]*?name=["']uuid["'][^>]*?value=["']([^"']+)["']""")
     val gdriveUuid2   = Regex("""<input[^>]*?value=["']([^"']+)["'][^>]*?name=["']uuid["']""")
-
-    // Dailymotion
     val dmVideoIdGeo = Regex("video=([a-zA-Z0-9_-]+)")
     val dmVideoIdStd = Regex("(?:video/|dai\\.ly/|embed/video/)([a-zA-Z0-9_-]+)")
     val dmM3u8       = Regex("[\"']url[\"']\\s*:\\s*[\"']([^\"']+\\.m3u8[^\"']*)[\"']")
-
-    // Generic URL scan
-    val anyUrl = Regex("https?://[^\\s\"'<>\\\\)]+")
+    val anyUrl       = Regex("https?://[^\\s\"'<>\\\\)]+")
 }
 
 class ChikiAnimationProvider : MainAPI() {
@@ -60,12 +49,10 @@ class ChikiAnimationProvider : MainAPI() {
         private const val EXTRACTOR_TIMEOUT_MS = 20_000L
         private const val GRACE_AFTER_FIRST_EMIT_MS = 1_500L
         private const val MAX_CONCURRENT_EXTRACTORS = 4
-
         private const val CARD_SELECTOR =
             "div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx"
         private const val EPISODE_LIST_SELECTOR = ".episodelist li, .eplister li"
         private const val EPISODE_LINK_SELECTOR = ".episodelist li > a[href], .eplister li > a[href]"
-
         private val BLACKLIST_HOSTS = setOf(
             "youtube", "disqus", "googlesyndication", "doubleclick"
         )
@@ -87,6 +74,16 @@ class ChikiAnimationProvider : MainAPI() {
         "Accept-Language" to "en-US,en;q=0.9",
         "Referer" to "https://drive.google.com/"
     )
+
+    // Swallow all exceptions except CancellationException.
+    // Used around every extractor call so one failure doesn't kill the batch.
+    private suspend fun safeExtract(block: suspend () -> Unit) {
+        try {
+            block()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {}
+    }
 
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update"          to "Recently Updated",
@@ -433,31 +430,19 @@ class ChikiAnimationProvider : MainAPI() {
 
                 if (cleanUrl.contains("galaxydonghua.xyz", true)) {
                     val before = emitCount.get()
-                    try {
-                        GalaxyDonghua().getUrl(cleanUrl, "$mainUrl/", subtitleCallback, countingCallback)
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Exception) {}
+                    safeExtract { GalaxyDonghua().getUrl(cleanUrl, "$mainUrl/", subtitleCallback, countingCallback) }
                     if (emitCount.get() > before) return
                 }
 
                 if (cleanUrl.contains("skylineai.cloud", true)) {
                     val before = emitCount.get()
-                    try {
-                        SkylineAI().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Exception) {}
+                    safeExtract { SkylineAI().getUrl(cleanUrl, ref, subtitleCallback, countingCallback) }
                     if (emitCount.get() > before) return
                 }
 
                 if (cleanUrl.contains("ghbrisk.com", true)) {
                     val before = emitCount.get()
-                    try {
-                        Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, countingCallback)
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Exception) {}
+                    safeExtract { Ghbrisk().getUrl(cleanUrl, ref, subtitleCallback, countingCallback) }
                     if (emitCount.get() > before) return
                 }
 
@@ -465,7 +450,7 @@ class ChikiAnimationProvider : MainAPI() {
                     val videoId = ProviderRx.dmVideoIdGeo.find(cleanUrl)?.groupValues?.get(1)
                     if (videoId != null && processedDmIds.add(videoId)) {
                         val before = emitCount.get()
-                        try {
+                        safeExtract {
                             val apiUrl = "https://geo.dailymotion.com/videos/$videoId"
                             val reqHeaders = mapOf(
                                 "User-Agent" to defaultUserAgent,
@@ -491,19 +476,15 @@ class ChikiAnimationProvider : MainAPI() {
                                     this.quality = Qualities.Unknown.value
                                 })
                             }
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (_: Exception) {}
+                        }
 
                         if (emitCount.get() == before) {
-                            try {
+                            safeExtract {
                                 loadExtractor(
                                     "https://www.dailymotion.com/embed/video/$videoId",
                                     ref, subtitleCallback, countingCallback
                                 )
-                            } catch (e: CancellationException) {
-                                throw e
-                            } catch (_: Exception) {}
+                            }
                         }
                         if (emitCount.get() > before) return
                     }
@@ -513,30 +494,20 @@ class ChikiAnimationProvider : MainAPI() {
                     val videoId = ProviderRx.dmVideoIdStd.find(cleanUrl)?.groupValues?.get(1)
                     if (videoId == null || processedDmIds.add(videoId)) {
                         val before = emitCount.get()
-                        try {
-                            loadExtractor(cleanUrl, ref, subtitleCallback, countingCallback)
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (_: Exception) {}
+                        safeExtract { loadExtractor(cleanUrl, ref, subtitleCallback, countingCallback) }
                         if (emitCount.get() > before) return
                     }
                 }
 
                 val beforeGeneric = emitCount.get()
-                try {
-                    loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (_: Exception) {}
+                safeExtract { loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback) }
                 if (emitCount.get() > beforeGeneric) return
 
                 if (cleanUrl.contains(".m3u8", true)) {
-                    try {
+                    safeExtract {
                         M3u8Helper.generateM3u8("Generic HLS", cleanUrl, ref)
                             .forEach { countingCallback(it) }
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Exception) {}
+                    }
                     if (emitCount.get() > beforeGeneric) return
                 } else if (cleanUrl.contains(".mp4", true)) {
                     countingCallback(
