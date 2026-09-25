@@ -2,7 +2,6 @@ package com.adfree
 
 import android.content.Context
 import android.util.Log
-import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.actions.VideoClickActionHolder
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
@@ -14,18 +13,16 @@ import java.util.Locale
 @CloudstreamPlugin
 class OptimizerPlugin : Plugin() {
     private val TAG = "NetOpt"
-    private var pluginContext: Context? = null
 
     override fun load(context: Context) {
-        Log.i(TAG, "Initializing Universal Ad & Donation Blocker...")
-        pluginContext = context
-        
+        Log.i(TAG, "Initializing Ad & Donation Blocker...")
+
         FilterStore.init(context)
         SystemInterceptor.inject(context)
-        
-        sweepSharedPreferences(context)
+
+        sweepDonationPreferences(context)
         dynamicReflectionInjection()
-        
+
         try {
             registerMainAPI(TrafficHandler())
         } catch (t: Throwable) {
@@ -43,128 +40,128 @@ class OptimizerPlugin : Plugin() {
         }
     }
 
-    private fun sweepSharedPreferences(context: Context) {
+    /**
+     * Sweeps ONLY preference files whose KEY STRUCTURE indicates a donation/ad manager.
+     * Player settings (swipe_to_seek_enabled, download_path, etc.) are never touched
+     * because their keys never contain "donation", "popup", "cached_amount", etc.
+     */
+    private fun sweepDonationPreferences(context: Context) {
         try {
             val prefsDir = File(context.applicationInfo.dataDir, "shared_prefs")
             if (!prefsDir.exists()) return
 
-            val keywords = listOf("donation", "ad", "popup", "promo", "support", "cooldown")
-            val futureTimestamp = 4084108800000L 
+            // Structural signatures — matches the shape of donation prefs, not filenames
+            val suspiciousKeyPatterns = listOf(
+                Regex("donation", RegexOption.IGNORE_CASE),
+                Regex("popup", RegexOption.IGNORE_CASE),
+                Regex("cached_(amount|goal|percent|supporters|month)", RegexOption.IGNORE_CASE),
+                Regex("achieved_shown_month", RegexOption.IGNORE_CASE),
+                Regex("cooldown_hours", RegexOption.IGNORE_CASE)
+            )
+
+            val futureTimestamp = 4084108800000L // Jan 1, 2099
             val currentMonth = SimpleDateFormat("MMMM yyyy", Locale.US).format(Date())
 
             prefsDir.listFiles()?.forEach { file ->
-                val fileName = file.nameWithoutExtension.lowercase()
-                if (keywords.any { fileName.contains(it) }) {
-                    Log.i(TAG, "Neutralizing preference file: $fileName")
-                    val prefs = context.getSharedPreferences(file.nameWithoutExtension, Context.MODE_PRIVATE)
-                    val editor = prefs.edit()
+                if (!file.name.endsWith(".xml")) return@forEach
+                val prefsName = file.nameWithoutExtension
+                val prefs = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
+                val allKeys = prefs.all.keys
 
-                    prefs.all.forEach { (key, value) ->
-                        when (value) {
-                            is Long -> {
-                                if (key.contains("last_shown") || key.contains("time") || key.contains("date")) {
-                                    editor.putLong(key, futureTimestamp)
-                                }
+                // Only proceed if this file is truly donation/ad related
+                val isSuspicious = allKeys.any { key ->
+                    suspiciousKeyPatterns.any { it.containsMatchIn(key) }
+                }
+                if (!isSuspicious) return@forEach
+
+                Log.i(TAG, "Neutralizing donation prefs: $prefsName")
+                val editor = prefs.edit()
+
+                prefs.all.forEach { (key, value) ->
+                    val lower = key.lowercase()
+                    when (value) {
+                        is Long -> {
+                            if (lower.contains("last_shown") || lower.contains("cached_time")) {
+                                editor.putLong(key, futureTimestamp)
                             }
-                            is Int -> {
-                                if (key.contains("cooldown") || key.contains("hours")) {
-                                    editor.putInt(key, 999999)
-                                }
+                        }
+                        is Int -> {
+                            if (lower.contains("cooldown")) {
+                                editor.putInt(key, 999999)
                             }
-                            is Boolean -> {
-                                if (key.contains("enabled") || key.contains("show") || key.contains("launching")) {
-                                    editor.putBoolean(key, false)
-                                }
+                        }
+                        is Boolean -> {
+                            if (lower.contains("donation") || lower.contains("popup") ||
+                                lower.contains("admanager")) {
+                                editor.putBoolean(key, false)
                             }
-                            is String -> {
-                                if (key.contains("achieved_shown_month")) {
-                                    editor.putString(key, currentMonth)
-                                }
+                        }
+                        is String -> {
+                            if (lower.contains("achieved_shown_month")) {
+                                editor.putString(key, currentMonth)
                             }
                         }
                     }
-                    editor.apply()
                 }
+                editor.apply()
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "Failed to sweep SharedPreferences", t)
+            Log.e(TAG, "Failed to sweep donation preferences", t)
         }
     }
 
     private fun dynamicReflectionInjection() {
         try {
-            val providers = APIHolder.allProviders.toList()
-            for (provider in providers) {
+            for (provider in com.lagradost.cloudstream3.APIHolder.allProviders.toList()) {
                 var clazz: Class<*>? = provider.javaClass
                 while (clazz != null && clazz != Any::class.java) {
                     for (field in clazz.declaredFields) {
                         val typeName = field.type.name.lowercase()
-                        if (typeName.contains("donation") || typeName.contains("admanager") || 
-                            typeName.contains("popup") || typeName.contains("support")) {
-                            
+                        if (typeName.contains("donation") || typeName.contains("admanager") ||
+                            typeName.contains("popup")) {
                             field.isAccessible = true
                             val instance = field.get(provider) ?: continue
-                            disableManagerInstance(instance)
+                            disableManager(instance)
                         }
                     }
                     clazz = clazz.superclass
                 }
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "Dynamic reflection injection failed", t)
+            Log.e(TAG, "Reflection injection failed", t)
         }
     }
 
-    private fun disableManagerInstance(instance: Any) {
+    private fun disableManager(instance: Any) {
         try {
             val clazz = instance.javaClass
-            
             for (field in clazz.declaredFields) {
-                if (field.type == Boolean::class.javaPrimitiveType) {
-                    field.isAccessible = true
-                    val name = field.name.lowercase()
-                    if (name.contains("enabled") || name.contains("launching") || 
-                        name.contains("showing") || name.contains("test")) {
-                        field.setBoolean(instance, false)
+                field.isAccessible = true
+                when {
+                    field.type == Boolean::class.javaPrimitiveType -> {
+                        val n = field.name.lowercase()
+                        if (n.contains("enabled") || n.contains("showing") || n.contains("launching")) {
+                            field.setBoolean(instance, false)
+                        }
+                    }
+                    field.type == Int::class.javaPrimitiveType -> {
+                        if (field.name.lowercase().contains("cooldown")) {
+                            field.setInt(instance, 999999)
+                        }
                     }
                 }
             }
-
-            for (field in clazz.declaredFields) {
-                if (field.type == Int::class.javaPrimitiveType) {
-                    field.isAccessible = true
-                    if (field.name.lowercase().contains("cooldown")) {
-                        field.setInt(instance, 999999)
-                    }
-                }
-            }
-
-            for (field in clazz.declaredFields) {
-                if (field.type.name.contains("Config")) {
-                    field.isAccessible = true
-                    val config = field.get(instance) ?: continue
-                    val configClass = config.javaClass
-                    try {
-                        val enabledField = configClass.getDeclaredField("enabled")
-                        enabledField.isAccessible = true
-                        enabledField.setBoolean(config, false)
-                    } catch (_: Throwable) {}
-                }
-            }
-        } catch (t: Throwable) {
-            // Ignore and continue
-        }
+        } catch (_: Throwable) {}
     }
 
     private fun sanitizeActions() {
-        val actions = VideoClickActionHolder.allVideoClickActions
-        val toRemove = actions.filter { action ->
-            val className = action::class.java.name.lowercase()
-            className.contains("malicious") || className.contains("redirect") || 
-            className.contains("adnetwork") || className.contains("support") ||
-            className.contains("donation") || className.contains("cncverse") ||
-            className.contains("popup") || className.contains("promo")
-        }
-        toRemove.forEach { actions.remove(it) }
+        try {
+            val actions = VideoClickActionHolder.allVideoClickActions
+            val toRemove = actions.filter { action ->
+                val n = action::class.java.name.lowercase()
+                n.contains("donation") || n.contains("adnetwork") || n.contains("promo")
+            }
+            toRemove.forEach { actions.remove(it) }
+        } catch (_: Throwable) {}
     }
 }
