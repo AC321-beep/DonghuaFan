@@ -12,30 +12,16 @@ import android.util.Log
 import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.MainAPI
 
-data class SecurityPolicy(
-    val blockAllUnknown: Boolean = true,
-    val showToast: Boolean = false
-)
-
 object SystemInterceptor {
     private const val TAG = "NetOpt"
     private val handler = Handler(Looper.getMainLooper())
-    @Volatile var policy = SecurityPolicy()
 
     fun inject(context: Context) {
-        // NOTE: Instrumentation injection via reflection was removed because
-        // 'execStartActivity' is a hidden Android API method that cannot be
-        // overridden in Kotlin. We rely on SecureContext wrapping instead,
-        // which is the officially supported interception mechanism.
-
         startProviderSanitizer()
 
         (context.applicationContext as? Application)?.registerActivityLifecycleCallbacks(
             object : Application.ActivityLifecycleCallbacks {
-                override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
-                    // Do NOT wrap Activity contexts directly - it breaks theme resolution
-                    // and can cause crashes. Providers get wrapped by the sanitizer loop.
-                }
+                override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}
                 override fun onActivityStarted(a: Activity) {}
                 override fun onActivityResumed(a: Activity) {}
                 override fun onActivityPaused(a: Activity) {}
@@ -46,28 +32,19 @@ object SystemInterceptor {
         )
     }
 
-    /**
-     * Polls every second to wrap any newly loaded provider's Context fields
-     * with our SecureContext interceptor.
-     */
     private fun startProviderSanitizer() {
         handler.post(object : Runnable {
             override fun run() {
                 try {
-                    val providers = APIHolder.allProviders.toList()
-                    for (provider in providers) {
+                    for (provider in APIHolder.allProviders.toList()) {
                         wrapContext(provider)
                     }
                 } catch (_: Throwable) {}
-                handler.postDelayed(this, 1000L)
+                handler.postDelayed(this, 1500L)
             }
         })
     }
 
-    /**
-     * Recursively walks a provider's class hierarchy and replaces any Context field
-     * with a SecureContext wrapper.
-     */
     private fun wrapContext(target: Any) {
         var klass: Class<*>? = target.javaClass
         while (klass != null && klass != Any::class.java) {
@@ -87,78 +64,47 @@ object SystemInterceptor {
         }
     }
 
-    // --- The Void Context ---
     class SecureContext(base: Context, private val source: String?) : ContextWrapper(base) {
         override fun startActivity(intent: Intent?) {
             if (shouldBlockIntent(intent, source)) {
                 Log.i(TAG, "Blocked startActivity: ${intent?.data}")
                 return
             }
-            try {
-                super.startActivity(intent)
-            } catch (t: Throwable) {
-                Log.e(TAG, "startActivity failed", t)
-            }
+            try { super.startActivity(intent) } catch (_: Throwable) {}
         }
 
         override fun startActivities(intents: Array<out Intent>?) {
             if (intents == null) return
-            // Filter the batch: only pass through safe intents
             val safe = intents.filter { !shouldBlockIntent(it, source) }
-            if (safe.isEmpty()) {
-                Log.i(TAG, "All ${intents.size} intents blocked in batch.")
-                return
-            }
-            if (safe.size < intents.size) {
-                Log.i(TAG, "Blocked ${intents.size - safe.size} intents in batch.")
-            }
-            try {
-                super.startActivities(safe.toTypedArray())
-            } catch (t: Throwable) {
-                Log.e(TAG, "startActivities failed", t)
-            }
+            if (safe.isEmpty()) return
+            try { super.startActivities(safe.toTypedArray()) } catch (_: Throwable) {}
         }
     }
 
-    /**
-     * Centralized intent blocking logic.
-     * Called by both the SecureContext wrapper and, if ever needed, external code.
-     */
     private fun shouldBlockIntent(intent: Intent?, providerName: String?): Boolean {
         if (intent == null) return false
-        val uri = intent.data
-        val scheme = uri?.scheme?.lowercase()
-        val host = uri?.host?.lowercase()
-        val url = uri?.toString() ?: ""
+        val uri = intent.data ?: return false
+        val scheme = uri.scheme?.lowercase()
+        val host = uri.host
+        val url = uri.toString()
 
-        // 1. Block non-HTTP schemes (UPI, Paytm, PhonePe, custom ad schemes)
-        //    Allow: http, https, market (Play Store), content (file access)
+        // 1. Block non-HTTP schemes except safe ones
         if (scheme != null && scheme != "http" && scheme != "https" &&
             scheme != "market" && scheme != "content") {
             return true
         }
 
-        // 2. Block known ad/donation hosts
-        if (host != null && FilterStore.isHostBlocked(host)) return true
+        // 2. Block if host or URL matches the known blocklist
+        if (FilterStore.isHostBlocked(host)) return true
+        if (FilterStore.looksLikeAdPath(url)) return true
 
-        // 3. Block donation/ad keywords anywhere in the URL
+        // 3. Block donation keywords anywhere in the URL
         if (url.contains("buymeacoffee", true) || url.contains("donate", true) ||
             url.contains("patreon", true) || url.contains("cncverse", true) ||
-            url.contains("upi://", true) || url.contains("paypal", true) ||
-            url.contains("support", true)) {
+            url.contains("paypal", true)) {
             return true
         }
 
-        // 4. Block if the calling provider is explicitly blocked
-        if (providerName != null && FilterStore.getBlockedProviders().contains(providerName)) {
-            if (host == null || !FilterStore.isHostSafe(host)) return true
-        }
-
-        // 5. Aggressive mode: block any host not explicitly marked safe
-        if (policy.blockAllUnknown && (host == null || !FilterStore.isHostSafe(host))) {
-            return true
-        }
-
-        return false
+            return false
     }
 }
