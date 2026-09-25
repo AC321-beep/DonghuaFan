@@ -18,12 +18,10 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.Collections
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  File-level compiled-once regexes.
-//  All patterns used in load() / loadLinks() were previously rebuilt on every
-//  call. Regex(pattern) compiles at construction; hoisting removes ~17
-//  compilations per playback.
+//  File-level compiled-once regexes for the provider side.
+//  (Uniquely named so it doesn't collide with the extractor-side object.)
 // ═══════════════════════════════════════════════════════════════════════════
-private object Rx {
+private object ProviderRx {
     // Episode number parsing
     val seasonNum  = Regex("(?i)(?:season\\s*(\\d+)|s(\\d+))")
     val episodeNum = Regex("(?i)(?:episode|ep)\\s*(\\d+)")
@@ -34,18 +32,18 @@ private object Rx {
     val episodePre = Regex("(?i)^\\s*Episode\\s*")
 
     // Google Drive
-    val gdriveFileId   = Regex("/file/d/([a-zA-Z0-9_-]{10,})")
-    val gdriveQueryId  = Regex("[?&]id=([a-zA-Z0-9_-]{10,})")
-    val gdriveUuid1    = Regex("""<input[^>]*?name=["']uuid["'][^>]*?value=["']([^"']+)["']""")
-    val gdriveUuid2    = Regex("""<input[^>]*?value=["']([^"']+)["'][^>]*?name=["']uuid["']""")
+    val gdriveFileId  = Regex("/file/d/([a-zA-Z0-9_-]{10,})")
+    val gdriveQueryId = Regex("[?&]id=([a-zA-Z0-9_-]{10,})")
+    val gdriveUuid1   = Regex("""<input[^>]*?name=["']uuid["'][^>]*?value=["']([^"']+)["']""")
+    val gdriveUuid2   = Regex("""<input[^>]*?value=["']([^"']+)["'][^>]*?name=["']uuid["']""")
 
     // Dailymotion
-    val dmVideoIdGeo   = Regex("video=([a-zA-Z0-9_-]+)")
-    val dmVideoIdStd   = Regex("(?:video/|dai\\.ly/|embed/video/)([a-zA-Z0-9_-]+)")
-    val dmM3u8         = Regex("[\"']url[\"']\\s*:\\s*[\"']([^\"']+\\.m3u8[^\"']*)[\"']")
+    val dmVideoIdGeo = Regex("video=([a-zA-Z0-9_-]+)")
+    val dmVideoIdStd = Regex("(?:video/|dai\\.ly/|embed/video/)([a-zA-Z0-9_-]+)")
+    val dmM3u8       = Regex("[\"']url[\"']\\s*:\\s*[\"']([^\"']+\\.m3u8[^\"']*)[\"']")
 
-    // Generic
-    val anyUrl         = Regex("https?://[^\\s\"'<>\\\\)]+")
+    // Generic URL scan
+    val anyUrl = Regex("https?://[^\\s\"'<>\\\\)]+")
 }
 
 class ChikiAnimationProvider : MainAPI() {
@@ -63,15 +61,11 @@ class ChikiAnimationProvider : MainAPI() {
         private const val GRACE_AFTER_FIRST_EMIT_MS = 1_500L
         private const val MAX_CONCURRENT_EXTRACTORS = 4
 
-        // Card grid selectors — used by getMainPage and search()
         private const val CARD_SELECTOR =
             "div.listupd article.bs, div.listupd div.bsx, article.bs, div.bsx"
-
-        // Episode-list selectors — used by load()
         private const val EPISODE_LIST_SELECTOR = ".episodelist li, .eplister li"
         private const val EPISODE_LINK_SELECTOR = ".episodelist li > a[href], .eplister li > a[href]"
 
-        // Hosts we never try to extract from
         private val BLACKLIST_HOSTS = setOf(
             "youtube", "disqus", "googlesyndication", "doubleclick"
         )
@@ -257,18 +251,18 @@ class ChikiAnimationProvider : MainAPI() {
                 ?.takeIf { it.isNotBlank() }
             val combinedText = "$epNumText $rawTitle"
 
-            val seasonNum = Rx.seasonNum.find(combinedText)?.let {
+            val seasonNum = ProviderRx.seasonNum.find(combinedText)?.let {
                 it.groupValues[1].ifEmpty { it.groupValues[2] }.toIntOrNull()
             }
 
-            val epNum = Rx.episodeNum.find(rawTitle)?.groupValues?.get(1)?.toIntOrNull()
-                ?: Rx.rangeTo.find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
-                ?: Rx.rangeParen.find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
-                ?: Rx.rangeDash.find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
-                ?: Rx.digits.find(epNumText)?.value?.toIntOrNull()
-                ?: Rx.digits.find(rawTitle)?.value?.toIntOrNull()
+            val epNum = ProviderRx.episodeNum.find(rawTitle)?.groupValues?.get(1)?.toIntOrNull()
+                ?: ProviderRx.rangeTo.find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
+                ?: ProviderRx.rangeParen.find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
+                ?: ProviderRx.rangeDash.find(epNumText)?.groupValues?.get(1)?.toIntOrNull()
+                ?: ProviderRx.digits.find(epNumText)?.value?.toIntOrNull()
+                ?: ProviderRx.digits.find(rawTitle)?.value?.toIntOrNull()
 
-            val cleanName = rawTitle.replace(Rx.episodePre, "").trim()
+            val cleanName = rawTitle.replace(ProviderRx.episodePre, "").trim()
                 .ifBlank { rawTitle.ifBlank { "Episode" } }
 
             newEpisode(fixUrl(href)) {
@@ -296,7 +290,6 @@ class ChikiAnimationProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // ─── 1) Fetch the episode page (bounded by a timeout) ───
         val document = try {
             withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
                 app.get(data, headers = defaultHeaders).document
@@ -307,14 +300,12 @@ class ChikiAnimationProvider : MainAPI() {
             null
         } ?: return false
 
-        // ─── 2) Shared state ───
         val emittedUrls = Collections.synchronizedSet(mutableSetOf<String>())
         val processedUrls = Collections.synchronizedSet(mutableSetOf<String>())
         val processedDmIds = Collections.synchronizedSet(mutableSetOf<String>())
         val processedGdriveIds = Collections.synchronizedSet(mutableSetOf<String>())
         val emitCount = AtomicInteger(0)
 
-        // First successful link signals the picker to appear
         val firstEmit = CompletableDeferred<Unit>()
 
         val countingCallback: (ExtractorLink) -> Unit = { link ->
@@ -325,7 +316,6 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // ─── 3) Small utilities ───
         fun getIframeSrc(iframe: Element): String {
             val src = iframe.attr("src")
             if (src.isNotBlank()) return src
@@ -346,7 +336,6 @@ class ChikiAnimationProvider : MainAPI() {
             }
         }
 
-        // ─── 4) Google Drive resolver ───
         suspend fun resolveGdriveStream(fileId: String): String? {
             val initialUrl =
                 "https://drive.usercontent.google.com/download?id=$fileId&export=download&authuser=0"
@@ -373,8 +362,8 @@ class ChikiAnimationProvider : MainAPI() {
             val html = try { resp1.text } catch (_: Exception) { "" }
             if (html.isBlank()) return null
 
-            val uuid = Rx.gdriveUuid1.find(html)?.groupValues?.get(1)
-                ?: Rx.gdriveUuid2.find(html)?.groupValues?.get(1)
+            val uuid = ProviderRx.gdriveUuid1.find(html)?.groupValues?.get(1)
+                ?: ProviderRx.gdriveUuid2.find(html)?.groupValues?.get(1)
                 ?: return null
 
             val confirmUrl =
@@ -406,8 +395,8 @@ class ChikiAnimationProvider : MainAPI() {
         }
 
         suspend fun handleGoogleDrive(cleanUrl: String): Boolean {
-            val fileId = Rx.gdriveFileId.find(cleanUrl)?.groupValues?.get(1)
-                ?: Rx.gdriveQueryId.find(cleanUrl)?.groupValues?.get(1)
+            val fileId = ProviderRx.gdriveFileId.find(cleanUrl)?.groupValues?.get(1)
+                ?: ProviderRx.gdriveQueryId.find(cleanUrl)?.groupValues?.get(1)
                 ?: return false
 
             if (!processedGdriveIds.add(fileId)) return false
@@ -428,7 +417,6 @@ class ChikiAnimationProvider : MainAPI() {
             return emitCount.get() > before
         }
 
-        // ─── 5) Main dispatcher — try every extractor in order ───
         suspend fun handleUrl(rawUrl: String, ref: String) {
             val cleanUrl = try { fixUrl(rawUrl) } catch (_: Exception) { return }
             if (!cleanUrl.startsWith("http")) return
@@ -436,7 +424,6 @@ class ChikiAnimationProvider : MainAPI() {
             if (BLACKLIST_HOSTS.any { cleanUrl.contains(it, true) }) return
 
             try {
-                // 1) Google Drive
                 if (cleanUrl.contains("drive.google.com", true) ||
                     cleanUrl.contains("drive.usercontent.google.com", true)
                 ) {
@@ -444,7 +431,6 @@ class ChikiAnimationProvider : MainAPI() {
                     if (handleGoogleDrive(cleanUrl) && emitCount.get() > before) return
                 }
 
-                // 2) Site-specific extractors
                 if (cleanUrl.contains("galaxydonghua.xyz", true)) {
                     val before = emitCount.get()
                     try {
@@ -475,9 +461,8 @@ class ChikiAnimationProvider : MainAPI() {
                     if (emitCount.get() > before) return
                 }
 
-                // 3) Dailymotion — two branches (geo embed + standard)
                 if (cleanUrl.contains("geo.dailymotion.com/player", true)) {
-                    val videoId = Rx.dmVideoIdGeo.find(cleanUrl)?.groupValues?.get(1)
+                    val videoId = ProviderRx.dmVideoIdGeo.find(cleanUrl)?.groupValues?.get(1)
                     if (videoId != null && processedDmIds.add(videoId)) {
                         val before = emitCount.get()
                         try {
@@ -490,7 +475,7 @@ class ChikiAnimationProvider : MainAPI() {
                             )
                             val apiRes = app.get(apiUrl, headers = reqHeaders).text
 
-                            val streamUrl = Rx.dmM3u8.find(apiRes)?.groupValues?.get(1)
+                            val streamUrl = ProviderRx.dmM3u8.find(apiRes)?.groupValues?.get(1)
 
                             if (!streamUrl.isNullOrBlank()) {
                                 val m3u8Url = streamUrl.replace("\\/", "/")
@@ -525,7 +510,7 @@ class ChikiAnimationProvider : MainAPI() {
                 } else if (cleanUrl.contains("dailymotion.com", true) ||
                            cleanUrl.contains("dai.ly", true)
                 ) {
-                    val videoId = Rx.dmVideoIdStd.find(cleanUrl)?.groupValues?.get(1)
+                    val videoId = ProviderRx.dmVideoIdStd.find(cleanUrl)?.groupValues?.get(1)
                     if (videoId == null || processedDmIds.add(videoId)) {
                         val before = emitCount.get()
                         try {
@@ -537,7 +522,6 @@ class ChikiAnimationProvider : MainAPI() {
                     }
                 }
 
-                // 4) Generic built-in extractor pass
                 val beforeGeneric = emitCount.get()
                 try {
                     loadExtractor(cleanUrl, referer = ref, subtitleCallback, countingCallback)
@@ -546,7 +530,6 @@ class ChikiAnimationProvider : MainAPI() {
                 } catch (_: Exception) {}
                 if (emitCount.get() > beforeGeneric) return
 
-                // 5) Direct media fallbacks
                 if (cleanUrl.contains(".m3u8", true)) {
                     try {
                         M3u8Helper.generateM3u8("Generic HLS", cleanUrl, ref)
@@ -573,12 +556,11 @@ class ChikiAnimationProvider : MainAPI() {
                 val src = getIframeSrc(iframe)
                 if (src.isNotBlank()) handleUrl(src, ref)
             }
-            Rx.anyUrl.findAll(decoded).forEach { m ->
+            ProviderRx.anyUrl.findAll(decoded).forEach { m ->
                 handleUrl(m.value, ref)
             }
         }
 
-        // ─── 6) Collect all sources first (CPU only) ───
         val mirrorOptions = document.select(
             "select.mirror option, .mobius option, select#mirror option, select[name=mirror] option"
         )
@@ -586,7 +568,6 @@ class ChikiAnimationProvider : MainAPI() {
             ".server_list li, ul.episodes li, .mirror_link, .mirrors li"
         )
 
-        // Build a list of suspend lambdas to run — one per source
         val sourceJobs: List<suspend () -> Unit> = buildList {
             for (option in mirrorOptions) {
                 val value = option.attr("value").trim()
@@ -620,7 +601,6 @@ class ChikiAnimationProvider : MainAPI() {
         }
 
         if (sourceJobs.isEmpty()) {
-            // Fallback: scan raw iframes
             document.select("iframe").forEach { iframe ->
                 val src = getIframeSrc(iframe)
                 if (src.isNotBlank()) handleUrl(src, data)
@@ -628,7 +608,6 @@ class ChikiAnimationProvider : MainAPI() {
             return emitCount.get() > 0
         }
 
-        // ─── 7) Fan out with semaphore + timeout, race for first emit ───
         val semaphore = Semaphore(MAX_CONCURRENT_EXTRACTORS)
 
         coroutineScope {
@@ -640,9 +619,7 @@ class ChikiAnimationProvider : MainAPI() {
                         }
                     } catch (e: CancellationException) {
                         throw e
-                    } catch (_: Exception) {
-                        // one bad extractor doesn't kill the rest
-                    }
+                    } catch (_: Exception) {}
                 }
             }
 
@@ -652,20 +629,17 @@ class ChikiAnimationProvider : MainAPI() {
                 allDone.complete(Unit)
             }
 
-            // Race: return when first link lands OR all jobs complete
             select<Unit> {
                 firstEmit.onAwait { }
                 allDone.onAwait { }
             }
 
-            // Grace window: let slower sources finish if they're close
             if (firstEmit.isCompleted && !allDone.isCompleted) {
                 withTimeoutOrNull(GRACE_AFTER_FIRST_EMIT_MS) {
                     jobs.forEach { it.join() }
                 }
             }
 
-            // Cancel anything still running — coroutineScope exits cleanly
             jobs.forEach { it.cancel() }
             waiter.cancel()
         }
