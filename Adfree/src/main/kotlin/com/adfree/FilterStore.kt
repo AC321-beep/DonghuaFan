@@ -9,12 +9,12 @@ object FilterStore {
     private const val KEY_ALWAYS = "always_allow_hosts"
     private const val KEY_CUSTOM_BLOCKED = "custom_blocked_hosts"
     private const val KEY_BLOCKED_PROVIDERS = "blocked_providers"
+    private const val KEY_MANUALLY_UNBLOCKED = "manually_unblocked"  // NEW
     private const val KEY_INTENSITY = "blocking_intensity"
 
     @Volatile private var prefs: SharedPreferences? = null
     private val sessionAllowOnce = java.util.Collections.synchronizedSet(HashSet<String>())
 
-    // Hardcoded known ad and donation platforms
     private val HARDCODED_BLOCKED_HOSTS = setOf(
         "buymeacoffee.com", "developers.buymeacoffee.com",
         "patreon.com", "ko-fi.com", "paypal.me", "paypal.com",
@@ -31,7 +31,6 @@ object FilterStore {
         "discord.com", "wikipedia.org"
     )
 
-    // Behavioral patterns (URL-shape based)
     private val NON_MEDIA_PATTERNS = listOf(
         Regex("/(popunder|popunderinit)", RegexOption.IGNORE_CASE),
         Regex("/(redirect|go|visit|jump)/[a-zA-Z0-9]+", RegexOption.IGNORE_CASE),
@@ -64,7 +63,6 @@ object FilterStore {
     }
 
     fun getCustomBlockedHosts(): Set<String> = customBlockedHosts
-
     fun setCustomBlockedHosts(hosts: List<String>) {
         val cleaned = hosts
             .map { it.trim().lowercase() }
@@ -77,21 +75,16 @@ object FilterStore {
             ?.apply()
     }
 
-    // --- Intensity Settings ---
-    fun getIntensity(): Int = prefs?.getInt(KEY_INTENSITY, 1) ?: 1
-
+    fun getIntensity(): Int = prefs?.getInt("blocking_intensity", 1) ?: 1
     fun setIntensity(level: Int) {
-        prefs?.edit()?.putInt(KEY_INTENSITY, level.coerceIn(0, 2))?.apply()
+        prefs?.edit()?.putInt("blocking_intensity", level.coerceIn(0, 2))?.apply()
     }
 
-    // --- Efficient O(dots) Host Checking ---
     fun isHostBlocked(host: String?): Boolean {
         if (host.isNullOrBlank()) return false
         val h = host.lowercase().trim()
         val blocked = mergedBlockedHosts
-
         if (h in blocked) return true
-
         var idx = h.indexOf('.')
         while (idx >= 0 && idx < h.length - 1) {
             if (h.substring(idx + 1) in blocked) return true
@@ -130,6 +123,7 @@ object FilterStore {
         } catch (_: Throwable) { emptySet() }
     }
 
+    // --- Blocked Providers ---
     fun getBlockedProviders(): MutableSet<String> {
         return try {
             val arr = JSONArray(prefs?.getString(KEY_BLOCKED_PROVIDERS, "[]") ?: "[]")
@@ -140,6 +134,20 @@ object FilterStore {
     fun updateBlockedProviders(providers: Set<String>) {
         prefs?.edit()
             ?.putString(KEY_BLOCKED_PROVIDERS, JSONArray(providers.toList()).toString())
+            ?.apply()
+    }
+
+    // --- Manually Unblocked Providers (NEW) ---
+    fun getManuallyUnblocked(): MutableSet<String> {
+        return try {
+            val arr = JSONArray(prefs?.getString(KEY_MANUALLY_UNBLOCKED, "[]") ?: "[]")
+            (0 until arr.length()).map { arr.getString(it).trim() }.toMutableSet()
+        } catch (_: Throwable) { mutableSetOf() }
+    }
+
+    fun updateManuallyUnblocked(providers: Set<String>) {
+        prefs?.edit()
+            ?.putString(KEY_MANUALLY_UNBLOCKED, JSONArray(providers.toList()).toString())
             ?.apply()
     }
 }
