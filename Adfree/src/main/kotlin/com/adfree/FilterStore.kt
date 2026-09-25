@@ -1,4 +1,4 @@
-package com.net.optimizer
+package com.adfree
 
 import android.content.Context
 import android.content.SharedPreferences
