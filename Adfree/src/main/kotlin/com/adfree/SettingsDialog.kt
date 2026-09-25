@@ -59,9 +59,9 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
         }
         container.addView(intensitySpinner)
 
-        // ---- Section 2: Custom Domains ----
+        // ---- Section 2: Custom Blocked Sources ----
         container.addView(TextView(context).apply {
-            text = "🚫 Custom Blocked Domains"
+            text = "🚫 Custom Blocked Sources"
             textSize = 16f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.parseColor("#FF6B6B"))
@@ -69,28 +69,27 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
         })
 
         container.addView(TextView(context).apply {
-            text = "One domain per line. Blocked in addition to the built-in list."
+            text = "Add GitHub username, repo URL or repo shortcode to filter " +
+                "Providers from these sources are auto-blocked "
             textSize = 12f
             setTextColor(Color.parseColor("#909090"))
             setPadding(0, 0, 0, 12)
         })
 
-        val customInput = EditText(context).apply {
-            setText(FilterStore.getCustomBlockedHosts().joinToString("\n"))
+        val customSourcesInput = EditText(context).apply {
+            setText(FilterStore.getCustomSources().joinToString("\n"))
             setTextColor(Color.WHITE)
-            hint = "ads.example.com\ntracker.site.net"
-            setHintTextColor(Color.parseColor("#606060"))
             setBackgroundColor(Color.parseColor("#1E1E1E"))
             setPadding(24, 24, 24, 24)
             minLines = 3
-            maxLines = 6
+            maxLines = 8
             gravity = Gravity.TOP or Gravity.START
         }
-        container.addView(customInput)
+        container.addView(customSourcesInput)
 
         // ---- Section 3: Provider Checkboxes ----
         container.addView(TextView(context).apply {
-            text = "🎯 Auto-Blocked Providers"
+            text = "🎯 Providers Filtering"
             textSize = 16f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.parseColor("#4FC3F7"))
@@ -98,7 +97,8 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
         })
 
         container.addView(TextView(context).apply {
-            text = "Providers from known bad repos are blocked automatically. Uncheck any you want to allow."
+            text = "Ads or Donation popups are filtered " +
+                "Uncheck any to allow it "
             textSize = 12f
             setTextColor(Color.parseColor("#909090"))
             setPadding(0, 0, 0, 12)
@@ -154,9 +154,14 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
             .setView(ScrollView(context).apply { addView(container) })
             .setPositiveButton("Save") { _, _ ->
                 FilterStore.setIntensity(intensitySpinner.selectedItemPosition)
-                FilterStore.setCustomBlockedHosts(customInput.text.toString().split("\n"))
+                FilterStore.setCustomSources(customSourcesInput.text.toString().split("\n"))
                 FilterStore.updateBlockedProviders(blockedSet)
                 FilterStore.updateManuallyUnblocked(unblockedSet)
+
+                try {
+                    OptimizerPlugin.refreshBlocklist(context)
+                } catch (_: Throwable) {}
+
                 onApply()
             }
             .setNegativeButton("Cancel", null)
