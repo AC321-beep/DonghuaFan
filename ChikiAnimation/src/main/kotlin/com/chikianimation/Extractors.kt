@@ -527,6 +527,11 @@ class GalaxyDonghua : AllSubPlayerExtractor() {
         return values.firstOrNull()
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  Emit streams — the emit loop is inline, not delegated to emitVideo().
+    //  Reason: emitVideo uses a stricter isM3u8 check that mistypes some
+    //  GalaxyDonghua URLs; the extended check below is the one verified working.
+    // ═══════════════════════════════════════════════════════════════════════════
     private suspend fun emitStreams(
         json: String, gxBase: String, fallbackEmbedUrl: String, globalCookies: Map<String, String>,
         callback: (ExtractorLink) -> Unit, subtitleCallback: (SubtitleFile) -> Unit
@@ -555,7 +560,20 @@ class GalaxyDonghua : AllSubPlayerExtractor() {
             val raw = m.groupValues[1]
             val abs = resolveUrl(raw, baseURL) ?: return@forEach
             if (abs.contains(".vtt", true) || abs.contains(".srt", true)) return@forEach
-            emitVideo(abs, dynamicEmbedUrl, ph, callback)
+
+            // Extended isM3u8 detection — same as the inline version that worked:
+            // any URL without .mp4 is treated as HLS. emitVideo() omits this
+            // third clause and misclassifies extension-less stream URLs.
+            val isM3u8 = abs.contains(".m3u8", true) || abs.contains("hls", true) ||
+                         !abs.contains(".mp4", true)
+            if (!isM3u8 && !abs.contains(".mp4", true)) return@forEach
+
+            callback.invoke(newExtractorLink(this.name, this.name, abs,
+                if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                this.referer = dynamicEmbedUrl
+                this.quality = Qualities.Unknown.value
+                this.headers = ph
+            })
         }
     }
 }
