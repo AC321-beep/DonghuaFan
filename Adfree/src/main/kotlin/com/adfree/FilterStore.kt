@@ -7,9 +7,9 @@ import org.json.JSONArray
 object FilterStore {
     private const val PREFS_NAME = "net_opt_config"
     private const val KEY_ALWAYS = "always_allow_hosts"
-    private const val KEY_CUSTOM_BLOCKED = "custom_blocked_hosts"
+    private const val KEY_CUSTOM_SOURCES = "custom_blocked_sources"
     private const val KEY_BLOCKED_PROVIDERS = "blocked_providers"
-    private const val KEY_MANUALLY_UNBLOCKED = "manually_unblocked"  // NEW
+    private const val KEY_MANUALLY_UNBLOCKED = "manually_unblocked"
     private const val KEY_INTENSITY = "blocking_intensity"
 
     @Volatile private var prefs: SharedPreferences? = null
@@ -39,55 +39,26 @@ object FilterStore {
         Regex("support|donate|patreon|buymeacoffee|ko-fi|cncverse", RegexOption.IGNORE_CASE)
     )
 
-    @Volatile private var mergedBlockedHosts: Set<String> = HARDCODED_BLOCKED_HOSTS
-    @Volatile private var customBlockedHosts: Set<String> = emptySet()
-
     fun init(context: Context) {
         if (prefs != null) return
         prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        loadCustomBlockedHosts()
     }
 
-    private fun loadCustomBlockedHosts() {
-        try {
-            val arr = JSONArray(prefs?.getString(KEY_CUSTOM_BLOCKED, "[]") ?: "[]")
-            customBlockedHosts = (0 until arr.length())
-                .map { arr.getString(it).lowercase().trim() }
-                .filter { it.isNotBlank() && it.contains(".") }
-                .toSet()
-            mergedBlockedHosts = HARDCODED_BLOCKED_HOSTS + customBlockedHosts
-        } catch (_: Throwable) {
-            customBlockedHosts = emptySet()
-            mergedBlockedHosts = HARDCODED_BLOCKED_HOSTS
-        }
-    }
+    // --- Intensity: 0 = Light, 1 = Medium, 2 = Strict ---
+    fun getIntensity(): Int = prefs?.getInt(KEY_INTENSITY, 1) ?: 1
 
-    fun getCustomBlockedHosts(): Set<String> = customBlockedHosts
-    fun setCustomBlockedHosts(hosts: List<String>) {
-        val cleaned = hosts
-            .map { it.trim().lowercase() }
-            .filter { it.isNotBlank() && it.contains(".") && !it.contains(" ") }
-            .toSet()
-        customBlockedHosts = cleaned
-        mergedBlockedHosts = HARDCODED_BLOCKED_HOSTS + cleaned
-        prefs?.edit()
-            ?.putString(KEY_CUSTOM_BLOCKED, JSONArray(cleaned.toList()).toString())
-            ?.apply()
-    }
-
-    fun getIntensity(): Int = prefs?.getInt("blocking_intensity", 1) ?: 1
     fun setIntensity(level: Int) {
-        prefs?.edit()?.putInt("blocking_intensity", level.coerceIn(0, 2))?.apply()
+        prefs?.edit()?.putInt(KEY_INTENSITY, level.coerceIn(0, 2))?.apply()
     }
 
+    // --- Efficient O(dots) host lookup ---
     fun isHostBlocked(host: String?): Boolean {
         if (host.isNullOrBlank()) return false
         val h = host.lowercase().trim()
-        val blocked = mergedBlockedHosts
-        if (h in blocked) return true
+        if (h in HARDCODED_BLOCKED_HOSTS) return true
         var idx = h.indexOf('.')
         while (idx >= 0 && idx < h.length - 1) {
-            if (h.substring(idx + 1) in blocked) return true
+            if (h.substring(idx + 1) in HARDCODED_BLOCKED_HOSTS) return true
             idx = h.indexOf('.', idx + 1)
         }
         return false
@@ -123,6 +94,49 @@ object FilterStore {
         } catch (_: Throwable) { emptySet() }
     }
 
+    // --- Custom Blocked Sources ---
+    fun getCustomSources(): Set<String> {
+        return try {
+            val arr = JSONArray(prefs?.getString(KEY_CUSTOM_SOURCES, "[]") ?: "[]")
+            (0 until arr.length()).map { arr.getString(it).lowercase().trim() }.toSet()
+        } catch (_: Throwable) { emptySet() }
+    }
+
+    fun setCustomSources(sources: List<String>) {
+        val cleaned = mutableSetOf<String>()
+        for (raw in sources) {
+            var s = raw.trim().lowercase()
+            if (s.isBlank()) continue
+
+            // Strip protocol and domain if a full URL was pasted
+            s = s.removePrefix("https://")
+                .removePrefix("http://")
+                .removePrefix("www.")
+                .removePrefix("github.com/")
+                .removePrefix("raw.githubusercontent.com/")
+
+            // Strip path suffixes
+            s = s.substringBefore("/refs/")
+                .substringBefore("/builds/")
+                .substringBefore("/tree/")
+                .substringBefore("/blob/")
+                .removeSuffix(".git")
+                .trimEnd('/')
+
+            // Remove spaces and underscores (so "Phisher repo" -> "phisherrepo")
+            val compact = s.replace(" ", "").replace("_", "")
+
+            // Split on "/" and "," to support "user/repo" entries
+            for (part in compact.split("/", ",")) {
+                val p = part.trim()
+                if (p.length >= 3) cleaned.add(p)
+            }
+        }
+        prefs?.edit()
+            ?.putString(KEY_CUSTOM_SOURCES, JSONArray(cleaned.toList()).toString())
+            ?.apply()
+    }
+
     // --- Blocked Providers ---
     fun getBlockedProviders(): MutableSet<String> {
         return try {
@@ -137,7 +151,7 @@ object FilterStore {
             ?.apply()
     }
 
-    // --- Manually Unblocked Providers (NEW) ---
+    // --- Manually Unblocked Providers ---
     fun getManuallyUnblocked(): MutableSet<String> {
         return try {
             val arr = JSONArray(prefs?.getString(KEY_MANUALLY_UNBLOCKED, "[]") ?: "[]")
