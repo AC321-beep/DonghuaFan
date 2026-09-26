@@ -1,6 +1,5 @@
 package com.donghuastream
 
-import android.util.Log
 import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -15,11 +14,6 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.net.URI
 
 /**
- * Rumble extractor modelled on OCE's MasterLinkGenerator + M3u8MasterVerifier,
- * without depending on the OCE package.
- *
- * Three ideas absorbed from OCE:
- *
  *  1. rumble.com/hls-vod rejects browser UAs from non-browser HTTP clients
  *     (TLS fingerprint mismatch → Cloudflare 403). "okhttp/4.12.0" passes.
  *
@@ -32,7 +26,7 @@ import java.net.URI
  *     split into individual variant links.
  */
 private data class MasterVariant(
-    val url: String?,        // null = malformed (no URI line after STREAM-INF)
+    val url: String?,
     val bandwidth: Long,
     val height: Int?
 )
@@ -43,7 +37,6 @@ class Rumble : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
-        private const val TAG = "Rumble"
         private const val HTML_TIMEOUT_MS = 12_000L
         private const val M3U8_TIMEOUT_MS = 6_000L
 
@@ -68,6 +61,9 @@ class Rumble : ExtractorApi() {
         private val RE_QUALITY_BRACE = Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
         private val RE_BANDWIDTH = Regex("""BANDWIDTH=(\d+)""")
         private val RE_RESOLUTION = Regex("""RESOLUTION=\d+x(\d+)""")
+        private val RE_EXT_X_RESOLUTION = Regex("""#EXT-X-RESOLUTION:\d+x(\d+)""", RegexOption.IGNORE_CASE)
+        private val RE_PATH_Q_P = Regex("""(?:^|[^0-9])(\d{3,4})p(?=[^0-9]|$)""")
+        private val RE_PATH_Q_N = Regex("""[_\-/](\d{3,4})(?=[^0-9]|$)""")
 
         private val JUNK_KEYWORDS = listOf("/assets/", "tracker", "thumb")
     }
@@ -78,42 +74,23 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        Log.d(TAG, "=== getUrl START ===")
-        Log.d(TAG, "url=$url")
-        Log.d(TAG, "referer=$referer")
-
-        // Fast path
+        // Fast path — direct media URL
         if (url.endsWith(".mp4", true) || url.endsWith(".m3u8", true)) {
-            Log.d(TAG, "[1] fast path — direct media URL")
             val t = if (url.endsWith(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
             callback(newExtractorLink(name, name, url, t) { this.referer = url })
-            Log.d(TAG, "=== getUrl END (fast path) ===")
             return
         }
 
-        // ---- 1. Fetch HTML ----
-        Log.d(TAG, "[2] fetching embed HTML…")
+        // ---- 1. Fetch embed HTML ----
         val html = withTimeoutOrNull(HTML_TIMEOUT_MS) {
             try {
                 app.get(url, referer = referer ?: "$mainUrl/", headers = PAGE_HEADERS).text
-            } catch (e: Exception) {
-                Log.e(TAG, "[2] HTML fetch threw: ${e.message}")
-                null
-            }
-        }
-        if (html == null) {
-            Log.e(TAG, "[2] HTML fetch FAILED (null or timeout)")
-            Log.d(TAG, "=== getUrl END (no html) ===")
-            return
-        }
-        Log.d(TAG, "[2] HTML fetched: ${html.length} bytes")
+            } catch (e: Exception) { null }
+        } ?: return
 
         // ---- 2. Slice JSON ----
         val afterMp4 = html.substringAfter("{\"mp4", "")
-        val hasMp4Marker = afterMp4.isNotEmpty()
-        val scriptData = if (hasMp4Marker) afterMp4.substringBefore("\"evt\":{") else html
-        Log.d(TAG, "[3] marker '{\"mp4' found: $hasMp4Marker")
-        Log.d(TAG, "[3] scriptData length: ${scriptData.length}")
+        val scriptData = if (afterMp4.isNotEmpty()) afterMp4.substringBefore("\"evt\":{") else html
 
         // ---- 3. Collect URLs ----
         val seen = LinkedHashSet<String>()
@@ -121,73 +98,37 @@ class Rumble : ExtractorApi() {
         val m3u8Hits = mutableListOf<Hit>()
         val mp4Hits  = mutableListOf<Hit>()
 
-        var totalMatches = 0
-        var junkRejected = 0
         RE_MEDIA_URL.findAll(scriptData).forEach { m ->
-            totalMatches++
             val clean = m.groupValues[1].replace("\\/", "/")
-            if (JUNK_KEYWORDS.any { clean.contains(it, true) }) {
-                junkRejected++
-                Log.d(TAG, "[4] junk rejected: $clean")
-                return@forEach
-            }
-            if (!seen.add(clean)) {
-                Log.d(TAG, "[4] dup rejected: $clean")
-                return@forEach
-            }
-            if (clean.contains(".m3u8", true)) {
-                m3u8Hits += Hit(clean, m.range.first)
-                Log.d(TAG, "[4] m3u8 accepted: $clean")
-            } else {
-                mp4Hits += Hit(clean, m.range.first)
-                Log.d(TAG, "[4] mp4 accepted: $clean")
-            }
+            if (JUNK_KEYWORDS.any { clean.contains(it, true) }) return@forEach
+            if (!seen.add(clean)) return@forEach
+            if (clean.contains(".m3u8", true)) m3u8Hits += Hit(clean, m.range.first)
+            else                                mp4Hits  += Hit(clean, m.range.first)
         }
-        Log.d(TAG, "[4] regex hits: $totalMatches total, $junkRejected junk, " +
-            "${m3u8Hits.size} m3u8, ${mp4Hits.size} mp4")
 
-        if (m3u8Hits.isEmpty() && mp4Hits.isEmpty()) {
-            Log.e(TAG, "[4] NO MEDIA URLS FOUND — check slice marker / regex")
-            Log.d(TAG, "=== getUrl END (no urls) ===")
-            return
-        }
+        if (m3u8Hits.isEmpty() && mp4Hits.isEmpty()) return
 
         // ---- 4. Fetch m3u8 bodies in parallel ----
-        Log.d(TAG, "[5] fetching ${m3u8Hits.size} m3u8 bodies (RAW UA)…")
         val m3u8Bodies = if (m3u8Hits.isEmpty()) emptyList() else coroutineScope {
             m3u8Hits.map { h ->
                 async {
-                    val t0 = System.currentTimeMillis()
-                    val body = try {
+                    try {
                         withTimeoutOrNull(M3U8_TIMEOUT_MS) {
                             app.get(h.url, referer = url, headers = CDN_HEADERS).text
                         }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "[5] body fetch threw for ${h.url}: ${e.message}")
-                        null
-                    }
-                    val ms = System.currentTimeMillis() - t0
-                    Log.d(TAG, "[5] body ${if (body != null) "ok" else "NULL"} " +
-                        "(${body?.length ?: 0} bytes, ${ms}ms): ${h.url}")
-                    body
+                    } catch (e: Exception) { null }
                 }
             }.awaitAll()
         }
 
         val emittedLabels = HashSet<String>()
-        fun emitLabel(label: String): Boolean {
-            val isNew = emittedLabels.add(label)
-            Log.d(TAG, "[6] emitLabel('$label') → ${if (isNew) "accepted" else "duplicate, skipped"}")
-            return isNew
-        }
+        fun emitLabel(label: String): Boolean = emittedLabels.add(label)
 
         // ---- 5. Classify each m3u8 ----
         m3u8Hits.forEachIndexed { i, hit ->
-            Log.d(TAG, "[6.$i] processing m3u8: ${hit.url}")
             val body = m3u8Bodies.getOrNull(i)
 
             if (body == null) {
-                Log.d(TAG, "[6.$i] body NULL — fallback: deliver master as-is")
                 if (emitLabel("$name (Auto)")) {
                     callback(newExtractorLink(name, "$name (Auto)", hit.url, ExtractorLinkType.M3U8) {
                         this.referer = url
@@ -199,15 +140,13 @@ class Rumble : ExtractorApi() {
             }
 
             val parsed = parseVariants(body)
-            Log.d(TAG, "[6.$i] parseVariants: ${parsed.size} STREAM-INF blocks")
-            parsed.forEachIndexed { j, v ->
-                Log.d(TAG, "[6.$i.$j] bw=${v.bandwidth} h=${v.height} " +
-                    "url=${v.url ?: "MALFORMED (no uri)"}")
-            }
 
             if (parsed.isEmpty()) {
-                Log.d(TAG, "[6.$i] not a master (no STREAM-INF) — treat as single-quality")
-                val q = detectQualityFromUrl(hit.url)
+                // Not a master. Try body tag → URL path → bare name.
+                val bodyHeight = RE_EXT_X_RESOLUTION.find(body)
+                    ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                val urlHeight = detectQualityFromUrl(hit.url)
+                val q = bodyHeight ?: urlHeight
                 val label = if (q != null) "$name ${q}p" else name
                 if (emitLabel(label)) {
                     callback(newExtractorLink(name, label, hit.url, ExtractorLinkType.M3U8) {
@@ -222,20 +161,16 @@ class Rumble : ExtractorApi() {
             val valid = parsed.mapNotNull { v ->
                 if (v.url == null) return@mapNotNull null
                 val resolved = resolveUrl(hit.url, v.url)
-                if (resolved == hit.url || resolved == hit.url.trimEnd('/')) {
-                    Log.d(TAG, "[6.$i] self-reference dropped: $resolved")
-                    null
-                } else resolved to v.height
+                if (resolved == hit.url || resolved == hit.url.trimEnd('/')) null
+                else resolved to v.height
             }
-
-            Log.d(TAG, "[6.$i] valid variants: ${valid.size}/${parsed.size}")
 
             when {
                 valid.isEmpty() -> {
-                    Log.e(TAG, "[6.$i] ALL MALFORMED — dropping master (would cause 3002)")
+                    // All malformed → drop silently (prevents ExoPlayer 3002)
                 }
                 valid.size == parsed.size -> {
-                    Log.d(TAG, "[6.$i] CLEAN master → deliver as-is (ABR works)")
+                    // Clean master → deliver as-is so ABR works
                     if (emitLabel("$name (Auto)")) {
                         callback(newExtractorLink(name, "$name (Auto)", hit.url, ExtractorLinkType.M3U8) {
                             this.referer = url
@@ -245,7 +180,7 @@ class Rumble : ExtractorApi() {
                     }
                 }
                 else -> {
-                    Log.d(TAG, "[6.$i] PARTIAL malformed → split into ${valid.size} variants")
+                    // Partial malformed → split into individual valid variants
                     valid.forEach { (variantUrl, height) ->
                         val label = if (height != null) "$name ${height}p" else name
                         if (emitLabel(label)) {
@@ -261,8 +196,7 @@ class Rumble : ExtractorApi() {
         }
 
         // ---- 6. mp4s ----
-        Log.d(TAG, "[7] processing ${mp4Hits.size} mp4 hits")
-        mp4Hits.forEachIndexed { i, h ->
+        mp4Hits.forEach { h ->
             val preceding = scriptData.substring(Math.max(0, h.start - 150), h.start)
             val qMatch = RE_QUALITY_H.findAll(preceding).lastOrNull()
                 ?: RE_QUALITY_BRACE.findAll(preceding).lastOrNull()
@@ -271,9 +205,9 @@ class Rumble : ExtractorApi() {
             if (qMatch != null) {
                 val digits = qMatch.groupValues[1].filter { it.isDigit() }.take(4)
                 if (digits.length in 3..4) label = "$name ${digits}p"
-                Log.d(TAG, "[7.$i] quality found: $label")
             } else {
-                Log.d(TAG, "[7.$i] no quality in JSON → label '$label'")
+                val fromUrl = detectQualityFromUrl(h.url)
+                if (fromUrl != null) label = "$name ${fromUrl}p"
             }
 
             if (emitLabel(label)) {
@@ -283,8 +217,6 @@ class Rumble : ExtractorApi() {
                 })
             }
         }
-
-        Log.d(TAG, "=== getUrl END — ${emittedLabels.size} total links emitted ===")
     }
 
     // ---------- helpers ----------
@@ -320,11 +252,26 @@ class Rumble : ExtractorApi() {
         return "$origin$dir/$path"
     }
 
-    private fun detectQualityFromUrl(url: String): Int? =
-        Regex("""\d{3,4}""").findAll(url)
-            .mapNotNull { it.value.toIntOrNull() }
-            .filter { it in 144..4320 }
-            .maxOrNull()
+    /**
+     * Extract a resolution from the URL — path only, no host/query.
+     * Prefers explicit "<N>p" markers, then "_N" / "-N" / "/N/" patterns.
+     * Returns null if no reliable marker is found.
+     */
+    private fun detectQualityFromUrl(url: String): Int? {
+        val path = url
+            .substringAfter("://", url)
+            .substringAfter('/', "")
+            .substringBefore('?')
+            .substringBefore('#')
+
+        RE_PATH_Q_P.find(path)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            ?.let { if (it in 144..2160) return it }
+
+        RE_PATH_Q_N.find(path)?.groupValues?.getOrNull(1)?.toIntOrNull()
+            ?.let { if (it in 144..2160) return it }
+
+        return null
+    }
 }
 
 open class PlayStreamplay : ExtractorApi() {
@@ -371,7 +318,6 @@ open class PlayStreamplay : ExtractorApi() {
         val packedScript = doc.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return
         val packedCode = RE_EVAL_BLOCK.find(packedScript)?.value ?: return
 
-        // Fast path: token often present in the packed script already — skip JsUnpacker
         val token = RE_TOKEN.find(packedCode)?.groupValues?.getOrNull(1)
             ?: run {
                 val unpackedJs = JsUnpacker(packedCode).unpack() ?: return
@@ -446,11 +392,9 @@ class OkRuCustom : ExtractorApi() {
     companion object {
         private const val FETCH_TIMEOUT_MS = 12_000L
 
-        // Precompiled regexes
         private val RE_VIDEO_ID = Regex("""/video(?:embed)?/(\d+)""")
         private val RE_MID_PARAM = Regex("""[?&]mid=(\d+)""")
 
-        // Static quality map — no re-allocation on every video entry
         private val QUALITY_MAP = mapOf(
             "mobile" to Qualities.P144.value,
             "lowest" to Qualities.P240.value,
@@ -470,7 +414,6 @@ class OkRuCustom : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         try {
-            // Multi-pattern id extraction — handles /video/, /videoembed/, ?mid=, and bare-id URLs
             val id = RE_VIDEO_ID.find(url)?.groupValues?.get(1)
                 ?: RE_MID_PARAM.find(url)?.groupValues?.get(1)
                 ?: url.substringAfterLast("/").substringBefore("?")
@@ -486,7 +429,6 @@ class OkRuCustom : ExtractorApi() {
                 }
             } ?: return
 
-            // 1. MP4 variants first (fastest playback)
             json.videos?.forEach { video ->
                 val qName = video.name?.lowercase() ?: ""
                 val vidUrl = video.url ?: ""
@@ -509,7 +451,6 @@ class OkRuCustom : ExtractorApi() {
                 )
             }
 
-            // 2. HLS fallback — track success so DASH can run if HLS parse yields nothing
             val hlsUrl = json.hlsManifestUrl.orEmpty()
             var hlsSucceeded = false
 
@@ -529,7 +470,6 @@ class OkRuCustom : ExtractorApi() {
                 }
             }
 
-            // 3. DASH fallback — runs if HLS was missing OR failed to parse
             if (!hlsSucceeded) {
                 val dashUrl = json.dashManifestUrl.orEmpty()
                 if (dashUrl.isNotBlank() && !dashUrl.contains("usr_login")) {
@@ -544,7 +484,7 @@ class OkRuCustom : ExtractorApi() {
                 }
             }
         } catch (e: Exception) {
-            // swallow — extractor failure must not crash the provider
+            // swallow
         }
     }
 
