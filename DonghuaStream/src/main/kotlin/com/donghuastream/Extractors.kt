@@ -7,7 +7,34 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
+import java.net.URI
+
+/**
+ * Rumble extractor modelled on OCE's MasterLinkGenerator + M3u8MasterVerifier,
+ * without depending on the OCE package.
+ *
+ * Three ideas absorbed from OCE:
+ *
+ *  1. rumble.com/hls-vod rejects browser UAs from non-browser HTTP clients
+ *     (TLS fingerprint mismatch → Cloudflare 403). "okhttp/4.12.0" passes.
+ *
+ *  2. Master playlists sometimes contain malformed #EXT-X-STREAM-INF lines
+ *     (no URI on the following line). Feeding those to ExoPlayer causes
+ *     error 3002 (PARSING_MANIFEST_MALFORMED).
+ *
+ *  3. Clean masters should be delivered AS-IS so ExoPlayer's ABR works and the
+ *     quality menu appears. Only masters with malformed variants need to be
+ *     split into individual variant links.
+ */
+private data class MasterVariant(
+    val url: String?,        // null = malformed (no URI line after STREAM-INF)
+    val bandwidth: Long,
+    val height: Int?
+)
 
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
@@ -15,13 +42,34 @@ class Rumble : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
-        private const val FETCH_TIMEOUT_MS = 12_000L
+        private const val HTML_TIMEOUT_MS = 12_000L
+        private const val M3U8_TIMEOUT_MS = 6_000L
 
-        private val RE_VIDEO_URL = Regex(
-            """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*"""
+        // Browser UA for the embed page — Rumble serves HTML fine to browsers.
+        private const val BROWSER_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+        // RAW UA for the HLS CDN. Browser UA here → CF 403.
+        private const val RAW_UA = "okhttp/4.12.0"
+
+        private val PAGE_HEADERS = mapOf(
+            "Accept" to "*/*",
+            "User-Agent" to BROWSER_UA
+        )
+        private val CDN_HEADERS = mapOf(
+            "Accept" to "*/*",
+            "User-Agent" to RAW_UA
+        )
+
+        private val RE_MEDIA_URL = Regex(
+            """(https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:m3u8|mp4)[^"'\s<>‘’“”]*)"""
         )
         private val RE_QUALITY_H = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""")
         private val RE_QUALITY_BRACE = Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
+
+        private val RE_BANDWIDTH = Regex("""BANDWIDTH=(\d+)""")
+        private val RE_RESOLUTION = Regex("""RESOLUTION=\d+x(\d+)""")
 
         private val JUNK_KEYWORDS = listOf("/assets/", "tracker", "thumb")
     }
@@ -32,77 +80,193 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Fast path
-        if (url.endsWith(".mp4", ignoreCase = true) || url.endsWith(".m3u8", ignoreCase = true)) {
-            val linkType = if (url.endsWith(".m3u8", ignoreCase = true))
-                ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-            callback(newExtractorLink(name, name, url, linkType) { this.referer = url })
+        // Fast path — caller passes a direct media URL
+        if (url.endsWith(".mp4", true) || url.endsWith(".m3u8", true)) {
+            val t = if (url.endsWith(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            callback(newExtractorLink(name, name, url, t) { this.referer = url })
             return
         }
 
-        val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-            try { app.get(url, referer = referer ?: mainUrl).text } catch (e: Exception) { null }
+        // ---- 1. Fetch embed HTML (browser UA) ----
+        val html = withTimeoutOrNull(HTML_TIMEOUT_MS) {
+            try {
+                app.get(url, referer = referer ?: "$mainUrl/", headers = PAGE_HEADERS).text
+            } catch (e: Exception) { null }
         } ?: return
 
-        val afterMp4 = html.substringAfter("{\"mp4", "")
-        val scriptData = if (afterMp4.isEmpty()) html else afterMp4.substringBefore("\"evt\":{")
+        // ---- 2. Slice the JSON blob ----
+        val scriptData = html
+            .substringAfter("{\"mp4", "")
+            .ifEmpty { html }
+            .substringBefore("\"evt\":{")
 
-        val scrapedUrls = LinkedHashSet<String>()
+        // ---- 3. Collect every m3u8/mp4 URL once ----
+        val seen = LinkedHashSet<String>()
         data class Hit(val url: String, val start: Int)
         val m3u8Hits = mutableListOf<Hit>()
-        val mp4Hits = mutableListOf<Hit>()
+        val mp4Hits  = mutableListOf<Hit>()
 
-        RE_VIDEO_URL.findAll(scriptData).forEach { match ->
-            val cleanUrl = match.value.replace("\\/", "/")
-            if (JUNK_KEYWORDS.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
-            if (!scrapedUrls.add(cleanUrl)) return@forEach
-
-            if (cleanUrl.contains(".m3u8", ignoreCase = true))
-                m3u8Hits.add(Hit(cleanUrl, match.range.first))
-            else
-                mp4Hits.add(Hit(cleanUrl, match.range.first))
+        RE_MEDIA_URL.findAll(scriptData).forEach { m ->
+            val clean = m.groupValues[1].replace("\\/", "/")
+            if (JUNK_KEYWORDS.any { clean.contains(it, true) }) return@forEach
+            if (!seen.add(clean)) return@forEach
+            if (clean.contains(".m3u8", true)) m3u8Hits += Hit(clean, m.range.first)
+            else                                mp4Hits  += Hit(clean, m.range.first)
         }
 
-        // --- m3u8s: emit both immediately, no network check, distinct labels ---
-        m3u8Hits.forEachIndexed { i, h ->
-            val label = if (i == 0) "$name (Auto)" else "$name (Auto ${i + 1})"
-            callback(
-                newExtractorLink(name, label, h.url, ExtractorLinkType.M3U8) {
-                    this.referer = url
-                    this.quality = Qualities.Unknown.value
+        // ---- 4. m3u8s: fetch each body in parallel with RAW UA ----
+        val m3u8Bodies = if (m3u8Hits.isEmpty()) emptyList() else coroutineScope {
+            m3u8Hits.map { h ->
+                async {
+                    try {
+                        withTimeoutOrNull(M3U8_TIMEOUT_MS) {
+                            app.get(h.url, referer = url, headers = CDN_HEADERS).text
+                        }
+                    } catch (e: Exception) { null }
                 }
-            )
+            }.awaitAll()
         }
 
-        // --- mp4s: sanitized labels, no duplicates ---
         val emittedLabels = HashSet<String>()
-        mp4Hits.forEach { h ->
-            val precedingText = scriptData.substring(
-                Math.max(0, h.start - 150),
-                h.start
-            )
-            val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull()
-                ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
 
-            var displayLabel = name
-            if (qMatch != null) {
-                val digits = qMatch.groupValues[1].filter { it.isDigit() }.take(4)
-                if (digits.length in 3..4) {
-                    displayLabel = "$name ${digits}p"
+        m3u8Hits.forEachIndexed { i, hit ->
+            val body = m3u8Bodies.getOrNull(i)
+
+            // No body → can't verify. Deliver master as-is (safe fallback).
+            if (body == null) {
+                if (emittedLabels.add("$name (Auto)")) {
+                    callback(newExtractorLink(name, "$name (Auto)", hit.url, ExtractorLinkType.M3U8) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
+                        this.headers = CDN_HEADERS
+                    })
                 }
+                return@forEachIndexed
             }
 
-            if (!emittedLabels.add(displayLabel)) return@forEach
+            val parsed = parseVariants(body)
 
-            callback(
-                newExtractorLink(name, displayLabel, h.url, INFER_TYPE) {
-                    this.referer = url
-                    this.quality = Qualities.Unknown.value
+            // No #EXT-X-STREAM-INF → single-quality media playlist, not a master.
+            if (parsed.isEmpty()) {
+                val q = detectQualityFromUrl(hit.url)
+                val label = if (q != null) "$name ${q}p" else name
+                if (emittedLabels.add(label)) {
+                    callback(newExtractorLink(name, label, hit.url, ExtractorLinkType.M3U8) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
+                        this.headers = CDN_HEADERS
+                    })
                 }
-            )
+                return@forEachIndexed
+            }
+
+            // Resolve each variant, drop nulls (malformed) and self-references.
+            val valid = parsed.mapNotNull { v ->
+                if (v.url == null) return@mapNotNull null
+                val resolved = resolveUrl(hit.url, v.url)
+                if (resolved == hit.url || resolved == hit.url.trimEnd('/')) null
+                else resolved to v.height
+            }
+
+            when {
+                // AllMalformed → drop silently. Prevents ExoPlayer 3002.
+                valid.isEmpty() -> return@forEachIndexed
+
+                // Clean master → deliver AS-IS. ABR works, quality menu appears.
+                valid.size == parsed.size -> {
+                    if (emittedLabels.add("$name (Auto)")) {
+                        callback(newExtractorLink(name, "$name (Auto)", hit.url, ExtractorLinkType.M3U8) {
+                            this.referer = url
+                            this.quality = Qualities.Unknown.value
+                            this.headers = CDN_HEADERS
+                        })
+                    }
+                }
+
+                // Some malformed → deliver only the valid variants, each labelled
+                // with its real resolution. Malformed ones never reach the player.
+                else -> {
+                    valid.forEach { (variantUrl, height) ->
+                        val label = if (height != null) "$name ${height}p" else name
+                        if (emittedLabels.add(label)) {
+                            callback(newExtractorLink(name, label, variantUrl, ExtractorLinkType.M3U8) {
+                                this.referer = url
+                                this.quality = height ?: Qualities.Unknown.value
+                                this.headers = CDN_HEADERS
+                            })
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- 5. mp4s: direct emit, quality from JSON ----
+        mp4Hits.forEach { h ->
+            val preceding = scriptData.substring(Math.max(0, h.start - 150), h.start)
+            val qMatch = RE_QUALITY_H.findAll(preceding).lastOrNull()
+                ?: RE_QUALITY_BRACE.findAll(preceding).lastOrNull()
+
+            var label = name
+            if (qMatch != null) {
+                val digits = qMatch.groupValues[1].filter { it.isDigit() }.take(4)
+                if (digits.length in 3..4) label = "$name ${digits}p"
+            }
+
+            if (!emittedLabels.add(label)) return@forEach
+
+            callback(newExtractorLink(name, label, h.url, INFER_TYPE) {
+                this.referer = url
+                this.quality = Qualities.Unknown.value
+            })
         }
     }
+
+    // ---------- helpers modelled on OCE's M3u8MasterVerifier ----------
+
+    /**
+     * Parse #EXT-X-STREAM-INF blocks. A variant whose next line is blank, a
+     * comment, or EOF is recorded with url=null so the caller drops it.
+     */
+    private fun parseVariants(text: String): List<MasterVariant> {
+        val out = mutableListOf<MasterVariant>()
+        val lines = text.lines()
+        var i = 0
+        while (i < lines.size) {
+            val line = lines[i].trim()
+            if (line.startsWith("#EXT-X-STREAM-INF")) {
+                val bw = RE_BANDWIDTH.find(line)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                val h  = RE_RESOLUTION.find(line)?.groupValues?.get(1)?.toIntOrNull()
+                val uri = if (i + 1 < lines.size) lines[i + 1].trim() else ""
+                val malformed = uri.isBlank() || uri.startsWith("#")
+                out += MasterVariant(if (malformed) null else uri, bw, h)
+                i += 2
+            } else i++
+        }
+        return out
+    }
+
+    /** Resolve a relative variant URL against the master URL. */
+    private fun resolveUrl(base: String, path: String): String {
+        if (path.startsWith("http://") || path.startsWith("https://")) return path
+        val uri = runCatching { URI(base) }.getOrNull() ?: return path
+        val origin = buildString {
+            append(uri.scheme ?: "https"); append("://"); append(uri.host.orEmpty())
+            val p = uri.port
+            if (p > 0 && p != 80 && p != 443) append(":$p")
+        }
+        if (path.startsWith("/")) return origin + path
+        val dir = uri.path.orEmpty().substringBeforeLast('/', "")
+        return "$origin$dir/$path"
+    }
+
+    /** Extract a resolution hint from the URL path (…/_1080p.m3u8, …/360/index.m3u8). */
+    private fun detectQualityFromUrl(url: String): Int? =
+        Regex("""\d{3,4}""").findAll(url)
+            .mapNotNull { it.value.toIntOrNull() }
+            .filter { it in 144..4320 }
+            .maxOrNull()
 }
+
 open class PlayStreamplay : ExtractorApi() {
     override var name = "All sub player"
     override var mainUrl = "https://play.streamplay.co.in"
