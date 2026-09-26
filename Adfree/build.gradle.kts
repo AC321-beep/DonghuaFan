@@ -3,11 +3,11 @@ plugins {
 }
 
 cloudstream {
-    description = "Blocks known ad and donation popups with a user-editable blocklist."
+    description = "Blocks ads and donation popups with behavior-triggered filtering."
     authors = listOf("AC321-beep")   
     status = 1
     language = "en"
-    version = 9
+    version = 10
     iconUrl = "https://raw.githubusercontent.com/AC321-beep/DonghuaFan/refs/heads/master/Adfree/Icon.png"
 }
 
