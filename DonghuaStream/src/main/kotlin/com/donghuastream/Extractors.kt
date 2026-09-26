@@ -24,25 +24,9 @@ class Rumble : ExtractorApi() {
         private val RE_QUALITY_H = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""")
         private val RE_QUALITY_BRACE = Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
 
-        // Precompiled — only run when the cheap substring gate passes
-        private val RE_TRAILER_TITLE = Regex(
-            """(?is)<title[^>]*>[^<]*\b(?:trailer|preview)\b[^<]*</title>"""
-        )
-        private val RE_TRAILER_OG = Regex(
-            """(?is)<meta[^>]+(?:property=["']og:title["']|name=["'](?:title|twitter:title)["'])[^>]+content=["'][^"']*\b(?:trailer|preview)\b"""
-        )
-
-        // "preview" no longer a junk keyword — classified separately as trailer marker
-        private val JUNK_KEYWORDS = listOf("/assets/", "loop", "tracker", "thumb")
-        private val TRAILER_KEYWORDS = listOf("preview", "trailer")
-
-        // Cheap substring gate — avoids running the regex engine on non-trailer pages
-        private fun mightBeTrailerPage(html: String): Boolean =
-            html.contains("trailer", ignoreCase = true) ||
-            html.contains("preview", ignoreCase = true)
+        // Only two keywords changed vs. your original
+        private val JUNK_KEYWORDS = listOf("/assets/", "tracker", "thumb")
     }
-
-    private data class RumbleMatch(val url: String, val start: Int, val isTrailer: Boolean)
 
     override suspend fun getUrl(
         url: String,
@@ -50,7 +34,6 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Fast path — direct media URL
         if (url.endsWith(".mp4", ignoreCase = true) || url.endsWith(".m3u8", ignoreCase = true)) {
             val linkType = if (url.endsWith(".m3u8", ignoreCase = true))
                 ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
@@ -62,90 +45,59 @@ class Rumble : ExtractorApi() {
             try { app.get(url, referer = referer ?: mainUrl).text } catch (e: Exception) { null }
         } ?: return
 
-        // Optional: JSON blob targeting
         val afterMp4 = html.substringAfter("{\"mp4", "")
         val scriptData = if (afterMp4.isEmpty()) html else afterMp4.substringBefore("\"evt\":{")
 
-        // Page-level trailer detection — gated by cheap substring check first.
-        // The regexes only run on the minority of pages that mention "trailer"/"preview".
-        val isTrailerPage = mightBeTrailerPage(html) && (
-            RE_TRAILER_TITLE.containsMatchIn(html) ||
-            RE_TRAILER_OG.containsMatchIn(html)
-        )
-
-        // Collect every candidate and classify
-        val matches = mutableListOf<RumbleMatch>()
-        val seen = LinkedHashSet<String>()
+        val scrapedUrls = LinkedHashSet<String>()
 
         RE_VIDEO_URL.findAll(scriptData).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
 
-            if (!cleanUrl.contains("rumble.com", ignoreCase = true)) return@forEach
+            // HOST FILTER REMOVED — this is the fix
             if (JUNK_KEYWORDS.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
-            if (!seen.add(cleanUrl)) return@forEach
 
-            val isTrailerUrl = TRAILER_KEYWORDS.any { cleanUrl.contains(it, ignoreCase = true) }
-            matches.add(RumbleMatch(cleanUrl, match.range.first, isTrailerUrl || isTrailerPage))
-        }
+            if (scrapedUrls.add(cleanUrl)) {
+                if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
+                    callback(
+                        newExtractorLink(name, "$name (Auto)", cleanUrl, ExtractorLinkType.M3U8) {
+                            this.referer = url
+                            this.quality = Qualities.Unknown.value
+                        }
+                    )
+                    val variants = try {
+                        withTimeoutOrNull(SPLIT_TIMEOUT_MS) {
+                            M3u8Helper.generateM3u8(name, cleanUrl, url)
+                        }
+                    } catch (e: Exception) { null }
+                    variants?.forEach(callback)
+                } else if (cleanUrl.contains(".mp4", ignoreCase = true)) {
+                    val precedingText = scriptData.substring(
+                        Math.max(0, match.range.first - 150),
+                        match.range.first
+                    )
+                    val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull()
+                        ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
 
-        val regulars = matches.filter { !it.isTrailer }
-        val trailers = matches.filter { it.isTrailer }
+                    var displayLabel = name
+                    var qualityInt = Qualities.Unknown.value
 
-        // Only fall back to trailers when there is no real video on the page
-        val trailerOnly = regulars.isEmpty() && trailers.isNotEmpty()
-        val toEmit = if (trailerOnly) trailers else regulars
-        if (toEmit.isEmpty()) return
-
-        // Tag name as "Rumble Trailer" only when we're emitting a trailer
-        val linkName = if (trailerOnly) "$name Trailer" else name
-
-        toEmit.forEach { info ->
-            val cleanUrl = info.url
-
-            if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
-                callback(
-                    newExtractorLink(name, "$linkName (Auto)", cleanUrl, ExtractorLinkType.M3U8) {
-                        this.referer = url
-                        this.quality = Qualities.Unknown.value
+                    if (qMatch != null) {
+                        val qStr = qMatch.groupValues[1]
+                        displayLabel = "$name ${qStr}p"
+                        qualityInt = qStr.toIntOrNull() ?: Qualities.Unknown.value
                     }
-                )
 
-                val variants = try {
-                    withTimeoutOrNull(SPLIT_TIMEOUT_MS) {
-                        M3u8Helper.generateM3u8(linkName, cleanUrl, url)
-                    }
-                } catch (e: Exception) { null }
-                variants?.forEach(callback)
-
-            } else if (cleanUrl.contains(".mp4", ignoreCase = true)) {
-                val precedingText = scriptData.substring(
-                    Math.max(0, info.start - 150),
-                    info.start
-                )
-
-                val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull()
-                    ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
-
-                var displayLabel = linkName
-                var qualityInt = Qualities.Unknown.value
-
-                if (qMatch != null) {
-                    val qStr = qMatch.groupValues[1]
-                    displayLabel = "$linkName ${qStr}p"
-                    qualityInt = qStr.toIntOrNull() ?: Qualities.Unknown.value
+                    callback(
+                        newExtractorLink(name, displayLabel, cleanUrl, INFER_TYPE) {
+                            this.referer = url
+                            this.quality = qualityInt
+                        }
+                    )
                 }
-
-                callback(
-                    newExtractorLink(name, displayLabel, cleanUrl, INFER_TYPE) {
-                        this.referer = url
-                        this.quality = qualityInt
-                    }
-                )
             }
         }
     }
 }
-
 open class PlayStreamplay : ExtractorApi() {
     override var name = "All sub player"
     override var mainUrl = "https://play.streamplay.co.in"
