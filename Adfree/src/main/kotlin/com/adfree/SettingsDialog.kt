@@ -69,8 +69,8 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
         })
 
         container.addView(TextView(context).apply {
-            text = "Add GitHub username, repo URL or repo shortcode to filter " +
-                "Providers from these sources are auto-blocked "
+            text = "Add repo URL or repo shortcode to filter. " +
+                "Providers from these sources are auto-blocked."
             textSize = 12f
             setTextColor(Color.parseColor("#909090"))
             setPadding(0, 0, 0, 12)
@@ -97,8 +97,8 @@ class SettingsDialog(private val context: Context, private val onApply: () -> Un
         })
 
         container.addView(TextView(context).apply {
-            text = "Ads or Donation popups are filtered " +
-                "Uncheck any to allow it "
+            text = "Ads or Donation popups are filtered. " +
+                "Uncheck any to allow it."
             textSize = 12f
             setTextColor(Color.parseColor("#909090"))
             setPadding(0, 0, 0, 12)
