@@ -15,10 +15,10 @@ object FilterStore {
     @Volatile private var prefs: SharedPreferences? = null
     private val sessionAllowOnce = java.util.Collections.synchronizedSet(HashSet<String>())
 
+    // Generic donation platforms and ad networks — no repo-specific domains.
     private val HARDCODED_BLOCKED_HOSTS = setOf(
         "buymeacoffee.com", "developers.buymeacoffee.com",
         "patreon.com", "ko-fi.com", "paypal.me", "paypal.com",
-        "cncverse.com", "phisher98.com",
         "cutt.ly", "tinyurl.com", "rebrand.ly", "is.gd", "bit.ly", "linkvertise.com",
         "omg10.com", "propellerads.com", "propeller-tracking.com",
         "monetag.com", "adsterra.com", "hilltopads.com",
@@ -31,12 +31,13 @@ object FilterStore {
         "discord.com", "wikipedia.org"
     )
 
+    // Generic behavioral patterns — no repo-specific keywords.
     private val NON_MEDIA_PATTERNS = listOf(
         Regex("/(popunder|popunderinit)", RegexOption.IGNORE_CASE),
         Regex("/(redirect|go|visit|jump)/[a-zA-Z0-9]+", RegexOption.IGNORE_CASE),
         Regex("/watch\\?key=", RegexOption.IGNORE_CASE),
         Regex("click\\?", RegexOption.IGNORE_CASE),
-        Regex("support|donate|patreon|buymeacoffee|ko-fi|cncverse", RegexOption.IGNORE_CASE)
+        Regex("support|donate|patreon|buymeacoffee|ko-fi", RegexOption.IGNORE_CASE)
     )
 
     fun init(context: Context) {
@@ -44,14 +45,12 @@ object FilterStore {
         prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
-    // --- Intensity: 0 = Light, 1 = Medium, 2 = Strict ---
     fun getIntensity(): Int = prefs?.getInt(KEY_INTENSITY, 1) ?: 1
 
     fun setIntensity(level: Int) {
         prefs?.edit()?.putInt(KEY_INTENSITY, level.coerceIn(0, 2))?.apply()
     }
 
-    // --- Efficient O(dots) host lookup ---
     fun isHostBlocked(host: String?): Boolean {
         if (host.isNullOrBlank()) return false
         val h = host.lowercase().trim()
@@ -94,7 +93,6 @@ object FilterStore {
         } catch (_: Throwable) { emptySet() }
     }
 
-    // --- Custom Blocked Sources ---
     fun getCustomSources(): Set<String> {
         return try {
             val arr = JSONArray(prefs?.getString(KEY_CUSTOM_SOURCES, "[]") ?: "[]")
@@ -108,14 +106,12 @@ object FilterStore {
             var s = raw.trim().lowercase()
             if (s.isBlank()) continue
 
-            // Strip protocol and domain if a full URL was pasted
             s = s.removePrefix("https://")
                 .removePrefix("http://")
                 .removePrefix("www.")
                 .removePrefix("github.com/")
                 .removePrefix("raw.githubusercontent.com/")
 
-            // Strip path suffixes
             s = s.substringBefore("/refs/")
                 .substringBefore("/builds/")
                 .substringBefore("/tree/")
@@ -123,21 +119,18 @@ object FilterStore {
                 .removeSuffix(".git")
                 .trimEnd('/')
 
-            // Remove spaces and underscores (so "Phisher repo" -> "phisherrepo")
-            val compact = s.replace(" ", "").replace("_", "")
+            val compact = s.replace(" ", "")
+                .replace("_", "")
+                .replace("/", "")
+                .replace(",", "")
 
-            // Split on "/" and "," to support "user/repo" entries
-            for (part in compact.split("/", ",")) {
-                val p = part.trim()
-                if (p.length >= 3) cleaned.add(p)
-            }
+            if (compact.length >= 3) cleaned.add(compact)
         }
         prefs?.edit()
             ?.putString(KEY_CUSTOM_SOURCES, JSONArray(cleaned.toList()).toString())
             ?.apply()
     }
 
-    // --- Blocked Providers ---
     fun getBlockedProviders(): MutableSet<String> {
         return try {
             val arr = JSONArray(prefs?.getString(KEY_BLOCKED_PROVIDERS, "[]") ?: "[]")
@@ -151,7 +144,6 @@ object FilterStore {
             ?.apply()
     }
 
-    // --- Manually Unblocked Providers ---
     fun getManuallyUnblocked(): MutableSet<String> {
         return try {
             val arr = JSONArray(prefs?.getString(KEY_MANUALLY_UNBLOCKED, "[]") ?: "[]")
