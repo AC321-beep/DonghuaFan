@@ -16,7 +16,7 @@ class Rumble : ExtractorApi() {
 
     companion object {
         private const val FETCH_TIMEOUT_MS = 12_000L
-        private const val SPLIT_TIMEOUT_MS = 2_500L
+        private const val M3U8_CHECK_TIMEOUT_MS = 3_000L
 
         private val RE_VIDEO_URL = Regex(
             """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*"""
@@ -24,7 +24,6 @@ class Rumble : ExtractorApi() {
         private val RE_QUALITY_H = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""")
         private val RE_QUALITY_BRACE = Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
 
-        // Only two keywords changed vs. your original
         private val JUNK_KEYWORDS = listOf("/assets/", "tracker", "thumb")
     }
 
@@ -34,6 +33,7 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
+        // Fast path
         if (url.endsWith(".mp4", ignoreCase = true) || url.endsWith(".m3u8", ignoreCase = true)) {
             val linkType = if (url.endsWith(".m3u8", ignoreCase = true))
                 ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
@@ -49,52 +49,79 @@ class Rumble : ExtractorApi() {
         val scriptData = if (afterMp4.isEmpty()) html else afterMp4.substringBefore("\"evt\":{")
 
         val scrapedUrls = LinkedHashSet<String>()
+        val emittedLabels = HashSet<String>()
+
+        data class Hit(val url: String, val start: Int)
+        val m3u8Hits = mutableListOf<Hit>()
+        val mp4Hits = mutableListOf<Hit>()
 
         RE_VIDEO_URL.findAll(scriptData).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
-
-            // HOST FILTER REMOVED — this is the fix
             if (JUNK_KEYWORDS.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
+            if (!scrapedUrls.add(cleanUrl)) return@forEach
 
-            if (scrapedUrls.add(cleanUrl)) {
-                if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
-                    callback(
-                        newExtractorLink(name, "$name (Auto)", cleanUrl, ExtractorLinkType.M3U8) {
-                            this.referer = url
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    val variants = try {
-                        withTimeoutOrNull(SPLIT_TIMEOUT_MS) {
-                            M3u8Helper.generateM3u8(name, cleanUrl, url)
-                        }
-                    } catch (e: Exception) { null }
-                    variants?.forEach(callback)
-                } else if (cleanUrl.contains(".mp4", ignoreCase = true)) {
-                    val precedingText = scriptData.substring(
-                        Math.max(0, match.range.first - 150),
-                        match.range.first
-                    )
-                    val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull()
-                        ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
+            if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
+                m3u8Hits.add(Hit(cleanUrl, match.range.first))
+            } else {
+                mp4Hits.add(Hit(cleanUrl, match.range.first))
+            }
+        }
 
-                    var displayLabel = name
-                    var qualityInt = Qualities.Unknown.value
+        // Fetch each m3u8 body. A master playlist contains #EXT-X-STREAM-INF —
+        // that's what makes the player show the quality selector. Single-quality
+        // playlists (the CDN one) don't have it, so we skip them.
+        val masters = m3u8Hits.filter { h ->
+            val isMaster = try {
+                withTimeoutOrNull(M3U8_CHECK_TIMEOUT_MS) {
+                    val body = app.get(h.url, referer = url).text
+                    body.contains("#EXT-X-STREAM-INF")
+                } ?: false
+            } catch (e: Exception) { false }
+            isMaster
+        }
 
-                    if (qMatch != null) {
-                        val qStr = qMatch.groupValues[1]
-                        displayLabel = "$name ${qStr}p"
-                        qualityInt = qStr.toIntOrNull() ?: Qualities.Unknown.value
+        // Emit masters as (Auto). If none detected, fall back to the first m3u8
+        // so playback still works — just without a quality menu.
+        val m3u8ToEmit = if (masters.isNotEmpty()) masters else m3u8Hits.take(1)
+
+        m3u8ToEmit.forEach { h ->
+            if (emittedLabels.add("$name (Auto)")) {
+                callback(
+                    newExtractorLink(name, "$name (Auto)", h.url, ExtractorLinkType.M3U8) {
+                        this.referer = url
+                        this.quality = Qualities.Unknown.value
                     }
+                )
+            }
+        }
 
-                    callback(
-                        newExtractorLink(name, displayLabel, cleanUrl, INFER_TYPE) {
-                            this.referer = url
-                            this.quality = qualityInt
-                        }
-                    )
+        // mp4 entries — same as before, plus label sanitization + dedup
+        mp4Hits.forEach { h ->
+            val precedingText = scriptData.substring(
+                Math.max(0, h.start - 150), h.start
+            )
+            val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull()
+                ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
+
+            var displayLabel = name
+            var qualityInt = Qualities.Unknown.value
+
+            if (qMatch != null) {
+                val digits = qMatch.groupValues[1].filter { it.isDigit() }.take(4)
+                if (digits.length in 3..4) {
+                    displayLabel = "$name ${digits}p"
+                    qualityInt = digits.toIntOrNull() ?: Qualities.Unknown.value
                 }
             }
+
+            if (!emittedLabels.add(displayLabel)) return@forEach
+
+            callback(
+                newExtractorLink(name, displayLabel, h.url, INFER_TYPE) {
+                    this.referer = url
+                    this.quality = qualityInt
+                }
+            )
         }
     }
 }
