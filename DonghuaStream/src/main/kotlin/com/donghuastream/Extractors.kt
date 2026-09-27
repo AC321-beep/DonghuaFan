@@ -24,11 +24,7 @@ class Rumble : ExtractorApi() {
         private val RE_QUALITY_H = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""")
         private val RE_QUALITY_BRACE = Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
 
-        // Strict filter — used for regular Rumble videos
         private val JUNK_KEYWORDS = listOf("/assets/", "loop", "preview", "tracker", "thumb")
-
-        // Relaxed filter — used only in the trailer fallback.
-        // Removes the two entries that a trailer/preview URL would normally hit.
         private val HARD_JUNK = listOf("/assets/", "tracker", "thumb")
     }
 
@@ -50,14 +46,13 @@ class Rumble : ExtractorApi() {
             try { app.get(url, referer = referer ?: mainUrl).text } catch (e: Exception) { null }
         } ?: return
 
-        // Optional JSON blob targeting (unchanged)
         val afterMp4 = html.substringAfter("{\"mp4", "")
         val scriptData = if (afterMp4.isEmpty()) html else afterMp4.substringBefore("\"evt\":{")
 
         val scrapedUrls = LinkedHashSet<String>()
         var emitted = false
 
-        // ===================== PASS 1 — strict (original behavior) =====================
+        // ===================== PASS 1 — strict =====================
         RE_VIDEO_URL.findAll(scriptData).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
 
@@ -71,15 +66,10 @@ class Rumble : ExtractorApi() {
         }
 
         // ===================== PASS 2 — trailer fallback =====================
-        // Runs only if PASS 1 emitted nothing. Trailer-only Rumble embeds serve
-        // media from CDN hosts (hugh.cdn.rumble.cloud, sp.rmbl.ws, …) and/or have
-        // "preview" / "loop" in the URL — both rejected by PASS 1. Here we accept
-        // them and tag every emitted link as "Rumble Trailer".
         if (!emitted) {
             RE_VIDEO_URL.findAll(scriptData).forEach { match ->
                 val cleanUrl = match.value.replace("\\/", "/")
 
-                // Only filter assets that are never playable media
                 if (HARD_JUNK.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
 
                 if (scrapedUrls.add(cleanUrl)) {
@@ -89,14 +79,6 @@ class Rumble : ExtractorApi() {
         }
     }
 
-    /**
-     * Emit one link. Mirrors the original inline code:
-     *   - m3u8 → emit "<labelBase> (Auto)" then run M3u8Helper split
-     *   - mp4  → look up quality in the JSON preceding the URL
-     *
-     * Behaviour is identical to the original loop; only the labelBase differs
-     * between the two passes ("Rumble" vs "Rumble Trailer").
-     */
     private suspend fun emitOne(
         cleanUrl: String,
         match: MatchResult,
@@ -129,19 +111,17 @@ class Rumble : ExtractorApi() {
             val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull()
                 ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
 
-            var displayLabel = labelBase
-            var qualityInt = Qualities.Unknown.value
-
-            if (qMatch != null) {
-                val qStr = qMatch.groupValues[1]
-                displayLabel = "$labelBase ${qStr}p"
-                qualityInt = qStr.toIntOrNull() ?: Qualities.Unknown.value
-            }
+            // Label carries the resolution — leave quality at Unknown so
+            // CloudStream doesn't append "360p" a second time in the picker.
+            val displayLabel = if (qMatch != null)
+                "$labelBase ${qMatch.groupValues[1]}p"
+            else
+                labelBase
 
             callback(
                 newExtractorLink(name, displayLabel, cleanUrl, INFER_TYPE) {
                     this.referer = referer
-                    this.quality = qualityInt
+                    this.quality = Qualities.Unknown.value
                 }
             )
         }
