@@ -149,14 +149,14 @@ class Rumble : ExtractorApi() {
 
     // ---------- helpers ----------
 
-    private fun link(
-        src: String, label: String, u: String, referer: String,
-        headers: Map<String, String>, quality: Int? = null
-    ): ExtractorLink = newExtractorLink(src, label, u, INFER_TYPE) {
-        this.referer = referer
-        this.quality = quality ?: Qualities.Unknown.value
-        if (headers.isNotEmpty()) this.headers = headers
-    }
+   private fun link(
+    src: String, label: String, u: String, referer: String,
+    headers: Map<String, String>, quality: Int? = null
+): ExtractorLink = newExtractorLink(src, label, u, INFER_TYPE) {
+    this.referer = referer
+    this.quality = quality ?: Qualities.Unknown.value
+    if (headers.isNotEmpty()) this.headers = headers
+}
 
     private fun parseVariants(text: String): List<RumbleVariant> {
         val out = mutableListOf<RumbleVariant>()
