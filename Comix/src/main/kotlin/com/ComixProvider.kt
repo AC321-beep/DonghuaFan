@@ -58,17 +58,15 @@ class ComixProvider : MainAPI() {
     )
 
     // ═══════════════════════════════════════════════════════════════════
-    //  fetchHtmlWithWebView — waits for React to render
-    //    • Non-title pages (home/search): return on first signal
-    //    • Title pages: keep polling until 3+ chapter anchors exist
+    //  fetchHtmlWithWebView
+    //  EXACT sample gate: lrow / list-grid / list-empty
+    //  EXACT sample timings: 6s hard timeout, 25 attempts × 300ms
     // ═══════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun fetchHtmlWithWebView(url: String): String =
         withContext(Dispatchers.Main) {
             val activity = CommonActivity.activity ?: return@withContext ""
             if (activity.isFinishing || activity.isDestroyed) return@withContext ""
-
-            val isTitlePage = url.contains("/title/")
 
             suspendCancellableCoroutine { cont ->
                 val wv = WebView(activity)
@@ -77,7 +75,8 @@ class ComixProvider : MainAPI() {
                     domStorageEnabled = true
                     loadsImagesAutomatically = false
                     userAgentString = userAgentString
-                        .replace("; wv", "").replace("Android TV", "Android")
+                        .replace("; wv", "")
+                        .replace("Android TV", "Android")
                 }
 
                 runCatching {
@@ -110,26 +109,9 @@ class ComixProvider : MainAPI() {
                         if (resumed) return@evaluateJavascript
                         val html = parseJsString(raw) ?: ""
 
-                        // Count chapter anchors present in the current DOM
-                        val chapterCount = Regex("href=\"[^\"]*-chapter-[\\d.]+")
-                            .findAll(html).count()
-
-                        val ready: Boolean = if (isTitlePage) {
-                            // Title page: wait until React has rendered the full chapter list.
-                            // 3+ anchors means the list has mounted (not just the 1-2 header links).
-                            chapterCount >= 3 ||
-                                html.contains("lrow") ||
-                                html.contains("list-grid") ||
-                                html.contains("list-empty")
-                        } else {
-                            // Home / search: initial-data alone is fine
-                            html.contains("lrow") ||
-                                html.contains("list-grid") ||
-                                html.contains("list-empty") ||
-                                html.contains("initial-data")
-                        }
-
-                        if (ready) {
+                        if (html.contains("lrow") ||
+                            html.contains("list-grid") ||
+                            html.contains("list-empty")) {
                             runCatching { CookieManager.getInstance().flush() }
                             finish(html)
                             return@evaluateJavascript
@@ -165,6 +147,9 @@ class ComixProvider : MainAPI() {
         return runCatching { JSONTokener(raw).nextValue().toString() }.getOrDefault(raw)
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  initial-data
+    // ═══════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
             is Document -> htmlOrDoc
@@ -217,6 +202,9 @@ class ComixProvider : MainAPI() {
         return out
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  DOM extract — EXACT sample selectors
+    // ═══════════════════════════════════════════════════════════════════
     private fun toSearchResult(card: Element): SearchResponse? {
         val anchor = if (card.tagName() == "a") card
                      else card.selectFirst("a[href*='/title/'], a[href]") ?: return null
@@ -263,6 +251,9 @@ class ComixProvider : MainAPI() {
         return extractSearchResultsDom(Jsoup.parse(html))
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  getMainPage
+    // ═══════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
@@ -299,6 +290,9 @@ class ComixProvider : MainAPI() {
         return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = items.size >= 20)
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  search
+    // ═══════════════════════════════════════════════════════════════════
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
@@ -321,10 +315,10 @@ class ComixProvider : MainAPI() {
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     // ═══════════════════════════════════════════════════════════════════
-    //  load — full chapter list, sequential 1..N episode numbers
+    //  load — two fetches of the same url (sample shape), sequential 1..N
     // ═══════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
-        // ═══ Suspend #1 — waits for chapters to render (see gate above) ═══
+        // ═══ Suspend #1 ═══
         val html1 = fetchHtmlWithWebView(url)
         if (html1.isBlank()) return null
         val document = Jsoup.parse(html1)
@@ -364,12 +358,14 @@ class ComixProvider : MainAPI() {
             }
         }.distinct()
 
+        val firstChapterUrl  = d.optString("firstChapterUrl").takeIf { it.isNotBlank() }
+        val latestChapterUrl = d.optString("latestChapterUrl").takeIf { it.isNotBlank() }
         val latestChapterNum = d.optInt("latestChapter", 0)
 
-        // ── chapterAnchors from the rendered DOM ──
+        // ── chapterAnchors from rendered DOM ──
         var chapterAnchors = document.select("a[href*='-chapter-']")
 
-        // ═══ Suspend #2 — retry if still short ═══
+        // ═══ Suspend #2 — retry if short ═══
         if (chapterAnchors.size < latestChapterNum) {
             val html2 = fetchHtmlWithWebView(url)
             if (html2.isNotBlank()) {
@@ -388,24 +384,55 @@ class ComixProvider : MainAPI() {
             name to href
         }
 
-        // ── dedupe by chapter number, keeping the first occurrence ──
+        // ── dedupe by chapter number (site lists same chapter from many groups) ──
         val seenNumbers = mutableSetOf<String>()
-        val dedupedLinks = parsedChapterLinks.filter { (_, href) ->
+        val deduped = parsedChapterLinks.filter { (_, href) ->
             val num = Regex("-chapter-([\\d.]+)").find(href)?.groupValues?.get(1) ?: href
             seenNumbers.add(num)
         }
 
-        // ── episodes: sequential 1..N, names as displayed by the site ──
-        val episodes: List<Episode> = dedupedLinks.mapIndexed { index, (name, href) ->
+        // ── startsAtZero / startCh ──
+        val numbers = deduped.mapNotNull { (_, href) ->
+            Regex("-chapter-([\\d.]+)").find(href)?.groupValues?.get(1)?.toIntOrNull()
+        }
+        val startsAtZero = numbers.minOrNull() == 0
+        val startCh      = if (startsAtZero) 1 else (numbers.minOrNull() ?: 1)
+
+        // ── episodes: sequential 1..N ──
+        val episodes: List<Episode> = deduped.mapIndexed { index, (name, href) ->
             newEpisode(fixUrl(href)) {
                 this.name    = name
                 this.season  = 1
-                this.episode = index + 1
+                this.episode = index + startCh
                 this.posterUrl = posterUrl
             }
         }
 
-        if (episodes.isEmpty()) return null
+        // ── bookend fallback if extraction failed ──
+        val finalEpisodes = if (episodes.isEmpty() && latestChapterNum > 0) {
+            buildList {
+                firstChapterUrl?.let { u ->
+                    add(newEpisode(fixUrl(u)) {
+                        this.name = "Ch. 0"
+                        this.season = 1
+                        this.episode = 1
+                        this.posterUrl = posterUrl
+                    })
+                }
+                if (latestChapterNum > 1) {
+                    latestChapterUrl?.let { u ->
+                        add(newEpisode(fixUrl(u)) {
+                            this.name = "Ch. $latestChapterNum"
+                            this.season = 1
+                            this.episode = 2
+                            this.posterUrl = posterUrl
+                        })
+                    }
+                }
+            }
+        } else episodes
+
+        if (finalEpisodes.isEmpty()) return null
 
         return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
             this.posterUrl = posterUrl
@@ -417,10 +444,13 @@ class ComixProvider : MainAPI() {
                 "releasing", "ongoing", "on_hiatus" -> ShowStatus.Ongoing
                 else -> null
             }
-            addEpisodes(DubStatus.Subbed, episodes)
+            addEpisodes(DubStatus.Subbed, finalEpisodes)
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  loadLinks
+    // ═══════════════════════════════════════════════════════════════════
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -439,7 +469,6 @@ class ComixProvider : MainAPI() {
                 title = name,
                 chapterName = chapterName,
                 chapterUrl = data,
-                targetUrl = data,
                 targetChapter = 0
             )
         }
