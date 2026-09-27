@@ -7,7 +7,6 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.VibrationEffect
@@ -28,7 +27,6 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.fragment.app.DialogFragment
-import androidx.fragment.app.FragmentActivity
 import androidx.fragment.app.FragmentManager
 import java.util.concurrent.ConcurrentHashMap
 
@@ -94,8 +92,6 @@ class ComixReaderDialogFragment : DialogFragment() {
 
     private var toolbarVisible = true
 
-    // ------------------------------------------------------------ lifecycle
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val a = arguments
@@ -141,7 +137,7 @@ class ComixReaderDialogFragment : DialogFragment() {
         super.onStart()
         dialog?.window?.apply {
             setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-            decorView.systemUiVisibility = 5380 // fullscreen + immersive sticky + hide nav
+            decorView.systemUiVisibility = 5380
         }
     }
 
@@ -156,8 +152,6 @@ class ComixReaderDialogFragment : DialogFragment() {
         webView = null
         super.onDestroyView()
     }
-
-    // ------------------------------------------------------------ view
 
     @SuppressLint("SetJavaScriptEnabled", "SetTextI18n")
     override fun onCreateView(
@@ -175,7 +169,6 @@ class ComixReaderDialogFragment : DialogFragment() {
             layoutParams = ViewGroup.LayoutParams(-1, -1)
         }
 
-        // Progress bar
         progressBar = ProgressBar(ctx, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
             progress = 0
@@ -184,7 +177,6 @@ class ComixReaderDialogFragment : DialogFragment() {
         }
         root.addView(progressBar)
 
-        // Web container
         val webContainer = FrameLayout(ctx).apply {
             layoutParams = LinearLayout.LayoutParams(-1, 0, 1f)
             setBackgroundColor(Color.parseColor("#07080C"))
@@ -259,13 +251,9 @@ class ComixReaderDialogFragment : DialogFragment() {
             }
         }
         webContainer.addView(webView)
-
-        // Edge hints (discoverability)
         addTapZoneHints(ctx, webContainer)
-
         root.addView(webContainer)
 
-        // Bottom toolbar
         root.addView(buildToolbar(ctx, density))
         loadUrlDirectly(currentChapterName, currentChapterUrl, targetChapterNumber)
         return root
@@ -282,7 +270,6 @@ class ComixReaderDialogFragment : DialogFragment() {
             layoutParams = LinearLayout.LayoutParams(-1, dp(46))
         }
 
-        // Left cluster
         val left = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = android.view.Gravity.CENTER_VERTICAL
@@ -296,7 +283,6 @@ class ComixReaderDialogFragment : DialogFragment() {
         }.apply { (layoutParams as? LinearLayout.LayoutParams)?.leftMargin = dp(5) })
         bar.addView(left)
 
-        // Middle scrollable cluster
         val scroll = HorizontalScrollView(ctx).apply {
             isHorizontalScrollBarEnabled = false
             layoutParams = LinearLayout.LayoutParams(0, -1, 1f).apply {
@@ -306,7 +292,9 @@ class ComixReaderDialogFragment : DialogFragment() {
         val middle = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = android.view.Gravity.CENTER
-            layoutParams = FrameLayout.LayoutParams(-2, -1).apply { gravity = android.view.Gravity.CENTER }
+            layoutParams = FrameLayout.LayoutParams(-2, -1).apply {
+                gravity = android.view.Gravity.CENTER
+            }
         }
 
         middle.addView(makeBtn(ctx, density, "🔍 −", null, null, 7, 0) { zoomOut() })
@@ -319,8 +307,9 @@ class ComixReaderDialogFragment : DialogFragment() {
         middle.addView(zoomValueBtn)
         middle.addView(makeBtn(ctx, density, "🔍 +", null, null, 7, 0) { zoomIn() }
             .apply { (layoutParams as? LinearLayout.LayoutParams)?.rightMargin = dp(5) })
-        middle.addView(makeBtn(ctx, density, "📚 Chs", "#1E2430", "#E2E8F0", 7, 0) { openInPageChapterList() }
-            .apply { (layoutParams as? LinearLayout.LayoutParams)?.rightMargin = dp(5) })
+        middle.addView(makeBtn(ctx, density, "📚 Chs", "#1E2430", "#E2E8F0", 7, 0) {
+            openInPageChapterList()
+        }.apply { (layoutParams as? LinearLayout.LayoutParams)?.rightMargin = dp(5) })
 
         chapterInfoTextView = TextView(ctx).apply {
             text = if (targetChapterNumber > 0) "Ch. $targetChapterNumber"
@@ -336,13 +325,14 @@ class ComixReaderDialogFragment : DialogFragment() {
         scroll.addView(middle)
         bar.addView(scroll)
 
-        // Right cluster
         val right = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = android.view.Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(-2, -1)
         }
-        right.addView(makeBtn(ctx, density, "Next ▶", "#4F46E5", "#FFFFFF", 10, 0) { triggerNextChapter() })
+        right.addView(makeBtn(ctx, density, "Next ▶", "#4F46E5", "#FFFFFF", 10, 0) {
+            triggerNextChapter()
+        })
         bar.addView(right)
 
         toolbarView = bar
@@ -378,8 +368,6 @@ class ComixReaderDialogFragment : DialogFragment() {
         }
     }
 
-    // ------------------------------------------------------------ tap-zone hints
-
     private fun addTapZoneHints(ctx: Context, container: FrameLayout) {
         fun hint(alignLeft: Boolean) = View(ctx).apply {
             layoutParams = FrameLayout.LayoutParams(
@@ -410,8 +398,6 @@ class ComixReaderDialogFragment : DialogFragment() {
         container.addView(hint(false))
     }
 
-    // ------------------------------------------------------------ toolbar toggle
-
     private fun toggleToolbar() {
         val bar = toolbarView ?: return
         toolbarVisible = !toolbarVisible
@@ -427,7 +413,8 @@ class ComixReaderDialogFragment : DialogFragment() {
 
     private fun hapticTap() {
         runCatching {
-            val v = requireContext().getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
+            val v = requireContext()
+                .getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 v.vibrate(VibrationEffect.createOneShot(15, VibrationEffect.DEFAULT_AMPLITUDE))
             } else {
@@ -435,8 +422,6 @@ class ComixReaderDialogFragment : DialogFragment() {
             }
         }
     }
-
-    // ------------------------------------------------------------ zoom
 
     private fun zoomIn() {
         if (currentZoom >= 200) return
@@ -497,8 +482,6 @@ class ComixReaderDialogFragment : DialogFragment() {
         """.trimIndent()
         webView?.evaluateJavascript(js, null)
     }
-
-    // ------------------------------------------------------------ target jump
 
     private fun checkAndJumpToTargetChapter(view: WebView) {
         if (targetChapterNumber <= 0) return
@@ -566,8 +549,6 @@ class ComixReaderDialogFragment : DialogFragment() {
         view.evaluateJavascript(js, null)
     }
 
-    // ------------------------------------------------------------ chapter navigation (toolbar only)
-
     private fun triggerNextChapter() {
         targetChapterNumber = 0
         webView?.evaluateJavascript(
@@ -629,14 +610,11 @@ class ComixReaderDialogFragment : DialogFragment() {
         )
     }
 
-    // ------------------------------------------------------------ injection
-
     private fun injectReaderOptimizations(view: WebView) {
         view.evaluateJavascript(
             """
             (function() {
               try {
-                // ---- style cleanup ----
                 if (!document.getElementById('cs-reader-style')) {
                   var s = document.createElement('style');
                   s.id = 'cs-reader-style';
@@ -654,7 +632,6 @@ class ComixReaderDialogFragment : DialogFragment() {
                   document.head.appendChild(s);
                 }
 
-                // ---- chapter detection / mapping ----
                 function report() {
                   var chText = '';
                   var el = document.querySelector('.rpage-floatctl__chap .mono, .rpage-chap-ending__title, h1');
@@ -674,16 +651,13 @@ class ComixReaderDialogFragment : DialogFragment() {
                 }
                 report();
 
-                // ---- tap-to-scroll zones (install once) ----
                 if (!window.__comixTapZonesInstalled) {
                   window.__comixTapZonesInstalled = true;
 
                   var lastTap = 0;
                   document.addEventListener('click', function(e) {
-                    // Never hijack taps on real interactive elements
                     if (e.target.closest('a, button, input, textarea, .rpage-modal')) return;
 
-                    // Cooldown for rapid double-taps
                     var now = Date.now();
                     if (now - lastTap < 220) return;
                     lastTap = now;
@@ -692,21 +666,17 @@ class ComixReaderDialogFragment : DialogFragment() {
                     var x = e.clientX;
 
                     if (x < w * 0.25) {
-                      // Left → scroll up
                       window.scrollBy({ top: -(window.innerHeight * 0.8), behavior: 'smooth' });
                       flashTap(e.clientX, e.clientY);
                     } else if (x > w * 0.75) {
-                      // Right → scroll down
                       window.scrollBy({ top:  (window.innerHeight * 0.8), behavior: 'smooth' });
                       flashTap(e.clientX, e.clientY);
                     } else {
-                      // Center → toggle toolbar (Kotlin side)
                       AndroidComix.onTapZone('center');
                     }
                   }, false);
                 }
 
-                // ---- tap feedback ripple ----
                 function flashTap(x, y) {
                   try {
                     var dot = document.createElement('div');
@@ -730,8 +700,6 @@ class ComixReaderDialogFragment : DialogFragment() {
         )
     }
 
-    // ------------------------------------------------------------ public API
-
     fun loadUrlDirectly(name: String, url: String, targetChapter: Int) {
         if (url.isBlank()) return
         currentChapterName = name
@@ -754,13 +722,13 @@ class ComixReaderDialogFragment : DialogFragment() {
         webView?.loadUrl(finalUrl, headers)
     }
 
-    // ------------------------------------------------------------ JS bridge
-
     class ComixJsBridge(private val dialog: ComixReaderDialogFragment) {
 
         @JavascriptInterface
         fun onChapterDetected(detectedTitle: String, detectedUrl: String) {
-            dialog.activity?.runOnUiThread { dialog.updateChapterTitle(detectedTitle, detectedUrl) }
+            dialog.activity?.runOnUiThread {
+                dialog.updateChapterTitle(detectedTitle, detectedUrl)
+            }
         }
 
         @JavascriptInterface
@@ -776,21 +744,15 @@ class ComixReaderDialogFragment : DialogFragment() {
             dialog.activity?.runOnUiThread { dialog.targetChapterNumber = 0 }
         }
 
-        /**
-         * Only "center" ever crosses the bridge now.
-         * Left / right taps are handled entirely in JS (window.scrollBy) — no round-trip.
-         */
         @JavascriptInterface
         fun onTapZone(zone: String) {
             if (zone != "center") return
             dialog.activity?.runOnUiThread {
-                dialog.hapticTap()
                 dialog.toggleToolbar()
+                dialog.hapticTap()
             }
         }
     }
-
-    // ------------------------------------------------------------ util
 
     fun extractSlug(url: String): String =
         Regex("/title/([^/]+)").find(url)?.groupValues?.get(1)?.substringBefore("#") ?: ""
