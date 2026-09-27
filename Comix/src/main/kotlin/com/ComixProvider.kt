@@ -30,7 +30,6 @@ import com.lagradost.cloudstream3.newAnimeSearchResponse
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -76,7 +75,7 @@ class ComixProvider : MainAPI() {
 
         val res = newAnimeSearchResponse(title, fixUrl(url), TvType.Anime)
         poster?.let { res.posterUrl = fixUrl(it) }
-        latest?.let { addSub(res, it) }
+        latest?.let { res.addSub(it) }
         return res
     }
 
@@ -100,7 +99,7 @@ class ComixProvider : MainAPI() {
 
         val res = newAnimeSearchResponse(title, fixUrl(href), TvType.Anime)
         poster?.let { res.posterUrl = fixUrl(it) }
-        if (latestEp != null && latestEp > 0) addSub(res, latestEp)
+        if (latestEp != null && latestEp > 0) res.addSub(latestEp)
         return res
     }
 
@@ -326,8 +325,7 @@ class ComixProvider : MainAPI() {
                     newExtractorLink(
                         source = name,
                         name = name,
-                        url = fixUrl(src),
-                        type = ExtractorLinkType.IMAGE
+                        url = fixUrl(src)
                     ) {
                         this.referer = mainUrl
                     }
@@ -350,8 +348,7 @@ class ComixProvider : MainAPI() {
                                 newExtractorLink(
                                     source = name,
                                     name = name,
-                                    url = fixUrl(src),
-                                    type = ExtractorLinkType.IMAGE
+                                    url = fixUrl(src)
                                 ) {
                                     this.referer = mainUrl
                                 }
