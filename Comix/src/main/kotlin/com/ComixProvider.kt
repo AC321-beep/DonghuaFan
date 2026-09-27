@@ -1,8 +1,6 @@
 package com.comix
 
 import android.annotation.SuppressLint
-import android.os.Handler
-import android.os.Looper
 import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -27,9 +25,12 @@ import com.lagradost.cloudstream3.newAnimeSearchResponse
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
@@ -59,11 +60,11 @@ class ComixProvider : MainAPI() {
 
     // ═══════════════════════════════════════════════════════════════════
     //  fetchHtmlWithWebView
-    //    • Sample gate: lrow / list-grid / list-empty
-    //    • Plus initial-data so the current site (which no longer
-    //      renders lrow elements) still resolves immediately.
-    //    • Timeout returns the CURRENT html instead of "" so we never
-    //      end up with a blank homepage.
+    //    Idiomatic coroutine implementation:
+    //      • withTimeoutOrNull — no manual handler.postDelayed
+    //      • delay(300L)       — no Runnable polling
+    //      • CompletableDeferred — clean page-load signal
+    //      • suspendCancellableCoroutine — only wraps evaluateJavascript
     // ═══════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun fetchHtmlWithWebView(url: String): String =
@@ -72,106 +73,98 @@ class ComixProvider : MainAPI() {
             if (activity.isFinishing || activity.isDestroyed) return@withContext ""
 
             val isTitlePage = url.contains("/title/")
+            val timeoutMs   = if (isTitlePage) 12_000L else 6_000L
+            val maxAttempts = if (isTitlePage) 40 else 25
 
-            suspendCancellableCoroutine { cont ->
-                val wv = WebView(activity)
-                wv.settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    loadsImagesAutomatically = false
-                    userAgentString = userAgentString
-                        .replace("; wv", "").replace("Android TV", "Android")
+            val wv = WebView(activity)
+            wv.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                loadsImagesAutomatically = false
+                userAgentString = userAgentString
+                    .replace("; wv", "").replace("Android TV", "Android")
+            }
+
+            runCatching {
+                CookieManager.getInstance().apply {
+                    setAcceptCookie(true)
+                    setAcceptThirdPartyCookies(wv, true)
                 }
+            }
 
-                runCatching {
-                    CookieManager.getInstance().apply {
-                        setAcceptCookie(true)
-                        setAcceptThirdPartyCookies(wv, true)
-                    }
-                }
+            try {
+                // 1. Wait for page load, poll for content, all under one timeout
+                val html = withTimeoutOrNull(timeoutMs) {
+                    val pageLoaded = CompletableDeferred<Unit>()
 
-                val handler = Handler(Looper.getMainLooper())
-                var resumed = false
-
-                fun finish(html: String) {
-                    if (resumed) return
-                    resumed = true
-                    handler.removeCallbacksAndMessages(null)
-                    runCatching { wv.stopLoading(); wv.destroy() }
-                    if (cont.isActive) cont.resume(html)
-                }
-
-                // 6s on normal pages, 12s on title pages (chapter list needs
-                // more time for React to mount). Grab the CURRENT html on timeout.
-                handler.postDelayed({
-                    wv.evaluateJavascript(
-                        "(function(){ return document.documentElement.outerHTML; })();"
-                    ) { raw -> finish(parseJsString(raw) ?: "") }
-                }, if (isTitlePage) 12_000L else 6_000L)
-
-                var attempts = 0
-                val maxAttempts = if (isTitlePage) 40 else 25
-
-                lateinit var checkHtml: Runnable
-                checkHtml = Runnable {
-                    if (resumed) return@Runnable
-                    wv.evaluateJavascript(
-                        "(function(){ return document.documentElement.outerHTML; })();"
-                    ) { raw ->
-                        if (resumed) return@evaluateJavascript
-                        val html = parseJsString(raw) ?: ""
-
-                        val ready: Boolean = if (isTitlePage) {
-                            // Title page: wait until React has mounted the
-                            // chapter list. 3+ chapter anchors = mounted.
-                            val chapterCount = Regex("href=\"[^\"]*-chapter-[\\d.]+")
-                                .findAll(html).count()
-                            chapterCount >= 3 ||
-                                html.contains("lrow") ||
-                                html.contains("list-grid") ||
-                                html.contains("list-empty")
-                        } else {
-                            // Home / search / etc.: sample gate PLUS initial-data
-                            html.contains("lrow") ||
-                                html.contains("list-grid") ||
-                                html.contains("list-empty") ||
-                                html.contains("initial-data")
+                    wv.webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView, u: String?) {
+                            if (!pageLoaded.isCompleted) pageLoaded.complete(Unit)
                         }
+                    }
 
-                        if (ready) {
+                    wv.loadUrl(url)
+                    pageLoaded.await()
+
+                    // 2. Poll loop — plain Kotlin, no Handlers
+                    repeat(maxAttempts) {
+                        val current = wv.currentHtml()
+                        if (isReady(current, isTitlePage)) {
                             runCatching { CookieManager.getInstance().flush() }
-                            finish(html)
-                            return@evaluateJavascript
+                            return@withTimeoutOrNull current
                         }
-
-                        attempts++
-                        if (attempts < maxAttempts && !resumed) {
-                            handler.postDelayed(checkHtml, 300L)
-                        }
+                        delay(300L)
                     }
+
+                    // Final snapshot even if not "ready"
+                    wv.currentHtml()
                 }
 
-                wv.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView, u: String?) {
-                        super.onPageFinished(view, u)
-                        handler.post(checkHtml)
-                    }
-                }
-
-                cont.invokeOnCancellation {
-                    handler.removeCallbacksAndMessages(null)
-                    runCatching { wv.destroy() }
-                }
-
-                wv.loadUrl(url)
+                // 3. On timeout, still grab whatever the page has
+                html ?: wv.currentHtml()
+            } finally {
+                runCatching { wv.stopLoading(); wv.destroy() }
             }
         }
+
+    /**
+     * Reads document.documentElement.outerHTML from the WebView.
+     * suspendCancellableCoroutine because evaluateJavascript is callback-based —
+     * this is the ONLY place a callback bridge is needed.
+     */
+    private suspend fun WebView.currentHtml(): String =
+        suspendCancellableCoroutine { cont ->
+            evaluateJavascript(
+                "(function(){ return document.documentElement.outerHTML; })();"
+            ) { raw ->
+                if (cont.isActive) {
+                    cont.resume(parseJsString(raw) ?: "")
+                }
+            }
+        }
+
+    private fun isReady(html: String, isTitlePage: Boolean): Boolean {
+        if (html.isBlank()) return false
+        return if (isTitlePage) {
+            // React needs to mount the chapter list
+            Regex("href=\"[^\"]*-chapter-[\\d.]+").findAll(html).count() >= 3
+        } else {
+            // Home / search / browse — initial-data is in the raw HTML
+            html.contains("initial-data") ||
+                html.contains("lrow") ||
+                html.contains("list-grid") ||
+                html.contains("list-empty")
+        }
+    }
 
     private fun parseJsString(raw: String?): String? {
         if (raw == null || raw == "null") return ""
         return runCatching { JSONTokener(raw).nextValue().toString() }.getOrDefault(raw)
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  initial-data parser
+    // ═══════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(doc: Document): JSONObject? {
         val script = doc.selectFirst("script#initial-data") ?: return null
         val text = script.data().ifBlank { script.html() }.trim()
@@ -219,6 +212,9 @@ class ComixProvider : MainAPI() {
         return out
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  DOM fallback for search results
+    // ═══════════════════════════════════════════════════════════════════
     private fun toSearchResult(card: Element): SearchResponse? {
         val anchor = if (card.tagName() == "a") card
                      else card.selectFirst("a[href*='/title/'], a[href]") ?: return null
@@ -242,12 +238,8 @@ class ComixProvider : MainAPI() {
     private fun extractSearchResults(doc: Document): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
 
-        val primary = doc.select(
-            ".list-grid .lrow, div.lrow, .lrow, .list-grid > div, .list-grid--cards > div"
-        )
-        if (primary.isNotEmpty()) {
-            primary.forEach { el -> toSearchResult(el)?.let { results.add(it) } }
-        }
+        doc.select(".list-grid .lrow, div.lrow, .lrow, .list-grid > div, .list-grid--cards > div")
+            .forEach { el -> toSearchResult(el)?.let { results.add(it) } }
 
         if (results.isEmpty()) {
             doc.select("article, .manga-card, .comic-item, a[href*='/title/']").forEach { el ->
@@ -261,16 +253,19 @@ class ComixProvider : MainAPI() {
         return results.distinctBy { it.url }
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  getMainPage
+    // ═══════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
-        val html1 = fetchHtmlWithWebView("$mainUrl/")
-        if (html1.isBlank()) return null
+        val html = fetchHtmlWithWebView("$mainUrl/")
+        if (html.isBlank()) return null
 
         var items: List<SearchResponse> = emptyList()
 
-        extractInitialDataJson(Jsoup.parse(html1))?.let { initial ->
+        extractInitialDataJson(Jsoup.parse(html))?.let { initial ->
             items = readQueries(initial) { k ->
                 if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
                 val subtype = k.optString(1)
@@ -286,30 +281,31 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        if (items.isEmpty()) items = extractSearchResults(Jsoup.parse(html1))
-
-        if (items.isEmpty()) {
-            val html2 = fetchHtmlWithWebView("$mainUrl/${request.data}?page=$page")
-            if (html2.isNotBlank()) items = extractSearchResults(Jsoup.parse(html2))
-        }
+        if (items.isEmpty()) items = extractSearchResults(Jsoup.parse(html))
 
         if (items.isEmpty()) return null
         return newHomePageResponse(request, items, hasNext = items.size >= 20)
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  search
+    // ═══════════════════════════════════════════════════════════════════
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
         val encodedQuery = URLEncoder.encode(cleanQuery, "UTF-8")
         val searchUrl = "$mainUrl/browse?q=$encodedQuery"
 
-        val html1 = fetchHtmlWithWebView(searchUrl)
-        var results = if (html1.isNotBlank())
-            extractSearchResults(Jsoup.parse(html1)) else emptyList()
+        val html = fetchHtmlWithWebView(searchUrl)
+        if (html.isBlank()) return emptyList()
 
+        var results = extractSearchResults(Jsoup.parse(html))
         if (results.isEmpty()) {
-            val html2 = fetchHtmlWithWebView(searchUrl)
-            if (html2.isNotBlank()) results = extractSearchResults(Jsoup.parse(html2))
+            extractInitialDataJson(Jsoup.parse(html))?.let { initial ->
+                results = readQueries(initial) { k ->
+                    k.length() >= 1 && k.optString(0) == "manga"
+                }
+            }
         }
 
         val lower = cleanQuery.lowercase()
@@ -320,13 +316,12 @@ class ComixProvider : MainAPI() {
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     // ═══════════════════════════════════════════════════════════════════
-    //  load — two fetches, dedupe by chapter number, sequential episodes
+    //  load — dedupe by chapter number, sequential episode numbering
     // ═══════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
-        // ═══ Suspend #1 ═══
-        val html1 = fetchHtmlWithWebView(url)
-        if (html1.isBlank()) return null
-        val document = Jsoup.parse(html1)
+        val html = fetchHtmlWithWebView(url)
+        if (html.isBlank()) return null
+        val document = Jsoup.parse(html)
         val initialData = extractInitialDataJson(document) ?: return null
 
         var detail: JSONObject? = null
@@ -363,22 +358,10 @@ class ComixProvider : MainAPI() {
             }
         }.distinct()
 
-        val firstChapterUrl  = d.optString("firstChapterUrl").takeIf { it.isNotBlank() }
-        val latestChapterUrl = d.optString("latestChapterUrl").takeIf { it.isNotBlank() }
-        val latestChapterNum = d.optInt("latestChapter", 0)
+        // Chapter anchors from rendered DOM
+        val chapterAnchors = document.select("a[href*='-chapter-']")
 
-        var chapterAnchors = document.select("a[href*='-chapter-']")
-
-        // ═══ Suspend #2 — retry if short ═══
-        if (chapterAnchors.size < latestChapterNum) {
-            val html2 = fetchHtmlWithWebView(url)
-            if (html2.isNotBlank()) {
-                val moreAnchors = Jsoup.parse(html2).select("a[href*='-chapter-']")
-                if (moreAnchors.size > chapterAnchors.size) chapterAnchors = moreAnchors
-            }
-        }
-
-        // parsedChapterLinks: (displayName, href)
+        // (name, href) pairs
         val parsedChapterLinks: List<Pair<String, String>> = chapterAnchors.mapNotNull { a ->
             val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val name = a.text().trim().ifBlank {
@@ -388,17 +371,15 @@ class ComixProvider : MainAPI() {
             name to href
         }
 
-        // ═══ Dedupe by chapter number — one entry per unique number ═══
-        // Extracts the numeric chapter from the href (e.g. "…-chapter-48" → "48")
-        // and keeps the FIRST occurrence. This collapses the 12 scan-group
-        // uploads of Ch. 2 into one entry.
-        val seenChapterNums = mutableSetOf<String>()
+        // Dedupe by chapter number
+        val seenNums = mutableSetOf<String>()
         val dedupedLinks = parsedChapterLinks.filter { (_, href) ->
-            val m = Regex("-chapter-([\\d.]+)").find(href) ?: return@filter false
-            seenChapterNums.add(m.groupValues[1])
+            val num = Regex("-chapter-([\\d.]+)").find(href)
+                ?.groupValues?.get(1) ?: href
+            seenNums.add(num)
         }
 
-        // ═══ Episodes — sequential 1..N, name kept from anchor text ═══
+        // Episodes — sequential 1..N
         val episodes: List<Episode> = dedupedLinks.mapIndexed { index, (chName, chHref) ->
             newEpisode(fixUrl(chHref)) {
                 this.name      = chName
@@ -408,31 +389,7 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ═══ Bookend fallback ═══
-        val finalEpisodes = if (episodes.isEmpty() && latestChapterNum > 0) {
-            buildList {
-                firstChapterUrl?.let { u ->
-                    add(newEpisode(fixUrl(u)) {
-                        this.name = "Ch. 0"
-                        this.season = 1
-                        this.episode = 1
-                        this.posterUrl = posterUrl
-                    })
-                }
-                if (latestChapterNum > 1) {
-                    latestChapterUrl?.let { u ->
-                        add(newEpisode(fixUrl(u)) {
-                            this.name = "Ch. $latestChapterNum"
-                            this.season = 1
-                            this.episode = 2
-                            this.posterUrl = posterUrl
-                        })
-                    }
-                }
-            }
-        } else episodes
-
-        if (finalEpisodes.isEmpty()) return null
+        if (episodes.isEmpty()) return null
 
         return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
             this.posterUrl = posterUrl
@@ -444,10 +401,13 @@ class ComixProvider : MainAPI() {
                 "releasing", "ongoing", "on_hiatus" -> ShowStatus.Ongoing
                 else -> null
             }
-            addEpisodes(DubStatus.Subbed, finalEpisodes.distinctBy { it.data })
+            addEpisodes(DubStatus.Subbed, episodes)
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  loadLinks — opens the reader dialog
+    // ═══════════════════════════════════════════════════════════════════
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
