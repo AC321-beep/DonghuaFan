@@ -115,7 +115,7 @@ class ComixProvider : MainAPI() {
         return out
     }
 
-    // ------------------------------------------------------------ API
+    // ------------------------------------------------------------ MAIN API
 
     override suspend fun getMainPage(
         page: Int,
@@ -149,7 +149,6 @@ class ComixProvider : MainAPI() {
 
         val candidates = listOf(
             "$mainUrl/browse?q=$encoded",
-            "$mainUrl/browse?search=$encoded",
             "$mainUrl/search?q=$encoded",
         )
         for (url in candidates) {
@@ -169,24 +168,26 @@ class ComixProvider : MainAPI() {
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
+    // ------------------------------------------------------------ LOAD
+
     override suspend fun load(url: String): LoadResponse? {
         val html = fetchHtml(url)
         if (html.isBlank()) return null
         val initial = extractInitialData(html) ?: return null
         val queries = initial.optJSONObject("queries") ?: return null
 
-        // Find the ["manga","detail",hid] query
+        // Find any "manga/detail/*" query
         var detail: JSONObject? = null
         val keys = queries.keys()
         while (keys.hasNext()) {
             val k = keys.next()
             val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
-            if (parsed.length() >= 3 &&
+            if (parsed.length() >= 2 &&
                 parsed.optString(0) == "manga" &&
                 parsed.optString(1) == "detail"
             ) {
                 detail = queries.optJSONObject(k)
-                break
+                if (detail != null) break
             }
         }
         val d = detail ?: return null
@@ -211,25 +212,28 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // --- Chapters ---
+        // ---- Chapter list: WebView render + scrape ----
         val chapters = mutableListOf<Episode>()
-
-        // Try WebView-rendered title page
-        val rendered = fetchRenderedHtml(url) { h ->
-            h.contains("-chapter-") &&
-                Regex("""href\s*=\s*"[^"]*-chapter-""").containsMatchIn(h)
+        val renderedHtml = fetchRenderedHtml(url) { h ->
+            Regex("-chapter-").findAll(h).take(3).count() >= 3
         }
-        if (rendered.isNotBlank()) {
-            val doc = Jsoup.parse(rendered)
-            doc.select("a[href*='-chapter-'], a[href*='/chapter/']").forEach { a ->
+        if (renderedHtml.isNotBlank()) {
+            val doc = Jsoup.parse(renderedHtml)
+            doc.select("a[href*='-chapter-']").forEach { a ->
                 val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
                 val numMatch = Regex("-chapter-([\\d.]+)").find(href) ?: return@forEach
-                val num = numMatch.groupValues[1].toDoubleOrNull()?.toInt() ?: return@forEach
-                if (num <= 0) return@forEach
+                val numStr = numMatch.groupValues[1]
+                val numInt = numStr.toDoubleOrNull()?.toInt() ?: return@forEach
+
+                val displayNum = if (numInt <= 0) 1 else numInt
+                val name = a.text().trim().ifBlank {
+                    if (numInt <= 0) "Ch. 0 (Prologue)" else "Ch. $numStr"
+                }
+
                 chapters.add(newEpisode(fixUrl(href)) {
-                    this.name = a.text().trim().ifBlank { "Ch. $num" }
+                    this.name = name
                     this.season = 1
-                    this.episode = num
+                    this.episode = displayNum
                     this.posterUrl = poster
                 })
             }
@@ -240,7 +244,7 @@ class ComixProvider : MainAPI() {
             firstChapterUrl != null && latestChapterUrl != null
         ) {
             chapters.add(newEpisode(fixUrl(firstChapterUrl)) {
-                this.name = "Ch. 1"
+                this.name = "Ch. 0 (Prologue)"
                 this.season = 1
                 this.episode = 1
                 this.posterUrl = poster
@@ -274,70 +278,51 @@ class ComixProvider : MainAPI() {
         }
     }
 
+    // ------------------------------------------------------------ LOAD LINKS
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val html = fetchHtml(data)
+        val rendered = fetchRenderedHtml(data) { h ->
+            h.contains("rpage-page") ||
+                Regex("static\\.comix\\.to").findAll(h).take(3).count() >= 3
+        }
+        if (rendered.isBlank()) return false
+
+        val doc = Jsoup.parse(rendered)
         var any = false
 
-        // Try initial-data for ["pages",...] query
-        if (html.isNotBlank()) {
-            extractInitialData(html)?.optJSONObject("queries")?.let { queries ->
-                val keys = queries.keys()
-                while (keys.hasNext()) {
-                    val k = keys.next()
-                    val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
-                    if (parsed.length() < 1 || parsed.optString(0) != "pages") continue
-                    val value = queries.opt(k)
-                    val arr = when (value) {
-                        is JSONArray -> value
-                        is JSONObject -> value.optJSONArray("items")
-                            ?: value.optJSONArray("pages")
-                        else -> null
-                    } ?: continue
-                    for (i in 0 until arr.length()) {
-                        val src = arr.optString(i).ifBlank {
-                            arr.optJSONObject(i)?.optString("url") ?: ""
-                        }
-                        if (src.isNotBlank()) {
-                            callback(newExtractorLink(name, name, fixUrl(src)) {
-                                this.referer = "$mainUrl/"
-                            })
-                            any = true
-                        }
-                    }
-                    if (any) break
+        doc.select("img.rpage-page__img, .rpage-page__img, .rpage-page img, .reader-page img")
+            .forEach { img ->
+                val src = img.attr("data-src").ifBlank { img.attr("src") }
+                if (src.isNotBlank() && !src.startsWith("data:")) {
+                    callback(newExtractorLink(name, name, fixUrl(src)) {
+                        this.referer = "$mainUrl/"
+                    })
+                    any = true
                 }
             }
+
+        if (!any) {
+            doc.select("img[src*='static.comix.to'], img[data-src*='static.comix.to']")
+                .forEach { img ->
+                    val src = img.attr("data-src").ifBlank { img.attr("src") }
+                    if (src.isNotBlank() && !src.startsWith("data:")) {
+                        callback(newExtractorLink(name, name, fixUrl(src)) {
+                            this.referer = "$mainUrl/"
+                        })
+                        any = true
+                    }
+                }
         }
 
-        // Fallback: WebView render + <img> extraction
-        if (!any) {
-            val rendered = fetchRenderedHtml(data) { h ->
-                h.contains("static.comix.to") &&
-                    (h.contains("rpage-page") || h.contains("reader-page"))
-            }
-            if (rendered.isNotBlank()) {
-                val doc = Jsoup.parse(rendered)
-                doc.select("img[src*='static.comix.to'], .rpage-page__img, .reader-page img")
-                    .forEach { img ->
-                        val src = img.attr("data-src").ifBlank { img.attr("src") }
-                        if (src.isNotBlank() && !src.startsWith("data:")) {
-                            callback(newExtractorLink(name, name, fixUrl(src)) {
-                                this.referer = "$mainUrl/"
-                            })
-                            any = true
-                        }
-                    }
-            }
-        }
         return any
     }
 
-    // ------------------------------------------------------------ WebView
+    // ------------------------------------------------------------ WEBVIEW
 
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun fetchRenderedHtml(
@@ -374,22 +359,23 @@ class ComixProvider : MainAPI() {
                 if (cont.isActive) cont.resume(html)
             }
 
-            handler.postDelayed({ finish("") }, 12_000L)
+            handler.postDelayed({ finish("") }, 15_000L)
 
             var attempts = 0
             lateinit var poll: Runnable
             poll = Runnable {
                 if (resumed) return@Runnable
                 wv.evaluateJavascript(
-                    "(function(){return document.documentElement.outerHTML;})();"
+                    "(function(){try{return document.documentElement.outerHTML;}catch(e){return '';}})();"
                 ) { raw ->
-                    if (resumed) return@ValueCallback
+                    if (resumed) return@evaluateJavascript
                     val html = parseJsString(raw) ?: ""
-                    if (ready(html)) {
-                        finish(html); return@ValueCallback
+                    if (html.isNotBlank() && ready(html)) {
+                        finish(html)
+                        return@evaluateJavascript
                     }
                     attempts++
-                    if (attempts < 30 && !resumed) handler.postDelayed(poll, 400L)
+                    if (attempts < 40 && !resumed) handler.postDelayed(poll, 400L)
                     else finish(html)
                 }
             }
@@ -397,7 +383,7 @@ class ComixProvider : MainAPI() {
             wv.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView, u: String?) {
                     super.onPageFinished(view, u)
-                    handler.postDelayed(poll, 800L)
+                    handler.postDelayed(poll, 700L)
                 }
             }
 
