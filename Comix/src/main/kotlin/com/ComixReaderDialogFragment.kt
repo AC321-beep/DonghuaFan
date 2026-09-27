@@ -239,6 +239,12 @@ class ComixReaderDialogFragment : DialogFragment() {
                         currentChapterName = "Ch. $visited"
                         chapterInfoTextView?.text = currentChapterName
                     }
+
+                    // Soft navigation: give the DOM a tick to settle, then re-apply
+                    // reader CSS + tap zones + report the new chapter title.
+                    view.postDelayed({
+                        injectReaderOptimizations(view)
+                    }, 220L)
                 }
 
                 override fun onPageFinished(view: WebView, url: String?) {
@@ -615,12 +621,13 @@ class ComixReaderDialogFragment : DialogFragment() {
             """
             (function() {
               try {
+                /* ── 1. Hide comments / share / footer / recs ───────────── */
                 if (!document.getElementById('cs-reader-style')) {
                   var s = document.createElement('style');
                   s.id = 'cs-reader-style';
                   s.innerHTML = `
-                    body { background-color: #07080C !important; margin: 0 !important; padding: 0 0 50px 0 !important; }
-                    header, nav, footer,
+                    body { background-color: #07080C !important; margin: 0 !important; padding: 0 !important; }
+                    header, footer,
                     .header, .navbar, .site-header,
                     [class*="ad-"], [id*="ad-"],
                     iframe[src*="ads"], iframe[src*="pop"],
@@ -628,10 +635,30 @@ class ComixReaderDialogFragment : DialogFragment() {
                     .rpage-floatctl__col, .rpage-bottombar, .rpage-hoverzone, .rpage-dir2 {
                       display: none !important;
                     }
+                    .rpage-strip-comments,
+                    .cm-widget,
+                    .share-block,
+                    .social-share,
+                    .mpage__recs,
+                    #comments {
+                      display: none !important;
+                    }
+                    .rpage-chap-ending {
+                      padding-bottom: 8px !important;
+                      margin-bottom: 0 !important;
+                    }
+                    .rpage-chap-ending__nav { margin-bottom: 8px !important; }
+                    .rpage-main,
+                    .rpage-main--long-strip,
+                    .rpage-main__inner {
+                      padding-bottom: 0 !important;
+                      margin-bottom: 0 !important;
+                    }
                   `;
                   document.head.appendChild(s);
                 }
 
+                /* ── 2. Report chapter title + map chapter URLs ─────────── */
                 function report() {
                   var chText = '';
                   var el = document.querySelector('.rpage-floatctl__chap .mono, .rpage-chap-ending__title, h1');
@@ -651,31 +678,121 @@ class ComixReaderDialogFragment : DialogFragment() {
                 }
                 report();
 
+                /* ── 3. Tap-to-scroll (Swiper-safe) ─────────────────────── */
+                /*    The reader's Swiper config uses touchStartPreventDefault,
+                 *    so `click` never fires inside the reader. We instead use
+                 *    `touchend` with passive capture, and only treat it as a
+                 *    tap when there was minimal movement and a short duration.
+                 */
                 if (!window.__comixTapZonesInstalled) {
                   window.__comixTapZonesInstalled = true;
 
-                  var lastTap = 0;
-                  document.addEventListener('click', function(e) {
-                    if (e.target.closest('a, button, input, textarea, .rpage-modal')) return;
+                  var TAP_MAX_MOVE  = 14;   // px
+                  var TAP_MAX_TIME  = 350;  // ms
+                  var TAP_DEBOUNCE  = 180;  // ms
 
+                  var startX = 0, startY = 0, startT = 0, lastTapEnd = 0;
+                  var moved = false;
+
+                  function isIgnored(target) {
+                    if (!target || !target.closest) return false;
+                    return !!target.closest(
+                      'a, button, input, textarea, select, ' +
+                      '.rpage-modal, .rpage-chaplist, .rpage-settings, ' +
+                      '.rpage-chappanel, .rpage-cmpanel, [role="dialog"]'
+                    );
+                  }
+
+                  function handleTap(x, y) {
                     var now = Date.now();
-                    if (now - lastTap < 220) return;
-                    lastTap = now;
+                    if (now - lastTapEnd < TAP_DEBOUNCE) return;
+                    lastTapEnd = now;
 
                     var w = window.innerWidth;
-                    var x = e.clientX;
-
                     if (x < w * 0.25) {
                       window.scrollBy({ top: -(window.innerHeight * 0.8), behavior: 'smooth' });
-                      flashTap(e.clientX, e.clientY);
+                      flashTap(x, y);
                     } else if (x > w * 0.75) {
                       window.scrollBy({ top:  (window.innerHeight * 0.8), behavior: 'smooth' });
-                      flashTap(e.clientX, e.clientY);
+                      flashTap(x, y);
                     } else {
-                      AndroidComix.onTapZone('center');
+                      if (window.AndroidComix) window.AndroidComix.onTapZone('center');
                     }
+                  }
+
+                  // Track touch start
+                  document.addEventListener('touchstart', function(e) {
+                    if (e.touches.length !== 1) return;
+                    var t = e.touches[0];
+                    startX = t.clientX; startY = t.clientY;
+                    startT = Date.now();
+                    moved = false;
+                  }, { passive: true, capture: true });
+
+                  // Cancel if user moves finger
+                  document.addEventListener('touchmove', function(e) {
+                    if (e.touches.length !== 1) return;
+                    var t = e.touches[0];
+                    if (Math.abs(t.clientX - startX) > TAP_MAX_MOVE ||
+                        Math.abs(t.clientY - startY) > TAP_MAX_MOVE) {
+                      moved = true;
+                    }
+                  }, { passive: true, capture: true });
+
+                  // Evaluate tap on release
+                  document.addEventListener('touchend', function(e) {
+                    if (e.changedTouches.length !== 1) return;
+                    if (moved) return;
+                    var t = e.changedTouches[0];
+                    if (Math.abs(t.clientX - startX) > TAP_MAX_MOVE) return;
+                    if (Math.abs(t.clientY - startY) > TAP_MAX_MOVE) return;
+                    if (Date.now() - startT > TAP_MAX_TIME) return;
+                    if (isIgnored(t.target || e.target)) return;
+                    handleTap(t.clientX, t.clientY);
+                  }, { passive: true, capture: true });
+
+                  // Reset on cancel
+                  document.addEventListener('touchcancel', function() {
+                    moved = true;
+                  }, { passive: true, capture: true });
+
+                  // Fallback for non-touch (desktop WebView, accessibility)
+                  document.addEventListener('click', function(e) {
+                    if ('ontouchstart' in window) return; // already handled above
+                    if (isIgnored(e.target)) return;
+                    handleTap(e.clientX, e.clientY);
                   }, false);
                 }
+
+                /* ── 4. Re-run report on SPA soft navigations ───────────── */
+                if (!window.__comixSoftNavInstalled) {
+                  window.__comixSoftNavInstalled = true;
+                  var relisten = function() {
+                    setTimeout(function() {
+                      try { report(); } catch(e) {}
+                      // Re-inject CSS if React replaced <head>
+                      if (!document.getElementById('cs-reader-style')) {
+                        // trigger a full re-inject through the outer function
+                        // (callable via a global trampoline installed below)
+                        if (window.__comixReinject) window.__comixReinject();
+                      }
+                    }, 120);
+                  };
+                  window.addEventListener('turbo:initial-updated', relisten);
+                  window.addEventListener('turbo:request-completed', relisten);
+                  window.addEventListener('popstate', relisten);
+                }
+
+                /* Trampoline so the soft-nav handler can ask Kotlin to
+                 * re-run injectReaderOptimizations after a chapter change.
+                 * Falls back to no-op when the bridge is missing. */
+                window.__comixReinject = function() {
+                  try {
+                    if (window.AndroidComix && window.AndroidComix.onReaderNeedsReinject) {
+                      window.AndroidComix.onReaderNeedsReinject();
+                    }
+                  } catch(e) {}
+                };
 
                 function flashTap(x, y) {
                   try {
@@ -750,6 +867,13 @@ class ComixReaderDialogFragment : DialogFragment() {
             dialog.activity?.runOnUiThread {
                 dialog.toggleToolbar()
                 dialog.hapticTap()
+            }
+        }
+
+        @JavascriptInterface
+        fun onReaderNeedsReinject() {
+            dialog.activity?.runOnUiThread {
+                dialog.webView?.let { dialog.injectReaderOptimizations(it) }
             }
         }
     }
