@@ -57,11 +57,6 @@ class ComixProvider : MainAPI() {
         "latest"   to "Latest Releases",
     )
 
-    // ═══════════════════════════════════════════════════════════════════
-    //  fetchHtmlWithWebView
-    //  EXACT sample gate: lrow / list-grid / list-empty
-    //  EXACT sample timings: 6s hard timeout, 25 attempts × 300ms
-    // ═══════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun fetchHtmlWithWebView(url: String): String =
         withContext(Dispatchers.Main) {
@@ -75,8 +70,7 @@ class ComixProvider : MainAPI() {
                     domStorageEnabled = true
                     loadsImagesAutomatically = false
                     userAgentString = userAgentString
-                        .replace("; wv", "")
-                        .replace("Android TV", "Android")
+                        .replace("; wv", "").replace("Android TV", "Android")
                 }
 
                 runCatching {
@@ -120,8 +114,6 @@ class ComixProvider : MainAPI() {
                         attempts++
                         if (attempts < 25 && !resumed) {
                             handler.postDelayed(checkHtml, 300L)
-                        } else {
-                            finish(html)
                         }
                     }
                 }
@@ -147,22 +139,14 @@ class ComixProvider : MainAPI() {
         return runCatching { JSONTokener(raw).nextValue().toString() }.getOrDefault(raw)
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    //  initial-data
-    // ═══════════════════════════════════════════════════════════════════
-    private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
-        val doc: Document = when (htmlOrDoc) {
-            is Document -> htmlOrDoc
-            is String   -> Jsoup.parse(htmlOrDoc)
-            else        -> return null
-        }
+    private fun extractInitialDataJson(doc: Document): JSONObject? {
         val script = doc.selectFirst("script#initial-data") ?: return null
         val text = script.data().ifBlank { script.html() }.trim()
         if (text.isEmpty()) return null
         return runCatching { JSONObject(text) }.getOrNull()
     }
 
-    private fun parseMangaFromJson(obj: JSONObject): SearchResponse? {
+    private fun parseMangaObject(obj: JSONObject): SearchResponse? {
         val title = obj.optString("title").takeIf { it.isNotBlank() } ?: return null
         val relUrl = obj.optString("url").takeIf { it.isNotBlank() } ?: return null
         val poster = obj.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
@@ -195,16 +179,13 @@ class ComixProvider : MainAPI() {
             } ?: continue
 
             for (i in 0 until arr.length()) {
-                arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
+                arr.optJSONObject(i)?.let { parseMangaObject(it)?.let { r -> out.add(r) } }
             }
             if (out.isNotEmpty()) break
         }
         return out
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    //  DOM extract — EXACT sample selectors
-    // ═══════════════════════════════════════════════════════════════════
     private fun toSearchResult(card: Element): SearchResponse? {
         val anchor = if (card.tagName() == "a") card
                      else card.selectFirst("a[href*='/title/'], a[href]") ?: return null
@@ -225,10 +206,16 @@ class ComixProvider : MainAPI() {
         return res
     }
 
-    private fun extractSearchResultsDom(doc: Document): List<SearchResponse> {
+    private fun extractSearchResults(doc: Document): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
-        doc.select(".list-grid .lrow, div.lrow, .lrow, .list-grid > div, .list-grid--cards > div")
-            .forEach { el -> toSearchResult(el)?.let { results.add(it) } }
+
+        val primary = doc.select(
+            ".list-grid .lrow, div.lrow, .lrow, .list-grid > div, .list-grid--cards > div"
+        )
+        if (primary.isNotEmpty()) {
+            primary.forEach { el -> toSearchResult(el)?.let { results.add(it) } }
+        }
+
         if (results.isEmpty()) {
             doc.select("article, .manga-card, .comic-item, a[href*='/title/']").forEach { el ->
                 if (el.tagName() == "a" &&
@@ -237,23 +224,10 @@ class ComixProvider : MainAPI() {
                 toSearchResult(el)?.let { results.add(it) }
             }
         }
+
         return results.distinctBy { it.url }
     }
 
-    private fun extractSearchResults(html: String): List<SearchResponse> {
-        val initial = extractInitialDataJson(html)
-        if (initial != null) {
-            val items = readQueries(initial) { k ->
-                k.length() >= 1 && k.optString(0) == "manga"
-            }
-            if (items.isNotEmpty()) return items.distinctBy { it.url }
-        }
-        return extractSearchResultsDom(Jsoup.parse(html))
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    //  getMainPage
-    // ═══════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
@@ -263,7 +237,7 @@ class ComixProvider : MainAPI() {
 
         var items: List<SearchResponse> = emptyList()
 
-        extractInitialDataJson(html1)?.let { initial ->
+        extractInitialDataJson(Jsoup.parse(html1))?.let { initial ->
             items = readQueries(initial) { k ->
                 if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
                 val subtype = k.optString(1)
@@ -279,20 +253,17 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        if (items.isEmpty()) items = extractSearchResultsDom(Jsoup.parse(html1))
+        if (items.isEmpty()) items = extractSearchResults(Jsoup.parse(html1))
 
         if (items.isEmpty()) {
             val html2 = fetchHtmlWithWebView("$mainUrl/${request.data}?page=$page")
-            if (html2.isNotBlank()) items = extractSearchResults(html2)
+            if (html2.isNotBlank()) items = extractSearchResults(Jsoup.parse(html2))
         }
 
         if (items.isEmpty()) return null
-        return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = items.size >= 20)
+        return newHomePageResponse(request, items, hasNext = items.size >= 20)
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    //  search
-    // ═══════════════════════════════════════════════════════════════════
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
@@ -300,11 +271,12 @@ class ComixProvider : MainAPI() {
         val searchUrl = "$mainUrl/browse?q=$encodedQuery"
 
         val html1 = fetchHtmlWithWebView(searchUrl)
-        var results = if (html1.isNotBlank()) extractSearchResults(html1) else emptyList()
+        var results = if (html1.isNotBlank())
+            extractSearchResults(Jsoup.parse(html1)) else emptyList()
 
         if (results.isEmpty()) {
             val html2 = fetchHtmlWithWebView(searchUrl)
-            if (html2.isNotBlank()) results = extractSearchResults(html2)
+            if (html2.isNotBlank()) results = extractSearchResults(Jsoup.parse(html2))
         }
 
         val lower = cleanQuery.lowercase()
@@ -314,9 +286,6 @@ class ComixProvider : MainAPI() {
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
-    // ═══════════════════════════════════════════════════════════════════
-    //  load — two fetches of the same url (sample shape), sequential 1..N
-    // ═══════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
         // ═══ Suspend #1 ═══
         val html1 = fetchHtmlWithWebView(url)
@@ -362,19 +331,17 @@ class ComixProvider : MainAPI() {
         val latestChapterUrl = d.optString("latestChapterUrl").takeIf { it.isNotBlank() }
         val latestChapterNum = d.optInt("latestChapter", 0)
 
-        // ── chapterAnchors from rendered DOM ──
         var chapterAnchors = document.select("a[href*='-chapter-']")
 
         // ═══ Suspend #2 — retry if short ═══
         if (chapterAnchors.size < latestChapterNum) {
             val html2 = fetchHtmlWithWebView(url)
             if (html2.isNotBlank()) {
-                val more = Jsoup.parse(html2).select("a[href*='-chapter-']")
-                if (more.size > chapterAnchors.size) chapterAnchors = more
+                val moreAnchors = Jsoup.parse(html2).select("a[href*='-chapter-']")
+                if (moreAnchors.size > chapterAnchors.size) chapterAnchors = moreAnchors
             }
         }
 
-        // ── parsedChapterLinks ──
         val parsedChapterLinks: List<Pair<String, String>> = chapterAnchors.mapNotNull { a ->
             val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val name = a.text().trim().ifBlank {
@@ -384,31 +351,26 @@ class ComixProvider : MainAPI() {
             name to href
         }
 
-        // ── dedupe by chapter number (site lists same chapter from many groups) ──
-        val seenNumbers = mutableSetOf<String>()
-        val deduped = parsedChapterLinks.filter { (_, href) ->
-            val num = Regex("-chapter-([\\d.]+)").find(href)?.groupValues?.get(1) ?: href
-            seenNumbers.add(num)
+        val chapterNums: List<Int> = parsedChapterLinks.mapNotNull { (_, href) ->
+            Regex("chapter[-/](\\d+)").find(href)?.groupValues?.get(1)?.toIntOrNull()
+        }
+        val startsAtZero = chapterNums.minOrNull() == 0
+        val startCh      = if (startsAtZero) 1 else (chapterNums.minOrNull() ?: 1)
+
+        val dedupedLinks = parsedChapterLinks.distinctBy { (_, href) ->
+            Regex("chapter[-/](\\d+)").find(href)?.groupValues?.get(1) ?: href
         }
 
-        // ── startsAtZero / startCh ──
-        val numbers = deduped.mapNotNull { (_, href) ->
-            Regex("-chapter-([\\d.]+)").find(href)?.groupValues?.get(1)?.toIntOrNull()
-        }
-        val startsAtZero = numbers.minOrNull() == 0
-        val startCh      = if (startsAtZero) 1 else (numbers.minOrNull() ?: 1)
-
-        // ── episodes: sequential 1..N ──
-        val episodes: List<Episode> = deduped.mapIndexed { index, (name, href) ->
-            newEpisode(fixUrl(href)) {
-                this.name    = name
-                this.season  = 1
-                this.episode = index + startCh
+        val episodes: List<Episode> = dedupedLinks.mapIndexed { index, (chName, chHref) ->
+            val epNum = startCh + index
+            newEpisode(fixUrl(chHref)) {
+                this.name      = chName
+                this.season    = 1
+                this.episode   = epNum
                 this.posterUrl = posterUrl
             }
         }
 
-        // ── bookend fallback if extraction failed ──
         val finalEpisodes = if (episodes.isEmpty() && latestChapterNum > 0) {
             buildList {
                 firstChapterUrl?.let { u ->
@@ -444,13 +406,10 @@ class ComixProvider : MainAPI() {
                 "releasing", "ongoing", "on_hiatus" -> ShowStatus.Ongoing
                 else -> null
             }
-            addEpisodes(DubStatus.Subbed, finalEpisodes)
+            addEpisodes(DubStatus.Subbed, finalEpisodes.distinctBy { it.data })
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    //  loadLinks
-    // ═══════════════════════════════════════════════════════════════════
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
