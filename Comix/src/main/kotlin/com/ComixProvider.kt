@@ -7,7 +7,6 @@ import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
-import com.lagradost.cloudstream3.AnimeLoadResponse
 import com.lagradost.cloudstream3.AnimeSearchResponse
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.DubStatus
@@ -59,12 +58,6 @@ class ComixProvider : MainAPI() {
         "latest"   to "Latest Releases",
     )
 
-    // ================================================================
-    //  fetchHtmlWithWebView
-    //  Same shape as decompiled sample (6s / 25×300ms) with the gate
-    //  extended to include "initial-data" — that string is present in
-    //  the raw server HTML so we finish on the first poll.
-    // ================================================================
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun fetchHtmlWithWebView(url: String): String =
         withContext(Dispatchers.Main) {
@@ -78,8 +71,7 @@ class ComixProvider : MainAPI() {
                     domStorageEnabled = true
                     loadsImagesAutomatically = false
                     userAgentString = userAgentString
-                        .replace("; wv", "")
-                        .replace("Android TV", "Android")
+                        .replace("; wv", "").replace("Android TV", "Android")
                 }
 
                 runCatching {
@@ -112,7 +104,6 @@ class ComixProvider : MainAPI() {
                         if (resumed) return@evaluateJavascript
                         val html = parseJsString(raw) ?: ""
 
-                        // Gate includes "initial-data" so we match the current site
                         if (html.contains("lrow") ||
                             html.contains("list-grid") ||
                             html.contains("list-empty") ||
@@ -152,9 +143,6 @@ class ComixProvider : MainAPI() {
         return runCatching { JSONTokener(raw).nextValue().toString() }.getOrDefault(raw)
     }
 
-    // ================================================================
-    //  extractInitialDataJson
-    // ================================================================
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
             is Document -> htmlOrDoc
@@ -167,9 +155,6 @@ class ComixProvider : MainAPI() {
         return runCatching { JSONObject(text) }.getOrNull()
     }
 
-    // ================================================================
-    //  parse one raw manga JSON object
-    // ================================================================
     private fun parseMangaFromJson(obj: JSONObject): SearchResponse? {
         val title = obj.optString("title").takeIf { it.isNotBlank() } ?: return null
         val relUrl = obj.optString("url").takeIf { it.isNotBlank() } ?: return null
@@ -183,9 +168,6 @@ class ComixProvider : MainAPI() {
         return res
     }
 
-    // ================================================================
-    //  readQueries — the FIX is here
-    // ================================================================
     private fun readQueries(
         initial: JSONObject,
         matcher: (JSONArray) -> Boolean
@@ -199,8 +181,6 @@ class ComixProvider : MainAPI() {
             if (!matcher(parsed)) continue
 
             val value = queries.opt(k)
-
-            // FIX: no explicit nullable type — let Kotlin infer non-null via ?: continue
             val arr = when (value) {
                 is JSONArray  -> value
                 is JSONObject -> value.optJSONArray("items")
@@ -215,9 +195,6 @@ class ComixProvider : MainAPI() {
         return out
     }
 
-    // ================================================================
-    //  DOM fallback — decompiled selectors
-    // ================================================================
     private fun toSearchResult(card: Element): SearchResponse? {
         val anchor = if (card.tagName() == "a") card
                      else card.selectFirst("a[href*='/title/'], a[href]") ?: return null
@@ -253,9 +230,6 @@ class ComixProvider : MainAPI() {
         return results.distinctBy { it.url }
     }
 
-    // ================================================================
-    //  combined extractor: JSON first, DOM fallback
-    // ================================================================
     private fun extractSearchResults(html: String): List<SearchResponse> {
         val initial = extractInitialDataJson(html)
         if (initial != null) {
@@ -267,20 +241,15 @@ class ComixProvider : MainAPI() {
         return extractSearchResultsDom(Jsoup.parse(html))
     }
 
-    // ================================================================
-    //  getMainPage — two WebView fetches (l = {218, 284})
-    // ================================================================
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
-        // ═══ Suspend #1 ═══
         val html1 = fetchHtmlWithWebView("$mainUrl/")
         if (html1.isBlank()) return null
 
         var items: List<SearchResponse> = emptyList()
 
-        // Try initial-data JSON first
         extractInitialDataJson(html1)?.let { initial ->
             items = readQueries(initial) { k ->
                 if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
@@ -297,10 +266,8 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // DOM fallback
         if (items.isEmpty()) items = extractSearchResultsDom(Jsoup.parse(html1))
 
-        // ═══ Suspend #2 — retry ═══
         if (items.isEmpty()) {
             val html2 = fetchHtmlWithWebView("$mainUrl/${request.data}?page=$page")
             if (html2.isNotBlank()) items = extractSearchResults(html2)
@@ -310,9 +277,6 @@ class ComixProvider : MainAPI() {
         return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = items.size >= 20)
     }
 
-    // ================================================================
-    //  search — two attempts (l = {303, 333})
-    // ================================================================
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
@@ -334,9 +298,6 @@ class ComixProvider : MainAPI() {
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
-    // ================================================================
-    //  load — two WebView fetches (l = {346, 475})
-    // ================================================================
     override suspend fun load(url: String): LoadResponse? {
         // ═══ Suspend #1 ═══
         val html1 = fetchHtmlWithWebView(url)
@@ -382,6 +343,7 @@ class ComixProvider : MainAPI() {
         val latestChapterUrl = d.optString("latestChapterUrl").takeIf { it.isNotBlank() }
         val latestChapterNum = d.optInt("latestChapter", 0)
 
+        // ── chapterAnchors ──
         var chapterAnchors = document.select("a[href*='-chapter-']")
 
         // ═══ Suspend #2 — retry if short ═══
@@ -393,6 +355,7 @@ class ComixProvider : MainAPI() {
             }
         }
 
+        // ── parsedChapterLinks ──
         val parsedChapterLinks: List<Pair<String, String>> = chapterAnchors.mapNotNull { a ->
             val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val name = a.text().trim().ifBlank {
@@ -400,21 +363,21 @@ class ComixProvider : MainAPI() {
                     ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
             }
             name to href
-        }.distinctBy { it.second }
+        }
 
+        // ── startsAtZero / startCh ──
         val chapterNums = parsedChapterLinks.mapNotNull { (_, href) ->
             Regex("chapter[-/](\\d+)").find(href)?.groupValues?.get(1)?.toIntOrNull()
         }
         val startsAtZero = chapterNums.minOrNull() == 0
         val startCh      = if (startsAtZero) 1 else (chapterNums.minOrNull() ?: 1)
 
-        val episodes: List<Episode> = parsedChapterLinks.mapIndexed { idx, (name, href) ->
-            val raw = chapterNums.getOrNull(idx) ?: (idx + 1)
-            val displayNum = if (startsAtZero) raw + 1 else raw
+        // ── episodes ──
+        val episodes: List<Episode> = parsedChapterLinks.mapIndexed { index, (name, href) ->
             newEpisode(fixUrl(href)) {
-                this.name    = if (raw == 0) "Ch. 0" else name
+                this.name    = name
                 this.season  = 1
-                this.episode = if (displayNum <= 0) startCh else displayNum
+                this.episode = index + startCh
                 this.posterUrl = posterUrl
             }
         }
@@ -434,7 +397,7 @@ class ComixProvider : MainAPI() {
                         add(newEpisode(fixUrl(u)) {
                             this.name = "Ch. $latestChapterNum"
                             this.season = 1
-                            this.episode = latestChapterNum
+                            this.episode = 2
                             this.posterUrl = posterUrl
                         })
                     }
@@ -454,14 +417,10 @@ class ComixProvider : MainAPI() {
                 "releasing", "ongoing", "on_hiatus" -> ShowStatus.Ongoing
                 else -> null
             }
-            addEpisodes(DubStatus.Subbed,
-                finalEpisodes.distinctBy { it.data }.sortedBy { it.episode })
+            addEpisodes(DubStatus.Subbed, finalEpisodes)
         }
     }
 
-    // ================================================================
-    //  loadLinks — Trick 5
-    // ================================================================
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
