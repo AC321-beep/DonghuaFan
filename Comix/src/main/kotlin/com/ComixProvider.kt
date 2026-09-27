@@ -1,7 +1,6 @@
 package com.comix
 
 import android.annotation.SuppressLint
-import android.app.Activity
 import android.os.Handler
 import android.os.Looper
 import android.webkit.CookieManager
@@ -11,6 +10,7 @@ import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.AnimeLoadResponse
 import com.lagradost.cloudstream3.AnimeSearchResponse
 import com.lagradost.cloudstream3.CommonActivity
+import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -30,8 +30,8 @@ import com.lagradost.cloudstream3.newAnimeSearchResponse
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import kotlinx.coroutines.CancellableContinuation
-import kotlinx.coroutines.CancellableContinuationImpl
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -62,8 +62,7 @@ class ComixProvider : MainAPI() {
     // ---------------------------------------------------------------- helpers
 
     private fun extractInitialDataJson(doc: Document): JSONObject? {
-        val script = doc.selectFirst("script#initial-data")
-            ?: return null
+        val script = doc.selectFirst("script#initial-data") ?: return null
         val text = script.data().ifBlank { script.html() }.trim()
         if (text.isEmpty()) return null
         return runCatching { JSONObject(text) }.getOrNull()
@@ -75,10 +74,10 @@ class ComixProvider : MainAPI() {
         val poster = obj.optString("poster").takeIf { it.isNotBlank() }
         val latest = obj.optInt("latest_chapter", 0).takeIf { it > 0 }
 
-        return newAnimeSearchResponse(title, fixUrl(url), TvType.Anime) {
-            poster?.let { setPosterUrl(fixUrl(it)) }
-            latest?.let { addSub(it) }
-        }
+        val res = newAnimeSearchResponse(title, fixUrl(url), TvType.Anime)
+        poster?.let { res.posterUrl = fixUrl(it) }
+        latest?.let { addSub(res, it) }
+        return res
     }
 
     private fun toSearchResult(card: Element): SearchResponse? {
@@ -99,10 +98,10 @@ class ComixProvider : MainAPI() {
         val latestEp = card.selectFirst(".chapter, .latest-chapter, .lrow__chapter")
             ?.text()?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
 
-        return newAnimeSearchResponse(title, fixUrl(href), TvType.Anime) {
-            poster?.let { setPosterUrl(fixUrl(it)) }
-            if (latestEp != null && latestEp > 0) addSub(latestEp)
-        }
+        val res = newAnimeSearchResponse(title, fixUrl(href), TvType.Anime)
+        poster?.let { res.posterUrl = fixUrl(it) }
+        if (latestEp != null && latestEp > 0) addSub(res, latestEp)
+        return res
     }
 
     private fun extractSearchResults(doc: Document): List<SearchResponse> {
@@ -166,13 +165,10 @@ class ComixProvider : MainAPI() {
                     if (cont.isActive) cont.resume(html)
                 }
 
-                // Hard timeout
-                val timeout = Runnable { finish("") }
-                handler.postDelayed(timeout, 6_000L)
+                handler.postDelayed({ finish("") }, 6_000L)
 
-                // Poll loop
-                lateinit var poll: Runnable
                 var attempts = 0
+                lateinit var poll: Runnable
                 poll = Runnable {
                     if (resumed) return@Runnable
                     wv.evaluateJavascript(
@@ -190,16 +186,14 @@ class ComixProvider : MainAPI() {
                                 return@ValueCallback
                             }
                             attempts++
-                            if (attempts < 25 && !resumed) {
-                                handler.postDelayed(poll, 300L)
-                            }
+                            if (attempts < 25 && !resumed) handler.postDelayed(poll, 300L)
                         }
                     )
                 }
 
                 wv.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView, url: String) {
-                        super.onPageFinished(view, url)
+                    override fun onPageFinished(view: WebView, u: String?) {
+                        super.onPageFinished(view, u)
                         handler.post(poll)
                     }
                 }
@@ -275,11 +269,9 @@ class ComixProvider : MainAPI() {
 
         val year = initial?.optInt("year", 0)?.takeIf { it > 0 }
 
-        // Chapters
         val chapterAnchors = doc.select("a[href*='-chapter-'], a[href*='/chapter/']")
         if (chapterAnchors.isEmpty()) return null
 
-        // Detect numbering (some sites start at 0, some at 1)
         val nums = chapterAnchors.mapNotNull {
             Regex("chapter[-/](\\d+)").find(it.attr("href"))?.groupValues?.get(1)?.toIntOrNull()
         }
@@ -310,7 +302,7 @@ class ComixProvider : MainAPI() {
                 "ongoing", "releasing" -> ShowStatus.Ongoing
                 else -> null
             }
-            addEpisodes(com.lagradost.cloudstream3.DubStatus.Subbed, episodes)
+            addEpisodes(DubStatus.Subbed, episodes)
         }
     }
 
@@ -326,18 +318,19 @@ class ComixProvider : MainAPI() {
 
         var any = false
 
-        // Strategy A: <img> inside the reader page (rpage)
+        // Strategy A: <img> inside the reader page
         doc.select(".rpage-page__img, .rpage-page img, .reader-page img").forEach { img ->
             val src = img.attr("data-src").ifBlank { img.attr("src") }
             if (src.isNotBlank() && !src.startsWith("data:")) {
                 callback(
-                    com.lagradost.cloudstream3.utils.newExtractorLink(
+                    newExtractorLink(
                         source = name,
                         name = name,
                         url = fixUrl(src),
-                        referer = mainUrl,
-                        quality = com.lagradost.cloudstream3.utils.ExtractorLinkType.IMAGE
-                    )
+                        type = ExtractorLinkType.IMAGE
+                    ) {
+                        this.referer = mainUrl
+                    }
                 )
                 any = true
             }
@@ -354,13 +347,14 @@ class ComixProvider : MainAPI() {
                         val src = pages.optString(i)
                         if (src.isNotBlank()) {
                             callback(
-                                com.lagradost.cloudstream3.utils.newExtractorLink(
+                                newExtractorLink(
                                     source = name,
                                     name = name,
                                     url = fixUrl(src),
-                                    referer = mainUrl,
-                                    quality = com.lagradost.cloudstream3.utils.ExtractorLinkType.IMAGE
-                                )
+                                    type = ExtractorLinkType.IMAGE
+                                ) {
+                                    this.referer = mainUrl
+                                }
                             )
                             any = true
                         }
