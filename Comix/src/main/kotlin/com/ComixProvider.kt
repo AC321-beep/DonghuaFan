@@ -298,7 +298,7 @@ class ComixProvider : MainAPI() {
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     override suspend fun load(url: String): LoadResponse? {
-        // ═══ Suspend #1 ═══
+        // ═══ Suspend #1 — page 1 of the title ═══
         val html1 = fetchHtmlWithWebView(url)
         if (html1.isBlank()) return null
         val document = Jsoup.parse(html1)
@@ -342,38 +342,70 @@ class ComixProvider : MainAPI() {
         val latestChapterUrl = d.optString("latestChapterUrl").takeIf { it.isNotBlank() }
         val latestChapterNum = d.optInt("latestChapter", 0)
 
-        // ── chapterAnchors ──
-        var chapterAnchors = document.select("a[href*='-chapter-']")
+        // ═══ Collect chapter anchors across all pagination pages ═══
+        val allAnchors = mutableListOf<Pair<String, String>>()
 
-        // ═══ Suspend #2 — retry if short ═══
-        if (chapterAnchors.size < latestChapterNum) {
-            val html2 = fetchHtmlWithWebView(url)
-            if (html2.isNotBlank()) {
-                val more = Jsoup.parse(html2).select("a[href*='-chapter-']")
-                if (more.size > chapterAnchors.size) chapterAnchors = more
+        fun collectAnchorsFromDoc(doc: Document) {
+            doc.select("a[href*='-chapter-']").forEach { a ->
+                val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
+                // Anchor text has useful suffixes like "Ch.46 new season 2" — keep them
+                val name = a.text().trim().ifBlank {
+                    Regex("-chapter-([\\d.]+)").find(href)
+                        ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
+                }
+                allAnchors.add(name to href)
             }
         }
 
-        // ═══ FIX: name from URL, dedupe by chapter number ═══
-        val parsedChapterLinks: List<Pair<String, String>> = chapterAnchors.mapNotNull { a ->
-            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val numStr = Regex("-chapter-([\\d.]+)").find(href)
-                ?.groupValues?.get(1) ?: return@mapNotNull null
-            "Ch. $numStr" to href
-        }
+        // Page 1
+        collectAnchorsFromDoc(document)
 
         val seenChapterNums = mutableSetOf<String>()
-        val dedupedLinks = parsedChapterLinks.filter { (_, href) ->
-            val num = Regex("-chapter-([\\d.]+)").find(href)?.groupValues?.get(1) ?: href
-            seenChapterNums.add(num)
+        fun noteChapterNums() {
+            allAnchors.forEach { (_, href) ->
+                Regex("-chapter-([\\d.]+)").find(href)?.groupValues?.get(1)
+                    ?.let { seenChapterNums.add(it) }
+            }
+        }
+        noteChapterNums()
+
+        // Pages 2..N until we've covered every chapter up to latestChapterNum
+        val targetUnique = latestChapterNum + 1   // e.g. 49 for chapters 0..48
+        val maxPage = 60                          // 734 items ÷ 20 per page ≈ 37, cap at 60
+
+        for (page in 2..maxPage) {
+            if (latestChapterNum > 0 && seenChapterNums.size >= targetUnique) break
+
+            val pageUrl = "$url?page=$page"
+            val pageHtml = fetchHtmlWithWebView(pageUrl)
+            if (pageHtml.isBlank()) break
+
+            val pageDoc = Jsoup.parse(pageHtml)
+            val pageAnchors = pageDoc.select("a[href*='-chapter-']")
+            if (pageAnchors.isEmpty()) break
+
+            // Guard: if the first anchor of this page was already seen, pagination
+            // isn't working — break to avoid looping on page 1 forever
+            val firstHref = pageAnchors.firstOrNull()?.attr("href") ?: break
+            if (allAnchors.any { it.second == firstHref }) break
+
+            collectAnchorsFromDoc(pageDoc)
+            noteChapterNums()
         }
 
-        // ═══ Episodes — sequential 1..N ═══
+        // ═══ Dedupe by chapter number — keeps first occurrence (best-ranked group) ═══
+        val finalSeen = mutableSetOf<String>()
+        val dedupedLinks = allAnchors.filter { (_, href) ->
+            val num = Regex("-chapter-([\\d.]+)").find(href)?.groupValues?.get(1) ?: href
+            finalSeen.add(num)
+        }
+
+        // ═══ Episodes — sequential 1..N, name preserves suffix ═══
         val episodes: List<Episode> = dedupedLinks.mapIndexed { index, (name, href) ->
             newEpisode(fixUrl(href)) {
-                this.name    = name
-                this.season  = 1
-                this.episode = index + 1
+                this.name      = name
+                this.season    = 1
+                this.episode   = index + 1
                 this.posterUrl = posterUrl
             }
         }
