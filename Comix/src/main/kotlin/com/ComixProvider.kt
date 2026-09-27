@@ -57,11 +57,21 @@ class ComixProvider : MainAPI() {
         "latest"   to "Latest Releases",
     )
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  fetchHtmlWithWebView
+    //    • Sample gate: lrow / list-grid / list-empty
+    //    • Plus initial-data so the current site (which no longer
+    //      renders lrow elements) still resolves immediately.
+    //    • Timeout returns the CURRENT html instead of "" so we never
+    //      end up with a blank homepage.
+    // ═══════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun fetchHtmlWithWebView(url: String): String =
         withContext(Dispatchers.Main) {
             val activity = CommonActivity.activity ?: return@withContext ""
             if (activity.isFinishing || activity.isDestroyed) return@withContext ""
+
+            val isTitlePage = url.contains("/title/")
 
             suspendCancellableCoroutine { cont ->
                 val wv = WebView(activity)
@@ -91,9 +101,17 @@ class ComixProvider : MainAPI() {
                     if (cont.isActive) cont.resume(html)
                 }
 
-                handler.postDelayed({ finish("") }, 6_000L)
+                // 6s on normal pages, 12s on title pages (chapter list needs
+                // more time for React to mount). Grab the CURRENT html on timeout.
+                handler.postDelayed({
+                    wv.evaluateJavascript(
+                        "(function(){ return document.documentElement.outerHTML; })();"
+                    ) { raw -> finish(parseJsString(raw) ?: "") }
+                }, if (isTitlePage) 12_000L else 6_000L)
 
                 var attempts = 0
+                val maxAttempts = if (isTitlePage) 40 else 25
+
                 lateinit var checkHtml: Runnable
                 checkHtml = Runnable {
                     if (resumed) return@Runnable
@@ -103,16 +121,31 @@ class ComixProvider : MainAPI() {
                         if (resumed) return@evaluateJavascript
                         val html = parseJsString(raw) ?: ""
 
-                        if (html.contains("lrow") ||
-                            html.contains("list-grid") ||
-                            html.contains("list-empty")) {
+                        val ready: Boolean = if (isTitlePage) {
+                            // Title page: wait until React has mounted the
+                            // chapter list. 3+ chapter anchors = mounted.
+                            val chapterCount = Regex("href=\"[^\"]*-chapter-[\\d.]+")
+                                .findAll(html).count()
+                            chapterCount >= 3 ||
+                                html.contains("lrow") ||
+                                html.contains("list-grid") ||
+                                html.contains("list-empty")
+                        } else {
+                            // Home / search / etc.: sample gate PLUS initial-data
+                            html.contains("lrow") ||
+                                html.contains("list-grid") ||
+                                html.contains("list-empty") ||
+                                html.contains("initial-data")
+                        }
+
+                        if (ready) {
                             runCatching { CookieManager.getInstance().flush() }
                             finish(html)
                             return@evaluateJavascript
                         }
 
                         attempts++
-                        if (attempts < 25 && !resumed) {
+                        if (attempts < maxAttempts && !resumed) {
                             handler.postDelayed(checkHtml, 300L)
                         }
                     }
@@ -286,6 +319,9 @@ class ComixProvider : MainAPI() {
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  load — two fetches, dedupe by chapter number, sequential episodes
+    // ═══════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
         // ═══ Suspend #1 ═══
         val html1 = fetchHtmlWithWebView(url)
@@ -342,6 +378,7 @@ class ComixProvider : MainAPI() {
             }
         }
 
+        // parsedChapterLinks: (displayName, href)
         val parsedChapterLinks: List<Pair<String, String>> = chapterAnchors.mapNotNull { a ->
             val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val name = a.text().trim().ifBlank {
@@ -351,26 +388,27 @@ class ComixProvider : MainAPI() {
             name to href
         }
 
-        val chapterNums: List<Int> = parsedChapterLinks.mapNotNull { (_, href) ->
-            Regex("chapter[-/](\\d+)").find(href)?.groupValues?.get(1)?.toIntOrNull()
+        // ═══ Dedupe by chapter number — one entry per unique number ═══
+        // Extracts the numeric chapter from the href (e.g. "…-chapter-48" → "48")
+        // and keeps the FIRST occurrence. This collapses the 12 scan-group
+        // uploads of Ch. 2 into one entry.
+        val seenChapterNums = mutableSetOf<String>()
+        val dedupedLinks = parsedChapterLinks.filter { (_, href) ->
+            val m = Regex("-chapter-([\\d.]+)").find(href) ?: return@filter false
+            seenChapterNums.add(m.groupValues[1])
         }
-        val startsAtZero = chapterNums.minOrNull() == 0
-        val startCh      = if (startsAtZero) 1 else (chapterNums.minOrNull() ?: 1)
 
-        val dedupedLinks = parsedChapterLinks.distinctBy { (_, href) ->
-            Regex("chapter[-/](\\d+)").find(href)?.groupValues?.get(1) ?: href
-        }
-
+        // ═══ Episodes — sequential 1..N, name kept from anchor text ═══
         val episodes: List<Episode> = dedupedLinks.mapIndexed { index, (chName, chHref) ->
-            val epNum = startCh + index
             newEpisode(fixUrl(chHref)) {
                 this.name      = chName
                 this.season    = 1
-                this.episode   = epNum
+                this.episode   = index + 1
                 this.posterUrl = posterUrl
             }
         }
 
+        // ═══ Bookend fallback ═══
         val finalEpisodes = if (episodes.isEmpty() && latestChapterNum > 0) {
             buildList {
                 firstChapterUrl?.let { u ->
