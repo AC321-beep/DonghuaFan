@@ -7,7 +7,6 @@ import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
-import com.lagradost.cloudstream3.AnimeSearchResponse
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.Episode
@@ -58,11 +57,18 @@ class ComixProvider : MainAPI() {
         "latest"   to "Latest Releases",
     )
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  fetchHtmlWithWebView — waits for React to render
+    //    • Non-title pages (home/search): return on first signal
+    //    • Title pages: keep polling until 3+ chapter anchors exist
+    // ═══════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun fetchHtmlWithWebView(url: String): String =
         withContext(Dispatchers.Main) {
             val activity = CommonActivity.activity ?: return@withContext ""
             if (activity.isFinishing || activity.isDestroyed) return@withContext ""
+
+            val isTitlePage = url.contains("/title/")
 
             suspendCancellableCoroutine { cont ->
                 val wv = WebView(activity)
@@ -104,10 +110,26 @@ class ComixProvider : MainAPI() {
                         if (resumed) return@evaluateJavascript
                         val html = parseJsString(raw) ?: ""
 
-                        if (html.contains("lrow") ||
-                            html.contains("list-grid") ||
-                            html.contains("list-empty") ||
-                            html.contains("initial-data")) {
+                        // Count chapter anchors present in the current DOM
+                        val chapterCount = Regex("href=\"[^\"]*-chapter-[\\d.]+")
+                            .findAll(html).count()
+
+                        val ready: Boolean = if (isTitlePage) {
+                            // Title page: wait until React has rendered the full chapter list.
+                            // 3+ anchors means the list has mounted (not just the 1-2 header links).
+                            chapterCount >= 3 ||
+                                html.contains("lrow") ||
+                                html.contains("list-grid") ||
+                                html.contains("list-empty")
+                        } else {
+                            // Home / search: initial-data alone is fine
+                            html.contains("lrow") ||
+                                html.contains("list-grid") ||
+                                html.contains("list-empty") ||
+                                html.contains("initial-data")
+                        }
+
+                        if (ready) {
                             runCatching { CookieManager.getInstance().flush() }
                             finish(html)
                             return@evaluateJavascript
@@ -298,8 +320,11 @@ class ComixProvider : MainAPI() {
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  load — full chapter list, sequential 1..N episode numbers
+    // ═══════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
-        // ═══ Suspend #1 ═══
+        // ═══ Suspend #1 — waits for chapters to render (see gate above) ═══
         val html1 = fetchHtmlWithWebView(url)
         if (html1.isBlank()) return null
         val document = Jsoup.parse(html1)
@@ -339,14 +364,12 @@ class ComixProvider : MainAPI() {
             }
         }.distinct()
 
-        val firstChapterUrl  = d.optString("firstChapterUrl").takeIf { it.isNotBlank() }
-        val latestChapterUrl = d.optString("latestChapterUrl").takeIf { it.isNotBlank() }
         val latestChapterNum = d.optInt("latestChapter", 0)
 
-        // ── chapterAnchors ──
+        // ── chapterAnchors from the rendered DOM ──
         var chapterAnchors = document.select("a[href*='-chapter-']")
 
-        // ═══ Suspend #2 — retry if short ═══
+        // ═══ Suspend #2 — retry if still short ═══
         if (chapterAnchors.size < latestChapterNum) {
             val html2 = fetchHtmlWithWebView(url)
             if (html2.isNotBlank()) {
@@ -365,47 +388,24 @@ class ComixProvider : MainAPI() {
             name to href
         }
 
-        // ── startsAtZero / startCh ──
-        val chapterNums = parsedChapterLinks.mapNotNull { (_, href) ->
-            Regex("chapter[-/](\\d+)").find(href)?.groupValues?.get(1)?.toIntOrNull()
+        // ── dedupe by chapter number, keeping the first occurrence ──
+        val seenNumbers = mutableSetOf<String>()
+        val dedupedLinks = parsedChapterLinks.filter { (_, href) ->
+            val num = Regex("-chapter-([\\d.]+)").find(href)?.groupValues?.get(1) ?: href
+            seenNumbers.add(num)
         }
-        val startsAtZero = chapterNums.minOrNull() == 0
-        val startCh      = if (startsAtZero) 1 else (chapterNums.minOrNull() ?: 1)
 
-        // ── episodes ──
-        val episodes: List<Episode> = parsedChapterLinks.mapIndexed { index, (name, href) ->
+        // ── episodes: sequential 1..N, names as displayed by the site ──
+        val episodes: List<Episode> = dedupedLinks.mapIndexed { index, (name, href) ->
             newEpisode(fixUrl(href)) {
                 this.name    = name
                 this.season  = 1
-                this.episode = index + startCh
+                this.episode = index + 1
                 this.posterUrl = posterUrl
             }
         }
 
-        val finalEpisodes = if (episodes.isEmpty() && latestChapterNum > 0) {
-            buildList {
-                firstChapterUrl?.let { u ->
-                    add(newEpisode(fixUrl(u)) {
-                        this.name = "Ch. 0"
-                        this.season = 1
-                        this.episode = 1
-                        this.posterUrl = posterUrl
-                    })
-                }
-                if (latestChapterNum > 1) {
-                    latestChapterUrl?.let { u ->
-                        add(newEpisode(fixUrl(u)) {
-                            this.name = "Ch. $latestChapterNum"
-                            this.season = 1
-                            this.episode = 2
-                            this.posterUrl = posterUrl
-                        })
-                    }
-                }
-            }
-        } else episodes
-
-        if (finalEpisodes.isEmpty()) return null
+        if (episodes.isEmpty()) return null
 
         return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
             this.posterUrl = posterUrl
@@ -417,7 +417,7 @@ class ComixProvider : MainAPI() {
                 "releasing", "ongoing", "on_hiatus" -> ShowStatus.Ongoing
                 else -> null
             }
-            addEpisodes(DubStatus.Subbed, finalEpisodes)
+            addEpisodes(DubStatus.Subbed, episodes)
         }
     }
 
@@ -439,6 +439,7 @@ class ComixProvider : MainAPI() {
                 title = name,
                 chapterName = chapterName,
                 chapterUrl = data,
+                targetUrl = data,
                 targetChapter = 0
             )
         }
