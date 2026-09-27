@@ -1,7 +1,15 @@
 package com.comix
 
+import android.annotation.SuppressLint
+import android.os.Handler
+import android.os.Looper
+import android.webkit.CookieManager
+import android.webkit.ValueCallback
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.AnimeLoadResponse
 import com.lagradost.cloudstream3.AnimeSearchResponse
+import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageResponse
@@ -23,10 +31,15 @@ import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 import org.jsoup.Jsoup
 import java.net.URLEncoder
+import kotlin.coroutines.resume
 
 class ComixProvider : MainAPI() {
 
@@ -40,9 +53,9 @@ class ComixProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "trending" to "Trending Today",
-        "follows" to "Most Followed",
-        "hot" to "Hot Updates",
-        "latest" to "Latest Releases",
+        "follows"  to "Most Followed",
+        "hot"      to "Hot Updates",
+        "latest"   to "Latest Releases",
     )
 
     private val browserHeaders = mapOf(
@@ -52,15 +65,12 @@ class ComixProvider : MainAPI() {
         "Accept-Language" to "en-US,en;q=0.9",
     )
 
-    // ---------------------------------------------------------------- core
+    // ------------------------------------------------------------ HTTP
 
-    /** Fetch the raw HTML (with the server-rendered initial-data script) */
     private suspend fun fetchHtml(url: String): String =
-        runCatching {
-            app.get(url, headers = browserHeaders, referer = "$mainUrl/").text
-        }.getOrDefault("")
+        runCatching { app.get(url, headers = browserHeaders, referer = "$mainUrl/").text }
+            .getOrDefault("")
 
-    /** Extract the JSON from <script id="initial-data"> */
     private fun extractInitialData(html: String): JSONObject? {
         val doc = Jsoup.parse(html)
         val script = doc.selectFirst("script#initial-data") ?: return null
@@ -69,119 +79,89 @@ class ComixProvider : MainAPI() {
         return runCatching { JSONObject(text) }.getOrNull()
     }
 
-    /** Parse a raw manga JSON object into a SearchResponse */
     private fun parseManga(obj: JSONObject): SearchResponse? {
         val title = obj.optString("title").takeIf { it.isNotBlank() } ?: return null
-        val url = obj.optString("url").takeIf { it.isNotBlank() } ?: return null
-        val poster = obj.optJSONObject("poster")
-            ?.optString("large")?.takeIf { it.isNotBlank() }
+        val relUrl = obj.optString("url").takeIf { it.isNotBlank() } ?: return null
+        val poster = obj.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
             ?: obj.optJSONObject("poster")?.optString("medium")?.takeIf { it.isNotBlank() }
         val latest = obj.optInt("latestChapter", 0).takeIf { it > 0 }
 
-        val res = newAnimeSearchResponse(title, fixUrl(url), TvType.Anime)
+        val res = newAnimeSearchResponse(title, fixUrl(relUrl), TvType.Anime)
         poster?.let { res.posterUrl = fixUrl(it) }
         latest?.let { res.addSub(it) }
         return res
     }
 
-    /** Read all manga items from a queries map for the given section name */
-    private fun readSection(initialData: JSONObject, section: String): List<SearchResponse> {
-        val queries = initialData.optJSONObject("queries") ?: return emptyList()
+    private fun collectFromQueries(
+        queries: JSONObject,
+        matcher: (JSONArray) -> Boolean
+    ): List<SearchResponse> {
         val out = mutableListOf<SearchResponse>()
         val keys = queries.keys()
         while (keys.hasNext()) {
             val key = keys.next()
             val parsed = runCatching { JSONArray(key) }.getOrNull() ?: continue
-            if (parsed.length() < 3) continue
-            if (parsed.optString(0) != "manga") continue
-            val subtype = parsed.optString(1)               // "top" or "list"
-            val params = parsed.optJSONObject(2) ?: continue
-
-            val matches = when (section) {
-                "trending" -> subtype == "top" && params.optString("type") == "trending"
-                "follows"  -> subtype == "top" && params.optString("type") == "follows"
-                "hot"      -> subtype == "list" && params.optString("scope") == "hot"
-                "latest"   -> subtype == "list"
-                    && params.optJSONObject("order")?.optString("created_at") == "desc"
-                else -> false
-            }
-            if (!matches) continue
-
+            if (!matcher(parsed)) continue
             val value = queries.opt(key)
-            val itemsArray: JSONArray? = when (value) {
+            val arr = when (value) {
                 is JSONArray -> value
                 is JSONObject -> value.optJSONArray("items")
                 else -> null
             } ?: continue
-
-            for (i in 0 until itemsArray.length()) {
-                val obj = itemsArray.optJSONObject(i) ?: continue
-                parseManga(obj)?.let { out.add(it) }
+            for (i in 0 until arr.length()) {
+                arr.optJSONObject(i)?.let { parseManga(it)?.let { r -> out.add(r) } }
             }
-            if (out.isNotEmpty()) break
         }
         return out
     }
 
-    /** Grab every manga from any "manga/*" query, deduped. Used for search. */
-    private fun readAllManga(initialData: JSONObject): List<SearchResponse> {
-        val queries = initialData.optJSONObject("queries") ?: return emptyList()
-        val out = mutableListOf<SearchResponse>()
-        val keys = queries.keys()
-        while (keys.hasNext()) {
-            val key = keys.next()
-            val parsed = runCatching { JSONArray(key) }.getOrNull() ?: continue
-            if (parsed.optString(0) != "manga") continue
-
-            val value = queries.opt(key)
-            val itemsArray: JSONArray? = when (value) {
-                is JSONArray -> value
-                is JSONObject -> value.optJSONArray("items")
-                else -> null
-            } ?: continue
-            for (i in 0 until itemsArray.length()) {
-                val obj = itemsArray.optJSONObject(i) ?: continue
-                parseManga(obj)?.let { out.add(it) }
-            }
-        }
-        return out.distinctBy { it.url }
-    }
-
-    // ---------------------------------------------------------------- API
+    // ------------------------------------------------------------ API
 
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
-        val url = if (page <= 1) "$mainUrl/" else "$mainUrl/?page=$page"
-        val html = fetchHtml(url)
-        val json = extractInitialData(html) ?: return null
-        val items = readSection(json, request.data)
+        val html = fetchHtml("$mainUrl/")
+        val queries = extractInitialData(html)?.optJSONObject("queries") ?: return null
+
+        val items = collectFromQueries(queries) { key ->
+            if (key.length() < 3 || key.optString(0) != "manga") return@collectFromQueries false
+            val subtype = key.optString(1)
+            val params = key.optJSONObject(2) ?: return@collectFromQueries false
+            when (request.data) {
+                "trending" -> subtype == "top" && params.optString("type") == "trending"
+                "follows"  -> subtype == "top" && params.optString("type") == "follows"
+                "hot"      -> subtype == "list" && params.optString("scope") == "hot"
+                "latest"   -> subtype == "list" &&
+                        params.optJSONObject("order")?.optString("created_at") == "desc"
+                else -> false
+            }
+        }
+
         if (items.isEmpty()) return null
-        return newHomePageResponse(request, items, hasNext = items.size >= 20)
+        return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = items.size >= 20)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val q = query.trim()
         if (q.isEmpty()) return emptyList()
         val encoded = URLEncoder.encode(q, "UTF-8")
+
         val candidates = listOf(
             "$mainUrl/browse?q=$encoded",
+            "$mainUrl/browse?search=$encoded",
             "$mainUrl/search?q=$encoded",
-            "$mainUrl/?q=$encoded",
         )
         for (url in candidates) {
             val html = fetchHtml(url)
-            val json = extractInitialData(html) ?: continue
-            val items = readAllManga(json)
+            val queries = extractInitialData(html)?.optJSONObject("queries") ?: continue
+            val items = collectFromQueries(queries) { key ->
+                key.length() >= 1 && key.optString(0) == "manga"
+            }
             if (items.isNotEmpty()) {
-                // Filter to those matching the query text (server may not filter for us)
                 val lower = q.lowercase()
-                val filtered = items.filter {
-                    it.name.lowercase().contains(lower)
-                }
-                if (filtered.isNotEmpty()) return filtered
-                return items
+                val filtered = items.filter { it.name.lowercase().contains(lower) }
+                return (filtered.ifEmpty { items }).distinctBy { it.url }
             }
         }
         return emptyList()
@@ -192,76 +172,62 @@ class ComixProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         val html = fetchHtml(url)
         if (html.isBlank()) return null
-        val doc = Jsoup.parse(html)
-        val initialData = extractInitialData(html)
+        val initial = extractInitialData(html) ?: return null
+        val queries = initial.optJSONObject("queries") ?: return null
 
-        // --- Find the "manga.show" query — that's the title detail object ---
-        var mangaObj: JSONObject? = null
-        var chaptersArr: JSONArray? = null
-
-        initialData?.optJSONObject("queries")?.let { queries ->
-            val keys = queries.keys()
-            while (keys.hasNext()) {
-                val key = keys.next()
-                val parsed = runCatching { JSONArray(key) }.getOrNull() ?: continue
-                if (parsed.optString(0) != "manga") continue
-                val subtype = parsed.optString(1)
-                val value = queries.opt(key)
-                when {
-                    subtype == "show" && value is JSONObject -> {
-                        mangaObj = value
-                        chaptersArr = value.optJSONArray("chapters")
-                    }
-                    subtype == "chapters" && value is JSONObject -> {
-                        chaptersArr = value.optJSONArray("items")
-                            ?: value.optJSONArray("chapters")
-                    }
-                    subtype == "chapters" && value is JSONArray -> {
-                        chaptersArr = value
-                    }
-                }
-                if (mangaObj != null && chaptersArr != null) break
+        // Find the ["manga","detail",hid] query
+        var detail: JSONObject? = null
+        val keys = queries.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
+            if (parsed.length() >= 3 &&
+                parsed.optString(0) == "manga" &&
+                parsed.optString(1) == "detail"
+            ) {
+                detail = queries.optJSONObject(k)
+                break
             }
         }
+        val d = detail ?: return null
 
-        val title = mangaObj?.optString("title")?.takeIf { it.isNotBlank() }
-            ?: doc.selectFirst("h1")?.text()?.trim()
-            ?: return null
+        val title = d.optString("title").takeIf { it.isNotBlank() } ?: return null
+        val poster = d.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
+            ?: d.optJSONObject("poster")?.optString("medium")
+        val plot = d.optString("synopsis").takeIf { it.isNotBlank() }
+        val statusStr = d.optString("status")
+        val year = d.optInt("year", 0).takeIf { it > 0 }
+        val latestNum = d.optInt("latestChapter", 0)
+        val firstChapterUrl = d.optString("firstChapterUrl").takeIf { it.isNotBlank() }
+        val latestChapterUrl = d.optString("latestChapterUrl").takeIf { it.isNotBlank() }
 
-        val poster = mangaObj?.optJSONObject("poster")
-            ?.optString("large")?.takeIf { it.isNotBlank() }
-            ?: mangaObj?.optJSONObject("poster")
-                ?.optString("medium")?.takeIf { it.isNotBlank() }
-
-        val plot = mangaObj?.optString("synopsis")?.takeIf { it.isNotBlank() }
-
-        val statusStr = mangaObj?.optString("status")?.takeIf { it.isNotBlank() }
-        val year = mangaObj?.optInt("year", 0)?.takeIf { it > 0 }
-
-        val genres = buildList {
-            mangaObj?.optJSONArray("genres")?.let { arr ->
+        val tags = mutableListOf<String>()
+        listOf("genres", "tags", "demographics", "formats").forEach { f ->
+            d.optJSONArray(f)?.let { arr ->
                 for (i in 0 until arr.length()) {
-                    val g = arr.optJSONObject(i)?.optString("name")
-                        ?: arr.optString(i)
-                    if (g.isNotBlank()) add(g)
+                    arr.optJSONObject(i)?.optString("title")
+                        ?.takeIf { it.isNotBlank() }?.let { tags.add(it) }
                 }
             }
         }
 
         // --- Chapters ---
-        val episodes = mutableListOf<Episode>()
-        if (chaptersArr != null) {
-            for (i in 0 until chaptersArr!!.length()) {
-                val ch = chaptersArr!!.optJSONObject(i) ?: continue
-                val chUrl = ch.optString("url").takeIf { it.isNotBlank() } ?: continue
-                val num = ch.optDouble("number", 0.0).takeIf { it > 0 }?.toInt()
-                    ?: ch.optInt("number", 0).takeIf { it > 0 }
-                    ?: Regex("chapter[-/](\\d+)").find(chUrl)
-                        ?.groupValues?.get(1)?.toIntOrNull()
-                    ?: (i + 1)
-                val name = ch.optString("name").takeIf { it.isNotBlank() } ?: "Ch. $num"
-                episodes.add(newEpisode(fixUrl(chUrl)) {
-                    this.name = name
+        val chapters = mutableListOf<Episode>()
+
+        // Try WebView-rendered title page
+        val rendered = fetchRenderedHtml(url) { h ->
+            h.contains("-chapter-") &&
+                Regex("""href\s*=\s*"[^"]*-chapter-""").containsMatchIn(h)
+        }
+        if (rendered.isNotBlank()) {
+            val doc = Jsoup.parse(rendered)
+            doc.select("a[href*='-chapter-'], a[href*='/chapter/']").forEach { a ->
+                val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
+                val numMatch = Regex("-chapter-([\\d.]+)").find(href) ?: return@forEach
+                val num = numMatch.groupValues[1].toDoubleOrNull()?.toInt() ?: return@forEach
+                if (num <= 0) return@forEach
+                chapters.add(newEpisode(fixUrl(href)) {
+                    this.name = a.text().trim().ifBlank { "Ch. $num" }
                     this.season = 1
                     this.episode = num
                     this.posterUrl = poster
@@ -269,34 +235,42 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // --- Fallback to DOM if JSON gave nothing ---
-        if (episodes.isEmpty()) {
-            doc.select("a[href*='-chapter-'], a[href*='/chapter/']").forEachIndexed { i, a ->
-                val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEachIndexed
-                val n = Regex("chapter[-/](\\d+)").find(href)
-                    ?.groupValues?.get(1)?.toIntOrNull() ?: (i + 1)
-                episodes.add(newEpisode(fixUrl(href)) {
-                    this.name = a.text().trim().ifBlank { "Ch. $n" }
+        // Fallback: bookends from initial-data
+        if (chapters.isEmpty() && latestNum > 0 &&
+            firstChapterUrl != null && latestChapterUrl != null
+        ) {
+            chapters.add(newEpisode(fixUrl(firstChapterUrl)) {
+                this.name = "Ch. 1"
+                this.season = 1
+                this.episode = 1
+                this.posterUrl = poster
+            })
+            if (latestNum > 1) {
+                chapters.add(newEpisode(fixUrl(latestChapterUrl)) {
+                    this.name = "Ch. $latestNum"
                     this.season = 1
-                    this.episode = n
+                    this.episode = latestNum
                     this.posterUrl = poster
                 })
             }
         }
 
-        if (episodes.isEmpty()) return null
+        if (chapters.isEmpty()) return null
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
             this.plot = plot
-            this.tags = genres
+            this.tags = tags.distinct()
             this.year = year
-            this.showStatus = when (statusStr?.lowercase()) {
+            this.showStatus = when (statusStr.lowercase()) {
                 "completed", "finished" -> ShowStatus.Completed
-                "releasing", "ongoing"   -> ShowStatus.Ongoing
+                "releasing", "ongoing", "on_hiatus" -> ShowStatus.Ongoing
                 else -> null
             }
-            addEpisodes(DubStatus.Subbed, episodes.distinctBy { it.data }.sortedBy { it.episode })
+            addEpisodes(
+                DubStatus.Subbed,
+                chapters.distinctBy { it.data }.sortedBy { it.episode }
+            )
         }
     }
 
@@ -306,55 +280,138 @@ class ComixProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // Chapter pages are React-rendered, so we still need a WebView here
         val html = fetchHtml(data)
-        if (html.isBlank()) return false
-        val doc = Jsoup.parse(html)
         var any = false
 
-        // Try "pages" array in initial-data first
-        extractInitialData(html)?.optJSONObject("queries")?.let { queries ->
-            val keys = queries.keys()
-            while (keys.hasNext()) {
-                val key = keys.next()
-                val parsed = runCatching { JSONArray(key) }.getOrNull() ?: continue
-                if (parsed.optString(0) != "pages") continue
-                val value = queries.opt(key)
-                val arr = when (value) {
-                    is JSONArray -> value
-                    is JSONObject -> value.optJSONArray("items")
-                        ?: value.optJSONArray("pages")
-                    else -> null
-                } ?: continue
-                for (i in 0 until arr.length()) {
-                    val src = arr.optString(i).ifBlank {
-                        arr.optJSONObject(i)?.optString("url") ?: ""
+        // Try initial-data for ["pages",...] query
+        if (html.isNotBlank()) {
+            extractInitialData(html)?.optJSONObject("queries")?.let { queries ->
+                val keys = queries.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
+                    if (parsed.length() < 1 || parsed.optString(0) != "pages") continue
+                    val value = queries.opt(k)
+                    val arr = when (value) {
+                        is JSONArray -> value
+                        is JSONObject -> value.optJSONArray("items")
+                            ?: value.optJSONArray("pages")
+                        else -> null
+                    } ?: continue
+                    for (i in 0 until arr.length()) {
+                        val src = arr.optString(i).ifBlank {
+                            arr.optJSONObject(i)?.optString("url") ?: ""
+                        }
+                        if (src.isNotBlank()) {
+                            callback(newExtractorLink(name, name, fixUrl(src)) {
+                                this.referer = "$mainUrl/"
+                            })
+                            any = true
+                        }
                     }
-                    if (src.isNotBlank()) {
-                        callback(newExtractorLink(
-                            source = name, name = name, url = fixUrl(src)
-                        ) { this.referer = "$mainUrl/" })
-                        any = true
-                    }
+                    if (any) break
                 }
-                if (any) break
             }
         }
 
-        // Fallback: <img> tags
+        // Fallback: WebView render + <img> extraction
         if (!any) {
-            doc.select("img[src*='static.comix.to'], .rpage-page__img, .reader-page img")
-                .forEach { img ->
-                    val src = img.attr("data-src").ifBlank { img.attr("src") }
-                    if (src.isNotBlank() && !src.startsWith("data:")) {
-                        callback(newExtractorLink(
-                            source = name, name = name, url = fixUrl(src)
-                        ) { this.referer = "$mainUrl/" })
-                        any = true
+            val rendered = fetchRenderedHtml(data) { h ->
+                h.contains("static.comix.to") &&
+                    (h.contains("rpage-page") || h.contains("reader-page"))
+            }
+            if (rendered.isNotBlank()) {
+                val doc = Jsoup.parse(rendered)
+                doc.select("img[src*='static.comix.to'], .rpage-page__img, .reader-page img")
+                    .forEach { img ->
+                        val src = img.attr("data-src").ifBlank { img.attr("src") }
+                        if (src.isNotBlank() && !src.startsWith("data:")) {
+                            callback(newExtractorLink(name, name, fixUrl(src)) {
+                                this.referer = "$mainUrl/"
+                            })
+                            any = true
+                        }
                     }
-                }
+            }
         }
-
         return any
+    }
+
+    // ------------------------------------------------------------ WebView
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun fetchRenderedHtml(
+        url: String,
+        ready: (String) -> Boolean
+    ): String = withContext(Dispatchers.Main) {
+        val activity = CommonActivity.activity ?: return@withContext ""
+        if (activity.isFinishing || activity.isDestroyed) return@withContext ""
+
+        suspendCancellableCoroutine { cont ->
+            val wv = WebView(activity)
+            wv.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                loadsImagesAutomatically = false
+                userAgentString = userAgentString
+                    .replace("; wv", "").replace("Android TV", "Android")
+            }
+            runCatching {
+                CookieManager.getInstance().apply {
+                    setAcceptCookie(true)
+                    setAcceptThirdPartyCookies(wv, true)
+                }
+            }
+
+            val handler = Handler(Looper.getMainLooper())
+            var resumed = false
+
+            fun finish(html: String) {
+                if (resumed) return
+                resumed = true
+                handler.removeCallbacksAndMessages(null)
+                runCatching { wv.stopLoading(); wv.destroy() }
+                if (cont.isActive) cont.resume(html)
+            }
+
+            handler.postDelayed({ finish("") }, 12_000L)
+
+            var attempts = 0
+            lateinit var poll: Runnable
+            poll = Runnable {
+                if (resumed) return@Runnable
+                wv.evaluateJavascript(
+                    "(function(){return document.documentElement.outerHTML;})();"
+                ) { raw ->
+                    if (resumed) return@ValueCallback
+                    val html = parseJsString(raw) ?: ""
+                    if (ready(html)) {
+                        finish(html); return@ValueCallback
+                    }
+                    attempts++
+                    if (attempts < 30 && !resumed) handler.postDelayed(poll, 400L)
+                    else finish(html)
+                }
+            }
+
+            wv.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView, u: String?) {
+                    super.onPageFinished(view, u)
+                    handler.postDelayed(poll, 800L)
+                }
+            }
+
+            cont.invokeOnCancellation {
+                handler.removeCallbacksAndMessages(null)
+                runCatching { wv.destroy() }
+            }
+
+            wv.loadUrl(url)
+        }
+    }
+
+    private fun parseJsString(raw: String?): String? {
+        if (raw == null || raw == "null") return ""
+        return runCatching { JSONTokener(raw).nextValue().toString() }.getOrDefault(raw)
     }
 }
