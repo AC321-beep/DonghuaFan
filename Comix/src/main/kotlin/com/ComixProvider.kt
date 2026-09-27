@@ -57,6 +57,9 @@ class ComixProvider : MainAPI() {
         "latest"   to "Latest Releases",
     )
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  WebView fetcher
+    // ═══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun fetchHtmlWithWebView(url: String): String =
         withContext(Dispatchers.Main) {
@@ -91,7 +94,7 @@ class ComixProvider : MainAPI() {
                     if (cont.isActive) cont.resume(html)
                 }
 
-                handler.postDelayed({ finish("") }, 6_000L)
+                handler.postDelayed({ finish("") }, 8_000L)
 
                 var attempts = 0
                 lateinit var checkHtml: Runnable
@@ -106,14 +109,15 @@ class ComixProvider : MainAPI() {
                         if (html.contains("lrow") ||
                             html.contains("list-grid") ||
                             html.contains("list-empty") ||
-                            html.contains("initial-data")) {
+                            html.contains("initial-data") ||
+                            html.contains("mchap-item")) {
                             runCatching { CookieManager.getInstance().flush() }
                             finish(html)
                             return@evaluateJavascript
                         }
 
                         attempts++
-                        if (attempts < 25 && !resumed) {
+                        if (attempts < 30 && !resumed) {
                             handler.postDelayed(checkHtml, 300L)
                         } else {
                             finish(html)
@@ -142,6 +146,9 @@ class ComixProvider : MainAPI() {
         return runCatching { JSONTokener(raw).nextValue().toString() }.getOrDefault(raw)
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  initial-data parsing
+    // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
             is Document -> htmlOrDoc
@@ -240,6 +247,9 @@ class ComixProvider : MainAPI() {
         return extractSearchResultsDom(Jsoup.parse(html))
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Main page
+    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
@@ -297,8 +307,46 @@ class ComixProvider : MainAPI() {
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Chapter-number helpers
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /** Extracts the chapter number from any href of the form `…/{id}-chapter-{n}`. */
+    private fun chapterNumberFromHref(href: String?): Double? {
+        if (href.isNullOrBlank()) return null
+        val m = Regex("-chapter-([\\d.]+)").find(href) ?: return null
+        return m.groupValues[1].toDoubleOrNull()
+    }
+
+    /** Human-friendly key: `0`, `1`, `48`, `48.5` (no trailing `.0`). */
+    private fun formatChapterNum(n: Double): String =
+        if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
+
+    /**
+     * Derives the expected unique-chapter count from the two canonical URLs.
+     * For The Crown I'll Claim: first=0, last=48 → 49.
+     * Returns 0 when it can't be determined (caller falls back to page-based loop).
+     */
+    private fun expectedUniqueCount(
+        firstChapterUrl: String?,
+        latestChapterUrl: String?,
+        latestChapterNum: Int,
+    ): Int {
+        val first = chapterNumberFromHref(firstChapterUrl)
+        val last  = chapterNumberFromHref(latestChapterUrl)
+        return when {
+            first != null && last != null -> ((last - first) + 1).toInt()
+            last  != null                 -> last.toInt() + 1
+            latestChapterNum > 0          -> latestChapterNum + 1
+            else                          -> 0
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  load()
+    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
-        // ═══ Suspend #1 — page 1 of the title ═══
+        // ─── Page 1 ────────────────────────────────────────────────────────
         val html1 = fetchHtmlWithWebView(url)
         if (html1.isBlank()) return null
         val document = Jsoup.parse(html1)
@@ -338,100 +386,91 @@ class ComixProvider : MainAPI() {
             }
         }.distinct()
 
+        // ── Canonical chapter range from initial-data ─────────────────────
         val firstChapterUrl  = d.optString("firstChapterUrl").takeIf { it.isNotBlank() }
         val latestChapterUrl = d.optString("latestChapterUrl").takeIf { it.isNotBlank() }
         val latestChapterNum = d.optInt("latestChapter", 0)
 
-        // ═══ Collect chapter anchors across all pagination pages ═══
-        val allAnchors = mutableListOf<Pair<String, String>>()
+        val expectedUnique = expectedUniqueCount(
+            firstChapterUrl, latestChapterUrl, latestChapterNum
+        )
 
-        fun collectAnchorsFromDoc(doc: Document) {
+        // ── Collect anchors keyed by chapter NUMBER ───────────────────────
+        // Key:   formatted chapter number ("0", "1", …, "48.5")
+        // Value: name (visible text, preserves "Ch. 46 new season 2") + href
+        val chapterMap = LinkedHashMap<String, Pair<String, String>>()
+
+        fun collectFromDoc(doc: Document) {
             doc.select("a[href*='-chapter-']").forEach { a ->
                 val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
-                // Anchor text has useful suffixes like "Ch.46 new season 2" — keep them
-                val name = a.text().trim().ifBlank {
-                    Regex("-chapter-([\\d.]+)").find(href)
-                        ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
-                }
-                allAnchors.add(name to href)
+                val num  = chapterNumberFromHref(href) ?: return@forEach
+                val key  = formatChapterNum(num)
+                if (chapterMap.containsKey(key)) return@forEach
+
+                val visible = a.text().trim()
+                val name = visible.ifBlank { "Ch. $key" }
+                chapterMap[key] = name to href
             }
         }
 
-        // Page 1
-        collectAnchorsFromDoc(document)
+        collectFromDoc(document)
 
-        val seenChapterNums = mutableSetOf<String>()
-        fun noteChapterNums() {
-            allAnchors.forEach { (_, href) ->
-                Regex("-chapter-([\\d.]+)").find(href)?.groupValues?.get(1)
-                    ?.let { seenChapterNums.add(it) }
-            }
-        }
-        noteChapterNums()
-
-        // Pages 2..N until we've covered every chapter up to latestChapterNum
-        val targetUnique = latestChapterNum + 1   // e.g. 49 for chapters 0..48
-        val maxPage = 60                          // 734 items ÷ 20 per page ≈ 37, cap at 60
-
+        // ── Pagination until no new chapters appear ───────────────────────
+        val maxPage = 80
         for (page in 2..maxPage) {
-            if (latestChapterNum > 0 && seenChapterNums.size >= targetUnique) break
+            if (expectedUnique > 0 && chapterMap.size >= expectedUnique) break
 
-            val pageUrl = "$url?page=$page"
+            val pageUrl = if (url.contains("?")) "$url&page=$page" else "$url?page=$page"
             val pageHtml = fetchHtmlWithWebView(pageUrl)
             if (pageHtml.isBlank()) break
 
             val pageDoc = Jsoup.parse(pageHtml)
-            val pageAnchors = pageDoc.select("a[href*='-chapter-']")
-            if (pageAnchors.isEmpty()) break
+            val before  = chapterMap.size
+            collectFromDoc(pageDoc)
 
-            // Guard: if the first anchor of this page was already seen, pagination
-            // isn't working — break to avoid looping on page 1 forever
-            val firstHref = pageAnchors.firstOrNull()?.attr("href") ?: break
-            if (allAnchors.any { it.second == firstHref }) break
-
-            collectAnchorsFromDoc(pageDoc)
-            noteChapterNums()
+            if (chapterMap.size == before) break
         }
 
-        // ═══ Dedupe by chapter number — keeps first occurrence (best-ranked group) ═══
-        val finalSeen = mutableSetOf<String>()
-        val dedupedLinks = allAnchors.filter { (_, href) ->
-            val num = Regex("-chapter-([\\d.]+)").find(href)?.groupValues?.get(1) ?: href
-            finalSeen.add(num)
-        }
+        // ── Sort ascending → episode 1 = chapter 0 ────────────────────────
+        val sortedChapters = chapterMap.entries
+            .sortedBy { it.key.toDoubleOrNull() ?: 0.0 }
+            .toList()
 
-        // ═══ Episodes — sequential 1..N, name preserves suffix ═══
-        val episodes: List<Episode> = dedupedLinks.mapIndexed { index, (name, href) ->
+        val episodes: List<Episode> = sortedChapters.mapIndexed { index, (key, pair) ->
+            val (name, href) = pair
             newEpisode(fixUrl(href)) {
-                this.name      = name
+                this.name      = name.ifBlank { "Ch. $key" }
                 this.season    = 1
                 this.episode   = index + 1
                 this.posterUrl = posterUrl
             }
         }
 
-        val finalEpisodes = if (episodes.isEmpty() && latestChapterNum > 0) {
+        // ── Fallback: only first/last URL available ───────────────────────
+        val finalEpisodes: List<Episode> = if (episodes.isEmpty() && latestChapterNum > 0) {
             buildList {
                 firstChapterUrl?.let { u ->
+                    val n = chapterNumberFromHref(u) ?: 0.0
                     add(newEpisode(fixUrl(u)) {
-                        this.name = "Ch. 0"
-                        this.season = 1
-                        this.episode = 1
+                        this.name      = "Ch. ${formatChapterNum(n)}"
+                        this.season    = 1
+                        this.episode   = 1
                         this.posterUrl = posterUrl
                     })
                 }
-                if (latestChapterNum > 1) {
-                    latestChapterUrl?.let { u ->
-                        add(newEpisode(fixUrl(u)) {
-                            this.name = "Ch. $latestChapterNum"
-                            this.season = 1
-                            this.episode = 2
-                            this.posterUrl = posterUrl
-                        })
-                    }
+                latestChapterUrl?.let { u ->
+                    val n = chapterNumberFromHref(u) ?: latestChapterNum.toDouble()
+                    add(newEpisode(fixUrl(u)) {
+                        this.name      = "Ch. ${formatChapterNum(n)}"
+                        this.season    = 1
+                        this.episode   = 2
+                        this.posterUrl = posterUrl
+                    })
                 }
             }
-        } else episodes
+        } else {
+            episodes
+        }
 
         if (finalEpisodes.isEmpty()) return null
 
@@ -449,6 +488,9 @@ class ComixProvider : MainAPI() {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  loadLinks()
+    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -458,7 +500,7 @@ class ComixProvider : MainAPI() {
         val activity = CommonActivity.activity as? AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
-        val chapterName = Regex("chapter[-/](\\d+)").find(data)
+        val chapterName = Regex("-chapter-([\\d.]+)").find(data)
             ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
 
         activity.runOnUiThread {
