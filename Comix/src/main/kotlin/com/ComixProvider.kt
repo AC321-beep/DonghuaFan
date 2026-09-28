@@ -54,6 +54,9 @@ class ComixProvider : MainAPI() {
     override val hasMainPage = true
     override val hasQuickSearch = true
 
+    // Global variable to securely store and share the User-Agent with native HTTP requests
+    private var customUserAgent: String? = null
+
     override val mainPage = mainPageOf(
         "trending" to "Trending Today",
         "follows"  to "Most Followed",
@@ -62,7 +65,7 @@ class ComixProvider : MainAPI() {
     )
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  WebView fetcher (Fast Exit for Cookies & Clearance)
+    //  WebView fetcher
     // ═══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun fetchHtmlWithWebView(url: String): String =
@@ -72,7 +75,10 @@ class ComixProvider : MainAPI() {
 
             suspendCancellableCoroutine { cont ->
                 val wv = WebView(activity)
-                val customUa = userAgentString.replace("; wv", "").replace("Android TV", "Android")
+                
+                // FIXED: Correctly grab User-Agent from WebSettings
+                val customUa = wv.settings.userAgentString.replace("; wv", "").replace("Android TV", "Android")
+                customUserAgent = customUa
                 
                 wv.settings.apply {
                     javaScriptEnabled = true
@@ -337,7 +343,6 @@ class ComixProvider : MainAPI() {
     //  load()
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
-        // Fetch Page 1 securely to bypass Cloudflare
         val html1 = fetchHtmlWithWebView(url)
         if (html1.isBlank()) return null
         val document = Jsoup.parse(html1)
@@ -382,7 +387,6 @@ class ComixProvider : MainAPI() {
                 val m = Regex("""chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return@forEach
                 val numStr = m.groupValues[1].toDoubleOrNull()?.let { formatChapterNum(it) } ?: return@forEach
                 
-                // Ensures we only scrape the valid chapter links and deduplicates simultaneously
                 if (a.hasClass("mchap-row__primary") || a.parents().any { it.hasClass("mchap-item") }) {
                     if (!parsedChapterLinks.containsKey(numStr)) {
                         val visible = a.text().trim()
@@ -403,18 +407,19 @@ class ComixProvider : MainAPI() {
         }
 
         // BATCH NATIVE HTTP FETCHING
-        // Pulls all authentic URLs natively, ignoring JS Timeouts and evading Cloudflare Limits
         if (maxPage > 1) {
-            val customUa = userAgentString.replace("; wv", "").replace("Android TV", "Android")
+            // FIXED: Using the safely stored User-Agent and setting a fallback just in case
+            val ua = customUserAgent ?: "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Mobile Safari/537.36"
             val cookies = runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull() ?: ""
+            
             val headers = mapOf(
                 "Cookie" to cookies,
-                "User-Agent" to customUa,
+                "User-Agent" to ua,
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "Referer" to url
             )
 
-            // Batch fetch 5 pages at a time to prevent 429 Too Many Requests
+            // Batch fetch 5 pages concurrently to prevent 429 Too Many Requests
             val pages = (2..maxPage).toList()
             for (chunk in pages.chunked(5)) {
                 coroutineScope {
@@ -431,7 +436,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // Sort accurately and map back to Episode object
         val sortedKeys = parsedChapterLinks.keys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
         
         val episodes = sortedKeys.mapIndexed { index, key ->
