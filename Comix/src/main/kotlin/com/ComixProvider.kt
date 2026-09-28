@@ -58,10 +58,10 @@ class ComixProvider : MainAPI() {
     )
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  WebView fetcher (Restored for High Speed)
+    //  WebView fetcher (Authentic URL Scraper & Fixed Homepage)
     // ═══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun fetchHtmlWithWebView(url: String): String =
+    private suspend fun fetchHtmlWithWebView(url: String, isDetailPage: Boolean = false): String =
         withContext(Dispatchers.Main) {
             val activity = CommonActivity.activity ?: return@withContext ""
             if (activity.isFinishing || activity.isDestroyed) return@withContext ""
@@ -84,42 +84,142 @@ class ComixProvider : MainAPI() {
 
                 val handler = Handler(Looper.getMainLooper())
                 var resumed = false
+                var lastHtml = ""
 
-                fun finish(html: String) {
+                fun finish(result: String) {
                     if (resumed) return
                     resumed = true
                     handler.removeCallbacksAndMessages(null)
                     runCatching { wv.stopLoading(); wv.destroy() }
-                    if (cont.isActive) cont.resume(html)
+                    if (cont.isActive) cont.resume(result)
                 }
 
-                handler.postDelayed({ finish("") }, 8_000L)
+                handler.postDelayed({ finish(lastHtml) }, if (isDetailPage) 15_000L else 8_000L)
 
                 var attempts = 0
                 lateinit var checkHtml: Runnable
                 checkHtml = Runnable {
                     if (resumed) return@Runnable
-                    wv.evaluateJavascript(
-                        "(function(){ return document.documentElement.outerHTML; })();"
-                    ) { raw ->
-                        if (resumed) return@evaluateJavascript
-                        val html = parseJsString(raw) ?: ""
-
-                        if (html.contains("lrow") ||
-                            html.contains("list-grid") ||
-                            html.contains("list-empty") ||
-                            html.contains("initial-data") ||
-                            html.contains("mchap-item")) {
-                            runCatching { CookieManager.getInstance().flush() }
-                            finish(html)
-                            return@evaluateJavascript
+                    
+                    if (isDetailPage) {
+                        // INJECT JS: Extracts AUTHENTIC URLs with unique IDs to prevent 404s
+                        val jsScript = """
+                            if (!window.comixStarted) {
+                                window.comixStarted = true;
+                                window.comixResult = 'LOADING';
+                                (async function() {
+                                    try {
+                                        let map = new Map();
+                                        function extract(doc) {
+                                            let items = doc.querySelectorAll('a[href*="chapter-"]');
+                                            items.forEach(a => {
+                                                let href = a.getAttribute('href');
+                                                let m = href.match(/chapter-([\d.]+)/i);
+                                                if (m) {
+                                                    let num = parseFloat(m[1]);
+                                                    let key = num % 1 === 0 ? num.toString() : num.toString();
+                                                    if (!map.has(key)) {
+                                                        let text = (a.innerText || "").trim().replace(/\n/g, ' ');
+                                                        map.set(key, { num: num, name: text || 'Ch. ' + key, href: href });
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        
+                                        let retries = 0;
+                                        while(document.querySelectorAll('.mchap-item').length === 0 && !document.querySelector('.mchap-empty, .list-empty') && retries < 20) {
+                                            await new Promise(r => setTimeout(r, 200));
+                                            retries++;
+                                        }
+                                        
+                                        extract(document);
+                                        
+                                        let maxPage = 1;
+                                        document.querySelectorAll('.npager__num').forEach(el => {
+                                            let p = parseInt(el.innerText);
+                                            if (p > maxPage) maxPage = p;
+                                        });
+                                        
+                                        if (maxPage > 1) {
+                                            let current = 2;
+                                            while (current <= maxPage) {
+                                                let promises = [];
+                                                for (let i = 0; i < 6 && current <= maxPage; i++, current++) {
+                                                    let purl = window.location.href.split('?')[0] + '?page=' + current;
+                                                    promises.push(fetch(purl).then(r => r.text()).catch(e => ""));
+                                                }
+                                                let htmls = await Promise.all(promises);
+                                                let parser = new DOMParser();
+                                                htmls.forEach(html => {
+                                                    if (html) {
+                                                        let doc = parser.parseFromString(html, 'text/html');
+                                                        extract(doc);
+                                                    }
+                                                });
+                                            }
+                                        }
+                                        
+                                        let chapters = Array.from(map.values());
+                                        let initData = document.querySelector('#initial-data');
+                                        let initText = initData ? (initData.innerText || initData.innerHTML) : "";
+                                        
+                                        window.comixResult = JSON.stringify({
+                                            initialData: initText.trim(),
+                                            chapters: chapters
+                                        });
+                                    } catch(e) {
+                                        window.comixResult = 'ERROR: ' + e.toString();
+                                    }
+                                })();
+                            }
+                            window.comixResult;
+                        """.trimIndent()
+                        
+                        wv.evaluateJavascript(jsScript) { rawStr ->
+                            if (resumed) return@evaluateJavascript
+                            val raw = parseJsString(rawStr)
+                            
+                            if (raw != null && raw != "LOADING" && raw != "null" && raw.isNotBlank()) {
+                                lastHtml = raw
+                                runCatching { CookieManager.getInstance().flush() }
+                                finish(raw)
+                            } else {
+                                attempts++
+                                if (attempts < 60 && !resumed) handler.postDelayed(checkHtml, 250L) 
+                                else finish(lastHtml)
+                            }
                         }
+                    } else {
+                        // Standard Mode for Main / Search pages (Fixed to prevent blank homepages)
+                        val jsScript = """
+                            (function(){ 
+                                var count = document.querySelectorAll('a[href*="/title/"], .lrow, .list-grid, article, .manga-card').length;
+                                var hasInit = document.querySelector('#initial-data') ? 1 : 0;
+                                if (count === 0 && document.querySelector('.list-empty')) count = -1;
+                                var status = (count !== 0 || hasInit !== 0) ? 'READY' : 'WAIT';
+                                return status + '_COMIX_SPLIT_' + document.documentElement.outerHTML; 
+                            })();
+                        """.trimIndent()
+                        
+                        wv.evaluateJavascript(jsScript) { rawStr ->
+                            if (resumed) return@evaluateJavascript
+                            
+                            val raw = parseJsString(rawStr) ?: ""
+                            val parts = raw.split("_COMIX_SPLIT_", limit = 2)
+                            val status = parts.getOrNull(0) ?: ""
+                            val html = parts.getOrNull(1) ?: raw
+                            
+                            if (html.isNotBlank() && html != "null") lastHtml = html
 
-                        attempts++
-                        if (attempts < 30 && !resumed) {
-                            handler.postDelayed(checkHtml, 300L)
-                        } else {
-                            finish(html)
+                            if (status == "READY") {
+                                runCatching { CookieManager.getInstance().flush() }
+                                finish(lastHtml)
+                                return@evaluateJavascript
+                            }
+
+                            attempts++
+                            if (attempts < 30 && !resumed) handler.postDelayed(checkHtml, 300L)
+                            else finish(lastHtml)
                         }
                     }
                 }
@@ -319,15 +419,51 @@ class ComixProvider : MainAPI() {
     private fun formatChapterNum(n: Double): String =
         if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
 
-
     // ═══════════════════════════════════════════════════════════════════════
     //  load()
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
-        val html1 = fetchHtmlWithWebView(url)
-        if (html1.isBlank()) return null
-        val document = Jsoup.parse(html1)
-        val initialData = extractInitialDataJson(document) ?: return null
+        val payload = fetchHtmlWithWebView(url, isDetailPage = true)
+        if (payload.isBlank()) return null
+
+        var initialData: JSONObject? = null
+        val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
+
+        // Determine if WebView successfully injected our custom JSON or timed out with raw HTML
+        if (payload.startsWith("{")) {
+            val payloadObj = runCatching { JSONObject(payload) }.getOrNull()
+            val initStr = payloadObj?.optString("initialData")
+            if (!initStr.isNullOrBlank()) {
+                initialData = runCatching { JSONObject(initStr) }.getOrNull()
+            }
+            
+            // Extract the authentic URLs scraped by the background fetcher
+            val episodesArray = payloadObj?.optJSONArray("chapters")
+            if (episodesArray != null) {
+                for (i in 0 until episodesArray.length()) {
+                    val epObj = episodesArray.optJSONObject(i) ?: continue
+                    val name = epObj.optString("name")
+                    val href = epObj.optString("href") // AUTHENTIC URL
+                    val numStr = epObj.optDouble("num").let { formatChapterNum(it) }
+                    parsedChapterLinks[numStr] = name to href
+                }
+            }
+        } else {
+            // Fallback: If JS timed out, parse the standard HTML returned
+            val document = Jsoup.parse(payload)
+            initialData = extractInitialDataJson(document)
+            document.select("a[href*='chapter-']").forEach { a ->
+                val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
+                val num = chapterNumberFromHref(href) ?: return@forEach
+                val key = formatChapterNum(num)
+                if (!parsedChapterLinks.containsKey(key)) {
+                    val visible = a.text().trim()
+                    parsedChapterLinks[key] = visible.ifBlank { "Ch. $key" } to href
+                }
+            }
+        }
+
+        if (initialData == null) return null
 
         var detail: JSONObject? = null
         initialData.optJSONObject("queries")?.let { queries ->
@@ -363,47 +499,11 @@ class ComixProvider : MainAPI() {
             }
         }.distinct()
 
-        // Synthetic Generator Data extracted from initial-data JSON
-        val latestChapterNum = d.optInt("latestChapter", 0)
-        val firstChapterUrl  = d.optString("firstChapterUrl").takeIf { it.isNotBlank() }
-        val startsAtZero = firstChapterUrl?.contains("chapter-0", ignoreCase = true) == true
-        val startCh = if (startsAtZero) 0 else 1
-
-        val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
-
-        // Extract what we can from Page 1 (This grabs real URLs for the latest 20, plus any .5 fractionals)
-        document.select("a[href*='chapter-']").forEach { a ->
-            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
-            val num = chapterNumberFromHref(href) ?: return@forEach
-            val key = formatChapterNum(num)
-            
-            // This intrinsically handles the deduplication for multiple scanlations
-            if (!parsedChapterLinks.containsKey(key)) {
-                val visible = a.text().trim()
-                parsedChapterLinks[key] = visible.ifBlank { "Ch. $key" } to href
-            }
-        }
-
-        // Generate synthetic list instantly without paginating
-        val allChapterKeys = mutableSetOf<String>()
-        if (latestChapterNum > 0) {
-            for (i in startCh..latestChapterNum) {
-                allChapterKeys.add(i.toString())
-            }
-        }
+        // Build the episodes using ONLY the authentic URLs mapped earlier
+        val sortedKeys = parsedChapterLinks.keys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
         
-        // Add any fractional chapters (48.5) or items parsed from Page 1 that aren't integers
-        parsedChapterLinks.keys.forEach { allChapterKeys.add(it) }
-
-        val sortedKeys = allChapterKeys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
-
         val episodes = sortedKeys.mapIndexed { index, key ->
-            val realData = parsedChapterLinks[key]
-            
-            // Fallback to a synthetic URL if we didn't scrape it from Page 1. 
-            // The reader fragment handles this via regex in loadLinks.
-            val epUrl = realData?.second ?: "$url/chapter-$key"
-            val epName = realData?.first ?: "Ch. $key"
+            val (epName, epUrl) = parsedChapterLinks[key]!!
 
             newEpisode(fixUrl(epUrl)) {
                 this.name = epName
@@ -441,7 +541,6 @@ class ComixProvider : MainAPI() {
         val activity = CommonActivity.activity as? AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
-        // Matches correctly against both authentic and synthetic URLs
         val chapterName = Regex("""chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(data)
             ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
 
