@@ -9,9 +9,6 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -37,14 +34,12 @@ class Anime4iProvider : MainAPI() {
 
     private val cardSelector = "article.bs, div.bsx"
 
-    // Exactly TWO categories as requested
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update" to "Latest Releases",
         "anime/?status=&type=&order=popular" to "Popular Today"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Appends the page number correctly to the queries defined in mainPageOf
         val url = "$mainUrl/${request.data}&page=$page"
 
         val document = try {
@@ -57,7 +52,6 @@ class Anime4iProvider : MainAPI() {
             null
         } ?: return newHomePageResponse(request.name, emptyList())
 
-        // Scrape the cards
         val items = document.select(cardSelector)
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
@@ -222,29 +216,14 @@ class Anime4iProvider : MainAPI() {
                 finalUrl = "https://ok.ru/videoembed/$okId"
             }
 
-            if (finalUrl.contains("playhydrax.com")) {
-                finalUrl = finalUrl.replace("playhydrax.com", "abyssplayer.com")
-            }
-
             val dedupUrl = finalUrl.substringBefore("?")
             if (!extractedIframeUrls.add(dedupUrl)) return
 
             try {
-                val isHandled = when {
-                    "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> {
-                        OkRuCustom().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback)
-                        true
-                    }
-                    "p2pstream" in finalUrl -> { P2pstream().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
-                    "upns.live" in finalUrl -> { UpnsLive().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
-                    "emturbovid" in finalUrl -> { Emturbovid().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
-                    "bysekoze.com" in finalUrl -> { Bysekoze().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
-                    "rumble.com" in finalUrl -> { Rumble().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
-                    "abyssplayer.com" in finalUrl -> { AbyssPlayer().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
-                    else -> false
-                }
-
-                if (!isHandled) {
+                // Route OkRu to custom class, everything else (like Dailymotion) to native loadExtractor
+                if ("ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl) {
+                    OkRuCustom().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback)
+                } else {
                     loadExtractor(finalUrl, referer = mainUrl, trackingSubtitleCallback, trackingCallback)
                 }
             } catch (e: CancellationException) {
@@ -253,7 +232,7 @@ class Anime4iProvider : MainAPI() {
         }
 
         val rawHtml = document.html()
-        val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|dailymotion\.com|dai\.ly|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com|abyssplayer\.com|playhydrax\.com)[^"'\s<>]+""")
+        val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|dailymotion\.com|dai\.ly)[^"'\s<>]+""")
         val rawMatches = globalUrlRegex.findAll(rawHtml)
             .map { it.value.replace("\\/", "/") }
             .toList()
@@ -313,4 +292,99 @@ class Anime4iProvider : MainAPI() {
 
         return true
     }
+}
+
+// ---------------------------------------------------------
+// CUSTOM EXTRACTORS
+// ---------------------------------------------------------
+
+class OkRuCustom : ExtractorApi() {
+    override val name = "OkRu"
+    override val mainUrl = "https://ok.ru"
+    override val requiresReferer = false
+
+    companion object {
+        private val RE_VIDEO_ID = Regex("""/video(?:embed)?/(\d+)""")
+        private val RE_MID_PARAM = Regex("""[?&]mid=(\d+)""")
+
+        private val QUALITY_MAP = mapOf(
+            "mobile" to Qualities.P144.value,
+            "lowest" to Qualities.P240.value,
+            "low"    to Qualities.P360.value,
+            "sd"     to Qualities.P480.value,
+            "hd"     to Qualities.P720.value,
+            "full"   to Qualities.P1080.value,
+            "quad"   to Qualities.P1440.value,
+            "ultra"  to Qualities.P2160.value,
+        )
+    }
+
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        try {
+            val id = RE_VIDEO_ID.find(url)?.groupValues?.get(1)
+                ?: RE_MID_PARAM.find(url)?.groupValues?.get(1)
+                ?: url.substringAfterLast("/").substringBefore("?")
+            if (id.isBlank() || !id.all { it.isDigit() }) return
+
+            val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id"
+            val json = app.post(apiUrl).parsedSafe<OkRuResponse>() ?: return
+
+            // MP4 first
+            json.videos?.forEach { video ->
+                val qName = video.name?.lowercase().orEmpty()
+                val vidUrl = video.url.orEmpty()
+                if (vidUrl.isBlank() || vidUrl.contains("usr_login")) return@forEach
+
+                val qualityValue = QUALITY_MAP[qName] ?: Qualities.Unknown.value
+                val displayLabel = if (qualityValue != Qualities.Unknown.value) "MP4 ${qualityValue}p" else "MP4 $qName"
+
+                callback(
+                    newExtractorLink(
+                        name = "${this.name} MP4",
+                        source = "${this.name} $displayLabel",
+                        url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"),
+                        type = INFER_TYPE
+                    ) {
+                        this.referer = "https://ok.ru/"
+                        this.quality = qualityValue
+                    }
+                )
+            }
+
+            // HLS fallback -> DASH fallback
+            val hlsUrl = json.hlsManifestUrl.orEmpty()
+            if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
+                M3u8Helper.generateM3u8(
+                    "$name HLS",
+                    hlsUrl.replace("\\u0026", "&").replace("\\/", "/"),
+                    url
+                ).forEach(callback)
+            } else {
+                val dashUrl = json.dashManifestUrl.orEmpty()
+                if (dashUrl.isNotBlank() && !dashUrl.contains("usr_login")) {
+                    callback(
+                        newExtractorLink(
+                            name = "$name DASH",
+                            source = "$name DASH",
+                            url = dashUrl.replace("\\u0026", "&").replace("\\/", "/"),
+                            type = ExtractorLinkType.DASH
+                        ) { this.referer = "https://ok.ru/" }
+                    )
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private data class OkRuResponse(
+        val videos: List<OkRuVideo>? = null,
+        val hlsManifestUrl: String? = null,
+        val dashManifestUrl: String? = null,
+    )
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private data class OkRuVideo(
+        val name: String? = null,
+        val url: String? = null,
+    )
 }
