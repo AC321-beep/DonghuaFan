@@ -20,6 +20,7 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.addEpisodes
 import com.lagradost.cloudstream3.addSub
+import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.fixUrl
 import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newAnimeLoadResponse
@@ -28,6 +29,9 @@ import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -50,6 +54,8 @@ class ComixProvider : MainAPI() {
     override val hasMainPage = true
     override val hasQuickSearch = true
 
+    private var customUserAgent: String? = null
+
     override val mainPage = mainPageOf(
         "trending" to "Trending Today",
         "follows"  to "Most Followed",
@@ -58,7 +64,7 @@ class ComixProvider : MainAPI() {
     )
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  WebView fetcher (Cloudflare-Bypass JS & Bulletproof Fallback)
+    //  WebView fetcher
     // ═══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun fetchHtmlWithWebView(url: String, isDetailPage: Boolean = false): String =
@@ -68,11 +74,15 @@ class ComixProvider : MainAPI() {
 
             suspendCancellableCoroutine { cont ->
                 val wv = WebView(activity)
+                
+                val customUa = wv.settings.userAgentString.replace("; wv", "").replace("Android TV", "Android")
+                customUserAgent = customUa
+                
                 wv.settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
                     loadsImagesAutomatically = false
-                    userAgentString = userAgentString.replace("; wv", "").replace("Android TV", "Android")
+                    userAgentString = customUa
                 }
 
                 runCatching {
@@ -94,7 +104,6 @@ class ComixProvider : MainAPI() {
                     if (cont.isActive) cont.resume(result)
                 }
 
-                // If 15 seconds pass, grab whatever JSON or HTML is ready to prevent crashes
                 handler.postDelayed({
                     if (!resumed) {
                         wv.evaluateJavascript("(function(){ return window.comixResult && window.comixResult !== 'LOADING' ? window.comixResult : document.documentElement.outerHTML; })();") { rawStr ->
@@ -152,7 +161,6 @@ class ComixProvider : MainAPI() {
                                             let current = 2;
                                             while (current <= maxPage) {
                                                 let promises = [];
-                                                // Batch size 4 prevents Cloudflare from blocking concurrent fetches
                                                 for (let i = 0; i < 4 && current <= maxPage; i++, current++) {
                                                     let purl = window.location.href.split('?')[0] + '?page=' + current;
                                                     promises.push(fetch(purl).then(r => r.text()).catch(e => ""));
@@ -165,7 +173,6 @@ class ComixProvider : MainAPI() {
                                                         extract(doc);
                                                     }
                                                 });
-                                                // Wait 300ms before fetching the next batch to mimic human scrolling
                                                 await new Promise(r => setTimeout(r, 300));
                                             }
                                         }
@@ -226,7 +233,7 @@ class ComixProvider : MainAPI() {
                             }
 
                             attempts++
-                            if (attempts < 30 && !resumed) handler.postDelayed(checkHtml, 300L)
+                            if (attempts < 80 && !resumed) handler.postDelayed(checkHtml, 100L)
                             else finish(lastHtml)
                         }
                     }
@@ -355,56 +362,62 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Main page
-    // ═══════════════════════════════════════════════════════════════════════
-   // ═══════════════════════════════════════════════════════════════════════
-    //  Main page
+    //  Main page (Fixed Pagination Loop)
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
+        val pageUrl = if (page == 1) {
+            "$mainUrl/"
+        } else {
+            "$mainUrl/${request.data}?page=$page"
+        }
+
+        var html = ""
+        
+        // Attempt native HTTP for speed on pagination
+        if (page > 1) {
+            val ua = customUserAgent ?: "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Mobile Safari/537.36"
+            val cookies = runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull() ?: ""
+            val headers = mapOf("Cookie" to cookies, "User-Agent" to ua)
+            
+            html = runCatching { app.get(pageUrl, headers = headers).text }.getOrNull() ?: ""
+        }
+
+        // Fallback to WebView if Native HTTP fails or triggers Cloudflare
+        if (html.isBlank() || html.contains("Just a moment...")) {
+            html = fetchHtmlWithWebView(pageUrl)
+        }
+
+        if (html.isBlank()) return null
+
         var items: List<SearchResponse> = emptyList()
 
-        if (page == 1) {
-            // Page 1: Scrape the homepage directly for fast initial loading
-            val html = fetchHtmlWithWebView("$mainUrl/")
-            if (html.isNotBlank()) {
-                extractInitialDataJson(html)?.let { initial ->
-                    items = readQueries(initial) { k ->
-                        if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
-                        val subtype = k.optString(1)
-                        val params = k.optJSONObject(2) ?: return@readQueries false
-                        when (request.data) {
-                            "trending" -> subtype == "top"  && params.optString("type") == "trending"
-                            "follows"  -> subtype == "top"  && params.optString("type") == "follows"
-                            "hot"      -> subtype == "list" && params.optString("scope") == "hot"
-                            "latest"   -> subtype == "list" && params.optJSONObject("order")?.optString("created_at") == "desc"
-                            else -> false
-                        }
-                    }
+        extractInitialDataJson(html)?.let { initial ->
+            items = readQueries(initial) { k ->
+                if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
+                val subtype = k.optString(1)
+                val params = k.optJSONObject(2) ?: return@readQueries false
+                
+                // CRITICAL FIX: Ensure we strictly match the JSON data for the requested page number.
+                // Prevents infinite loops caused by reading global "Page 1" sidebars cached in the JSON.
+                val jsonPage = params.optInt("page", 1)
+                if (page > 1 && jsonPage != page) return@readQueries false
+
+                when (request.data) {
+                    "trending" -> subtype == "top"  && params.optString("type") == "trending"
+                    "follows"  -> subtype == "top"  && params.optString("type") == "follows"
+                    "hot"      -> subtype == "list" && params.optString("scope") == "hot"
+                    "latest"   -> subtype == "list" && params.optJSONObject("order")?.optString("created_at") == "desc"
+                    else -> false
                 }
-                if (items.isEmpty()) items = extractSearchResultsDom(Jsoup.parse(html))
-            }
-        } else {
-            // Page 2+: Bypass the homepage and query the dedicated browse endpoints
-            val sortParam = when (request.data) {
-                "latest" -> "created_at:desc"
-                "hot"    -> "views_7d:desc"
-                else     -> request.data // "trending" or "follows"
-            }
-            
-            val pageUrl = "$mainUrl/browse?sort=$sortParam&page=$page"
-            val html = fetchHtmlWithWebView(pageUrl)
-            
-            if (html.isNotBlank()) {
-                items = extractSearchResults(html)
             }
         }
 
+        if (items.isEmpty()) items = extractSearchResultsDom(Jsoup.parse(html))
+
         if (items.isEmpty()) return null
-        
-        // hasNext = true ensures Cloudstream knows it can keep scrolling
         return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = items.size >= 20)
     }
 
@@ -414,14 +427,17 @@ class ComixProvider : MainAPI() {
         val encodedQuery = URLEncoder.encode(cleanQuery, "UTF-8")
         val searchUrl = "$mainUrl/browse?q=$encodedQuery"
 
-        val html1 = fetchHtmlWithWebView(searchUrl)
-        var results = if (html1.isNotBlank()) extractSearchResults(html1) else emptyList()
-
-        if (results.isEmpty()) {
-            val html2 = fetchHtmlWithWebView(searchUrl)
-            if (html2.isNotBlank()) results = extractSearchResults(html2)
+        val ua = customUserAgent ?: "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Mobile Safari/537.36"
+        val cookies = runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull() ?: ""
+        val headers = mapOf("Cookie" to cookies, "User-Agent" to ua)
+        
+        var html = runCatching { app.get(searchUrl, headers = headers).text }.getOrNull() ?: ""
+        
+        if (html.isBlank() || html.contains("Just a moment...")) {
+            html = fetchHtmlWithWebView(searchUrl)
         }
 
+        val results = if (html.isNotBlank()) extractSearchResults(html) else emptyList()
         val lower = cleanQuery.lowercase()
         val filtered = results.filter { it.name.lowercase().contains(lower) }
         return (filtered.ifEmpty { results }).distinctBy { it.url }
@@ -442,7 +458,6 @@ class ComixProvider : MainAPI() {
         var initialData: JSONObject? = null
         val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
 
-        // Determine if JS background fetch succeeded or timed out
         if (payload.startsWith("{")) {
             val payloadObj = runCatching { JSONObject(payload) }.getOrNull()
             val initStr = payloadObj?.optString("initialData")
@@ -461,7 +476,6 @@ class ComixProvider : MainAPI() {
                 }
             }
         } else {
-            // Safety Fallback: Parse raw HTML if network timed out
             val document = Jsoup.parse(payload)
             initialData = extractInitialDataJson(document)
             document.select("a.mchap-row__primary, a[href*='-chapter-']").forEach { a ->
@@ -511,7 +525,6 @@ class ComixProvider : MainAPI() {
             }
         }.distinct()
 
-        // ALWAYS fill the missing chapters so you NEVER get "few chapters only"
         val latestChapterNum = d.optInt("latestChapter", 0)
         val firstChapterUrl  = d.optString("firstChapterUrl").takeIf { it.isNotBlank() }
         val startsAtZero = firstChapterUrl?.contains("-chapter-0", ignoreCase = true) == true
@@ -529,9 +542,6 @@ class ComixProvider : MainAPI() {
         val episodes = sortedKeys.mapIndexed { index, key ->
             val realData = parsedChapterLinks[key]
             
-            // 1. Prioritize Real Auth URL
-            // 2. Explicitly link first chapter to prevent 404s for Ch 0/1
-            // 3. Last Resort Synthetic URL
             val epUrl = if (realData != null) {
                 realData.second
             } else if (key == "0" && startsAtZero && firstChapterUrl != null) {
