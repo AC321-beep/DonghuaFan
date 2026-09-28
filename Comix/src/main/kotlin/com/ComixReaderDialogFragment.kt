@@ -616,7 +616,7 @@ class ComixReaderDialogFragment : DialogFragment() {
         )
     }
 
- private fun injectReaderOptimizations(view: WebView) {
+    private fun injectReaderOptimizations(view: WebView) {
         view.evaluateJavascript(
             """
             (function() {
@@ -678,13 +678,13 @@ class ComixReaderDialogFragment : DialogFragment() {
                 }
                 report();
 
-                /* ── 3. Tap-to-scroll (Intelligent Next Chapter) ─────────────────────── */
+                /* ── 3. Tap-to-scroll (Intelligent Next Chapter) ────────── */
                 if (!window.__comixTapZonesInstalled) {
                   window.__comixTapZonesInstalled = true;
 
-                  var TAP_MAX_MOVE  = 14;   // px
-                  var TAP_MAX_TIME  = 350;  // ms
-                  var TAP_DEBOUNCE  = 180;  // ms
+                  var TAP_MAX_MOVE  = 14;   
+                  var TAP_MAX_TIME  = 350;  
+                  var TAP_DEBOUNCE  = 180;  
 
                   var startX = 0, startY = 0, startT = 0, lastTapEnd = 0;
                   var moved = false;
@@ -706,38 +706,46 @@ class ComixReaderDialogFragment : DialogFragment() {
                     var w = window.innerWidth;
                     var h = window.innerHeight;
                     
-                    // Check if user is scrolled to the absolute bottom of the chapter
-                    var scrollPosition = window.innerHeight + window.scrollY;
-                    var bottomThreshold = document.body.offsetHeight - 50; 
-                    var isAtBottom = scrollPosition >= bottomThreshold;
+                    // Check scroll position (Internal scroll container OR window)
+                    var isAtBottom = false;
+                    var scrollContainer = document.querySelector('.rpage-main') || document.querySelector('.rpage-main--long-strip');
+                    
+                    try {
+                        if (scrollContainer && scrollContainer.scrollHeight > scrollContainer.clientHeight) {
+                            isAtBottom = (scrollContainer.scrollTop + scrollContainer.clientHeight) >= (scrollContainer.scrollHeight - 150);
+                        } else {
+                            var scrollPos = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
+                            var docHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+                            isAtBottom = (scrollPos + h) >= (docHeight - 150);
+                        }
+                    } catch(e) {}
 
                     if (x < w * 0.25) {
-                      // TAP LEFT: Always scroll up
-                      window.scrollBy({ top: -(window.innerHeight * 0.8), behavior: 'smooth' });
+                      // TAP LEFT: Scroll Up
+                      if (scrollContainer) scrollContainer.scrollBy({ top: -(h * 0.8), behavior: 'smooth' });
+                      window.scrollBy({ top: -(h * 0.8), behavior: 'smooth' });
                       flashTap(x, y);
                     } else if (x > w * 0.75) {
-                      // TAP RIGHT: Scroll down normally, BUT go to Next Chapter if at the bottom
+                      // TAP RIGHT: Scroll Down OR Next Chapter
                       if (isAtBottom) {
                         flashTap(x, y);
                         if (window.AndroidComix) window.AndroidComix.onTriggerNextChapter();
                       } else {
-                        window.scrollBy({ top:  (window.innerHeight * 0.8), behavior: 'smooth' });
+                        if (scrollContainer) scrollContainer.scrollBy({ top: (h * 0.8), behavior: 'smooth' });
+                        window.scrollBy({ top:  (h * 0.8), behavior: 'smooth' });
                         flashTap(x, y);
                       }
                     } else {
                       // TAP CENTER / BOTTOM
                       if (isAtBottom && y > h * 0.75) {
-                        // Tapped the bottom 25% of the screen while at the end of the chapter
                         flashTap(x, y);
                         if (window.AndroidComix) window.AndroidComix.onTriggerNextChapter();
                       } else {
-                        // Tapped the middle of the screen (Opens Menu)
                         if (window.AndroidComix) window.AndroidComix.onTapZone('center');
                       }
                     }
                   }
 
-                  // Track touch start
                   document.addEventListener('touchstart', function(e) {
                     if (e.touches.length !== 1) return;
                     var t = e.touches[0];
@@ -746,7 +754,6 @@ class ComixReaderDialogFragment : DialogFragment() {
                     moved = false;
                   }, { passive: true, capture: true });
 
-                  // Cancel if user moves finger
                   document.addEventListener('touchmove', function(e) {
                     if (e.touches.length !== 1) return;
                     var t = e.touches[0];
@@ -756,7 +763,6 @@ class ComixReaderDialogFragment : DialogFragment() {
                     }
                   }, { passive: true, capture: true });
 
-                  // Evaluate tap on release
                   document.addEventListener('touchend', function(e) {
                     if (e.changedTouches.length !== 1) return;
                     if (moved) return;
@@ -768,12 +774,10 @@ class ComixReaderDialogFragment : DialogFragment() {
                     handleTap(t.clientX, t.clientY);
                   }, { passive: true, capture: true });
 
-                  // Reset on cancel
                   document.addEventListener('touchcancel', function() {
                     moved = true;
                   }, { passive: true, capture: true });
 
-                  // Fallback for non-touch (desktop WebView, accessibility)
                   document.addEventListener('click', function(e) {
                     if ('ontouchstart' in window) return; 
                     if (isIgnored(e.target)) return;
@@ -878,6 +882,14 @@ class ComixReaderDialogFragment : DialogFragment() {
             dialog.activity?.runOnUiThread {
                 dialog.toggleToolbar()
                 dialog.hapticTap()
+            }
+        }
+
+        @JavascriptInterface
+        fun onTriggerNextChapter() {
+            dialog.activity?.runOnUiThread {
+                dialog.hapticTap()
+                dialog.triggerNextChapter()
             }
         }
 
