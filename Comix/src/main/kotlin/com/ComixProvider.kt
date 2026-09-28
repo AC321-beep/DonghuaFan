@@ -357,39 +357,54 @@ class ComixProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════
     //  Main page
     // ═══════════════════════════════════════════════════════════════════════
+   // ═══════════════════════════════════════════════════════════════════════
+    //  Main page
+    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
-        val html1 = fetchHtmlWithWebView("$mainUrl/")
-        if (html1.isBlank()) return null
-
         var items: List<SearchResponse> = emptyList()
 
-        extractInitialDataJson(html1)?.let { initial ->
-            items = readQueries(initial) { k ->
-                if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
-                val subtype = k.optString(1)
-                val params = k.optJSONObject(2) ?: return@readQueries false
-                when (request.data) {
-                    "trending" -> subtype == "top"  && params.optString("type") == "trending"
-                    "follows"  -> subtype == "top"  && params.optString("type") == "follows"
-                    "hot"      -> subtype == "list" && params.optString("scope") == "hot"
-                    "latest"   -> subtype == "list" &&
-                            params.optJSONObject("order")?.optString("created_at") == "desc"
-                    else -> false
+        if (page == 1) {
+            // Page 1: Scrape the homepage directly for fast initial loading
+            val html = fetchHtmlWithWebView("$mainUrl/")
+            if (html.isNotBlank()) {
+                extractInitialDataJson(html)?.let { initial ->
+                    items = readQueries(initial) { k ->
+                        if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
+                        val subtype = k.optString(1)
+                        val params = k.optJSONObject(2) ?: return@readQueries false
+                        when (request.data) {
+                            "trending" -> subtype == "top"  && params.optString("type") == "trending"
+                            "follows"  -> subtype == "top"  && params.optString("type") == "follows"
+                            "hot"      -> subtype == "list" && params.optString("scope") == "hot"
+                            "latest"   -> subtype == "list" && params.optJSONObject("order")?.optString("created_at") == "desc"
+                            else -> false
+                        }
+                    }
                 }
+                if (items.isEmpty()) items = extractSearchResultsDom(Jsoup.parse(html))
+            }
+        } else {
+            // Page 2+: Bypass the homepage and query the dedicated browse endpoints
+            val sortParam = when (request.data) {
+                "latest" -> "created_at:desc"
+                "hot"    -> "views_7d:desc"
+                else     -> request.data // "trending" or "follows"
+            }
+            
+            val pageUrl = "$mainUrl/browse?sort=$sortParam&page=$page"
+            val html = fetchHtmlWithWebView(pageUrl)
+            
+            if (html.isNotBlank()) {
+                items = extractSearchResults(html)
             }
         }
 
-        if (items.isEmpty()) items = extractSearchResultsDom(Jsoup.parse(html1))
-
-        if (items.isEmpty()) {
-            val html2 = fetchHtmlWithWebView("$mainUrl/${request.data}?page=$page")
-            if (html2.isNotBlank()) items = extractSearchResults(html2)
-        }
-
         if (items.isEmpty()) return null
+        
+        // hasNext = true ensures Cloudstream knows it can keep scrolling
         return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = items.size >= 20)
     }
 
