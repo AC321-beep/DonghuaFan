@@ -20,7 +20,6 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.addEpisodes
 import com.lagradost.cloudstream3.addSub
-import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.fixUrl
 import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newAnimeLoadResponse
@@ -59,7 +58,7 @@ class ComixProvider : MainAPI() {
     )
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  WebView fetcher (Optimized for Early Exit)
+    //  WebView fetcher (Turbo-Charged JS DOM Detection)
     // ═══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun fetchHtmlWithWebView(url: String): String =
@@ -95,41 +94,43 @@ class ComixProvider : MainAPI() {
                     if (cont.isActive) cont.resume(html)
                 }
 
-                handler.postDelayed({ finish("") }, 8_000L)
+                // Fallback timeout to ensure it never hangs infinitely 
+                handler.postDelayed({ finish("") }, 7_500L)
 
                 var attempts = 0
-                val isDetailPage = url.contains("/title/") || url.contains("/manga/") || url.contains("/comic/")
-                
                 lateinit var checkHtml: Runnable
+                
                 checkHtml = Runnable {
                     if (resumed) return@Runnable
-                    wv.evaluateJavascript(
-                        "(function(){ return document.documentElement.outerHTML; })();"
-                    ) { raw ->
+                    
+                    // INJECT JS: Count chapter/manga anchor tags directly in the DOM. 
+                    // This exits the millisecond React/Nuxt actually renders the content.
+                    val jsScript = """
+                        (function(){ 
+                            var count = document.querySelectorAll('a[href*="chapter-"], a[href*="/title/"], .lrow, .list-grid').length; 
+                            return count + '_COMIX_SPLIT_' + document.documentElement.outerHTML; 
+                        })();
+                    """.trimIndent()
+                    
+                    wv.evaluateJavascript(jsScript) { rawStr ->
                         if (resumed) return@evaluateJavascript
-                        val html = parseJsString(raw) ?: ""
+                        
+                        val raw = parseJsString(rawStr) ?: ""
+                        val parts = raw.split("_COMIX_SPLIT_", limit = 2)
+                        
+                        val domCount = parts.getOrNull(0)?.toIntOrNull() ?: 0
+                        val html = parts.getOrNull(1) ?: raw
 
-                        // OPTIMIZATION: Check if the JSON data payload is loaded. 
-                        // If it is, we don't need to wait for the DOM to visually render.
-                        val hasJsonData = html.contains("initial-data") && 
-                                (html.contains("queries") || html.contains("firstChapterUrl"))
-
-                        val ready = if (isDetailPage) {
-                            hasJsonData || html.contains("mchap-item") || html.contains("chapter-list") || 
-                            html.contains("list-empty") || html.contains("chapter_list")
-                        } else {
-                            hasJsonData || html.contains("lrow") || html.contains("list-grid") || 
-                            html.contains("list-empty")
-                        }
-
-                        if (ready) {
+                        // Exit immediately if JS has rendered the links, or if the page is explicitly empty
+                        if (domCount > 0 || html.contains("list-empty") || html.contains("mchap-empty")) {
                             runCatching { CookieManager.getInstance().flush() }
                             finish(html)
                             return@evaluateJavascript
                         }
 
                         attempts++
-                        if (attempts < 30 && !resumed) {
+                        // Check every 300ms up to 25 times (7.5 seconds)
+                        if (attempts < 25 && !resumed) {
                             handler.postDelayed(checkHtml, 300L)
                         } else {
                             finish(html)
@@ -382,7 +383,6 @@ class ComixProvider : MainAPI() {
     //  load()
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
-        // Page 1 uses WebView to bypass potential anti-bot and get initial data
         val html1 = fetchHtmlWithWebView(url)
         if (html1.isBlank()) return null
         val document = Jsoup.parse(html1)
@@ -459,24 +459,18 @@ class ComixProvider : MainAPI() {
 
         processHtmlAndJson(html1, document, initialData)
 
-        // ── FAST PAGINATION: Raw HTTP instead of WebViews ───────────────────────
+        // ── RESTORED: FAST WEBVIEW PAGINATION ───────────────────────
         val maxPage = 40 
         
-        // Grab the Cloudflare cookies obtained from the Page 1 WebView run
-        val cookies = runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull() ?: ""
-        val headers = mapOf("Cookie" to cookies)
-
         for (page in 2..maxPage) {
             if (expectedUnique > 0 && chapterMap.size >= expectedUnique) break
 
             val pageUrl = if (url.contains("?")) "$url&page=$page" else "$url?page=$page"
             
-            // OPTIMIZATION: Call `app.get()` which is incredibly fast compared to a headless browser.
-            val pageHtml = runCatching { 
-                app.get(pageUrl, headers = headers).text 
-            }.getOrNull()
+            // We use the new Turbo-WebView which skips the 8-second hang time
+            val pageHtml = fetchHtmlWithWebView(pageUrl)
             
-            if (pageHtml.isNullOrBlank()) break
+            if (pageHtml.isBlank()) break
 
             val pageDoc = Jsoup.parse(pageHtml)
             val pageJson = extractInitialDataJson(pageDoc)
