@@ -84,6 +84,7 @@ class ComixProvider : MainAPI() {
 
                 val handler = Handler(Looper.getMainLooper())
                 var resumed = false
+                var lastHtml = ""
 
                 fun finish(result: String) {
                     if (resumed) return
@@ -93,8 +94,8 @@ class ComixProvider : MainAPI() {
                     if (cont.isActive) cont.resume(result)
                 }
 
-                // Increased timeout specifically for the detail page's background async fetches
-                handler.postDelayed({ finish("") }, if (isDetailPage) 20_000L else 8_000L)
+                // If it hits the timeout, return whatever HTML we managed to get instead of a blank string
+                handler.postDelayed({ finish(lastHtml) }, if (isDetailPage) 20_000L else 8_000L)
 
                 var attempts = 0
                 lateinit var checkHtml: Runnable
@@ -103,8 +104,6 @@ class ComixProvider : MainAPI() {
                     if (resumed) return@Runnable
                     
                     if (isDetailPage) {
-                        // INJECTION: This JS runs background API fetches using the active Cloudflare session.
-                        // It scrapes all paginated pages and compiles a perfectly clean JSON array of unique chapters.
                         val jsScript = """
                             if (!window.comixStarted) {
                                 window.comixStarted = true;
@@ -120,7 +119,6 @@ class ComixProvider : MainAPI() {
                                                 if (m) {
                                                     let num = parseFloat(m[1]);
                                                     let key = num % 1 === 0 ? num.toString() : num.toString();
-                                                    // Map intrinsically deduplicates the massive scanlation overlap
                                                     if (!map.has(key)) {
                                                         let text = (a.innerText || "").trim().replace(/\n/g, ' ');
                                                         map.set(key, { num: num, name: text || 'Ch. ' + key, href: href });
@@ -129,7 +127,6 @@ class ComixProvider : MainAPI() {
                                             });
                                         }
                                         
-                                        // Await the physical rendering of the chapter DOM
                                         let retries = 0;
                                         while(document.querySelectorAll('.mchap-item').length === 0 && !document.querySelector('.mchap-empty, .list-empty') && retries < 20) {
                                             await new Promise(r => setTimeout(r, 200));
@@ -148,7 +145,6 @@ class ComixProvider : MainAPI() {
                                             let current = 2;
                                             while (current <= maxPage) {
                                                 let promises = [];
-                                                // Fetch 6 pages concurrently
                                                 for (let i = 0; i < 6 && current <= maxPage; i++, current++) {
                                                     let purl = window.location.href.split('?')[0] + '?page=' + current;
                                                     promises.push(fetch(purl).then(r => r.text()).catch(e => ""));
@@ -186,23 +182,25 @@ class ComixProvider : MainAPI() {
                             if (resumed) return@evaluateJavascript
                             val raw = parseJsString(rawStr)
                             
-                            // Exit only when the JS Async function completes and populates the result variable
                             if (raw != null && raw != "LOADING" && raw != "null" && raw.isNotBlank()) {
+                                lastHtml = raw
                                 runCatching { CookieManager.getInstance().flush() }
                                 finish(raw)
                             } else {
                                 attempts++
-                                if (attempts < 60 && !resumed) handler.postDelayed(checkHtml, 400L) // Wait longer for async fetch
-                                else finish("")
+                                if (attempts < 60 && !resumed) handler.postDelayed(checkHtml, 400L) 
+                                else finish(lastHtml)
                             }
                         }
                     } else {
-                        // Standard Mode for Main / Search pages
+                        // Standard Mode for Main / Search pages (FIXED to allow early exit on JSON data)
                         val jsScript = """
                             (function(){ 
-                                var count = document.querySelectorAll('.lrow, .list-grid').length;
+                                var count = document.querySelectorAll('a[href*="/title/"], .lrow, .list-grid, article, .manga-card').length;
+                                var hasInit = document.querySelector('#initial-data') ? 1 : 0;
                                 if (count === 0 && document.querySelector('.list-empty')) count = -1;
-                                return count + '_COMIX_SPLIT_' + document.documentElement.outerHTML; 
+                                var status = (count !== 0 || hasInit !== 0) ? 'READY' : 'WAIT';
+                                return status + '_COMIX_SPLIT_' + document.documentElement.outerHTML; 
                             })();
                         """.trimIndent()
                         
@@ -211,18 +209,20 @@ class ComixProvider : MainAPI() {
                             
                             val raw = parseJsString(rawStr) ?: ""
                             val parts = raw.split("_COMIX_SPLIT_", limit = 2)
-                            val domCount = parts.getOrNull(0)?.toIntOrNull() ?: 0
+                            val status = parts.getOrNull(0) ?: ""
                             val html = parts.getOrNull(1) ?: raw
+                            
+                            if (html.isNotBlank() && html != "null") lastHtml = html
 
-                            if (domCount != 0) {
+                            if (status == "READY") {
                                 runCatching { CookieManager.getInstance().flush() }
-                                finish(html)
+                                finish(lastHtml)
                                 return@evaluateJavascript
                             }
 
                             attempts++
                             if (attempts < 30 && !resumed) handler.postDelayed(checkHtml, 300L)
-                            else finish(html)
+                            else finish(lastHtml)
                         }
                     }
                 }
@@ -249,7 +249,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  initial-data parsing (For Search/Main pages)
+    //  initial-data parsing
     // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
@@ -413,7 +413,6 @@ class ComixProvider : MainAPI() {
     //  load() 
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
-        // Runs the background Client-Side JS engine to fetch everything
         val jsonPayload = fetchHtmlWithWebView(url, isDetailPage = true)
         
         if (jsonPayload.isBlank() || jsonPayload.startsWith("ERROR:")) return null
@@ -454,7 +453,6 @@ class ComixProvider : MainAPI() {
             }
         }.distinct()
 
-        // Extract compiled chapters from our JS payload
         val episodesArray = payloadObj.optJSONArray("chapters") ?: JSONArray()
         val episodes = buildList {
             for (i in 0 until episodesArray.length()) {
