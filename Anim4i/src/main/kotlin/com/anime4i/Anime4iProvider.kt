@@ -70,7 +70,8 @@ class Anime4iProvider : MainAPI() {
                 home.add(HomePageList("Latest Release", latestItems))
             }
 
-            return HomePageResponse(home)
+            // FIX: Using builder instead of constructor
+            return newHomePageResponse(home)
         }
 
         // 2. Standard Paginated Parsing
@@ -106,7 +107,6 @@ class Anime4iProvider : MainAPI() {
         var document = app.get(url).document
 
         // If the clicked link is a specific episode, try to resolve the parent series page
-        // so the user gets access to the full episode playlist instead of just one episode
         if (url.contains("-episode-")) {
             val seriesHref = document.selectFirst(
                 ".allep a, .ts-breadcrumb li:nth-child(2) a, a.series, .naveps .nve a[href*='/anime/']"
@@ -127,18 +127,25 @@ class Anime4iProvider : MainAPI() {
             val epName = ep.selectFirst(".epl-num")?.text()
                 ?: ep.selectFirst(".epl-title")?.text()
                 ?: "Episode"
-            Episode(epHref, name = epName)
+            
+            // FIX: Using newEpisode builder
+            newEpisode(epHref) {
+                this.name = epName
+            }
         }.reversed()
 
         // Fallback: If no episode list was found, use the current page as a single episode
         val finalEpisodes = episodes.ifEmpty {
-            listOf(Episode(url, name = title))
+            listOf(
+                newEpisode(url) { this.name = title } // FIX: Using newEpisode builder
+            )
         }
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
             this.plot = description
-            addEpisodes(finalEpisodes)
+            // FIX: Explicitly providing DubStatus.Subbed before the episode list
+            addEpisodes(DubStatus.Subbed, finalEpisodes)
         }
     }
 
