@@ -45,10 +45,10 @@ class ComixProvider : MainAPI() {
     override val hasQuickSearch = true
 
     override val mainPage = mainPageOf(
-        "trending" to "Trending Today",
-        "follows"  to "Most Followed",
-        "hot"      to "Hot Updates",
-        "latest"   to "Latest Releases",
+        "latest"         to "Latest Updates",
+        "trending"       to "Trending",
+        "follows"        to "Most Followed",
+        "recommendation" to "Recommendation",
     )
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -176,13 +176,16 @@ class ComixProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
+        // Recommendation is only a slider on the homepage, there is no pagination
+        if (request.data == "recommendation" && page > 1) return null
+
         val pageUrl = if (page == 1) {
             "$mainUrl/"
         } else {
             val sortParam = when (request.data) {
-                "latest" -> "created_at:desc"
-                "hot"    -> "views_7d:desc"
-                else     -> request.data 
+                "latest"   -> "created_at:desc"
+                "trending" -> "views_7d:desc"
+                else       -> request.data 
             }
             "$mainUrl/browse?sort=$sortParam&page=$page"
         }
@@ -192,29 +195,57 @@ class ComixProvider : MainAPI() {
 
         var items: List<SearchResponse> = emptyList()
 
-        extractInitialDataJson(html)?.let { initial ->
-            items = readQueries(initial) { k ->
-                if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
-                val subtype = k.optString(1)
-                val params = k.optJSONObject(2) ?: return@readQueries false
-                
-                val jsonPage = params.optInt("page", 1)
-                if (page > 1 && jsonPage != page) return@readQueries false
+        if (page == 1) {
+            // First attempt to grab from initial-data JSON
+            extractInitialDataJson(html)?.let { initial ->
+                items = readQueries(initial) { k ->
+                    if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
+                    val subtype = k.optString(1)
+                    val params = k.optJSONObject(2) ?: return@readQueries false
+                    
+                    val jsonPage = params.optInt("page", 1)
+                    if (jsonPage != page) return@readQueries false
 
-                when (request.data) {
-                    "trending" -> subtype == "top"  && params.optString("type") == "trending"
-                    "follows"  -> subtype == "top"  && params.optString("type") == "follows"
-                    "hot"      -> subtype == "list" && params.optString("scope") == "hot"
-                    "latest"   -> subtype == "list" && params.optJSONObject("order")?.optString("created_at") == "desc"
-                    else -> false
+                    when (request.data) {
+                        "trending"       -> subtype == "top"  && params.optString("type") == "trending"
+                        "follows"        -> subtype == "top"  && params.optString("type") == "follows"
+                        "latest"         -> subtype == "list" && params.optJSONObject("order")?.optString("created_at") == "desc"
+                        "recommendation" -> false // Recommendations usually not populated in these queries cleanly
+                        else -> false
+                    }
                 }
             }
+
+            // Fallback: Parse the DOM specifically by section to avoid mixing all categories on the homepage
+            if (items.isEmpty()) {
+                val doc = Jsoup.parse(html)
+                val sectionHeader = when (request.data) {
+                    "trending"       -> "Most Recent Popular"
+                    "recommendation" -> "Recommended for you"
+                    "follows"        -> "Most Follows"
+                    "latest"         -> "Latest Updates"
+                    else             -> ""
+                }
+                
+                val section = doc.select("section.section").firstOrNull { 
+                    it.select(".section__title").text().contains(sectionHeader, true) 
+                }
+                
+                val results = mutableListOf<SearchResponse>()
+                section?.select("a.card")?.forEach { el ->
+                    toSearchResult(el)?.let { results.add(it) }
+                }
+                items = results.distinctBy { it.url }
+            }
+        } else {
+            // For page > 1, we are on the /browse page, so we can extract everything
+            items = extractSearchResultsDom(Jsoup.parse(html))
         }
 
-        if (items.isEmpty()) items = extractSearchResultsDom(Jsoup.parse(html))
-
         if (items.isEmpty()) return null
-        return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = items.size >= 20)
+
+        val hasNext = if (request.data == "recommendation") false else items.size >= 20
+        return newHomePageResponse(request, items, hasNext = hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
