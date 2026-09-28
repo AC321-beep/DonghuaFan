@@ -46,6 +46,7 @@ class ComixProvider : MainAPI() {
 
     override val mainPage = mainPageOf(
         "latest"         to "Latest Updates",
+        "hot"            to "Hot Updates",
         "trending"       to "Trending",
         "follows"        to "Most Followed",
         "recommendation" to "Recommendation",
@@ -138,14 +139,14 @@ class ComixProvider : MainAPI() {
         val anchor = if (card.tagName() == "a") card
                      else card.selectFirst("a[href*='/title/'], a[href]") ?: return null
         val href = anchor.attr("href").takeIf { it.isNotBlank() } ?: return null
-        val title = card.selectFirst("h3, h2, .title, .manga-title, .lrow__title")
+        val title = card.selectFirst("h3, h2, .title, .manga-title, .lrow__title, .card__title")
             ?.text()?.trim()
             ?: anchor.attr("title").ifBlank { anchor.text().trim() }
         if (title.isBlank()) return null
         val poster = card.selectFirst("img")
             ?.let { it.attr("data-src").ifBlank { it.attr("src") } }
             ?.takeIf { it.isNotBlank() }
-        val latestEp = card.selectFirst(".chapter, .latest-chapter, .lrow__chapter")
+        val latestEp = card.selectFirst(".chapter, .latest-chapter, .lrow__chapter, .card__ch")
             ?.text()?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
 
         val res = newAnimeSearchResponse(title, fixUrl(href), TvType.Anime)
@@ -176,15 +177,30 @@ class ComixProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
-        // Recommendation is only a slider on the homepage, there is no pagination
-        if (request.data == "recommendation" && page > 1) return null
+        
+        // Recommendation is only a slider on the homepage, there is no pagination for it
+        if (request.data == "recommendation") {
+            if (page > 1) return null 
+            val html = fetchHtml("$mainUrl/")
+            val doc = Jsoup.parse(html)
+            val section = doc.select("section.section").firstOrNull { 
+                it.select(".section__title").text().contains("Recommended for you", true) 
+            }
+            val items = mutableListOf<SearchResponse>()
+            section?.select("a.card")?.forEach { el ->
+                toSearchResult(el)?.let { items.add(it) }
+            }
+            return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = false)
+        }
 
-        val pageUrl = if (page == 1) {
+        // For "latest" (New), the homepage defaults to rendering the "Hot" tab in the DOM.
+        // Therefore, we MUST fetch from the browse endpoint even on page 1 to guarantee we get the New items.
+        val pageUrl = if (page == 1 && request.data != "latest") {
             "$mainUrl/"
         } else {
             val sortParam = when (request.data) {
                 "latest"   -> "created_at:desc"
-                "trending" -> "views_7d:desc"
+                "hot"      -> "views_7d:desc"
                 else       -> request.data 
             }
             "$mainUrl/browse?sort=$sortParam&page=$page"
@@ -193,59 +209,48 @@ class ComixProvider : MainAPI() {
         val html = fetchHtml(pageUrl)
         if (html.isBlank()) return null
 
-        var items: List<SearchResponse> = emptyList()
+        val items = mutableListOf<SearchResponse>()
 
-        if (page == 1) {
-            // First attempt to grab from initial-data JSON
-            extractInitialDataJson(html)?.let { initial ->
-                items = readQueries(initial) { k ->
-                    if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
-                    val subtype = k.optString(1)
-                    val params = k.optJSONObject(2) ?: return@readQueries false
-                    
-                    val jsonPage = params.optInt("page", 1)
-                    if (jsonPage != page) return@readQueries false
-
-                    when (request.data) {
-                        "trending"       -> subtype == "top"  && params.optString("type") == "trending"
-                        "follows"        -> subtype == "top"  && params.optString("type") == "follows"
-                        "latest"         -> subtype == "list" && params.optJSONObject("order")?.optString("created_at") == "desc"
-                        "recommendation" -> false // Recommendations usually not populated in these queries cleanly
-                        else -> false
-                    }
-                }
+        if (page == 1 && request.data != "latest") {
+            // Parse specific curated sections directly from the homepage
+            val doc = Jsoup.parse(html)
+            val sectionHeader = when (request.data) {
+                "trending" -> "Most Recent Popular"
+                "follows"  -> "Most Follows"
+                "hot"      -> "Latest Updates" 
+                else       -> ""
             }
-
-            // Fallback: Parse the DOM specifically by section to avoid mixing all categories on the homepage
+            
+            val section = doc.select("section.section").firstOrNull { 
+                it.select(".section__title").text().contains(sectionHeader, true) 
+            }
+            
+            section?.select("a.card")?.forEach { el ->
+                toSearchResult(el)?.let { items.add(it) }
+            }
+            
+            // Fallback to JSON if DOM selection fails
             if (items.isEmpty()) {
-                val doc = Jsoup.parse(html)
-                val sectionHeader = when (request.data) {
-                    "trending"       -> "Most Recent Popular"
-                    "recommendation" -> "Recommended for you"
-                    "follows"        -> "Most Follows"
-                    "latest"         -> "Latest Updates"
-                    else             -> ""
+                extractInitialDataJson(html)?.let { initial ->
+                    items.addAll(readQueries(initial) { k ->
+                        k.length() >= 1 && k.optString(0) == "manga"
+                    })
                 }
-                
-                val section = doc.select("section.section").firstOrNull { 
-                    it.select(".section__title").text().contains(sectionHeader, true) 
-                }
-                
-                val results = mutableListOf<SearchResponse>()
-                section?.select("a.card")?.forEach { el ->
-                    toSearchResult(el)?.let { results.add(it) }
-                }
-                items = results.distinctBy { it.url }
             }
         } else {
-            // For page > 1, we are on the /browse page, so we can extract everything
-            items = extractSearchResultsDom(Jsoup.parse(html))
+            // Parse from the /browse grid for page > 1 (or page 1 of "latest")
+            extractInitialDataJson(html)?.let { initial ->
+                items.addAll(readQueries(initial) { k ->
+                    k.length() >= 1 && k.optString(0) == "manga"
+                })
+            }
+            if (items.isEmpty()) {
+                items.addAll(extractSearchResultsDom(Jsoup.parse(html)))
+            }
         }
 
         if (items.isEmpty()) return null
-
-        val hasNext = if (request.data == "recommendation") false else items.size >= 20
-        return newHomePageResponse(request, items, hasNext = hasNext)
+        return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = items.size >= 20)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
