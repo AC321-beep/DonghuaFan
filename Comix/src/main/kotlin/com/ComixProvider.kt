@@ -20,7 +20,6 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.addEpisodes
 import com.lagradost.cloudstream3.addSub
-import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.fixUrl
 import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newAnimeLoadResponse
@@ -29,9 +28,6 @@ import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -54,9 +50,6 @@ class ComixProvider : MainAPI() {
     override val hasMainPage = true
     override val hasQuickSearch = true
 
-    // Global variable to securely store and share the User-Agent with native HTTP requests
-    private var customUserAgent: String? = null
-
     override val mainPage = mainPageOf(
         "trending" to "Trending Today",
         "follows"  to "Most Followed",
@@ -65,26 +58,21 @@ class ComixProvider : MainAPI() {
     )
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  WebView fetcher
+    //  WebView fetcher (Authentic Scraper + Safety Fallback)
     // ═══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun fetchHtmlWithWebView(url: String): String =
+    private suspend fun fetchHtmlWithWebView(url: String, isDetailPage: Boolean = false): String =
         withContext(Dispatchers.Main) {
             val activity = CommonActivity.activity ?: return@withContext ""
             if (activity.isFinishing || activity.isDestroyed) return@withContext ""
 
             suspendCancellableCoroutine { cont ->
                 val wv = WebView(activity)
-                
-                // FIXED: Correctly grab User-Agent from WebSettings
-                val customUa = wv.settings.userAgentString.replace("; wv", "").replace("Android TV", "Android")
-                customUserAgent = customUa
-                
                 wv.settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
                     loadsImagesAutomatically = false
-                    userAgentString = customUa
+                    userAgentString = userAgentString.replace("; wv", "").replace("Android TV", "Android")
                 }
 
                 runCatching {
@@ -106,42 +94,139 @@ class ComixProvider : MainAPI() {
                     if (cont.isActive) cont.resume(result)
                 }
 
-                handler.postDelayed({ finish(lastHtml) }, 8_000L)
+                // Fallback: If 15 seconds pass, forcefully grab whatever HTML is visible instead of crashing
+                handler.postDelayed({
+                    if (!resumed) {
+                        wv.evaluateJavascript("(function(){ return document.documentElement.outerHTML; })();") { rawStr ->
+                            val html = parseJsString(rawStr) ?: lastHtml
+                            finish(html)
+                        }
+                    }
+                }, if (isDetailPage) 15_000L else 8_000L)
 
                 var attempts = 0
                 lateinit var checkHtml: Runnable
                 checkHtml = Runnable {
                     if (resumed) return@Runnable
                     
-                    val jsScript = """
-                        (function(){ 
-                            var count = document.querySelectorAll('a[href*="/title/"], .lrow, .list-grid, article, .manga-card, .mchap-item').length;
-                            var hasInit = document.querySelector('#initial-data') ? 1 : 0;
-                            if (count === 0 && document.querySelector('.list-empty, .mchap-empty')) count = -1;
-                            var status = (count !== 0 || hasInit !== 0) ? 'READY' : 'WAIT';
-                            return status + '_COMIX_SPLIT_' + document.documentElement.outerHTML; 
-                        })();
-                    """.trimIndent()
-                    
-                    wv.evaluateJavascript(jsScript) { rawStr ->
-                        if (resumed) return@evaluateJavascript
+                    if (isDetailPage) {
+                        val jsScript = """
+                            if (!window.comixStarted) {
+                                window.comixStarted = true;
+                                window.comixResult = 'LOADING';
+                                (async function() {
+                                    try {
+                                        let map = new Map();
+                                        function extract(doc) {
+                                            let items = doc.querySelectorAll('a[href*="-chapter-"]');
+                                            items.forEach(a => {
+                                                let href = a.getAttribute('href');
+                                                if(!href) return;
+                                                let m = href.match(/-chapter-([\d.]+)/i);
+                                                if (m) {
+                                                    let num = parseFloat(m[1]);
+                                                    let key = num % 1 === 0 ? num.toString() : num.toString();
+                                                    if (!map.has(key)) {
+                                                        let text = (a.innerText || "").trim().replace(/\n/g, ' ');
+                                                        map.set(key, { num: num, name: text || 'Ch. ' + key, href: href });
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        
+                                        let retries = 0;
+                                        while(document.querySelectorAll('.mchap-item').length === 0 && !document.querySelector('.mchap-empty, .list-empty') && retries < 20) {
+                                            await new Promise(r => setTimeout(r, 200));
+                                            retries++;
+                                        }
+                                        
+                                        extract(document);
+                                        
+                                        let maxPage = 1;
+                                        document.querySelectorAll('.npager__num').forEach(el => {
+                                            let p = parseInt(el.innerText);
+                                            if (p > maxPage) maxPage = p;
+                                        });
+                                        
+                                        if (maxPage > 1) {
+                                            let current = 2;
+                                            while (current <= maxPage) {
+                                                let promises = [];
+                                                for (let i = 0; i < 8 && current <= maxPage; i++, current++) {
+                                                    let purl = window.location.href.split('?')[0] + '?page=' + current;
+                                                    promises.push(fetch(purl).then(r => r.text()).catch(e => ""));
+                                                }
+                                                let htmls = await Promise.all(promises);
+                                                let parser = new DOMParser();
+                                                htmls.forEach(html => {
+                                                    if (html) {
+                                                        let doc = parser.parseFromString(html, 'text/html');
+                                                        extract(doc);
+                                                    }
+                                                });
+                                            }
+                                        }
+                                        
+                                        let chapters = Array.from(map.values());
+                                        let initData = document.querySelector('#initial-data');
+                                        let initText = initData ? (initData.innerText || initData.innerHTML) : "";
+                                        
+                                        window.comixResult = JSON.stringify({
+                                            initialData: initText.trim(),
+                                            chapters: chapters
+                                        });
+                                    } catch(e) {
+                                        window.comixResult = 'ERROR: ' + e.toString();
+                                    }
+                                })();
+                            }
+                            window.comixResult;
+                        """.trimIndent()
                         
-                        val raw = parseJsString(rawStr) ?: ""
-                        val parts = raw.split("_COMIX_SPLIT_", limit = 2)
-                        val status = parts.getOrNull(0) ?: ""
-                        val html = parts.getOrNull(1) ?: raw
-                        
-                        if (html.isNotBlank() && html != "null") lastHtml = html
-
-                        if (status == "READY") {
-                            runCatching { CookieManager.getInstance().flush() }
-                            finish(lastHtml)
-                            return@evaluateJavascript
+                        wv.evaluateJavascript(jsScript) { rawStr ->
+                            if (resumed) return@evaluateJavascript
+                            val raw = parseJsString(rawStr)
+                            
+                            // Exit only when the JSON is fully built
+                            if (raw != null && raw.startsWith("{")) {
+                                runCatching { CookieManager.getInstance().flush() }
+                                finish(raw)
+                            } else {
+                                attempts++
+                                if (attempts < 60 && !resumed) handler.postDelayed(checkHtml, 250L) 
+                            }
                         }
+                    } else {
+                        val jsScript = """
+                            (function(){ 
+                                var count = document.querySelectorAll('a[href*="/title/"], .lrow, .list-grid, article, .manga-card').length;
+                                var hasInit = document.querySelector('#initial-data') ? 1 : 0;
+                                if (count === 0 && document.querySelector('.list-empty')) count = -1;
+                                var status = (count !== 0 || hasInit !== 0) ? 'READY' : 'WAIT';
+                                return status + '_COMIX_SPLIT_' + document.documentElement.outerHTML; 
+                            })();
+                        """.trimIndent()
+                        
+                        wv.evaluateJavascript(jsScript) { rawStr ->
+                            if (resumed) return@evaluateJavascript
+                            
+                            val raw = parseJsString(rawStr) ?: ""
+                            val parts = raw.split("_COMIX_SPLIT_", limit = 2)
+                            val status = parts.getOrNull(0) ?: ""
+                            val html = parts.getOrNull(1) ?: raw
+                            
+                            if (html.isNotBlank() && html != "null") lastHtml = html
 
-                        attempts++
-                        if (attempts < 30 && !resumed) handler.postDelayed(checkHtml, 300L)
-                        else finish(lastHtml)
+                            if (status == "READY") {
+                                runCatching { CookieManager.getInstance().flush() }
+                                finish(lastHtml)
+                                return@evaluateJavascript
+                            }
+
+                            attempts++
+                            if (attempts < 30 && !resumed) handler.postDelayed(checkHtml, 300L)
+                            else finish(lastHtml)
+                        }
                     }
                 }
 
@@ -327,15 +412,6 @@ class ComixProvider : MainAPI() {
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Chapter-number helpers
-    // ═══════════════════════════════════════════════════════════════════════
-    private fun chapterNumberFromHref(href: String?): Double? {
-        if (href.isNullOrBlank()) return null
-        val m = Regex("""chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return null
-        return m.groupValues[1].toDoubleOrNull()
-    }
-
     private fun formatChapterNum(n: Double): String =
         if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
 
@@ -343,10 +419,50 @@ class ComixProvider : MainAPI() {
     //  load()
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
-        val html1 = fetchHtmlWithWebView(url)
-        if (html1.isBlank()) return null
-        val document = Jsoup.parse(html1)
-        val initialData = extractInitialDataJson(document) ?: return null
+        // FIXED: Passes isDetailPage = true to ensure the background JS fetcher runs!
+        val payload = fetchHtmlWithWebView(url, isDetailPage = true)
+        if (payload.isBlank()) return null
+
+        var initialData: JSONObject? = null
+        val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
+
+        // Determine if JS fetcher succeeded (starts with JSON curly brace) or timed out (raw HTML)
+        if (payload.startsWith("{")) {
+            val payloadObj = runCatching { JSONObject(payload) }.getOrNull()
+            val initStr = payloadObj?.optString("initialData")
+            if (!initStr.isNullOrBlank()) {
+                initialData = runCatching { JSONObject(initStr) }.getOrNull()
+            }
+            
+            val episodesArray = payloadObj?.optJSONArray("chapters")
+            if (episodesArray != null) {
+                for (i in 0 until episodesArray.length()) {
+                    val epObj = episodesArray.optJSONObject(i) ?: continue
+                    val name = epObj.optString("name")
+                    val href = epObj.optString("href") 
+                    val numStr = epObj.optDouble("num").let { formatChapterNum(it) }
+                    parsedChapterLinks[numStr] = name to href
+                }
+            }
+        } else {
+            // Safety Fallback: Parse the raw HTML if the network timed out the JSON fetch
+            val document = Jsoup.parse(payload)
+            initialData = extractInitialDataJson(document)
+            document.select("a.mchap-row__primary, a[href*='-chapter-']").forEach { a ->
+                val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
+                val m = Regex("""-chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return@forEach
+                val numStr = m.groupValues[1].toDoubleOrNull()?.let { formatChapterNum(it) } ?: return@forEach
+                
+                if (a.hasClass("mchap-row__primary") || a.parents().any { it.hasClass("mchap-item") }) {
+                    if (!parsedChapterLinks.containsKey(numStr)) {
+                        val visible = a.text().trim()
+                        parsedChapterLinks[numStr] = visible.ifBlank { "Ch. $numStr" } to href
+                    }
+                }
+            }
+        }
+
+        if (initialData == null) return null
 
         var detail: JSONObject? = null
         initialData.optJSONObject("queries")?.let { queries ->
@@ -379,63 +495,6 @@ class ComixProvider : MainAPI() {
             }
         }.distinct()
 
-        val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
-
-        fun extractChaptersFromHtml(doc: Document) {
-            doc.select("a.mchap-row__primary, a[href*='chapter-']").forEach { a ->
-                val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
-                val m = Regex("""chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return@forEach
-                val numStr = m.groupValues[1].toDoubleOrNull()?.let { formatChapterNum(it) } ?: return@forEach
-                
-                if (a.hasClass("mchap-row__primary") || a.parents().any { it.hasClass("mchap-item") }) {
-                    if (!parsedChapterLinks.containsKey(numStr)) {
-                        val visible = a.text().trim()
-                        parsedChapterLinks[numStr] = visible.ifBlank { "Ch. $numStr" } to href
-                    }
-                }
-            }
-        }
-
-        // Parse Page 1 Chapters
-        extractChaptersFromHtml(document)
-
-        // Find Total Pages
-        var maxPage = 1
-        document.select(".npager__num").forEach { el ->
-            val p = el.text().toIntOrNull() ?: 1
-            if (p > maxPage) maxPage = p
-        }
-
-        // BATCH NATIVE HTTP FETCHING
-        if (maxPage > 1) {
-            // FIXED: Using the safely stored User-Agent and setting a fallback just in case
-            val ua = customUserAgent ?: "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Mobile Safari/537.36"
-            val cookies = runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull() ?: ""
-            
-            val headers = mapOf(
-                "Cookie" to cookies,
-                "User-Agent" to ua,
-                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "Referer" to url
-            )
-
-            // Batch fetch 5 pages concurrently to prevent 429 Too Many Requests
-            val pages = (2..maxPage).toList()
-            for (chunk in pages.chunked(5)) {
-                coroutineScope {
-                    chunk.map { pageNum ->
-                        async {
-                            val pUrl = if (url.contains("?")) "$url&page=$pageNum" else "$url?page=$pageNum"
-                            val response = runCatching { app.get(pUrl, headers = headers).text }.getOrNull()
-                            if (!response.isNullOrBlank()) {
-                                extractChaptersFromHtml(Jsoup.parse(response))
-                            }
-                        }
-                    }.awaitAll()
-                }
-            }
-        }
-
         val sortedKeys = parsedChapterLinks.keys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
         
         val episodes = sortedKeys.mapIndexed { index, key ->
@@ -449,6 +508,7 @@ class ComixProvider : MainAPI() {
             }
         }
 
+        // Extremely safe fallback if episodes are somehow completely empty
         if (episodes.isEmpty()) return null
 
         return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
@@ -477,7 +537,8 @@ class ComixProvider : MainAPI() {
         val activity = CommonActivity.activity as? AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
-        val chapterName = Regex("""chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(data)
+        // RESTORED: Exact regex from the user's very first script to guarantee compatibility 
+        val chapterName = Regex("-chapter-([\\d.]+)").find(data)
             ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
 
         activity.runOnUiThread {
