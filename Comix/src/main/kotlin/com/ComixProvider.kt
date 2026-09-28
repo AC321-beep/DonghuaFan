@@ -324,8 +324,6 @@ class ComixProvider : MainAPI() {
 
     /**
      * Derives the expected unique-chapter count from the two canonical URLs.
-     * For The Crown I'll Claim: first=0, last=48 → 49.
-     * Returns 0 when it can't be determined (caller falls back to page-based loop).
      */
     private fun expectedUniqueCount(
         firstChapterUrl: String?,
@@ -396,24 +394,70 @@ class ComixProvider : MainAPI() {
         )
 
         // ── Collect anchors keyed by chapter NUMBER ───────────────────────
-        // Key:   formatted chapter number ("0", "1", …, "48.5")
+        // Key:  formatted chapter number ("0", "1", …, "48.5")
         // Value: name (visible text, preserves "Ch. 46 new season 2") + href
         val chapterMap = LinkedHashMap<String, Pair<String, String>>()
 
-        fun collectFromDoc(doc: Document) {
+        fun processHtmlAndJson(htmlStr: String, doc: Document, jsonObj: JSONObject?) {
+            // 1. Jsoup DOM parsing (if loaded)
             doc.select("a[href*='-chapter-']").forEach { a ->
                 val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
-                val num  = chapterNumberFromHref(href) ?: return@forEach
-                val key  = formatChapterNum(num)
-                if (chapterMap.containsKey(key)) return@forEach
+                val num = chapterNumberFromHref(href) ?: return@forEach
+                val key = formatChapterNum(num)
+                if (!chapterMap.containsKey(key)) {
+                    val visible = a.text().trim()
+                    chapterMap[key] = visible.ifBlank { "Ch. $key" } to href
+                }
+            }
 
-                val visible = a.text().trim()
-                val name = visible.ifBlank { "Ch. $key" }
-                chapterMap[key] = name to href
+            // 2. Extract thoroughly from JSON Data without waiting for DOM render 
+            jsonObj?.optJSONObject("queries")?.let { queries ->
+                val keys = queries.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val value = queries.opt(k)
+                    val items = when (value) {
+                        is JSONArray -> value
+                        is JSONObject -> value.optJSONArray("items") 
+                            ?: value.optJSONArray("chapters") 
+                            ?: value.optJSONObject("data")?.optJSONArray("items")
+                        else -> null
+                    }
+                    if (items != null) {
+                        for (i in 0 until items.length()) {
+                            val item = items.optJSONObject(i) ?: continue
+                            val href = item.optString("url")
+                            if (href.contains("-chapter-")) {
+                                val num = chapterNumberFromHref(href) ?: continue
+                                val keyStr = formatChapterNum(num)
+                                // Only storing one iteration deduplicates automatically 
+                                if (!chapterMap.containsKey(keyStr)) {
+                                    val title = item.optString("title").takeIf { it.isNotBlank() }
+                                        ?: item.optString("name").takeIf { it.isNotBlank() } 
+                                        ?: "Ch. $keyStr"
+                                    chapterMap[keyStr] = title to href
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Regex on Raw HTML as a final fallback for unparsed cached queries
+            val regex = """["']([^"']+-chapter-[\d.]+)["']""".toRegex()
+            regex.findAll(htmlStr).forEach { match ->
+                val href = match.groupValues[1].replace("\\/", "/")
+                if (href.endsWith(".png") || href.endsWith(".jpg") || href.endsWith(".css")) return@forEach
+                val num = chapterNumberFromHref(href) ?: return@forEach
+                val key = formatChapterNum(num)
+                if (!chapterMap.containsKey(key)) {
+                    chapterMap[key] = "Ch. $key" to href
+                }
             }
         }
 
-        collectFromDoc(document)
+        // Apply our robust parsing rules on Page 1
+        processHtmlAndJson(html1, document, initialData)
 
         // ── Pagination until no new chapters appear ───────────────────────
         val maxPage = 80
@@ -425,8 +469,10 @@ class ComixProvider : MainAPI() {
             if (pageHtml.isBlank()) break
 
             val pageDoc = Jsoup.parse(pageHtml)
-            val before  = chapterMap.size
-            collectFromDoc(pageDoc)
+            val pageJson = extractInitialDataJson(pageDoc)
+            val before = chapterMap.size
+
+            processHtmlAndJson(pageHtml, pageDoc, pageJson)
 
             if (chapterMap.size == before) break
         }
