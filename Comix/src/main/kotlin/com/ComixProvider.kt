@@ -58,10 +58,10 @@ class ComixProvider : MainAPI() {
     )
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  WebView fetcher (Client-Side JS Fetcher Injection)
+    //  WebView fetcher (Restored for High Speed)
     // ═══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun fetchHtmlWithWebView(url: String, isDetailPage: Boolean = false): String =
+    private suspend fun fetchHtmlWithWebView(url: String): String =
         withContext(Dispatchers.Main) {
             val activity = CommonActivity.activity ?: return@withContext ""
             if (activity.isFinishing || activity.isDestroyed) return@withContext ""
@@ -84,145 +84,42 @@ class ComixProvider : MainAPI() {
 
                 val handler = Handler(Looper.getMainLooper())
                 var resumed = false
-                var lastHtml = ""
 
-                fun finish(result: String) {
+                fun finish(html: String) {
                     if (resumed) return
                     resumed = true
                     handler.removeCallbacksAndMessages(null)
                     runCatching { wv.stopLoading(); wv.destroy() }
-                    if (cont.isActive) cont.resume(result)
+                    if (cont.isActive) cont.resume(html)
                 }
 
-                // If it hits the timeout, return whatever HTML we managed to get instead of a blank string
-                handler.postDelayed({ finish(lastHtml) }, if (isDetailPage) 20_000L else 8_000L)
+                handler.postDelayed({ finish("") }, 8_000L)
 
                 var attempts = 0
                 lateinit var checkHtml: Runnable
-                
                 checkHtml = Runnable {
                     if (resumed) return@Runnable
-                    
-                    if (isDetailPage) {
-                        val jsScript = """
-                            if (!window.comixStarted) {
-                                window.comixStarted = true;
-                                window.comixResult = 'LOADING';
-                                (async function() {
-                                    try {
-                                        let map = new Map();
-                                        function extract(doc) {
-                                            let items = doc.querySelectorAll('a[href*="chapter-"]');
-                                            items.forEach(a => {
-                                                let href = a.getAttribute('href');
-                                                let m = href.match(/chapter-([\d.]+)/i);
-                                                if (m) {
-                                                    let num = parseFloat(m[1]);
-                                                    let key = num % 1 === 0 ? num.toString() : num.toString();
-                                                    if (!map.has(key)) {
-                                                        let text = (a.innerText || "").trim().replace(/\n/g, ' ');
-                                                        map.set(key, { num: num, name: text || 'Ch. ' + key, href: href });
-                                                    }
-                                                }
-                                            });
-                                        }
-                                        
-                                        let retries = 0;
-                                        while(document.querySelectorAll('.mchap-item').length === 0 && !document.querySelector('.mchap-empty, .list-empty') && retries < 20) {
-                                            await new Promise(r => setTimeout(r, 200));
-                                            retries++;
-                                        }
-                                        
-                                        extract(document);
-                                        
-                                        let maxPage = 1;
-                                        document.querySelectorAll('.npager__num').forEach(el => {
-                                            let p = parseInt(el.innerText);
-                                            if (p > maxPage) maxPage = p;
-                                        });
-                                        
-                                        if (maxPage > 1) {
-                                            let current = 2;
-                                            while (current <= maxPage) {
-                                                let promises = [];
-                                                for (let i = 0; i < 6 && current <= maxPage; i++, current++) {
-                                                    let purl = window.location.href.split('?')[0] + '?page=' + current;
-                                                    promises.push(fetch(purl).then(r => r.text()).catch(e => ""));
-                                                }
-                                                let htmls = await Promise.all(promises);
-                                                let parser = new DOMParser();
-                                                htmls.forEach(html => {
-                                                    if (html) {
-                                                        let doc = parser.parseFromString(html, 'text/html');
-                                                        extract(doc);
-                                                    }
-                                                });
-                                            }
-                                        }
-                                        
-                                        let chapters = Array.from(map.values());
-                                        chapters.sort((a, b) => a.num - b.num);
-                                        
-                                        let initData = document.querySelector('#initial-data');
-                                        let initText = initData ? (initData.innerText || initData.innerHTML) : "";
-                                        
-                                        window.comixResult = JSON.stringify({
-                                            initialData: initText.trim(),
-                                            chapters: chapters
-                                        });
-                                    } catch(e) {
-                                        window.comixResult = 'ERROR: ' + e.toString();
-                                    }
-                                })();
-                            }
-                            window.comixResult;
-                        """.trimIndent()
-                        
-                        wv.evaluateJavascript(jsScript) { rawStr ->
-                            if (resumed) return@evaluateJavascript
-                            val raw = parseJsString(rawStr)
-                            
-                            if (raw != null && raw != "LOADING" && raw != "null" && raw.isNotBlank()) {
-                                lastHtml = raw
-                                runCatching { CookieManager.getInstance().flush() }
-                                finish(raw)
-                            } else {
-                                attempts++
-                                if (attempts < 60 && !resumed) handler.postDelayed(checkHtml, 400L) 
-                                else finish(lastHtml)
-                            }
+                    wv.evaluateJavascript(
+                        "(function(){ return document.documentElement.outerHTML; })();"
+                    ) { raw ->
+                        if (resumed) return@evaluateJavascript
+                        val html = parseJsString(raw) ?: ""
+
+                        if (html.contains("lrow") ||
+                            html.contains("list-grid") ||
+                            html.contains("list-empty") ||
+                            html.contains("initial-data") ||
+                            html.contains("mchap-item")) {
+                            runCatching { CookieManager.getInstance().flush() }
+                            finish(html)
+                            return@evaluateJavascript
                         }
-                    } else {
-                        // Standard Mode for Main / Search pages (FIXED to allow early exit on JSON data)
-                        val jsScript = """
-                            (function(){ 
-                                var count = document.querySelectorAll('a[href*="/title/"], .lrow, .list-grid, article, .manga-card').length;
-                                var hasInit = document.querySelector('#initial-data') ? 1 : 0;
-                                if (count === 0 && document.querySelector('.list-empty')) count = -1;
-                                var status = (count !== 0 || hasInit !== 0) ? 'READY' : 'WAIT';
-                                return status + '_COMIX_SPLIT_' + document.documentElement.outerHTML; 
-                            })();
-                        """.trimIndent()
-                        
-                        wv.evaluateJavascript(jsScript) { rawStr ->
-                            if (resumed) return@evaluateJavascript
-                            
-                            val raw = parseJsString(rawStr) ?: ""
-                            val parts = raw.split("_COMIX_SPLIT_", limit = 2)
-                            val status = parts.getOrNull(0) ?: ""
-                            val html = parts.getOrNull(1) ?: raw
-                            
-                            if (html.isNotBlank() && html != "null") lastHtml = html
 
-                            if (status == "READY") {
-                                runCatching { CookieManager.getInstance().flush() }
-                                finish(lastHtml)
-                                return@evaluateJavascript
-                            }
-
-                            attempts++
-                            if (attempts < 30 && !resumed) handler.postDelayed(checkHtml, 300L)
-                            else finish(lastHtml)
+                        attempts++
+                        if (attempts < 30 && !resumed) {
+                            handler.postDelayed(checkHtml, 300L)
+                        } else {
+                            finish(html)
                         }
                     }
                 }
@@ -410,25 +307,37 @@ class ComixProvider : MainAPI() {
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  load() 
+    //  Chapter-number helpers
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private fun chapterNumberFromHref(href: String?): Double? {
+        if (href.isNullOrBlank()) return null
+        val m = Regex("""chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return null
+        return m.groupValues[1].toDoubleOrNull()
+    }
+
+    private fun formatChapterNum(n: Double): String =
+        if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
+
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  load()
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
-        val jsonPayload = fetchHtmlWithWebView(url, isDetailPage = true)
-        
-        if (jsonPayload.isBlank() || jsonPayload.startsWith("ERROR:")) return null
-        
-        val payloadObj = runCatching { JSONObject(jsonPayload) }.getOrNull() ?: return null
-        
-        val initialDataStr = payloadObj.optString("initialData")
-        val initialData = runCatching { JSONObject(initialDataStr) }.getOrNull() ?: return null
-        
+        val html1 = fetchHtmlWithWebView(url)
+        if (html1.isBlank()) return null
+        val document = Jsoup.parse(html1)
+        val initialData = extractInitialDataJson(document) ?: return null
+
         var detail: JSONObject? = null
         initialData.optJSONObject("queries")?.let { queries ->
             val keys = queries.keys()
             while (keys.hasNext()) {
                 val k = keys.next()
                 val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
-                if (parsed.length() >= 2 && parsed.optString(0) == "manga" && parsed.optString(1) == "detail") {
+                if (parsed.length() >= 2 &&
+                    parsed.optString(0) == "manga" &&
+                    parsed.optString(1) == "detail") {
                     detail = queries.optJSONObject(k)
                     if (detail != null) break
                 }
@@ -447,25 +356,60 @@ class ComixProvider : MainAPI() {
             listOf("genres", "tags", "demographics", "formats").forEach { f ->
                 d.optJSONArray(f)?.let { arr ->
                     for (i in 0 until arr.length()) {
-                        arr.optJSONObject(i)?.optString("title")?.takeIf { it.isNotBlank() }?.let { add(it) }
+                        arr.optJSONObject(i)?.optString("title")
+                            ?.takeIf { it.isNotBlank() }?.let { add(it) }
                     }
                 }
             }
         }.distinct()
 
-        val episodesArray = payloadObj.optJSONArray("chapters") ?: JSONArray()
-        val episodes = buildList {
-            for (i in 0 until episodesArray.length()) {
-                val epObj = episodesArray.optJSONObject(i) ?: continue
-                val name = epObj.optString("name")
-                val href = epObj.optString("href")
-                
-                add(newEpisode(fixUrl(href)) {
-                    this.name = name
-                    this.season = 1
-                    this.episode = i + 1
-                    this.posterUrl = posterUrl
-                })
+        // Synthetic Generator Data extracted from initial-data JSON
+        val latestChapterNum = d.optInt("latestChapter", 0)
+        val firstChapterUrl  = d.optString("firstChapterUrl").takeIf { it.isNotBlank() }
+        val startsAtZero = firstChapterUrl?.contains("chapter-0", ignoreCase = true) == true
+        val startCh = if (startsAtZero) 0 else 1
+
+        val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
+
+        // Extract what we can from Page 1 (This grabs real URLs for the latest 20, plus any .5 fractionals)
+        document.select("a[href*='chapter-']").forEach { a ->
+            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
+            val num = chapterNumberFromHref(href) ?: return@forEach
+            val key = formatChapterNum(num)
+            
+            // This intrinsically handles the deduplication for multiple scanlations
+            if (!parsedChapterLinks.containsKey(key)) {
+                val visible = a.text().trim()
+                parsedChapterLinks[key] = visible.ifBlank { "Ch. $key" } to href
+            }
+        }
+
+        // Generate synthetic list instantly without paginating
+        val allChapterKeys = mutableSetOf<String>()
+        if (latestChapterNum > 0) {
+            for (i in startCh..latestChapterNum) {
+                allChapterKeys.add(i.toString())
+            }
+        }
+        
+        // Add any fractional chapters (48.5) or items parsed from Page 1 that aren't integers
+        parsedChapterLinks.keys.forEach { allChapterKeys.add(it) }
+
+        val sortedKeys = allChapterKeys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
+
+        val episodes = sortedKeys.mapIndexed { index, key ->
+            val realData = parsedChapterLinks[key]
+            
+            // Fallback to a synthetic URL if we didn't scrape it from Page 1. 
+            // The reader fragment handles this via regex in loadLinks.
+            val epUrl = realData?.second ?: "$url/chapter-$key"
+            val epName = realData?.first ?: "Ch. $key"
+
+            newEpisode(fixUrl(epUrl)) {
+                this.name = epName
+                this.season = 1
+                this.episode = index + 1
+                this.posterUrl = posterUrl
             }
         }
 
@@ -497,6 +441,7 @@ class ComixProvider : MainAPI() {
         val activity = CommonActivity.activity as? AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
+        // Matches correctly against both authentic and synthetic URLs
         val chapterName = Regex("""chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(data)
             ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
 
