@@ -58,7 +58,7 @@ class ComixProvider : MainAPI() {
     )
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  WebView fetcher (Authentic Scraper + Safety Fallback)
+    //  WebView fetcher (Cloudflare-Bypass JS & Bulletproof Fallback)
     // ═══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun fetchHtmlWithWebView(url: String, isDetailPage: Boolean = false): String =
@@ -94,10 +94,10 @@ class ComixProvider : MainAPI() {
                     if (cont.isActive) cont.resume(result)
                 }
 
-                // Fallback: If 15 seconds pass, forcefully grab whatever HTML is visible instead of crashing
+                // If 15 seconds pass, grab whatever JSON or HTML is ready to prevent crashes
                 handler.postDelayed({
                     if (!resumed) {
-                        wv.evaluateJavascript("(function(){ return document.documentElement.outerHTML; })();") { rawStr ->
+                        wv.evaluateJavascript("(function(){ return window.comixResult && window.comixResult !== 'LOADING' ? window.comixResult : document.documentElement.outerHTML; })();") { rawStr ->
                             val html = parseJsString(rawStr) ?: lastHtml
                             finish(html)
                         }
@@ -136,7 +136,7 @@ class ComixProvider : MainAPI() {
                                         
                                         let retries = 0;
                                         while(document.querySelectorAll('.mchap-item').length === 0 && !document.querySelector('.mchap-empty, .list-empty') && retries < 20) {
-                                            await new Promise(r => setTimeout(r, 200));
+                                            await new Promise(r => setTimeout(r, 250));
                                             retries++;
                                         }
                                         
@@ -152,18 +152,21 @@ class ComixProvider : MainAPI() {
                                             let current = 2;
                                             while (current <= maxPage) {
                                                 let promises = [];
-                                                for (let i = 0; i < 8 && current <= maxPage; i++, current++) {
+                                                // Batch size 4 prevents Cloudflare from blocking concurrent fetches
+                                                for (let i = 0; i < 4 && current <= maxPage; i++, current++) {
                                                     let purl = window.location.href.split('?')[0] + '?page=' + current;
                                                     promises.push(fetch(purl).then(r => r.text()).catch(e => ""));
                                                 }
                                                 let htmls = await Promise.all(promises);
                                                 let parser = new DOMParser();
                                                 htmls.forEach(html => {
-                                                    if (html) {
+                                                    if (html && html.includes('mchap-item')) {
                                                         let doc = parser.parseFromString(html, 'text/html');
                                                         extract(doc);
                                                     }
                                                 });
+                                                // Wait 300ms before fetching the next batch to mimic human scrolling
+                                                await new Promise(r => setTimeout(r, 300));
                                             }
                                         }
                                         
@@ -187,13 +190,12 @@ class ComixProvider : MainAPI() {
                             if (resumed) return@evaluateJavascript
                             val raw = parseJsString(rawStr)
                             
-                            // Exit only when the JSON is fully built
                             if (raw != null && raw.startsWith("{")) {
                                 runCatching { CookieManager.getInstance().flush() }
                                 finish(raw)
                             } else {
                                 attempts++
-                                if (attempts < 60 && !resumed) handler.postDelayed(checkHtml, 250L) 
+                                if (attempts < 60 && !resumed) handler.postDelayed(checkHtml, 300L) 
                             }
                         }
                     } else {
@@ -419,14 +421,13 @@ class ComixProvider : MainAPI() {
     //  load()
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
-        // FIXED: Passes isDetailPage = true to ensure the background JS fetcher runs!
         val payload = fetchHtmlWithWebView(url, isDetailPage = true)
         if (payload.isBlank()) return null
 
         var initialData: JSONObject? = null
         val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
 
-        // Determine if JS fetcher succeeded (starts with JSON curly brace) or timed out (raw HTML)
+        // Determine if JS background fetch succeeded or timed out
         if (payload.startsWith("{")) {
             val payloadObj = runCatching { JSONObject(payload) }.getOrNull()
             val initStr = payloadObj?.optString("initialData")
@@ -445,7 +446,7 @@ class ComixProvider : MainAPI() {
                 }
             }
         } else {
-            // Safety Fallback: Parse the raw HTML if the network timed out the JSON fetch
+            // Safety Fallback: Parse raw HTML if network timed out
             val document = Jsoup.parse(payload)
             initialData = extractInitialDataJson(document)
             document.select("a.mchap-row__primary, a[href*='-chapter-']").forEach { a ->
@@ -495,10 +496,38 @@ class ComixProvider : MainAPI() {
             }
         }.distinct()
 
-        val sortedKeys = parsedChapterLinks.keys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
+        // ALWAYS fill the missing chapters so you NEVER get "few chapters only"
+        val latestChapterNum = d.optInt("latestChapter", 0)
+        val firstChapterUrl  = d.optString("firstChapterUrl").takeIf { it.isNotBlank() }
+        val startsAtZero = firstChapterUrl?.contains("-chapter-0", ignoreCase = true) == true
+        val startCh = if (startsAtZero) 0 else 1
+
+        val allChapterKeys = mutableSetOf<String>()
+        if (latestChapterNum > 0) {
+            for (i in startCh..latestChapterNum) {
+                allChapterKeys.add(i.toString())
+            }
+        }
+        parsedChapterLinks.keys.forEach { allChapterKeys.add(it) }
+        val sortedKeys = allChapterKeys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
         
         val episodes = sortedKeys.mapIndexed { index, key ->
-            val (epName, epUrl) = parsedChapterLinks[key]!!
+            val realData = parsedChapterLinks[key]
+            
+            // 1. Prioritize Real Auth URL
+            // 2. Explicitly link first chapter to prevent 404s for Ch 0/1
+            // 3. Last Resort Synthetic URL
+            val epUrl = if (realData != null) {
+                realData.second
+            } else if (key == "0" && startsAtZero && firstChapterUrl != null) {
+                firstChapterUrl
+            } else if (key == "1" && !startsAtZero && firstChapterUrl != null) {
+                firstChapterUrl
+            } else {
+                "$url/chapter-$key"
+            }
+
+            val epName = realData?.first ?: "Ch. $key"
 
             newEpisode(fixUrl(epUrl)) {
                 this.name = epName
@@ -508,7 +537,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // Extremely safe fallback if episodes are somehow completely empty
         if (episodes.isEmpty()) return null
 
         return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
@@ -537,7 +565,6 @@ class ComixProvider : MainAPI() {
         val activity = CommonActivity.activity as? AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
-        // RESTORED: Exact regex from the user's very first script to guarantee compatibility 
         val chapterName = Regex("-chapter-([\\d.]+)").find(data)
             ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
 
