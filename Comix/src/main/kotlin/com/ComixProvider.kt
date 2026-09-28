@@ -20,6 +20,7 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.addEpisodes
 import com.lagradost.cloudstream3.addSub
+import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.fixUrl
 import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newAnimeLoadResponse
@@ -58,7 +59,7 @@ class ComixProvider : MainAPI() {
     )
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  WebView fetcher
+    //  WebView fetcher (Optimized for Early Exit)
     // ═══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun fetchHtmlWithWebView(url: String): String =
@@ -108,13 +109,17 @@ class ComixProvider : MainAPI() {
                         if (resumed) return@evaluateJavascript
                         val html = parseJsString(raw) ?: ""
 
+                        // OPTIMIZATION: Check if the JSON data payload is loaded. 
+                        // If it is, we don't need to wait for the DOM to visually render.
+                        val hasJsonData = html.contains("initial-data") && 
+                                (html.contains("queries") || html.contains("firstChapterUrl"))
+
                         val ready = if (isDetailPage) {
-                            // On detail pages, wait specifically for chapters to render or indicate empty
-                            html.contains("mchap-item") || html.contains("chapter-list") || 
+                            hasJsonData || html.contains("mchap-item") || html.contains("chapter-list") || 
                             html.contains("list-empty") || html.contains("chapter_list")
                         } else {
-                            html.contains("lrow") || html.contains("list-grid") || 
-                            html.contains("list-empty") || html.contains("initial-data")
+                            hasJsonData || html.contains("lrow") || html.contains("list-grid") || 
+                            html.contains("list-empty")
                         }
 
                         if (ready) {
@@ -127,7 +132,7 @@ class ComixProvider : MainAPI() {
                         if (attempts < 30 && !resumed) {
                             handler.postDelayed(checkHtml, 300L)
                         } else {
-                            finish(html) // Force finish if timeout threshold reached
+                            finish(html)
                         }
                     }
                 }
@@ -318,14 +323,12 @@ class ComixProvider : MainAPI() {
     //  Chapter-number helpers
     // ═══════════════════════════════════════════════════════════════════════
 
-    /** Extracts the chapter number correctly bypassing missing hyphens before "chapter" */
     private fun chapterNumberFromHref(href: String?): Double? {
         if (href.isNullOrBlank()) return null
         val m = Regex("""chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return null
         return m.groupValues[1].toDoubleOrNull()
     }
 
-    /** Human-friendly key: `0`, `1`, `48`, `48.5` (no trailing `.0`). */
     private fun formatChapterNum(n: Double): String =
         if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
 
@@ -344,7 +347,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    /** Deep recursive search to rip chapter links out of nested React Query JSON objects */
     private fun extractChaptersFromJson(json: Any?, map: LinkedHashMap<String, Pair<String, String>>) {
         if (json == null) return
         when (json) {
@@ -354,7 +356,6 @@ class ComixProvider : MainAPI() {
                     val num = chapterNumberFromHref(href)
                     if (num != null) {
                         val keyStr = formatChapterNum(num)
-                        // Deduplication: Only store the first chapter encountered for this number
                         if (!map.containsKey(keyStr)) {
                             val title = json.optString("title").takeIf { it.isNotBlank() }
                                 ?: json.optString("name").takeIf { it.isNotBlank() }
@@ -381,6 +382,7 @@ class ComixProvider : MainAPI() {
     //  load()
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
+        // Page 1 uses WebView to bypass potential anti-bot and get initial data
         val html1 = fetchHtmlWithWebView(url)
         if (html1.isBlank()) return null
         val document = Jsoup.parse(html1)
@@ -431,7 +433,6 @@ class ComixProvider : MainAPI() {
         val chapterMap = LinkedHashMap<String, Pair<String, String>>()
 
         fun processHtmlAndJson(htmlStr: String, doc: Document, jsonObj: JSONObject?) {
-            // 1. Jsoup DOM parsing via the updated generic regex query
             doc.select("a[href*='chapter-']").forEach { a ->
                 val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
                 val num = chapterNumberFromHref(href) ?: return@forEach
@@ -442,10 +443,8 @@ class ComixProvider : MainAPI() {
                 }
             }
 
-            // 2. Extract thoroughly from JSON Data via recursive deep search
             extractChaptersFromJson(jsonObj, chapterMap)
 
-            // 3. Regex on Raw HTML as a final fallback
             val regex = """["']([^"']+chapter-[\d.]+)["']""".toRegex(RegexOption.IGNORE_CASE)
             regex.findAll(htmlStr).forEach { match ->
                 val href = match.groupValues[1].replace("\\/", "/")
@@ -460,14 +459,24 @@ class ComixProvider : MainAPI() {
 
         processHtmlAndJson(html1, document, initialData)
 
-        // ── Pagination until no new chapters appear ───────────────────────
-        val maxPage = 80
+        // ── FAST PAGINATION: Raw HTTP instead of WebViews ───────────────────────
+        val maxPage = 40 
+        
+        // Grab the Cloudflare cookies obtained from the Page 1 WebView run
+        val cookies = runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull() ?: ""
+        val headers = mapOf("Cookie" to cookies)
+
         for (page in 2..maxPage) {
             if (expectedUnique > 0 && chapterMap.size >= expectedUnique) break
 
             val pageUrl = if (url.contains("?")) "$url&page=$page" else "$url?page=$page"
-            val pageHtml = fetchHtmlWithWebView(pageUrl)
-            if (pageHtml.isBlank()) break
+            
+            // OPTIMIZATION: Call `app.get()` which is incredibly fast compared to a headless browser.
+            val pageHtml = runCatching { 
+                app.get(pageUrl, headers = headers).text 
+            }.getOrNull()
+            
+            if (pageHtml.isNullOrBlank()) break
 
             val pageDoc = Jsoup.parse(pageHtml)
             val pageJson = extractInitialDataJson(pageDoc)
@@ -478,7 +487,6 @@ class ComixProvider : MainAPI() {
             if (chapterMap.size == before) break
         }
 
-        // Sort ascending → episode 1 = chapter 0
         val sortedChapters = chapterMap.entries
             .sortedBy { it.key.toDoubleOrNull() ?: 0.0 }
             .toList()
@@ -493,7 +501,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ── Fallback: only first/last URL available ───────────────────────
         val finalEpisodes: List<Episode> = if (episodes.isEmpty() && latestChapterNum > 0) {
             buildList {
                 firstChapterUrl?.let { u ->
@@ -547,7 +554,6 @@ class ComixProvider : MainAPI() {
         val activity = CommonActivity.activity as? AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
-        // Updated Regex here to match the new relaxed filter
         val chapterName = Regex("""chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(data)
             ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
 
