@@ -1,11 +1,5 @@
 package com.comix
 
-import android.annotation.SuppressLint
-import android.os.Handler
-import android.os.Looper
-import android.webkit.CookieManager
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.DubStatus
@@ -27,21 +21,17 @@ import com.lagradost.cloudstream3.newAnimeLoadResponse
 import com.lagradost.cloudstream3.newAnimeSearchResponse
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import org.json.JSONTokener
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
-import kotlin.coroutines.resume
 
 class ComixProvider : MainAPI() {
 
@@ -54,8 +44,6 @@ class ComixProvider : MainAPI() {
     override val hasMainPage = true
     override val hasQuickSearch = true
 
-    private var customUserAgent: String? = null
-
     override val mainPage = mainPageOf(
         "trending" to "Trending Today",
         "follows"  to "Most Followed",
@@ -64,200 +52,31 @@ class ComixProvider : MainAPI() {
     )
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  WebView fetcher
+    //  Inbuilt Cloudflare Bypass & Browser Mimic
     // ═══════════════════════════════════════════════════════════════════════
-    @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun fetchHtmlWithWebView(url: String, isDetailPage: Boolean = false): String =
-        withContext(Dispatchers.Main) {
-            val activity = CommonActivity.activity ?: return@withContext ""
-            if (activity.isFinishing || activity.isDestroyed) return@withContext ""
+    
+    // Uses Cloudstream's native interceptor to silently solve CF and sync cookies
+    private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
-            suspendCancellableCoroutine { cont ->
-                val wv = WebView(activity)
-                
-                val customUa = wv.settings.userAgentString.replace("; wv", "").replace("Android TV", "Android")
-                customUserAgent = customUa
-                
-                wv.settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    loadsImagesAutomatically = false
-                    userAgentString = customUa
-                }
-
-                runCatching {
-                    CookieManager.getInstance().apply {
-                        setAcceptCookie(true)
-                        setAcceptThirdPartyCookies(wv, true)
-                    }
-                }
-
-                val handler = Handler(Looper.getMainLooper())
-                var resumed = false
-                var lastHtml = ""
-
-                fun finish(result: String) {
-                    if (resumed) return
-                    resumed = true
-                    handler.removeCallbacksAndMessages(null)
-                    runCatching { wv.stopLoading(); wv.destroy() }
-                    if (cont.isActive) cont.resume(result)
-                }
-
-                handler.postDelayed({
-                    if (!resumed) {
-                        wv.evaluateJavascript("(function(){ return window.comixResult && window.comixResult !== 'LOADING' ? window.comixResult : document.documentElement.outerHTML; })();") { rawStr ->
-                            val html = parseJsString(rawStr) ?: lastHtml
-                            finish(html)
-                        }
-                    }
-                }, if (isDetailPage) 15_000L else 8_000L)
-
-                var attempts = 0
-                lateinit var checkHtml: Runnable
-                checkHtml = Runnable {
-                    if (resumed) return@Runnable
-                    
-                    if (isDetailPage) {
-                        val jsScript = """
-                            if (!window.comixStarted) {
-                                window.comixStarted = true;
-                                window.comixResult = 'LOADING';
-                                (async function() {
-                                    try {
-                                        let map = new Map();
-                                        function extract(doc) {
-                                            let items = doc.querySelectorAll('a[href*="-chapter-"]');
-                                            items.forEach(a => {
-                                                let href = a.getAttribute('href');
-                                                if(!href) return;
-                                                let m = href.match(/-chapter-([\d.]+)/i);
-                                                if (m) {
-                                                    let num = parseFloat(m[1]);
-                                                    let key = num % 1 === 0 ? num.toString() : num.toString();
-                                                    if (!map.has(key)) {
-                                                        let text = (a.innerText || "").trim().replace(/\n/g, ' ');
-                                                        map.set(key, { num: num, name: text || 'Ch. ' + key, href: href });
-                                                    }
-                                                }
-                                            });
-                                        }
-                                        
-                                        let retries = 0;
-                                        while(document.querySelectorAll('.mchap-item').length === 0 && !document.querySelector('.mchap-empty, .list-empty') && retries < 20) {
-                                            await new Promise(r => setTimeout(r, 250));
-                                            retries++;
-                                        }
-                                        
-                                        extract(document);
-                                        
-                                        let maxPage = 1;
-                                        document.querySelectorAll('.npager__num').forEach(el => {
-                                            let p = parseInt(el.innerText);
-                                            if (p > maxPage) maxPage = p;
-                                        });
-                                        
-                                        if (maxPage > 1) {
-                                            let current = 2;
-                                            while (current <= maxPage) {
-                                                let promises = [];
-                                                for (let i = 0; i < 4 && current <= maxPage; i++, current++) {
-                                                    let purl = window.location.href.split('?')[0] + '?page=' + current;
-                                                    promises.push(fetch(purl).then(r => r.text()).catch(e => ""));
-                                                }
-                                                let htmls = await Promise.all(promises);
-                                                let parser = new DOMParser();
-                                                htmls.forEach(html => {
-                                                    if (html && html.includes('mchap-item')) {
-                                                        let doc = parser.parseFromString(html, 'text/html');
-                                                        extract(doc);
-                                                    }
-                                                });
-                                                await new Promise(r => setTimeout(r, 300));
-                                            }
-                                        }
-                                        
-                                        let chapters = Array.from(map.values());
-                                        let initData = document.querySelector('#initial-data');
-                                        let initText = initData ? (initData.innerText || initData.innerHTML) : "";
-                                        
-                                        window.comixResult = JSON.stringify({
-                                            initialData: initText.trim(),
-                                            chapters: chapters
-                                        });
-                                    } catch(e) {
-                                        window.comixResult = 'ERROR: ' + e.toString();
-                                    }
-                                })();
-                            }
-                            window.comixResult;
-                        """.trimIndent()
-                        
-                        wv.evaluateJavascript(jsScript) { rawStr ->
-                            if (resumed) return@evaluateJavascript
-                            val raw = parseJsString(rawStr)
-                            
-                            if (raw != null && raw.startsWith("{")) {
-                                runCatching { CookieManager.getInstance().flush() }
-                                finish(raw)
-                            } else {
-                                attempts++
-                                if (attempts < 60 && !resumed) handler.postDelayed(checkHtml, 300L) 
-                            }
-                        }
-                    } else {
-                        val jsScript = """
-                            (function(){ 
-                                var count = document.querySelectorAll('a[href*="/title/"], .lrow, .list-grid, article, .manga-card').length;
-                                var hasInit = document.querySelector('#initial-data') ? 1 : 0;
-                                if (count === 0 && document.querySelector('.list-empty')) count = -1;
-                                var status = (count !== 0 || hasInit !== 0) ? 'READY' : 'WAIT';
-                                return status + '_COMIX_SPLIT_' + document.documentElement.outerHTML; 
-                            })();
-                        """.trimIndent()
-                        
-                        wv.evaluateJavascript(jsScript) { rawStr ->
-                            if (resumed) return@evaluateJavascript
-                            
-                            val raw = parseJsString(rawStr) ?: ""
-                            val parts = raw.split("_COMIX_SPLIT_", limit = 2)
-                            val status = parts.getOrNull(0) ?: ""
-                            val html = parts.getOrNull(1) ?: raw
-                            
-                            if (html.isNotBlank() && html != "null") lastHtml = html
-
-                            if (status == "READY") {
-                                runCatching { CookieManager.getInstance().flush() }
-                                finish(lastHtml)
-                                return@evaluateJavascript
-                            }
-
-                            attempts++
-                            if (attempts < 80 && !resumed) handler.postDelayed(checkHtml, 100L)
-                            else finish(lastHtml)
-                        }
-                    }
-                }
-
-                wv.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView, u: String?) {
-                        super.onPageFinished(view, u)
-                        handler.post(checkHtml)
-                    }
-                }
-
-                cont.invokeOnCancellation {
-                    handler.removeCallbacksAndMessages(null)
-                    runCatching { wv.destroy() }
-                }
-
-                wv.loadUrl(url)
-            }
-        }
-
-    private fun parseJsString(raw: String?): String? {
-        if (raw == null || raw == "null") return ""
-        return runCatching { JSONTokener(raw).nextValue().toString() }.getOrDefault(raw)
+    private suspend fun fetchHtml(url: String): String {
+        return app.get(
+            url,
+            interceptor = cfInterceptor,
+            // "Mimic" a modern Desktop Chrome browser to evade initial bot detection
+            headers = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+                "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language" to "en-US,en;q=0.5",
+                "Sec-Ch-Ua" to "\"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"121\", \"Chromium\";v=\"121\"",
+                "Sec-Ch-Ua-Mobile" to "?0",
+                "Sec-Ch-Ua-Platform" to "\"Windows\"",
+                "Sec-Fetch-Dest" to "document",
+                "Sec-Fetch-Mode" to "navigate",
+                "Sec-Fetch-Site" to "none",
+                "Sec-Fetch-User" to "?1",
+                "Upgrade-Insecure-Requests" to "1"
+            )
+        ).text
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -350,19 +169,8 @@ class ComixProvider : MainAPI() {
         return results.distinctBy { it.url }
     }
 
-    private fun extractSearchResults(html: String): List<SearchResponse> {
-        val initial = extractInitialDataJson(html)
-        if (initial != null) {
-            val items = readQueries(initial) { k ->
-                k.length() >= 1 && k.optString(0) == "manga"
-            }
-            if (items.isNotEmpty()) return items.distinctBy { it.url }
-        }
-        return extractSearchResultsDom(Jsoup.parse(html))
-    }
-
     // ═══════════════════════════════════════════════════════════════════════
-    //  Main page (Fixed Pagination Loop)
+    //  Main page & Search (Natively accelerated)
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
@@ -371,25 +179,15 @@ class ComixProvider : MainAPI() {
         val pageUrl = if (page == 1) {
             "$mainUrl/"
         } else {
-            "$mainUrl/${request.data}?page=$page"
+            val sortParam = when (request.data) {
+                "latest" -> "created_at:desc"
+                "hot"    -> "views_7d:desc"
+                else     -> request.data 
+            }
+            "$mainUrl/browse?sort=$sortParam&page=$page"
         }
 
-        var html = ""
-        
-        // Attempt native HTTP for speed on pagination
-        if (page > 1) {
-            val ua = customUserAgent ?: "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Mobile Safari/537.36"
-            val cookies = runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull() ?: ""
-            val headers = mapOf("Cookie" to cookies, "User-Agent" to ua)
-            
-            html = runCatching { app.get(pageUrl, headers = headers).text }.getOrNull() ?: ""
-        }
-
-        // Fallback to WebView if Native HTTP fails or triggers Cloudflare
-        if (html.isBlank() || html.contains("Just a moment...")) {
-            html = fetchHtmlWithWebView(pageUrl)
-        }
-
+        val html = fetchHtml(pageUrl)
         if (html.isBlank()) return null
 
         var items: List<SearchResponse> = emptyList()
@@ -400,8 +198,6 @@ class ComixProvider : MainAPI() {
                 val subtype = k.optString(1)
                 val params = k.optJSONObject(2) ?: return@readQueries false
                 
-                // CRITICAL FIX: Ensure we strictly match the JSON data for the requested page number.
-                // Prevents infinite loops caused by reading global "Page 1" sidebars cached in the JSON.
                 val jsonPage = params.optInt("page", 1)
                 if (page > 1 && jsonPage != page) return@readQueries false
 
@@ -427,17 +223,15 @@ class ComixProvider : MainAPI() {
         val encodedQuery = URLEncoder.encode(cleanQuery, "UTF-8")
         val searchUrl = "$mainUrl/browse?q=$encodedQuery"
 
-        val ua = customUserAgent ?: "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Mobile Safari/537.36"
-        val cookies = runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull() ?: ""
-        val headers = mapOf("Cookie" to cookies, "User-Agent" to ua)
-        
-        var html = runCatching { app.get(searchUrl, headers = headers).text }.getOrNull() ?: ""
-        
-        if (html.isBlank() || html.contains("Just a moment...")) {
-            html = fetchHtmlWithWebView(searchUrl)
-        }
+        val html = fetchHtml(searchUrl)
+        if (html.isBlank()) return emptyList()
 
-        val results = if (html.isNotBlank()) extractSearchResults(html) else emptyList()
+        var results: List<SearchResponse> = emptyList()
+        extractInitialDataJson(html)?.let { initial ->
+            results = readQueries(initial) { k -> k.length() >= 1 && k.optString(0) == "manga" }
+        }
+        if (results.isEmpty()) results = extractSearchResultsDom(Jsoup.parse(html))
+
         val lower = cleanQuery.lowercase()
         val filtered = results.filter { it.name.lowercase().contains(lower) }
         return (filtered.ifEmpty { results }).distinctBy { it.url }
@@ -452,33 +246,16 @@ class ComixProvider : MainAPI() {
     //  load()
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
-        val payload = fetchHtmlWithWebView(url, isDetailPage = true)
-        if (payload.isBlank()) return null
+        val html = fetchHtml(url)
+        if (html.isBlank()) return null
 
-        var initialData: JSONObject? = null
+        val document = Jsoup.parse(html)
+        val initialData = extractInitialDataJson(document) ?: return null
+
         val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
 
-        if (payload.startsWith("{")) {
-            val payloadObj = runCatching { JSONObject(payload) }.getOrNull()
-            val initStr = payloadObj?.optString("initialData")
-            if (!initStr.isNullOrBlank()) {
-                initialData = runCatching { JSONObject(initStr) }.getOrNull()
-            }
-            
-            val episodesArray = payloadObj?.optJSONArray("chapters")
-            if (episodesArray != null) {
-                for (i in 0 until episodesArray.length()) {
-                    val epObj = episodesArray.optJSONObject(i) ?: continue
-                    val name = epObj.optString("name")
-                    val href = epObj.optString("href") 
-                    val numStr = epObj.optDouble("num").let { formatChapterNum(it) }
-                    parsedChapterLinks[numStr] = name to href
-                }
-            }
-        } else {
-            val document = Jsoup.parse(payload)
-            initialData = extractInitialDataJson(document)
-            document.select("a.mchap-row__primary, a[href*='-chapter-']").forEach { a ->
+        fun extractChaptersFromHtml(doc: Document) {
+            doc.select("a.mchap-row__primary, a[href*='-chapter-']").forEach { a ->
                 val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
                 val m = Regex("""-chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return@forEach
                 val numStr = m.groupValues[1].toDoubleOrNull()?.let { formatChapterNum(it) } ?: return@forEach
@@ -492,7 +269,34 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        if (initialData == null) return null
+        // Parse visible chapters from Page 1
+        extractChaptersFromHtml(document)
+
+        // Find Total Pages
+        var maxPage = 1
+        document.select(".npager__num").forEach { el ->
+            val p = el.text().toIntOrNull() ?: 1
+            if (p > maxPage) maxPage = p
+        }
+
+        // BATCH NATIVE HTTP: Since Cloudstream has solved Cloudflare and holds the cookie, 
+        // this batch fetching executes safely and natively at maximum speed without WebView timers.
+        if (maxPage > 1) {
+            val pages = (2..maxPage).toList()
+            for (chunk in pages.chunked(5)) {
+                coroutineScope {
+                    chunk.map { pageNum ->
+                        async {
+                            val pUrl = if (url.contains("?")) "$url&page=$pageNum" else "$url?page=$pageNum"
+                            val response = runCatching { fetchHtml(pUrl) }.getOrNull()
+                            if (!response.isNullOrBlank()) {
+                                extractChaptersFromHtml(Jsoup.parse(response))
+                            }
+                        }
+                    }.awaitAll()
+                }
+            }
+        }
 
         var detail: JSONObject? = null
         initialData.optJSONObject("queries")?.let { queries ->
