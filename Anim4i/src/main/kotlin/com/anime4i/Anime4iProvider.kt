@@ -1,5 +1,6 @@
-package com.lagradost.cloudstream3.animeproviders
+package com.anime4i
 
+import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -22,42 +23,63 @@ class Anime4iProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val document = app.get("$mainUrl${request.data}$page").document
-        
-        // 1. Dynamic Tab Parsing for the Root Homepage
-        if (request.data == "/") {
+        val url = when {
+            request.data == "/" -> {
+                if (page > 1) "$mainUrl/page/$page/" else "$mainUrl/"
+            }
+            request.data.endsWith("page=") -> "$mainUrl${request.data}$page"
+            else -> "$mainUrl${request.data}$page"
+        }
+
+        val document = app.get(url).document
+
+        // 1. Dynamic Tab & Multi-Row Parsing on Root Homepage (Page 1)
+        if (request.data == "/" && page == 1) {
             val home = ArrayList<HomePageList>()
 
-            // Extract the Category Tabs (Adventure, Drama, Full CGI, etc.)
+            // Popular Today Row
+            val popularToday = document.select(".popularslider article.bs").mapNotNull { it.toSearchResult() }
+            if (popularToday.isNotEmpty()) {
+                home.add(HomePageList("Popular Today", popularToday))
+            }
+
+            // Category Tabs (Adventure, Drama, Full CGI, Martial Arts, Urban Fantasy)
             document.select(".series-gen .nav-tabs li a").forEach { tab ->
-                val tabName = tab.text()
-                val tabId = tab.attr("href")
+                val tabName = tab.text().trim()
+                val tabId = tab.attr("href").trim() // e.g. #series-750
 
-                val tabItems = document.select("$tabId article.bs").mapNotNull {
-                    it.toSearchResult()
-                }
-
-                if (tabItems.isNotEmpty()) {
-                    home.add(HomePageList(tabName, tabItems))
+                if (tabId.startsWith("#")) {
+                    val tabItems = document.select("$tabId article.bs").mapNotNull {
+                        it.toSearchResult()
+                    }
+                    if (tabItems.isNotEmpty()) {
+                        home.add(HomePageList(tabName, tabItems))
+                    }
                 }
             }
-            
-            // Extract the Trending Section
+
+            // Trending This Week Row
             val trendingItems = document.select(".wpop-weekly article.bs").mapNotNull { it.toSearchResult() }
             if (trendingItems.isNotEmpty()) {
                 home.add(HomePageList("Trending This Week", trendingItems))
             }
 
+            // Latest Releases Row
+            val latestItems = document.select(".latesthome ~ .listupd article.bs").mapNotNull { it.toSearchResult() }
+            if (latestItems.isNotEmpty()) {
+                home.add(HomePageList("Latest Release", latestItems))
+            }
+
             return HomePageResponse(home)
-        } 
-        
-        // 2. Standard Parsing for paginated categories
+        }
+
+        // 2. Standard Paginated Parsing
         val items = document.select("article.bs").mapNotNull { it.toSearchResult() }
         return newHomePageResponse(request.name, items)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/?s=${query}"
+        val url = "$mainUrl/?s=${query.trim().replace(" ", "+")}"
         val document = app.get(url).document
 
         return document.select("article.bs").mapNotNull {
@@ -67,11 +89,11 @@ class Anime4iProvider : MainAPI() {
 
     private fun Element.toSearchResult(): AnimeSearchResponse? {
         val a = this.selectFirst("a") ?: return null
-        val title = a.attr("title")
+        val title = a.attr("title").ifEmpty { this.selectFirst(".tt")?.text() } ?: return null
         val href = a.attr("href") ?: return null
-        val posterUrl = a.selectFirst("img")?.attr("src")
-        
-        val epString = a.selectFirst(".epx")?.text()?.replace(Regex("[^0-9]"), "")
+        val posterUrl = this.selectFirst("img")?.attr("src")
+
+        val epString = this.selectFirst(".epx")?.text()?.replace(Regex("[^0-9]"), "")
         val epNum = epString?.toIntOrNull()
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
@@ -81,31 +103,42 @@ class Anime4iProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        val document = app.get(url).document
-        val title = document.selectFirst(".infox h1")?.text() ?: return null
-        val poster = document.selectFirst(".thumb img")?.attr("src")
-        val description = document.selectFirst(".entry-content, .infox .desc")?.text()
-        
-        val isEpisodePage = url.contains("-episode-")
-        
-        if (isEpisodePage) {
-            return newAnimeLoadResponse(title, url, TvType.Anime) {
-                this.posterUrl = poster
-                this.plot = description
-                addEpisodes(Episode(url, name = title))
+        var document = app.get(url).document
+
+        // If the clicked link is a specific episode, try to resolve the parent series page
+        // so the user gets access to the full episode playlist instead of just one episode
+        if (url.contains("-episode-")) {
+            val seriesHref = document.selectFirst(
+                ".allep a, .ts-breadcrumb li:nth-child(2) a, a.series, .naveps .nve a[href*='/anime/']"
+            )?.attr("href")
+
+            if (!seriesHref.isNullOrBlank() && seriesHref != url) {
+                document = app.get(seriesHref).document
             }
         }
 
+        val title = document.selectFirst(".infox h1, h1.entry-title")?.text() ?: return null
+        val poster = document.selectFirst(".thumb img, .infox .thumb img")?.attr("src")
+        val description = document.selectFirst(".entry-content, .infox .desc, .mindes")?.text()
+
+        // Scrape episodes from the episode list container
         val episodes = document.select(".eplister ul li a").mapNotNull { ep ->
             val epHref = ep.attr("href") ?: return@mapNotNull null
-            val epName = ep.selectFirst(".epl-num")?.text() ?: ep.selectFirst(".epl-title")?.text() ?: "Episode"
+            val epName = ep.selectFirst(".epl-num")?.text()
+                ?: ep.selectFirst(".epl-title")?.text()
+                ?: "Episode"
             Episode(epHref, name = epName)
         }.reversed()
+
+        // Fallback: If no episode list was found, use the current page as a single episode
+        val finalEpisodes = episodes.ifEmpty {
+            listOf(Episode(url, name = title))
+        }
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
             this.plot = description
-            addEpisodes(episodes)
+            addEpisodes(finalEpisodes)
         }
     }
 
@@ -116,28 +149,60 @@ class Anime4iProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = app.get(data).document
-        
-        val iframeUrls = document.select("iframe").mapNotNull { it.attr("src") }
+        val foundUrls = LinkedHashSet<String>()
+
+        // 1. Direct iframes in video containers
+        document.select("#pembed iframe, .player-embed iframe, iframe").forEach { iframe ->
+            val src = iframe.attr("src")
+            if (src.isNotBlank()) foundUrls.add(src)
+        }
+
+        // 2. Embedded server selects/options (decoding base64 iframes if present)
+        document.select("select.mirror option, .mirror li, select[name='server'] option").forEach { option ->
+            val raw = option.attr("value").ifEmpty { option.attr("data-embed") }.ifEmpty { option.attr("data-src") }
+            decodeEmbedUrl(raw)?.let { foundUrls.add(it) }
+        }
+
         var handled = false
-        
-        iframeUrls.forEach { iframeUrl ->
-            if (iframeUrl.contains("ok.ru")) {
-                // Route explicitly to your custom Ok.ru extractor
-                OkRuCustom().getUrl(iframeUrl, data, subtitleCallback, callback)
-                handled = true
-            } else if (iframeUrl.contains("dailymotion.com")) {
-                // Route to CloudStream's native Dailymotion extractor
-                loadExtractor(iframeUrl, data, subtitleCallback, callback)
-                handled = true
+        foundUrls.forEach { targetUrl ->
+            val cleanUrl = if (targetUrl.startsWith("//")) "https:$targetUrl" else targetUrl
+
+            when {
+                cleanUrl.contains("ok.ru") -> {
+                    OkRuCustom().getUrl(cleanUrl, data, subtitleCallback, callback)
+                    handled = true
+                }
+                cleanUrl.contains("dailymotion.com") -> {
+                    loadExtractor(cleanUrl, data, subtitleCallback, callback)
+                    handled = true
+                }
+                else -> {
+                    loadExtractor(cleanUrl, data, subtitleCallback, callback)
+                    handled = true
+                }
             }
         }
 
         return handled
     }
+
+    private fun decodeEmbedUrl(raw: String): String? {
+        if (raw.isBlank()) return null
+        if (raw.startsWith("http://") || raw.startsWith("https://") || raw.startsWith("//")) {
+            return raw
+        }
+        return try {
+            val decoded = String(Base64.decode(raw, Base64.DEFAULT))
+            Regex("""src=["'](https?://[^"']+|//[^"']+)["']""").find(decoded)?.groupValues?.get(1)
+                ?: if (decoded.startsWith("http")) decoded else null
+        } catch (_: Exception) {
+            null
+        }
+    }
 }
 
 // ---------------------------------------------------------
-// CUSTOM EXTRACTORS (Included in the same file for ease)
+// CUSTOM EXTRACTORS
 // ---------------------------------------------------------
 
 class OkRuCustom : ExtractorApi() {
@@ -166,13 +231,13 @@ class OkRuCustom : ExtractorApi() {
             val id = RE_VIDEO_ID.find(url)?.groupValues?.get(1)
                 ?: RE_MID_PARAM.find(url)?.groupValues?.get(1)
                 ?: url.substringAfterLast("/").substringBefore("?")
-            
+
             if (id.isBlank() || !id.all { it.isDigit() }) return
 
             val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id"
             val json = app.post(apiUrl).parsedSafe<OkRuResponse>() ?: return
 
-            // 1. MP4 first
+            // 1. Direct MP4 links
             json.videos?.forEach { video ->
                 val qName = video.name?.lowercase().orEmpty()
                 val vidUrl = video.url.orEmpty()
@@ -194,7 +259,7 @@ class OkRuCustom : ExtractorApi() {
                 )
             }
 
-            // 2. HLS → 3. DASH fallback
+            // 2. HLS -> DASH Fallback
             val hlsUrl = json.hlsManifestUrl.orEmpty()
             if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
                 M3u8Helper.generateM3u8(
@@ -215,8 +280,8 @@ class OkRuCustom : ExtractorApi() {
                     )
                 }
             }
-        } catch (e: Exception) {
-            // Fails silently
+        } catch (_: Exception) {
+            // Fail silently
         }
     }
 
