@@ -97,6 +97,8 @@ class ComixProvider : MainAPI() {
                 handler.postDelayed({ finish("") }, 8_000L)
 
                 var attempts = 0
+                val isDetailPage = url.contains("/title/") || url.contains("/manga/") || url.contains("/comic/")
+                
                 lateinit var checkHtml: Runnable
                 checkHtml = Runnable {
                     if (resumed) return@Runnable
@@ -106,11 +108,16 @@ class ComixProvider : MainAPI() {
                         if (resumed) return@evaluateJavascript
                         val html = parseJsString(raw) ?: ""
 
-                        if (html.contains("lrow") ||
-                            html.contains("list-grid") ||
-                            html.contains("list-empty") ||
-                            html.contains("initial-data") ||
-                            html.contains("mchap-item")) {
+                        val ready = if (isDetailPage) {
+                            // On detail pages, wait specifically for chapters to render or indicate empty
+                            html.contains("mchap-item") || html.contains("chapter-list") || 
+                            html.contains("list-empty") || html.contains("chapter_list")
+                        } else {
+                            html.contains("lrow") || html.contains("list-grid") || 
+                            html.contains("list-empty") || html.contains("initial-data")
+                        }
+
+                        if (ready) {
                             runCatching { CookieManager.getInstance().flush() }
                             finish(html)
                             return@evaluateJavascript
@@ -120,7 +127,7 @@ class ComixProvider : MainAPI() {
                         if (attempts < 30 && !resumed) {
                             handler.postDelayed(checkHtml, 300L)
                         } else {
-                            finish(html)
+                            finish(html) // Force finish if timeout threshold reached
                         }
                     }
                 }
@@ -311,10 +318,10 @@ class ComixProvider : MainAPI() {
     //  Chapter-number helpers
     // ═══════════════════════════════════════════════════════════════════════
 
-    /** Extracts the chapter number from any href of the form `…/{id}-chapter-{n}`. */
+    /** Extracts the chapter number correctly bypassing missing hyphens before "chapter" */
     private fun chapterNumberFromHref(href: String?): Double? {
         if (href.isNullOrBlank()) return null
-        val m = Regex("-chapter-([\\d.]+)").find(href) ?: return null
+        val m = Regex("""chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return null
         return m.groupValues[1].toDoubleOrNull()
     }
 
@@ -322,9 +329,6 @@ class ComixProvider : MainAPI() {
     private fun formatChapterNum(n: Double): String =
         if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
 
-    /**
-     * Derives the expected unique-chapter count from the two canonical URLs.
-     */
     private fun expectedUniqueCount(
         firstChapterUrl: String?,
         latestChapterUrl: String?,
@@ -340,11 +344,43 @@ class ComixProvider : MainAPI() {
         }
     }
 
+    /** Deep recursive search to rip chapter links out of nested React Query JSON objects */
+    private fun extractChaptersFromJson(json: Any?, map: LinkedHashMap<String, Pair<String, String>>) {
+        if (json == null) return
+        when (json) {
+            is JSONObject -> {
+                val href = json.optString("url")
+                if (href.contains("chapter-", ignoreCase = true)) {
+                    val num = chapterNumberFromHref(href)
+                    if (num != null) {
+                        val keyStr = formatChapterNum(num)
+                        // Deduplication: Only store the first chapter encountered for this number
+                        if (!map.containsKey(keyStr)) {
+                            val title = json.optString("title").takeIf { it.isNotBlank() }
+                                ?: json.optString("name").takeIf { it.isNotBlank() }
+                                ?: "Ch. $keyStr"
+                            map[keyStr] = title to href
+                        }
+                    }
+                }
+                
+                val keys = json.keys()
+                while (keys.hasNext()) {
+                    extractChaptersFromJson(json.opt(keys.next()), map)
+                }
+            }
+            is JSONArray -> {
+                for (i in 0 until json.length()) {
+                    extractChaptersFromJson(json.opt(i), map)
+                }
+            }
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     //  load()
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
-        // ─── Page 1 ────────────────────────────────────────────────────────
         val html1 = fetchHtmlWithWebView(url)
         if (html1.isBlank()) return null
         val document = Jsoup.parse(html1)
@@ -384,7 +420,6 @@ class ComixProvider : MainAPI() {
             }
         }.distinct()
 
-        // ── Canonical chapter range from initial-data ─────────────────────
         val firstChapterUrl  = d.optString("firstChapterUrl").takeIf { it.isNotBlank() }
         val latestChapterUrl = d.optString("latestChapterUrl").takeIf { it.isNotBlank() }
         val latestChapterNum = d.optInt("latestChapter", 0)
@@ -393,14 +428,11 @@ class ComixProvider : MainAPI() {
             firstChapterUrl, latestChapterUrl, latestChapterNum
         )
 
-        // ── Collect anchors keyed by chapter NUMBER ───────────────────────
-        // Key:  formatted chapter number ("0", "1", …, "48.5")
-        // Value: name (visible text, preserves "Ch. 46 new season 2") + href
         val chapterMap = LinkedHashMap<String, Pair<String, String>>()
 
         fun processHtmlAndJson(htmlStr: String, doc: Document, jsonObj: JSONObject?) {
-            // 1. Jsoup DOM parsing (if loaded)
-            doc.select("a[href*='-chapter-']").forEach { a ->
+            // 1. Jsoup DOM parsing via the updated generic regex query
+            doc.select("a[href*='chapter-']").forEach { a ->
                 val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
                 val num = chapterNumberFromHref(href) ?: return@forEach
                 val key = formatChapterNum(num)
@@ -410,41 +442,11 @@ class ComixProvider : MainAPI() {
                 }
             }
 
-            // 2. Extract thoroughly from JSON Data without waiting for DOM render 
-            jsonObj?.optJSONObject("queries")?.let { queries ->
-                val keys = queries.keys()
-                while (keys.hasNext()) {
-                    val k = keys.next()
-                    val value = queries.opt(k)
-                    val items = when (value) {
-                        is JSONArray -> value
-                        is JSONObject -> value.optJSONArray("items") 
-                            ?: value.optJSONArray("chapters") 
-                            ?: value.optJSONObject("data")?.optJSONArray("items")
-                        else -> null
-                    }
-                    if (items != null) {
-                        for (i in 0 until items.length()) {
-                            val item = items.optJSONObject(i) ?: continue
-                            val href = item.optString("url")
-                            if (href.contains("-chapter-")) {
-                                val num = chapterNumberFromHref(href) ?: continue
-                                val keyStr = formatChapterNum(num)
-                                // Only storing one iteration deduplicates automatically 
-                                if (!chapterMap.containsKey(keyStr)) {
-                                    val title = item.optString("title").takeIf { it.isNotBlank() }
-                                        ?: item.optString("name").takeIf { it.isNotBlank() } 
-                                        ?: "Ch. $keyStr"
-                                    chapterMap[keyStr] = title to href
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // 2. Extract thoroughly from JSON Data via recursive deep search
+            extractChaptersFromJson(jsonObj, chapterMap)
 
-            // 3. Regex on Raw HTML as a final fallback for unparsed cached queries
-            val regex = """["']([^"']+-chapter-[\d.]+)["']""".toRegex()
+            // 3. Regex on Raw HTML as a final fallback
+            val regex = """["']([^"']+chapter-[\d.]+)["']""".toRegex(RegexOption.IGNORE_CASE)
             regex.findAll(htmlStr).forEach { match ->
                 val href = match.groupValues[1].replace("\\/", "/")
                 if (href.endsWith(".png") || href.endsWith(".jpg") || href.endsWith(".css")) return@forEach
@@ -456,7 +458,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // Apply our robust parsing rules on Page 1
         processHtmlAndJson(html1, document, initialData)
 
         // ── Pagination until no new chapters appear ───────────────────────
@@ -477,7 +478,7 @@ class ComixProvider : MainAPI() {
             if (chapterMap.size == before) break
         }
 
-        // ── Sort ascending → episode 1 = chapter 0 ────────────────────────
+        // Sort ascending → episode 1 = chapter 0
         val sortedChapters = chapterMap.entries
             .sortedBy { it.key.toDoubleOrNull() ?: 0.0 }
             .toList()
@@ -546,7 +547,8 @@ class ComixProvider : MainAPI() {
         val activity = CommonActivity.activity as? AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
-        val chapterName = Regex("-chapter-([\\d.]+)").find(data)
+        // Updated Regex here to match the new relaxed filter
+        val chapterName = Regex("""chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(data)
             ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
 
         activity.runOnUiThread {
