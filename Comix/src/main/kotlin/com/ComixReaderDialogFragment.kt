@@ -616,7 +616,7 @@ class ComixReaderDialogFragment : DialogFragment() {
         )
     }
 
-    private fun injectReaderOptimizations(view: WebView) {
+ private fun injectReaderOptimizations(view: WebView) {
         view.evaluateJavascript(
             """
             (function() {
@@ -678,12 +678,7 @@ class ComixReaderDialogFragment : DialogFragment() {
                 }
                 report();
 
-                /* ── 3. Tap-to-scroll (Swiper-safe) ─────────────────────── */
-                /*    The reader's Swiper config uses touchStartPreventDefault,
-                 *    so `click` never fires inside the reader. We instead use
-                 *    `touchend` with passive capture, and only treat it as a
-                 *    tap when there was minimal movement and a short duration.
-                 */
+                /* ── 3. Tap-to-scroll (Intelligent Next Chapter) ─────────────────────── */
                 if (!window.__comixTapZonesInstalled) {
                   window.__comixTapZonesInstalled = true;
 
@@ -709,14 +704,36 @@ class ComixReaderDialogFragment : DialogFragment() {
                     lastTapEnd = now;
 
                     var w = window.innerWidth;
+                    var h = window.innerHeight;
+                    
+                    // Check if user is scrolled to the absolute bottom of the chapter
+                    var scrollPosition = window.innerHeight + window.scrollY;
+                    var bottomThreshold = document.body.offsetHeight - 50; 
+                    var isAtBottom = scrollPosition >= bottomThreshold;
+
                     if (x < w * 0.25) {
+                      // TAP LEFT: Always scroll up
                       window.scrollBy({ top: -(window.innerHeight * 0.8), behavior: 'smooth' });
                       flashTap(x, y);
                     } else if (x > w * 0.75) {
-                      window.scrollBy({ top:  (window.innerHeight * 0.8), behavior: 'smooth' });
-                      flashTap(x, y);
+                      // TAP RIGHT: Scroll down normally, BUT go to Next Chapter if at the bottom
+                      if (isAtBottom) {
+                        flashTap(x, y);
+                        if (window.AndroidComix) window.AndroidComix.onTriggerNextChapter();
+                      } else {
+                        window.scrollBy({ top:  (window.innerHeight * 0.8), behavior: 'smooth' });
+                        flashTap(x, y);
+                      }
                     } else {
-                      if (window.AndroidComix) window.AndroidComix.onTapZone('center');
+                      // TAP CENTER / BOTTOM
+                      if (isAtBottom && y > h * 0.75) {
+                        // Tapped the bottom 25% of the screen while at the end of the chapter
+                        flashTap(x, y);
+                        if (window.AndroidComix) window.AndroidComix.onTriggerNextChapter();
+                      } else {
+                        // Tapped the middle of the screen (Opens Menu)
+                        if (window.AndroidComix) window.AndroidComix.onTapZone('center');
+                      }
                     }
                   }
 
@@ -758,7 +775,7 @@ class ComixReaderDialogFragment : DialogFragment() {
 
                   // Fallback for non-touch (desktop WebView, accessibility)
                   document.addEventListener('click', function(e) {
-                    if ('ontouchstart' in window) return; // already handled above
+                    if ('ontouchstart' in window) return; 
                     if (isIgnored(e.target)) return;
                     handleTap(e.clientX, e.clientY);
                   }, false);
@@ -770,10 +787,7 @@ class ComixReaderDialogFragment : DialogFragment() {
                   var relisten = function() {
                     setTimeout(function() {
                       try { report(); } catch(e) {}
-                      // Re-inject CSS if React replaced <head>
                       if (!document.getElementById('cs-reader-style')) {
-                        // trigger a full re-inject through the outer function
-                        // (callable via a global trampoline installed below)
                         if (window.__comixReinject) window.__comixReinject();
                       }
                     }, 120);
@@ -783,9 +797,6 @@ class ComixReaderDialogFragment : DialogFragment() {
                   window.addEventListener('popstate', relisten);
                 }
 
-                /* Trampoline so the soft-nav handler can ask Kotlin to
-                 * re-run injectReaderOptimizations after a chapter change.
-                 * Falls back to no-op when the bridge is missing. */
                 window.__comixReinject = function() {
                   try {
                     if (window.AndroidComix && window.AndroidComix.onReaderNeedsReinject) {
