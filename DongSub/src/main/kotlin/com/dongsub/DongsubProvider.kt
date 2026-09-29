@@ -1,9 +1,11 @@
 package com.dongsub
 
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withTimeoutOrNull
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
@@ -31,6 +33,7 @@ class DongsubProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        // Blogger uses tokens for deep pagination, so we keep the homepage to Page 1
         if (page > 1) return newHomePageResponse(request.name, emptyList())
 
         val document = try {
@@ -45,7 +48,7 @@ class DongsubProvider : MainAPI() {
 
         val home = ArrayList<HomePageList>()
 
-        // Popular Posts from sidebar
+        // 1. Popular Posts from sidebar
         val popularItems = document.select(".widget.PopularPosts article.post").mapNotNull { post ->
             val a = post.selectFirst(".post-title a") ?: return@mapNotNull null
             val title = a.text().trim()
@@ -60,7 +63,7 @@ class DongsubProvider : MainAPI() {
             home.add(HomePageList("Populer", popularItems))
         }
 
-        // Latest Releases main feed
+        // 2. Latest Releases main feed
         val latestItems = document.select("article.post-outer-container").mapNotNull {
             it.toSearchResult()
         }
@@ -106,26 +109,37 @@ class DongsubProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url, headers = defaultHeaders).document
 
-        val title = document.selectFirst("h1.post-title, h2.heading, h3.post-title")?.text()?.trim() ?: ""
+        // Clean up the title (remove "Episode X Subtitles" from the main show title)
+        val rawTitle = document.selectFirst("h1.post-title, h2.heading, h3.post-title")?.text()?.trim() ?: ""
+        val title = rawTitle.replace(Regex("(?i)Episode\\s*\\d+.*$"), "").trim()
+
         val poster = fixUrlNull(
             document.selectFirst("meta[property=og:image]")?.attr("content")
                 ?: document.selectFirst(".bigcover img, .ime img")?.attr("src")
         )
         val description = document.selectFirst(".sinoposis, .descNime, .entry-content")?.text()?.trim()
 
-        var episodes = document.select("#episodelain a, .playlistList a, .episodelist li a").mapNotNull { ep ->
-            val epHref = ep.attr("href") ?: return@mapNotNull null
-            val epName = ep.text().trim()
+        // EXPLICITLY target only the actual episode list for this specific show (.bxcl)
+        // This prevents scraping the "Recommended" sidebar widgets which caused the global list bug.
+        var episodes = document.select(".bxcl ul li, #eplist ul li").mapNotNull { ep ->
+            val a = ep.selectFirst("a") ?: return@mapNotNull null
+            val epHref = fixUrlNull(a.attr("href")) ?: return@mapNotNull null
+            
+            // Try to get just the chapter number, fallback to full text
+            val epName = ep.selectFirst(".chapternum")?.text() 
+                ?: ep.selectFirst(".eph-num")?.text() 
+                ?: a.text()
+                
             newEpisode(epHref) {
-                this.name = epName
-                this.posterUrl = poster
+                this.name = epName.trim()
             }
         }.reversed()
 
+        // Fallback: If no list exists (Blogger single post), use the current page as the only episode
         if (episodes.isEmpty()) {
             episodes = listOf(
                 newEpisode(url) {
-                    this.name = title
+                    this.name = rawTitle.ifBlank { title }
                     this.posterUrl = poster
                 }
             )
@@ -158,7 +172,7 @@ class DongsubProvider : MainAPI() {
         val rawHtml = response.text
         val extractedUrls = ConcurrentHashMap.newKeySet<String>()
 
-        // 1. Direct DOM iframes matching Dailymotion
+        // 1. Direct iframes matching Dailymotion
         document.select("iframe").forEach { iframe ->
             val src = iframe.attr("src")
             if (src.contains("dailymotion.com") || src.contains("dai.ly")) {
@@ -166,7 +180,21 @@ class DongsubProvider : MainAPI() {
             }
         }
 
-        // 2. Scan script tags and raw HTML for Dailymotion URLs (embedded in Blogger player scripts)
+        // 2. Base64 decoded server buttons (Dongsub heavily hides iframes in data-embed attributes)
+        document.select("[data-embed], .DagPlayOpt").forEach { elem ->
+            val raw = elem.attr("data-embed").ifEmpty { elem.attr("data-src") }
+            if (raw.isNotBlank()) {
+                try {
+                    val decoded = String(Base64.decode(raw, Base64.DEFAULT))
+                    val iframeSrc = Jsoup.parse(decoded).selectFirst("iframe")?.attr("src") ?: decoded
+                    if (iframeSrc.contains("dailymotion") || iframeSrc.contains("dai.ly")) {
+                        extractedUrls.add(iframeSrc)
+                    }
+                } catch (_: Exception) {}
+            }
+        }
+
+        // 3. Scan script tags and raw HTML for Dailymotion URLs (embedded in Blogger player scripts)
         val dmRegex = Regex("""https?://(?:www\.)?(?:dailymotion\.com/(?:embed/)?video/|dai\.ly/)[a-zA-Z0-9]+""")
         dmRegex.findAll(rawHtml).forEach { match ->
             extractedUrls.add(match.value)
