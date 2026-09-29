@@ -154,9 +154,9 @@ class DongsubProvider : MainAPI() {
                 parseCards(ld).forEach { card ->
                     episodes.add(newEpisode(card.url) {
                         this.name = card.name
-                        // `card.sub` is where `addSub(epNum)` stored the episode number.
-                        this.episode = card.sub
                         this.posterUrl = card.posterUrl
+                        // Episode number is already part of card.name, no
+                        // need to set .episode explicitly.
                     })
                 }
             }
