@@ -45,11 +45,12 @@ class ComixProvider : MainAPI() {
     override val hasQuickSearch = true
 
     override val mainPage = mainPageOf(
-        "latest"         to "Latest Updates",
-        "trending"       to "Trending",
-        "follows"        to "Most Followed",
-        "recommendation" to "Recommendation",
-        "completed"      to "Completed",
+        "latest_new"      to "Latest Updates (New)",
+        "latest_hot"      to "Latest Updates (Hot)",
+        "trending"        to "Trending",
+        "follows"         to "Most Followed",
+        "recommended_you" to "Recommendation",
+        "completed"       to "Completed",
     )
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -177,14 +178,13 @@ class ComixProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
-        // "Recommendation" is a single curated carousel slider on the homepage without pagination
-        if (request.data == "recommendation") {
+        // "Recommended for you" is a single curated carousel slider on the homepage without pagination
+        if (request.data == "recommended_you") {
             if (page > 1) return null
             val html = fetchHtml("$mainUrl/")
             if (html.isBlank()) return null
             val doc = Jsoup.parse(html)
             
-            // Internally matches the actual HTML section title "Recommended for you"
             val recSection = doc.select("section.section").firstOrNull { 
                 it.select(".section__title").text().contains("Recommended for you", ignoreCase = true) 
             } ?: return null
@@ -194,17 +194,20 @@ class ComixProvider : MainAPI() {
         }
 
         // Determine target URL for pagination or direct queries
-        // - "latest"    -> fetches directly from endpoint to bypass homepage default
-        // - "completed" -> fetches directly from endpoint to get full grid instead of small sidebar
-        val pageUrl = if (page == 1 && request.data != "latest" && request.data != "completed") {
+        val pageUrl = if (page == 1 && request.data != "latest_new" && request.data != "completed") {
             "$mainUrl/"
         } else {
-            when (request.data) {
-                "latest"    -> "$mainUrl/browse?sort=created_at:desc&page=$page"
-                "trending"  -> "$mainUrl/browse?sort=views_7d:desc&page=$page"
-                "follows"   -> "$mainUrl/browse?sort=follows:desc&page=$page"
-                "completed" -> "$mainUrl/browse?status=completed&sort=created_at:desc&page=$page"
-                else        -> "$mainUrl/browse?sort=created_at:desc&page=$page"
+            val sortParam = when (request.data) {
+                "latest_new" -> "chapter_updated_at:desc"
+                "latest_hot" -> "views_7d:desc"
+                "trending"   -> "views_7d:desc"
+                "follows"    -> "follows:desc"
+                else         -> "chapter_updated_at:desc"
+            }
+            if (request.data == "completed") {
+                "$mainUrl/browse?status=completed&sort=chapter_updated_at:desc&page=$page"
+            } else {
+                "$mainUrl/browse?sort=$sortParam&page=$page"
             }
         }
 
@@ -214,7 +217,7 @@ class ComixProvider : MainAPI() {
         val items = mutableListOf<SearchResponse>()
         val initial = extractInitialDataJson(html)
 
-        if (page == 1 && request.data != "latest" && request.data != "completed") {
+        if (page == 1 && request.data != "latest_new" && request.data != "completed") {
             // First check initial-data queries for exact matching keys
             if (initial != null) {
                 val matched = readQueries(initial) { k ->
@@ -222,9 +225,10 @@ class ComixProvider : MainAPI() {
                     val subtype = k.optString(1)
                     val params = k.optJSONObject(2) ?: return@readQueries false
                     when (request.data) {
-                        "trending" -> subtype == "top" && params.optString("type") == "trending"
-                        "follows"  -> subtype == "top" && params.optString("type") == "follows"
-                        else       -> false
+                        "trending"   -> subtype == "top" && params.optString("type") == "trending"
+                        "follows"    -> subtype == "top" && params.optString("type") == "follows"
+                        "latest_hot" -> subtype == "list" && params.optString("scope") == "hot"
+                        else         -> false
                     }
                 }
                 items.addAll(matched)
@@ -234,9 +238,10 @@ class ComixProvider : MainAPI() {
             if (items.isEmpty()) {
                 val doc = Jsoup.parse(html)
                 val sectionHeader = when (request.data) {
-                    "trending" -> "Most Recent Popular"
-                    "follows"  -> "Most Follows"
-                    else       -> ""
+                    "trending"   -> "Most Recent Popular"
+                    "follows"    -> "Most Follows"
+                    "latest_hot" -> "Latest Updates"
+                    else         -> ""
                 }
                 val sec = doc.select("section.section").firstOrNull { 
                     it.select(".section__title").text().contains(sectionHeader, ignoreCase = true) 
@@ -244,7 +249,7 @@ class ComixProvider : MainAPI() {
                 sec?.select("a.card")?.mapNotNull { toSearchResult(it) }?.let { items.addAll(it) }
             }
         } else {
-            // For browse pages (page > 1 or page 1 of latest / completed)
+            // For browse pages (page > 1 or page 1 of latest_new / completed)
             if (initial != null) {
                 items.addAll(readQueries(initial) { k ->
                     k.length() >= 1 && k.optString(0) == "manga"
