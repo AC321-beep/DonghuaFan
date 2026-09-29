@@ -36,10 +36,11 @@ class DongsubProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        // Blogger feed supports start-index → real, working pagination.
         val startIndex = (page - 1) * pageSize + 1
         val url = "$mainUrl/feeds/posts/default" +
-                "?alt=json&max-results=$pageSize&start-index=$startIndex"
+                "?alt=json&max-results=$pageSize" +
+                "&start-index=$startIndex" +
+                "&orderby=published"
 
         val text = try {
             app.get(url, headers = defaultHeaders).text
@@ -76,7 +77,6 @@ class DongsubProvider : MainAPI() {
                 }
                 if (href.isNullOrBlank() || !href.contains("dongsub.net")) continue
 
-                // Bump Blogger thumbnail size (feeds return s72-c by default)
                 val thumb = e.optJSONObject("media\$thumbnail")?.optString("url")
                     ?.replace("s72-c", "s320")
                     ?.replace("s72", "s320")
@@ -162,16 +162,7 @@ class DongsubProvider : MainAPI() {
         return null
     }
 
-    private suspend fun fetchLabelFeed(label: String): List<Pair<String, String>> {
-        val encoded = label.replace(" ", "%20")
-        val url = "$mainUrl/feeds/posts/default/-/$encoded?alt=json&max-results=500"
-
-        val text = try {
-            app.get(url, headers = defaultHeaders).text
-        } catch (_: Exception) {
-            return emptyList()
-        }
-
+    private fun feedEntriesToPairs(text: String): List<Pair<String, String>> {
         return try {
             val root = JSONObject(text)
             val feed = root.optJSONObject("feed") ?: return emptyList()
@@ -191,12 +182,38 @@ class DongsubProvider : MainAPI() {
                         break
                     }
                 }
-                if (!href.isNullOrBlank()) result.add(title to href)
+                if (!href.isNullOrBlank() && href.contains("dongsub.net")) {
+                    result.add(title to href)
+                }
             }
             result
         } catch (_: Exception) {
             emptyList()
         }
+    }
+
+    private suspend fun fetchLabelFeed(label: String): List<Pair<String, String>> {
+        val encoded = label.replace(" ", "%20")
+        val url = "$mainUrl/feeds/posts/default/-/$encoded" +
+                "?alt=json&max-results=500&orderby=published"
+        val text = try {
+            app.get(url, headers = defaultHeaders).text
+        } catch (_: Exception) {
+            return emptyList()
+        }
+        return feedEntriesToPairs(text)
+    }
+
+    private suspend fun fetchSearchFeed(query: String): List<Pair<String, String>> {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val url = "$mainUrl/feeds/posts/default" +
+                "?alt=json&q=$encoded&max-results=500&orderby=published"
+        val text = try {
+            app.get(url, headers = defaultHeaders).text
+        } catch (_: Exception) {
+            return emptyList()
+        }
+        return feedEntriesToPairs(text)
     }
 
     private suspend fun fetchLabelPage(labelOrHref: String): List<AnimeSearchResponse> {
@@ -214,6 +231,20 @@ class DongsubProvider : MainAPI() {
         }
         return parseCards(doc)
     }
+
+    private suspend fun fetchSearchPage(query: String): List<AnimeSearchResponse> {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val url = "$mainUrl/search?q=$encoded&max-results=500"
+        val doc = try {
+            app.get(url, headers = defaultHeaders).document
+        } catch (_: Exception) {
+            return emptyList()
+        }
+        return parseCards(doc)
+    }
+
+    private fun cleanEpTitle(t: String): String =
+        t.replace(Regex("(?i)\\s*Subtitles?\\s*$"), "").trim()
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = defaultHeaders).document
@@ -234,34 +265,67 @@ class DongsubProvider : MainAPI() {
         val plot = doc.selectFirst("div.desc p, .descNime, .sinoposis, .entry-content p")
             ?.text()?.trim()
 
-        val episodes = mutableListOf<Episode>()
         val anchor = extractSeriesAnchor(doc)
+        val label = anchor?.first
+        val labelHref = anchor?.second
 
-        if (anchor != null) {
-            val (label, href) = anchor
+        // ---- Multi-strategy: pick whichever gives the MOST episodes ----
 
-            val feed = fetchLabelFeed(label)
-            if (feed.isNotEmpty()) {
-                feed.forEach { (epTitle, epUrl) ->
-                    episodes.add(newEpisode(epUrl) {
-                        this.name = epTitle
-                            .replace(Regex("(?i)\\s*Subtitles\\s*$"), "")
-                            .trim()
-                    })
-                }
-            } else {
-                val cards = fetchLabelPage(href ?: label)
-                cards.forEach { card ->
-                    episodes.add(newEpisode(card.url) { this.name = card.name })
-                }
+        fun buildFromPairs(pairs: List<Pair<String, String>>): List<Episode> {
+            val seen = mutableSetOf<String>()
+            val out = mutableListOf<Episode>()
+            for ((t, u) in pairs) {
+                if (u.isBlank()) continue
+                if (!seen.add(u)) continue
+                val n = cleanEpTitle(t)
+                out.add(newEpisode(u) { this.name = n })
             }
+            return out
         }
 
-        if (episodes.isEmpty()) {
-            episodes.add(newEpisode(url) { this.name = rawTitle })
+        fun buildFromCards(cards: List<AnimeSearchResponse>): List<Episode> {
+            val seen = mutableSetOf<String>()
+            val out = mutableListOf<Episode>()
+            for (c in cards) {
+                if (c.url.isBlank()) continue
+                if (!seen.add(c.url)) continue
+                out.add(newEpisode(c.url) { this.name = c.name })
+            }
+            return out
         }
 
-        val ordered = episodes.reversed()
+        var best: List<Episode> = emptyList()
+
+        // 1. Feed for the exact label
+        if (!label.isNullOrBlank()) {
+            val eps = buildFromPairs(fetchLabelFeed(label))
+            if (eps.size > best.size) best = eps
+        }
+
+        // 2. HTML page for the exact label
+        if (!label.isNullOrBlank()) {
+            val eps = buildFromCards(fetchLabelPage(labelHref ?: label))
+            if (eps.size > best.size) best = eps
+        }
+
+        // 3. Feed search by series title (catches shows whose label is only on the newest ep)
+        if (title.isNotBlank()) {
+            val eps = buildFromPairs(fetchSearchFeed(title))
+            if (eps.size > best.size) best = eps
+        }
+
+        // 4. HTML search page by series title
+        if (title.isNotBlank()) {
+            val eps = buildFromCards(fetchSearchPage(title))
+            if (eps.size > best.size) best = eps
+        }
+
+        // 5. Absolute fallback: this single episode
+        if (best.isEmpty()) {
+            best = listOf(newEpisode(url) { this.name = rawTitle })
+        }
+
+        val ordered = best.reversed()
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
