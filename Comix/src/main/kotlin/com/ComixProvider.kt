@@ -45,26 +45,23 @@ class ComixProvider : MainAPI() {
     override val hasQuickSearch = true
 
     override val mainPage = mainPageOf(
-        "latest"         to "Latest Updates",
-        "trending"       to "Trending",
-        "most_viewed"    to "Most Viewed",
-        "follows"        to "Most Followed",
-        "recommendation" to "Recommendation",
-        "completed"      to "Completed",
+        "latest"      to "Latest Updates",
+        "trending"    to "Trending",
+        "most_viewed" to "Most Viewed",
+        "follows"     to "Most Followed",
+        "completed"   to "Completed",
     )
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Inbuilt Cloudflare Bypass & Browser Mimic
     // ═══════════════════════════════════════════════════════════════════════
     
-    // Uses Cloudstream's native interceptor to silently solve CF and sync cookies
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
     private suspend fun fetchHtml(url: String): String {
         return app.get(
             url,
             interceptor = cfInterceptor,
-            // "Mimic" a modern Desktop Chrome browser to evade initial bot detection
             headers = mapOf(
                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -82,7 +79,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  initial-data parsing
+    //  Data Parsing & Extraction
     // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
@@ -159,7 +156,7 @@ class ComixProvider : MainAPI() {
 
     private fun extractSearchResultsDom(doc: Document): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
-        doc.select("a.card").forEach { el ->
+        doc.select("a.card, .list-grid .lrow, div.lrow, .lrow, .list-grid > div").forEach { el ->
             // Restricting search to main grid to prevent mixing with sidebars/widgets
             if (el.parents().any { p -> p.hasClass("side-col") || p.hasClass("sidebar") || p.tagName() == "aside" }) return@forEach
             toSearchResult(el)?.let { results.add(it) }
@@ -175,28 +172,11 @@ class ComixProvider : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse? {
         
-        // 1. RECOMMENDATION (Single curated slider, no pagination)
-        if (request.data == "recommendation") {
-            if (page > 1) return null
-            val html = fetchHtml("$mainUrl/")
-            if (html.isBlank()) return null
-            val doc = Jsoup.parse(html)
-            
-            // Accurately matches the exact HTML section title text
-            val recSection = doc.select("section.section").firstOrNull { 
-                it.select(".section__title").text().contains("Recommend", ignoreCase = true) 
-            } ?: return null
-
-            val results = recSection.select("a.card").mapNotNull { toSearchResult(it) }
-            return newHomePageResponse(request, results.distinctBy { it.url }, hasNext = false)
-        }
-
-        // 2. ALL OTHER CATEGORIES (Fetched natively via direct /browse endpoints)
-        // Note: Using safely URL-encoded %3A instead of a raw colon to prevent server rejections
+        // Exclusively construct clean /browse URLs with encoded parameters
         val pageUrl = when (request.data) {
             "latest"      -> if (page == 1) "$mainUrl/browse" else "$mainUrl/browse?page=$page"
-            "most_viewed" -> if (page == 1) "$mainUrl/browse?sort=views_total%3Adesc" else "$mainUrl/browse?sort=views_total%3Adesc&page=$page"
             "trending"    -> if (page == 1) "$mainUrl/browse?sort=views_7d%3Adesc" else "$mainUrl/browse?sort=views_7d%3Adesc&page=$page"
+            "most_viewed" -> if (page == 1) "$mainUrl/browse?sort=views_total%3Adesc" else "$mainUrl/browse?sort=views_total%3Adesc&page=$page"
             "follows"     -> if (page == 1) "$mainUrl/browse?sort=follows%3Adesc" else "$mainUrl/browse?sort=follows%3Adesc&page=$page"
             "completed"   -> if (page == 1) "$mainUrl/browse?status=completed" else "$mainUrl/browse?status=completed&page=$page"
             else          -> "$mainUrl/browse?page=$page"
@@ -208,14 +188,14 @@ class ComixProvider : MainAPI() {
         val items = mutableListOf<SearchResponse>()
         val doc = Jsoup.parse(html)
 
-        // Extract seamlessly from the initial-data JSON block targeting "list" items
+        // The /browse page structures its data perfectly under ["manga", "list"] in initial-data
         extractInitialDataJson(doc)?.let { initial ->
             items.addAll(readQueries(initial) { k ->
                 k.length() >= 2 && k.optString(0) == "manga" && k.optString(1) == "list"
             })
         }
         
-        // Safety Fallback to DOM extraction
+        // Safety Fallback to DOM extraction if JSON is missing or structure changes
         if (items.isEmpty()) {
             items.addAll(extractSearchResultsDom(doc))
         }
@@ -237,7 +217,9 @@ class ComixProvider : MainAPI() {
         val doc = Jsoup.parse(html)
         
         extractInitialDataJson(doc)?.let { initial ->
-            results.addAll(readQueries(initial) { k -> k.length() >= 2 && k.optString(0) == "manga" && k.optString(1) == "list" })
+            results.addAll(readQueries(initial) { k -> 
+                k.length() >= 2 && k.optString(0) == "manga" && k.optString(1) == "list" 
+            })
         }
         
         if (results.isEmpty()) results.addAll(extractSearchResultsDom(doc))
@@ -287,6 +269,8 @@ class ComixProvider : MainAPI() {
             if (p > maxPage) maxPage = p
         }
 
+        // BATCH NATIVE HTTP: Since Cloudstream has solved Cloudflare and holds the cookie, 
+        // this batch fetching executes safely and natively at maximum speed without WebView timers.
         if (maxPage > 1) {
             val pages = (2..maxPage).toList()
             for (chunk in pages.chunked(5)) {
