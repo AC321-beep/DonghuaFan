@@ -57,12 +57,14 @@ class ComixProvider : MainAPI() {
     //  Inbuilt Cloudflare Bypass & Browser Mimic
     // ═══════════════════════════════════════════════════════════════════════
     
+    // Uses Cloudstream's native interceptor to silently solve CF and sync cookies
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
     private suspend fun fetchHtml(url: String): String {
         return app.get(
             url,
             interceptor = cfInterceptor,
+            // "Mimic" a modern Desktop Chrome browser to evade initial bot detection
             headers = mapOf(
                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -80,7 +82,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Data Parsing & Extraction
+    //  initial-data parsing
     // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
@@ -131,7 +133,6 @@ class ComixProvider : MainAPI() {
                 arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
             }
         }
-        // Safely returning all matching query items instead of breaking early to prevent empty lists
         return out
     }
 
@@ -163,33 +164,27 @@ class ComixProvider : MainAPI() {
             if (el.parents().any { p -> p.hasClass("side-col") || p.hasClass("sidebar") || p.tagName() == "aside" }) return@forEach
             toSearchResult(el)?.let { results.add(it) }
         }
-        
-        if (results.isEmpty()) {
-            doc.select(".list-grid .lrow, div.lrow, .lrow, .list-grid > div").forEach { el ->
-                toSearchResult(el)?.let { results.add(it) }
-            }
-        }
         return results.distinctBy { it.url }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Main page & Search 
+    //  Main page & Search
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
         
-        // 1. RECOMMENDATION (Single slider, no pagination, direct from homepage)
+        // 1. RECOMMENDATION (Single curated slider, no pagination)
         if (request.data == "recommendation") {
             if (page > 1) return null
             val html = fetchHtml("$mainUrl/")
             if (html.isBlank()) return null
             val doc = Jsoup.parse(html)
             
-            // Internally matching the exact HTML text to accurately extract the slider
+            // Accurately matches the exact HTML section title text
             val recSection = doc.select("section.section").firstOrNull { 
-                it.select(".section__title").text().contains("Recommended for you", ignoreCase = true) 
+                it.select(".section__title").text().contains("Recommend", ignoreCase = true) 
             } ?: return null
 
             val results = recSection.select("a.card").mapNotNull { toSearchResult(it) }
@@ -197,11 +192,12 @@ class ComixProvider : MainAPI() {
         }
 
         // 2. ALL OTHER CATEGORIES (Fetched natively via direct /browse endpoints)
+        // Note: Using safely URL-encoded %3A instead of a raw colon to prevent server rejections
         val pageUrl = when (request.data) {
             "latest"      -> if (page == 1) "$mainUrl/browse" else "$mainUrl/browse?page=$page"
-            "most_viewed" -> if (page == 1) "$mainUrl/browse?sort=views_total:desc" else "$mainUrl/browse?sort=views_total:desc&page=$page"
-            "trending"    -> if (page == 1) "$mainUrl/browse?sort=views_7d:desc" else "$mainUrl/browse?sort=views_7d:desc&page=$page"
-            "follows"     -> if (page == 1) "$mainUrl/browse?sort=follows:desc" else "$mainUrl/browse?sort=follows:desc&page=$page"
+            "most_viewed" -> if (page == 1) "$mainUrl/browse?sort=views_total%3Adesc" else "$mainUrl/browse?sort=views_total%3Adesc&page=$page"
+            "trending"    -> if (page == 1) "$mainUrl/browse?sort=views_7d%3Adesc" else "$mainUrl/browse?sort=views_7d%3Adesc&page=$page"
+            "follows"     -> if (page == 1) "$mainUrl/browse?sort=follows%3Adesc" else "$mainUrl/browse?sort=follows%3Adesc&page=$page"
             "completed"   -> if (page == 1) "$mainUrl/browse?status=completed" else "$mainUrl/browse?status=completed&page=$page"
             else          -> "$mainUrl/browse?page=$page"
         }
@@ -213,7 +209,7 @@ class ComixProvider : MainAPI() {
         val doc = Jsoup.parse(html)
 
         // Extract seamlessly from the initial-data JSON block targeting "list" items
-        extractInitialDataJson(html)?.let { initial ->
+        extractInitialDataJson(doc)?.let { initial ->
             items.addAll(readQueries(initial) { k ->
                 k.length() >= 2 && k.optString(0) == "manga" && k.optString(1) == "list"
             })
@@ -237,11 +233,14 @@ class ComixProvider : MainAPI() {
         val html = fetchHtml(searchUrl)
         if (html.isBlank()) return emptyList()
 
-        var results: List<SearchResponse> = emptyList()
-        extractInitialDataJson(html)?.let { initial ->
-            results = readQueries(initial) { k -> k.length() >= 1 && k.optString(0) == "manga" }
+        val results = mutableListOf<SearchResponse>()
+        val doc = Jsoup.parse(html)
+        
+        extractInitialDataJson(doc)?.let { initial ->
+            results.addAll(readQueries(initial) { k -> k.length() >= 2 && k.optString(0) == "manga" && k.optString(1) == "list" })
         }
-        if (results.isEmpty()) results = extractSearchResultsDom(Jsoup.parse(html))
+        
+        if (results.isEmpty()) results.addAll(extractSearchResultsDom(doc))
 
         val lower = cleanQuery.lowercase()
         val filtered = results.filter { it.name.lowercase().contains(lower) }
