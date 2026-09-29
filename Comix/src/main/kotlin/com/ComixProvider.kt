@@ -45,12 +45,12 @@ class ComixProvider : MainAPI() {
     override val hasQuickSearch = true
 
     override val mainPage = mainPageOf(
-        "latest_new"     to "Latest Updates (New)",
-        "latest_hot"     to "Latest Updates (Hot)",
-        "trending"       to "Trending",
-        "follows"        to "Most Followed",
-        "recommendation" to "Recommendation",
-        "completed"      to "Completed",
+        "latest_new"      to "Latest Updates (New)",
+        "latest_hot"      to "Latest Updates (Hot)",
+        "trending"        to "Trending",
+        "follows"         to "Most Followed",
+        "recommended_you" to "Recommended for you",
+        "completed"       to "Completed",
     )
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -158,15 +158,15 @@ class ComixProvider : MainAPI() {
 
     private fun extractSearchResultsDom(doc: Document): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
-        // Target specifically the generic manga cards to avoid grabbing wrong UI elements
-        doc.select("a.card").forEach { el ->
-            // Prevent sidebars/widgets from mixing with main grid results
-            if (el.parents().any { p -> p.hasClass("side-col") || p.hasClass("sidebar") || p.tagName() == "aside" }) return@forEach
-            toSearchResult(el)?.let { results.add(it) }
-        }
-        
+        doc.select(".list-grid .lrow, div.lrow, .lrow, .list-grid > div, .list-grid--cards > div")
+            .forEach { el -> toSearchResult(el)?.let { results.add(it) } }
         if (results.isEmpty()) {
-            doc.select(".list-grid .lrow, div.lrow, .lrow, .list-grid > div").forEach { el ->
+            doc.select("article, .manga-card, .comic-item, a[href*='/title/']").forEach { el ->
+                if (el.tagName() == "a" &&
+                    el.parents().any { p -> p.hasClass("lrow") || p.hasClass("list-grid") }
+                ) return@forEach
+                // Prevent sidebars/widgets from mixing with main grid results
+                if (el.parents().any { p -> p.hasClass("side-col") || p.hasClass("sidebar") || p.tagName() == "aside" }) return@forEach
                 toSearchResult(el)?.let { results.add(it) }
             }
         }
@@ -180,14 +180,15 @@ class ComixProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
-        // "Recommendation" is a single curated carousel slider on the homepage without pagination
-        if (request.data == "recommendation") {
+        
+        // "Recommended for you" is a single curated carousel slider on the homepage without pagination
+        if (request.data == "recommended_you") {
             if (page > 1) return null
             val html = fetchHtml("$mainUrl/")
             if (html.isBlank()) return null
             val doc = Jsoup.parse(html)
             
-            // Internally matches the actual HTML section title "Recommended for you"
+            // Internally matches the actual HTML section title
             val recSection = doc.select("section.section").firstOrNull { 
                 it.select(".section__title").text().contains("Recommended for you", ignoreCase = true) 
             } ?: return null
@@ -196,63 +197,32 @@ class ComixProvider : MainAPI() {
             return newHomePageResponse(request, results.distinctBy { it.url }, hasNext = false)
         }
 
-        // Safely determine target URL for pagination or direct queries
-        // - "latest_new" skips the homepage completely and fetches the normal browse page
-        // - "completed" directly applies the status filter
-        val pageUrl = if (page == 1 && request.data != "latest_new" && request.data != "completed") {
-            "$mainUrl/"
-        } else {
-            when (request.data) {
-                "latest_new" -> "$mainUrl/browse?page=$page"
-                "latest_hot" -> "$mainUrl/browse?sort=views_7d:desc&page=$page"
-                "trending"   -> "$mainUrl/browse?sort=views_7d:desc&page=$page"
-                "follows"    -> "$mainUrl/browse?sort=follows:desc&page=$page"
-                "completed"  -> "$mainUrl/browse?status=completed&page=$page"
-                else         -> "$mainUrl/browse?page=$page"
-            }
+        // All other categories fetch directly from the /browse endpoint to guarantee 
+        // infinite pagination and a consistent styling logic across tabs.
+        val pageUrl = when (request.data) {
+            "latest_new" -> "$mainUrl/browse?sort=chapter_updated_at:desc&page=$page"
+            "latest_hot" -> "$mainUrl/browse?sort=views_7d:desc&page=$page"
+            "trending"   -> "$mainUrl/browse?sort=views_24h:desc&page=$page"
+            "follows"    -> "$mainUrl/browse?sort=follows:desc&page=$page"
+            "completed"  -> "$mainUrl/browse?status=completed&sort=chapter_updated_at:desc&page=$page"
+            else         -> "$mainUrl/browse?page=$page"
         }
 
         val html = fetchHtml(pageUrl)
         if (html.isBlank()) return null
 
         val items = mutableListOf<SearchResponse>()
-
-        if (page == 1 && request.data != "latest_new" && request.data != "completed") {
-            // First check initial-data queries for exact matching keys on the homepage
-            val initial = extractInitialDataJson(html)
-            if (initial != null) {
-                val matched = readQueries(initial) { k ->
-                    if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
-                    val subtype = k.optString(1)
-                    val params = k.optJSONObject(2) ?: return@readQueries false
-                    when (request.data) {
-                        "trending"   -> subtype == "top" && params.optString("type") == "trending"
-                        "follows"    -> subtype == "top" && params.optString("type") == "follows"
-                        "latest_hot" -> subtype == "list" && params.optString("scope") == "hot"
-                        else         -> false
-                    }
-                }
-                items.addAll(matched)
-            }
-
-            // Fallback directly to the section DOM if JSON was not matched
-            if (items.isEmpty()) {
-                val doc = Jsoup.parse(html)
-                val sectionHeader = when (request.data) {
-                    "trending"   -> "Most Recent Popular"
-                    "follows"    -> "Most Follows"
-                    "latest_hot" -> "Latest Updates"
-                    else         -> ""
-                }
-                val sec = doc.select("section.section").firstOrNull { 
-                    it.select(".section__title").text().contains(sectionHeader, ignoreCase = true) 
-                }
-                sec?.select("a.card")?.mapNotNull { toSearchResult(it) }?.let { items.addAll(it) }
-            }
-        } else {
-            // For browse pages (page > 1, OR "latest_new", OR "completed"), always rely on the grid DOM
-            val doc = Jsoup.parse(html)
-            items.addAll(extractSearchResultsDom(doc))
+        
+        // Extract from initial-data JSON available on the browse page
+        extractInitialDataJson(html)?.let { initial ->
+            items.addAll(readQueries(initial) { k ->
+                k.length() >= 1 && k.optString(0) == "manga"
+            })
+        }
+        
+        // Fallback to DOM extraction
+        if (items.isEmpty()) {
+            items.addAll(extractSearchResultsDom(Jsoup.parse(html)))
         }
 
         if (items.isEmpty()) return null
