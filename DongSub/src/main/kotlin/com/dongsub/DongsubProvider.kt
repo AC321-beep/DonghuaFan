@@ -3,6 +3,9 @@ package com.dongsub
 import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
@@ -21,21 +24,17 @@ class DongsubProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
-    // Simplified logic using the exact categories available from the site itself
+    // Using the real categories available on Dongsub
     override val mainPage = mainPageOf(
-        "" to "Latest Release",
-        "search/label/Donghua" to "Donghua",
-        "search/label/Movie" to "Movie",
-        "search/label/Live%20Action" to "Live Action"
+        "$mainUrl/" to "Latest Release",
+        "$mainUrl/search/label/Donghua" to "Donghua",
+        "$mainUrl/search/label/Movie" to "Movie",
+        "$mainUrl/search/label/Live%20Action" to "Live Action"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page == 1) {
-            if (request.data.isEmpty()) "$mainUrl/" else "$mainUrl/${request.data}?max-results=20"
-        } else {
-            // Blogger tokens make number pagination hard, skipped for safety
-            return newHomePageResponse(request.name, emptyList())
-        }
+        // Blogger uses string tokens for deep pagination, so we add a high max-results to Page 1 to get plenty of shows
+        val url = if (page == 1) "${request.data}?max-results=20" else return newHomePageResponse(request.name, emptyList())
 
         val document = try {
             app.get(url, headers = defaultHeaders).document
@@ -52,17 +51,24 @@ class DongsubProvider : MainAPI() {
 
     private fun Element.toSearchResult(): AnimeSearchResponse? {
         val titleElem = this.selectFirst("h3.post-title a, a.grid2-tt, .info-az a") ?: return null
-        val title = titleElem.text().trim()
-        val href = fixUrlNull(titleElem.attr("href")) ?: return null
+        val rawTitle = titleElem.text().trim()
+        
+        // 1. EXTRACT SERIES NAME (MyAnimeLive Logic)
+        val seriesName = extractSeriesName(rawTitle)
+        if (seriesName.isBlank()) return null
+
+        // 2. FAKE A SERIES PAGE VIA SEARCH (MyAnimeLive Logic)
+        // We append max-results=500 so Blogger returns every episode at once
+        val encodedName = URLEncoder.encode(seriesName, "UTF-8").replace("+", "%20")
+        val seriesUrl = "$mainUrl/search?q=$encodedName&max-results=500"
 
         // Target lazy loaded images in Blogger (checking data-src first)
         val imgElem = this.selectFirst("img.gambar, img")
         val posterUrl = fixUrlNull(imgElem?.attr("data-src")?.ifEmpty { imgElem.attr("src") })
 
-        val epString = this.selectFirst(".epsid, .tipeps, .subind")?.text()?.replace(Regex("[^0-9]"), "")
-        val epNum = epString?.toIntOrNull()
+        val epNum = extractEpisodeNumber(rawTitle)
 
-        return newAnimeSearchResponse(title, href, TvType.Anime) {
+        return newAnimeSearchResponse(seriesName, seriesUrl, TvType.Anime) {
             this.posterUrl = posterUrl
             addSub(epNum)
         }
@@ -84,55 +90,94 @@ class DongsubProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        var document = app.get(url, headers = defaultHeaders).document
+        val doc = app.get(url, headers = defaultHeaders).document
 
-        // FIX FOR 1 EPISODE: The homepage links to single Episode Pages, not Series Pages.
-        // We find the "Home / All Episodes" button in the Next/Prev bar (#ecHome a) and jump to the Series page.
-        val seriesUrl = document.selectFirst("#ecHome a, .breadcrumbs span a:nth-child(2)")?.attr("href")
-        
-        if (!seriesUrl.isNullOrBlank() && seriesUrl != url && !seriesUrl.equals("$mainUrl/", true)) {
-            try {
-                document = app.get(seriesUrl, headers = defaultHeaders).document
-            } catch (_: Exception) {}
-        }
-
-        val rawTitle = document.selectFirst("h1, h2.heading, h3.post-title")?.text()?.trim() ?: ""
-        val title = rawTitle.replace(Regex("(?i)\\s*(?:Episode|Eps)\\s*\\d+.*$"), "").trim()
-
-        val poster = fixUrlNull(
-            document.selectFirst("meta[property=og:image]")?.attr("content")
-                ?: document.selectFirst(".bigcover img, .ime img, .thumbox img")?.attr("src")
-        )
-        val description = document.selectFirst(".sinoposis, .descNime, .entry-content, .keyword")?.text()?.trim()
-
-        // Extract episode list from the Series page (.bxcl)
-        var episodes = document.select(".bxcl ul li, .episodelist li").mapNotNull { ep ->
-            val a = ep.selectFirst("a") ?: return@mapNotNull null
-            val epHref = fixUrlNull(a.attr("href")) ?: return@mapNotNull null
+        // If the URL is our fake search-series page (MyAnimeLive Logic)
+        if (url.contains("/search?q=")) {
+            val firstArticle = doc.selectFirst("article.post-outer-container, .list-post li")
+            val rawTitle = firstArticle?.selectFirst("h3.post-title a, a.grid2-tt, .info-az a")?.text()?.trim() ?: "Unknown Series"
+            val seriesName = extractSeriesName(rawTitle)
             
-            val epName = ep.selectFirst(".chapternum")?.text() 
-                ?: ep.selectFirst(".eps-num")?.text() 
-                ?: a.text()
+            var poster = firstArticle?.selectFirst("img.gambar, img")?.let { it.attr("data-src").ifEmpty { it.attr("src") } }
+            var description: String? = null
+
+            val allEpisodes = mutableListOf<Episode>()
+            
+            // Loop through the search results to build the episode list
+            doc.select("article.post-outer-container, .list-post li").forEach { article ->
+                val link = article.selectFirst("h3.post-title a, a.grid2-tt, .info-az a") ?: return@forEach
+                val epUrl = fixUrlNull(link.attr("href")) ?: return@forEach
+                val epTitle = link.text().trim()
                 
-            newEpisode(epHref) {
-                this.name = epName.trim()
+                val epNum = extractEpisodeNumber(epTitle)
+                val epPoster = article.selectFirst("img.gambar, img")?.let { it.attr("data-src").ifEmpty { it.attr("src") } }
+                
+                allEpisodes.add(newEpisode(epUrl) {
+                    this.name = if (epNum != null) "Episode $epNum" else epTitle
+                    this.episode = epNum
+                    this.posterUrl = epPoster
+                })
             }
-        }.reversed()
 
-        // Fallback for standalone single-episode movies
-        if (episodes.isEmpty()) {
-            episodes = listOf(
-                newEpisode(url) {
-                    this.name = title
-                }
-            )
-        }
+            // Clean, deduplicate, and sort episodes chronologically
+            val uniqueEpisodes = allEpisodes.distinctBy { it.data }
+            val sortedEpisodes = uniqueEpisodes.sortedBy { it.episode ?: Int.MAX_VALUE }
 
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
-            this.posterUrl = poster
-            this.plot = description
-            addEpisodes(DubStatus.Subbed, episodes)
+            // Quickly fetch the Plot Description from the first episode's page
+            val firstEpUrl = sortedEpisodes.firstOrNull()?.data
+            if (firstEpUrl != null) {
+                try {
+                    val epDoc = app.get(firstEpUrl, headers = defaultHeaders).document
+                    description = epDoc.selectFirst(".sinoposis, .descNime, .entry-content, .keyword")?.text()?.trim()
+                    poster = epDoc.selectFirst(".bigcover img, .ime img")?.attr("src") ?: poster
+                } catch (_: Exception) {}
+            }
+
+            return newAnimeLoadResponse(seriesName, url, TvType.Anime) {
+                addEpisodes(DubStatus.Subbed, sortedEpisodes)
+                this.posterUrl = poster
+                this.plot = description
+            }
+        } else {
+            // Fallback: If it's a standalone movie or single page
+            val title = doc.selectFirst("h1.post-title, h2.heading, h3.post-title")?.text()?.trim() ?: "Episode"
+            val seriesName = extractSeriesName(title).ifBlank { "Unknown Series" }
+            val epNum = extractEpisodeNumber(title)
+            val poster = doc.selectFirst("meta[property=og:image]")?.attr("content") ?: doc.selectFirst(".bigcover img, .ime img, img.gambar")?.attr("src")
+            
+            val episode = newEpisode(url) {
+                this.name = if (epNum != null) "Episode $epNum" else title
+                this.episode = epNum
+                this.posterUrl = poster
+            }
+            return newAnimeLoadResponse(seriesName, url, TvType.Anime) {
+                addEpisodes(DubStatus.Subbed, listOf(episode))
+                this.posterUrl = poster
+            }
         }
+    }
+
+    // Exact logic from MyAnimeLive, customized for Dongsub titles
+    private fun extractSeriesName(title: String): String {
+        var name = title
+            .replace(Regex("(?i)\\s*(?:Episode|Eps)\\.?\\s*\\d+.*$"), "")
+            .trim()
+        name = Regex("(?i)\\s+english\\s+sub$").replace(name, "")
+        name = Regex("(?i)\\s+subtitles?$").replace(name, "")
+        
+        if (name.isBlank() || name.length < 3) {
+            name = title.split(Regex("[-–:]"))[0].trim()
+        }
+        return name
+    }
+
+    private fun extractEpisodeNumber(text: String): Int? {
+        val patterns = listOf(
+            Regex("""(?:episode|eps|ep|eps\.|ep\.)\s*(\d+)""", RegexOption.IGNORE_CASE),
+            Regex("""E(\d+)""", RegexOption.IGNORE_CASE),
+            Regex("""#(\d+)""")
+        )
+        return patterns.firstNotNullOfOrNull { it.find(text)?.groupValues?.get(1)?.toIntOrNull() }
     }
 
     override suspend fun loadLinks(
@@ -141,53 +186,60 @@ class DongsubProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = try {
+        val doc = try {
             app.get(data, headers = defaultHeaders).document
         } catch (_: Exception) {
             return false
         }
-
+        
+        val rawHtml = doc.html()
+        var linksLoaded = false
         val extractedUrls = mutableSetOf<String>()
 
-        // 1. Direct iframes - FIX: Target 'data-src' to bypass Blogger's image lazy-loader
-        document.select(".tvideo iframe, .bixbox.streaming iframe, iframe").forEach { iframe ->
+        // 1. Direct iframes (Check data-src for Blogger lazy-loading first!)
+        doc.select("iframe").forEach { iframe ->
             val src = iframe.attr("data-src").ifEmpty { iframe.attr("src") }
-            if (src.contains("dailymotion.com") || src.contains("dai.ly")) {
-                extractedUrls.add(src)
-            }
+            if (src.isNotBlank()) extractedUrls.add(src)
         }
 
-        // 2. Decode hidden server buttons (Blogger data-embed attributes)
-        document.select("#server ul li a, .DagPlayOpt, [data-embed]").forEach { elem ->
+        // 2. Decode hidden server buttons (Blogger data-embed base64 strings)
+        doc.select("[data-embed], .DagPlayOpt, #server ul li a").forEach { elem ->
             val raw = elem.attr("data-embed").ifEmpty { elem.attr("data-src") }.ifEmpty { elem.attr("value") }
             if (raw.isNotBlank()) {
                 try {
                     val decoded = String(Base64.decode(raw, Base64.DEFAULT))
                     val iframeSrc = Jsoup.parse(decoded).selectFirst("iframe")?.attr("src") ?: decoded
-                    if (iframeSrc.contains("dailymotion") || iframeSrc.contains("dai.ly")) {
-                        extractedUrls.add(iframeSrc)
-                    }
+                    extractedUrls.add(iframeSrc)
                 } catch (_: Exception) {}
             }
         }
 
-        // 3. Fallback: Deep regex scan in the raw HTML for Dailymotion
-        val rawHtml = document.html()
+        // 3. Raw HTML Regex scan (Defeats JavaScript Obfuscation completely)
         val dmRegex = Regex("""https?://(?:www\.)?(?:dailymotion\.com/(?:embed/)?video/|dai\.ly/)[a-zA-Z0-9]+""")
         dmRegex.findAll(rawHtml).forEach { match ->
             extractedUrls.add(match.value)
         }
 
-        var handled = false
-        for (dmUrl in extractedUrls) {
-            val cleanUrl = if (dmUrl.startsWith("//")) "https:$dmUrl" else dmUrl
-            try {
-                // CloudStream's native Dailymotion extractor will execute automatically
-                loadExtractor(cleanUrl, referer = mainUrl, subtitleCallback, callback)
-                handled = true
-            } catch (_: Exception) {}
+        // MyAnimeLive Concurrent Execution Logic
+        coroutineScope {
+            extractedUrls.map { rawUrl ->
+                async {
+                    val fullUrl = if (rawUrl.startsWith("//")) "https:$rawUrl" else rawUrl
+                    
+                    if (fullUrl.contains("dailymotion") || fullUrl.contains("dai.ly")) {
+                        // Some sites hide dailymotion in weird parameters, this extracts the pure video ID
+                        val videoId = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(fullUrl)?.groupValues?.get(1)
+                        val cleanUrl = videoId?.let { "https://www.dailymotion.com/video/$it" } ?: fullUrl
+                        
+                        val success = loadExtractor(cleanUrl, mainUrl, subtitleCallback, callback)
+                        if (success) {
+                            linksLoaded = true
+                        }
+                    }
+                }
+            }.awaitAll()
         }
 
-        return handled
+        return linksLoaded
     }
 }
