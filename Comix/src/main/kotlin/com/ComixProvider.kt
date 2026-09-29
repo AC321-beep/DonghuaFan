@@ -45,9 +45,9 @@ class ComixProvider : MainAPI() {
     override val hasQuickSearch = true
 
     override val mainPage = mainPageOf(
-        "latest_new"     to "Latest Updates (New)",
-        "latest_hot"     to "Latest Updates (Hot)",
+        "latest"         to "Latest Updates",
         "trending"       to "Trending",
+        "most_viewed"    to "Most Viewed",
         "follows"        to "Most Followed",
         "recommendation" to "Recommendation",
         "completed"      to "Completed",
@@ -109,6 +109,33 @@ class ComixProvider : MainAPI() {
         return res
     }
 
+    private fun readQueries(
+        initial: JSONObject,
+        matcher: (JSONArray) -> Boolean
+    ): List<SearchResponse> {
+        val queries = initial.optJSONObject("queries") ?: return emptyList()
+        val out = mutableListOf<SearchResponse>()
+        val keys = queries.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
+            if (!matcher(parsed)) continue
+
+            val value = queries.opt(k)
+            val arr = when (value) {
+                is JSONArray  -> value
+                is JSONObject -> value.optJSONArray("items")
+                else          -> null
+            } ?: continue
+
+            for (i in 0 until arr.length()) {
+                arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
+            }
+            if (out.isNotEmpty()) break
+        }
+        return out
+    }
+
     private fun toSearchResult(card: Element): SearchResponse? {
         val anchor = if (card.tagName() == "a") card
                      else card.selectFirst("a[href*='/title/'], a[href]") ?: return null
@@ -131,17 +158,14 @@ class ComixProvider : MainAPI() {
 
     private fun extractSearchResultsDom(doc: Document): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
-        // Specifically target browse page grids
-        doc.select(".list-grid .lrow, div.lrow, .lrow, .list-grid > div").forEach { el ->
+        doc.select("a.card").forEach { el ->
+            // Prevent sidebars/widgets from mixing with main grid results
+            if (el.parents().any { p -> p.hasClass("side-col") || p.hasClass("sidebar") || p.tagName() == "aside" }) return@forEach
             toSearchResult(el)?.let { results.add(it) }
         }
         
-        // Fallback for generic cards, excluding sidebars and sliders to prevent pollution
         if (results.isEmpty()) {
-            doc.select("a.card, article, .manga-card, .comic-item").forEach { el ->
-                if (el.parents().any { p -> 
-                    p.hasClass("side-col") || p.hasClass("sidebar") || p.tagName() == "aside" || p.hasClass("swiper") 
-                }) return@forEach
+            doc.select(".list-grid .lrow, div.lrow, .lrow, .list-grid > div").forEach { el ->
                 toSearchResult(el)?.let { results.add(it) }
             }
         }
@@ -156,7 +180,7 @@ class ComixProvider : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse? {
         
-        // 1. RECOMMENDATION (Single slider, no pagination)
+        // "Recommendation" is a single curated carousel slider on the homepage without pagination
         if (request.data == "recommendation") {
             if (page > 1) return null
             val html = fetchHtml("$mainUrl/")
@@ -172,14 +196,14 @@ class ComixProvider : MainAPI() {
             return newHomePageResponse(request, results.distinctBy { it.url }, hasNext = false)
         }
 
-        // 2. DETERMINE TARGET URL
+        // Accurately routing to the precise URLs for each category to ensure perfect pagination
         val pageUrl = when (request.data) {
-            "latest_new" -> if (page == 1) "$mainUrl/?tab=New" else "$mainUrl/?tab=New&page=$page"
-            "latest_hot" -> if (page == 1) "$mainUrl/" else "$mainUrl/?page=$page"
-            "trending"   -> "$mainUrl/browse?sort=views_7d:desc&page=$page"
-            "follows"    -> "$mainUrl/browse?sort=follows:desc&page=$page"
-            "completed"  -> "$mainUrl/browse?status=completed&sort=chapter_updated_at:desc&page=$page"
-            else         -> "$mainUrl/browse?page=$page"
+            "latest"      -> if (page == 1) "$mainUrl/browse" else "$mainUrl/browse?page=$page"
+            "most_viewed" -> if (page == 1) "$mainUrl/browse?sort=views_total:desc" else "$mainUrl/browse?sort=views_total:desc&page=$page"
+            "trending"    -> if (page == 1) "$mainUrl/browse?sort=views_7d:desc" else "$mainUrl/browse?sort=views_7d:desc&page=$page"
+            "follows"     -> if (page == 1) "$mainUrl/browse?sort=follows:desc" else "$mainUrl/browse?sort=follows:desc&page=$page"
+            "completed"   -> if (page == 1) "$mainUrl/browse?status=completed" else "$mainUrl/browse?status=completed&page=$page"
+            else          -> "$mainUrl/browse?page=$page"
         }
 
         val html = fetchHtml(pageUrl)
@@ -188,38 +212,17 @@ class ComixProvider : MainAPI() {
         val items = mutableListOf<SearchResponse>()
         val doc = Jsoup.parse(html)
 
-        // 3. EXTRACT BASED ON CATEGORY TYPE
-        when (request.data) {
-            "latest_new", "latest_hot" -> {
-                // Extracts specifically from the homepage grid-updates container
-                doc.select(".grid-updates a.card").mapNotNull { toSearchResult(it) }.let { items.addAll(it) }
-                
-                // Safety fallback
-                if (items.isEmpty()) items.addAll(extractSearchResultsDom(doc))
-            }
-            else -> {
-                // For Trending, Follows, and Completed (Hits /browse endpoint)
-                // Extract securely from the initial-data JSON block
-                extractInitialDataJson(html)?.optJSONObject("queries")?.let { queries ->
-                    val keys = queries.keys()
-                    while (keys.hasNext()) {
-                        val k = keys.next()
-                        val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
-                        // Safely target the primary list query to prevent grabbing widget sidebars
-                        if (parsed.length() >= 2 && parsed.optString(0) == "manga" && parsed.optString(1) == "list") {
-                            val value = queries.opt(k)
-                            val arr = (if (value is JSONArray) value else (value as? JSONObject)?.optJSONArray("items")) ?: continue
-                            for (i in 0 until arr.length()) {
-                                arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> items.add(r) } }
-                            }
-                            if (items.isNotEmpty()) break
-                        }
-                    }
-                }
-                
-                // Safety fallback
-                if (items.isEmpty()) items.addAll(extractSearchResultsDom(doc))
-            }
+        // All these request types hit the /browse page, so we can extract cleanly 
+        // from the JSON data (targeting "list" to avoid sidebars)
+        extractInitialDataJson(html)?.let { initial ->
+            items.addAll(readQueries(initial) { k ->
+                k.length() >= 2 && k.optString(0) == "manga" && k.optString(1) == "list"
+            })
+        }
+        
+        // Fallback to DOM extraction
+        if (items.isEmpty()) {
+            items.addAll(extractSearchResultsDom(doc))
         }
 
         if (items.isEmpty()) return null
@@ -234,27 +237,12 @@ class ComixProvider : MainAPI() {
 
         val html = fetchHtml(searchUrl)
         if (html.isBlank()) return emptyList()
-        
-        val doc = Jsoup.parse(html)
-        val results = mutableListOf<SearchResponse>()
 
-        extractInitialDataJson(html)?.optJSONObject("queries")?.let { queries ->
-            val keys = queries.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
-                if (parsed.length() >= 2 && parsed.optString(0) == "manga" && parsed.optString(1) == "list") {
-                    val value = queries.opt(k)
-                    val arr = (if (value is JSONArray) value else (value as? JSONObject)?.optJSONArray("items")) ?: continue
-                    for (i in 0 until arr.length()) {
-                        arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> results.add(r) } }
-                    }
-                    if (results.isNotEmpty()) break
-                }
-            }
+        var results: List<SearchResponse> = emptyList()
+        extractInitialDataJson(html)?.let { initial ->
+            results = readQueries(initial) { k -> k.length() >= 2 && k.optString(0) == "manga" && k.optString(1) == "list" }
         }
-        
-        if (results.isEmpty()) results.addAll(extractSearchResultsDom(doc))
+        if (results.isEmpty()) results = extractSearchResultsDom(Jsoup.parse(html))
 
         val lower = cleanQuery.lowercase()
         val filtered = results.filter { it.name.lowercase().contains(lower) }
