@@ -26,26 +26,80 @@ class DongsubProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
+    private val pageSize = 20
+
     override val mainPage = mainPageOf(
-        "" to "Latest Release",
-        "search/label/Donghua?&max-results=20" to "Donghua",
-        "search/label/Movie?&max-results=20" to "Movie",
-        "search/label/Live%20Action?&max-results=20" to "Live Action"
+        "" to "Latest Release"
     )
 
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        if (page > 1) return newHomePageResponse(request.name, emptyList())
+        // Blogger feed supports start-index → real, working pagination.
+        val startIndex = (page - 1) * pageSize + 1
+        val url = "$mainUrl/feeds/posts/default" +
+                "?alt=json&max-results=$pageSize&start-index=$startIndex"
 
-        val url = if (request.data.isEmpty()) "$mainUrl/" else "$mainUrl/${request.data}"
-        val doc: Document = try {
-            app.get(url, headers = defaultHeaders).document
+        val text = try {
+            app.get(url, headers = defaultHeaders).text
         } catch (_: Exception) {
             return newHomePageResponse(request.name, emptyList())
         }
-        return newHomePageResponse(request.name, parseCards(doc))
+
+        val items = parseFeed(text)
+        val hasNext = items.size >= pageSize
+        return newHomePageResponse(request.name, items, hasNext)
+    }
+
+    private fun parseFeed(text: String): List<AnimeSearchResponse> {
+        return try {
+            val root = JSONObject(text)
+            val feed = root.optJSONObject("feed") ?: return emptyList()
+            val entries = feed.optJSONArray("entry") ?: return emptyList()
+
+            val out = mutableListOf<AnimeSearchResponse>()
+            for (i in 0 until entries.length()) {
+                val e = entries.optJSONObject(i) ?: continue
+
+                val title = e.optJSONObject("title")?.optString("\$t") ?: continue
+                if (title.isBlank()) continue
+
+                val links = e.optJSONArray("link") ?: continue
+                var href: String? = null
+                for (j in 0 until links.length()) {
+                    val l = links.optJSONObject(j) ?: continue
+                    if (l.optString("rel") == "alternate") {
+                        href = l.optString("href")
+                        break
+                    }
+                }
+                if (href.isNullOrBlank() || !href.contains("dongsub.net")) continue
+
+                // Bump Blogger thumbnail size (feeds return s72-c by default)
+                val thumb = e.optJSONObject("media\$thumbnail")?.optString("url")
+                    ?.replace("s72-c", "s320")
+                    ?.replace("s72", "s320")
+                    ?.takeIf { it.isNotBlank() }
+
+                val epNum = Regex("(?i)(?:Episode|Eps\\.?|Ep\\.?)\\s*(\\d+)")
+                    .find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()
+
+                val cleanTitle = title
+                    .replace(Regex("(?i)\\s*(?:Episode|Eps\\.?|Ep\\.?)\\s*\\d+.*$"), "")
+                    .replace(Regex("(?i)\\s*Subtitles?\\s*$"), "")
+                    .trim()
+                    .ifBlank { title.trim() }
+
+                out.add(newAnimeSearchResponse(cleanTitle, href, TvType.Anime) {
+                    this.posterUrl = thumb
+                    addSub(epNum)
+                })
+            }
+            out
+        } catch (_: Exception) {
+            emptyList()
+        }
     }
 
     private fun parseCards(doc: Document): List<AnimeSearchResponse> {
@@ -90,20 +144,17 @@ class DongsubProvider : MainAPI() {
         return parseCards(doc)
     }
 
-    /** Returns the series label + its /search/label/ href (from the "Series" line). */
     private fun extractSeriesAnchor(doc: Document): Pair<String, String?>? {
         doc.selectFirst("span.info-stream a[rel=tag], span.info-stream a[data]")?.let {
             val label = it.text().trim()
             val href = it.attr("href").ifBlank { null }
             if (label.isNotBlank()) return label to href
         }
-        // Fallback: any /search/label/ link
         doc.selectFirst("a[href*=/search/label/][data]")?.let {
             val label = it.text().trim()
             val href = it.attr("href").ifBlank { null }
             if (label.isNotBlank()) return label to href
         }
-        // Fallback: var labelopt = '...'
         doc.select("script").forEach { s ->
             val m = Regex("""var\s+labelopt\s*=\s*['"]([^'"]+)['"]""").find(s.data())
             if (m != null) return m.groupValues[1] to null
@@ -111,9 +162,7 @@ class DongsubProvider : MainAPI() {
         return null
     }
 
-    /** Fetch every post under a Blogger label via the JSON feed. */
     private suspend fun fetchLabelFeed(label: String): List<Pair<String, String>> {
-        // Blogger label paths want %20 for spaces, not '+'.
         val encoded = label.replace(" ", "%20")
         val url = "$mainUrl/feeds/posts/default/-/$encoded?alt=json&max-results=500"
 
@@ -150,7 +199,6 @@ class DongsubProvider : MainAPI() {
         }
     }
 
-    /** Scrape a Blogger label page for the same cards as the homepage. */
     private suspend fun fetchLabelPage(labelOrHref: String): List<AnimeSearchResponse> {
         val base = if (labelOrHref.startsWith("http")) {
             labelOrHref
@@ -192,7 +240,6 @@ class DongsubProvider : MainAPI() {
         if (anchor != null) {
             val (label, href) = anchor
 
-            // 1) Preferred: JSON feed (complete list, no Blogger HTML cap)
             val feed = fetchLabelFeed(label)
             if (feed.isNotEmpty()) {
                 feed.forEach { (epTitle, epUrl) ->
@@ -203,7 +250,6 @@ class DongsubProvider : MainAPI() {
                     })
                 }
             } else {
-                // 2) Fallback: scrape the label search page HTML
                 val cards = fetchLabelPage(href ?: label)
                 cards.forEach { card ->
                     episodes.add(newEpisode(card.url) { this.name = card.name })
@@ -211,12 +257,10 @@ class DongsubProvider : MainAPI() {
             }
         }
 
-        // 3) Last-resort fallback: just the current episode
         if (episodes.isEmpty()) {
             episodes.add(newEpisode(url) { this.name = rawTitle })
         }
 
-        // Blogger feeds/pages are newest-first; flip so ep 1 is first
         val ordered = episodes.reversed()
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
