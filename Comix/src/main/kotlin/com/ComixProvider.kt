@@ -45,11 +45,12 @@ class ComixProvider : MainAPI() {
     override val hasQuickSearch = true
 
     override val mainPage = mainPageOf(
-        "latest"      to "Latest Updates",
-        "trending"    to "Trending",
-        "most_viewed" to "Most Viewed",
-        "follows"     to "Most Followed",
-        "completed"   to "Completed",
+        "latest"         to "Latest Updates",
+        "trending"       to "Trending",
+        "most_viewed"    to "Most Viewed",
+        "follows"        to "Most Followed",
+        "completed"      to "Completed",
+        "recommendation" to "Recommendation"
     )
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -88,7 +89,17 @@ class ComixProvider : MainAPI() {
             else        -> return null
         }
         val script = doc.selectFirst("script#initial-data") ?: return null
-        val text = script.data().ifBlank { script.html() }.trim()
+        var text = script.data()
+        
+        // Safeguard: If .data() is blank due to Jsoup treating it as HTML, grab the HTML and unescape it
+        if (text.isBlank()) {
+            text = script.html()
+                .replace("&quot;", "\"")
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+        }
+        text = text.trim()
         if (text.isEmpty()) return null
         return runCatching { JSONObject(text) }.getOrNull()
     }
@@ -120,14 +131,35 @@ class ComixProvider : MainAPI() {
             if (!matcher(parsed)) continue
 
             val value = queries.opt(k)
-            val arr = when (value) {
-                is JSONArray  -> value
-                is JSONObject -> value.optJSONArray("items")
-                else          -> null
-            } ?: continue
+            
+            // Safeguard: Safely handles both normal { "items": [] } AND infinite query { "pages": [ {"items": []} ] } structures
+            val itemsArray = if (value is JSONArray) {
+                value
+            } else if (value is JSONObject) {
+                if (value.has("pages")) {
+                    val pages = value.optJSONArray("pages")
+                    val combined = JSONArray()
+                    if (pages != null) {
+                        for (p in 0 until pages.length()) {
+                            val pageObj = pages.optJSONObject(p)
+                            val pItems = pageObj?.optJSONArray("items")
+                            if (pItems != null) {
+                                for (i in 0 until pItems.length()) {
+                                    combined.put(pItems.get(i))
+                                }
+                            }
+                        }
+                    }
+                    combined
+                } else {
+                    value.optJSONArray("items")
+                }
+            } else null
 
-            for (i in 0 until arr.length()) {
-                arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
+            if (itemsArray == null) continue
+
+            for (i in 0 until itemsArray.length()) {
+                itemsArray.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
             }
         }
         return out
@@ -156,10 +188,20 @@ class ComixProvider : MainAPI() {
 
     private fun extractSearchResultsDom(doc: Document): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
-        doc.select("a.card, .list-grid .lrow, div.lrow, .lrow, .list-grid > div").forEach { el ->
+        doc.select("a.card").forEach { el ->
             // Restricting search to main grid to prevent mixing with sidebars/widgets
-            if (el.parents().any { p -> p.hasClass("side-col") || p.hasClass("sidebar") || p.tagName() == "aside" }) return@forEach
+            if (el.parents().any { p -> 
+                val cls = p.className().lowercase()
+                cls.contains("side") || cls.contains("swiper") 
+            }) return@forEach
             toSearchResult(el)?.let { results.add(it) }
+        }
+        
+        // Absolute fallback: If the restricted search failed, grab every card on the page
+        if (results.isEmpty()) {
+            doc.select("a.card").forEach { el ->
+                toSearchResult(el)?.let { results.add(it) }
+            }
         }
         return results.distinctBy { it.url }
     }
@@ -172,11 +214,27 @@ class ComixProvider : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse? {
         
-        // Exclusively construct clean /browse URLs with encoded parameters
+        // 1. RECOMMENDATION (Single curated slider, extracted straight from HTML text)
+        if (request.data == "recommendation") {
+            if (page > 1) return null
+            val html = fetchHtml("$mainUrl/")
+            if (html.isBlank()) return null
+            val doc = Jsoup.parse(html)
+            
+            // Explicitly locking onto the exact "Recommended for you" header text
+            val recSection = doc.select("section.section").firstOrNull { 
+                it.select(".section__title").text().contains("Recommended for you", ignoreCase = true) 
+            } ?: return null
+
+            val results = recSection.select("a.card").mapNotNull { toSearchResult(it) }
+            return newHomePageResponse(request, results.distinctBy { it.url }, hasNext = false)
+        }
+
+        // 2. ALL BROWSE CATEGORIES (Uses exact endpoints instructed for pristine pagination)
         val pageUrl = when (request.data) {
             "latest"      -> if (page == 1) "$mainUrl/browse" else "$mainUrl/browse?page=$page"
-            "trending"    -> if (page == 1) "$mainUrl/browse?sort=views_7d%3Adesc" else "$mainUrl/browse?sort=views_7d%3Adesc&page=$page"
             "most_viewed" -> if (page == 1) "$mainUrl/browse?sort=views_total%3Adesc" else "$mainUrl/browse?sort=views_total%3Adesc&page=$page"
+            "trending"    -> if (page == 1) "$mainUrl/browse?sort=views_7d%3Adesc" else "$mainUrl/browse?sort=views_7d%3Adesc&page=$page"
             "follows"     -> if (page == 1) "$mainUrl/browse?sort=follows%3Adesc" else "$mainUrl/browse?sort=follows%3Adesc&page=$page"
             "completed"   -> if (page == 1) "$mainUrl/browse?status=completed" else "$mainUrl/browse?status=completed&page=$page"
             else          -> "$mainUrl/browse?page=$page"
@@ -188,14 +246,14 @@ class ComixProvider : MainAPI() {
         val items = mutableListOf<SearchResponse>()
         val doc = Jsoup.parse(html)
 
-        // The /browse page structures its data perfectly under ["manga", "list"] in initial-data
+        // Securely extract from the raw JSON payload
         extractInitialDataJson(doc)?.let { initial ->
             items.addAll(readQueries(initial) { k ->
-                k.length() >= 2 && k.optString(0) == "manga" && k.optString(1) == "list"
+                k.length() >= 2 && k.optString(0) == "manga" && (k.optString(1) == "list" || k.optString(1) == "search")
             })
         }
         
-        // Safety Fallback to DOM extraction if JSON is missing or structure changes
+        // Safety Fallback: Scrape the DOM if JSON structure alters or fails
         if (items.isEmpty()) {
             items.addAll(extractSearchResultsDom(doc))
         }
@@ -218,7 +276,7 @@ class ComixProvider : MainAPI() {
         
         extractInitialDataJson(doc)?.let { initial ->
             results.addAll(readQueries(initial) { k -> 
-                k.length() >= 2 && k.optString(0) == "manga" && k.optString(1) == "list" 
+                k.length() >= 2 && k.optString(0) == "manga" && (k.optString(1) == "list" || k.optString(1) == "search")
             })
         }
         
