@@ -30,7 +30,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
-import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
 class ComixProvider : MainAPI() {
@@ -44,13 +43,13 @@ class ComixProvider : MainAPI() {
     override val hasMainPage = true
     override val hasQuickSearch = true
 
+    // Cleaned up and strictly using the requested categories
     override val mainPage = mainPageOf(
-        "latest"         to "Latest Updates",
-        "trending"       to "Trending",
-        "most_viewed"    to "Most Viewed",
-        "follows"        to "Most Followed",
-        "completed"      to "Completed",
-        "recommendation" to "Recommendation"
+        "latest"      to "Latest Updates",
+        "trending"    to "Trending",
+        "most_viewed" to "Most Viewed",
+        "follows"     to "Most Followed",
+        "completed"   to "Completed"
     )
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -80,161 +79,94 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Data Parsing & Extraction
+    //  Direct JSON Parsing (Bypassing HTML DOM completely)
     // ═══════════════════════════════════════════════════════════════════════
-    private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
-        val doc: Document = when (htmlOrDoc) {
-            is Document -> htmlOrDoc
-            is String   -> Jsoup.parse(htmlOrDoc)
-            else        -> return null
-        }
-        val script = doc.selectFirst("script#initial-data") ?: return null
-        var text = script.data()
-        
-        // Safeguard: If .data() is blank due to Jsoup treating it as HTML, grab the HTML and unescape it
-        if (text.isBlank()) {
-            text = script.html()
-                .replace("&quot;", "\"")
-                .replace("&amp;", "&")
-                .replace("&lt;", "<")
-                .replace("&gt;", ">")
-        }
-        text = text.trim()
-        if (text.isEmpty()) return null
-        return runCatching { JSONObject(text) }.getOrNull()
-    }
-
-    private fun parseMangaFromJson(obj: JSONObject): SearchResponse? {
-        val title = obj.optString("title").takeIf { it.isNotBlank() } ?: return null
-        val relUrl = obj.optString("url").takeIf { it.isNotBlank() } ?: return null
-        val poster = obj.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
-            ?: obj.optJSONObject("poster")?.optString("medium")?.takeIf { it.isNotBlank() }
-        val latest = obj.optInt("latestChapter", 0).takeIf { it > 0 }
-
-        val res = newAnimeSearchResponse(title, fixUrl(relUrl), TvType.Anime)
-        poster?.let { res.posterUrl = fixUrl(it) }
-        latest?.let { res.addSub(it) }
-        return res
-    }
-
-    private fun readQueries(
-        initial: JSONObject,
-        matcher: (JSONArray) -> Boolean
-    ): List<SearchResponse> {
-        val queries = initial.optJSONObject("queries") ?: return emptyList()
+    
+    private fun extractMangaFromJson(html: String): List<SearchResponse> {
         val out = mutableListOf<SearchResponse>()
-        val keys = queries.keys()
         
+        // Pure Regex extraction to prevent Jsoup from corrupting the JSON string
+        val jsonMatch = Regex("""<script[^>]*id="initial-data"[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL).find(html)
+        val jsonText = jsonMatch?.groupValues?.get(1)?.trim() ?: return out
+        
+        val initialData = runCatching { JSONObject(jsonText) }.getOrNull() ?: return out
+        val queries = initialData.optJSONObject("queries") ?: return out
+        
+        val keys = queries.keys()
         while (keys.hasNext()) {
             val k = keys.next()
-            val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
-            if (!matcher(parsed)) continue
-
-            val value = queries.opt(k)
             
-            // Safeguard: Safely handles both normal { "items": [] } AND infinite query { "pages": [ {"items": []} ] } structures
-            val itemsArray = if (value is JSONArray) {
-                value
-            } else if (value is JSONObject) {
-                if (value.has("pages")) {
-                    val pages = value.optJSONArray("pages")
-                    val combined = JSONArray()
-                    if (pages != null) {
-                        for (p in 0 until pages.length()) {
-                            val pageObj = pages.optJSONObject(p)
-                            val pItems = pageObj?.optJSONArray("items")
-                            if (pItems != null) {
-                                for (i in 0 until pItems.length()) {
-                                    combined.put(pItems.get(i))
+            // If the query key contains "manga", it holds our data
+            if (k.contains("\"manga\"")) {
+                val value = queries.opt(k)
+                
+                // Safely handles both normal { "items": [] } AND infinite query { "pages": [ {"items": []} ] }
+                val itemsArray = when (value) {
+                    is JSONArray -> value
+                    is JSONObject -> {
+                        if (value.has("pages")) {
+                            val pages = value.optJSONArray("pages")
+                            val combined = JSONArray()
+                            if (pages != null) {
+                                for (p in 0 until pages.length()) {
+                                    val pItems = pages.optJSONObject(p)?.optJSONArray("items")
+                                    if (pItems != null) {
+                                        for (i in 0 until pItems.length()) {
+                                            combined.put(pItems.get(i))
+                                        }
+                                    }
                                 }
                             }
+                            combined
+                        } else {
+                            value.optJSONArray("items")
                         }
                     }
-                    combined
-                } else {
-                    value.optJSONArray("items")
+                    else -> null
                 }
-            } else null
 
-            if (itemsArray == null) continue
+                if (itemsArray != null) {
+                    for (i in 0 until itemsArray.length()) {
+                        val obj = itemsArray.optJSONObject(i) ?: continue
+                        val title = obj.optString("title").takeIf { it.isNotBlank() } ?: continue
+                        
+                        // Safely resolve URL
+                        val relUrl = obj.optString("url").takeIf { it.isNotBlank() } 
+                            ?: obj.optString("hid").takeIf { it.isNotBlank() }?.let { "/title/$it" } 
+                            ?: continue
+                            
+                        val poster = obj.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
+                            ?: obj.optJSONObject("poster")?.optString("medium")?.takeIf { it.isNotBlank() }
+                        
+                        val latest = obj.optInt("latestChapter", 0)
 
-            for (i in 0 until itemsArray.length()) {
-                itemsArray.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
+                        val res = newAnimeSearchResponse(title, fixUrl(relUrl), TvType.Anime)
+                        poster?.let { res.posterUrl = fixUrl(it) }
+                        if (latest > 0) res.addSub(latest)
+                        
+                        out.add(res)
+                    }
+                }
             }
         }
-        return out
-    }
-
-    private fun toSearchResult(card: Element): SearchResponse? {
-        val anchor = if (card.tagName() == "a") card
-                     else card.selectFirst("a[href*='/title/'], a[href]") ?: return null
-        val href = anchor.attr("href").takeIf { it.isNotBlank() } ?: return null
-        val title = card.selectFirst("h3, h2, .title, .manga-title, .lrow__title, .card__title")
-            ?.text()?.trim()
-            ?: anchor.attr("title").ifBlank { anchor.text().trim() }
-        if (title.isBlank()) return null
         
-        val poster = card.selectFirst("img")
-            ?.let { it.attr("data-src").ifBlank { it.attr("src") } }
-            ?.takeIf { it.isNotBlank() }
-        val latestEp = card.selectFirst(".chapter, .latest-chapter, .lrow__chapter, .card__ch")
-            ?.text()?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
-
-        val res = newAnimeSearchResponse(title, fixUrl(href), TvType.Anime)
-        poster?.let { res.posterUrl = fixUrl(it) }
-        if (latestEp != null && latestEp > 0) res.addSub(latestEp)
-        return res
-    }
-
-    private fun extractSearchResultsDom(doc: Document): List<SearchResponse> {
-        val results = mutableListOf<SearchResponse>()
-        doc.select("a.card").forEach { el ->
-            // Restricting search to main grid to prevent mixing with sidebars/widgets
-            if (el.parents().any { p -> 
-                val cls = p.className().lowercase()
-                cls.contains("side") || cls.contains("swiper") 
-            }) return@forEach
-            toSearchResult(el)?.let { results.add(it) }
-        }
-        
-        // Absolute fallback: If the restricted search failed, grab every card on the page
-        if (results.isEmpty()) {
-            doc.select("a.card").forEach { el ->
-                toSearchResult(el)?.let { results.add(it) }
-            }
-        }
-        return results.distinctBy { it.url }
+        return out.distinctBy { it.url }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Main page & Search
+    //  Main page & Search 
     // ═══════════════════════════════════════════════════════════════════════
+    
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
         
-        // 1. RECOMMENDATION (Single curated slider, extracted straight from HTML text)
-        if (request.data == "recommendation") {
-            if (page > 1) return null
-            val html = fetchHtml("$mainUrl/")
-            if (html.isBlank()) return null
-            val doc = Jsoup.parse(html)
-            
-            // Explicitly locking onto the exact "Recommended for you" header text
-            val recSection = doc.select("section.section").firstOrNull { 
-                it.select(".section__title").text().contains("Recommended for you", ignoreCase = true) 
-            } ?: return null
-
-            val results = recSection.select("a.card").mapNotNull { toSearchResult(it) }
-            return newHomePageResponse(request, results.distinctBy { it.url }, hasNext = false)
-        }
-
-        // 2. ALL BROWSE CATEGORIES (Uses exact endpoints securely URL-encoded for pristine pagination)
+        // Exact URLs built from scratch based purely on your instructions
         val pageUrl = when (request.data) {
             "latest"      -> if (page == 1) "$mainUrl/browse" else "$mainUrl/browse?page=$page"
-            "most_viewed" -> if (page == 1) "$mainUrl/browse?sort=views_total%3Adesc" else "$mainUrl/browse?sort=views_total%3Adesc&page=$page"
             "trending"    -> if (page == 1) "$mainUrl/browse?sort=views_7d%3Adesc" else "$mainUrl/browse?sort=views_7d%3Adesc&page=$page"
+            "most_viewed" -> if (page == 1) "$mainUrl/browse?sort=views_total%3Adesc" else "$mainUrl/browse?sort=views_total%3Adesc&page=$page"
             "follows"     -> if (page == 1) "$mainUrl/browse?sort=follows%3Adesc" else "$mainUrl/browse?sort=follows%3Adesc&page=$page"
             "completed"   -> if (page == 1) "$mainUrl/browse?status=completed" else "$mainUrl/browse?status=completed&page=$page"
             else          -> "$mainUrl/browse?page=$page"
@@ -243,23 +175,10 @@ class ComixProvider : MainAPI() {
         val html = fetchHtml(pageUrl)
         if (html.isBlank()) return null
 
-        val items = mutableListOf<SearchResponse>()
-        val doc = Jsoup.parse(html)
-
-        // Securely extract from the raw JSON payload
-        extractInitialDataJson(doc)?.let { initial ->
-            items.addAll(readQueries(initial) { k ->
-                k.length() >= 2 && k.optString(0) == "manga" && (k.optString(1) == "list" || k.optString(1) == "search")
-            })
-        }
-        
-        // Safety Fallback: Scrape the DOM if JSON structure alters or fails
-        if (items.isEmpty()) {
-            items.addAll(extractSearchResultsDom(doc))
-        }
+        val items = extractMangaFromJson(html)
 
         if (items.isEmpty()) return null
-        return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = items.size >= 20)
+        return newHomePageResponse(request, items, hasNext = items.size >= 20)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -271,20 +190,11 @@ class ComixProvider : MainAPI() {
         val html = fetchHtml(searchUrl)
         if (html.isBlank()) return emptyList()
 
-        val results = mutableListOf<SearchResponse>()
-        val doc = Jsoup.parse(html)
-        
-        extractInitialDataJson(doc)?.let { initial ->
-            results.addAll(readQueries(initial) { k -> 
-                k.length() >= 2 && k.optString(0) == "manga" && (k.optString(1) == "list" || k.optString(1) == "search")
-            })
-        }
-        
-        if (results.isEmpty()) results.addAll(extractSearchResultsDom(doc))
-
+        val results = extractMangaFromJson(html)
         val lower = cleanQuery.lowercase()
         val filtered = results.filter { it.name.lowercase().contains(lower) }
-        return (filtered.ifEmpty { results }).distinctBy { it.url }
+        
+        return filtered.ifEmpty { results }
     }
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
@@ -300,7 +210,11 @@ class ComixProvider : MainAPI() {
         if (html.isBlank()) return null
 
         val document = Jsoup.parse(html)
-        val initialData = extractInitialDataJson(document) ?: return null
+        
+        // Also applying the robust Regex JSON extractor to the Load page
+        val jsonMatch = Regex("""<script[^>]*id="initial-data"[^>]*>(.*?)</script>""", RegexOption.DOT_MATCHES_ALL).find(html)
+        val jsonText = jsonMatch?.groupValues?.get(1)?.trim() ?: return null
+        val initialData = runCatching { JSONObject(jsonText) }.getOrNull() ?: return null
 
         val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
 
@@ -327,8 +241,7 @@ class ComixProvider : MainAPI() {
             if (p > maxPage) maxPage = p
         }
 
-        // BATCH NATIVE HTTP: Since Cloudstream has solved Cloudflare and holds the cookie, 
-        // this batch fetching executes safely and natively at maximum speed without WebView timers.
+        // BATCH NATIVE HTTP
         if (maxPage > 1) {
             val pages = (2..maxPage).toList()
             for (chunk in pages.chunked(5)) {
