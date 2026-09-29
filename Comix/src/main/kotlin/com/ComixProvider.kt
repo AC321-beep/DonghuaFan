@@ -109,33 +109,6 @@ class ComixProvider : MainAPI() {
         return res
     }
 
-    private fun readQueries(
-        initial: JSONObject,
-        matcher: (JSONArray) -> Boolean
-    ): List<SearchResponse> {
-        val queries = initial.optJSONObject("queries") ?: return emptyList()
-        val out = mutableListOf<SearchResponse>()
-        val keys = queries.keys()
-        while (keys.hasNext()) {
-            val k = keys.next()
-            val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
-            if (!matcher(parsed)) continue
-
-            val value = queries.opt(k)
-            val arr = when (value) {
-                is JSONArray  -> value
-                is JSONObject -> value.optJSONArray("items")
-                else          -> null
-            } ?: continue
-
-            for (i in 0 until arr.length()) {
-                arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
-            }
-            if (out.isNotEmpty()) break
-        }
-        return out
-    }
-
     private fun toSearchResult(card: Element): SearchResponse? {
         val anchor = if (card.tagName() == "a") card
                      else card.selectFirst("a[href*='/title/'], a[href]") ?: return null
@@ -158,14 +131,17 @@ class ComixProvider : MainAPI() {
 
     private fun extractSearchResultsDom(doc: Document): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
-        doc.select("a.card").forEach { el ->
-            // Prevent sidebars/widgets from mixing with main grid results
-            if (el.parents().any { p -> p.hasClass("side-col") || p.hasClass("sidebar") || p.tagName() == "aside" }) return@forEach
+        // Specifically target browse page grids
+        doc.select(".list-grid .lrow, div.lrow, .lrow, .list-grid > div").forEach { el ->
             toSearchResult(el)?.let { results.add(it) }
         }
         
+        // Fallback for generic cards, excluding sidebars and sliders to prevent pollution
         if (results.isEmpty()) {
-            doc.select(".list-grid .lrow, div.lrow, .lrow, .list-grid > div").forEach { el ->
+            doc.select("a.card, article, .manga-card, .comic-item").forEach { el ->
+                if (el.parents().any { p -> 
+                    p.hasClass("side-col") || p.hasClass("sidebar") || p.tagName() == "aside" || p.hasClass("swiper") 
+                }) return@forEach
                 toSearchResult(el)?.let { results.add(it) }
             }
         }
@@ -180,7 +156,7 @@ class ComixProvider : MainAPI() {
         request: MainPageRequest
     ): HomePageResponse? {
         
-        // "Recommendation" is a single curated carousel slider on the homepage without pagination
+        // 1. RECOMMENDATION (Single slider, no pagination)
         if (request.data == "recommendation") {
             if (page > 1) return null
             val html = fetchHtml("$mainUrl/")
@@ -196,13 +172,13 @@ class ComixProvider : MainAPI() {
             return newHomePageResponse(request, results.distinctBy { it.url }, hasNext = false)
         }
 
-        // Accurately routing to the precise URLs for each category to ensure perfect pagination
+        // 2. DETERMINE TARGET URL
         val pageUrl = when (request.data) {
             "latest_new" -> if (page == 1) "$mainUrl/?tab=New" else "$mainUrl/?tab=New&page=$page"
             "latest_hot" -> if (page == 1) "$mainUrl/" else "$mainUrl/?page=$page"
             "trending"   -> "$mainUrl/browse?sort=views_7d:desc&page=$page"
             "follows"    -> "$mainUrl/browse?sort=follows:desc&page=$page"
-            "completed"  -> if (page == 1) "$mainUrl/browse?status=completed" else "$mainUrl/browse?status=completed&page=$page"
+            "completed"  -> "$mainUrl/browse?status=completed&sort=chapter_updated_at:desc&page=$page"
             else         -> "$mainUrl/browse?page=$page"
         }
 
@@ -212,18 +188,37 @@ class ComixProvider : MainAPI() {
         val items = mutableListOf<SearchResponse>()
         val doc = Jsoup.parse(html)
 
-        if (request.data == "latest_new" || request.data == "latest_hot") {
-            // Extract exclusively from the main updates grid on the homepage
-            doc.select(".grid-updates a.card").mapNotNull { toSearchResult(it) }.let { items.addAll(it) }
-        } else {
-            // Trending, Follows, and Completed use the /browse page which has JSON initial-data
-            extractInitialDataJson(html)?.let { initial ->
-                items.addAll(readQueries(initial) { k ->
-                    k.length() >= 1 && k.optString(0) == "manga"
-                })
+        // 3. EXTRACT BASED ON CATEGORY TYPE
+        when (request.data) {
+            "latest_new", "latest_hot" -> {
+                // Extracts specifically from the homepage grid-updates container
+                doc.select(".grid-updates a.card").mapNotNull { toSearchResult(it) }.let { items.addAll(it) }
+                
+                // Safety fallback
+                if (items.isEmpty()) items.addAll(extractSearchResultsDom(doc))
             }
-            if (items.isEmpty()) {
-                items.addAll(extractSearchResultsDom(doc))
+            else -> {
+                // For Trending, Follows, and Completed (Hits /browse endpoint)
+                // Extract securely from the initial-data JSON block
+                extractInitialDataJson(html)?.optJSONObject("queries")?.let { queries ->
+                    val keys = queries.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
+                        // Safely target the primary list query to prevent grabbing widget sidebars
+                        if (parsed.length() >= 2 && parsed.optString(0) == "manga" && parsed.optString(1) == "list") {
+                            val value = queries.opt(k)
+                            val arr = (if (value is JSONArray) value else (value as? JSONObject)?.optJSONArray("items")) ?: continue
+                            for (i in 0 until arr.length()) {
+                                arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> items.add(r) } }
+                            }
+                            if (items.isNotEmpty()) break
+                        }
+                    }
+                }
+                
+                // Safety fallback
+                if (items.isEmpty()) items.addAll(extractSearchResultsDom(doc))
             }
         }
 
@@ -239,12 +234,27 @@ class ComixProvider : MainAPI() {
 
         val html = fetchHtml(searchUrl)
         if (html.isBlank()) return emptyList()
+        
+        val doc = Jsoup.parse(html)
+        val results = mutableListOf<SearchResponse>()
 
-        var results: List<SearchResponse> = emptyList()
-        extractInitialDataJson(html)?.let { initial ->
-            results = readQueries(initial) { k -> k.length() >= 1 && k.optString(0) == "manga" }
+        extractInitialDataJson(html)?.optJSONObject("queries")?.let { queries ->
+            val keys = queries.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
+                if (parsed.length() >= 2 && parsed.optString(0) == "manga" && parsed.optString(1) == "list") {
+                    val value = queries.opt(k)
+                    val arr = (if (value is JSONArray) value else (value as? JSONObject)?.optJSONArray("items")) ?: continue
+                    for (i in 0 until arr.length()) {
+                        arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> results.add(r) } }
+                    }
+                    if (results.isNotEmpty()) break
+                }
+            }
         }
-        if (results.isEmpty()) results = extractSearchResultsDom(Jsoup.parse(html))
+        
+        if (results.isEmpty()) results.addAll(extractSearchResultsDom(doc))
 
         val lower = cleanQuery.lowercase()
         val filtered = results.filter { it.name.lowercase().contains(lower) }
