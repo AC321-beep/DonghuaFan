@@ -57,14 +57,12 @@ class ComixProvider : MainAPI() {
     //  Inbuilt Cloudflare Bypass & Browser Mimic
     // ═══════════════════════════════════════════════════════════════════════
     
-    // Uses Cloudstream's native interceptor to silently solve CF and sync cookies
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
     private suspend fun fetchHtml(url: String): String {
         return app.get(
             url,
             interceptor = cfInterceptor,
-            // "Mimic" a modern Desktop Chrome browser to evade initial bot detection
             headers = mapOf(
                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -82,7 +80,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  initial-data parsing
+    //  Data Parsing & Extraction
     // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
@@ -116,6 +114,7 @@ class ComixProvider : MainAPI() {
         val queries = initial.optJSONObject("queries") ?: return emptyList()
         val out = mutableListOf<SearchResponse>()
         val keys = queries.keys()
+        
         while (keys.hasNext()) {
             val k = keys.next()
             val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
@@ -131,8 +130,8 @@ class ComixProvider : MainAPI() {
             for (i in 0 until arr.length()) {
                 arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
             }
-            if (out.isNotEmpty()) break
         }
+        // Safely returning all matching query items instead of breaking early to prevent empty lists
         return out
     }
 
@@ -144,6 +143,7 @@ class ComixProvider : MainAPI() {
             ?.text()?.trim()
             ?: anchor.attr("title").ifBlank { anchor.text().trim() }
         if (title.isBlank()) return null
+        
         val poster = card.selectFirst("img")
             ?.let { it.attr("data-src").ifBlank { it.attr("src") } }
             ?.takeIf { it.isNotBlank() }
@@ -159,7 +159,7 @@ class ComixProvider : MainAPI() {
     private fun extractSearchResultsDom(doc: Document): List<SearchResponse> {
         val results = mutableListOf<SearchResponse>()
         doc.select("a.card").forEach { el ->
-            // Prevent sidebars/widgets from mixing with main grid results
+            // Restricting search to main grid to prevent mixing with sidebars/widgets
             if (el.parents().any { p -> p.hasClass("side-col") || p.hasClass("sidebar") || p.tagName() == "aside" }) return@forEach
             toSearchResult(el)?.let { results.add(it) }
         }
@@ -173,21 +173,21 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Main page & Search (Natively accelerated)
+    //  Main page & Search 
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
         
-        // "Recommendation" is a single curated carousel slider on the homepage without pagination
+        // 1. RECOMMENDATION (Single slider, no pagination, direct from homepage)
         if (request.data == "recommendation") {
             if (page > 1) return null
             val html = fetchHtml("$mainUrl/")
             if (html.isBlank()) return null
             val doc = Jsoup.parse(html)
             
-            // Internally matches the exact HTML section title "Recommended for you"
+            // Internally matching the exact HTML text to accurately extract the slider
             val recSection = doc.select("section.section").firstOrNull { 
                 it.select(".section__title").text().contains("Recommended for you", ignoreCase = true) 
             } ?: return null
@@ -196,7 +196,7 @@ class ComixProvider : MainAPI() {
             return newHomePageResponse(request, results.distinctBy { it.url }, hasNext = false)
         }
 
-        // Accurately routing to the precise URLs for each category to ensure perfect pagination
+        // 2. ALL OTHER CATEGORIES (Fetched natively via direct /browse endpoints)
         val pageUrl = when (request.data) {
             "latest"      -> if (page == 1) "$mainUrl/browse" else "$mainUrl/browse?page=$page"
             "most_viewed" -> if (page == 1) "$mainUrl/browse?sort=views_total:desc" else "$mainUrl/browse?sort=views_total:desc&page=$page"
@@ -212,15 +212,14 @@ class ComixProvider : MainAPI() {
         val items = mutableListOf<SearchResponse>()
         val doc = Jsoup.parse(html)
 
-        // All these request types hit the /browse page, so we can extract cleanly 
-        // from the JSON data (targeting "list" to avoid sidebars)
+        // Extract seamlessly from the initial-data JSON block targeting "list" items
         extractInitialDataJson(html)?.let { initial ->
             items.addAll(readQueries(initial) { k ->
                 k.length() >= 2 && k.optString(0) == "manga" && k.optString(1) == "list"
             })
         }
         
-        // Fallback to DOM extraction
+        // Safety Fallback to DOM extraction
         if (items.isEmpty()) {
             items.addAll(extractSearchResultsDom(doc))
         }
@@ -240,7 +239,7 @@ class ComixProvider : MainAPI() {
 
         var results: List<SearchResponse> = emptyList()
         extractInitialDataJson(html)?.let { initial ->
-            results = readQueries(initial) { k -> k.length() >= 2 && k.optString(0) == "manga" && k.optString(1) == "list" }
+            results = readQueries(initial) { k -> k.length() >= 1 && k.optString(0) == "manga" }
         }
         if (results.isEmpty()) results = extractSearchResultsDom(Jsoup.parse(html))
 
@@ -281,18 +280,14 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // Parse visible chapters from Page 1
         extractChaptersFromHtml(document)
 
-        // Find Total Pages
         var maxPage = 1
         document.select(".npager__num").forEach { el ->
             val p = el.text().toIntOrNull() ?: 1
             if (p > maxPage) maxPage = p
         }
 
-        // BATCH NATIVE HTTP: Since Cloudstream has solved Cloudflare and holds the cookie, 
-        // this batch fetching executes safely and natively at maximum speed without WebView timers.
         if (maxPage > 1) {
             val pages = (2..maxPage).toList()
             for (chunk in pages.chunked(5)) {
