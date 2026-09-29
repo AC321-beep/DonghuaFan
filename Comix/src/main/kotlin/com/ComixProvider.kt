@@ -45,11 +45,10 @@ class ComixProvider : MainAPI() {
     override val hasQuickSearch = true
 
     override val mainPage = mainPageOf(
-        "latest"      to "Latest Updates",
-        "trending"    to "Trending",
-        "most_viewed" to "Most Viewed",
-        "follows"     to "Most Followed",
-        "completed"   to "Completed",
+        "trending" to "Trending Today",
+        "follows"  to "Most Followed",
+        "hot"      to "Hot Updates",
+        "latest"   to "Latest Releases",
     )
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -177,13 +176,15 @@ class ComixProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
-        val pageUrl = when (request.data) {
-            "latest"      -> if (page == 1) "$mainUrl/browse" else "$mainUrl/browse?page=$page"
-            "most_viewed" -> if (page == 1) "$mainUrl/browse?sort=views_total%3Adesc" else "$mainUrl/browse?sort=views_total%3Adesc&page=$page"
-            "trending"    -> if (page == 1) "$mainUrl/browse?sort=views_7d%3Adesc" else "$mainUrl/browse?sort=views_7d%3Adesc&page=$page"
-            "follows"     -> if (page == 1) "$mainUrl/browse?sort=follows%3Adesc" else "$mainUrl/browse?sort=follows%3Adesc&page=$page"
-            "completed"   -> if (page == 1) "$mainUrl/browse?status=completed" else "$mainUrl/browse?status=completed&page=$page"
-            else          -> "$mainUrl/browse?page=$page"
+        val pageUrl = if (page == 1) {
+            "$mainUrl/"
+        } else {
+            val sortParam = when (request.data) {
+                "latest" -> "created_at:desc"
+                "hot"    -> "views_7d:desc"
+                else     -> request.data 
+            }
+            "$mainUrl/browse?sort=$sortParam&page=$page"
         }
 
         val html = fetchHtml(pageUrl)
@@ -195,9 +196,18 @@ class ComixProvider : MainAPI() {
             items = readQueries(initial) { k ->
                 if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
                 val subtype = k.optString(1)
+                val params = k.optJSONObject(2) ?: return@readQueries false
                 
-                // When we hit the /browse endpoint, the subtype is "list" for the main grid items
-                subtype == "list"
+                val jsonPage = params.optInt("page", 1)
+                if (page > 1 && jsonPage != page) return@readQueries false
+
+                when (request.data) {
+                    "trending" -> subtype == "top"  && params.optString("type") == "trending"
+                    "follows"  -> subtype == "top"  && params.optString("type") == "follows"
+                    "hot"      -> subtype == "list" && params.optString("scope") == "hot"
+                    "latest"   -> subtype == "list" && params.optJSONObject("order")?.optString("created_at") == "desc"
+                    else -> false
+                }
             }
         }
 
