@@ -230,7 +230,7 @@ class ComixProvider : MainAPI() {
             return newHomePageResponse(request, results.distinctBy { it.url }, hasNext = false)
         }
 
-        // 2. ALL BROWSE CATEGORIES (Uses exact endpoints instructed for pristine pagination)
+        // 2. ALL BROWSE CATEGORIES (Uses exact endpoints securely URL-encoded for pristine pagination)
         val pageUrl = when (request.data) {
             "latest"      -> if (page == 1) "$mainUrl/browse" else "$mainUrl/browse?page=$page"
             "most_viewed" -> if (page == 1) "$mainUrl/browse?sort=views_total%3Adesc" else "$mainUrl/browse?sort=views_total%3Adesc&page=$page"
