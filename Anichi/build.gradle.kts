@@ -1,7 +1,7 @@
 cloudstream {
    description = "Watch Anime streams from Anichi"
    authors = listOf("AC321-beep")
-   status = 1
+   status = 0
    tvTypes = listOf("Anime", "AnimeMovie")
    language = "en"
    version = 1
