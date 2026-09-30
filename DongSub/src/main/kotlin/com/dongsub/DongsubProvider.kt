@@ -29,8 +29,6 @@ class DongsubProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
-    private val pageSize = 20
-
     // ---------- title parsing ----------
 
     private data class ParsedTitle(
@@ -39,8 +37,6 @@ class DongsubProvider : MainAPI() {
         val episode: Int?
     )
 
-    // "A Will Eternal Final Season 4 Episode 13 Subtitles"
-    //   -> base="A Will Eternal", season=4, episode=13
     private fun parseTitle(raw: String): ParsedTitle {
         var s = raw.trim()
             .replace(Regex("(?i)\\s*Subtitles?\\s*$"), "")
@@ -74,93 +70,60 @@ class DongsubProvider : MainAPI() {
         else -> fallback
     }
 
-    /**
-     * Series-level key. Uses parseTitle so "A Will Eternal Season 3",
-     * "A Will Eternal Final Season 4 Eps 13" etc. all collapse to one key.
-     */
     private fun seriesKey(name: String): String =
         parseTitle(name).base.replace(Regex("[^a-zA-Z0-9]"), "").lowercase()
 
-    // ---------- homepage ----------
+    // ---------- pagination URL cache ----------
+    // Blogger label pages paginate with `updated-max` tokens that only appear
+    // inside each page's "older posts" link. We cache the next-page URL here.
+    private val pageUrlCache = mutableMapOf<String, String>()
 
+    // "Latest Release" = the Episode label page (what the homepage's
+    // "older posts" link actually points to).
     override val mainPage = mainPageOf(
-        "" to "Latest Release"
+        "search/label/Episode?max-results=20" to "Latest Release"
     )
 
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val startIndex = (page - 1) * pageSize + 1
-        val url = "$mainUrl/feeds/posts/default" +
-                "?alt=json&max-results=$pageSize" +
-                "&start-index=$startIndex" +
-                "&orderby=published"
+        val cacheKey = "${request.name}:$page"
 
-        val text = try {
-            app.get(url, headers = defaultHeaders).text
+        val url: String? = when {
+            page == 1 -> "$mainUrl/${request.data}"
+            else -> pageUrlCache[cacheKey]
+        }
+
+        if (url.isNullOrBlank()) {
+            return newHomePageResponse(request.name, emptyList())
+        }
+
+        val doc: Document = try {
+            app.get(url, headers = defaultHeaders).document
         } catch (_: Exception) {
             return newHomePageResponse(request.name, emptyList())
         }
 
-        val raw = parseFeed(text)
+        val raw = parseCards(doc)
 
-        // One card per SERIES (not per episode). Blogger feed is newest-first,
-        // so the first hit for each series is the latest episode.
+        // Dedup by series key (one card per show)
         val items = raw.distinctBy { seriesKey(it.name) }
 
-        // hasNext must be based on RAW count, otherwise dedup shrinks
-        // the list and pagination stops after page 1.
-        val hasNext = raw.size >= pageSize
+        // Extract the next-page URL from Blogger's "older posts" link.
+        // This is where the `updated-max` token lives.
+        val olderHref = doc.selectFirst("#blog-pager-older-link a[href]")?.attr("href")
+        val nextUrl = olderHref?.takeIf { it.isNotBlank() }?.let { fixUrl(it) }
+
+        val hasNext = !nextUrl.isNullOrBlank()
+        if (hasNext) {
+            pageUrlCache["${request.name}:${page + 1}"] = nextUrl!!
+        }
 
         return newHomePageResponse(request.name, items, hasNext)
     }
 
-    // Shared: turn a Blogger JSON feed response into search results.
-    // Caller can filter afterwards.
-    private fun parseFeed(text: String): List<AnimeSearchResponse> {
-        return try {
-            val root = JSONObject(text)
-            val feed = root.optJSONObject("feed") ?: return emptyList()
-            val entries = feed.optJSONArray("entry") ?: return emptyList()
-
-            val out = mutableListOf<AnimeSearchResponse>()
-            for (i in 0 until entries.length()) {
-                val e = entries.optJSONObject(i) ?: continue
-
-                val title = e.optJSONObject("title")?.optString("\$t") ?: continue
-                if (title.isBlank()) continue
-
-                val links = e.optJSONArray("link") ?: continue
-                var href: String? = null
-                for (j in 0 until links.length()) {
-                    val l = links.optJSONObject(j) ?: continue
-                    if (l.optString("rel") == "alternate") {
-                        href = l.optString("href")
-                        break
-                    }
-                }
-                if (href.isNullOrBlank() || !href.contains("dongsub.net")) continue
-
-                val thumb = e.optJSONObject("media\$thumbnail")?.optString("url")
-                    ?.replace("s72-c", "s320")
-                    ?.replace("s72", "s320")
-                    ?.takeIf { it.isNotBlank() }
-
-                val parsed = parseTitle(title)
-
-                out.add(newAnimeSearchResponse(parsed.base.ifBlank { title }, href, TvType.Anime) {
-                    this.posterUrl = thumb
-                    addSub(parsed.episode)
-                })
-            }
-            out
-        } catch (_: Exception) {
-            emptyList()
-        }
-    }
-
-    // ---------- cards / search ----------
+    // ---------- card / feed parsing ----------
 
     private fun parseCards(doc: Document): List<AnimeSearchResponse> {
         return doc.select("article.post-outer-container, div.blog-posts article")
@@ -196,13 +159,49 @@ class DongsubProvider : MainAPI() {
         }
     }
 
-    /**
-     * Global search: query the Blogger feed and the HTML search page in
-     * parallel, keep only real matches, dedup by URL, rank by relevance.
-     *
-     * Blogger's `?q=` is word-based and loose (matches any single word),
-     * so we post-filter to titles that actually contain the full query.
-     */
+    private fun parseFeed(text: String): List<AnimeSearchResponse> {
+        return try {
+            val root = JSONObject(text)
+            val feed = root.optJSONObject("feed") ?: return emptyList()
+            val entries = feed.optJSONArray("entry") ?: return emptyList()
+
+            val out = mutableListOf<AnimeSearchResponse>()
+            for (i in 0 until entries.length()) {
+                val e = entries.optJSONObject(i) ?: continue
+                val title = e.optJSONObject("title")?.optString("\$t") ?: continue
+                if (title.isBlank()) continue
+
+                val links = e.optJSONArray("link") ?: continue
+                var href: String? = null
+                for (j in 0 until links.length()) {
+                    val l = links.optJSONObject(j) ?: continue
+                    if (l.optString("rel") == "alternate") {
+                        href = l.optString("href")
+                        break
+                    }
+                }
+                if (href.isNullOrBlank() || !href.contains("dongsub.net")) continue
+
+                val thumb = e.optJSONObject("media\$thumbnail")?.optString("url")
+                    ?.replace("s72-c", "s320")
+                    ?.replace("s72", "s320")
+                    ?.takeIf { it.isNotBlank() }
+
+                val parsed = parseTitle(title)
+
+                out.add(newAnimeSearchResponse(parsed.base.ifBlank { title }, href, TvType.Anime) {
+                    this.posterUrl = thumb
+                    addSub(parsed.episode)
+                })
+            }
+            out
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    // ---------- search ----------
+
     override suspend fun search(query: String): List<SearchResponse> = coroutineScope {
         val q = query.trim()
         if (q.isBlank()) return@coroutineScope emptyList()
@@ -237,7 +236,6 @@ class DongsubProvider : MainAPI() {
         val combined = (feedDeferred.await() + htmlDeferred.await())
             .distinctBy { it.url }
 
-        // Rank: exact-name first, then starts-with, then contains, then others.
         combined.sortedWith(
             compareBy(
                 { !it.name.equals(q, ignoreCase = true) },
@@ -359,7 +357,6 @@ class DongsubProvider : MainAPI() {
 
         val anchor = extractSeriesAnchor(doc)
 
-        // Gather candidate (title, url) pairs from multiple sources
         val candidates = mutableListOf<Pair<String, String>>()
 
         if (seriesBase.isNotBlank()) candidates += fetchSearchFeed(seriesBase)
@@ -370,15 +367,11 @@ class DongsubProvider : MainAPI() {
             }
         }
 
-        // Keep only candidates whose parsed series base matches this page's base
         val exact = candidates.filter { (t, _) ->
             parseTitle(t).base.equals(seriesBase, ignoreCase = true)
         }
         val chosen = if (exact.size >= 2) exact else candidates
 
-        // Two-layer dedup:
-        //   - seenUrls: two different listings pointing at the same page
-        //   - seenEpKeys: S:E collision when the same episode appears twice
         val seenUrls = mutableSetOf<String>()
         val seenEpKeys = mutableSetOf<String>()
         val episodes = mutableListOf<Episode>()
