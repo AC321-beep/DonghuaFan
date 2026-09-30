@@ -2,9 +2,9 @@ package com.dongsub
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -29,21 +29,49 @@ class DongsubProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
-    // ───────── cross-page dedup state ─────────
-    // CloudStream concatenates getMainPage(1), getMainPage(2), … into one list.
-    // Blogger's label windows overlap, so without this the same show reappears
-    // on every page. Reset whenever page 1 is requested.
-    private val globallySeenSeries = mutableSetOf<String>()
+    // ═══════════════════════════════════════════════════════════════════
+    //  Home-page caches
+    //  ─ getMainPage(N) is called by CloudStream one at a time; we can't
+    //    make the app call them in parallel. But we can prefetch pages
+    //    in the background from inside getMainPage(1) so later calls
+    //    hit a warm cache.
+    //  ─ Blogger supports offset pagination via ?start=N, so page URLs
+    //    are known upfront and can be fetched concurrently.
+    // ═══════════════════════════════════════════════════════════════════
 
-    // ───────── pagination URL cache (bounded) ─────────
-    private val pageUrlCache = object : LinkedHashMap<String, String>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
-            size > 32
+    private companion object {
+        const val PER_PAGE = 20
+        const val LOOKAHEAD = 4
+        const val FEED_LIMIT = 100
+        val GENERIC_LABELS = setOf(
+            "donghua", "anime", "episode", "episodes", "series",
+            "movie", "movies", "ongoing", "completed", "ova", "ona"
+        )
     }
 
-    // ---------- title parsing ----------
+    private data class PageCache(
+        val items: List<AnimeSearchResponse>,
+        val hasNext: Boolean
+    )
 
-    private data class ParsedTitle(val base: String, val season: Int?, val episode: Int?)
+    private val htmlLock = Mutex()
+    private val prefetchScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val pageDeferreds = mutableMapOf<Int, Deferred<Document?>>()
+    private val builtPages = mutableMapOf<Int, PageCache>()
+    private var highestBuiltPage = 0
+
+    // Global dedup across pages. Cleared on page-1 refresh.
+    private val globallySeenSeries = mutableSetOf<String>()
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  Title parsing / normalization
+    // ═══════════════════════════════════════════════════════════════════
+
+    private data class ParsedTitle(
+        val base: String,
+        val season: Int?,
+        val episode: Int?
+    )
 
     private fun parseTitle(raw: String): ParsedTitle {
         var s = raw.trim()
@@ -79,13 +107,9 @@ class DongsubProvider : MainAPI() {
     }
 
     /**
-     * Normalize a show title into a key that is stable across:
-     *  - "Subtitles" / "Sub" / "Dub" / "Raw" suffixes
-     *  - "Episode 553", "Eps. 553", "Ep 553"
-     *  - "Season 4", "Final Season 4", "S4"
-     *  - resolution/quality tags: 1080p, 720p, HD, BluRay, …
-     *  - trailing "[1080p]" / "(HD)" / " - Good Sub"
-     *  - case, punctuation, whitespace
+     * Stable series key. Strips "Subtitles", "Episode N", "Season N",
+     * "Final Season N", resolution tags, and trailing [..]/(..) junk so
+     * variants of the same show collapse to one key.
      */
     private fun seriesKey(name: String): String {
         var s = name.trim()
@@ -107,10 +131,12 @@ class DongsubProvider : MainAPI() {
             .removeSuffix("/")
             .lowercase()
 
-    // ---------- main page ----------
+    // ═══════════════════════════════════════════════════════════════════
+    //  Main page
+    // ═══════════════════════════════════════════════════════════════════
 
     override val mainPage = mainPageOf(
-        "search/label/Episode?max-results=20" to "Latest Release"
+        "search/label/Episode" to "Latest Release"
     )
 
     override suspend fun getMainPage(
@@ -119,61 +145,83 @@ class DongsubProvider : MainAPI() {
     ): HomePageResponse {
         if (page < 1) return newHomePageResponse(request.name, emptyList())
 
-        // Reset every time CloudStream refreshes the home feed.
         if (page == 1) {
-            globallySeenSeries.clear()
-            pageUrlCache.clear()
-        }
-
-        val baseUrl = "$mainUrl/${request.data}"
-        val key1 = "${request.name}:1"
-        var url: String = pageUrlCache[key1] ?: baseUrl.also { pageUrlCache[key1] = it }
-        var currentPage = 1
-
-        // Walk forward following the "older posts" chain so out-of-order
-        // page requests also work.
-        while (currentPage < page) {
-            val cachedNext = pageUrlCache["${request.name}:${currentPage + 1}"]
-            if (cachedNext != null) {
-                url = cachedNext
-                currentPage++
-                continue
+            htmlLock.withLock {
+                globallySeenSeries.clear()
+                pageDeferreds.clear()
+                builtPages.clear()
+                highestBuiltPage = 0
             }
-            val peek = try {
-                app.get(url, headers = defaultHeaders).document
-            } catch (_: Exception) {
-                return newHomePageResponse(request.name, emptyList())
+        }
+
+        // ── Phase 1: ensure pages 1..page are fetched (in parallel).
+        // Memoized via Deferred, so if the background prefetch already
+        // got them, these awaits return instantly.
+        val docs: Map<Int, Document?> = coroutineScope {
+            (1..page).associateWith { p ->
+                async { getPageHtml(p, request) }
+            }.mapValues { (_, d) -> d.await() }
+        }
+
+        // ── Phase 2: build deduped responses in page order.
+        // Order matters: whichever page claims a series first keeps it.
+        htmlLock.withLock {
+            var p = highestBuiltPage + 1
+            while (p <= page) {
+                val doc = docs[p] ?: break
+                val items = parseCards(doc)
+                    .filter { globallySeenSeries.add(seriesKey(it.name)) }
+                val hasNext = doc.selectFirst("#blog-pager-older-link a[href]") != null
+                builtPages[p] = PageCache(items, hasNext)
+                highestBuiltPage = p
+                p++
             }
-            val olderHref = peek.selectFirst("#blog-pager-older-link a[href]")?.attr("href")
-            val nextUrl = olderHref?.takeIf { it.isNotBlank() }?.let { fixUrl(it) }
-                ?: return newHomePageResponse(request.name, emptyList())
-            pageUrlCache["${request.name}:${currentPage + 1}"] = nextUrl
-            url = nextUrl
-            currentPage++
         }
 
-        val doc = try {
-            app.get(url, headers = defaultHeaders).document
-        } catch (_: Exception) {
-            return newHomePageResponse(request.name, emptyList())
+        // ── Phase 3: warm the next few pages in the background (fire-and-forget).
+        if (page == 1) {
+            prefetchScope.launch {
+                (2..(1 + LOOKAHEAD)).forEach { p ->
+                    launch { getPageHtml(p, request) }
+                }
+            }
         }
 
-        // THE IMPORTANT PART:
-        //   .filter { globallySeenSeries.add(...) } returns false for anything
-        //   we've already returned on an earlier page, so overlapping
-        //   Blogger windows can't reintroduce the same show.
-        val items = parseCards(doc)
-            .filter { globallySeenSeries.add(seriesKey(it.name)) }
-
-        val olderHref = doc.selectFirst("#blog-pager-older-link a[href]")?.attr("href")
-        val nextUrl = olderHref?.takeIf { it.isNotBlank() }?.let { fixUrl(it) }
-        val hasNext = !nextUrl.isNullOrBlank()
-        if (hasNext) pageUrlCache["${request.name}:${page + 1}"] = nextUrl!!
-
-        return newHomePageResponse(request.name, items, hasNext)
+        val cached = builtPages[page]
+            ?: return newHomePageResponse(request.name, emptyList())
+        return newHomePageResponse(request.name, cached.items, cached.hasNext)
     }
 
-    // ---------- card / feed parsing ----------
+    /**
+     * Fetches the HTML for page [p] using Blogger's offset pagination.
+     * Returns a memoized Deferred so concurrent callers share one request.
+     * Awaiting a completed Deferred is instant.
+     */
+    private suspend fun getPageHtml(p: Int, request: MainPageRequest): Document? {
+        val deferred = htmlLock.withLock {
+            pageDeferreds.getOrPut(p) {
+                prefetchScope.async(Dispatchers.IO) {
+                    val offset = (p - 1) * PER_PAGE
+                    val url = "$mainUrl/${request.data}?max-results=$PER_PAGE&start=$offset"
+                    try {
+                        app.get(url, headers = defaultHeaders).document
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+            }
+        }
+        val doc = deferred.await()
+        // Drop failed fetches so a later attempt can retry.
+        if (doc == null) {
+            htmlLock.withLock { pageDeferreds.remove(p) }
+        }
+        return doc
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  Card / feed parsing
+    // ═══════════════════════════════════════════════════════════════════
 
     private fun parseCards(doc: Document): List<AnimeSearchResponse> {
         return doc.select("article.post-outer-container")
@@ -249,7 +297,9 @@ class DongsubProvider : MainAPI() {
         } catch (_: Exception) { emptyList() }
     }
 
-    // ---------- search ----------
+    // ═══════════════════════════════════════════════════════════════════
+    //  Search
+    // ═══════════════════════════════════════════════════════════════════
 
     override suspend fun search(query: String): List<SearchResponse> = coroutineScope {
         val q = query.trim()
@@ -283,12 +333,9 @@ class DongsubProvider : MainAPI() {
             ))
     }
 
-    // ---------- episode helpers ----------
-
-    private val GENERIC_LABELS = setOf(
-        "donghua", "anime", "episode", "episodes", "series",
-        "movie", "movies", "ongoing", "completed", "ova", "ona"
-    )
+    // ═══════════════════════════════════════════════════════════════════
+    //  Episode discovery helpers
+    // ═══════════════════════════════════════════════════════════════════
 
     private fun extractSeriesAnchor(doc: Document): Pair<String, String?>? {
         val tagLinks = doc.select("span.info-stream a[rel=tag], span.info-stream a[data]")
@@ -328,8 +375,9 @@ class DongsubProvider : MainAPI() {
                         href = link.optString("href"); break
                     }
                 }
-                if (!href.isNullOrBlank() && href.contains("dongsub.net") && seen.add(canonicalUrl(href)))
-                    result.add(title to href)
+                if (!href.isNullOrBlank() && href.contains("dongsub.net")
+                    && seen.add(canonicalUrl(href))
+                ) result.add(title to href)
             }
             result
         } catch (_: Exception) { emptyList() }
@@ -338,7 +386,7 @@ class DongsubProvider : MainAPI() {
     private suspend fun fetchLabelFeed(label: String): List<Pair<String, String>> {
         val encoded = label.replace(" ", "%20")
         val url = "$mainUrl/feeds/posts/default/-/$encoded" +
-                "?alt=json&max-results=500&orderby=published"
+                "?alt=json&max-results=$FEED_LIMIT&orderby=published"
         return try {
             feedEntriesToPairs(app.get(url, headers = defaultHeaders).text)
         } catch (_: Exception) { emptyList() }
@@ -347,7 +395,7 @@ class DongsubProvider : MainAPI() {
     private suspend fun fetchSearchFeed(query: String): List<Pair<String, String>> {
         val encoded = URLEncoder.encode(query, "UTF-8")
         val url = "$mainUrl/feeds/posts/default" +
-                "?alt=json&q=$encoded&max-results=500&orderby=published"
+                "?alt=json&q=$encoded&max-results=$FEED_LIMIT&orderby=published"
         return try {
             feedEntriesToPairs(app.get(url, headers = defaultHeaders).text)
         } catch (_: Exception) { emptyList() }
@@ -356,16 +404,20 @@ class DongsubProvider : MainAPI() {
     private suspend fun fetchLabelPage(labelOrHref: String): List<AnimeSearchResponse> {
         val base = if (labelOrHref.startsWith("http")) labelOrHref
         else "$mainUrl/search/label/${labelOrHref.replace(" ", "%20")}"
-        val url = if (base.contains("?")) "$base&max-results=500" else "$base?&max-results=500"
+        val url = if (base.contains("?")) "$base&max-results=$FEED_LIMIT"
+        else "$base?&max-results=$FEED_LIMIT"
         return try {
             parseCards(app.get(url, headers = defaultHeaders).document)
         } catch (_: Exception) { emptyList() }
     }
 
-    // ---------- load ----------
+    // ═══════════════════════════════════════════════════════════════════
+    //  load()
+    // ═══════════════════════════════════════════════════════════════════
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = defaultHeaders).document
+
         val rawTitle = doc.selectFirst("h1.title-stream, h1.entry-title, h1")
             ?.text()?.trim().orEmpty()
         val parsedPage = parseTitle(rawTitle)
@@ -379,16 +431,30 @@ class DongsubProvider : MainAPI() {
             ?.text()?.trim()
 
         val anchor = extractSeriesAnchor(doc)
-        val candidates = mutableListOf<Pair<String, String>>()
-        if (seriesBase.isNotBlank()) candidates += fetchSearchFeed(seriesBase)
-        anchor?.let { (label, _) -> candidates += fetchLabelFeed(label) }
 
-        val distinctUrlCount = candidates.asSequence().map { canonicalUrl(it.second) }.toHashSet().size
-        if (distinctUrlCount < 2 && anchor != null) {
+        // ── Parallel: search feed + label feed fetched concurrently.
+        val (searchCandidates, labelCandidates) = coroutineScope {
+            val sJob = async {
+                if (seriesBase.isNotBlank()) fetchSearchFeed(seriesBase) else emptyList()
+            }
+            val lJob = async {
+                anchor?.let { (label, _) -> fetchLabelFeed(label) } ?: emptyList()
+            }
+            sJob.await() to lJob.await()
+        }
+        val candidates = (searchCandidates + labelCandidates).toMutableList()
+
+        // Fallback: HTML scrape the label page only if feeds came back thin.
+        val distinctUrls = candidates.asSequence()
+            .map { canonicalUrl(it.second) }.toHashSet().size
+        if (distinctUrls < 2 && anchor != null) {
             val (label, href) = anchor
             fetchLabelPage(href ?: label).forEach { candidates.add(it.name to it.url) }
         }
 
+        // ── SAFETY: never fall back to raw candidates. The anchor can be a
+        // generic label ("Donghua", "Episode") whose feed returns the whole
+        // site; picking it wholesale would merge every show into one list.
         val exact = candidates.filter { (t, _) ->
             parseTitle(t).base.equals(seriesBase, ignoreCase = true)
         }
@@ -397,10 +463,13 @@ class DongsubProvider : MainAPI() {
             seriesBase.length < 3 -> emptyList()
             else -> candidates.filter { (t, _) ->
                 val b = parseTitle(t).base
-                b.isNotBlank() && (b.contains(seriesBase, true) || seriesBase.contains(b, true))
+                b.isNotBlank() &&
+                        (b.contains(seriesBase, ignoreCase = true) ||
+                                seriesBase.contains(b, ignoreCase = true))
             }
         }
 
+        // ── Triple-layer episode dedup.
         val seenUrls = mutableSetOf<String>()
         val seenEpKeys = mutableSetOf<String>()
         val seenNames = mutableSetOf<String>()
@@ -415,7 +484,6 @@ class DongsubProvider : MainAPI() {
                 val epKey = "${p.season ?: 1}:${p.episode}"
                 if (!seenEpKeys.add(epKey)) continue
             }
-
             val displayName = buildEpName(p, t)
             val nameKey = displayName.lowercase().replace(Regex("[^a-z0-9]"), "")
             if (!seenNames.add(nameKey)) continue
@@ -440,7 +508,9 @@ class DongsubProvider : MainAPI() {
         }
     }
 
-    // ---------- loadLinks ----------
+    // ═══════════════════════════════════════════════════════════════════
+    //  loadLinks()
+    // ═══════════════════════════════════════════════════════════════════
 
     override suspend fun loadLinks(
         data: String,
