@@ -52,18 +52,10 @@ class ComixProvider : MainAPI() {
     )
 
     @Volatile private var cfgToken: String? = null
+    @Volatile private var apiToken: String? = null
 
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Debug logger — two channels:
-    //    • println(...)            → captured by Cloudstream's in-app log viewer
-    //    • android.util.Log.e(...) → survives R8 stripping, visible via adb
-    //
-    //  Where to read:
-    //    Cloudstream → Settings → Debug → View Logs → filter "ComixDebug"
-    //    ADB:  adb logcat | grep ComixDebug
-    // ═══════════════════════════════════════════════════════════════════════
     private fun dbg(msg: String) {
         println("ComixDebug: $msg")
         runCatching { android.util.Log.e("ComixDebug", msg) }
@@ -99,7 +91,7 @@ class ComixProvider : MainAPI() {
                 ?.takeIf { it.isNotBlank() }
                 ?.let {
                     cfgToken = it
-                    dbg("[fetchHtml] cfg token captured: ${it.take(30)}…")
+                    dbg("[fetchHtml] cfg token captured: ${it.take(30)}… (${it.length} chars)")
                 }
         }
         return text
@@ -114,24 +106,10 @@ class ComixProvider : MainAPI() {
             is String   -> Jsoup.parse(htmlOrDoc)
             else        -> return null
         }
-        val script = doc.selectFirst("script#initial-data")
-        if (script == null) {
-            dbg("[extractInitialData] ✗ <script#initial-data> not found")
-            return null
-        }
+        val script = doc.selectFirst("script#initial-data") ?: return null
         val text = script.data().ifBlank { script.html() }.trim()
-        if (text.isEmpty()) {
-            dbg("[extractInitialData] ✗ script tag empty")
-            return null
-        }
-        val json = runCatching { JSONObject(text) }.getOrNull()
-        if (json == null) {
-            dbg("[extractInitialData] ✗ JSONObject parse failed")
-        } else {
-            val q = json.optJSONObject("queries")
-            dbg("[extractInitialData] ✓ parsed, query keys: ${q?.length() ?: 0}")
-        }
-        return json
+        if (text.isEmpty()) return null
+        return runCatching { JSONObject(text) }.getOrNull()
     }
 
     private fun parseMangaFromJson(obj: JSONObject): SearchResponse? {
@@ -216,45 +194,24 @@ class ComixProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
-        dbgSection("getMainPage(page=$page, request='${request.data}', name='${request.name}')")
+        dbgSection("getMainPage(page=$page, request='${request.data}')")
 
         if (request.data == "trending" || request.data == "follows") {
-            if (page > 1) {
-                dbg("[getMainPage] trending/follows: page>1 → returning null (not paginated)")
-                return null
-            }
-            dbg("[getMainPage] trending/follows: fetching homepage SSR…")
+            if (page > 1) return null
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
-            dbg("[getMainPage] trending/follows: ${items.size} items parsed")
-            if (items.isEmpty()) {
-                dbg("[getMainPage] ✗ no items → returning null")
-                return null
-            }
+            if (items.isEmpty()) return null
             return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = false)
         }
 
         if (page == 1) {
-            dbg("[getMainPage] hot/latest page 1: fetching homepage SSR…")
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
-            dbg("[getMainPage] ✓ page 1: ${items.size} items parsed")
-            if (items.isEmpty()) {
-                dbg("[getMainPage] ✗ no items → returning null")
-                return null
-            }
+            dbg("[getMainPage] page 1: ${items.size} items")
+            if (items.isEmpty()) return null
             return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = true)
         }
 
-        dbg("[getMainPage] hot/latest page $page: calling fetchQueryPage…")
-        val result = fetchQueryPage(request, page)
-        if (result == null) {
-            dbg("[getMainPage] ✗ fetchQueryPage returned null → returning null")
-            return null
-        }
-        dbg("[getMainPage] ✓ fetchQueryPage: ${result.items.size} items, hasNext=${result.hasNext}")
-        if (result.items.isEmpty()) {
-            dbg("[getMainPage] ✗ items empty → returning null")
-            return null
-        }
+        val result = fetchQueryPage(request, page) ?: return null
+        if (result.items.isEmpty()) return null
         return newHomePageResponse(
             request,
             result.items.distinctBy { it.url },
@@ -267,10 +224,7 @@ class ComixProvider : MainAPI() {
         request: MainPageRequest,
         page: Int
     ): List<SearchResponse> {
-        if (html.isBlank()) {
-            dbg("[parseMainPage] ✗ html blank")
-            return emptyList()
-        }
+        if (html.isBlank()) return emptyList()
         var items: List<SearchResponse> = emptyList()
 
         extractInitialDataJson(html)?.let { initial ->
@@ -292,7 +246,6 @@ class ComixProvider : MainAPI() {
                     if (page > 1 && jsonPage != page) return@readQueries false
                     precise(subtype, params)
                 }
-                dbg("[parseMainPage] precise matcher → ${items.size} items")
             }
             if (items.isEmpty() && request.data == "latest") {
                 items = readQueries(initial) { k ->
@@ -305,18 +258,18 @@ class ComixProvider : MainAPI() {
                         params.optString("scope") != "hot" &&
                         params.optJSONObject("order")?.optString("created_at") == "desc"
                 }
-                dbg("[parseMainPage] latest fallback matcher → ${items.size} items")
             }
         }
-        if (items.isEmpty()) {
-            items = extractSearchResultsDom(Jsoup.parse(html))
-            dbg("[parseMainPage] DOM fallback → ${items.size} items")
-        }
+        if (items.isEmpty()) items = extractSearchResultsDom(Jsoup.parse(html))
         return items
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Pagination — GET /api/v1/manga
+    //  Order of attempts:
+    //    1. NO `_` at all — the cleanest test.
+    //    2. Fetch /api/v1/user, log it, extract any long token field, use it.
+    //    3. cfg meta token as `_`.
     // ═══════════════════════════════════════════════════════════════════════
     private data class PageResult(
         val items: List<SearchResponse>,
@@ -332,19 +285,13 @@ class ComixProvider : MainAPI() {
         val (orderField, scopeParam, limit) = when (request.data) {
             "hot"    -> Triple("chapter_updated_at", "hot", 31)
             "latest" -> Triple("created_at", "", 10)
-            else     -> {
-                dbg("[fetchQueryPage] ✗ unsupported category '${request.data}'")
-                return null
-            }
+            else     -> return null
         }
         dbg("[fetchQueryPage] order=$orderField scope='$scopeParam' limit=$limit")
 
         if (cfgToken == null) {
-            dbg("[fetchQueryPage] cfgToken null → bootstrapping via homepage fetch")
+            dbg("[fetchQueryPage] bootstrapping via homepage…")
             runCatching { fetchHtml("$mainUrl/") }
-            dbg("[fetchQueryPage] bootstrap done, cfgToken=${if (cfgToken == null) "STILL NULL" else "set"}")
-        } else {
-            dbg("[fetchQueryPage] cfgToken already cached")
         }
 
         val headers = mapOf(
@@ -357,113 +304,150 @@ class ComixProvider : MainAPI() {
             "Sec-Fetch-Site" to "same-origin"
         )
 
-        val paramsLiteral = buildString {
+        val paramsBase = buildString {
             append("order[").append(orderField).append("]=desc")
             if (scopeParam.isNotEmpty()) append("&scope=").append(scopeParam)
             append("&content_rating[]=safe&content_rating[]=suggestive")
             append("&page=").append(page).append("&limit=").append(limit)
-            append("&_=").append(randomCacheBuster())
         }
-        val urlLiteral = "$mainUrl/api/v1/manga?$paramsLiteral"
+        val urlBase = "$mainUrl/api/v1/manga?$paramsBase"
 
-        val paramsEncoded = buildString {
-            append("order%5B").append(orderField).append("%5D=desc")
-            if (scopeParam.isNotEmpty()) append("&scope=").append(scopeParam)
-            append("&content_rating%5B%5D=safe&content_rating%5B%5D=suggestive")
-            append("&page=").append(page).append("&limit=").append(limit)
-            append("&_=").append(randomCacheBuster())
-        }
-        val urlEncoded = "$mainUrl/api/v1/manga?$paramsEncoded"
-
-        // ── Attempt 1: literal brackets + CF interceptor ──────────────────
-        dbg("[fetchQueryPage] ▶ Attempt 1: literal brackets + cfInterceptor")
-        dbg("[fetchQueryPage] URL: $urlLiteral")
+        // ═══ Try 1: no `_` at all ═══
+        dbg("[fetchQueryPage] ▶ Try 1: NO `_` param")
+        dbg("[fetchQueryPage] URL: $urlBase")
         runCatching {
-            app.get(urlLiteral, headers = headers, interceptor = cfInterceptor).text
+            app.get(urlBase, headers = headers, interceptor = cfInterceptor).text
         }.onSuccess { text ->
             dbg("[fetchQueryPage] ← ${text.length} chars | first 200: ${text.take(200).replace("\n", " ")}")
             parsePageResponse(text)?.let {
-                dbg("[fetchQueryPage] ✓ Attempt 1 succeeded: ${it.items.size} items, hasNext=${it.hasNext}")
+                dbg("[fetchQueryPage] ✓ Try 1 succeeded: ${it.items.size} items")
                 return it
             }
-            dbg("[fetchQueryPage] ✗ Attempt 1: response not parseable as expected JSON")
         }.onFailure { e ->
-            dbg("[fetchQueryPage] ✗ Attempt 1 threw: ${e.javaClass.simpleName}: ${e.message}")
+            dbg("[fetchQueryPage] ✗ Try 1 threw: ${e.javaClass.simpleName}: ${e.message}")
         }
 
-        // ── Attempt 2: literal brackets, no interceptor ───────────────────
-        dbg("[fetchQueryPage] ▶ Attempt 2: literal brackets, no cfInterceptor")
-        runCatching {
-            app.get(urlLiteral, headers = headers).text
-        }.onSuccess { text ->
-            dbg("[fetchQueryPage] ← ${text.length} chars | first 200: ${text.take(200).replace("\n", " ")}")
-            parsePageResponse(text)?.let {
-                dbg("[fetchQueryPage] ✓ Attempt 2 succeeded: ${it.items.size} items, hasNext=${it.hasNext}")
-                return it
+        // ═══ Discover the real `_` token via /api/v1/user ═══
+        dbgSection("fetchQueryPage: discovering real token via /api/v1/user")
+        val userText = runCatching {
+            app.get(
+                "$mainUrl/api/v1/user",
+                headers = mapOf(
+                    "Accept" to "application/json, text/plain, */*",
+                    "Referer" to "$mainUrl/",
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Sec-Fetch-Dest" to "empty",
+                    "Sec-Fetch-Mode" to "cors",
+                    "Sec-Fetch-Site" to "same-origin"
+                ),
+                interceptor = cfInterceptor
+            ).text
+        }.getOrNull()
+        dbg("[fetchQueryPage] /api/v1/user ← ${userText?.length ?: 0} chars")
+        dbg("[fetchQueryPage] /api/v1/user body (first 1500 chars): ${userText?.take(1500)?.replace("\n", " ")}")
+
+        var discoveredToken: String? = null
+        if (userText != null && userText.isNotBlank()) {
+            runCatching { JSONObject(userText) }.getOrNull()?.let { obj ->
+                // Log every top-level key + type + first 60 chars of its value
+                val keys = obj.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val v = obj.opt(k)
+                    val preview = when (v) {
+                        is String -> "\"${v.take(80)}…\" (len=${v.length})"
+                        is JSONObject -> "JSONObject(keys=${v.keys().asSequence().toList()})"
+                        is JSONArray -> "JSONArray(len=${v.length()})"
+                        else -> v.toString()
+                    }
+                    dbg("[fetchQueryPage] /api/v1/user key='$k' → $preview")
+                }
+
+                // Scan for any long token-shaped string, root first then nested.
+                val candidates = listOf(
+                    "token", "_", "apiToken", "api_token", "csrf", "csrfToken",
+                    "xsrf", "xsrfToken", "session", "sessionToken", "key",
+                    "nonce", "sig", "signature", "auth", "authToken", "bearer"
+                )
+                fun scan(container: JSONObject, prefix: String) {
+                    if (discoveredToken != null) return
+                    for (name in candidates) {
+                        val v = container.optString(name)
+                        if (v.length in 60..300) {
+                            dbg("[fetchQueryPage] token-like: $prefix$name = ${v.take(40)}… (len=${v.length})")
+                            discoveredToken = v
+                            return
+                        }
+                    }
+                    // Brute scan of every string field
+                    val ks = container.keys()
+                    while (ks.hasNext()) {
+                        val k = ks.next()
+                        val v = container.optString(k)
+                        if (v.length in 60..300) {
+                            dbg("[fetchQueryPage] brute token: $prefix$k = ${v.take(40)}… (len=${v.length})")
+                            discoveredToken = v
+                            return
+                        }
+                    }
+                }
+                scan(obj, "")
+                if (discoveredToken == null) obj.optJSONObject("data")?.let { scan(it, "data.") }
+                if (discoveredToken == null) obj.optJSONObject("result")?.let { scan(it, "result.") }
             }
-            dbg("[fetchQueryPage] ✗ Attempt 2: response not parseable")
-        }.onFailure { e ->
-            dbg("[fetchQueryPage] ✗ Attempt 2 threw: ${e.javaClass.simpleName}: ${e.message}")
         }
 
-        // ── Attempt 3: pre-encoded brackets + CF interceptor ──────────────
-        dbg("[fetchQueryPage] ▶ Attempt 3: pre-encoded brackets + cfInterceptor")
-        dbg("[fetchQueryPage] URL: $urlEncoded")
-        runCatching {
-            app.get(urlEncoded, headers = headers, interceptor = cfInterceptor).text
-        }.onSuccess { text ->
-            dbg("[fetchQueryPage] ← ${text.length} chars | first 200: ${text.take(200).replace("\n", " ")}")
-            parsePageResponse(text)?.let {
-                dbg("[fetchQueryPage] ✓ Attempt 3 succeeded: ${it.items.size} items, hasNext=${it.hasNext}")
-                return it
+        if (discoveredToken != null) {
+            apiToken = discoveredToken
+            val url = "$urlBase&_=$discoveredToken"
+            dbg("[fetchQueryPage] ▶ Try 2: token from /api/v1/user as `_`")
+            dbg("[fetchQueryPage] URL: $url")
+            runCatching {
+                app.get(url, headers = headers, interceptor = cfInterceptor).text
+            }.onSuccess { text ->
+                dbg("[fetchQueryPage] ← ${text.length} chars | first 200: ${text.take(200).replace("\n", " ")}")
+                parsePageResponse(text)?.let {
+                    dbg("[fetchQueryPage] ✓ Try 2 succeeded: ${it.items.size} items")
+                    return it
+                }
+            }.onFailure { e ->
+                dbg("[fetchQueryPage] ✗ Try 2 threw: ${e.javaClass.simpleName}: ${e.message}")
             }
-            dbg("[fetchQueryPage] ✗ Attempt 3: response not parseable")
-        }.onFailure { e ->
-            dbg("[fetchQueryPage] ✗ Attempt 3 threw: ${e.javaClass.simpleName}: ${e.message}")
+        } else {
+            dbg("[fetchQueryPage] ✗ no token discovered in /api/v1/user")
         }
 
-        // ── Attempt 4: pre-encoded brackets, no interceptor ───────────────
-        dbg("[fetchQueryPage] ▶ Attempt 4: pre-encoded brackets, no cfInterceptor")
-        runCatching {
-            app.get(urlEncoded, headers = headers).text
-        }.onSuccess { text ->
-            dbg("[fetchQueryPage] ← ${text.length} chars | first 200: ${text.take(200).replace("\n", " ")}")
-            parsePageResponse(text)?.let {
-                dbg("[fetchQueryPage] ✓ Attempt 4 succeeded: ${it.items.size} items, hasNext=${it.hasNext}")
-                return it
+        // ═══ Try 3: cfg token as `_` ═══
+        cfgToken?.let { cfg ->
+            val url = "$urlBase&_=$cfg"
+            dbg("[fetchQueryPage] ▶ Try 3: cfg as `_`")
+            runCatching {
+                app.get(url, headers = headers, interceptor = cfInterceptor).text
+            }.onSuccess { text ->
+                dbg("[fetchQueryPage] ← ${text.length} chars | first 200: ${text.take(200).replace("\n", " ")}")
+                parsePageResponse(text)?.let {
+                    dbg("[fetchQueryPage] ✓ Try 3 succeeded: ${it.items.size} items")
+                    return it
+                }
+            }.onFailure { e ->
+                dbg("[fetchQueryPage] ✗ Try 3 threw: ${e.javaClass.simpleName}: ${e.message}")
             }
-            dbg("[fetchQueryPage] ✗ Attempt 4: response not parseable")
-        }.onFailure { e ->
-            dbg("[fetchQueryPage] ✗ Attempt 4 threw: ${e.javaClass.simpleName}: ${e.message}")
         }
 
-        dbg("[fetchQueryPage] ✗ ALL 4 ATTEMPTS FAILED — returning null")
+        dbg("[fetchQueryPage] ✗ ALL ATTEMPTS FAILED — returning null")
         return null
-    }
-
-    private fun randomCacheBuster(): String {
-        val chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-        return (1..129).map { chars.random() }.joinToString("")
     }
 
     private fun parsePageResponse(response: String): PageResult? {
         val trimmed = response.trim()
-        if (trimmed.isEmpty()) {
-            dbg("[parsePageResponse] ✗ response blank")
-            return null
-        }
+        if (trimmed.isEmpty()) return null
 
         runCatching { JSONArray(trimmed) }.getOrNull()?.let { arr ->
             val items = arrToResults(arr)
-            dbg("[parsePageResponse] bare array: ${items.size} items")
             return if (items.isEmpty()) null else PageResult(items, hasNext = items.size >= 5)
         }
 
-        val root = runCatching { JSONObject(trimmed) }.getOrNull()
-        if (root == null) {
-            dbg("[parsePageResponse] ✗ response is not valid JSON. First 300: ${trimmed.take(300).replace("\n", " ")}")
-            return null
-        }
+        val root = runCatching { JSONObject(trimmed) }.getOrNull() ?: return null
 
         root.optJSONObject("result")?.let { result ->
             result.optJSONArray("items")?.let { itemsArr ->
@@ -471,7 +455,7 @@ class ComixProvider : MainAPI() {
                 if (items.isNotEmpty()) {
                     val hasNext = result.optJSONObject("meta")?.optBoolean("hasNext")
                         ?: (items.size >= 5)
-                    dbg("[parsePageResponse] ✓ envelope match: ${items.size} items, hasNext=$hasNext")
+                    dbg("[parsePageResponse] ✓ envelope: ${items.size} items, hasNext=$hasNext")
                     return PageResult(items, hasNext)
                 }
             }
@@ -480,10 +464,7 @@ class ComixProvider : MainAPI() {
         for (field in listOf("items", "data", "results", "list")) {
             root.optJSONArray(field)?.let { arr ->
                 val items = arrToResults(arr)
-                if (items.isNotEmpty()) {
-                    dbg("[parsePageResponse] ✓ root.$field: ${items.size} items")
-                    return PageResult(items, items.size >= 5)
-                }
+                if (items.isNotEmpty()) return PageResult(items, items.size >= 5)
             }
             root.optJSONObject(field)?.let { obj ->
                 obj.optJSONArray("items")?.let { arr ->
@@ -491,33 +472,11 @@ class ComixProvider : MainAPI() {
                     if (items.isNotEmpty()) {
                         val hasNext = obj.optJSONObject("meta")?.optBoolean("hasNext")
                             ?: (items.size >= 5)
-                        dbg("[parsePageResponse] ✓ root.$field.items: ${items.size} items, hasNext=$hasNext")
                         return PageResult(items, hasNext)
                     }
                 }
             }
         }
-
-        val keys = root.keys()
-        while (keys.hasNext()) {
-            val k = keys.next()
-            val v = root.opt(k)
-            val arr = when (v) {
-                is JSONArray  -> v
-                is JSONObject -> v.optJSONArray("items")
-                else          -> null
-            } ?: continue
-            val items = arrToResults(arr)
-            if (items.isNotEmpty()) {
-                val hasNext = (v as? JSONObject)
-                    ?.optJSONObject("meta")?.optBoolean("hasNext")
-                    ?: (items.size >= 5)
-                dbg("[parsePageResponse] ✓ map[$k]: ${items.size} items, hasNext=$hasNext")
-                return PageResult(items, hasNext)
-            }
-        }
-
-        dbg("[parsePageResponse] ✗ no items array found. Keys: ${root.keys().asSequence().toList()}")
         return null
     }
 
@@ -533,7 +492,6 @@ class ComixProvider : MainAPI() {
     //  Search
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun search(query: String): List<SearchResponse> {
-        dbg("[search] query='$query'")
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
         val encodedQuery = URLEncoder.encode(cleanQuery, "UTF-8")
@@ -550,7 +508,6 @@ class ComixProvider : MainAPI() {
 
         val lower = cleanQuery.lowercase()
         val filtered = results.filter { it.name.lowercase().contains(lower) }
-        dbg("[search] ✓ ${filtered.size} / ${results.size} items match")
         return (filtered.ifEmpty { results }).distinctBy { it.url }
     }
 
@@ -560,15 +517,11 @@ class ComixProvider : MainAPI() {
         if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  load() — never returns null just because chapters list is empty
+    //  load()
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
-        dbg("[load] url=$url")
         val html = fetchHtml(url)
-        if (html.isBlank()) {
-            dbg("[load] ✗ html blank")
-            return null
-        }
+        if (html.isBlank()) return null
 
         val document = Jsoup.parse(html)
         val initialData = extractInitialDataJson(document)
@@ -596,7 +549,6 @@ class ComixProvider : MainAPI() {
             val p = el.text().toIntOrNull() ?: 1
             if (p > maxPage) maxPage = p
         }
-        dbg("[load] max chapter-list page = $maxPage")
 
         if (maxPage > 1) {
             val pages = (2..maxPage).toList()
@@ -681,10 +633,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // NEVER return null because of empty episodes. Titles legitimately
-        // exist with 0 chapters (newly-added, finished, "other"-type pages).
-        dbg("[load] ✓ title='$mangaTitle' episodes=${episodes.size}")
-
         return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
             this.posterUrl = posterUrl
             this.plot      = plot
@@ -710,7 +658,6 @@ class ComixProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        dbg("[loadLinks] data=$data")
         val activity = CommonActivity.activity as? AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
