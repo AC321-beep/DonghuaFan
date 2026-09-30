@@ -73,13 +73,14 @@ class DongsubProvider : MainAPI() {
     private fun seriesKey(name: String): String =
         parseTitle(name).base.replace(Regex("[^a-zA-Z0-9]"), "").lowercase()
 
-    // ---------- pagination URL cache ----------
-    // Blogger label pages paginate with `updated-max` tokens that only appear
-    // inside each page's "older posts" link. We cache the next-page URL here.
-    private val pageUrlCache = mutableMapOf<String, String>()
+    // ---------- pagination URL cache (bounded LRU) ----------
+    // Blogger's `updated-max` tokens only live inside the "older posts" href,
+    // so we must remember them. LRU-capped so scrolling forever can't OOM.
+    private val pageUrlCache = object : LinkedHashMap<String, String>(32, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
+            size > 64
+    }
 
-    // "Latest Release" = the Episode label page (what the homepage's
-    // "older posts" link actually points to).
     override val mainPage = mainPageOf(
         "search/label/Episode?max-results=20" to "Latest Release"
     )
@@ -88,37 +89,53 @@ class DongsubProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse {
-        val cacheKey = "${request.name}:$page"
+        if (page < 1) return newHomePageResponse(request.name, emptyList())
 
-        val url: String? = when {
-            page == 1 -> "$mainUrl/${request.data}"
-            else -> pageUrlCache[cacheKey]
+        val baseUrl = "$mainUrl/${request.data}"
+        val key1 = "${request.name}:1"
+        var url: String = pageUrlCache[key1] ?: baseUrl.also { pageUrlCache[key1] = it }
+        var currentPage = 1
+
+        // Walk forward following the `older-link` chain, caching each hop.
+        // This makes out-of-order page requests (e.g. jump to page 5) work.
+        while (currentPage < page) {
+            if (url.isBlank()) return newHomePageResponse(request.name, emptyList())
+
+            val cachedNext = pageUrlCache["${request.name}:${currentPage + 1}"]
+            if (cachedNext != null) {
+                url = cachedNext
+                currentPage++
+                continue
+            }
+
+            val peekDoc = try {
+                app.get(url, headers = defaultHeaders).document
+            } catch (_: Exception) {
+                return newHomePageResponse(request.name, emptyList())
+            }
+            val olderHref = peekDoc
+                .selectFirst("#blog-pager-older-link a[href]")?.attr("href")
+            val nextUrl = olderHref?.takeIf { it.isNotBlank() }?.let { fixUrl(it) }
+                ?: return newHomePageResponse(request.name, emptyList())
+
+            pageUrlCache["${request.name}:${currentPage + 1}"] = nextUrl
+            url = nextUrl
+            currentPage++
         }
 
-        if (url.isNullOrBlank()) {
-            return newHomePageResponse(request.name, emptyList())
-        }
-
-        val doc: Document = try {
+        val doc = try {
             app.get(url, headers = defaultHeaders).document
         } catch (_: Exception) {
             return newHomePageResponse(request.name, emptyList())
         }
 
-        val raw = parseCards(doc)
+        // One card per series (keeps the most recent episode on the label page).
+        val items = parseCards(doc).distinctBy { seriesKey(it.name) }
 
-        // Dedup by series key (one card per show)
-        val items = raw.distinctBy { seriesKey(it.name) }
-
-        // Extract the next-page URL from Blogger's "older posts" link.
-        // This is where the `updated-max` token lives.
         val olderHref = doc.selectFirst("#blog-pager-older-link a[href]")?.attr("href")
         val nextUrl = olderHref?.takeIf { it.isNotBlank() }?.let { fixUrl(it) }
-
         val hasNext = !nextUrl.isNullOrBlank()
-        if (hasNext) {
-            pageUrlCache["${request.name}:${page + 1}"] = nextUrl!!
-        }
+        if (hasNext) pageUrlCache["${request.name}:${page + 1}"] = nextUrl!!
 
         return newHomePageResponse(request.name, items, hasNext)
     }
@@ -126,7 +143,8 @@ class DongsubProvider : MainAPI() {
     // ---------- card / feed parsing ----------
 
     private fun parseCards(doc: Document): List<AnimeSearchResponse> {
-        return doc.select("article.post-outer-container, div.blog-posts article")
+        // Single, non-overlapping selector. `div.blog-posts article` was redundant.
+        return doc.select("article.post-outer-container")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
     }
@@ -166,6 +184,7 @@ class DongsubProvider : MainAPI() {
             val entries = feed.optJSONArray("entry") ?: return emptyList()
 
             val out = mutableListOf<AnimeSearchResponse>()
+            val seen = mutableSetOf<String>()
             for (i in 0 until entries.length()) {
                 val e = entries.optJSONObject(i) ?: continue
                 val title = e.optJSONObject("title")?.optString("\$t") ?: continue
@@ -181,6 +200,7 @@ class DongsubProvider : MainAPI() {
                     }
                 }
                 if (href.isNullOrBlank() || !href.contains("dongsub.net")) continue
+                if (!seen.add(href)) continue
 
                 val thumb = e.optJSONObject("media\$thumbnail")?.optString("url")
                     ?.replace("s72-c", "s320")
@@ -233,8 +253,11 @@ class DongsubProvider : MainAPI() {
             }
         }
 
+        // Dedup by URL first (feed/html overlap), then by series key so
+        // multiple episodes of the same show collapse to one result.
         val combined = (feedDeferred.await() + htmlDeferred.await())
             .distinctBy { it.url }
+            .distinctBy { seriesKey(it.name) }
 
         combined.sortedWith(
             compareBy(
@@ -249,19 +272,28 @@ class DongsubProvider : MainAPI() {
     // ---------- episode discovery helpers ----------
 
     private fun extractSeriesAnchor(doc: Document): Pair<String, String?>? {
-        doc.selectFirst("span.info-stream a[rel=tag], span.info-stream a[data]")?.let {
-            val label = it.text().trim()
-            val href = it.attr("href").ifBlank { null }
-            if (label.isNotBlank()) return label to href
+        // Prefer a non-generic tag. On Dongsub, series tags sit inside
+        // `span.info-stream`; the first one is often `Donghua` / `Episode`.
+        val tagLinks = doc.select("span.info-stream a[rel=tag], span.info-stream a[data]")
+        for (el in tagLinks.reversed()) {
+            val label = el.text().trim()
+            if (label.isBlank()) continue
+            if (label.lowercase() in GENERIC_LABELS) continue
+            val href = el.attr("href").ifBlank { null }
+            return label to href
         }
         doc.selectFirst("a[href*=/search/label/][data]")?.let {
             val label = it.text().trim()
-            val href = it.attr("href").ifBlank { null }
-            if (label.isNotBlank()) return label to href
+            if (label.isNotBlank() && label.lowercase() !in GENERIC_LABELS) {
+                val href = it.attr("href").ifBlank { null }
+                return label to href
+            }
         }
         doc.select("script").forEach { s ->
             val m = Regex("""var\s+labelopt\s*=\s*['"]([^'"]+)['"]""").find(s.data())
-            if (m != null) return m.groupValues[1] to null
+            if (m != null && m.groupValues[1].lowercase() !in GENERIC_LABELS) {
+                return m.groupValues[1] to null
+            }
         }
         return null
     }
@@ -273,6 +305,7 @@ class DongsubProvider : MainAPI() {
             val entries = feed.optJSONArray("entry") ?: return emptyList()
 
             val result = mutableListOf<Pair<String, String>>()
+            val seen = mutableSetOf<String>()
             for (i in 0 until entries.length()) {
                 val entry = entries.getJSONObject(i)
                 val title = entry.optJSONObject("title")?.optString("\$t") ?: continue
@@ -286,7 +319,7 @@ class DongsubProvider : MainAPI() {
                         break
                     }
                 }
-                if (!href.isNullOrBlank() && href.contains("dongsub.net")) {
+                if (!href.isNullOrBlank() && href.contains("dongsub.net") && seen.add(href)) {
                     result.add(title to href)
                 }
             }
@@ -358,19 +391,33 @@ class DongsubProvider : MainAPI() {
         val anchor = extractSeriesAnchor(doc)
 
         val candidates = mutableListOf<Pair<String, String>>()
-
         if (seriesBase.isNotBlank()) candidates += fetchSearchFeed(seriesBase)
         anchor?.let { (label, _) -> candidates += fetchLabelFeed(label) }
-        if (candidates.size < 2) {
-            anchor?.let { (label, href) ->
-                fetchLabelPage(href ?: label).forEach { candidates.add(it.name to it.url) }
-            }
+
+        // If feeds under-delivered, scrape the label page HTML.
+        val distinctUrlCount = candidates.asSequence().map { it.second }.toHashSet().size
+        if (distinctUrlCount < 2 && anchor != null) {
+            val (label, href) = anchor
+            fetchLabelPage(href ?: label).forEach { candidates.add(it.name to it.url) }
         }
 
+        // ---- SAFETY: never fall back to raw `candidates` ----
+        // The anchor label may be generic (e.g. "Episode"), which would
+        // otherwise inject every unrelated show into this series' episodes.
         val exact = candidates.filter { (t, _) ->
             parseTitle(t).base.equals(seriesBase, ignoreCase = true)
         }
-        val chosen = if (exact.size >= 2) exact else candidates
+        val chosen = when {
+            exact.isNotEmpty() -> exact
+            seriesBase.length < 3 -> emptyList()
+            else -> candidates.filter { (t, _) ->
+                val b = parseTitle(t).base
+                b.isNotBlank() && (
+                        b.contains(seriesBase, ignoreCase = true) ||
+                                seriesBase.contains(b, ignoreCase = true)
+                        )
+            }
+        }
 
         val seenUrls = mutableSetOf<String>()
         val seenEpKeys = mutableSetOf<String>()
@@ -381,8 +428,8 @@ class DongsubProvider : MainAPI() {
             if (!seenUrls.add(u)) continue
 
             val p = parseTitle(t)
-            val epKey = if (p.episode != null) "${p.season ?: 1}:${p.episode}" else "url:$u"
-            if (!seenEpKeys.add(epKey)) continue
+            val epKey = if (p.episode != null) "${p.season ?: 1}:${p.episode}" else null
+            if (epKey != null && !seenEpKeys.add(epKey)) continue
 
             episodes.add(newEpisode(u) {
                 this.name = buildEpName(p, t)
@@ -471,5 +518,12 @@ class DongsubProvider : MainAPI() {
         }
 
         return handled
+    }
+
+    private companion object {
+        val GENERIC_LABELS = setOf(
+            "donghua", "anime", "episode", "episodes", "series",
+            "movie", "movies", "ongoing", "completed", "ova", "ona"
+        )
     }
 }
