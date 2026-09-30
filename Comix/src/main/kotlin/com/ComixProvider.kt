@@ -1,5 +1,6 @@
 package com.comix
 
+import android.util.Log
 import androidx.appcompat.app.AppCompatActivity
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.DubStatus
@@ -44,7 +45,7 @@ class ComixProvider : MainAPI() {
     override val hasMainPage = true
     override val hasQuickSearch = true
 
-       override val mainPage = mainPageOf(
+    override val mainPage = mainPageOf(
         "hot"      to "Hot Updates",
         "latest"   to "Latest Releases",
         "trending" to "Trending Today",
@@ -54,6 +55,26 @@ class ComixProvider : MainAPI() {
     @Volatile private var cfgToken: String? = null
 
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Debug logger — every line goes through here so the whole flow can be
+    //  traced with a single tag: `ComixDebug`.
+    //
+    //  To see the log on an Android device connected to a PC:
+    //      adb logcat -s ComixDebug:V
+    //  Inside the Cloudstream app itself you can also check
+    //  Settings → Debug → App Log (filters by TAG "ComixDebug").
+    // ═══════════════════════════════════════════════════════════════════════
+    private fun dbg(msg: String) {
+        Log.d("ComixDebug", msg)
+        println("ComixDebug: $msg")   // also visible in Cloudstream's internal log
+    }
+
+    private fun dbgSection(title: String) {
+        dbg("═══════════════════════════════════════════════════════")
+        dbg("  $title")
+        dbg("═══════════════════════════════════════════════════════")
+    }
 
     private fun browserHeaders(extra: Map<String, String> = emptyMap()): Map<String, String> =
         mapOf(
@@ -71,11 +92,16 @@ class ComixProvider : MainAPI() {
         ) + extra
 
     private suspend fun fetchHtml(url: String): String {
+        dbg("[fetchHtml] → GET $url")
         val text = app.get(url, interceptor = cfInterceptor, headers = browserHeaders()).text
+        dbg("[fetchHtml] ← ${text.length} chars | first 120: ${text.take(120).replace("\n", " ")}")
         runCatching {
             Jsoup.parse(text).selectFirst("meta[name=cfg]")?.attr("content")
                 ?.takeIf { it.isNotBlank() }
-                ?.let { cfgToken = it }
+                ?.let {
+                    cfgToken = it
+                    dbg("[fetchHtml] cfg token captured: ${it.take(30)}…")
+                }
         }
         return text
     }
@@ -89,10 +115,24 @@ class ComixProvider : MainAPI() {
             is String   -> Jsoup.parse(htmlOrDoc)
             else        -> return null
         }
-        val script = doc.selectFirst("script#initial-data") ?: return null
+        val script = doc.selectFirst("script#initial-data")
+        if (script == null) {
+            dbg("[extractInitialData] ✗ <script#initial-data> not found")
+            return null
+        }
         val text = script.data().ifBlank { script.html() }.trim()
-        if (text.isEmpty()) return null
-        return runCatching { JSONObject(text) }.getOrNull()
+        if (text.isEmpty()) {
+            dbg("[extractInitialData] ✗ script tag empty")
+            return null
+        }
+        val json = runCatching { JSONObject(text) }.getOrNull()
+        if (json == null) {
+            dbg("[extractInitialData] ✗ JSONObject parse failed")
+        } else {
+            val q = json.optJSONObject("queries")
+            dbg("[extractInitialData] ✓ parsed, query keys: ${q?.length() ?: 0}")
+        }
+        return json
     }
 
     private fun parseMangaFromJson(obj: JSONObject): SearchResponse? {
@@ -177,21 +217,48 @@ class ComixProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
+        dbgSection("getMainPage(page=$page, request='${request.data}', name='${request.name}')")
+
+        // Trending / Follows are single-page "top" queries.
         if (request.data == "trending" || request.data == "follows") {
-            if (page > 1) return null
+            if (page > 1) {
+                dbg("[getMainPage] trending/follows: page>1 → returning null (not paginated)")
+                return null
+            }
+            dbg("[getMainPage] trending/follows: fetching homepage SSR…")
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
-            if (items.isEmpty()) return null
+            dbg("[getMainPage] trending/follows: ${items.size} items parsed")
+            if (items.isEmpty()) {
+                dbg("[getMainPage] ✗ no items → returning null")
+                return null
+            }
             return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = false)
         }
 
+        // Hot / Latest — page 1 uses SSR
         if (page == 1) {
+            dbg("[getMainPage] hot/latest page 1: fetching homepage SSR…")
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
-            if (items.isEmpty()) return null
+            dbg("[getMainPage] ✓ page 1: ${items.size} items parsed")
+            if (items.isEmpty()) {
+                dbg("[getMainPage] ✗ no items → returning null")
+                return null
+            }
             return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = true)
         }
 
-        val result = fetchQueryPage(request, page) ?: return null
-        if (result.items.isEmpty()) return null
+        // Hot / Latest — page 2+ uses the API
+        dbg("[getMainPage] hot/latest page $page: calling fetchQueryPage…")
+        val result = fetchQueryPage(request, page)
+        if (result == null) {
+            dbg("[getMainPage] ✗ fetchQueryPage returned null → returning null (page stuck here)")
+            return null
+        }
+        dbg("[getMainPage] ✓ fetchQueryPage: ${result.items.size} items, hasNext=${result.hasNext}")
+        if (result.items.isEmpty()) {
+            dbg("[getMainPage] ✗ items empty → returning null")
+            return null
+        }
         return newHomePageResponse(
             request,
             result.items.distinctBy { it.url },
@@ -204,7 +271,10 @@ class ComixProvider : MainAPI() {
         request: MainPageRequest,
         page: Int
     ): List<SearchResponse> {
-        if (html.isBlank()) return emptyList()
+        if (html.isBlank()) {
+            dbg("[parseMainPage] ✗ html blank")
+            return emptyList()
+        }
         var items: List<SearchResponse> = emptyList()
 
         extractInitialDataJson(html)?.let { initial ->
@@ -226,6 +296,7 @@ class ComixProvider : MainAPI() {
                     if (page > 1 && jsonPage != page) return@readQueries false
                     precise(subtype, params)
                 }
+                dbg("[parseMainPage] precise matcher → ${items.size} items")
             }
             if (items.isEmpty() && request.data == "latest") {
                 items = readQueries(initial) { k ->
@@ -238,16 +309,18 @@ class ComixProvider : MainAPI() {
                         params.optString("scope") != "hot" &&
                         params.optJSONObject("order")?.optString("created_at") == "desc"
                 }
+                dbg("[parseMainPage] latest fallback matcher → ${items.size} items")
             }
         }
-        if (items.isEmpty()) items = extractSearchResultsDom(Jsoup.parse(html))
+        if (items.isEmpty()) {
+            items = extractSearchResultsDom(Jsoup.parse(html))
+            dbg("[parseMainPage] DOM fallback → ${items.size} items")
+        }
         return items
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Pagination — GET /api/v1/manga
-    //  Uses exactly the shape of the browser cURL: minimal headers,
-    //  Referer carrying the page number, 129-char random `_` cache buster.
     // ═══════════════════════════════════════════════════════════════════════
     private data class PageResult(
         val items: List<SearchResponse>,
@@ -258,14 +331,26 @@ class ComixProvider : MainAPI() {
         request: MainPageRequest,
         page: Int
     ): PageResult? {
+        dbgSection("fetchQueryPage(page=$page, category='${request.data}')")
+
         val (orderField, scopeParam, limit) = when (request.data) {
             "hot"    -> Triple("chapter_updated_at", "hot", 31)
             "latest" -> Triple("created_at", "", 10)
-            else     -> return null
+            else     -> {
+                dbg("[fetchQueryPage] ✗ unsupported category '${request.data}'")
+                return null
+            }
         }
+        dbg("[fetchQueryPage] order=$orderField scope='$scopeParam' limit=$limit")
 
-        // Ensure cf_clearance + session cookies are already in the jar.
-        if (cfgToken == null) runCatching { fetchHtml("$mainUrl/") }
+        // Bootstrap WebView once
+        if (cfgToken == null) {
+            dbg("[fetchQueryPage] cfgToken null → bootstrapping via homepage fetch")
+            runCatching { fetchHtml("$mainUrl/") }
+            dbg("[fetchQueryPage] bootstrap done, cfgToken=${if (cfgToken == null) "STILL NULL" else "set"}")
+        } else {
+            dbg("[fetchQueryPage] cfgToken already cached")
+        }
 
         val headers = mapOf(
             "Accept" to "application/json",
@@ -277,7 +362,6 @@ class ComixProvider : MainAPI() {
             "Sec-Fetch-Site" to "same-origin"
         )
 
-        // Literal brackets — OkHttp encodes them to %5B/%5D exactly once.
         val paramsLiteral = buildString {
             append("order[").append(orderField).append("]=desc")
             if (scopeParam.isNotEmpty()) append("&scope=").append(scopeParam)
@@ -287,7 +371,6 @@ class ComixProvider : MainAPI() {
         }
         val urlLiteral = "$mainUrl/api/v1/manga?$paramsLiteral"
 
-        // Pre-encoded variant, in case OkHttp double-encodes.
         val paramsEncoded = buildString {
             append("order%5B").append(orderField).append("%5D=desc")
             if (scopeParam.isNotEmpty()) append("&scope=").append(scopeParam)
@@ -297,24 +380,69 @@ class ComixProvider : MainAPI() {
         }
         val urlEncoded = "$mainUrl/api/v1/manga?$paramsEncoded"
 
-        // Try literal URL: with interceptor, then without.
+        // ─── Attempt 1: literal brackets + CF interceptor ──────────────────
+        dbg("[fetchQueryPage] ▶ Attempt 1: literal brackets + cfInterceptor")
+        dbg("[fetchQueryPage] URL: $urlLiteral")
         runCatching {
             app.get(urlLiteral, headers = headers, interceptor = cfInterceptor).text
-        }.getOrNull()?.let { parsePageResponse(it)?.let { r -> return r } }
+        }.onSuccess { text ->
+            dbg("[fetchQueryPage] ← ${text.length} chars | first 200: ${text.take(200).replace("\n", " ")}")
+            parsePageResponse(text)?.let {
+                dbg("[fetchQueryPage] ✓ Attempt 1 succeeded: ${it.items.size} items, hasNext=${it.hasNext}")
+                return it
+            }
+            dbg("[fetchQueryPage] ✗ Attempt 1: response not parseable as expected JSON")
+        }.onFailure { e ->
+            dbg("[fetchQueryPage] ✗ Attempt 1 threw: ${e.javaClass.simpleName}: ${e.message}")
+        }
 
+        // ─── Attempt 2: literal brackets, no interceptor ───────────────────
+        dbg("[fetchQueryPage] ▶ Attempt 2: literal brackets, no cfInterceptor")
         runCatching {
             app.get(urlLiteral, headers = headers).text
-        }.getOrNull()?.let { parsePageResponse(it)?.let { r -> return r } }
+        }.onSuccess { text ->
+            dbg("[fetchQueryPage] ← ${text.length} chars | first 200: ${text.take(200).replace("\n", " ")}")
+            parsePageResponse(text)?.let {
+                dbg("[fetchQueryPage] ✓ Attempt 2 succeeded: ${it.items.size} items, hasNext=${it.hasNext}")
+                return it
+            }
+            dbg("[fetchQueryPage] ✗ Attempt 2: response not parseable")
+        }.onFailure { e ->
+            dbg("[fetchQueryPage] ✗ Attempt 2 threw: ${e.javaClass.simpleName}: ${e.message}")
+        }
 
-        // Try pre-encoded URL: with interceptor, then without.
+        // ─── Attempt 3: pre-encoded brackets + CF interceptor ──────────────
+        dbg("[fetchQueryPage] ▶ Attempt 3: pre-encoded brackets + cfInterceptor")
+        dbg("[fetchQueryPage] URL: $urlEncoded")
         runCatching {
             app.get(urlEncoded, headers = headers, interceptor = cfInterceptor).text
-        }.getOrNull()?.let { parsePageResponse(it)?.let { r -> return r } }
+        }.onSuccess { text ->
+            dbg("[fetchQueryPage] ← ${text.length} chars | first 200: ${text.take(200).replace("\n", " ")}")
+            parsePageResponse(text)?.let {
+                dbg("[fetchQueryPage] ✓ Attempt 3 succeeded: ${it.items.size} items, hasNext=${it.hasNext}")
+                return it
+            }
+            dbg("[fetchQueryPage] ✗ Attempt 3: response not parseable")
+        }.onFailure { e ->
+            dbg("[fetchQueryPage] ✗ Attempt 3 threw: ${e.javaClass.simpleName}: ${e.message}")
+        }
 
+        // ─── Attempt 4: pre-encoded brackets, no interceptor ───────────────
+        dbg("[fetchQueryPage] ▶ Attempt 4: pre-encoded brackets, no cfInterceptor")
         runCatching {
             app.get(urlEncoded, headers = headers).text
-        }.getOrNull()?.let { parsePageResponse(it)?.let { r -> return r } }
+        }.onSuccess { text ->
+            dbg("[fetchQueryPage] ← ${text.length} chars | first 200: ${text.take(200).replace("\n", " ")}")
+            parsePageResponse(text)?.let {
+                dbg("[fetchQueryPage] ✓ Attempt 4 succeeded: ${it.items.size} items, hasNext=${it.hasNext}")
+                return it
+            }
+            dbg("[fetchQueryPage] ✗ Attempt 4: response not parseable")
+        }.onFailure { e ->
+            dbg("[fetchQueryPage] ✗ Attempt 4 threw: ${e.javaClass.simpleName}: ${e.message}")
+        }
 
+        dbg("[fetchQueryPage] ✗ ALL 4 ATTEMPTS FAILED — returning null")
         return null
     }
 
@@ -323,27 +451,34 @@ class ComixProvider : MainAPI() {
         return (1..129).map { chars.random() }.joinToString("")
     }
 
-    /**
-     * Response envelope (from browser capture):
-     *   {"status":"ok","result":{"items":[…],"meta":{"hasNext":true,…}}}
-     */
     private fun parsePageResponse(response: String): PageResult? {
         val trimmed = response.trim()
-        if (trimmed.isEmpty()) return null
+        if (trimmed.isEmpty()) {
+            dbg("[parsePageResponse] ✗ response blank")
+            return null
+        }
 
+        // Bare array
         runCatching { JSONArray(trimmed) }.getOrNull()?.let { arr ->
             val items = arrToResults(arr)
+            dbg("[parsePageResponse] bare array: ${items.size} items")
             return if (items.isEmpty()) null else PageResult(items, hasNext = items.size >= 5)
         }
 
-        val root = runCatching { JSONObject(trimmed) }.getOrNull() ?: return null
+        val root = runCatching { JSONObject(trimmed) }.getOrNull()
+        if (root == null) {
+            dbg("[parsePageResponse] ✗ response is not valid JSON. First 300: ${trimmed.take(300).replace("\n", " ")}")
+            return null
+        }
 
+        // Envelope: {status, result:{items, meta}}
         root.optJSONObject("result")?.let { result ->
             result.optJSONArray("items")?.let { itemsArr ->
                 val items = arrToResults(itemsArr)
                 if (items.isNotEmpty()) {
                     val hasNext = result.optJSONObject("meta")?.optBoolean("hasNext")
                         ?: (items.size >= 5)
+                    dbg("[parsePageResponse] ✓ envelope match: ${items.size} items, hasNext=$hasNext")
                     return PageResult(items, hasNext)
                 }
             }
@@ -352,7 +487,10 @@ class ComixProvider : MainAPI() {
         for (field in listOf("items", "data", "results", "list")) {
             root.optJSONArray(field)?.let { arr ->
                 val items = arrToResults(arr)
-                if (items.isNotEmpty()) return PageResult(items, items.size >= 5)
+                if (items.isNotEmpty()) {
+                    dbg("[parsePageResponse] ✓ root.$field: ${items.size} items")
+                    return PageResult(items, items.size >= 5)
+                }
             }
             root.optJSONObject(field)?.let { obj ->
                 obj.optJSONArray("items")?.let { arr ->
@@ -360,6 +498,7 @@ class ComixProvider : MainAPI() {
                     if (items.isNotEmpty()) {
                         val hasNext = obj.optJSONObject("meta")?.optBoolean("hasNext")
                             ?: (items.size >= 5)
+                        dbg("[parsePageResponse] ✓ root.$field.items: ${items.size} items, hasNext=$hasNext")
                         return PageResult(items, hasNext)
                     }
                 }
@@ -380,9 +519,12 @@ class ComixProvider : MainAPI() {
                 val hasNext = (v as? JSONObject)
                     ?.optJSONObject("meta")?.optBoolean("hasNext")
                     ?: (items.size >= 5)
+                dbg("[parsePageResponse] ✓ map[$k]: ${items.size} items, hasNext=$hasNext")
                 return PageResult(items, hasNext)
             }
         }
+
+        dbg("[parsePageResponse] ✗ no items array found in response. Keys: ${root.keys().asSequence().toList()}")
         return null
     }
 
@@ -398,6 +540,7 @@ class ComixProvider : MainAPI() {
     //  Search
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun search(query: String): List<SearchResponse> {
+        dbg("[search] query='$query'")
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
         val encodedQuery = URLEncoder.encode(cleanQuery, "UTF-8")
@@ -414,6 +557,7 @@ class ComixProvider : MainAPI() {
 
         val lower = cleanQuery.lowercase()
         val filtered = results.filter { it.name.lowercase().contains(lower) }
+        dbg("[search] ✓ ${filtered.size} / ${results.size} items match")
         return (filtered.ifEmpty { results }).distinctBy { it.url }
     }
 
@@ -426,11 +570,19 @@ class ComixProvider : MainAPI() {
     //  load()
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
+        dbg("[load] url=$url")
         val html = fetchHtml(url)
-        if (html.isBlank()) return null
+        if (html.isBlank()) {
+            dbg("[load] ✗ html blank")
+            return null
+        }
 
         val document = Jsoup.parse(html)
-        val initialData = extractInitialDataJson(document) ?: return null
+        val initialData = extractInitialDataJson(document)
+        if (initialData == null) {
+            dbg("[load] ✗ no initial-data")
+            return null
+        }
 
         val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
 
@@ -455,6 +607,7 @@ class ComixProvider : MainAPI() {
             val p = el.text().toIntOrNull() ?: 1
             if (p > maxPage) maxPage = p
         }
+        dbg("[load] max chapter-list page = $maxPage")
 
         if (maxPage > 1) {
             val pages = (2..maxPage).toList()
@@ -483,7 +636,11 @@ class ComixProvider : MainAPI() {
                 }
             }
         }
-        val d = detail ?: return null
+        val d = detail
+        if (d == null) {
+            dbg("[load] ✗ no detail query")
+            return null
+        }
 
         val mangaTitle = d.optString("title").takeIf { it.isNotBlank() } ?: return null
         val posterUrl = d.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
@@ -527,7 +684,11 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        if (episodes.isEmpty()) return null
+        if (episodes.isEmpty()) {
+            dbg("[load] ✗ 0 episodes")
+            return null
+        }
+        dbg("[load] ✓ title='$mangaTitle' episodes=${episodes.size}")
 
         return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
             this.posterUrl = posterUrl
@@ -552,6 +713,7 @@ class ComixProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        dbg("[loadLinks] data=$data")
         val activity = CommonActivity.activity as? AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
