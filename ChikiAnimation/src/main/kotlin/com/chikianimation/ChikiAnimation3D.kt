@@ -1,5 +1,7 @@
 package com.chikianimation
 
+import com.lagradost.cloudstream3.mainPageOf
+
 class ChikiAnimation3D : ChikiAnimationProvider() {
     override var name = "ChikiAnimation (3D)"
     override var mainUrl = "https://chikianimation.online"
