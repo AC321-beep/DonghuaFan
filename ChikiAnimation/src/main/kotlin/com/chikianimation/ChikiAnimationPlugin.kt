@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class ChikiAnimationPlugin : Plugin() {
     override fun load() {
-        registerMainAPI(ChikiAnimationProvider())
+        registerMainAPI(ChikiAnimation2D())
+        registerMainAPI(ChikiAnimation3D())
     }
 }
