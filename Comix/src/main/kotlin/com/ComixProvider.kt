@@ -54,7 +54,7 @@ class ComixProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════
     //  Inbuilt Cloudflare Bypass & Browser Mimic
     // ═══════════════════════════════════════════════════════════════════════
-    
+
     // Uses Cloudstream's native interceptor to silently solve CF and sync cookies
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
@@ -176,13 +176,15 @@ class ComixProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
-        val pageUrl = if (page == 1) {
+        // "latest" now routes to /browse on page 1 as well, so the sorted
+        // chapter_updated_at list is actually returned by the site's JSON.
+        val pageUrl = if (page == 1 && request.data != "latest") {
             "$mainUrl/"
         } else {
             val sortParam = when (request.data) {
-                "latest" -> "created_at:desc"
+                "latest" -> "chapter_updated_at:desc"   // was: "created_at:desc"
                 "hot"    -> "views_7d:desc"
-                else     -> request.data 
+                else     -> request.data
             }
             "$mainUrl/browse?sort=$sortParam&page=$page"
         }
@@ -197,7 +199,7 @@ class ComixProvider : MainAPI() {
                 if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
                 val subtype = k.optString(1)
                 val params = k.optJSONObject(2) ?: return@readQueries false
-                
+
                 val jsonPage = params.optInt("page", 1)
                 if (page > 1 && jsonPage != page) return@readQueries false
 
@@ -205,7 +207,8 @@ class ComixProvider : MainAPI() {
                     "trending" -> subtype == "top"  && params.optString("type") == "trending"
                     "follows"  -> subtype == "top"  && params.optString("type") == "follows"
                     "hot"      -> subtype == "list" && params.optString("scope") == "hot"
-                    "latest"   -> subtype == "list" && params.optJSONObject("order")?.optString("created_at") == "desc"
+                    "latest"   -> subtype == "list" &&
+                                  params.optJSONObject("order")?.optString("chapter_updated_at") == "desc"   // was: created_at
                     else -> false
                 }
             }
@@ -259,7 +262,7 @@ class ComixProvider : MainAPI() {
                 val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
                 val m = Regex("""-chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return@forEach
                 val numStr = m.groupValues[1].toDoubleOrNull()?.let { formatChapterNum(it) } ?: return@forEach
-                
+
                 if (a.hasClass("mchap-row__primary") || a.parents().any { it.hasClass("mchap-item") }) {
                     if (!parsedChapterLinks.containsKey(numStr)) {
                         val visible = a.text().trim()
@@ -279,7 +282,7 @@ class ComixProvider : MainAPI() {
             if (p > maxPage) maxPage = p
         }
 
-        // BATCH NATIVE HTTP: Since Cloudstream has solved Cloudflare and holds the cookie, 
+        // BATCH NATIVE HTTP: Since Cloudstream has solved Cloudflare and holds the cookie,
         // this batch fetching executes safely and natively at maximum speed without WebView timers.
         if (maxPage > 1) {
             val pages = (2..maxPage).toList()
@@ -342,10 +345,10 @@ class ComixProvider : MainAPI() {
         }
         parsedChapterLinks.keys.forEach { allChapterKeys.add(it) }
         val sortedKeys = allChapterKeys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
-        
+
         val episodes = sortedKeys.mapIndexed { index, key ->
             val realData = parsedChapterLinks[key]
-            
+
             val epUrl = if (realData != null) {
                 realData.second
             } else if (key == "0" && startsAtZero && firstChapterUrl != null) {
