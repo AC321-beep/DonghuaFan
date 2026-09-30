@@ -35,10 +35,8 @@ private object ProviderRx {
     val anyUrl       = Regex("https?://[^\\s\"'<>\\\\)]+")
 }
 
-class ChikiAnimationProvider : MainAPI() {
+abstract class ChikiAnimationProvider : MainAPI() {
 
-    override var mainUrl = "https://chikianimation.com"
-    override var name = "ChikiAnimation"
     override val hasMainPage = true
     override var lang = "zh"
     override val hasDownloadSupport = true
@@ -62,11 +60,13 @@ class ChikiAnimationProvider : MainAPI() {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
-    private val defaultHeaders = mapOf(
-        "User-Agent" to defaultUserAgent,
-        "Referer" to mainUrl,
-        "Origin" to mainUrl
-    )
+    // CRITICAL: This must be a get() property so it reads mainUrl from the subclass
+    private val defaultHeaders: Map<String, String>
+        get() = mapOf(
+            "User-Agent" to defaultUserAgent,
+            "Referer" to mainUrl,
+            "Origin" to mainUrl
+        )
 
     private val gdriveHeaders = mapOf(
         "User-Agent" to defaultUserAgent,
@@ -75,8 +75,6 @@ class ChikiAnimationProvider : MainAPI() {
         "Referer" to "https://drive.google.com/"
     )
 
-    // Swallow all exceptions except CancellationException.
-    // Used around every extractor call so one failure doesn't kill the batch.
     private suspend fun safeExtract(block: suspend () -> Unit) {
         try {
             block()
@@ -84,15 +82,6 @@ class ChikiAnimationProvider : MainAPI() {
             throw e
         } catch (_: Exception) {}
     }
-
-    override val mainPage = mainPageOf(
-        "anime/?status=&type=&order=update"          to "Recently Updated",
-        "anime/?status=&type=&order=popular"         to "Popular",
-        "anime/?status=&type=ai+animes&order=update" to "AI Anime",
-        "anime/?status=ongoing&type=&order=update"   to "Ongoing",
-        "anime/?status=completed&type=&order=update" to "Completed",
-        "anime/?status=&type=movie&order=update"     to "Movies"
-    )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = buildPageUrl(request.data, page)
