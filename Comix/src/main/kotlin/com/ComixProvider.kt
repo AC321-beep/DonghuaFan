@@ -54,15 +54,12 @@ class ComixProvider : MainAPI() {
     // ═══════════════════════════════════════════════════════════════════════
     //  Inbuilt Cloudflare Bypass & Browser Mimic
     // ═══════════════════════════════════════════════════════════════════════
-
-    // Uses Cloudstream's native interceptor to silently solve CF and sync cookies
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
     private suspend fun fetchHtml(url: String): String {
         return app.get(
             url,
             interceptor = cfInterceptor,
-            // "Mimic" a modern Desktop Chrome browser to evade initial bot detection
             headers = mapOf(
                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -170,54 +167,193 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Main page & Search (Natively accelerated)
+    //  Main page & Search
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
-        // "latest" now routes to /browse on page 1 as well, so the sorted
-        // chapter_updated_at list is actually returned by the site's JSON.
-        val pageUrl = if (page == 1 && request.data != "latest") {
-            "$mainUrl/"
-        } else {
-            val sortParam = when (request.data) {
-                "latest" -> "chapter_updated_at:desc"   // was: "created_at:desc"
-                "hot"    -> "views_7d:desc"
-                else     -> request.data
-            }
-            "$mainUrl/browse?sort=$sortParam&page=$page"
+        // Trending / Follows are single-page "top" queries — their JSON query
+        // keys carry no `page` field (see initial-data on the homepage).
+        if (request.data == "trending" || request.data == "follows") {
+            if (page > 1) return null
+            val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
+            if (items.isEmpty()) return null
+            return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = false)
         }
 
-        val html = fetchHtml(pageUrl)
-        if (html.isBlank()) return null
+        // Latest / Hot
+        //   page 1  → homepage SSR (only surface with SSR'd queries)
+        //   page 2+ → site query API (best effort), else /browse fallback
+        val items: List<SearchResponse> = if (page == 1) {
+            parseMainPage(fetchHtml("$mainUrl/"), request, 1)
+        } else {
+            val apiItems = fetchQueryPage(request, page)
+            if (apiItems.isNotEmpty()) apiItems
+            else parseMainPage(fetchHtml(buildBrowseUrl(request, page)), request, page)
+        }
+
+        // No page-1 fallback here anymore — if a page yields nothing, we stop
+        // pagination cleanly by returning null instead of looping forever.
+        if (items.isEmpty()) return null
+        return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = items.size >= 5)
+    }
+
+    /**
+     * Build a /browse URL for pages 2+ of Hot / Latest.
+     * Fixed: `hot` now sorts by chapter_updated_at (matches the site's Hot tab),
+     * not views_7d.
+     */
+    private fun buildBrowseUrl(request: MainPageRequest, page: Int): String {
+        val sort = when (request.data) {
+            "latest" -> "created_at:desc"
+            "hot"    -> "chapter_updated_at:desc"   // was: views_7d:desc
+            else     -> "chapter_updated_at:desc"
+        }
+        return "$mainUrl/browse?sort=$sort&page=$page"
+    }
+
+    /**
+     * Attempt to fetch a paginated list through the site's internal query API.
+     * The site serializes every query as a JSON array ["entity","action",{...}],
+     * so we POST that key to a few plausible endpoints and parse the response.
+     * Returns empty if none succeed — the caller falls back to /browse.
+     */
+    private suspend fun fetchQueryPage(
+        request: MainPageRequest,
+        page: Int
+    ): List<SearchResponse> {
+        val queryKey = buildQueryKey(request, page) ?: return emptyList()
+
+        for (endpoint in listOf("/api/query", "/api/queries", "/api/v1/query")) {
+            try {
+                val response = app.post(
+                    "$mainUrl$endpoint",
+                    headers = mapOf(
+                        "Content-Type" to "application/json",
+                        "Accept" to "application/json",
+                        "X-Requested-With" to "XMLHttpRequest"
+                    ),
+                    data = JSONObject().apply { put("key", queryKey) }.toString()
+                ).text
+                val items = extractItemsFromResponse(response)
+                if (items.isNotEmpty()) return items
+            } catch (_: Exception) {
+                // try next endpoint
+            }
+        }
+        return emptyList()
+    }
+
+    /**
+     * Build the JSON query key the site itself uses, e.g.
+     *   ["manga","list",{"scope":"hot","order":{"chapter_updated_at":"desc"},
+     *                    "page":2,"limit":28,"content_rating":["safe","suggestive"]}]
+     */
+    private fun buildQueryKey(request: MainPageRequest, page: Int): JSONArray? {
+        val rating = JSONArray().apply { put("safe"); put("suggestive") }
+        return when (request.data) {
+            "latest" -> JSONArray().apply {
+                put("manga")
+                put("list")
+                put(JSONObject().apply {
+                    put("order", JSONObject().put("created_at", "desc"))
+                    put("page", page)
+                    put("limit", 28)
+                    put("content_rating", rating)
+                })
+            }
+            "hot" -> JSONArray().apply {
+                put("manga")
+                put("list")
+                put(JSONObject().apply {
+                    put("scope", "hot")
+                    put("order", JSONObject().put("chapter_updated_at", "desc"))
+                    put("page", page)
+                    put("limit", 28)
+                    put("content_rating", rating)
+                })
+            }
+            else -> null
+        }
+    }
+
+    /**
+     * Try several plausible response shapes from the query API:
+     *   { "items": [...] }   { "data": [...] }   { "results": [...] }
+     */
+    private fun extractItemsFromResponse(response: String): List<SearchResponse> {
+        val json = runCatching { JSONObject(response) }.getOrNull() ?: return emptyList()
+        val array = json.optJSONArray("items")
+            ?: json.optJSONArray("data")
+            ?: json.optJSONArray("results")
+            ?: return emptyList()
+
+        val out = mutableListOf<SearchResponse>()
+        for (i in 0 until array.length()) {
+            array.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
+        }
+        return out
+    }
+
+    /**
+     * Parse a main-page HTML response into a list of search results.
+     */
+    private fun parseMainPage(
+        html: String,
+        request: MainPageRequest,
+        page: Int
+    ): List<SearchResponse> {
+        if (html.isBlank()) return emptyList()
 
         var items: List<SearchResponse> = emptyList()
 
         extractInitialDataJson(html)?.let { initial ->
-            items = readQueries(initial) { k ->
-                if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
-                val subtype = k.optString(1)
-                val params = k.optJSONObject(2) ?: return@readQueries false
+            // Tier 1: precise per-category matcher
+            val precise: ((String, JSONObject) -> Boolean)? = when (request.data) {
+                "trending" -> { st, p ->
+                    st == "top" && p.optString("type") == "trending"
+                }
+                "follows"  -> { st, p ->
+                    st == "top" && p.optString("type") == "follows"
+                }
+                "hot"      -> { st, p ->
+                    st == "list" && p.optString("scope") == "hot"
+                }
+                "latest"   -> { st, p ->
+                    st == "list" &&
+                        p.optJSONObject("order")?.optString("created_at") == "desc"
+                }
+                else -> null
+            }
+            if (precise != null) {
+                items = readQueries(initial) { k ->
+                    if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
+                    val subtype = k.optString(1)
+                    val params = k.optJSONObject(2) ?: return@readQueries false
+                    val jsonPage = params.optInt("page", 1)
+                    if (page > 1 && jsonPage != page) return@readQueries false
+                    precise(subtype, params)
+                }
+            }
 
-                val jsonPage = params.optInt("page", 1)
-                if (page > 1 && jsonPage != page) return@readQueries false
-
-                when (request.data) {
-                    "trending" -> subtype == "top"  && params.optString("type") == "trending"
-                    "follows"  -> subtype == "top"  && params.optString("type") == "follows"
-                    "hot"      -> subtype == "list" && params.optString("scope") == "hot"
-                    "latest"   -> subtype == "list" &&
-                                  params.optJSONObject("order")?.optString("chapter_updated_at") == "desc"   // was: created_at
-                    else -> false
+            // Tier 2: lenient fallback ONLY for "latest".
+            if (items.isEmpty() && request.data == "latest") {
+                items = readQueries(initial) { k ->
+                    if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
+                    val subtype = k.optString(1)
+                    val params = k.optJSONObject(2) ?: return@readQueries false
+                    val jsonPage = params.optInt("page", 1)
+                    if (page > 1 && jsonPage != page) return@readQueries false
+                    (subtype == "list" || subtype == "browse") &&
+                        params.optString("scope") != "hot" &&
+                        params.optJSONObject("order")?.optString("created_at") == "desc"
                 }
             }
         }
 
         if (items.isEmpty()) items = extractSearchResultsDom(Jsoup.parse(html))
-
-        if (items.isEmpty()) return null
-        return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = items.size >= 20)
+        return items
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -272,18 +408,14 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // Parse visible chapters from Page 1
         extractChaptersFromHtml(document)
 
-        // Find Total Pages
         var maxPage = 1
         document.select(".npager__num").forEach { el ->
             val p = el.text().toIntOrNull() ?: 1
             if (p > maxPage) maxPage = p
         }
 
-        // BATCH NATIVE HTTP: Since Cloudstream has solved Cloudflare and holds the cookie,
-        // this batch fetching executes safely and natively at maximum speed without WebView timers.
         if (maxPage > 1) {
             val pages = (2..maxPage).toList()
             for (chunk in pages.chunked(5)) {
@@ -344,71 +476,4 @@ class ComixProvider : MainAPI() {
             }
         }
         parsedChapterLinks.keys.forEach { allChapterKeys.add(it) }
-        val sortedKeys = allChapterKeys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
-
-        val episodes = sortedKeys.mapIndexed { index, key ->
-            val realData = parsedChapterLinks[key]
-
-            val epUrl = if (realData != null) {
-                realData.second
-            } else if (key == "0" && startsAtZero && firstChapterUrl != null) {
-                firstChapterUrl
-            } else if (key == "1" && !startsAtZero && firstChapterUrl != null) {
-                firstChapterUrl
-            } else {
-                "$url/chapter-$key"
-            }
-
-            val epName = realData?.first ?: "Ch. $key"
-
-            newEpisode(fixUrl(epUrl)) {
-                this.name = epName
-                this.season = 1
-                this.episode = index + 1
-                this.posterUrl = posterUrl
-            }
-        }
-
-        if (episodes.isEmpty()) return null
-
-        return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
-            this.posterUrl = posterUrl
-            this.plot      = plot
-            this.tags      = genres
-            this.year      = yearInt
-            this.showStatus = when (statusStr?.lowercase()) {
-                "completed", "finished"             -> ShowStatus.Completed
-                "releasing", "ongoing", "on_hiatus" -> ShowStatus.Ongoing
-                else -> null
-            }
-            addEpisodes(DubStatus.Subbed, episodes)
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    //  loadLinks()
-    // ═══════════════════════════════════════════════════════════════════════
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val activity = CommonActivity.activity as? AppCompatActivity ?: return false
-        if (activity.isFinishing || activity.isDestroyed) return false
-
-        val chapterName = Regex("-chapter-([\\d.]+)").find(data)
-            ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
-
-        activity.runOnUiThread {
-            ComixReaderDialogFragment.show(
-                activity = activity,
-                title = name,
-                chapterName = chapterName,
-                chapterUrl = data,
-                targetChapter = 0
-            )
-        }
-        return true
-    }
-}
+        val sortedKeys = allChapterKeys.toList().sortedBy { it
