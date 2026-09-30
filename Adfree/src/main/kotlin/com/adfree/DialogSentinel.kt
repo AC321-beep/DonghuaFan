@@ -6,8 +6,6 @@ import android.content.Context
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import androidx.fragment.app.DialogFragment
-import androidx.fragment.app.FragmentActivity
 
 /**
  * Second layer of defense.
@@ -17,22 +15,26 @@ import androidx.fragment.app.FragmentActivity
  * user triggers test mode), we dismiss it shortly after the hosting
  * activity resumes.
  *
- * Watches the FragmentManager — the dialog is a DialogFragment, so Intent
- * interception would be the wrong tool.
+ * Implemented with reflection so we do NOT depend on androidx.fragment —
+ * the CloudStream plugin classpath does not guarantee it. We only need
+ * three runtime methods:
+ *    FragmentActivity#getSupportFragmentManager()
+ *    FragmentManager#getFragments()
+ *    Fragment#dismissAllowingStateLoss()  (falls back to #dismiss())
  */
 object DialogSentinel {
 
-    private val TAG_PATTERNS = listOf(
-        Regex("donat",  RegexOption.IGNORE_CASE),
-        Regex("popup",  RegexOption.IGNORE_CASE),
-        Regex("promo",  RegexOption.IGNORE_CASE),
-        Regex("support.*repo", RegexOption.IGNORE_CASE)
-    )
     private val CLASS_PATTERNS = listOf(
         Regex("donation",         RegexOption.IGNORE_CASE),
         Regex("promo.?dialog",    RegexOption.IGNORE_CASE),
         Regex("popup.?dialog",    RegexOption.IGNORE_CASE),
         Regex("support.?dialog",  RegexOption.IGNORE_CASE)
+    )
+    private val TAG_PATTERNS = listOf(
+        Regex("donat",  RegexOption.IGNORE_CASE),
+        Regex("popup",  RegexOption.IGNORE_CASE),
+        Regex("promo",  RegexOption.IGNORE_CASE),
+        Regex("support.*repo", RegexOption.IGNORE_CASE)
     )
 
     fun install(context: Context) {
@@ -42,10 +44,7 @@ object DialogSentinel {
         app.registerActivityLifecycleCallbacks(
             object : Application.ActivityLifecycleCallbacks {
                 override fun onActivityResumed(activity: Activity) {
-                    if (!ConfigStore.enabled) return
-                    if (activity !is FragmentActivity) return
-
-                    // Delay so the dialog has time to attach after resume.
+                    if (!FilterStore.enabled) return
                     handler.postDelayed({
                         if (activity.isFinishing || activity.isDestroyed) return@postDelayed
                         dismissAny(activity)
@@ -61,20 +60,39 @@ object DialogSentinel {
         )
     }
 
-    private fun dismissAny(activity: FragmentActivity) {
-        val fm = activity.supportFragmentManager
-        val dialogs = fm.fragments.filterIsInstance<DialogFragment>()
-        for (frag in dialogs) {
-            if (isScheduledDialog(frag) && frag.isAdded) {
-                try { frag.dismissAllowingStateLoss() } catch (_: Throwable) {}
+    private fun dismissAny(activity: Activity) {
+        try {
+            val fm = call(activity, "getSupportFragmentManager") ?: return
+            val fragments = call(fm, "getFragments") as? List<*> ?: return
+            for (frag in fragments) {
+                if (frag == null) continue
+                if (!looksLikeTarget(frag)) continue
+                if ((call(frag, "isAdded") as? Boolean) != true) continue
+                tryDismiss(frag)
             }
+        } catch (_: Throwable) {}
+    }
+
+    private fun looksLikeTarget(frag: Any): Boolean {
+        if (CLASS_PATTERNS.any { it.containsMatchIn(frag.javaClass.name) }) return true
+        val tag = call(frag, "getTag") as? String ?: return false
+        return TAG_PATTERNS.any { it.containsMatchIn(tag) }
+    }
+
+    /** Best-effort dismissal. Tries state-loss-safe variant first, then plain. */
+    private fun tryDismiss(frag: Any) {
+        for (name in listOf("dismissAllowingStateLoss", "dismiss")) {
+            try {
+                frag.javaClass.getMethod(name).invoke(frag)
+                return
+            } catch (_: Throwable) {}
         }
     }
 
-    private fun isScheduledDialog(frag: DialogFragment): Boolean {
-        val tag = frag.tag.orEmpty()
-        val cls = frag.javaClass.name
-        return TAG_PATTERNS.any { it.containsMatchIn(tag) } ||
-               CLASS_PATTERNS.any { it.containsMatchIn(cls) }
+    /** Null-safe reflective invoke. `getMethod` already walks the superclass chain. */
+    private fun call(target: Any, name: String): Any? = try {
+        target.javaClass.getMethod(name).invoke(target)
+    } catch (_: Throwable) {
+        null
     }
 }
