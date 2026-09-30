@@ -476,4 +476,71 @@ class ComixProvider : MainAPI() {
             }
         }
         parsedChapterLinks.keys.forEach { allChapterKeys.add(it) }
-        val sortedKeys = allChapterKeys.toList().sortedBy { it
+        val sortedKeys = allChapterKeys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
+
+        val episodes = sortedKeys.mapIndexed { index, key ->
+            val realData = parsedChapterLinks[key]
+
+            val epUrl = if (realData != null) {
+                realData.second
+            } else if (key == "0" && startsAtZero && firstChapterUrl != null) {
+                firstChapterUrl
+            } else if (key == "1" && !startsAtZero && firstChapterUrl != null) {
+                firstChapterUrl
+            } else {
+                "$url/chapter-$key"
+            }
+
+            val epName = realData?.first ?: "Ch. $key"
+
+            newEpisode(fixUrl(epUrl)) {
+                this.name = epName
+                this.season = 1
+                this.episode = index + 1
+                this.posterUrl = posterUrl
+            }
+        }
+
+        if (episodes.isEmpty()) return null
+
+        return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
+            this.posterUrl = posterUrl
+            this.plot      = plot
+            this.tags      = genres
+            this.year      = yearInt
+            this.showStatus = when (statusStr?.lowercase()) {
+                "completed", "finished"             -> ShowStatus.Completed
+                "releasing", "ongoing", "on_hiatus" -> ShowStatus.Ongoing
+                else -> null
+            }
+            addEpisodes(DubStatus.Subbed, episodes)
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  loadLinks()
+    // ═══════════════════════════════════════════════════════════════════════
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val activity = CommonActivity.activity as? AppCompatActivity ?: return false
+        if (activity.isFinishing || activity.isDestroyed) return false
+
+        val chapterName = Regex("-chapter-([\\d.]+)").find(data)
+            ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
+
+        activity.runOnUiThread {
+            ComixReaderDialogFragment.show(
+                activity = activity,
+                title = name,
+                chapterName = chapterName,
+                chapterUrl = data,
+                targetChapter = 0
+            )
+        }
+        return true
+    }
+}
