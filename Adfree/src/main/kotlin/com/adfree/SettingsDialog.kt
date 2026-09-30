@@ -32,9 +32,7 @@ class SettingsDialog(
         })
 
         container.addView(TextView(context).apply {
-            text = "Neutralizes stale UI trigger preferences at startup and " +
-                   "dismisses a stray dialog if one still appears. " +
-                   "Provider loading and video playback are untouched."
+            text = "Blocks the donation popup."
             textSize = 12f
             setTextColor(Color.parseColor("#909090"))
             setPadding(0, dp(6), 0, dp(16))
