@@ -51,8 +51,9 @@ class ComixProvider : MainAPI() {
         "latest"   to "Latest Releases",
     )
 
+    // Tracks whether we've bootstrapped the WebView (which stores the
+    // cf_clearance + session cookies used by /api/v1/manga).
     @Volatile private var cfgToken: String? = null
-    @Volatile private var sessionToken: String? = null
 
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
@@ -81,6 +82,9 @@ class ComixProvider : MainAPI() {
         return text
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  initial-data parsing
+    // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
             is Document -> htmlOrDoc
@@ -168,10 +172,14 @@ class ComixProvider : MainAPI() {
         return results.distinctBy { it.url }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Main page
+    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
+        // Trending / Follows are single-page "top" queries.
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
@@ -179,6 +187,9 @@ class ComixProvider : MainAPI() {
             return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = false)
         }
 
+        // Hot / Latest
+        //   page 1 → homepage SSR
+        //   page 2+ → GET /api/v1/manga
         if (page == 1) {
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
             if (items.isEmpty()) return null
@@ -239,6 +250,9 @@ class ComixProvider : MainAPI() {
         return items
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Pagination — GET /api/v1/manga  (exact match to browser cURL)
+    // ═══════════════════════════════════════════════════════════════════════
     private data class PageResult(
         val items: List<SearchResponse>,
         val hasNext: Boolean
@@ -248,75 +262,77 @@ class ComixProvider : MainAPI() {
         request: MainPageRequest,
         page: Int
     ): PageResult? {
-        val (order, scope, limit) = when (request.data) {
-            "hot"    -> Triple("chapter_updated_at", "&scope=hot", 31)
+        val (orderField, scopeParam, limit) = when (request.data) {
+            "hot"    -> Triple("chapter_updated_at", "hot", 31)
             "latest" -> Triple("created_at", "", 10)
             else     -> return null
         }
 
-        val baseQs = buildString {
-            append("order%5B$order%5D=desc")
-            append(scope)
-            append("&content_rating%5B%5D=safe")
-            append("&content_rating%5B%5D=suggestive")
-            append("&page=$page")
-            append("&limit=$limit")
-        }
+        // Bootstrap the WebView once so cf_clearance + session cookies
+        // are present in the jar before we make the API call.
+        if (cfgToken == null) runCatching { fetchHtml("$mainUrl/") }
 
-        val jsonHeaders = browserHeaders(
-            mapOf(
-                "Accept" to "application/json, text/plain, */*",
-                "Sec-Fetch-Dest" to "empty",
-                "Sec-Fetch-Mode" to "cors",
-                "Sec-Fetch-Site" to "same-origin"
-            )
+        // Headers that mirror the browser's XHR exactly. Referer carries
+        // the page number — without it the server rejects the request.
+        val jsonHeaders = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+            "Accept" to "application/json",
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Cache-Control" to "no-cache",
+            "Pragma" to "no-cache",
+            "Priority" to "u=1, i",
+            "Referer" to "$mainUrl/?page=$page",
+            "Sec-Ch-Ua" to "\"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"121\", \"Chromium\";v=\"121\"",
+            "Sec-Ch-Ua-Mobile" to "?0",
+            "Sec-Ch-Ua-Platform" to "\"Windows\"",
+            "Sec-Fetch-Dest" to "empty",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Site" to "same-origin",
+            "X-Requested-With" to "XMLHttpRequest"
         )
 
-        fetchSessionToken()
+        // Literal brackets — OkHttp encodes them exactly once to %5B/%5D.
+        val orderLiteral  = "order[$orderField]=desc"
+        val ratingLiteral = "content_rating[]=safe&content_rating[]=suggestive"
 
-        val variants = mutableListOf<String>()
-        sessionToken?.let { variants.add("$mainUrl/api/v1/manga?$baseQs&_=$it") }
-        cfgToken?.let     { variants.add("$mainUrl/api/v1/manga?$baseQs&_=$it") }
-        variants.add("$mainUrl/api/v1/manga?$baseQs")
-        variants.add("$mainUrl/api/v1/manga?$baseQs&_=" + randomCacheBuster())
+        // Fallback: pre-encoded, in case OkHttp leaves escapes alone.
+        val orderEncoded  = "order%5B$orderField%5D=desc"
+        val ratingEncoded = "content_rating%5B%5D=safe&content_rating%5B%5D=suggestive"
 
-        for (url in variants) {
-            val text = runCatching {
-                app.get(url, headers = jsonHeaders, interceptor = cfInterceptor).text
-            }.getOrNull() ?: continue
-            parsePageResponse(text)?.let { return it }
-        }
-        return null
-    }
-
-    private suspend fun fetchSessionToken() {
-        if (sessionToken != null) return
-        val text = runCatching {
-            app.get(
-                "$mainUrl/api/v1/user",
-                headers = browserHeaders(mapOf(
-                    "Accept" to "application/json, text/plain, */*",
-                    "Sec-Fetch-Dest" to "empty",
-                    "Sec-Fetch-Mode" to "cors",
-                    "Sec-Fetch-Site" to "same-origin"
-                )),
-                interceptor = cfInterceptor
-            ).text
-        }.getOrNull() ?: return
-
-        val json = runCatching { JSONObject(text) }.getOrNull() ?: return
-        val candidates = listOf("token", "_", "csrf", "csrfToken", "session",
-                                "sessionId", "key", "secret")
-        fun tryExtract(container: JSONObject): Boolean {
-            for (key in candidates) {
-                val v = container.optString(key)
-                if (v.isNotBlank() && v.length in 40..500) { sessionToken = v; return true }
+        val bases = listOf(
+            buildString {
+                append("$mainUrl/api/v1/manga?$orderLiteral")
+                if (scopeParam.isNotEmpty()) append("&scope=$scopeParam")
+                append("&$ratingLiteral&page=$page&limit=$limit")
+            },
+            buildString {
+                append("$mainUrl/api/v1/manga?$orderEncoded")
+                if (scopeParam.isNotEmpty()) append("&scope=$scopeParam")
+                append("&$ratingEncoded&page=$page&limit=$limit")
             }
-            return false
+        )
+
+        // The `_` param is just a 129-char random cache buster, exactly
+        // as the browser sends it.
+        val cacheBuster = randomCacheBuster()
+
+        for (base in bases) {
+            // (1) With `_` — matches the browser cURL exactly.
+            runCatching {
+                app.get(
+                    "$base&_=$cacheBuster",
+                    headers = jsonHeaders,
+                    interceptor = cfInterceptor
+                ).text
+            }.getOrNull()?.let { parsePageResponse(it)?.let { r -> return r } }
+
+            // (2) Without `_` — some servers ignore it.
+            runCatching {
+                app.get(base, headers = jsonHeaders, interceptor = cfInterceptor).text
+            }.getOrNull()?.let { parsePageResponse(it)?.let { r -> return r } }
         }
-        if (tryExtract(json)) return
-        json.optJSONObject("data")?.let { tryExtract(it) }
-            ?: json.optJSONObject("result")?.let { tryExtract(it) }
+
+        return null
     }
 
     private fun randomCacheBuster(): String {
@@ -324,6 +340,10 @@ class ComixProvider : MainAPI() {
         return (1..129).map { chars.random() }.joinToString("")
     }
 
+    /**
+     * Response envelope (confirmed from browser capture):
+     *   {"status":"ok","result":{"items":[…],"meta":{"hasNext":true,…}}}
+     */
     private fun parsePageResponse(response: String): PageResult? {
         val trimmed = response.trim()
         if (trimmed.isEmpty()) return null
@@ -391,6 +411,9 @@ class ComixProvider : MainAPI() {
         return out
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Search
+    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
@@ -416,6 +439,9 @@ class ComixProvider : MainAPI() {
     private fun formatChapterNum(n: Double): String =
         if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  load()
+    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
         val html = fetchHtml(url)
         if (html.isBlank()) return null
@@ -534,6 +560,9 @@ class ComixProvider : MainAPI() {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  loadLinks()
+    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
