@@ -8,34 +8,39 @@ import com.lagradost.cloudstream3.plugins.Plugin
 class OptimizerPlugin : Plugin() {
 
     companion object {
-        @Volatile private var currentInstance: OptimizerPlugin? = null
-        fun setInstance(p: OptimizerPlugin) { currentInstance = p }
-        fun reSanitize(context: Context) { currentInstance?.runSanitization(context) }
-    }
+        @Volatile private var instance: OptimizerPlugin? = null
 
-    override fun load(context: Context) {
-        setInstance(this)
-        FilterStore.init(context)
-
-        // Layer 1: neutralize any stale UI-triggering preference file.
-        runSanitization(context)
-
-        // Layer 2: dismiss the dialog if it ever appears anyway.
-        DialogSentinel.install(context)
-
-        openSettings = {
-            try { SettingsDialog(context) {}.show() } catch (_: Throwable) {}
+        /** Called from SettingsDialog after the user toggles the switch. */
+        fun reSanitize(context: Context) {
+            instance?.runSanitization(context)
         }
     }
 
-    /**
-     * Public so the Settings dialog can force a re-run.
-     * Idempotent and cheap (~5 ms) — safe to call repeatedly.
-     */
+    override fun load(context: Context) {
+        instance = this
+        FilterStore.init(context)
+
+        // Layer 1: pin every known donation/popup gate to today so the
+        // extension's own cooldown check returns early.
+        runSanitization(context)
+
+        // Layer 2: dismiss the dialog if it ever attaches anyway, and
+        // re-pin the gate on every activity resume (catches midnight rollover
+        // and any post-sweep writes by the extension).
+        DialogSentinel.install(context)
+
+        openSettings = {
+            try {
+                SettingsDialog(context) {}.show()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
     fun runSanitization(context: Context) {
         try {
-            val count = PreferenceSanitizer.sanitize(context)
-            FilterStore.recordSweep(count)
-        } catch (_: Throwable) {}
+            PreferenceSanitizer.sanitize(context)
+        } catch (_: Throwable) {
+        }
     }
 }
