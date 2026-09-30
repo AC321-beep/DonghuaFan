@@ -60,7 +60,7 @@ abstract class ChikiAnimationProvider : MainAPI() {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
-    // CRITICAL: This must be a get() property so it reads mainUrl from the subclass
+    // get() so it reads mainUrl from whichever subclass is running
     private val defaultHeaders: Map<String, String>
         get() = mapOf(
             "User-Agent" to defaultUserAgent,
@@ -81,6 +81,20 @@ abstract class ChikiAnimationProvider : MainAPI() {
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {}
+    }
+
+    /**
+     * Resolve an <img> URL. On chikianimation.online, WordPress lazy-load
+     * plugins hide the real URL in data-src / data-lazy-src and put a base64
+     * placeholder GIF in src. Always prefer the lazy attributes and reject
+     * base64 placeholders. On chikianimation.com, data-src is empty and we
+     * fall through to src — identical behaviour to before.
+     */
+    private fun Element.resolveLazyImg(): String? {
+        val raw = attr("data-src").ifEmpty { attr("data-lazy-src") }
+            .ifEmpty { attr("data-original") }
+            .ifEmpty { attr("src") }
+        return raw.takeIf { it.isNotBlank() && !it.startsWith("data:") }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -129,15 +143,13 @@ abstract class ChikiAnimationProvider : MainAPI() {
             ?: anchor.text().trim().takeIf { it.isNotBlank() }
             ?: return null
 
-        val posterUrl = fixUrlNull(
-            selectFirst("img.ts-post-image")?.let { img ->
-                img.attr("data-src").ifEmpty { img.attr("src") }
-                    .ifEmpty { img.attr("data-lazy-src") }
-                    .ifEmpty { img.attr("data-original") }
-            }
-                ?: selectFirst("div.limit img")?.attr("src")
-                ?: selectFirst("img")?.attr("src")
-        )
+        // Grab any img element then resolve its real URL via the lazy-aware helper.
+        // Works for both .com (direct src) and .online (lazy data-src).
+        val imgElement = selectFirst("img.ts-post-image")
+            ?: selectFirst("div.limit img")
+            ?: selectFirst("img")
+
+        val posterUrl = fixUrlNull(imgElement?.resolveLazyImg())
 
         return newAnimeSearchResponse(title, href) {
             this.posterUrl = posterUrl
@@ -177,10 +189,17 @@ abstract class ChikiAnimationProvider : MainAPI() {
             ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
             ?: return null
 
-        val poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim()
-            ?: document.selectFirst("div.thumb img.wp-post-image")?.attr("src")?.trim()
-            ?: document.selectFirst("div.thumb img")?.attr("src")?.trim()
-            ?: document.selectFirst("img.wp-post-image")?.attr("src")?.trim()
+        // Poster on the detail page — same lazy-aware logic as cards
+        val poster = document.selectFirst("meta[property=og:image]")
+            ?.attr("content")?.trim()?.takeIf { it.isNotBlank() }
+            ?: fixUrl(
+                (
+                    document.selectFirst("div.thumb img.wp-post-image")
+                        ?: document.selectFirst("div.thumb img")
+                        ?: document.selectFirst("img.wp-post-image")
+                        ?: document.selectFirst("img")
+                )?.resolveLazyImg()
+            )
             ?: ""
 
         val description = document
