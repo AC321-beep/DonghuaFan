@@ -44,15 +44,13 @@ class ComixProvider : MainAPI() {
     override val hasMainPage = true
     override val hasQuickSearch = true
 
-    override val mainPage = mainPageOf(
-        "trending" to "Trending Today",
-        "follows"  to "Most Followed",
+       override val mainPage = mainPageOf(
         "hot"      to "Hot Updates",
         "latest"   to "Latest Releases",
+        "trending" to "Trending Today",
+        "follows"  to "Most Followed",
     )
 
-    // Tracks whether we've bootstrapped the WebView (which stores the
-    // cf_clearance + session cookies used by /api/v1/manga).
     @Volatile private var cfgToken: String? = null
 
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
@@ -179,7 +177,6 @@ class ComixProvider : MainAPI() {
         page: Int,
         request: MainPageRequest
     ): HomePageResponse? {
-        // Trending / Follows are single-page "top" queries.
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
@@ -187,9 +184,6 @@ class ComixProvider : MainAPI() {
             return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = false)
         }
 
-        // Hot / Latest
-        //   page 1 → homepage SSR
-        //   page 2+ → GET /api/v1/manga
         if (page == 1) {
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
             if (items.isEmpty()) return null
@@ -251,7 +245,9 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Pagination — GET /api/v1/manga  (exact match to browser cURL)
+    //  Pagination — GET /api/v1/manga
+    //  Uses exactly the shape of the browser cURL: minimal headers,
+    //  Referer carrying the page number, 129-char random `_` cache buster.
     // ═══════════════════════════════════════════════════════════════════════
     private data class PageResult(
         val items: List<SearchResponse>,
@@ -268,69 +264,56 @@ class ComixProvider : MainAPI() {
             else     -> return null
         }
 
-        // Bootstrap the WebView once so cf_clearance + session cookies
-        // are present in the jar before we make the API call.
+        // Ensure cf_clearance + session cookies are already in the jar.
         if (cfgToken == null) runCatching { fetchHtml("$mainUrl/") }
 
-        // Headers that mirror the browser's XHR exactly. Referer carries
-        // the page number — without it the server rejects the request.
-        val jsonHeaders = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        val headers = mapOf(
             "Accept" to "application/json",
             "Accept-Language" to "en-US,en;q=0.9",
-            "Cache-Control" to "no-cache",
-            "Pragma" to "no-cache",
-            "Priority" to "u=1, i",
+            "X-Requested-With" to "XMLHttpRequest",
             "Referer" to "$mainUrl/?page=$page",
-            "Sec-Ch-Ua" to "\"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"121\", \"Chromium\";v=\"121\"",
-            "Sec-Ch-Ua-Mobile" to "?0",
-            "Sec-Ch-Ua-Platform" to "\"Windows\"",
             "Sec-Fetch-Dest" to "empty",
             "Sec-Fetch-Mode" to "cors",
-            "Sec-Fetch-Site" to "same-origin",
-            "X-Requested-With" to "XMLHttpRequest"
+            "Sec-Fetch-Site" to "same-origin"
         )
 
-        // Literal brackets — OkHttp encodes them exactly once to %5B/%5D.
-        val orderLiteral  = "order[$orderField]=desc"
-        val ratingLiteral = "content_rating[]=safe&content_rating[]=suggestive"
-
-        // Fallback: pre-encoded, in case OkHttp leaves escapes alone.
-        val orderEncoded  = "order%5B$orderField%5D=desc"
-        val ratingEncoded = "content_rating%5B%5D=safe&content_rating%5B%5D=suggestive"
-
-        val bases = listOf(
-            buildString {
-                append("$mainUrl/api/v1/manga?$orderLiteral")
-                if (scopeParam.isNotEmpty()) append("&scope=$scopeParam")
-                append("&$ratingLiteral&page=$page&limit=$limit")
-            },
-            buildString {
-                append("$mainUrl/api/v1/manga?$orderEncoded")
-                if (scopeParam.isNotEmpty()) append("&scope=$scopeParam")
-                append("&$ratingEncoded&page=$page&limit=$limit")
-            }
-        )
-
-        // The `_` param is just a 129-char random cache buster, exactly
-        // as the browser sends it.
-        val cacheBuster = randomCacheBuster()
-
-        for (base in bases) {
-            // (1) With `_` — matches the browser cURL exactly.
-            runCatching {
-                app.get(
-                    "$base&_=$cacheBuster",
-                    headers = jsonHeaders,
-                    interceptor = cfInterceptor
-                ).text
-            }.getOrNull()?.let { parsePageResponse(it)?.let { r -> return r } }
-
-            // (2) Without `_` — some servers ignore it.
-            runCatching {
-                app.get(base, headers = jsonHeaders, interceptor = cfInterceptor).text
-            }.getOrNull()?.let { parsePageResponse(it)?.let { r -> return r } }
+        // Literal brackets — OkHttp encodes them to %5B/%5D exactly once.
+        val paramsLiteral = buildString {
+            append("order[").append(orderField).append("]=desc")
+            if (scopeParam.isNotEmpty()) append("&scope=").append(scopeParam)
+            append("&content_rating[]=safe&content_rating[]=suggestive")
+            append("&page=").append(page).append("&limit=").append(limit)
+            append("&_=").append(randomCacheBuster())
         }
+        val urlLiteral = "$mainUrl/api/v1/manga?$paramsLiteral"
+
+        // Pre-encoded variant, in case OkHttp double-encodes.
+        val paramsEncoded = buildString {
+            append("order%5B").append(orderField).append("%5D=desc")
+            if (scopeParam.isNotEmpty()) append("&scope=").append(scopeParam)
+            append("&content_rating%5B%5D=safe&content_rating%5B%5D=suggestive")
+            append("&page=").append(page).append("&limit=").append(limit)
+            append("&_=").append(randomCacheBuster())
+        }
+        val urlEncoded = "$mainUrl/api/v1/manga?$paramsEncoded"
+
+        // Try literal URL: with interceptor, then without.
+        runCatching {
+            app.get(urlLiteral, headers = headers, interceptor = cfInterceptor).text
+        }.getOrNull()?.let { parsePageResponse(it)?.let { r -> return r } }
+
+        runCatching {
+            app.get(urlLiteral, headers = headers).text
+        }.getOrNull()?.let { parsePageResponse(it)?.let { r -> return r } }
+
+        // Try pre-encoded URL: with interceptor, then without.
+        runCatching {
+            app.get(urlEncoded, headers = headers, interceptor = cfInterceptor).text
+        }.getOrNull()?.let { parsePageResponse(it)?.let { r -> return r } }
+
+        runCatching {
+            app.get(urlEncoded, headers = headers).text
+        }.getOrNull()?.let { parsePageResponse(it)?.let { r -> return r } }
 
         return null
     }
@@ -341,7 +324,7 @@ class ComixProvider : MainAPI() {
     }
 
     /**
-     * Response envelope (confirmed from browser capture):
+     * Response envelope (from browser capture):
      *   {"status":"ok","result":{"items":[…],"meta":{"hasNext":true,…}}}
      */
     private fun parsePageResponse(response: String): PageResult? {
