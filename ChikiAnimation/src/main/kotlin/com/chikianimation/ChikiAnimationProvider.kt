@@ -192,7 +192,7 @@ abstract class ChikiAnimationProvider : MainAPI() {
         // Poster on the detail page — same lazy-aware logic as cards
         val poster = document.selectFirst("meta[property=og:image]")
             ?.attr("content")?.trim()?.takeIf { it.isNotBlank() }
-            ?: fixUrl(
+            ?: fixUrlNull(
                 (
                     document.selectFirst("div.thumb img.wp-post-image")
                         ?: document.selectFirst("div.thumb img")
