@@ -7,28 +7,13 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 
-/**
- * Second layer of defense.
- *
- * If a scheduled dialog ever appears despite the prefs sanitizer (e.g. the
- * extension writes a fresh "last shown" value after sanitization, or the
- * user triggers test mode), we dismiss it shortly after the hosting
- * activity resumes.
- *
- * Implemented with reflection so we do NOT depend on androidx.fragment —
- * the CloudStream plugin classpath does not guarantee it. We only need
- * three runtime methods:
- *    FragmentActivity#getSupportFragmentManager()
- *    FragmentManager#getFragments()
- *    Fragment#dismissAllowingStateLoss()  (falls back to #dismiss())
- */
 object DialogSentinel {
 
     private val CLASS_PATTERNS = listOf(
-        Regex("donation",         RegexOption.IGNORE_CASE),
-        Regex("promo.?dialog",    RegexOption.IGNORE_CASE),
-        Regex("popup.?dialog",    RegexOption.IGNORE_CASE),
-        Regex("support.?dialog",  RegexOption.IGNORE_CASE)
+        Regex("donation",        RegexOption.IGNORE_CASE),
+        Regex("promo.?dialog",   RegexOption.IGNORE_CASE),
+        Regex("popup.?dialog",   RegexOption.IGNORE_CASE),
+        Regex("support.?dialog", RegexOption.IGNORE_CASE)
     )
     private val TAG_PATTERNS = listOf(
         Regex("donat",  RegexOption.IGNORE_CASE),
@@ -39,12 +24,17 @@ object DialogSentinel {
 
     fun install(context: Context) {
         val app = context.applicationContext as? Application ?: return
+        val appContext = context.applicationContext
         val handler = Handler(Looper.getMainLooper())
 
         app.registerActivityLifecycleCallbacks(
             object : Application.ActivityLifecycleCallbacks {
                 override fun onActivityResumed(activity: Activity) {
-                    if (!FilterStore.enabled) return
+                    // Re-pin the gate to today. Catches:
+                    //  - the extension writing last_shown_day after our startup sweep
+                    //  - the app running across midnight
+                    try { PreferenceSanitizer.sanitize(appContext) } catch (_: Throwable) {}
+
                     handler.postDelayed({
                         if (activity.isFinishing || activity.isDestroyed) return@postDelayed
                         dismissAny(activity)
@@ -79,7 +69,6 @@ object DialogSentinel {
         return TAG_PATTERNS.any { it.containsMatchIn(tag) }
     }
 
-    /** Best-effort dismissal. Tries state-loss-safe variant first, then plain. */
     private fun tryDismiss(frag: Any) {
         for (name in listOf("dismissAllowingStateLoss", "dismiss")) {
             try {
@@ -89,10 +78,7 @@ object DialogSentinel {
         }
     }
 
-    /** Null-safe reflective invoke. `getMethod` already walks the superclass chain. */
     private fun call(target: Any, name: String): Any? = try {
         target.javaClass.getMethod(name).invoke(target)
-    } catch (_: Throwable) {
-        null
-    }
+    } catch (_: Throwable) { null }
 }
