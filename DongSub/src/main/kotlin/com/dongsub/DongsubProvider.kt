@@ -2,6 +2,9 @@ package com.dongsub
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -28,6 +31,58 @@ class DongsubProvider : MainAPI() {
 
     private val pageSize = 20
 
+    // ---------- title parsing ----------
+
+    private data class ParsedTitle(
+        val base: String,
+        val season: Int?,
+        val episode: Int?
+    )
+
+    // "A Will Eternal Final Season 4 Episode 13 Subtitles"
+    //   -> base="A Will Eternal", season=4, episode=13
+    private fun parseTitle(raw: String): ParsedTitle {
+        var s = raw.trim()
+            .replace(Regex("(?i)\\s*Subtitles?\\s*$"), "")
+            .trim()
+
+        var episode: Int? = null
+        Regex("(?i)\\s*(?:Episode|Eps\\.?|Ep\\.?)\\s*(\\d+)").find(s)?.let { m ->
+            episode = m.groupValues[1].toIntOrNull()
+            s = s.removeRange(m.range.first, m.range.last + 1)
+        }
+
+        var season: Int? = null
+        Regex("(?i)\\s*[(\\[]?\\s*\\b(?:Final\\s+)?Season\\s*(\\d+)\\s*[)\\]]?\\b").find(s)?.let { m ->
+            season = m.groupValues[1].toIntOrNull()
+            s = s.removeRange(m.range.first, m.range.last + 1)
+        }
+
+        val base = s.replace(Regex("\\s*[-–:,]\\s*$"), "")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        return ParsedTitle(base.ifBlank { raw.trim() }, season, episode)
+    }
+
+    private fun pad(n: Int, w: Int) = n.toString().padStart(w, '0')
+
+    private fun buildEpName(p: ParsedTitle, fallback: String): String = when {
+        p.season != null && p.episode != null -> "S${pad(p.season, 2)} E${pad(p.episode, 3)}"
+        p.season != null -> "S${pad(p.season, 2)}"
+        p.episode != null -> "Episode ${p.episode}"
+        else -> fallback
+    }
+
+    /**
+     * Series-level key. Uses parseTitle so "A Will Eternal Season 3",
+     * "A Will Eternal Final Season 4 Eps 13" etc. all collapse to one key.
+     */
+    private fun seriesKey(name: String): String =
+        parseTitle(name).base.replace(Regex("[^a-zA-Z0-9]"), "").lowercase()
+
+    // ---------- homepage ----------
+
     override val mainPage = mainPageOf(
         "" to "Latest Release"
     )
@@ -48,11 +103,21 @@ class DongsubProvider : MainAPI() {
             return newHomePageResponse(request.name, emptyList())
         }
 
-        val items = parseFeed(text)
-        val hasNext = items.size >= pageSize
+        val raw = parseFeed(text)
+
+        // One card per SERIES (not per episode). Blogger feed is newest-first,
+        // so the first hit for each series is the latest episode.
+        val items = raw.distinctBy { seriesKey(it.name) }
+
+        // hasNext must be based on RAW count, otherwise dedup shrinks
+        // the list and pagination stops after page 1.
+        val hasNext = raw.size >= pageSize
+
         return newHomePageResponse(request.name, items, hasNext)
     }
 
+    // Shared: turn a Blogger JSON feed response into search results.
+    // Caller can filter afterwards.
     private fun parseFeed(text: String): List<AnimeSearchResponse> {
         return try {
             val root = JSONObject(text)
@@ -82,18 +147,11 @@ class DongsubProvider : MainAPI() {
                     ?.replace("s72", "s320")
                     ?.takeIf { it.isNotBlank() }
 
-                val epNum = Regex("(?i)(?:Episode|Eps\\.?|Ep\\.?)\\s*(\\d+)")
-                    .find(title)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                val parsed = parseTitle(title)
 
-                val cleanTitle = title
-                    .replace(Regex("(?i)\\s*(?:Episode|Eps\\.?|Ep\\.?)\\s*\\d+.*$"), "")
-                    .replace(Regex("(?i)\\s*Subtitles?\\s*$"), "")
-                    .trim()
-                    .ifBlank { title.trim() }
-
-                out.add(newAnimeSearchResponse(cleanTitle, href, TvType.Anime) {
+                out.add(newAnimeSearchResponse(parsed.base.ifBlank { title }, href, TvType.Anime) {
                     this.posterUrl = thumb
-                    addSub(epNum)
+                    addSub(parsed.episode)
                 })
             }
             out
@@ -101,6 +159,8 @@ class DongsubProvider : MainAPI() {
             emptyList()
         }
     }
+
+    // ---------- cards / search ----------
 
     private fun parseCards(doc: Document): List<AnimeSearchResponse> {
         return doc.select("article.post-outer-container, div.blog-posts article")
@@ -128,21 +188,67 @@ class DongsubProvider : MainAPI() {
         val epText = selectFirst("span.epsid, span.tipeps span")?.text()
         val epNum = epText?.replace(Regex("[^0-9]"), "")?.toIntOrNull()
 
-        return newAnimeSearchResponse(title, href, TvType.Anime) {
+        val parsed = parseTitle(title)
+
+        return newAnimeSearchResponse(parsed.base.ifBlank { title }, href, TvType.Anime) {
             this.posterUrl = poster
-            addSub(epNum)
+            addSub(epNum ?: parsed.episode)
         }
     }
 
-    override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/search?q=${URLEncoder.encode(query, "UTF-8")}"
-        val doc = try {
-            app.get(url, headers = defaultHeaders).document
-        } catch (_: Exception) {
-            return emptyList()
+    /**
+     * Global search: query the Blogger feed and the HTML search page in
+     * parallel, keep only real matches, dedup by URL, rank by relevance.
+     *
+     * Blogger's `?q=` is word-based and loose (matches any single word),
+     * so we post-filter to titles that actually contain the full query.
+     */
+    override suspend fun search(query: String): List<SearchResponse> = coroutineScope {
+        val q = query.trim()
+        if (q.isBlank()) return@coroutineScope emptyList()
+
+        val encoded = URLEncoder.encode(q, "UTF-8")
+
+        val feedDeferred = async {
+            try {
+                val url = "$mainUrl/feeds/posts/default" +
+                        "?alt=json&q=$encoded&max-results=60&orderby=published"
+                val text = app.get(url, headers = defaultHeaders).text
+                parseFeed(text).filter { it.name.contains(q, ignoreCase = true) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                emptyList()
+            }
         }
-        return parseCards(doc)
+
+        val htmlDeferred = async {
+            try {
+                val url = "$mainUrl/search?q=$encoded&max-results=60"
+                val doc = app.get(url, headers = defaultHeaders).document
+                parseCards(doc).filter { it.name.contains(q, ignoreCase = true) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+
+        val combined = (feedDeferred.await() + htmlDeferred.await())
+            .distinctBy { it.url }
+
+        // Rank: exact-name first, then starts-with, then contains, then others.
+        combined.sortedWith(
+            compareBy(
+                { !it.name.equals(q, ignoreCase = true) },
+                { !it.name.startsWith(q, ignoreCase = true) },
+                { !it.name.contains(q, ignoreCase = true) },
+                { it.name.length }
+            )
+        )
     }
+
+    // ---------- episode discovery helpers ----------
 
     private fun extractSeriesAnchor(doc: Document): Pair<String, String?>? {
         doc.selectFirst("span.info-stream a[rel=tag], span.info-stream a[data]")?.let {
@@ -232,19 +338,7 @@ class DongsubProvider : MainAPI() {
         return parseCards(doc)
     }
 
-    private suspend fun fetchSearchPage(query: String): List<AnimeSearchResponse> {
-        val encoded = URLEncoder.encode(query, "UTF-8")
-        val url = "$mainUrl/search?q=$encoded&max-results=500"
-        val doc = try {
-            app.get(url, headers = defaultHeaders).document
-        } catch (_: Exception) {
-            return emptyList()
-        }
-        return parseCards(doc)
-    }
-
-    private fun cleanEpTitle(t: String): String =
-        t.replace(Regex("(?i)\\s*Subtitles?\\s*$"), "").trim()
+    // ---------- load ----------
 
     override suspend fun load(url: String): LoadResponse {
         val doc = app.get(url, headers = defaultHeaders).document
@@ -252,10 +346,8 @@ class DongsubProvider : MainAPI() {
         val rawTitle = doc.selectFirst("h1.title-stream, h1.entry-title, h1")
             ?.text()?.trim().orEmpty()
 
-        val title = rawTitle
-            .replace(Regex("(?i)\\s*(?:Episode|Eps\\.?|Ep\\.?)\\s*\\d+.*$"), "")
-            .trim()
-            .ifBlank { rawTitle }
+        val parsedPage = parseTitle(rawTitle)
+        val seriesBase = parsedPage.base.ifBlank { rawTitle }
 
         val poster = fixUrlNull(
             doc.selectFirst("meta[property=og:image]")?.attr("content")
@@ -266,73 +358,62 @@ class DongsubProvider : MainAPI() {
             ?.text()?.trim()
 
         val anchor = extractSeriesAnchor(doc)
-        val label = anchor?.first
-        val labelHref = anchor?.second
 
-        // ---- Multi-strategy: pick whichever gives the MOST episodes ----
+        // Gather candidate (title, url) pairs from multiple sources
+        val candidates = mutableListOf<Pair<String, String>>()
 
-        fun buildFromPairs(pairs: List<Pair<String, String>>): List<Episode> {
-            val seen = mutableSetOf<String>()
-            val out = mutableListOf<Episode>()
-            for ((t, u) in pairs) {
-                if (u.isBlank()) continue
-                if (!seen.add(u)) continue
-                val n = cleanEpTitle(t)
-                out.add(newEpisode(u) { this.name = n })
+        if (seriesBase.isNotBlank()) candidates += fetchSearchFeed(seriesBase)
+        anchor?.let { (label, _) -> candidates += fetchLabelFeed(label) }
+        if (candidates.size < 2) {
+            anchor?.let { (label, href) ->
+                fetchLabelPage(href ?: label).forEach { candidates.add(it.name to it.url) }
             }
-            return out
         }
 
-        fun buildFromCards(cards: List<AnimeSearchResponse>): List<Episode> {
-            val seen = mutableSetOf<String>()
-            val out = mutableListOf<Episode>()
-            for (c in cards) {
-                if (c.url.isBlank()) continue
-                if (!seen.add(c.url)) continue
-                out.add(newEpisode(c.url) { this.name = c.name })
-            }
-            return out
+        // Keep only candidates whose parsed series base matches this page's base
+        val exact = candidates.filter { (t, _) ->
+            parseTitle(t).base.equals(seriesBase, ignoreCase = true)
+        }
+        val chosen = if (exact.size >= 2) exact else candidates
+
+        // Two-layer dedup:
+        //   - seenUrls: two different listings pointing at the same page
+        //   - seenEpKeys: S:E collision when the same episode appears twice
+        val seenUrls = mutableSetOf<String>()
+        val seenEpKeys = mutableSetOf<String>()
+        val episodes = mutableListOf<Episode>()
+
+        for ((t, u) in chosen) {
+            if (u.isBlank()) continue
+            if (!seenUrls.add(u)) continue
+
+            val p = parseTitle(t)
+            val epKey = if (p.episode != null) "${p.season ?: 1}:${p.episode}" else "url:$u"
+            if (!seenEpKeys.add(epKey)) continue
+
+            episodes.add(newEpisode(u) {
+                this.name = buildEpName(p, t)
+                this.season = p.season
+                this.episode = p.episode
+            })
         }
 
-        var best: List<Episode> = emptyList()
-
-        // 1. Feed for the exact label
-        if (!label.isNullOrBlank()) {
-            val eps = buildFromPairs(fetchLabelFeed(label))
-            if (eps.size > best.size) best = eps
+        if (episodes.isEmpty()) {
+            episodes.add(newEpisode(url) { this.name = rawTitle })
         }
 
-        // 2. HTML page for the exact label
-        if (!label.isNullOrBlank()) {
-            val eps = buildFromCards(fetchLabelPage(labelHref ?: label))
-            if (eps.size > best.size) best = eps
-        }
+        val sorted = episodes.sortedWith(
+            compareBy<Episode> { it.season ?: 1 }.thenBy { it.episode ?: 0 }
+        )
 
-        // 3. Feed search by series title (catches shows whose label is only on the newest ep)
-        if (title.isNotBlank()) {
-            val eps = buildFromPairs(fetchSearchFeed(title))
-            if (eps.size > best.size) best = eps
-        }
-
-        // 4. HTML search page by series title
-        if (title.isNotBlank()) {
-            val eps = buildFromCards(fetchSearchPage(title))
-            if (eps.size > best.size) best = eps
-        }
-
-        // 5. Absolute fallback: this single episode
-        if (best.isEmpty()) {
-            best = listOf(newEpisode(url) { this.name = rawTitle })
-        }
-
-        val ordered = best.reversed()
-
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
+        return newAnimeLoadResponse(seriesBase, url, TvType.Anime) {
             this.posterUrl = poster
             this.plot = plot
-            addEpisodes(DubStatus.Subbed, ordered)
+            addEpisodes(DubStatus.Subbed, sorted)
         }
     }
+
+    // ---------- loadLinks ----------
 
     override suspend fun loadLinks(
         data: String,
