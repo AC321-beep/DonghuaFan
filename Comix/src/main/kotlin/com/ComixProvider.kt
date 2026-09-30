@@ -1,6 +1,5 @@
 package com.comix
 
-import android.util.Log
 import androidx.appcompat.app.AppCompatActivity
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.DubStatus
@@ -57,17 +56,17 @@ class ComixProvider : MainAPI() {
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Debug logger — every line goes through here so the whole flow can be
-    //  traced with a single tag: `ComixDebug`.
+    //  Debug logger — two channels:
+    //    • println(...)            → captured by Cloudstream's in-app log viewer
+    //    • android.util.Log.e(...) → survives R8 stripping, visible via adb
     //
-    //  To see the log on an Android device connected to a PC:
-    //      adb logcat -s ComixDebug:V
-    //  Inside the Cloudstream app itself you can also check
-    //  Settings → Debug → App Log (filters by TAG "ComixDebug").
+    //  Where to read:
+    //    Cloudstream → Settings → Debug → View Logs → filter "ComixDebug"
+    //    ADB:  adb logcat | grep ComixDebug
     // ═══════════════════════════════════════════════════════════════════════
     private fun dbg(msg: String) {
-        Log.d("ComixDebug", msg)
-        println("ComixDebug: $msg")   // also visible in Cloudstream's internal log
+        println("ComixDebug: $msg")
+        runCatching { android.util.Log.e("ComixDebug", msg) }
     }
 
     private fun dbgSection(title: String) {
@@ -219,7 +218,6 @@ class ComixProvider : MainAPI() {
     ): HomePageResponse? {
         dbgSection("getMainPage(page=$page, request='${request.data}', name='${request.name}')")
 
-        // Trending / Follows are single-page "top" queries.
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) {
                 dbg("[getMainPage] trending/follows: page>1 → returning null (not paginated)")
@@ -235,7 +233,6 @@ class ComixProvider : MainAPI() {
             return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = false)
         }
 
-        // Hot / Latest — page 1 uses SSR
         if (page == 1) {
             dbg("[getMainPage] hot/latest page 1: fetching homepage SSR…")
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
@@ -247,11 +244,10 @@ class ComixProvider : MainAPI() {
             return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = true)
         }
 
-        // Hot / Latest — page 2+ uses the API
         dbg("[getMainPage] hot/latest page $page: calling fetchQueryPage…")
         val result = fetchQueryPage(request, page)
         if (result == null) {
-            dbg("[getMainPage] ✗ fetchQueryPage returned null → returning null (page stuck here)")
+            dbg("[getMainPage] ✗ fetchQueryPage returned null → returning null")
             return null
         }
         dbg("[getMainPage] ✓ fetchQueryPage: ${result.items.size} items, hasNext=${result.hasNext}")
@@ -343,7 +339,6 @@ class ComixProvider : MainAPI() {
         }
         dbg("[fetchQueryPage] order=$orderField scope='$scopeParam' limit=$limit")
 
-        // Bootstrap WebView once
         if (cfgToken == null) {
             dbg("[fetchQueryPage] cfgToken null → bootstrapping via homepage fetch")
             runCatching { fetchHtml("$mainUrl/") }
@@ -380,7 +375,7 @@ class ComixProvider : MainAPI() {
         }
         val urlEncoded = "$mainUrl/api/v1/manga?$paramsEncoded"
 
-        // ─── Attempt 1: literal brackets + CF interceptor ──────────────────
+        // ── Attempt 1: literal brackets + CF interceptor ──────────────────
         dbg("[fetchQueryPage] ▶ Attempt 1: literal brackets + cfInterceptor")
         dbg("[fetchQueryPage] URL: $urlLiteral")
         runCatching {
@@ -396,7 +391,7 @@ class ComixProvider : MainAPI() {
             dbg("[fetchQueryPage] ✗ Attempt 1 threw: ${e.javaClass.simpleName}: ${e.message}")
         }
 
-        // ─── Attempt 2: literal brackets, no interceptor ───────────────────
+        // ── Attempt 2: literal brackets, no interceptor ───────────────────
         dbg("[fetchQueryPage] ▶ Attempt 2: literal brackets, no cfInterceptor")
         runCatching {
             app.get(urlLiteral, headers = headers).text
@@ -411,7 +406,7 @@ class ComixProvider : MainAPI() {
             dbg("[fetchQueryPage] ✗ Attempt 2 threw: ${e.javaClass.simpleName}: ${e.message}")
         }
 
-        // ─── Attempt 3: pre-encoded brackets + CF interceptor ──────────────
+        // ── Attempt 3: pre-encoded brackets + CF interceptor ──────────────
         dbg("[fetchQueryPage] ▶ Attempt 3: pre-encoded brackets + cfInterceptor")
         dbg("[fetchQueryPage] URL: $urlEncoded")
         runCatching {
@@ -427,7 +422,7 @@ class ComixProvider : MainAPI() {
             dbg("[fetchQueryPage] ✗ Attempt 3 threw: ${e.javaClass.simpleName}: ${e.message}")
         }
 
-        // ─── Attempt 4: pre-encoded brackets, no interceptor ───────────────
+        // ── Attempt 4: pre-encoded brackets, no interceptor ───────────────
         dbg("[fetchQueryPage] ▶ Attempt 4: pre-encoded brackets, no cfInterceptor")
         runCatching {
             app.get(urlEncoded, headers = headers).text
@@ -458,7 +453,6 @@ class ComixProvider : MainAPI() {
             return null
         }
 
-        // Bare array
         runCatching { JSONArray(trimmed) }.getOrNull()?.let { arr ->
             val items = arrToResults(arr)
             dbg("[parsePageResponse] bare array: ${items.size} items")
@@ -471,7 +465,6 @@ class ComixProvider : MainAPI() {
             return null
         }
 
-        // Envelope: {status, result:{items, meta}}
         root.optJSONObject("result")?.let { result ->
             result.optJSONArray("items")?.let { itemsArr ->
                 val items = arrToResults(itemsArr)
@@ -524,7 +517,7 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        dbg("[parsePageResponse] ✗ no items array found in response. Keys: ${root.keys().asSequence().toList()}")
+        dbg("[parsePageResponse] ✗ no items array found. Keys: ${root.keys().asSequence().toList()}")
         return null
     }
 
@@ -567,7 +560,7 @@ class ComixProvider : MainAPI() {
         if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  load()
+    //  load() — never returns null just because chapters list is empty
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
         dbg("[load] url=$url")
@@ -579,10 +572,6 @@ class ComixProvider : MainAPI() {
 
         val document = Jsoup.parse(html)
         val initialData = extractInitialDataJson(document)
-        if (initialData == null) {
-            dbg("[load] ✗ no initial-data")
-            return null
-        }
 
         val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
 
@@ -625,7 +614,7 @@ class ComixProvider : MainAPI() {
         }
 
         var detail: JSONObject? = null
-        initialData.optJSONObject("queries")?.let { queries ->
+        initialData?.optJSONObject("queries")?.let { queries ->
             val keys = queries.keys()
             while (keys.hasNext()) {
                 val k = keys.next()
@@ -637,30 +626,38 @@ class ComixProvider : MainAPI() {
             }
         }
         val d = detail
-        if (d == null) {
-            dbg("[load] ✗ no detail query")
-            return null
+
+        val fallbackTitle: String = run {
+            val slug = url.substringAfter("/title/", "").substringAfter("-", "")
+            val guess = slug.replace('-', ' ').trim()
+            if (guess.isBlank()) "Untitled" else
+                guess.split(' ').joinToString(" ") { w ->
+                    if (w.isEmpty()) w else w[0].uppercase() + w.drop(1)
+                }
         }
 
-        val mangaTitle = d.optString("title").takeIf { it.isNotBlank() } ?: return null
-        val posterUrl = d.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
-            ?: d.optJSONObject("poster")?.optString("medium")
-        val plot = d.optString("synopsis").takeIf { it.isNotBlank() }
-        val statusStr = d.optString("status").takeIf { it.isNotBlank() }
-        val yearInt = d.optInt("year", 0).takeIf { it > 0 }
+        val mangaTitle = d?.optString("title")?.takeIf { it.isNotBlank() } ?: fallbackTitle
+        val posterUrl = d?.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
+            ?: d?.optJSONObject("poster")?.optString("medium")
+        val plot = d?.optString("synopsis")?.takeIf { it.isNotBlank() }
+        val statusStr = d?.optString("status")?.takeIf { it.isNotBlank() }
+        val yearInt = d?.optInt("year", 0)?.takeIf { it > 0 }
 
         val genres = buildList {
-            listOf("genres", "tags", "demographics", "formats").forEach { f ->
-                d.optJSONArray(f)?.let { arr ->
-                    for (i in 0 until arr.length()) {
-                        arr.optJSONObject(i)?.optString("title")?.takeIf { it.isNotBlank() }?.let { add(it) }
+            if (d != null) {
+                listOf("genres", "tags", "demographics", "formats").forEach { f ->
+                    d.optJSONArray(f)?.let { arr ->
+                        for (i in 0 until arr.length()) {
+                            arr.optJSONObject(i)?.optString("title")
+                                ?.takeIf { it.isNotBlank() }?.let { add(it) }
+                        }
                     }
                 }
             }
         }.distinct()
 
-        val latestChapterNum = d.optInt("latestChapter", 0)
-        val firstChapterUrl  = d.optString("firstChapterUrl").takeIf { it.isNotBlank() }
+        val latestChapterNum = d?.optInt("latestChapter", 0) ?: 0
+        val firstChapterUrl  = d?.optString("firstChapterUrl")?.takeIf { it.isNotBlank() }
         val startsAtZero = firstChapterUrl?.contains("-chapter-0", ignoreCase = true) == true
         val startCh = if (startsAtZero) 0 else 1
 
@@ -684,10 +681,8 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        if (episodes.isEmpty()) {
-            dbg("[load] ✗ 0 episodes")
-            return null
-        }
+        // NEVER return null because of empty episodes. Titles legitimately
+        // exist with 0 chapters (newly-added, finished, "other"-type pages).
         dbg("[load] ✓ title='$mangaTitle' episodes=${episodes.size}")
 
         return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
@@ -700,7 +695,9 @@ class ComixProvider : MainAPI() {
                 "releasing", "ongoing", "on_hiatus" -> ShowStatus.Ongoing
                 else -> null
             }
-            addEpisodes(DubStatus.Subbed, episodes)
+            if (episodes.isNotEmpty()) {
+                addEpisodes(DubStatus.Subbed, episodes)
+            }
         }
     }
 
