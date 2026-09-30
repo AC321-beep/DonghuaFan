@@ -2,7 +2,13 @@ package com.dongsub
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
@@ -29,19 +35,8 @@ class DongsubProvider : MainAPI() {
         "Origin" to mainUrl
     )
 
-    // ═══════════════════════════════════════════════════════════════════
-    //  Home-page caches
-    //  ─ getMainPage(N) is called by CloudStream one at a time; we can't
-    //    make the app call them in parallel. But we can prefetch pages
-    //    in the background from inside getMainPage(1) so later calls
-    //    hit a warm cache.
-    //  ─ Blogger supports offset pagination via ?start=N, so page URLs
-    //    are known upfront and can be fetched concurrently.
-    // ═══════════════════════════════════════════════════════════════════
-
     private companion object {
         const val PER_PAGE = 20
-        const val LOOKAHEAD = 4
         const val FEED_LIMIT = 100
         val GENERIC_LABELS = setOf(
             "donghua", "anime", "episode", "episodes", "series",
@@ -49,13 +44,21 @@ class DongsubProvider : MainAPI() {
         )
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    //  Home-page cache
+    //
+    //  CloudStream calls getMainPage(N) one at a time — the app can't be
+    //  made to call them in parallel. But Blogger supports offset
+    //  pagination via ?start=N, so each page's URL is known upfront.
+    //  We fetch pages as needed, in parallel, and memoize the results.
+    // ═══════════════════════════════════════════════════════════════════
+
     private data class PageCache(
         val items: List<AnimeSearchResponse>,
         val hasNext: Boolean
     )
 
     private val htmlLock = Mutex()
-    private val prefetchScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val pageDeferreds = mutableMapOf<Int, Deferred<Document?>>()
     private val builtPages = mutableMapOf<Int, PageCache>()
     private var highestBuiltPage = 0
@@ -154,21 +157,25 @@ class DongsubProvider : MainAPI() {
             }
         }
 
-        // ── Phase 1: ensure pages 1..page are fetched (in parallel).
-        // Memoized via Deferred, so if the background prefetch already
-        // got them, these awaits return instantly.
-        val docs: Map<Int, Document?> = coroutineScope {
-            (1..page).associateWith { p ->
-                async { getPageHtml(p, request) }
-            }.mapValues { (_, d) -> d.await() }
+        // Which pages still need HTML? Only the ones we haven't built yet.
+        val toFetch = htmlLock.withLock {
+            (highestBuiltPage + 1..page).toList()
         }
 
-        // ── Phase 2: build deduped responses in page order.
-        // Order matters: whichever page claims a series first keeps it.
+        // Fetch missing pages in parallel — each is a single canonical URL.
+        if (toFetch.isNotEmpty()) {
+            coroutineScope {
+                toFetch.map { p -> async { getPageHtml(p, request) } }.awaitAll()
+            }
+        }
+
+        // Build in page order so dedup claims series deterministically.
         htmlLock.withLock {
             var p = highestBuiltPage + 1
             while (p <= page) {
-                val doc = docs[p] ?: break
+                val d = pageDeferreds[p] ?: break
+                if (!d.isCompleted) break
+                val doc = try { d.getCompleted() } catch (_: Exception) { null } ?: break
                 val items = parseCards(doc)
                     .filter { globallySeenSeries.add(seriesKey(it.name)) }
                 val hasNext = doc.selectFirst("#blog-pager-older-link a[href]") != null
@@ -178,31 +185,25 @@ class DongsubProvider : MainAPI() {
             }
         }
 
-        // ── Phase 3: warm the next few pages in the background (fire-and-forget).
-        if (page == 1) {
-            prefetchScope.launch {
-                (2..(1 + LOOKAHEAD)).forEach { p ->
-                    launch { getPageHtml(p, request) }
-                }
-            }
-        }
-
         val cached = builtPages[page]
             ?: return newHomePageResponse(request.name, emptyList())
         return newHomePageResponse(request.name, cached.items, cached.hasNext)
     }
 
     /**
-     * Fetches the HTML for page [p] using Blogger's offset pagination.
-     * Returns a memoized Deferred so concurrent callers share one request.
-     * Awaiting a completed Deferred is instant.
+     * Fetch the HTML for page [p].
+     *
+     *  - Page 1 uses the canonical URL (no `start` param). Blogger
+     *    301-redirects `?start=0`, which doubles first-page latency.
+     *  - Page N>1 uses `?max-results=20&start=(N-1)*20`.
+     *  - Memoized via Deferred so concurrent callers share one request.
      */
     private suspend fun getPageHtml(p: Int, request: MainPageRequest): Document? {
         val deferred = htmlLock.withLock {
             pageDeferreds.getOrPut(p) {
-                prefetchScope.async(Dispatchers.IO) {
-                    val offset = (p - 1) * PER_PAGE
-                    val url = "$mainUrl/${request.data}?max-results=$PER_PAGE&start=$offset"
+                GlobalScope.async(Dispatchers.IO) {
+                    val base = "$mainUrl/${request.data}?max-results=$PER_PAGE"
+                    val url = if (p == 1) base else "$base&start=${(p - 1) * PER_PAGE}"
                     try {
                         app.get(url, headers = defaultHeaders).document
                     } catch (_: Exception) {
@@ -211,11 +212,8 @@ class DongsubProvider : MainAPI() {
                 }
             }
         }
-        val doc = deferred.await()
-        // Drop failed fetches so a later attempt can retry.
-        if (doc == null) {
-            htmlLock.withLock { pageDeferreds.remove(p) }
-        }
+        val doc = try { deferred.await() } catch (_: Exception) { null }
+        if (doc == null) htmlLock.withLock { pageDeferreds.remove(p) }
         return doc
     }
 
@@ -432,7 +430,7 @@ class DongsubProvider : MainAPI() {
 
         val anchor = extractSeriesAnchor(doc)
 
-        // ── Parallel: search feed + label feed fetched concurrently.
+        // Parallel: search feed + label feed fetched concurrently.
         val (searchCandidates, labelCandidates) = coroutineScope {
             val sJob = async {
                 if (seriesBase.isNotBlank()) fetchSearchFeed(seriesBase) else emptyList()
@@ -444,7 +442,7 @@ class DongsubProvider : MainAPI() {
         }
         val candidates = (searchCandidates + labelCandidates).toMutableList()
 
-        // Fallback: HTML scrape the label page only if feeds came back thin.
+        // Fallback: HTML scrape only if feeds came back thin.
         val distinctUrls = candidates.asSequence()
             .map { canonicalUrl(it.second) }.toHashSet().size
         if (distinctUrls < 2 && anchor != null) {
@@ -452,9 +450,9 @@ class DongsubProvider : MainAPI() {
             fetchLabelPage(href ?: label).forEach { candidates.add(it.name to it.url) }
         }
 
-        // ── SAFETY: never fall back to raw candidates. The anchor can be a
-        // generic label ("Donghua", "Episode") whose feed returns the whole
-        // site; picking it wholesale would merge every show into one list.
+        // SAFETY: never fall back to raw candidates. A generic anchor
+        // ("Donghua", "Episode") returns the whole site and would merge
+        // every show into one episode list.
         val exact = candidates.filter { (t, _) ->
             parseTitle(t).base.equals(seriesBase, ignoreCase = true)
         }
@@ -469,7 +467,7 @@ class DongsubProvider : MainAPI() {
             }
         }
 
-        // ── Triple-layer episode dedup.
+        // Triple-layer episode dedup.
         val seenUrls = mutableSetOf<String>()
         val seenEpKeys = mutableSetOf<String>()
         val seenNames = mutableSetOf<String>()
