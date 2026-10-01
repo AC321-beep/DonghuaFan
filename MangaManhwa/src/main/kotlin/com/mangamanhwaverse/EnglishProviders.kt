@@ -1,6 +1,6 @@
 package com.mangamanhwaverse
 
-// Madara theme
+// ── Madara (15) ──────────────────────────────────────────────
 class Manhuanext       : ThemeBasedProvider(Themes.Madara, "Manhuanext", "https://manhuanext.com")
 class HunlightScans    : ThemeBasedProvider(Themes.Madara, "HunlightScans", "https://hunlightscans.com")
 class Toonily          : ThemeBasedProvider(Themes.Madara, "Toonily", "https://toonily.com")
@@ -17,7 +17,7 @@ class MangaBob         : ThemeBasedProvider(Themes.Madara, "MangaBob", "https://
 class HiveScans        : ThemeBasedProvider(Themes.Madara, "HiveScans", "https://hivescans.com")
 class AsuraScans       : ThemeBasedProvider(Themes.Madara, "AsuraScans", "https://asurascans.com")
 
-// MangaThemesia theme
+// ── MangaThemesia (9) ────────────────────────────────────────
 class ManhwaFreakXyz   : ThemeBasedProvider(Themes.MangaThemesia, "ManhwaFreakXyz", "https://manhwafreak.xyz")
 class IgnisComic       : ThemeBasedProvider(Themes.MangaThemesia, "IgnisComic", "https://igniscomic.com")
 class MangaKakalot     : ThemeBasedProvider(Themes.MangaThemesia, "MangaKakalot", "https://mangakakalot.com")
