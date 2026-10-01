@@ -1,9 +1,13 @@
 package com.mangamanhwaverse
 
+import android.webkit.CookieManager
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import okhttp3.Interceptor
+import okhttp3.Request
+import okhttp3.Response
 import org.jsoup.nodes.Document
 import java.net.URI
 
@@ -39,10 +43,43 @@ abstract class MangaManhwaProvider : MainAPI() {
     override val hasQuickSearch = true
     override val hasDownloadSupport = false
 
+    /** Multi-host CF pattern. Theme providers override to cover fallback URLs. */
     protected open val cfPattern: Regex
         get() = Regex(".*${hostOf(baseUrl)}.*")
 
-    private val cfInterceptor by lazy { WebViewResolver(cfPattern) }
+    private val cfResolver = WebViewResolver(cfPattern)
+
+    /**
+     * Unified interceptor:
+     *   1. Strips X-Requested-With (CF fingerprint signal)
+     *   2. Applies the per-host WebView UA (syncs with CFSolver)
+     *   3. Injects WebView cookies (set by WebViewResolver OR CFSolver)
+     *   4. Delegates to WebViewResolver for silent challenge solving
+     */
+    private val unifiedInterceptor: Interceptor by lazy {
+        Interceptor { chain ->
+            val original = chain.request()
+            val modified = original.newBuilder().apply {
+                removeHeader("X-Requested-With")
+
+                CFState.userAgentFor(original.url.host)?.let {
+                    header("User-Agent", it)
+                }
+
+                val cookies = CookieManager
+                    .getInstance()
+                    .getCookie(original.url.toString())
+                if (!cookies.isNullOrEmpty()) {
+                    header("Cookie", cookies)
+                }
+            }.build()
+
+            // Hand the modified request to the CF resolver
+            cfResolver.intercept(object : Interceptor.Chain by chain {
+                override fun request(): Request = modified
+            })
+        }
+    }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val items = runCatching {
@@ -103,15 +140,37 @@ abstract class MangaManhwaProvider : MainAPI() {
 
     protected suspend fun fetch(url: String, referer: String? = baseUrl): Document? {
         val absolute = if (url.startsWith("http")) url else abs(url)
+
         return runCatching {
-            app.get(
+            var doc = app.get(
                 absolute,
-                interceptor = cfInterceptor,
+                interceptor = unifiedInterceptor,
                 referer = referer,
                 headers = browserHeaders()
             ).document
+
+            // If WebViewResolver failed silently and we're still on a CF page,
+            // fall back to the visible CFSolver dialog.
+            if (isCfChallenge(doc)) {
+                log("CF challenge persists after silent solve — invoking dialog")
+                val solved = CFSolver(absolute).solve()
+                if (solved) {
+                    doc = app.get(
+                        absolute,
+                        interceptor = unifiedInterceptor,
+                        referer = referer,
+                        headers = browserHeaders()
+                    ).document
+                }
+            }
+            doc
         }.onFailure {
-            logErr("fetch failed $absolute: ${it.message}", it)
+            val msg = it.message ?: ""
+            if (msg.contains("SSL", true) || msg.contains("TLS", true)) {
+                log("fetch skipped (TLS): $absolute")
+            } else {
+                logErr("fetch failed $absolute: $msg", it)
+            }
         }.getOrNull()
     }
 
@@ -124,11 +183,25 @@ abstract class MangaManhwaProvider : MainAPI() {
             "User-Agent" to UA,
             "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language" to "en-US,en;q=0.5",
+            "Sec-Ch-Ua" to "\"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"122\", \"Chromium\";v=\"122\"",
+            "Sec-Ch-Ua-Mobile" to "?0",
+            "Sec-Ch-Ua-Platform" to "\"Windows\"",
             "Sec-Fetch-Dest" to "document",
             "Sec-Fetch-Mode" to "navigate",
             "Sec-Fetch-Site" to "none",
+            "Sec-Fetch-User" to "?1",
             "Upgrade-Insecure-Requests" to "1"
         ) + extra
+
+    protected fun isCfChallenge(doc: Document): Boolean {
+        val title = doc.title()
+        return title.contains("Just a moment", true) ||
+               title.contains("Attention Required", true) ||
+               title.contains("Checking your browser", true) ||
+               doc.selectFirst("div#cf-challenge-running") != null ||
+               doc.selectFirst("form#challenge-form") != null ||
+               doc.html().contains("cf-chl-")
+    }
 
     protected fun log(msg: String) {
         if (Settings.verboseLog()) android.util.Log.d("MangaManhwa/$name", msg)
