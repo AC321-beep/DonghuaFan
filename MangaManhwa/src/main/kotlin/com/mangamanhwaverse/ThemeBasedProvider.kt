@@ -50,7 +50,7 @@ open class ThemeBasedProvider(
         return if (Settings.dataSaver()) raw.map(::shrink) else raw
     }
 
-    // ── Parsing (inside the class so `this` is a MainAPI receiver) ──
+    // ── Parsing (uses `newAnimeSearchResponse` like Comix) ──
 
     private fun parseList(doc: Document): List<SearchResponse> =
         doc.select(config.listSelector).mapNotNull { el ->
@@ -59,7 +59,7 @@ open class ThemeBasedProvider(
             val title = (el.selectFirst(config.titleSelector)?.text()?.trim()
                 ?: a.text().trim()).takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val poster = el.selectFirst(config.imageSelector)?.let(::img)?.let { abs(it) }
-            newMovieSearchResponse(title, abs(href), TvType.Others).apply {
+            newAnimeSearchResponse(title, abs(href), TvType.Anime).apply {
                 posterUrl = poster
             }
         }
