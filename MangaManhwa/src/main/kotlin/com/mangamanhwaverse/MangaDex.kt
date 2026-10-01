@@ -6,10 +6,10 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
 
 class MangaDex : MangaManhwaProvider() {
-    override val name = "MangaDex"
-    override val mainUrl = "https://mangadex.org"
+    override var name = "MangaDex"
+    override var mainUrl = "https://mangadex.org"
     override val baseUrl = "https://api.mangadex.org"
-    override val lang = "en"
+    override var lang = "en"
 
     @Serializable private data class ListDto(val data: List<MangaDto> = emptyList())
     @Serializable private data class MangaDto(val id: String, val attributes: Attrs)
@@ -19,6 +19,7 @@ class MangaDex : MangaManhwaProvider() {
     @Serializable private data class ChapAttrs(val chapter: String? = null, val title: String? = null)
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true; coerceInputValues = true }
+
     private suspend fun getText(url: String): String? =
         runCatching { app.get(url, headers = browserHeaders()).text }.getOrNull()
 
@@ -28,15 +29,16 @@ class MangaDex : MangaManhwaProvider() {
         return dto?.data.orEmpty().map { m ->
             newMovieSearchResponse(
                 m.attributes.title["en"] ?: m.attributes.title.values.firstOrNull() ?: "Unknown",
-                "https://mangadex.org/title/${m.id}", TvType.Manga
+                "https://mangadex.org/title/${m.id}", TvType.Others
             ).apply { posterUrl = "https://uploads.mangadex.org/covers/${m.id}" }
         }
     }
 
-    override suspend fun popular(page: Int) = list(
+    override suspend fun popular(page: Int): List<SearchResponse> = list(
         "$baseUrl/manga?limit=30&offset=${(page - 1) * 30}&order[followedCount]=desc"
     )
-    override suspend fun search(query: String, page: Int) = list(
+
+    override suspend fun searchPage(query: String, page: Int): List<SearchResponse> = list(
         "$baseUrl/manga?limit=30&offset=${(page - 1) * 30}&title=$query"
     )
 
@@ -47,7 +49,7 @@ class MangaDex : MangaManhwaProvider() {
         val dto = runCatching { json.decodeFromString<ChaptersDto>(raw) }.getOrNull()
         return dto?.data.orEmpty().map { c ->
             newEpisode("https://mangadex.org/chapter/${c.id}") {
-                name = "Ch. ${c.attributes.chapter ?: "?"} ${c.attributes.title.orEmpty()}".trim()
+                this.name = "Ch. ${c.attributes.chapter ?: "?"} ${c.attributes.title.orEmpty()}".trim()
             }
         }
     }
