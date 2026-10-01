@@ -47,6 +47,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.DataNode
 import org.jsoup.nodes.Element
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -209,17 +210,16 @@ class ComixProvider : MainAPI() {
             return null
         }
         dbg("[cipher] got ${rawHtml.length} chars")
-
-        val modifiedHtml = try {
-            val doc = Jsoup.parse(rawHtml, mainUrl)
-            val scriptTag = doc.createElement("script")
-            scriptTag.data(CAPTURE_SCRIPT)
-            doc.head().prependChild(scriptTag)
-            doc.outerHtml()
-        } catch (t: Throwable) {
-            dbg("[cipher] inject failed: ${t.message}")
-            return null
-        }
+val modifiedHtml = try {
+    val doc = Jsoup.parse(rawHtml, mainUrl)
+    val scriptTag = doc.createElement("script")
+    scriptTag.appendChild(DataNode(CAPTURE_SCRIPT))
+    doc.head().prependChild(scriptTag)
+    doc.outerHtml()
+} catch (t: Throwable) {
+    dbg("[cipher] inject failed: ${t.message}")
+    return null
+}
         dbg("[cipher] hook injected into <head>")
 
         return withContext(Dispatchers.Main) {
