@@ -3,6 +3,7 @@ package com.mangamanhwaverse
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.network.WebViewResolver
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -17,10 +18,10 @@ import java.net.URLEncoder
 
 class ComixProvider : MangaManhwaProvider() {
 
-    override val name = "Comix"
-    override val mainUrl = "https://comix.to"
-    override val baseUrl = mainUrl
-    override val lang = "en"
+    override var name = "Comix"
+    override var mainUrl = "https://comix.to"
+    override val baseUrl = "https://comix.to"
+    override var lang = "en"
 
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
@@ -47,12 +48,17 @@ class ComixProvider : MangaManhwaProvider() {
         return loadCachedCipher()?.also { cipher = it }
     }
 
+    // ═════════════════════════════════════════════════════════════════
+    //  Cipher capture
+    // ═════════════════════════════════════════════════════════════════
     @android.annotation.SuppressLint("SetJavaScriptEnabled")
-    private suspend fun captureCipherMaterial(): CipherMaterial? = withContext(Dispatchers.Main) {
+    private suspend fun captureCipherMaterial(): CipherMaterial? {
         val activity = CommonActivity.activity as? androidx.appcompat.app.AppCompatActivity
-            ?: return@withContext null
+            ?: return null
 
-        kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+        val deferred = CompletableDeferred<CipherMaterial?>()
+
+        withContext(Dispatchers.Main) {
             val web = android.webkit.WebView(activity)
             val done = java.util.concurrent.atomic.AtomicBoolean(false)
             val handler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -66,7 +72,7 @@ class ComixProvider : MangaManhwaProvider() {
                 runCatching { web.stopLoading() }
                 runCatching { web.loadUrl("about:blank") }
                 runCatching { web.destroy() }
-                if (cont.isActive) cont.resume(result)
+                deferred.complete(result)
             }
 
             web.settings.apply {
@@ -85,15 +91,18 @@ class ComixProvider : MangaManhwaProvider() {
             }, "ComixCipherBridge")
 
             web.webViewClient = object : android.webkit.WebViewClient() {
-                override fun onPageStarted(view: android.webkit.WebView?, url: String?, f: android.graphics.Bitmap?) {
+                override fun onPageStarted(
+                    view: android.webkit.WebView?,
+                    url: String?,
+                    favicon: android.graphics.Bitmap?
+                ) {
                     view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                 }
+
                 override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
                     view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                 }
             }
-
-            cont.invokeOnCancellation { finish(null) }
 
             timeoutRunnable = Runnable { finish(null) }
                 .also { handler.postDelayed(it, 30_000L) }
@@ -102,20 +111,24 @@ class ComixProvider : MangaManhwaProvider() {
                 override fun run() {
                     if (done.get()) return
                     web.evaluateJavascript(CAPTURE_SCRIPT, null)
-                    web.evaluateJavascript("""
+                    web.evaluateJavascript(
+                        """
                         (function(){
                           if (window.__comixTriggered) return;
                           var el = document.querySelector('.npager a, a[href*="/browse"], a[href*="/title/"]');
                           if (el) { window.__comixTriggered = true; el.click(); }
                           else { window.scrollTo(0, document.body.scrollHeight); }
                         })();
-                    """.trimIndent(), null)
+                        """.trimIndent(), null
+                    )
                     handler.postDelayed(this, 800L)
                 }
             }.also { handler.postDelayed(it, 800L) }
 
             web.loadUrl(mainUrl)
         }
+
+        return deferred.await()
     }
 
     private suspend fun ensureCipher(): ComixCipher? {
@@ -125,6 +138,9 @@ class ComixProvider : MangaManhwaProvider() {
         return ComixCipher(mat).also { cipher = it }
     }
 
+    // ═════════════════════════════════════════════════════════════════
+    //  HTTP helpers
+    // ═════════════════════════════════════════════════════════════════
     private suspend fun fetchHtml(url: String): String = runCatching {
         RateLimiter.acquire(RateLimiter.hostOf(url), 3)
         app.get(url, interceptor = cfInterceptor, headers = browserHeaders()).text
@@ -134,11 +150,11 @@ class ComixProvider : MangaManhwaProvider() {
         val c = cachedCipher() ?: return null
         return try {
             val canonical = params.toSortedMap().entries.joinToString("&") { (rawName, values) ->
-                val name = rawName.removeSuffix("[]")
+                val key = rawName.removeSuffix("[]")
                 if (values.size == 1 && !rawName.endsWith("[]")) {
-                    "$name=${values.single().trim()}"
+                    "$key=${values.single().trim()}"
                 } else {
-                    values.mapIndexed { i, v -> "$name[$i]=${v.trim()}" }.joinToString("&")
+                    values.mapIndexed { i, v -> "$key[$i]=${v.trim()}" }.joinToString("&")
                 }
             }
             val token = c.sign(path, canonical)
@@ -147,15 +163,15 @@ class ComixProvider : MangaManhwaProvider() {
                 append(mainUrl).append(path).append("?")
                 var first = true
                 params.toSortedMap().forEach { (rawName, values) ->
-                    val name = rawName.removeSuffix("[]")
+                    val key = rawName.removeSuffix("[]")
                     fun emit(k: String, v: String) {
                         if (!first) append("&"); first = false
                         append(URLEncoder.encode(k, "UTF-8"))
                             .append("=")
                             .append(URLEncoder.encode(v.trim(), "UTF-8"))
                     }
-                    if (values.size == 1 && !rawName.endsWith("[]")) emit(name, values.single())
-                    else values.forEachIndexed { i, v -> emit("$name[$i]", v) }
+                    if (values.size == 1 && !rawName.endsWith("[]")) emit(key, values.single())
+                    else values.forEachIndexed { i, v -> emit("$key[$i]", v) }
                 }
                 if (!first) append("&")
                 append("_=").append(URLEncoder.encode(token, "UTF-8"))
@@ -184,6 +200,9 @@ class ComixProvider : MangaManhwaProvider() {
         }
     }
 
+    // ═════════════════════════════════════════════════════════════════
+    //  JSON parsing
+    // ═════════════════════════════════════════════════════════════════
     private fun extractInitial(doc: Document): JSONObject? {
         val script = doc.selectFirst("script#initial-data") ?: return null
         val text = script.data().ifBlank { script.html() }.trim()
@@ -197,12 +216,15 @@ class ComixProvider : MangaManhwaProvider() {
             ?: return null
         val poster = obj.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
             ?: obj.optJSONObject("poster")?.optString("medium")
-        val res = newMovieSearchResponse(title, fixUrl(rel), TvType.Manga)
+        val res = newMovieSearchResponse(title, fixUrl(rel), TvType.Others)
         poster?.let { res.posterUrl = fixUrl(it) }
         return res
     }
 
-    private fun readQueries(initial: JSONObject, matcher: (JSONArray) -> Boolean): List<SearchResponse> {
+    private fun readQueries(
+        initial: JSONObject,
+        matcher: (JSONArray) -> Boolean
+    ): List<SearchResponse> {
         val queries = initial.optJSONObject("queries") ?: return emptyList()
         val keys = queries.keys()
         while (keys.hasNext()) {
@@ -214,35 +236,49 @@ class ComixProvider : MangaManhwaProvider() {
                 is JSONObject -> v.optJSONArray("items")
                 else -> null
             } ?: continue
-            val out = (0 until arr.length()).mapNotNull { parseCard(arr.optJSONObject(it) ?: return@mapNotNull null) }
+            val out = (0 until arr.length()).mapNotNull {
+                val o = arr.optJSONObject(it) ?: return@mapNotNull null
+                parseCard(o)
+            }
             if (out.isNotEmpty()) return out
         }
         return emptyList()
     }
 
+    // ═════════════════════════════════════════════════════════════════
+    //  MangaManhwaProvider implementation
+    // ═════════════════════════════════════════════════════════════════
     override suspend fun popular(page: Int): List<SearchResponse> {
         ensureCipher()
+
         val params = mapOf(
             "scope" to listOf("hot"),
             "page" to listOf(page.toString()),
             "order[chapter_updated_at]" to listOf("desc"),
             "limit" to listOf("28"),
         )
+
         cachedCipher()?.let {
             getSigned("/api/v1/manga", params)?.let { body ->
                 val root = runCatching { JSONObject(body) }.getOrNull()
                 val arr = root?.optJSONObject("result")?.optJSONArray("items")
                     ?: root?.optJSONArray("items")
                 if (arr != null) {
-                    val items = (0 until arr.length()).mapNotNull { parseCard(arr.optJSONObject(it) ?: return@mapNotNull null) }
+                    val items = (0 until arr.length()).mapNotNull {
+                        val o = arr.optJSONObject(it) ?: return@mapNotNull null
+                        parseCard(o)
+                    }
                     if (items.isNotEmpty()) return items
                 }
             }
         }
+
         val html = fetchHtml("$mainUrl/")
         val doc = Jsoup.parse(html)
         extractInitial(doc)?.let { initial ->
-            val items = readQueries(initial) { k -> k.length() >= 3 && k.optString(0) == "manga" }
+            val items = readQueries(initial) { k ->
+                k.length() >= 3 && k.optString(0) == "manga"
+            }
             if (items.isNotEmpty()) return items
         }
         return emptyList()
@@ -250,20 +286,24 @@ class ComixProvider : MangaManhwaProvider() {
 
     override suspend fun latest(page: Int): List<SearchResponse> = popular(page)
 
-    override suspend fun search(query: String, page: Int): List<SearchResponse> {
+    override suspend fun searchPage(query: String, page: Int): List<SearchResponse> {
         val url = "$mainUrl/browse?q=${URLEncoder.encode(query, "UTF-8")}"
         val html = fetchHtml(url)
         if (html.isBlank()) return emptyList()
         val doc = Jsoup.parse(html)
+
         extractInitial(doc)?.let { initial ->
-            val items = readQueries(initial) { k -> k.length() >= 1 && k.optString(0) == "manga" }
+            val items = readQueries(initial) { k ->
+                k.length() >= 1 && k.optString(0) == "manga"
+            }
             if (items.isNotEmpty()) return items
         }
+
         return doc.select("a[href*='/title/']").mapNotNull { a ->
             val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val title = a.selectFirst("h3, .title")?.text()?.trim()
                 ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            newMovieSearchResponse(title, fixUrl(href), TvType.Manga)
+            newMovieSearchResponse(title, fixUrl(href), TvType.Others)
         }.distinctBy { it.url }
     }
 
@@ -273,9 +313,11 @@ class ComixProvider : MangaManhwaProvider() {
         val doc = Jsoup.parse(html)
 
         val chapters = mutableMapOf<Double, Pair<String, String>>()
+
         doc.select("a.mchap-row__primary, a[href*='-chapter-']").forEach { a ->
             val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
-            val m = Regex("""-chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return@forEach
+            val m = Regex("""-chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href)
+                ?: return@forEach
             val num = m.groupValues[1].toDoubleOrNull() ?: return@forEach
             if (!chapters.containsKey(num)) {
                 chapters[num] = (a.text().trim().ifBlank { "Ch. $num" }) to href
@@ -286,25 +328,35 @@ class ComixProvider : MangaManhwaProvider() {
         doc.select(".npager__num").forEach { el ->
             (el.text().toIntOrNull() ?: 1).let { if (it > maxPage) maxPage = it }
         }
+
         if (maxPage > 1) {
             val pages = (2..maxPage).toList().chunked(5)
             for (batch in pages) {
                 coroutineScope {
                     batch.map { p ->
                         async {
-                            val u = if (mangaUrl.contains("?")) "$mangaUrl&page=$p" else "$mangaUrl?page=$p"
+                            val u = if (mangaUrl.contains("?")) "$mangaUrl&page=$p"
+                                    else "$mangaUrl?page=$p"
                             val h = runCatching { fetchHtml(u) }.getOrDefault("")
                             if (h.isNotBlank()) {
-                                Jsoup.parse(h).select("a[href*='-chapter-']").forEach { a ->
-                                    val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
-                                    val m = Regex("""-chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return@forEach
-                                    val num = m.groupValues[1].toDoubleOrNull() ?: return@forEach
-                                    synchronized(chapters) {
-                                        if (!chapters.containsKey(num)) {
-                                            chapters[num] = (a.text().trim().ifBlank { "Ch. $num" }) to href
+                                Jsoup.parse(h)
+                                    .select("a[href*='-chapter-']")
+                                    .forEach { a ->
+                                        val href = a.attr("href")
+                                            .takeIf { it.isNotBlank() } ?: return@forEach
+                                        val m = Regex(
+                                            """-chapter-([\d.]+)""",
+                                            RegexOption.IGNORE_CASE
+                                        ).find(href) ?: return@forEach
+                                        val num = m.groupValues[1].toDoubleOrNull()
+                                            ?: return@forEach
+                                        synchronized(chapters) {
+                                            if (!chapters.containsKey(num)) {
+                                                chapters[num] =
+                                                    (a.text().trim().ifBlank { "Ch. $num" }) to href
+                                            }
                                         }
                                     }
-                                }
                             }
                         }
                     }.awaitAll()
@@ -312,9 +364,9 @@ class ComixProvider : MangaManhwaProvider() {
             }
         }
 
-        return chapters.toSortedMap().mapIndexed { i, (num, pair) ->
-            newEpisode(fixUrl(pair.second)) {
-                this.name = pair.first
+        return chapters.toSortedMap().entries.mapIndexed { i, entry ->
+            newEpisode(fixUrl(entry.value.second)) {
+                this.name = entry.value.first
                 this.episode = i + 1
             }
         }
@@ -328,7 +380,8 @@ class ComixProvider : MangaManhwaProvider() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val activity = CommonActivity.activity as? androidx.appcompat.app.AppCompatActivity ?: return false
+        val activity = CommonActivity.activity as? androidx.appcompat.app.AppCompatActivity
+            ?: return false
         val chapterName = Regex("-chapter-([\\d.]+)").find(data)
             ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
         activity.runOnUiThread {
