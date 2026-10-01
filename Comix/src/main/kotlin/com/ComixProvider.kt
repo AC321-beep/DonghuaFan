@@ -1,9 +1,17 @@
 package com.comix
 
+import android.annotation.SuppressLint
+import android.graphics.Bitmap
+import android.os.Handler
+import android.os.Looper
+import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.DubStatus
-import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.MainAPI
@@ -23,15 +31,22 @@ import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.ByteArrayInputStream
+import java.io.File
 import java.net.URLEncoder
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
 
 class ComixProvider : MainAPI() {
 
@@ -52,6 +67,10 @@ class ComixProvider : MainAPI() {
     )
 
     @Volatile private var cfgToken: String? = null
+
+    /** Per-request signed API cipher. Captured lazily from the site's JS. */
+    @Volatile private var cipher: ComixCipher? = null
+    @Volatile private var captureInFlight = false
 
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
@@ -97,6 +116,222 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    //  Cipher capture + signed API
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private val cipherCacheFile: File?
+        get() {
+            val ctx = CommonActivity.activity ?: return null
+            return File(ctx.cacheDir, "comix_cipher.json")
+        }
+
+    private fun loadCachedCipher(): ComixCipher? {
+        val f = cipherCacheFile ?: return null
+        if (!f.exists() || f.length() == 0L) return null
+        return runCatching {
+            val mat = CipherMaterial.fromJson(JSONObject(f.readText())) ?: return null
+            ComixCipher(mat).also { dbg("[cipher] loaded from disk cache") }
+        }.getOrNull()
+    }
+
+    private fun saveCachedCipher(mat: CipherMaterial) {
+        runCatching { cipherCacheFile?.writeText(mat.toJson().toString()) }
+    }
+
+    private fun invalidateCipher() {
+        cipher = null
+        runCatching { cipherCacheFile?.delete() }
+    }
+
+    /**
+     * Returns a usable cipher, capturing one via WebView if needed.
+     * The WebView capture only happens once per install (or after invalidation),
+     * because the material is cached to disk.
+     */
+    private suspend fun ensureCipher(): ComixCipher? {
+        cipher?.let { return it }
+        loadCachedCipher()?.let { cipher = it; return it }
+
+        if (captureInFlight) return null
+        captureInFlight = true
+        return try {
+            val mat = captureCipherMaterial() ?: return null
+            val c = ComixCipher(mat)
+            cipher = c
+            saveCachedCipher(mat)
+            c
+        } finally {
+            captureInFlight = false
+        }
+    }
+
+    /**
+     * Drives a WebView against the homepage and hooks window.atob to grab the
+     * three 256-byte S-boxes and three 24/32-byte keys that the site's JS
+     * publishes for its API signer.
+     */
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun captureCipherMaterial(): CipherMaterial? = withContext(Dispatchers.Main) {
+        val activity = CommonActivity.activity ?: run {
+            dbg("[cipher] no activity — cannot capture")
+            return@withContext null
+        }
+
+        suspendCancellableCoroutine { cont ->
+            val web = WebView(activity)
+            val done = AtomicBoolean(false)
+            val handler = Handler(Looper.getMainLooper())
+            var timeoutRunnable: Runnable? = null
+
+            fun finish(result: CipherMaterial?) {
+                if (!done.compareAndSet(false, true)) return
+                timeoutRunnable?.let { handler.removeCallbacks(it) }
+                runCatching { web.stopLoading() }
+                runCatching { web.loadUrl("about:blank") }
+                runCatching { web.destroy() }
+                if (cont.isActive) cont.resume(result)
+            }
+
+            web.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                userAgentString = browserHeaders()["User-Agent"]
+            }
+
+            web.addJavascriptInterface(object {
+                @JavascriptInterface
+                fun submit(json: String) {
+                    val mat = runCatching {
+                        CipherMaterial.fromJson(JSONObject(json))
+                    }.getOrNull()
+                    if (mat != null && mat.isValid()) {
+                        dbg("[cipher] captured 3 sboxes + 3 keys")
+                        finish(mat)
+                    }
+                }
+            }, "ComixCipherBridge")
+
+            web.webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: WebView,
+                    request: WebResourceRequest,
+                ): WebResourceResponse? {
+                    val host = request.url.host ?: return null
+                    val allowed = host == "comix.to" || host.endsWith(".comix.to") ||
+                                  host == "comix.ws" || host.endsWith(".comix.ws") ||
+                                  host == "challenges.cloudflare.com"
+                    return if (allowed) null else WebResourceResponse(
+                        "text/plain", "utf-8", ByteArrayInputStream(ByteArray(0))
+                    )
+                }
+
+                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                    view?.evaluateJavascript(CAPTURE_SCRIPT, null)
+                }
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    view?.evaluateJavascript(CAPTURE_SCRIPT, null)
+                }
+            }
+
+            cont.invokeOnCancellation { finish(null) }
+
+            timeoutRunnable = Runnable {
+                dbg("[cipher] capture timed out")
+                finish(null)
+            }.also { handler.postDelayed(it, CIPHER_CAPTURE_TIMEOUT_MS) }
+
+            dbg("[cipher] launching WebView capture…")
+            web.loadUrl(mainUrl)
+        }
+    }
+
+    /**
+     * Builds the canonical query string (raw brackets) and signs it with the
+     * current cipher. Returns the decrypted JSON body, or null on any failure
+     * (which also invalidates the cipher so the next call re-captures).
+     */
+    private suspend fun getSigned(
+        path: String,
+        params: Map<String, List<String>>,
+    ): String? {
+        val c = ensureCipher() ?: return null
+
+        return try {
+            // Sign against the raw-bracket canonical form (matches Tachiyomi).
+            val canonical = params.toSortedMap().entries.joinToString("&") { (rawName, values) ->
+                val name = rawName.removeSuffix("[]")
+                if (values.size == 1 && !rawName.endsWith("[]")) {
+                    "$name=${values.single().trim()}"
+                } else {
+                    values.mapIndexed { i, v -> "$name[$i]=${v.trim()}" }.joinToString("&")
+                }
+            }
+            val token = c.sign(path, canonical)
+
+            // Send encoded (URL-safe) form.
+            val encoded = buildString {
+                append(mainUrl).append(path).append("?")
+                var first = true
+                params.toSortedMap().forEach { (rawName, values) ->
+                    val name = rawName.removeSuffix("[]")
+                    fun emit(k: String, v: String) {
+                        if (!first) append("&")
+                        first = false
+                        append(URLEncoder.encode(k, "UTF-8"))
+                            .append("=")
+                            .append(URLEncoder.encode(v.trim(), "UTF-8"))
+                    }
+                    if (values.size == 1 && !rawName.endsWith("[]")) {
+                        emit(name, values.single())
+                    } else {
+                        values.forEachIndexed { i, v -> emit("$name[$i]", v) }
+                    }
+                }
+                if (!first) append("&")
+                append("_=").append(URLEncoder.encode(token, "UTF-8"))
+            }
+
+            dbg("[signed] GET $encoded")
+
+            val raw = app.get(
+                encoded,
+                interceptor = cfInterceptor,
+                headers = browserHeaders(
+                    mapOf(
+                        "Accept" to "application/json, text/plain, */*",
+                        "X-Requested-With" to "XMLHttpRequest",
+                        "Referer" to "$mainUrl/",
+                        "Sec-Fetch-Dest" to "empty",
+                        "Sec-Fetch-Mode" to "cors",
+                        "Sec-Fetch-Site" to "same-origin",
+                    )
+                ),
+            ).text
+
+            dbg("[signed] ← ${raw.length} chars: ${raw.take(200).replace("\n", " ")}")
+
+            val root = runCatching { JSONObject(raw) }.getOrNull()
+                ?: return null
+
+            if (root.has("e")) {
+                val decrypted = runCatching { c.decrypt(root.optString("e")) }.getOrNull()
+                if (decrypted == null) {
+                    dbg("[signed] decrypt failed; dropping cipher")
+                    invalidateCipher()
+                    return null
+                }
+                return decrypted
+            }
+            return raw
+        } catch (t: Throwable) {
+            dbg("[signed] error: ${t.message}; dropping cipher")
+            invalidateCipher()
+            null
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     //  initial-data parsing
     // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
@@ -111,11 +346,6 @@ class ComixProvider : MainAPI() {
         return runCatching { JSONObject(text) }.getOrNull()
     }
 
-    /**
-     * Parses a manga/manga-card object. Tolerant of field-name variations
-     * because the SSR HTML and the JSON API sometimes use different keys
-     * (url vs slug vs href, poster vs cover vs thumbnail, etc.).
-     */
     private fun parseMangaFromJson(obj: JSONObject): SearchResponse? {
         val title = (obj.optString("title").takeIf { it.isNotBlank() }
             ?: obj.optString("name").takeIf { it.isNotBlank() }
@@ -217,35 +447,31 @@ class ComixProvider : MainAPI() {
         val hasNext: Boolean
     )
 
-    /**
-     * Reads pagination metadata from a JSON envelope. Falls back to a
-     * conservative item-count heuristic only when no metadata exists.
-     */
-    private fun JSONObject.hasNextPage(page: Int, itemCount: Int): Boolean {
-        optJSONObject("meta")?.let { m ->
-            m.optInt("last_page", -1).takeIf { it > 0 }?.let { return page < it }
-            m.optInt("total_pages", -1).takeIf { it > 0 }?.let { return page < it }
-            m.optInt("page_count", -1).takeIf { it > 0 }?.let { return page < it }
-            if (m.has("has_next_page")) return m.optBoolean("has_next_page")
-            if (m.has("hasNext"))       return m.optBoolean("hasNext")
-            if (m.has("next_page")) {
-                val np = m.opt("next_page")
-                if (np != null && np.toString() != "null") return true
-            }
+    private fun readHasNext(root: JSONObject?, page: Int, itemCount: Int): Boolean {
+        val resultObj = root?.optJSONObject("result")
+        val meta = resultObj?.optJSONObject("meta")
+            ?: resultObj?.optJSONObject("pagination")
+            ?: root?.optJSONObject("meta")
+
+        if (meta != null) {
+            val lastPage = meta.optInt("lastPage", meta.optInt("last_page", -1))
+            if (lastPage > 0) return page < lastPage
+            if (meta.has("hasNext"))       return meta.optBoolean("hasNext")
+            if (meta.has("has_next_page")) return meta.optBoolean("has_next_page")
         }
-        optJSONObject("pagination")?.let { m ->
-            m.optInt("last_page", -1).takeIf { it > 0 }?.let { return page < it }
-            m.optInt("total_pages", -1).takeIf { it > 0 }?.let { return page < it }
-            if (m.has("has_next_page")) return m.optBoolean("has_next_page")
-        }
-        optJSONObject("links")?.let { l ->
+
+        resultObj?.optJSONObject("links")?.let { l ->
             val next = l.optString("next")
             if (next.isNotBlank() && next != "null") return true
         }
-        if (has("has_next_page")) return optBoolean("has_next_page")
-        if (has("hasNext"))       return optBoolean("hasNext")
-        // Last-resort heuristic. Only trust this if metadata is truly absent.
-        return itemCount >= 20
+
+        if (root != null) {
+            if (root.has("has_next_page")) return root.optBoolean("has_next_page")
+            if (root.has("hasNext"))       return root.optBoolean("hasNext")
+        }
+
+        // Last-resort heuristic
+        return itemCount >= 28
     }
 
     private fun arrToResults(arr: JSONArray): List<SearchResponse> {
@@ -258,10 +484,6 @@ class ComixProvider : MainAPI() {
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Main page
-    //
-    //  hot / latest: route EVERY page (including 1) through the API so item
-    //  offsets line up. SSR is only used as a fallback if the API fails.
-    //  trending / follows: single-page, read from the homepage SSR.
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
@@ -269,38 +491,32 @@ class ComixProvider : MainAPI() {
     ): HomePageResponse? {
         dbgSection("getMainPage(page=$page, request='${request.data}')")
 
-        // One-page sections only
+        // trending / follows: single-page, homepage SSR
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
             if (items.isEmpty()) return null
             return newHomePageResponse(
-                request,
-                items.distinctBy { it.url },
-                hasNext = false
+                request, items.distinctBy { it.url }, hasNext = false
             )
         }
 
-        // hot / latest — API for every page, so page 1 and page 2 are aligned.
+        // hot / latest: same source (signed API) for every page so offsets line up
         val result = fetchQueryPage(request, page)
         if (result != null && result.items.isNotEmpty()) {
             dbg("[getMainPage] ✓ ${result.items.size} items, hasNext=${result.hasNext}")
             return newHomePageResponse(
-                request,
-                result.items.distinctBy { it.url },
-                hasNext = result.hasNext
+                request, result.items.distinctBy { it.url }, hasNext = result.hasNext
             )
         }
 
-        // Fallback: only page 1 can be recovered from the homepage SSR.
+        // Page-1 fallback if the cipher capture failed entirely
         if (page == 1) {
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
             dbg("[getMainPage] fallback page 1: ${items.size} items")
             if (items.isNotEmpty()) {
                 return newHomePageResponse(
-                    request,
-                    items.distinctBy { it.url },
-                    hasNext = true
+                    request, items.distinctBy { it.url }, hasNext = true
                 )
             }
         }
@@ -354,11 +570,11 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  fetchQueryPage — paginated hot / latest
+    //  fetchQueryPage — hot / latest pagination
     //
-    //  Strategy 1: GET /api/v1/manga?page=N&scope=...&order[key]=desc
-    //  Strategy 2: SSR  https://comix.to/?page=N     (usually still page 1)
-    //  Strategy 3: SSR  https://comix.to/browse?page=N&order[key]=desc
+    //  Strategy 1: SIGNED API  /api/v1/manga
+    //  Strategy 2: SSR ?page=N            (kept as fallback)
+    //  Strategy 3: SSR /browse?page=N     (kept as fallback)
     // ═══════════════════════════════════════════════════════════════════════
     private suspend fun fetchQueryPage(
         request: MainPageRequest,
@@ -366,76 +582,47 @@ class ComixProvider : MainAPI() {
     ): PageResult? {
         dbgSection("fetchQueryPage(page=$page, category='${request.data}')")
 
-        // ═══ Strategy 1: raw API ═══
-        val apiUrl = when (request.data) {
-            "hot"    -> "$mainUrl/api/v1/manga?scope=hot&page=$page&order[chapter_updated_at]=desc"
-            "latest" -> "$mainUrl/api/v1/manga?page=$page&order[created_at]=desc"
-            else     -> null
+        // ── Strategy 1: signed API ───────────────────────────────────────
+        val params: Map<String, List<String>>? = when (request.data) {
+            "hot" -> mapOf(
+                "scope"                     to listOf("hot"),
+                "page"                      to listOf(page.toString()),
+                "order[chapter_updated_at]" to listOf("desc"),
+                "limit"                     to listOf("28"),
+            )
+            "latest" -> mapOf(
+                "page"              to listOf(page.toString()),
+                "order[created_at]" to listOf("desc"),
+                "limit"             to listOf("28"),
+            )
+            else -> null
         }
 
-        if (apiUrl != null) {
-            dbg("[fetchQueryPage] ▶ Strategy 1 (API): GET $apiUrl")
-
-            val apiHeaders = browserHeaders(
-                mapOf(
-                    "Accept" to "application/json, text/plain, */*",
-                    "X-Requested-With" to "XMLHttpRequest",
-                    "Referer" to "$mainUrl/",
-                    "Sec-Fetch-Dest" to "empty",
-                    "Sec-Fetch-Mode" to "cors",
-                    "Sec-Fetch-Site" to "same-origin"
-                )
-            )
-
-            val apiRes = runCatching {
-                app.get(apiUrl, interceptor = cfInterceptor, headers = apiHeaders).text
-            }.getOrNull()
-
-            if (!apiRes.isNullOrBlank()) {
-                dbg("[fetchQueryPage] API raw (${apiRes.length} chars): ${apiRes.take(500).replace("\n", " ")}")
-
-                val root: Any? = runCatching { JSONObject(apiRes) }.getOrNull()
-                    ?: runCatching { JSONArray(apiRes) }.getOrNull()
-
-                if (root != null) {
-                    val arr: JSONArray? = when (root) {
-                        is JSONArray  -> root
-                        is JSONObject -> root.optJSONArray("data")
-                            ?: root.optJSONArray("items")
-                            ?: root.optJSONArray("results")
-                            ?: root.optJSONArray("mangas")
-                            ?: root.optJSONObject("data")?.optJSONArray("items")
-                            ?: root.optJSONObject("data")?.optJSONArray("data")
-                            ?: root.optJSONObject("data")?.optJSONArray("mangas")
-                            ?: root.optJSONObject("result")?.optJSONArray("items")
-                        else -> null
+        if (params != null) {
+            dbg("[fetchQueryPage] ▶ Strategy 1: SIGNED API")
+            val body = getSigned("/api/v1/manga", params)
+            if (!body.isNullOrBlank()) {
+                val root = runCatching { JSONObject(body) }.getOrNull()
+                val arr: JSONArray? = root?.optJSONObject("result")?.optJSONArray("items")
+                    ?: root?.optJSONArray("items")
+                    ?: root?.optJSONObject("data")?.optJSONArray("items")
+                if (arr != null) {
+                    val items = arrToResults(arr)
+                    if (items.isNotEmpty()) {
+                        val hasNext = readHasNext(root, page, items.size)
+                        dbg("[fetchQueryPage] ✓ SIGNED API: ${items.size} items, hasNext=$hasNext")
+                        return PageResult(items, hasNext)
                     }
-
-                    if (arr != null) {
-                        val items = arrToResults(arr)
-                        if (items.isNotEmpty()) {
-                            val hasNext = when (root) {
-                                is JSONObject -> root.hasNextPage(page, items.size)
-                                else -> items.size >= 20
-                            }
-                            dbg("[fetchQueryPage] ✓ API matched: ${items.size} items, hasNext=$hasNext")
-                            return PageResult(items, hasNext)
-                        } else {
-                            dbg("[fetchQueryPage] ✗ API parsed 0 items (field-name mismatch?)")
-                        }
-                    } else {
-                        dbg("[fetchQueryPage] ✗ API JSON had no recognised item array. Top keys: " +
-                            (root as? JSONObject)?.keys()?.asSequence()?.joinToString() ?: "n/a")
-                    }
+                    dbg("[fetchQueryPage] ✗ SIGNED API parsed 0 items")
                 } else {
-                    dbg("[fetchQueryPage] ✗ API response was not JSON.")
+                    dbg("[fetchQueryPage] ✗ SIGNED API body had no items array. Body head: ${body.take(200)}")
                 }
             } else {
-                dbg("[fetchQueryPage] ✗ API request returned null/empty.")
+                dbg("[fetchQueryPage] ✗ SIGNED API returned null")
             }
         }
 
-        // ═══ Strategy 2: SSR ?page=N ═══
+        // ── Strategy 2: SSR ?page=N ─────────────────────────────────────
         dbg("[fetchQueryPage] ▶ Strategy 2: SSR $mainUrl/?page=$page")
         val homeSsrHtml = runCatching { fetchHtml("$mainUrl/?page=$page") }.getOrNull()
         if (!homeSsrHtml.isNullOrBlank()) {
@@ -444,13 +631,13 @@ class ComixProvider : MainAPI() {
                 val items = readQueries(initial) { k ->
                     if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
                     val subtype = k.optString(1)
-                    val params = k.optJSONObject(2) ?: return@readQueries false
-                    val jsonPage = params.optInt("page", -1)
+                    val p = k.optJSONObject(2) ?: return@readQueries false
+                    val jsonPage = p.optInt("page", -1)
                     if (jsonPage != page) return@readQueries false
                     when (request.data) {
-                        "hot"    -> subtype == "list" && params.optString("scope") == "hot"
+                        "hot"    -> subtype == "list" && p.optString("scope") == "hot"
                         "latest" -> subtype == "list" &&
-                            params.optJSONObject("order")?.optString("created_at") == "desc"
+                            p.optJSONObject("order")?.optString("created_at") == "desc"
                         else -> false
                     }
                 }
@@ -461,7 +648,7 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ═══ Strategy 3: SSR /browse?page=N ═══
+        // ── Strategy 3: SSR /browse?page=N ──────────────────────────────
         val browseUrl = when (request.data) {
             "hot"    -> "$mainUrl/browse?page=$page&scope=hot&order[chapter_updated_at]=desc"
             "latest" -> "$mainUrl/browse?page=$page&order[created_at]=desc"
@@ -473,7 +660,7 @@ class ComixProvider : MainAPI() {
             val items = parseMainPage(browseHtml, request, page)
             if (items.isNotEmpty()) {
                 dbg("[fetchQueryPage] ✓ SSR /browse matched: ${items.size} items")
-                return PageResult(items, hasNext = items.size >= 20)
+                return PageResult(items, hasNext = items.size >= 28)
             }
             dbg("[fetchQueryPage] ✗ SSR /browse returned 0 items")
         }
@@ -668,5 +855,44 @@ class ComixProvider : MainAPI() {
             )
         }
         return true
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Companion constants
+    // ═══════════════════════════════════════════════════════════════════════
+    private companion object {
+        const val CIPHER_CAPTURE_TIMEOUT_MS = 35_000L
+
+        /**
+         * Installed into the page before any other JS runs. Hooks window.atob
+         * and forwards the first three 256-byte blobs (S-boxes) and three
+         * 24/32-byte blobs (keys) it sees to the JS bridge.
+         */
+        val CAPTURE_SCRIPT = """
+            (function () {
+                if (window.__comixCipherHook) return;
+                window.__comixCipherHook = true;
+                var captures = window.__comixCipherCaptures = [];
+                var originalAtob = window.atob.bind(window);
+                window.atob = function (value) {
+                    var decoded = originalAtob(value);
+                    try {
+                        var bytes = new Array(decoded.length);
+                        for (var i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i) & 255;
+                        var len = bytes.length;
+                        if (len === 256 || len === 24 || len === 32) {
+                            captures.push(bytes);
+                            var sboxes = captures.filter(function (x) { return x.length === 256; }).slice(0, 3);
+                            var keys   = captures.filter(function (x) { return x.length === 24 || x.length === 32; }).slice(0, 3);
+                            if (sboxes.length === 3 && keys.length === 3) {
+                                var payload = JSON.stringify({ sboxes: sboxes, keys: keys });
+                                try { ComixCipherBridge.submit(payload); } catch (e) {}
+                            }
+                        }
+                    } catch (e) {}
+                    return decoded;
+                };
+            })();
+        """.trimIndent()
     }
 }
