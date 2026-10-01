@@ -419,12 +419,10 @@ class ComixProvider : MangaManhwaProvider() {
     //  getMainPage — 6-category routing
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        // These go through signed API → prewarm cipher
         if (request.data in listOf("popular", "hot", "latest", "completed")) {
             maybeStartPrewarm()
         }
 
-        // Trending + follows are homepage-only — no pagination
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
@@ -588,7 +586,7 @@ class ComixProvider : MangaManhwaProvider() {
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun popular(page: Int): List<SearchResponse> =
         fetchQueryPage(
-            MainPageRequest("popular", "Popular", "popular"),
+            MainPageRequest(name = "Popular", data = "popular"),
             page
         )?.items.orEmpty()
 
