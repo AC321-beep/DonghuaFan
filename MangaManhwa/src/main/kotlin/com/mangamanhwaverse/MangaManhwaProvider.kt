@@ -45,7 +45,6 @@ abstract class MangaManhwaProvider : MainAPI() {
     protected open val cfPattern: Regex
         get() = Regex(".*${hostOf(baseUrl)}.*")
 
-    // by lazy: deferred until first fetch(), when all subclass fields are set
     private val cfResolver by lazy { WebViewResolver(cfPattern) }
 
     private val unifiedInterceptor: Interceptor by lazy {
@@ -113,8 +112,17 @@ abstract class MangaManhwaProvider : MainAPI() {
             ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
-        val chapterName = Regex("(?:chapter|ch)[-\\s]?([\\d.]+)", RegexOption.IGNORE_CASE)
-            .find(data)?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
+        val chapterNum = Regex("(?:chapter|ch)[-\\s]?([\\d.]+)", RegexOption.IGNORE_CASE)
+            .find(data)
+            ?.groupValues?.get(1)
+            ?.toDoubleOrNull()
+            ?.toInt() ?: 0
+
+        val chapterName = when {
+            chapterNum <= 0 -> "Chapter"
+            chapterNum == 0 -> "Prologue"
+            else -> "Ch. $chapterNum"
+        }
 
         activity.runOnUiThread {
             ReaderDialog.show(
@@ -123,7 +131,7 @@ abstract class MangaManhwaProvider : MainAPI() {
                 chapterName = chapterName,
                 chapterUrl = data,
                 referer = baseUrl,
-                targetChapter = 0
+                targetChapter = chapterNum
             )
         }
         return true
