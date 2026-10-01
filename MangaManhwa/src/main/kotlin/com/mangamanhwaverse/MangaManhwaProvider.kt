@@ -12,25 +12,55 @@ abstract class MangaManhwaProvider : MainAPI() {
     final override val supportedTypes = setOf(TvType.Anime, TvType.Others)
     abstract val baseUrl: String
 
-    abstract suspend fun searchPage(query: String, page: Int): List<SearchResponse>
+    override val mainPage = mainPageOf(
+        "popular"   to "Popular",
+        "latest"    to "Latest",
+        "trending"  to "Trending",
+        "hot"       to "Hot Updates",
+        "follows"   to "Most Followed",
+        "completed" to "Completed",
+        "new"       to "New Releases"
+    )
+
     abstract suspend fun popular(page: Int): List<SearchResponse>
+
+    open suspend fun latest(page: Int): List<SearchResponse>      = emptyList()
+    open suspend fun trending(page: Int): List<SearchResponse>    = emptyList()
+    open suspend fun hot(page: Int): List<SearchResponse>         = emptyList()
+    open suspend fun follows(page: Int): List<SearchResponse>     = emptyList()
+    open suspend fun completed(page: Int): List<SearchResponse>   = emptyList()
+    open suspend fun newReleases(page: Int): List<SearchResponse> = emptyList()
+
+    abstract suspend fun searchPage(query: String, page: Int): List<SearchResponse>
     abstract suspend fun chapters(mangaUrl: String): List<Episode>
     abstract suspend fun pages(chapterUrl: String): List<String>
-    open suspend fun latest(page: Int): List<SearchResponse> = popular(page)
 
     override val hasMainPage = true
     override val hasQuickSearch = true
     override val hasDownloadSupport = false
 
-    private val cfInterceptor by lazy {
-        WebViewResolver(Regex(".*${hostOf(baseUrl)}.*"))
-    }
+    protected open val cfPattern: Regex
+        get() = Regex(".*${hostOf(baseUrl)}.*")
 
-    override suspend fun getMainPage(page: Int, request: MainPageRequest) =
-        newHomePageResponse(
-            request.name,
-            if (request.name.equals("latest", true)) latest(page) else popular(page)
-        )
+    private val cfInterceptor by lazy { WebViewResolver(cfPattern) }
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
+        val items = runCatching {
+            when (request.data) {
+                "popular"   -> popular(page)
+                "latest"    -> latest(page)
+                "trending"  -> trending(page)
+                "hot"       -> hot(page)
+                "follows"   -> follows(page)
+                "completed" -> completed(page)
+                "new"       -> newReleases(page)
+                else        -> emptyList()
+            }
+        }.getOrDefault(emptyList())
+
+        if (items.isEmpty()) return null
+        return newHomePageResponse(request.name, items)
+    }
 
     override suspend fun search(query: String): List<SearchResponse>? =
         runCatching { searchPage(query, 1) }.getOrNull()
@@ -41,7 +71,6 @@ abstract class MangaManhwaProvider : MainAPI() {
             url,
             TvType.Anime
         ) {
-            this.posterUrl = null
             addEpisodes(DubStatus.Subbed, chapters(url))
         }
     }.getOrNull()
@@ -75,7 +104,6 @@ abstract class MangaManhwaProvider : MainAPI() {
     protected suspend fun fetch(url: String, referer: String? = baseUrl): Document? {
         val absolute = if (url.startsWith("http")) url else abs(url)
         return runCatching {
-            RateLimiter.acquire(RateLimiter.hostOf(absolute), maxPerSecond())
             app.get(
                 absolute,
                 interceptor = cfInterceptor,
@@ -90,8 +118,6 @@ abstract class MangaManhwaProvider : MainAPI() {
     protected fun abs(url: String) =
         if (url.startsWith("http")) url
         else "$baseUrl${if (url.startsWith("/")) "" else "/"}$url"
-
-    protected open fun maxPerSecond(): Int = 3
 
     protected fun browserHeaders(extra: Map<String, String> = emptyMap()): Map<String, String> =
         mapOf(
