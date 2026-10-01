@@ -1,21 +1,35 @@
 package com.mangamanhwaverse
 
+import android.annotation.SuppressLint
+import android.graphics.Bitmap
+import android.os.Handler
+import android.os.Looper
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.appcompat.app.AppCompatActivity
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import java.io.File
 import java.net.URLEncoder
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
 
 class ComixProvider : MangaManhwaProvider() {
 
@@ -24,9 +38,26 @@ class ComixProvider : MangaManhwaProvider() {
     override val baseUrl = "https://comix.to"
     override var lang = "en"
 
-    private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
+    // ── 6 categories. `new` from the base class stays hidden —
+    //    on Comix it's a duplicate of `latest` (order[created_at]=desc).
+    override val mainPage = mainPageOf(
+        "popular"   to "Popular",
+        "hot"       to "Hot Updates",
+        "latest"    to "Latest Releases",
+        "trending"  to "Trending Today",
+        "follows"   to "Most Followed",
+        "completed" to "Completed",
+    )
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Cipher state
+    // ═══════════════════════════════════════════════════════════════════════
     @Volatile private var cipher: ComixCipher? = null
+    @Volatile private var captureInFlight = false
+    @Volatile private var prewarmStarted = false
+
+    private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
     private val cipherCacheFile: File?
         get() = AppContext.ctx?.let { File(it.cacheDir, "comix_cipher.json") }
@@ -44,25 +75,47 @@ class ComixProvider : MangaManhwaProvider() {
         runCatching { cipherCacheFile?.writeText(mat.toJson().toString()) }
     }
 
+    private fun invalidateCipher() {
+        cipher = null
+        runCatching { cipherCacheFile?.delete() }
+    }
+
     private fun cachedCipher(): ComixCipher? {
         cipher?.let { return it }
         return loadCachedCipher()?.also { cipher = it }
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    //  Cipher capture
-    // ═════════════════════════════════════════════════════════════════
-    @android.annotation.SuppressLint("SetJavaScriptEnabled")
-    private suspend fun captureCipherMaterial(): CipherMaterial? {
-        val activity = CommonActivity.activity as? androidx.appcompat.app.AppCompatActivity
-            ?: return null
+    private suspend fun captureCipher(): ComixCipher? {
+        cipher?.let { return it }
+        loadCachedCipher()?.let { cipher = it; return it }
 
-        val deferred = CompletableDeferred<CipherMaterial?>()
+        if (captureInFlight) return null
+        captureInFlight = true
+        return try {
+            val mat = captureCipherMaterial() ?: return null
+            val c = ComixCipher(mat)
+            cipher = c
+            saveCachedCipher(mat)
+            c
+        } finally {
+            captureInFlight = false
+        }
+    }
 
-        withContext(Dispatchers.Main) {
-            val web = android.webkit.WebView(activity)
-            val done = java.util.concurrent.atomic.AtomicBoolean(false)
-            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private fun maybeStartPrewarm() {
+        if (prewarmStarted || cipher != null || loadCachedCipher() != null) return
+        prewarmStarted = true
+        bgScope.launch { captureCipher() }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun captureCipherMaterial(): CipherMaterial? = withContext(Dispatchers.Main) {
+        val activity = CommonActivity.activity ?: return@withContext null
+
+        suspendCancellableCoroutine { cont ->
+            val web = WebView(activity)
+            val done = AtomicBoolean(false)
+            val handler = Handler(Looper.getMainLooper())
             var timeoutRunnable: Runnable? = null
             var pollRunnable: Runnable? = null
 
@@ -73,40 +126,39 @@ class ComixProvider : MangaManhwaProvider() {
                 runCatching { web.stopLoading() }
                 runCatching { web.loadUrl("about:blank") }
                 runCatching { web.destroy() }
-                deferred.complete(result)
+                if (cont.isActive) cont.resume(result)
             }
 
             web.settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
                 databaseEnabled = true
-                userAgentString = MangaManhwaProvider.UA
+                userAgentString = UA
             }
 
             web.addJavascriptInterface(object {
-                @android.webkit.JavascriptInterface
+                @JavascriptInterface
                 fun submit(json: String) {
-                    val mat = runCatching { CipherMaterial.fromJson(JSONObject(json)) }.getOrNull()
+                    val mat = runCatching {
+                        CipherMaterial.fromJson(JSONObject(json))
+                    }.getOrNull()
                     if (mat != null && mat.isValid()) finish(mat)
                 }
             }, "ComixCipherBridge")
 
-            web.webViewClient = object : android.webkit.WebViewClient() {
-                override fun onPageStarted(
-                    view: android.webkit.WebView?,
-                    url: String?,
-                    favicon: android.graphics.Bitmap?
-                ) {
+            web.webViewClient = object : WebViewClient() {
+                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                     view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                 }
-
-                override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
+                override fun onPageFinished(view: WebView?, url: String?) {
                     view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                 }
             }
 
+            cont.invokeOnCancellation { finish(null) }
+
             timeoutRunnable = Runnable { finish(null) }
-                .also { handler.postDelayed(it, 30_000L) }
+                .also { handler.postDelayed(it, CIPHER_CAPTURE_TIMEOUT_MS) }
 
             pollRunnable = object : Runnable {
                 override fun run() {
@@ -115,10 +167,10 @@ class ComixProvider : MangaManhwaProvider() {
                     web.evaluateJavascript(
                         """
                         (function(){
-                          if (window.__comixTriggered) return;
-                          var el = document.querySelector('.npager a, a[href*="/browse"], a[href*="/title/"]');
-                          if (el) { window.__comixTriggered = true; el.click(); }
-                          else { window.scrollTo(0, document.body.scrollHeight); }
+                            if (window.__comixTriggered) return;
+                            var el = document.querySelector('.npager a, a[href*="/browse"], a[href*="/title/"]');
+                            if (el) { window.__comixTriggered = true; el.click(); }
+                            else { window.scrollTo(0, document.body.scrollHeight); }
                         })();
                         """.trimIndent(), null
                     )
@@ -128,26 +180,33 @@ class ComixProvider : MangaManhwaProvider() {
 
             web.loadUrl(mainUrl)
         }
-
-        return deferred.await()
     }
 
-    private suspend fun ensureCipher(): ComixCipher? {
-        cachedCipher()?.let { return it }
-        val mat = captureCipherMaterial() ?: return null
-        saveCachedCipher(mat)
-        return ComixCipher(mat).also { cipher = it }
-    }
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Network helpers
+    // ═══════════════════════════════════════════════════════════════════════
+    private fun comixHeaders(extra: Map<String, String> = emptyMap()): Map<String, String> =
+        mapOf(
+            "User-Agent" to UA,
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language" to "en-US,en;q=0.5",
+            "Sec-Ch-Ua" to "\"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"121\", \"Chromium\";v=\"121\"",
+            "Sec-Ch-Ua-Mobile" to "?0",
+            "Sec-Ch-Ua-Platform" to "\"Windows\"",
+            "Sec-Fetch-Dest" to "document",
+            "Sec-Fetch-Mode" to "navigate",
+            "Sec-Fetch-Site" to "none",
+            "Sec-Fetch-User" to "?1",
+            "Upgrade-Insecure-Requests" to "1"
+        ) + extra
 
-    // ═════════════════════════════════════════════════════════════════
-    //  HTTP helpers
-    // ═════════════════════════════════════════════════════════════════
-    private suspend fun fetchHtml(url: String): String = runCatching {
-        RateLimiter.acquire(RateLimiter.hostOf(url), 3)
-        app.get(url, interceptor = cfInterceptor, headers = browserHeaders()).text
-    }.getOrDefault("")
+    private suspend fun fetchHtml(url: String): String =
+        app.get(url, interceptor = cfInterceptor, headers = comixHeaders()).text
 
-    private suspend fun getSigned(path: String, params: Map<String, List<String>>): String? {
+    private suspend fun getSigned(
+        path: String,
+        params: Map<String, List<String>>,
+    ): String? {
         val c = cachedCipher() ?: return null
         return try {
             val canonical = params.toSortedMap().entries.joinToString("&") { (rawName, values) ->
@@ -181,45 +240,77 @@ class ComixProvider : MangaManhwaProvider() {
             val raw = app.get(
                 encoded,
                 interceptor = cfInterceptor,
-                headers = browserHeaders(mapOf(
+                headers = comixHeaders(mapOf(
                     "Accept" to "application/json, text/plain, */*",
                     "X-Requested-With" to "XMLHttpRequest",
                     "Referer" to "$mainUrl/",
+                    "Sec-Fetch-Dest" to "empty",
+                    "Sec-Fetch-Mode" to "cors",
+                    "Sec-Fetch-Site" to "same-origin",
                 ))
             ).text
 
             val root = runCatching { JSONObject(raw) }.getOrNull() ?: return null
+
             if (root.has("e")) {
-                val dec = runCatching { c.decrypt(root.optString("e")) }.getOrNull()
-                if (dec == null) { cipher = null; return null }
-                return dec
+                val decrypted = runCatching { c.decrypt(root.optString("e")) }.getOrNull()
+                if (decrypted == null) {
+                    if (cipher === c) { invalidateCipher(); prewarmStarted = false }
+                    return null
+                }
+                return decrypted
             }
             raw
         } catch (_: Throwable) {
-            cipher = null
+            if (cipher === c) { invalidateCipher(); prewarmStarted = false }
             null
         }
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    //  JSON parsing
-    // ═════════════════════════════════════════════════════════════════
-    private fun extractInitial(doc: Document): JSONObject? {
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Parsing — JSON + DOM helpers
+    // ═══════════════════════════════════════════════════════════════════════
+    private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
+        val doc: Document = when (htmlOrDoc) {
+            is Document -> htmlOrDoc
+            is String   -> Jsoup.parse(htmlOrDoc)
+            else        -> return null
+        }
         val script = doc.selectFirst("script#initial-data") ?: return null
         val text = script.data().ifBlank { script.html() }.trim()
+        if (text.isEmpty()) return null
         return runCatching { JSONObject(text) }.getOrNull()
     }
 
-    // ✅ FIX 1: newAnimeSearchResponse + TvType.Anime
-    private fun parseCard(obj: JSONObject): SearchResponse? {
-        val title = obj.optString("title").takeIf { it.isNotBlank() } ?: return null
-        val rel = obj.optString("url").takeIf { it.isNotBlank() }
-            ?: obj.optString("hid").takeIf { it.isNotBlank() }?.let { "/title/$it" }
-            ?: return null
-        val poster = obj.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
-            ?: obj.optJSONObject("poster")?.optString("medium")
-        val res = newAnimeSearchResponse(title, fixUrl(rel), TvType.Anime)
+    private fun parseMangaFromJson(obj: JSONObject): SearchResponse? {
+        val title = (obj.optString("title").takeIf { it.isNotBlank() }
+            ?: obj.optString("name").takeIf { it.isNotBlank() }
+            ?: obj.optString("manga_title").takeIf { it.isNotBlank() }
+            ?: return null)
+
+        val relUrl = (obj.optString("url").takeIf  { it.isNotBlank() }
+            ?: obj.optString("href").takeIf  { it.isNotBlank() }
+            ?: obj.optString("slug").takeIf  { it.isNotBlank() }?.let { "/title/$it" }
+            ?: obj.optString("hid").takeIf   { it.isNotBlank() }?.let { "/title/$it" }
+            ?: obj.optString("link").takeIf  { it.isNotBlank() }
+            ?: return null)
+
+        val poster = (obj.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
+            ?: obj.optJSONObject("poster")?.optString("medium")?.takeIf { it.isNotBlank() }
+            ?: obj.optJSONObject("cover")?.optString("large")?.takeIf { it.isNotBlank() }
+            ?: obj.optJSONObject("cover")?.optString("medium")?.takeIf { it.isNotBlank() }
+            ?: obj.optString("cover").takeIf { it.isNotBlank() }
+            ?: obj.optString("thumbnail").takeIf { it.isNotBlank() }
+            ?: obj.optString("image").takeIf { it.isNotBlank() })
+
+        val latest = (obj.optInt("latestChapter", 0).takeIf { it > 0 }
+            ?: obj.optInt("latest_chapter", 0).takeIf { it > 0 }
+            ?: obj.optInt("chapters_count", 0).takeIf { it > 0 }
+            ?: obj.optJSONObject("latest_chapter")?.optInt("number", 0)?.takeIf { it > 0 })
+
+        val res = newAnimeSearchResponse(title, fixUrl(relUrl), TvType.Anime)
         poster?.let { res.posterUrl = fixUrl(it) }
+        latest?.let { res.addSub(it) }
         return res
     }
 
@@ -228,205 +319,518 @@ class ComixProvider : MangaManhwaProvider() {
         matcher: (JSONArray) -> Boolean
     ): List<SearchResponse> {
         val queries = initial.optJSONObject("queries") ?: return emptyList()
+        val out = mutableListOf<SearchResponse>()
         val keys = queries.keys()
         while (keys.hasNext()) {
             val k = keys.next()
             val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
             if (!matcher(parsed)) continue
-            val arr = when (val v = queries.opt(k)) {
-                is JSONArray -> v
-                is JSONObject -> v.optJSONArray("items")
-                else -> null
+
+            val value = queries.opt(k)
+            val arr = when (value) {
+                is JSONArray  -> value
+                is JSONObject -> value.optJSONArray("items")
+                else          -> null
             } ?: continue
-            val out = (0 until arr.length()).mapNotNull {
-                val o = arr.optJSONObject(it) ?: return@mapNotNull null
-                parseCard(o)
+
+            for (i in 0 until arr.length()) {
+                arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
             }
-            if (out.isNotEmpty()) return out
+            if (out.isNotEmpty()) break
         }
-        return emptyList()
+        return out
     }
 
-    // ═════════════════════════════════════════════════════════════════
-    //  MangaManhwaProvider implementation
-    // ═════════════════════════════════════════════════════════════════
-    override suspend fun popular(page: Int): List<SearchResponse> {
-        ensureCipher()
+    private fun toSearchResult(card: Element): SearchResponse? {
+        val anchor = if (card.tagName() == "a") card
+                     else card.selectFirst("a[href*='/title/'], a[href]") ?: return null
+        val href = anchor.attr("href").takeIf { it.isNotBlank() } ?: return null
+        val title = card.selectFirst("h3, h2, .title, .manga-title, .lrow__title")
+            ?.text()?.trim()
+            ?: anchor.attr("title").ifBlank { anchor.text().trim() }
+        if (title.isBlank()) return null
+        val poster = card.selectFirst("img")
+            ?.let { it.attr("data-src").ifBlank { it.attr("src") } }
+            ?.takeIf { it.isNotBlank() }
+        val latestEp = card.selectFirst(".chapter, .latest-chapter, .lrow__chapter")
+            ?.text()?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
 
-        val params = mapOf(
-            "scope" to listOf("hot"),
-            "page" to listOf(page.toString()),
-            "order[chapter_updated_at]" to listOf("desc"),
-            "limit" to listOf("28"),
-        )
+        val res = newAnimeSearchResponse(title, fixUrl(href), TvType.Anime)
+        poster?.let { res.posterUrl = fixUrl(it) }
+        if (latestEp != null && latestEp > 0) res.addSub(latestEp)
+        return res
+    }
 
-        cachedCipher()?.let {
-            getSigned("/api/v1/manga", params)?.let { body ->
+    private fun extractSearchResultsDom(doc: Document): List<SearchResponse> {
+        val results = mutableListOf<SearchResponse>()
+        doc.select(".list-grid .lrow, div.lrow, .lrow, .list-grid > div, .list-grid--cards > div")
+            .forEach { el -> toSearchResult(el)?.let { results.add(it) } }
+        if (results.isEmpty()) {
+            doc.select("article, .manga-card, .comic-item, a[href*='/title/']").forEach { el ->
+                if (el.tagName() == "a" &&
+                    el.parents().any { p -> p.hasClass("lrow") || p.hasClass("list-grid") }
+                ) return@forEach
+                toSearchResult(el)?.let { results.add(it) }
+            }
+        }
+        return results.distinctBy { it.url }
+    }
+
+    private data class PageResult(
+        val items: List<SearchResponse>,
+        val hasNext: Boolean
+    )
+
+    private fun readHasNext(root: JSONObject?, page: Int, itemCount: Int): Boolean {
+        val resultObj = root?.optJSONObject("result")
+        val meta = resultObj?.optJSONObject("meta")
+            ?: resultObj?.optJSONObject("pagination")
+            ?: root?.optJSONObject("meta")
+
+        if (meta != null) {
+            val lastPage = meta.optInt("lastPage", meta.optInt("last_page", -1))
+            if (lastPage > 0) return page < lastPage
+            if (meta.has("hasNext"))       return meta.optBoolean("hasNext")
+            if (meta.has("has_next_page")) return meta.optBoolean("has_next_page")
+        }
+
+        resultObj?.optJSONObject("links")?.let { l ->
+            val next = l.optString("next")
+            if (next.isNotBlank() && next != "null") return true
+        }
+
+        if (root != null) {
+            if (root.has("has_next_page")) return root.optBoolean("has_next_page")
+            if (root.has("hasNext"))       return root.optBoolean("hasNext")
+        }
+
+        return itemCount >= 28
+    }
+
+    private fun arrToResults(arr: JSONArray): List<SearchResponse> {
+        val out = mutableListOf<SearchResponse>()
+        for (i in 0 until arr.length()) {
+            arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
+        }
+        return out
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  getMainPage — 6-category routing
+    // ═══════════════════════════════════════════════════════════════════════
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
+        // These go through signed API → prewarm cipher
+        if (request.data in listOf("popular", "hot", "latest", "completed")) {
+            maybeStartPrewarm()
+        }
+
+        // Trending + follows are homepage-only — no pagination
+        if (request.data == "trending" || request.data == "follows") {
+            if (page > 1) return null
+            val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
+            if (items.isEmpty()) return null
+            return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = false)
+        }
+
+        val apiResult = fetchQueryPage(request, page)
+        if (apiResult != null && apiResult.items.isNotEmpty()) {
+            return newHomePageResponse(
+                request, apiResult.items.distinctBy { it.url }, hasNext = apiResult.hasNext
+            )
+        }
+
+        if (page == 1) {
+            val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
+            if (items.isNotEmpty()) {
+                return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = true)
+            }
+        }
+
+        return null
+    }
+
+    private fun parseMainPage(
+        html: String,
+        request: MainPageRequest,
+        page: Int
+    ): List<SearchResponse> {
+        if (html.isBlank()) return emptyList()
+        var items: List<SearchResponse> = emptyList()
+
+        extractInitialDataJson(html)?.let { initial ->
+            val precise: ((String, JSONObject) -> Boolean)? = when (request.data) {
+                "popular"   -> { st, p -> st == "list" && p.optString("scope") == "popular" }
+                "trending"  -> { st, p -> st == "top"  && p.optString("type") == "trending" }
+                "follows"   -> { st, p -> st == "top"  && p.optString("type") == "follows" }
+                "hot"       -> { st, p -> st == "list" && p.optString("scope") == "hot" }
+                "latest"    -> { st, p ->
+                    st == "list" && p.optJSONObject("order")?.optString("created_at") == "desc"
+                }
+                "completed" -> { st, p -> st == "list" && p.optString("status") == "completed" }
+                else -> null
+            }
+            if (precise != null) {
+                items = readQueries(initial) { k ->
+                    if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
+                    val subtype = k.optString(1)
+                    val params = k.optJSONObject(2) ?: return@readQueries false
+                    val jsonPage = params.optInt("page", 1)
+                    if (page > 1 && jsonPage != page) return@readQueries false
+                    precise(subtype, params)
+                }
+            }
+            if (items.isEmpty() && request.data == "latest") {
+                items = readQueries(initial) { k ->
+                    if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
+                    val subtype = k.optString(1)
+                    val params = k.optJSONObject(2) ?: return@readQueries false
+                    val jsonPage = params.optInt("page", 1)
+                    if (page > 1 && jsonPage != page) return@readQueries false
+                    (subtype == "list" || subtype == "browse") &&
+                        params.optString("scope") != "hot" &&
+                        params.optJSONObject("order")?.optString("created_at") == "desc"
+                }
+            }
+        }
+        if (items.isEmpty()) items = extractSearchResultsDom(Jsoup.parse(html))
+        return items
+    }
+
+    private suspend fun fetchQueryPage(
+        request: MainPageRequest,
+        page: Int
+    ): PageResult? {
+        val params: Map<String, List<String>>? = when (request.data) {
+            "popular" -> mapOf(
+                "scope"                     to listOf("popular"),
+                "page"                      to listOf(page.toString()),
+                "order[chapter_updated_at]" to listOf("desc"),
+                "limit"                     to listOf("28"),
+            )
+            "hot" -> mapOf(
+                "scope"                     to listOf("hot"),
+                "page"                      to listOf(page.toString()),
+                "order[chapter_updated_at]" to listOf("desc"),
+                "limit"                     to listOf("28"),
+            )
+            "latest" -> mapOf(
+                "page"              to listOf(page.toString()),
+                "order[created_at]" to listOf("desc"),
+                "limit"             to listOf("28"),
+            )
+            "completed" -> mapOf(
+                "status"                    to listOf("completed"),
+                "page"                      to listOf(page.toString()),
+                "order[chapter_updated_at]" to listOf("desc"),
+                "limit"                     to listOf("28"),
+            )
+            else -> null
+        }
+
+        if (params != null && cachedCipher() != null) {
+            val body = getSigned("/api/v1/manga", params)
+            if (!body.isNullOrBlank()) {
                 val root = runCatching { JSONObject(body) }.getOrNull()
-                val arr = root?.optJSONObject("result")?.optJSONArray("items")
+                val arr: JSONArray? = root?.optJSONObject("result")?.optJSONArray("items")
                     ?: root?.optJSONArray("items")
+                    ?: root?.optJSONObject("data")?.optJSONArray("items")
                 if (arr != null) {
-                    val items = (0 until arr.length()).mapNotNull {
-                        val o = arr.optJSONObject(it) ?: return@mapNotNull null
-                        parseCard(o)
+                    val items = arrToResults(arr)
+                    if (items.isNotEmpty()) {
+                        val hasNext = readHasNext(root, page, items.size)
+                        return PageResult(items, hasNext)
                     }
-                    if (items.isNotEmpty()) return items
                 }
             }
         }
 
-        val html = fetchHtml("$mainUrl/")
-        val doc = Jsoup.parse(html)
-        extractInitial(doc)?.let { initial ->
-            val items = readQueries(initial) { k ->
-                k.length() >= 3 && k.optString(0) == "manga"
+        val homeSsrHtml = runCatching { fetchHtml("$mainUrl/?page=$page") }.getOrNull()
+        if (!homeSsrHtml.isNullOrBlank()) {
+            val initial = extractInitialDataJson(homeSsrHtml)
+            if (initial != null) {
+                val items = readQueries(initial) { k ->
+                    if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
+                    val subtype = k.optString(1)
+                    val p = k.optJSONObject(2) ?: return@readQueries false
+                    val jsonPage = p.optInt("page", -1)
+                    if (jsonPage != page) return@readQueries false
+                    when (request.data) {
+                        "popular"   -> subtype == "list" && p.optString("scope") == "popular"
+                        "hot"       -> subtype == "list" && p.optString("scope") == "hot"
+                        "latest"    -> subtype == "list" &&
+                            p.optJSONObject("order")?.optString("created_at") == "desc"
+                        "completed" -> subtype == "list" && p.optString("status") == "completed"
+                        else -> false
+                    }
+                }
+                if (items.isNotEmpty()) return PageResult(items, hasNext = true)
             }
-            if (items.isNotEmpty()) return items
         }
-        return emptyList()
+
+        val browseUrl = when (request.data) {
+            "popular"   -> "$mainUrl/browse?page=$page&scope=popular"
+            "hot"       -> "$mainUrl/browse?page=$page&scope=hot&order[chapter_updated_at]=desc"
+            "latest"    -> "$mainUrl/browse?page=$page&order[created_at]=desc"
+            "completed" -> "$mainUrl/browse?page=$page&status=completed"
+            else        -> return null
+        }
+        val browseHtml = runCatching { fetchHtml(browseUrl) }.getOrNull()
+        if (!browseHtml.isNullOrBlank()) {
+            val items = parseMainPage(browseHtml, request, page)
+            if (items.isNotEmpty()) return PageResult(items, hasNext = items.size >= 28)
+        }
+
+        return null
     }
 
-    override suspend fun latest(page: Int): List<SearchResponse> = popular(page)
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Base abstract stubs — never called because getMainPage/load are overridden
+    // ═══════════════════════════════════════════════════════════════════════
+    override suspend fun popular(page: Int): List<SearchResponse> =
+        fetchQueryPage(
+            MainPageRequest("popular", "Popular", "popular"),
+            page
+        )?.items.orEmpty()
 
-    // ✅ FIX 2: newAnimeSearchResponse + TvType.Anime in search fallback
-    override suspend fun searchPage(query: String, page: Int): List<SearchResponse> {
-        val url = "$mainUrl/browse?q=${URLEncoder.encode(query, "UTF-8")}"
+    override suspend fun chapters(mangaUrl: String): List<Episode> = emptyList()
+    override suspend fun pages(chapterUrl: String): List<String> = emptyList()
+    override suspend fun searchPage(query: String, page: Int): List<SearchResponse> = search(query)
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Search
+    // ═══════════════════════════════════════════════════════════════════════
+    override suspend fun search(query: String): List<SearchResponse> {
+        val cleanQuery = query.trim()
+        if (cleanQuery.isEmpty()) return emptyList()
+        val encodedQuery = URLEncoder.encode(cleanQuery, "UTF-8")
+        val searchUrl = "$mainUrl/browse?q=$encodedQuery"
+
+        val html = fetchHtml(searchUrl)
+        if (html.isBlank()) return emptyList()
+
+        var results: List<SearchResponse> = emptyList()
+        extractInitialDataJson(html)?.let { initial ->
+            results = readQueries(initial) { k -> k.length() >= 1 && k.optString(0) == "manga" }
+        }
+        if (results.isEmpty()) results = extractSearchResultsDom(Jsoup.parse(html))
+
+        val lower = cleanQuery.lowercase()
+        val filtered = results.filter { it.name.lowercase().contains(lower) }
+        return (filtered.ifEmpty { results }).distinctBy { it.url }
+    }
+
+    override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
+
+    private fun formatChapterNum(n: Double): String =
+        if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  load — Comix-specific
+    // ═══════════════════════════════════════════════════════════════════════
+    override suspend fun load(url: String): LoadResponse? {
         val html = fetchHtml(url)
-        if (html.isBlank()) return emptyList()
-        val doc = Jsoup.parse(html)
+        if (html.isBlank()) return null
 
-        extractInitial(doc)?.let { initial ->
-            val items = readQueries(initial) { k ->
-                k.length() >= 1 && k.optString(0) == "manga"
-            }
-            if (items.isNotEmpty()) return items
-        }
+        val document = Jsoup.parse(html)
+        val initialData = extractInitialDataJson(document)
 
-        return doc.select("a[href*='/title/']").mapNotNull { a ->
-            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val title = a.selectFirst("h3, .title")?.text()?.trim()
-                ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            newAnimeSearchResponse(title, fixUrl(href), TvType.Anime)
-        }.distinctBy { it.url }
-    }
+        val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
 
-    override suspend fun chapters(mangaUrl: String): List<Episode> {
-        val html = fetchHtml(mangaUrl)
-        if (html.isBlank()) return emptyList()
-        val doc = Jsoup.parse(html)
-
-        val chapters = mutableMapOf<Double, Pair<String, String>>()
-
-        doc.select("a.mchap-row__primary, a[href*='-chapter-']").forEach { a ->
-            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
-            val m = Regex("""-chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href)
-                ?: return@forEach
-            val num = m.groupValues[1].toDoubleOrNull() ?: return@forEach
-            if (!chapters.containsKey(num)) {
-                chapters[num] = (a.text().trim().ifBlank { "Ch. $num" }) to href
+        fun extractChaptersFromHtml(doc: Document) {
+            doc.select("a.mchap-row__primary, a[href*='-chapter-']").forEach { a ->
+                val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
+                val m = Regex("""-chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return@forEach
+                val numStr = m.groupValues[1].toDoubleOrNull()?.let { formatChapterNum(it) } ?: return@forEach
+                if (a.hasClass("mchap-row__primary") || a.parents().any { it.hasClass("mchap-item") }) {
+                    if (!parsedChapterLinks.containsKey(numStr)) {
+                        val visible = a.text().trim()
+                        parsedChapterLinks[numStr] = visible.ifBlank { "Ch. $numStr" } to href
+                    }
+                }
             }
         }
+
+        extractChaptersFromHtml(document)
 
         var maxPage = 1
-        doc.select(".npager__num").forEach { el ->
-            (el.text().toIntOrNull() ?: 1).let { if (it > maxPage) maxPage = it }
+        document.select(".npager__num").forEach { el ->
+            val p = el.text().toIntOrNull() ?: 1
+            if (p > maxPage) maxPage = p
         }
 
         if (maxPage > 1) {
-            val pages = (2..maxPage).toList().chunked(5)
-            for (batch in pages) {
+            val pages = (2..maxPage).toList()
+            for (chunk in pages.chunked(5)) {
                 coroutineScope {
-                    batch.map { p ->
+                    chunk.map { pageNum ->
                         async {
-                            val u = if (mangaUrl.contains("?")) "$mangaUrl&page=$p"
-                                    else "$mangaUrl?page=$p"
-                            val h = runCatching { fetchHtml(u) }.getOrDefault("")
-                            if (h.isNotBlank()) {
-                                Jsoup.parse(h)
-                                    .select("a[href*='-chapter-']")
-                                    .forEach { a ->
-                                        val href = a.attr("href")
-                                            .takeIf { it.isNotBlank() } ?: return@forEach
-                                        val m = Regex(
-                                            """-chapter-([\d.]+)""",
-                                            RegexOption.IGNORE_CASE
-                                        ).find(href) ?: return@forEach
-                                        val num = m.groupValues[1].toDoubleOrNull()
-                                            ?: return@forEach
-                                        synchronized(chapters) {
-                                            if (!chapters.containsKey(num)) {
-                                                chapters[num] =
-                                                    (a.text().trim().ifBlank { "Ch. $num" }) to href
-                                            }
-                                        }
-                                    }
-                            }
+                            val pUrl = if (url.contains("?")) "$url&page=$pageNum" else "$url?page=$pageNum"
+                            val response = runCatching { fetchHtml(pUrl) }.getOrNull()
+                            if (!response.isNullOrBlank()) extractChaptersFromHtml(Jsoup.parse(response))
                         }
                     }.awaitAll()
                 }
             }
         }
 
-        return chapters.toSortedMap().entries.mapIndexed { i, entry ->
-            newEpisode(fixUrl(entry.value.second)) {
-                this.name = entry.value.first
-                this.episode = i + 1
+        var detail: JSONObject? = null
+        initialData?.optJSONObject("queries")?.let { queries ->
+            val keys = queries.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
+                if (parsed.length() >= 2 && parsed.optString(0) == "manga" && parsed.optString(1) == "detail") {
+                    detail = queries.optJSONObject(k)
+                    if (detail != null) break
+                }
+            }
+        }
+        val d = detail
+
+        val fallbackTitle: String = run {
+            val slug = url.substringAfter("/title/", "").substringAfter("-", "")
+            val guess = slug.replace('-', ' ').trim()
+            if (guess.isBlank()) "Untitled" else
+                guess.split(' ').joinToString(" ") { w ->
+                    if (w.isEmpty()) w else w[0].uppercase() + w.drop(1)
+                }
+        }
+
+        val mangaTitle = d?.optString("title")?.takeIf { it.isNotBlank() } ?: fallbackTitle
+        val posterUrl = d?.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
+            ?: d?.optJSONObject("poster")?.optString("medium")
+        val plot = d?.optString("synopsis")?.takeIf { it.isNotBlank() }
+        val statusStr = d?.optString("status")?.takeIf { it.isNotBlank() }
+        val yearInt = d?.optInt("year", 0)?.takeIf { it > 0 }
+
+        val genres = buildList {
+            if (d != null) {
+                listOf("genres", "tags", "demographics", "formats").forEach { f ->
+                    d.optJSONArray(f)?.let { arr ->
+                        for (i in 0 until arr.length()) {
+                            arr.optJSONObject(i)?.optString("title")
+                                ?.takeIf { it.isNotBlank() }?.let { add(it) }
+                        }
+                    }
+                }
+            }
+        }.distinct()
+
+        val latestChapterNum = d?.optInt("latestChapter", 0) ?: 0
+        val firstChapterUrl  = d?.optString("firstChapterUrl")?.takeIf { it.isNotBlank() }
+        val startsAtZero = firstChapterUrl?.contains("-chapter-0", ignoreCase = true) == true
+        val startCh = if (startsAtZero) 0 else 1
+
+        val allChapterKeys = mutableSetOf<String>()
+        if (latestChapterNum > 0) for (i in startCh..latestChapterNum) allChapterKeys.add(i.toString())
+        parsedChapterLinks.keys.forEach { allChapterKeys.add(it) }
+        val sortedKeys = allChapterKeys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
+
+        val episodes = sortedKeys.mapIndexed { index, key ->
+            val realData = parsedChapterLinks[key]
+            val epUrl = if (realData != null) realData.second
+                else if (key == "0" && startsAtZero && firstChapterUrl != null) firstChapterUrl
+                else if (key == "1" && !startsAtZero && firstChapterUrl != null) firstChapterUrl
+                else "$url/chapter-$key"
+            val epName = realData?.first ?: "Ch. $key"
+            newEpisode(fixUrl(epUrl)) {
+                this.name = epName
+                this.season = 1
+                this.episode = index + 1
+                this.posterUrl = posterUrl
+            }
+        }
+
+        return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
+            this.posterUrl = posterUrl
+            this.plot      = plot
+            this.tags      = genres
+            this.year      = yearInt
+            this.showStatus = when (statusStr?.lowercase()) {
+                "completed", "finished"             -> ShowStatus.Completed
+                "releasing", "ongoing", "on_hiatus" -> ShowStatus.Ongoing
+                else -> null
+            }
+            if (episodes.isNotEmpty()) {
+                addEpisodes(DubStatus.Subbed, episodes)
             }
         }
     }
 
-    override suspend fun pages(chapterUrl: String): List<String> = emptyList()
-
-    // ✅ FIX 3: added isFinishing/isDestroyed guard
+    // ═══════════════════════════════════════════════════════════════════════
+    //  loadLinks — launches the unified ReaderDialog
+    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val activity = CommonActivity.activity as? androidx.appcompat.app.AppCompatActivity
-            ?: return false
+        val activity = CommonActivity.activity as? AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
         val chapterName = Regex("-chapter-([\\d.]+)").find(data)
             ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
 
         activity.runOnUiThread {
-            ReaderDialog.show(activity, name, chapterName, data, baseUrl, 0)
+            ReaderDialog.show(
+                activity = activity,
+                title = name,
+                chapterName = chapterName,
+                chapterUrl = data,
+                referer = baseUrl,
+                targetChapter = 0
+            )
         }
         return true
     }
 
     private companion object {
+        const val CIPHER_CAPTURE_TIMEOUT_MS = 30_000L
+
         val CAPTURE_SCRIPT = """
             (function () {
                 if (window.__comixCipherHook) return;
                 window.__comixCipherHook = true;
+
                 var captures = window.__comixCipherCaptures = [];
+                var seen = window.__comixSeenLengths = {};
                 var originalAtob = window.atob;
+
                 var stealthAtob = function (value) {
                     var decoded = originalAtob.call(window, value);
                     try {
                         var len = decoded.length;
+                        var key = 'L' + len;
+                        if (!seen[key]) { seen[key] = true; }
+
                         if (len === 256 || len === 24 || len === 32) {
                             var bytes = new Array(len);
                             for (var i = 0; i < len; i++) bytes[i] = decoded.charCodeAt(i) & 255;
                             captures.push(bytes);
+
                             var sboxes = captures.filter(function (x) { return x.length === 256; }).slice(0, 3);
                             var keys   = captures.filter(function (x) { return x.length === 24 || x.length === 32; }).slice(0, 3);
                             if (sboxes.length === 3 && keys.length === 3) {
-                                ComixCipherBridge.submit(JSON.stringify({ sboxes: sboxes, keys: keys }));
+                                var payload = JSON.stringify({ sboxes: sboxes, keys: keys });
+                                try { ComixCipherBridge.submit(payload); } catch (e) {}
                             }
                         }
                     } catch (e) {}
                     return decoded;
                 };
-                var origFp = Function.prototype.toString;
+
+                var origFpToString = Function.prototype.toString;
                 Function.prototype.toString = function () {
                     if (this === stealthAtob) return 'function atob() { [native code] }';
-                    return origFp.call(this);
+                    return origFpToString.call(this);
                 };
-                Object.defineProperty(window, 'atob', { value: stealthAtob, writable: true, configurable: true });
+
+                Object.defineProperty(window, 'atob', {
+                    value: stealthAtob,
+                    writable: true,
+                    configurable: true
+                });
             })();
         """.trimIndent()
     }
