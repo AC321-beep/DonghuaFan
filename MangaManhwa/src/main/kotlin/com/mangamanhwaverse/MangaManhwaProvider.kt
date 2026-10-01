@@ -9,7 +9,7 @@ import java.net.URI
 
 abstract class MangaManhwaProvider : MainAPI() {
 
-    final override val supportedTypes = setOf(TvType.Others)
+    final override val supportedTypes = setOf(TvType.Anime, TvType.Others)
     abstract val baseUrl: String
 
     abstract suspend fun searchPage(query: String, page: Int): List<SearchResponse>
@@ -36,12 +36,14 @@ abstract class MangaManhwaProvider : MainAPI() {
         runCatching { searchPage(query, 1) }.getOrNull()
 
     override suspend fun load(url: String): LoadResponse? = runCatching {
-        newTvSeriesLoadResponse(
-            name = url.substringAfterLast("/").replace('-', ' '),
-            url = url,
-            type = TvType.Others,
-            episodes = chapters(url)
-        )
+        newAnimeLoadResponse(
+            url.substringAfterLast("/").replace('-', ' '),
+            url,
+            TvType.Anime
+        ) {
+            this.posterUrl = null
+            addEpisodes(DubStatus.Subbed, chapters(url))
+        }
     }.getOrNull()
 
     override suspend fun loadLinks(
