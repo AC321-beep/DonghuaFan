@@ -17,14 +17,17 @@ import android.view.View
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.fragment.app.DialogFragment
 import java.net.URI
@@ -199,14 +202,57 @@ class ReaderDialog : DialogFragment() {
             }
 
             webViewClient = object : WebViewClient() {
+
+                // Allow site-internal navigation; block ad/external hosts
                 override fun shouldOverrideUrlLoading(
                     view: WebView, request: WebResourceRequest
                 ): Boolean {
                     val u = request.url?.toString() ?: return false
-                    if (referer.isBlank()) return false
-                    val refHost = runCatching { URI(referer).host }.getOrNull() ?: return false
-                    val navHost = runCatching { URI(u).host }.getOrNull() ?: return false
-                    return refHost != navHost
+                    if (!u.startsWith("http")) return false
+
+                    val blocklist = listOf(
+                        "doubleclick", "googlesyndication", "googleadservices",
+                        "facebook.com/tr", "analytics", "scorecardresearch",
+                        "adservice", "adsystem"
+                    )
+                    if (blocklist.any { u.contains(it, ignoreCase = true) }) return true
+
+                    return false
+                }
+
+                // Accept broken certs (common on smaller hosts)
+                override fun onReceivedSslError(
+                    view: WebView?,
+                    handler: android.webkit.SslErrorHandler?,
+                    error: android.net.http.SslError?
+                ) {
+                    handler?.proceed()
+                }
+
+                // Show a friendly error page on main-frame failures
+                override fun onReceivedError(
+                    view: WebView,
+                    request: WebResourceRequest,
+                    error: WebResourceError
+                ) {
+                    if (!request.isForMainFrame) return
+                    progressBar?.visibility = View.GONE
+                    val desc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        error.description.toString()
+                    } else "Network error"
+                    view.loadData(
+                        """
+                        <html><body style="background:#07080C;color:#94A3B8;
+                          font-family:sans-serif;padding:40px;text-align:center">
+                          <h3 style="color:#E2E8F0">Couldn't load chapter</h3>
+                          <p>$desc</p>
+                          <p style="font-size:12px;margin-top:24px;word-break:break-all">
+                            ${request.url}
+                          </p>
+                        </body></html>
+                        """.trimIndent(),
+                        "text/html", "UTF-8"
+                    )
                 }
 
                 override fun onPageFinished(view: WebView, url: String?) {
@@ -214,6 +260,7 @@ class ReaderDialog : DialogFragment() {
                     progressBar?.visibility = View.GONE
                     injectReaderJs(view)
                     applyZoom(view, currentZoom)
+                    checkAndJumpToTargetChapter(view)
                 }
             }
         }
@@ -255,6 +302,7 @@ class ReaderDialog : DialogFragment() {
         zoomBtn = btn(ctx, density, "100%", "#11141D", "#93C5FD") { resetZoom() }
         middle.addView(zoomBtn)
         middle.addView(btn(ctx, density, "+", null, null) { zoomBy(25) })
+        middle.addView(btn(ctx, density, "↷", null, "#A78BFA") { promptJump() })
 
         chapterInfo = TextView(ctx).apply {
             text = currentChapterName.ifBlank { "Chapter" }
@@ -335,7 +383,9 @@ class ReaderDialog : DialogFragment() {
               if (!s) { s = document.createElement('style'); s.id = 'mm-zoom'; document.head.appendChild(s); }
               s.innerHTML =
                 'img, .rpage-page__img, canvas { max-width:' + z + '% !important; width:' + z + '% !important; height:auto !important; display:block !important; margin:0 auto !important; }' +
-                '.rpage-main__inner, .reading-content, .container, #readerarea { width:' + z + '% !important; max-width:' + z + '% !important; margin:0 auto !important; }';
+                '.rpage-main__inner, .reading-content, #readerarea, .container, ' +
+                '.viewer, .chapter-content, .manga-reading, #chapter-content, main' +
+                ' { width:' + z + '% !important; max-width:' + z + '% !important; margin:0 auto !important; }';
             })();
             """.trimIndent(), null
         )
@@ -358,6 +408,132 @@ class ReaderDialog : DialogFragment() {
             })();
         """.trimIndent()
         webView?.evaluateJavascript(js, null)
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Jump-to-chapter — waterfall of selectors for all provider types
+    // ═══════════════════════════════════════════════════════════════
+    private fun checkAndJumpToTargetChapter(view: WebView) {
+        if (targetChapter <= 0) return
+        val target = targetChapter
+        val js = """
+            (function() {
+              var targetCh = $target;
+              var ticks = 0, opened = false, searched = false;
+
+              var initialMatch = /(?:chapter|ch)[-/\s]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
+              if (initialMatch && parseFloat(initialMatch[1]) === targetCh) {
+                if (window.MMReader) window.MMReader.onTargetReached(targetCh);
+                return;
+              }
+
+              var timer = setInterval(function() {
+                ticks++;
+                if (ticks > 80) {
+                  clearInterval(timer);
+                  if (window.MMReader) window.MMReader.onTargetReached(0);
+                  return;
+                }
+
+                var m = /(?:chapter|ch)[-/\s]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
+                if (m && parseFloat(m[1]) === targetCh) {
+                  clearInterval(timer);
+                  if (window.MMReader) window.MMReader.onTargetReached(targetCh);
+                  return;
+                }
+
+                var modal = document.querySelector(
+                  '.rpage-modal--chaplist,' +
+                  '.chapter-list, .chapter-list-container, .eplister,' +
+                  '#chapterlist, #chapters, .listing-chapters_wrap,' +
+                  '.wp-manga-chapter, .version-chap, .manga-chapters'
+                );
+
+                if (!modal) {
+                  if (!opened) {
+                    var trigger = document.querySelector(
+                      '.rpage-floatctl__chap,' +
+                      'button[aria-label*="chapter" i],' +
+                      '[title*="chapter" i],' +
+                      '.chapter-list-btn, .btn-chapter-list, .toggle-chapters'
+                    );
+                    if (trigger) { trigger.click(); opened = true; }
+                  }
+                  return;
+                }
+
+                var items = modal.querySelectorAll(
+                  '.rpage-chaplist__item, a[href*="chapter"], li > a, .chapter-item a, ' +
+                  '.wp-manga-chapter a, .eplister a'
+                );
+
+                for (var i = 0; i < items.length; i++) {
+                  var btn = items[i];
+                  var href = btn.getAttribute('href') || '';
+                  var linkMatch = /(?:chapter|ch)[-/\s]?(\d+(?:\.\d+)?)/i.exec(href);
+                  if (linkMatch && parseFloat(linkMatch[1]) === targetCh) {
+                    clearInterval(timer);
+                    if (window.MMReader) window.MMReader.onTargetReached(targetCh);
+                    btn.click();
+                    return;
+                  }
+                  var txt = (btn.innerText || '').trim();
+                  var textMatch = /(?:chapter|ch\.?)\s*(\d+(?:\.\d+)?)/i.exec(txt);
+                  if (textMatch && parseFloat(textMatch[1]) === targetCh) {
+                    clearInterval(timer);
+                    if (window.MMReader) window.MMReader.onTargetReached(targetCh);
+                    btn.click();
+                    return;
+                  }
+                }
+
+                if (!searched) {
+                  var input = modal.querySelector(
+                    '.rpage-chaplist__search input,' +
+                    'input[type="search"], input[placeholder*="search" i], ' +
+                    'input[placeholder*="chapter" i]'
+                  );
+                  if (input) {
+                    searched = true;
+                    try {
+                      var setter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, "value"
+                      ).set;
+                      setter.call(input, String(targetCh));
+                      input.dispatchEvent(new Event('input', { bubbles: true }));
+                      input.dispatchEvent(new Event('change', { bubbles: true }));
+                    } catch (e) {
+                      input.value = String(targetCh);
+                      input.dispatchEvent(new Event('input', { bubbles: true }));
+                    }
+                  }
+                }
+              }, 100);
+            })();
+        """.trimIndent()
+        view.evaluateJavascript(js, null)
+    }
+
+    private fun promptJump() {
+        val ctx = context ?: return
+        val input = EditText(ctx).apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or
+                        android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+            hint = "Chapter number"
+        }
+        AlertDialog.Builder(ctx)
+            .setTitle("Jump to chapter")
+            .setView(input)
+            .setPositiveButton("Go") { _, _ ->
+                val n = input.text.toString().trim().toDoubleOrNull()?.toInt() ?: return@setPositiveButton
+                if (n <= 0) return@setPositiveButton
+                targetChapter = n
+                currentChapterName = "Ch. $n"
+                chapterInfo?.text = currentChapterName
+                webView?.let { checkAndJumpToTargetChapter(it) }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun injectReaderJs(view: WebView) {
@@ -428,6 +604,7 @@ class ReaderDialog : DialogFragment() {
                       if (atBottom() && y > h * 0.75) {
                         flash(x, y); if (window.MMReader) window.MMReader.onNext();
                       } else {
+                        flash(x, y);
                         if (window.MMReader) window.MMReader.onCenterTap();
                       }
                     }
@@ -537,6 +714,17 @@ class ReaderDialog : DialogFragment() {
         fun onReinject() {
             dialog.activity?.runOnUiThread {
                 dialog.webView?.let { dialog.injectReaderJs(it) }
+            }
+        }
+
+        @JavascriptInterface
+        fun onTargetReached(chapterNum: Int) {
+            dialog.activity?.runOnUiThread {
+                if (chapterNum > 0) {
+                    dialog.targetChapter = 0
+                    dialog.currentChapterName = "Ch. $chapterNum"
+                    dialog.chapterInfo?.text = "Ch. $chapterNum"
+                }
             }
         }
     }
