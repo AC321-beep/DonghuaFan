@@ -48,6 +48,7 @@ import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.ByteArrayInputStream
 import java.io.File
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
@@ -71,8 +72,6 @@ class ComixProvider : MainAPI() {
         "follows"  to "Most Followed",
     )
 
-    @Volatile private var cfgToken: String? = null
-
     @Volatile private var cipher: ComixCipher? = null
     @Volatile private var captureInFlight = false
     @Volatile private var prewarmStarted = false
@@ -83,7 +82,7 @@ class ComixProvider : MainAPI() {
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Debug helpers
+    //  Debug & Network Helpers
     // ═══════════════════════════════════════════════════════════════════════
     private fun dbg(msg: String) {
         println("ComixDebug: $msg")
@@ -115,18 +114,12 @@ class ComixProvider : MainAPI() {
         dbg("[fetchHtml] → GET $url")
         val text = app.get(url, interceptor = cfInterceptor, headers = browserHeaders()).text
         dbg("[fetchHtml] ← ${text.length} chars | first 120: ${text.take(120).replace("\n", " ")}")
-        runCatching {
-            Jsoup.parse(text).selectFirst("meta[name=cfg]")?.attr("content")
-                ?.takeIf { it.isNotBlank() }
-                ?.let { cfgToken = it }
-        }
         return text
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Cipher: state, cache, background prewarm, capture
     // ═══════════════════════════════════════════════════════════════════════
-
     private val cipherCacheFile: File?
         get() {
             val ctx = CommonActivity.activity ?: return null
@@ -201,15 +194,9 @@ class ComixProvider : MainAPI() {
     }
 
     /**
-     * Drives a WebView against the site with a NATURAL loadUrl (not
-     * loadDataWithBaseURL). The natural navigation is required for Cloudflare
-     * Turnstile to clear — synthetic loads via loadDataWithBaseURL are
-     * detected and frozen.
-     *
-     * Because loadUrl means we can't guarantee our hook runs before the site's
-     * bundle, we install the hook in onPageStarted AND re-install on a poll.
-     * We also simulate a UI click on a DOM link to force the site's SPA router 
-     * to perform a legitimate internal fetch, natively bypassing 403s.
+     * Drives a WebView against the site with a NATURAL loadUrl to seamlessly pass
+     * Cloudflare Turnstile verification. Simulates a UI click to force the SPA 
+     * router to perform an internal fetch, natively triggering the site's cipher.
      */
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun captureCipherMaterial(htmlOrNull: String?): CipherMaterial? = withContext(Dispatchers.Main) {
@@ -239,7 +226,7 @@ class ComixProvider : MainAPI() {
                 javaScriptEnabled = true
                 domStorageEnabled = true
                 databaseEnabled = true
-                // Let the WebView act exactly like a normal Chrome browser. 
+                // Let the WebView act exactly like a normal Chrome browser.
                 // Do not block images, as CF Turnstile often relies on 1x1 tracking pixels.
                 userAgentString = browserHeaders()["User-Agent"]
             }
@@ -272,9 +259,6 @@ class ComixProvider : MainAPI() {
             }
 
             web.webViewClient = object : WebViewClient() {
-                // Removed shouldInterceptRequest completely to prevent ERR_CONNECTION_REFUSED
-                // on Cloudflare challenge assets.
-
                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                     dbg("[cipher] onPageStarted: $url")
                     view?.evaluateJavascript(CAPTURE_SCRIPT, null)
@@ -290,7 +274,6 @@ class ComixProvider : MainAPI() {
                     request: WebResourceRequest?,
                     error: WebResourceError?,
                 ) {
-                    // Only log main-frame errors to keep logcat clean
                     if (request?.isForMainFrame == true) {
                         dbg("[cipher] main frame error: ${request.url} -> ${error?.description}")
                     }
@@ -325,14 +308,12 @@ class ComixProvider : MainAPI() {
                         """
                         (function(){
                             if (window.__comixTriggered) return;
-                            // Find a pagination button, a browse link, or a manga card
                             var el = document.querySelector('.npager a, a[href*="/browse"], a[href*="/title/"]');
                             if (el) {
                                 window.__comixTriggered = true;
                                 try { ComixCipherBridge.progress('Triggering SPA click on: ' + el.href); } catch(e){}
-                                el.click(); // This forces the site's own API client to execute
+                                el.click();
                             } else {
-                                // Fallback: Scroll to bottom to trigger lazy loaders
                                 window.scrollTo(0, document.body.scrollHeight);
                             }
                         })();
@@ -351,9 +332,8 @@ class ComixProvider : MainAPI() {
     /**
      * Uses the cached cipher only. Never blocks on WebView capture.
      *
-     * Race-safe invalidation (matches Tachiyomi): if this request's cipher is
-     * replaced by a concurrent capture while we're in flight, we only drop the
-     * one we were using — never the newer replacement.
+     * Race-safe invalidation: if this request's cipher is replaced by a concurrent 
+     * capture while we're in flight, we only drop the one we were using.
      */
     private suspend fun getSigned(
         path: String,
@@ -442,7 +422,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  initial-data parsing
+    //  Initial Data & JSON Parsing
     // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
@@ -458,9 +438,8 @@ class ComixProvider : MainAPI() {
 
     /**
      * Parses a manga/manga-card object. Tolerates field-name drift between the
-     * SSR HTML and the JSON API. Matches the Tachiyomi extension's fallbacks:
-     * `url` is optional in the API model, and the path is reconstructed from
-     * `hid` when absent.
+     * SSR HTML and the JSON API. `url` is optional in the API model, and the path 
+     * is reconstructed from `hid` when absent.
      */
     private fun parseMangaFromJson(obj: JSONObject): SearchResponse? {
         val title = (obj.optString("title").takeIf { it.isNotBlank() }
@@ -557,7 +536,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Pagination helpers
+    //  Pagination Handlers
     // ═══════════════════════════════════════════════════════════════════════
     private data class PageResult(
         val items: List<SearchResponse>,
@@ -599,10 +578,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Main page
-    //
-    //  Never blocks on cipher capture. Dispatch prewarm, answer from SSR
-    //  immediately, and switch to the signed API on the next visit / page.
+    //  Main Page Routing
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
@@ -610,7 +586,6 @@ class ComixProvider : MainAPI() {
     ): HomePageResponse? {
         dbgSection("getMainPage(page=$page, request='${request.data}')")
 
-        // One-shot background capture of the cipher. Doesn't block.
         if (request.data == "hot" || request.data == "latest") {
             maybeStartPrewarm()
         }
@@ -624,7 +599,7 @@ class ComixProvider : MainAPI() {
             )
         }
 
-        // hot / latest: try signed API only if cipher is cached.
+        // Try signed API only if cipher is cached
         val apiResult = fetchQueryPage(request, page)
         if (apiResult != null && apiResult.items.isNotEmpty()) {
             dbg("[getMainPage] ✓ ${apiResult.items.size} items, hasNext=${apiResult.hasNext}")
@@ -635,7 +610,7 @@ class ComixProvider : MainAPI() {
             )
         }
 
-        // SSR fallback for page 1 only — provides an instant first paint.
+        // SSR fallback for page 1 provides an instant first paint
         if (page == 1) {
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
             dbg("[getMainPage] SSR fallback page 1: ${items.size} items")
@@ -643,7 +618,7 @@ class ComixProvider : MainAPI() {
                 return newHomePageResponse(
                     request,
                     items.distinctBy { it.url },
-                    hasNext = true  // pagination becomes available once prewarm finishes
+                    hasNext = true 
                 )
             }
         }
@@ -696,9 +671,6 @@ class ComixProvider : MainAPI() {
         return items
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  fetchQueryPage — signed API when cached, SSR otherwise
-    // ═══════════════════════════════════════════════════════════════════════
     private suspend fun fetchQueryPage(
         request: MainPageRequest,
         page: Int
@@ -746,7 +718,6 @@ class ComixProvider : MainAPI() {
             dbg("[fetchQueryPage] no cipher cached yet; skipping signed API")
         }
 
-        // ── SSR ?page=N
         dbg("[fetchQueryPage] ▶ SSR $mainUrl/?page=$page")
         val homeSsrHtml = runCatching { fetchHtml("$mainUrl/?page=$page") }.getOrNull()
         if (!homeSsrHtml.isNullOrBlank()) {
@@ -772,7 +743,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ── SSR /browse?page=N
         val browseUrl = when (request.data) {
             "hot"    -> "$mainUrl/browse?page=$page&scope=hot&order[chapter_updated_at]=desc"
             "latest" -> "$mainUrl/browse?page=$page&order[created_at]=desc"
@@ -793,10 +763,7 @@ class ComixProvider : MainAPI() {
         return null
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Search
-    // ═══════════════════════════════════════════════════════════════════════
-    override suspend fun search(query: String): List<SearchResponse> {
+     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
         val encodedQuery = URLEncoder.encode(cleanQuery, "UTF-8")
@@ -821,10 +788,7 @@ class ComixProvider : MainAPI() {
     private fun formatChapterNum(n: Double): String =
         if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  load()
-    // ═══════════════════════════════════════════════════════════════════════
-    override suspend fun load(url: String): LoadResponse? {
+     override suspend fun load(url: String): LoadResponse? {
         val html = fetchHtml(url)
         if (html.isBlank()) return null
 
@@ -911,7 +875,7 @@ class ComixProvider : MainAPI() {
                     }
                 }
             }
-        }
+        }.distinct()
 
         val latestChapterNum = d?.optInt("latestChapter", 0) ?: 0
         val firstChapterUrl  = d?.optString("firstChapterUrl")?.takeIf { it.isNotBlank() }
@@ -954,10 +918,7 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  loadLinks()
-    // ═══════════════════════════════════════════════════════════════════════
-    override suspend fun loadLinks(
+     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -981,10 +942,7 @@ class ComixProvider : MainAPI() {
         return true
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Companion constants
-    // ═══════════════════════════════════════════════════════════════════════
-    private companion object {
+        private companion object {
         const val CIPHER_CAPTURE_TIMEOUT_MS = 30_000L
 
         val CAPTURE_SCRIPT = """
