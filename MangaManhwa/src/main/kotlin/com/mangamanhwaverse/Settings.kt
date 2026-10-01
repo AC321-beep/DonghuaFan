@@ -7,8 +7,6 @@ import android.text.InputType
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
-import android.widget.RadioButton
-import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -21,9 +19,6 @@ object Settings {
     }
 
     // ── Core preferences ──
-    fun readingDirection(): String = prefs.getString("reading_direction", "ltr")!!
-    fun setReadingDirection(v: String) { prefs.edit().putString("reading_direction", v).apply() }
-
     fun dataSaver(): Boolean = prefs.getBoolean("data_saver", false)
     fun setDataSaver(v: Boolean) { prefs.edit().putBoolean("data_saver", v).apply() }
 
@@ -38,7 +33,6 @@ object Settings {
 
     fun setAllProvidersEnabled(v: Boolean) {
         prefs.edit().putBoolean("all_providers_enabled", v).apply()
-        // Sync the per-provider set
         if (v) setEnabledProviderNames(ProviderRegistry.names.toSet())
         else setEnabledProviderNames(emptySet())
     }
@@ -81,7 +75,7 @@ object Settings {
             setPadding(dp(16), dp(16), dp(16), dp(16))
         }
 
-        // ── Sources section ──
+        // ── Sources ──
         val enabledCount = ProviderRegistry.names.count { isProviderEnabled(it) }
         val totalCount = ProviderRegistry.names.size
 
@@ -105,24 +99,6 @@ object Settings {
             isClickable = true
             setOnClickListener { showSourcePicker(context) }
         })
-
-        // ── Reading direction ──
-        layout.addView(TextView(context).apply {
-            text = "Reading direction"
-            setPadding(0, dp(16), 0, dp(6))
-        })
-
-        val group = RadioGroup(context).apply { orientation = RadioGroup.HORIZONTAL }
-        val rbLtr  = RadioButton(context).apply { text = "LTR"; id = 1 }
-        val rbRtl  = RadioButton(context).apply { text = "RTL"; id = 2 }
-        val rbVert = RadioButton(context).apply { text = "Vertical"; id = 3 }
-        group.addView(rbLtr); group.addView(rbRtl); group.addView(rbVert)
-        when (readingDirection()) {
-            "rtl" -> group.check(2)
-            "vertical" -> group.check(3)
-            else -> group.check(1)
-        }
-        layout.addView(group)
 
         // ── Toggles ──
         val cbDataSaver = CheckBox(context).apply {
@@ -166,10 +142,6 @@ object Settings {
             .setTitle("MangaManhwa Settings")
             .setView(scroll)
             .setPositiveButton("Save & Restart") { _, _ ->
-                val dir = when (group.checkedRadioButtonId) {
-                    2 -> "rtl"; 3 -> "vertical"; else -> "ltr"
-                }
-                setReadingDirection(dir)
                 setDataSaver(cbDataSaver.isChecked)
                 setPreloadNext(cbPreload.isChecked)
                 setVerboseLog(cbVerbose.isChecked)
