@@ -38,8 +38,6 @@ class ComixProvider : MangaManhwaProvider() {
     override val baseUrl = "https://comix.to"
     override var lang = "en"
 
-    // ── 6 categories. `new` from the base class stays hidden —
-    //    on Comix it's a duplicate of `latest` (order[created_at]=desc).
     override val mainPage = mainPageOf(
         "popular"   to "Popular",
         "hot"       to "Hot Updates",
@@ -49,9 +47,6 @@ class ComixProvider : MangaManhwaProvider() {
         "completed" to "Completed",
     )
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Cipher state
-    // ═══════════════════════════════════════════════════════════════════════
     @Volatile private var cipher: ComixCipher? = null
     @Volatile private var captureInFlight = false
     @Volatile private var prewarmStarted = false
@@ -182,9 +177,6 @@ class ComixProvider : MangaManhwaProvider() {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Network helpers
-    // ═══════════════════════════════════════════════════════════════════════
     private fun comixHeaders(extra: Map<String, String> = emptyMap()): Map<String, String> =
         mapOf(
             "User-Agent" to UA,
@@ -267,9 +259,6 @@ class ComixProvider : MangaManhwaProvider() {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Parsing — JSON + DOM helpers
-    // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
             is Document -> htmlOrDoc
@@ -415,9 +404,6 @@ class ComixProvider : MangaManhwaProvider() {
         return out
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  getMainPage — 6-category routing
-    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         if (request.data in listOf("popular", "hot", "latest", "completed")) {
             maybeStartPrewarm()
@@ -581,34 +567,26 @@ class ComixProvider : MangaManhwaProvider() {
         return null
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Base abstract stubs — never called because getMainPage/load are overridden
-    // ═══════════════════════════════════════════════════════════════════════
-   override suspend fun popular(page: Int): List<SearchResponse> {
-    // Stub — never actually called, because getMainPage() is overridden.
-    // Directly calls the signed API so it compiles without MainPageRequest.
-    val params = mapOf(
-        "scope"                     to listOf("popular"),
-        "page"                      to listOf(page.toString()),
-        "order[chapter_updated_at]" to listOf("desc"),
-        "limit"                     to listOf("28"),
-    )
-    val cipher = cachedCipher() ?: return emptyList()
-    val body = getSigned("/api/v1/manga", params) ?: return emptyList()
-    val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
-    val arr: JSONArray = root.optJSONObject("result")?.optJSONArray("items")
-        ?: root.optJSONArray("items")
-        ?: return emptyList()
-    return arrToResults(arr)
-}
+    override suspend fun popular(page: Int): List<SearchResponse> {
+        val params = mapOf(
+            "scope"                     to listOf("popular"),
+            "page"                      to listOf(page.toString()),
+            "order[chapter_updated_at]" to listOf("desc"),
+            "limit"                     to listOf("28"),
+        )
+        val cipher = cachedCipher() ?: return emptyList()
+        val body = getSigned("/api/v1/manga", params) ?: return emptyList()
+        val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
+        val arr: JSONArray = root.optJSONObject("result")?.optJSONArray("items")
+            ?: root.optJSONArray("items")
+            ?: return emptyList()
+        return arrToResults(arr)
+    }
 
     override suspend fun chapters(mangaUrl: String): List<Episode> = emptyList()
     override suspend fun pages(chapterUrl: String): List<String> = emptyList()
     override suspend fun searchPage(query: String, page: Int): List<SearchResponse> = search(query)
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Search
-    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
@@ -634,9 +612,6 @@ class ComixProvider : MangaManhwaProvider() {
     private fun formatChapterNum(n: Double): String =
         if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  load — Comix-specific
-    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
         val html = fetchHtml(url)
         if (html.isBlank()) return null
@@ -767,9 +742,6 @@ class ComixProvider : MangaManhwaProvider() {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  loadLinks — launches the unified ReaderDialog
-    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -779,8 +751,16 @@ class ComixProvider : MangaManhwaProvider() {
         val activity = CommonActivity.activity as? AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
-        val chapterName = Regex("-chapter-([\\d.]+)").find(data)
-            ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
+        val chapterNum = Regex("-chapter-([\\d.]+)").find(data)
+            ?.groupValues?.get(1)
+            ?.toDoubleOrNull()
+            ?.toInt() ?: 0
+
+        val chapterName = when {
+            chapterNum <= 0 -> "Chapter"
+            chapterNum == 0 -> "Prologue"
+            else -> "Ch. $chapterNum"
+        }
 
         activity.runOnUiThread {
             ReaderDialog.show(
@@ -789,7 +769,7 @@ class ComixProvider : MangaManhwaProvider() {
                 chapterName = chapterName,
                 chapterUrl = data,
                 referer = baseUrl,
-                targetChapter = 0
+                targetChapter = chapterNum
             )
         }
         return true
