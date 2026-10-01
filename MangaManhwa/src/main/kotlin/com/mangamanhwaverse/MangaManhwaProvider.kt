@@ -3,6 +3,7 @@ package com.mangamanhwaverse
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.network.WebViewResolver
+import com.lagradost.cloudstream3.utils.ExtractorLink
 import org.jsoup.nodes.Document
 import java.net.URI
 
@@ -11,7 +12,6 @@ abstract class MangaManhwaProvider : MainAPI() {
     final override val supportedTypes = setOf(TvType.Others)
     abstract val baseUrl: String
 
-    // Renamed from `search` to avoid hiding MainAPI.search(query)
     abstract suspend fun searchPage(query: String, page: Int): List<SearchResponse>
     abstract suspend fun popular(page: Int): List<SearchResponse>
     abstract suspend fun chapters(mangaUrl: String): List<Episode>
