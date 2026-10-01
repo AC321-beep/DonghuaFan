@@ -3,6 +3,7 @@ package com.mangamanhwaverse
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.network.WebViewResolver
+import com.lagradost.cloudstream3.utils.ExtractorLink
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
