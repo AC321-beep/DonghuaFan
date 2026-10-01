@@ -584,11 +584,23 @@ class ComixProvider : MangaManhwaProvider() {
     // ═══════════════════════════════════════════════════════════════════════
     //  Base abstract stubs — never called because getMainPage/load are overridden
     // ═══════════════════════════════════════════════════════════════════════
-    override suspend fun popular(page: Int): List<SearchResponse> =
-        fetchQueryPage(
-            MainPageRequest(name = "Popular", data = "popular"),
-            page
-        )?.items.orEmpty()
+   override suspend fun popular(page: Int): List<SearchResponse> {
+    // Stub — never actually called, because getMainPage() is overridden.
+    // Directly calls the signed API so it compiles without MainPageRequest.
+    val params = mapOf(
+        "scope"                     to listOf("popular"),
+        "page"                      to listOf(page.toString()),
+        "order[chapter_updated_at]" to listOf("desc"),
+        "limit"                     to listOf("28"),
+    )
+    val cipher = cachedCipher() ?: return emptyList()
+    val body = getSigned("/api/v1/manga", params) ?: return emptyList()
+    val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
+    val arr: JSONArray = root.optJSONObject("result")?.optJSONArray("items")
+        ?: root.optJSONArray("items")
+        ?: return emptyList()
+    return arrToResults(arr)
+}
 
     override suspend fun chapters(mangaUrl: String): List<Episode> = emptyList()
     override suspend fun pages(chapterUrl: String): List<String> = emptyList()
