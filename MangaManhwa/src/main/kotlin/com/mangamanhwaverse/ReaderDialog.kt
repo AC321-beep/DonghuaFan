@@ -27,11 +27,12 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.fragment.app.DialogFragment
+import java.net.URI
 
 class ReaderDialog : DialogFragment() {
 
     companion object {
-        const val TAG = "ReaderDialog"
+        const val TAG = "MangaManhwaReader"
         private const val ARG_TITLE = "title"
         private const val ARG_CHAPTER = "chapter"
         private const val ARG_URL = "url"
@@ -178,14 +179,12 @@ class ReaderDialog : DialogFragment() {
                 databaseEnabled = true
                 useWideViewPort = true
                 loadWithOverviewMode = true
-                builtInZoomControls = false           // disable native zoom — we control via JS
+                builtInZoomControls = false
                 displayZoomControls = false
                 setSupportZoom(false)
                 cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
                 mediaPlaybackRequiresUserGesture = false
-                userAgentString =
-                    "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+                userAgentString = MangaManhwaProvider.UA
             }
 
             addJavascriptInterface(JsBridge(this@ReaderDialog), "MMReader")
@@ -204,9 +203,10 @@ class ReaderDialog : DialogFragment() {
                     view: WebView, request: WebResourceRequest
                 ): Boolean {
                     val u = request.url?.toString() ?: return false
-                    // Keep navigation inside the source domain
-                    return referer.isNotBlank() &&
-                        !u.startsWith(referer.substringBefore("/", referer), true)
+                    if (referer.isBlank()) return false
+                    val refHost = runCatching { URI(referer).host }.getOrNull() ?: return false
+                    val navHost = runCatching { URI(u).host }.getOrNull() ?: return false
+                    return refHost != navHost
                 }
 
                 override fun onPageFinished(view: WebView, url: String?) {
@@ -236,7 +236,6 @@ class ReaderDialog : DialogFragment() {
         }
 
         bar.addView(btn(ctx, density, "✕", "#281417", "#F87171") { dismissAllowingStateLoss() })
-
         bar.addView(btn(ctx, density, "◀", null, "#CBD5E1") { jsNext(-1) }.apply {
             (layoutParams as? LinearLayout.LayoutParams)?.leftMargin = dp(6)
         })
@@ -314,7 +313,6 @@ class ReaderDialog : DialogFragment() {
         }
     }
 
-    // ── Zoom ────────────────────────────────────────────────
     private fun zoomBy(delta: Int) {
         val next = (currentZoom + delta).coerceIn(25, 200)
         if (next == currentZoom) return
@@ -343,7 +341,6 @@ class ReaderDialog : DialogFragment() {
         )
     }
 
-    // ── Chapter navigation (site-agnostic) ──────────────────
     private fun jsNext(dir: Int) {
         val js = if (dir > 0) """
             (function(){
@@ -363,13 +360,11 @@ class ReaderDialog : DialogFragment() {
         webView?.evaluateJavascript(js, null)
     }
 
-    // ── The core: tap-scrolling + generic reader CSS ────────
     private fun injectReaderJs(view: WebView) {
         view.evaluateJavascript(
             """
             (function(){
               try {
-                /* ── 1. Reader CSS — strip chrome & ads ── */
                 if (!document.getElementById('mm-css')) {
                   var s = document.createElement('style');
                   s.id = 'mm-css';
@@ -383,10 +378,8 @@ class ReaderDialog : DialogFragment() {
                   document.head.appendChild(s);
                 }
 
-                /* ── 2. Tap-scroll engine ── */
                 if (!window.__mmTapInstalled) {
                   window.__mmTapInstalled = true;
-
                   var MAX_MOVE = 14, MAX_TIME = 350, DEBOUNCE = 180;
                   var sx = 0, sy = 0, st = 0, last = 0, moved = false;
 
@@ -396,12 +389,9 @@ class ReaderDialog : DialogFragment() {
                       '[role="dialog"],.modal,.popup,.settings,.chapter-list');
                   }
 
-                  /* Find the actual scroll container — some themes
-                     put overflow on a wrapper, not <body>. */
                   function scroller() {
-                    var cands = [document.scrollingElement, document.body, document.documentElement];
-                    var best = null, bestH = 0;
                     var all = document.querySelectorAll('div,main,section');
+                    var best = null, bestH = 0;
                     for (var i=0;i<all.length;i++){
                       var e = all[i];
                       if (e.scrollHeight > e.clientHeight + 100) {
@@ -414,14 +404,7 @@ class ReaderDialog : DialogFragment() {
 
                   function atBottom() {
                     var el = scroller();
-                    var pos = el.scrollTop || 0;
-                    var max = el.scrollHeight - el.clientHeight;
-                    return (max - pos) < 150;
-                  }
-
-                  function atTop() {
-                    var el = scroller();
-                    return (el.scrollTop || 0) < 100;
+                    return ((el.scrollHeight - el.clientHeight) - (el.scrollTop || 0)) < 150;
                   }
 
                   function scrollByPage(frac) {
@@ -435,28 +418,15 @@ class ReaderDialog : DialogFragment() {
                     var now = Date.now();
                     if (now - last < DEBOUNCE) return;
                     last = now;
+                    var w = window.innerWidth, h = window.innerHeight;
 
-                    var w = window.innerWidth;
-                    var h = window.innerHeight;
-
-                    if (x < w * 0.25) {
-                      // LEFT → scroll up
-                      scrollByPage(-0.8);
-                      flash(x, y);
-                    } else if (x > w * 0.75) {
-                      // RIGHT → scroll down, or next chapter at bottom
-                      if (atBottom()) {
-                        flash(x, y);
-                        if (window.MMReader) window.MMReader.onNext();
-                      } else {
-                        scrollByPage(0.8);
-                        flash(x, y);
-                      }
+                    if (x < w * 0.25) { scrollByPage(-0.8); flash(x, y); }
+                    else if (x > w * 0.75) {
+                      if (atBottom()) { flash(x, y); if (window.MMReader) window.MMReader.onNext(); }
+                      else { scrollByPage(0.8); flash(x, y); }
                     } else {
-                      // CENTER → toggle toolbar (or next at bottom-edge)
                       if (atBottom() && y > h * 0.75) {
-                        flash(x, y);
-                        if (window.MMReader) window.MMReader.onNext();
+                        flash(x, y); if (window.MMReader) window.MMReader.onNext();
                       } else {
                         if (window.MMReader) window.MMReader.onCenterTap();
                       }
@@ -489,7 +459,6 @@ class ReaderDialog : DialogFragment() {
                   document.addEventListener('touchcancel', function(){ moved = true; },
                     { passive: true, capture: true });
 
-                  /* Desktop/emulator fallback */
                   document.addEventListener('click', function(e){
                     if ('ontouchstart' in window) return;
                     if (ignored(e.target)) return;
@@ -497,19 +466,17 @@ class ReaderDialog : DialogFragment() {
                   }, false);
                 }
 
-                /* ── 3. Optional: SPA soft-nav re-inject ── */
                 if (!window.__mmSoftNav) {
                   window.__mmSoftNav = true;
                   var relist = function(){
                     setTimeout(function(){
-                      try {
-                        if (window.MMReader) window.MMReader.onReinject();
-                      } catch(e){}
+                      try { if (window.MMReader) window.MMReader.onReinject(); } catch(e){}
                     }, 150);
                   };
-                  window.addEventListener('popstate', relist);
-                  window.addEventListener('pushstate', relist);
-                  window.addEventListener('replaceState', relist);
+                  ['popstate','turbo:load','turbo:render','pjax:end',
+                   'swup:contentReplaced','inertia:navigate'].forEach(function(ev){
+                    window.addEventListener(ev, relist);
+                  });
                 }
 
                 function flash(x, y) {
@@ -536,7 +503,6 @@ class ReaderDialog : DialogFragment() {
         )
     }
 
-    // ── Public load ─────────────────────────────────────────
     fun loadUrl(name: String, url: String, target: Int) {
         if (url.isBlank()) return
         currentChapterName = name
@@ -546,11 +512,10 @@ class ReaderDialog : DialogFragment() {
         chapterInfo?.text = currentChapterName.ifBlank { "Chapter" }
         webView?.loadUrl(url, mapOf(
             "Referer" to referer,
-            "User-Agent" to (webView?.settings?.userAgentString ?: "Mozilla/5.0")
+            "User-Agent" to (webView?.settings?.userAgentString ?: MangaManhwaProvider.UA)
         ))
     }
 
-    // ── JS → Kotlin bridge ──────────────────────────────────
     class JsBridge(private val dialog: ReaderDialog) {
         @JavascriptInterface
         fun onCenterTap() {
