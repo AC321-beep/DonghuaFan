@@ -1,41 +1,34 @@
 package com.mangamanhwaverse
 
 import android.content.Context
+import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 
 @CloudstreamPlugin
 class MangaManhwaPlugin : Plugin() {
     override fun load(context: Context) {
-        // Madara theme
-        registerMainAPI(Manhuanext())
-        registerMainAPI(HunlightScans())
-        registerMainAPI(Toonily())
-        registerMainAPI(KunManga())
-        registerMainAPI(MangaTX())
-        registerMainAPI(ReaperScans())
-        registerMainAPI(FlameComics())
-        registerMainAPI(LuminousScans())
-        registerMainAPI(AquaManga())
-        registerMainAPI(CosmicScans())
-        registerMainAPI(Disasterscans())
-        registerMainAPI(VyvyManga())
-        registerMainAPI(MangaBob())
-        registerMainAPI(HiveScans())
-        registerMainAPI(AsuraScans())
+        AppContext.ctx = context
+        Settings.init(context)
 
-        // MangaThemesia theme
-        registerMainAPI(ManhwaFreakXyz())
-        registerMainAPI(IgnisComic())
-        registerMainAPI(MangaKakalot())
-        registerMainAPI(MangaBat())
-        registerMainAPI(MangaReader())
-        registerMainAPI(MangaPanda())
-        registerMainAPI(MangaFox())
-        registerMainAPI(ManhwaWorld())
-        registerMainAPI(NyxScans())
+        val all: List<MainAPI> = listOf(
+            // Madara (15)
+            Manhuanext(), HunlightScans(), Toonily(), KunManga(), MangaTX(),
+            ReaperScans(), FlameComics(), LuminousScans(), AquaManga(),
+            CosmicScans(), Disasterscans(), VyvyManga(), MangaBob(),
+            HiveScans(), AsuraScans(),
+            // MangaThemesia (9)
+            ManhwaFreakXyz(), IgnisComic(), MangaKakalot(), MangaBat(),
+            MangaReader(), MangaPanda(), MangaFox(), ManhwaWorld(), NyxScans(),
+            // API-based (2)
+            MangaDex(), ComixProvider()
+        )
 
-        // API-based
-        registerMainAPI(MangaDex())
+        ProviderRegistry.names = all.map { it.name }
+
+        val disabled = Settings.disabledProviders()
+        all.filter { it.name !in disabled }.forEach { registerMainAPI(it) }
+
+        this.openSettings = { ctx -> Settings.show(ctx) }
     }
 }
