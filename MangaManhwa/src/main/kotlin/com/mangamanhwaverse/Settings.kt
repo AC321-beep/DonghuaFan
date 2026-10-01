@@ -20,6 +20,7 @@ object Settings {
         prefs = context.getSharedPreferences("mangamanhwaverse", Context.MODE_PRIVATE)
     }
 
+    // ── Core preferences ──
     fun readingDirection(): String = prefs.getString("reading_direction", "ltr")!!
     fun setReadingDirection(v: String) { prefs.edit().putString("reading_direction", v).apply() }
 
@@ -32,9 +33,33 @@ object Settings {
     fun verboseLog(): Boolean = prefs.getBoolean("verbose_log", false)
     fun setVerboseLog(v: Boolean) { prefs.edit().putBoolean("verbose_log", v).apply() }
 
+    // ── Master toggle ──
     fun allProvidersEnabled(): Boolean = prefs.getBoolean("all_providers_enabled", true)
-    fun setAllProvidersEnabled(v: Boolean) { prefs.edit().putBoolean("all_providers_enabled", v).apply() }
 
+    fun setAllProvidersEnabled(v: Boolean) {
+        prefs.edit().putBoolean("all_providers_enabled", v).apply()
+        // Sync the per-provider set
+        if (v) setEnabledProviderNames(ProviderRegistry.names.toSet())
+        else setEnabledProviderNames(emptySet())
+    }
+
+    // ── Per-provider selection ──
+    fun enabledProviderNames(): Set<String> =
+        prefs.getStringSet("enabled_providers", emptySet()) ?: emptySet()
+
+    fun setEnabledProviderNames(s: Set<String>) {
+        prefs.edit().putStringSet("enabled_providers", s).apply()
+    }
+
+    fun isProviderEnabled(name: String): Boolean {
+        if (!prefs.contains("enabled_providers")) return allProvidersEnabled()
+        return name in enabledProviderNames()
+    }
+
+    fun hasInitializedProviderSet(): Boolean =
+        prefs.contains("enabled_providers")
+
+    // ── Per-provider URL override ──
     fun providerUrlOverride(name: String): String =
         prefs.getString("url_override_$name", "") ?: ""
 
@@ -42,6 +67,9 @@ object Settings {
         prefs.edit().putString("url_override_$name", url.trim()).apply()
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    //  Main dialog
+    // ═══════════════════════════════════════════════════════════════
     fun show(context: Context) {
         if (!::prefs.isInitialized) init(context)
 
@@ -53,9 +81,35 @@ object Settings {
             setPadding(dp(16), dp(16), dp(16), dp(16))
         }
 
+        // ── Sources section ──
+        val enabledCount = ProviderRegistry.names.count { isProviderEnabled(it) }
+        val totalCount = ProviderRegistry.names.size
+
+        val cbAllProviders = CheckBox(context).apply {
+            text = "Enable all sources"
+            isChecked = allProvidersEnabled()
+        }
+        layout.addView(cbAllProviders)
+
+        layout.addView(TextView(context).apply {
+            text = "Selected — $enabledCount of $totalCount"
+            textSize = 12f
+            setPadding(0, dp(4), 0, dp(6))
+        })
+
+        layout.addView(TextView(context).apply {
+            text = "Manage sources"
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            setBackgroundColor(0xFF151923.toInt())
+            setTextColor(0xFFE2E8F0.toInt())
+            isClickable = true
+            setOnClickListener { showSourcePicker(context) }
+        })
+
+        // ── Reading direction ──
         layout.addView(TextView(context).apply {
             text = "Reading direction"
-            setPadding(0, 0, 0, dp(6))
+            setPadding(0, dp(16), 0, dp(6))
         })
 
         val group = RadioGroup(context).apply { orientation = RadioGroup.HORIZONTAL }
@@ -70,6 +124,7 @@ object Settings {
         }
         layout.addView(group)
 
+        // ── Toggles ──
         val cbDataSaver = CheckBox(context).apply {
             text = "Data saver (lower-quality images)"
             isChecked = dataSaver()
@@ -82,19 +137,16 @@ object Settings {
             text = "Verbose logging (Logcat)"
             isChecked = verboseLog()
         }
-        val cbAllProviders = CheckBox(context).apply {
-            text = "Enable all sources"
-            isChecked = allProvidersEnabled()
-        }
         layout.addView(cbDataSaver)
         layout.addView(cbPreload)
         layout.addView(cbVerbose)
-        layout.addView(cbAllProviders)
 
+        // ── Utilities ──
         layout.addView(TextView(context).apply {
             text = "Override provider URL…"
             setPadding(dp(10), dp(12), dp(10), dp(8))
             setBackgroundColor(0xFF151923.toInt())
+            setTextColor(0xFFE2E8F0.toInt())
             isClickable = true
             setOnClickListener { showUrlOverrideDialog(context) }
         })
@@ -103,6 +155,7 @@ object Settings {
             text = "Open custom reader…"
             setPadding(dp(10), dp(8), dp(10), dp(8))
             setBackgroundColor(0xFF151923.toInt())
+            setTextColor(0xFFE2E8F0.toInt())
             isClickable = true
             setOnClickListener { promptReaderUrl(context) }
         })
@@ -127,6 +180,81 @@ object Settings {
             .show()
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    //  Per-provider picker
+    // ═══════════════════════════════════════════════════════════════
+    private fun showSourcePicker(context: Context) {
+        val names = ProviderRegistry.names.sorted()
+        val initial = enabledProviderNames().toMutableSet()
+
+        val density = context.resources.displayMetrics.density
+        fun dp(v: Int) = (v * density).toInt()
+
+        val root = LinearLayout(context).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+        }
+
+        val masterLabel = TextView(context).apply {
+            textSize = 13f
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setBackgroundColor(0xFF4F46E5.toInt())
+            setTextColor(0xFFFFFFFF.toInt())
+            isClickable = true
+        }
+
+        val boxes = mutableMapOf<String, CheckBox>()
+
+        fun refreshMaster() {
+            val count = boxes.count { it.value.isChecked }
+            masterLabel.text = if (count == boxes.size) "Uncheck All ($count/${boxes.size})"
+                               else "Check All ($count/${boxes.size})"
+        }
+
+        masterLabel.setOnClickListener {
+            val allChecked = boxes.values.all { it.isChecked }
+            val newState = !allChecked
+            boxes.values.forEach { it.isChecked = newState }
+            refreshMaster()
+        }
+        root.addView(masterLabel)
+
+        names.forEach { name ->
+            val cb = CheckBox(context).apply {
+                text = name
+                isChecked = name in initial
+                setOnCheckedChangeListener { _, _ -> refreshMaster() }
+            }
+            boxes[name] = cb
+            root.addView(cb)
+        }
+
+        refreshMaster()
+
+        val scroll = ScrollView(context).apply { addView(root) }
+
+        AlertDialog.Builder(context)
+            .setTitle("Select Sources (${names.size})")
+            .setView(scroll)
+            .setPositiveButton("Apply") { _, _ ->
+                val picked = boxes.filterValues { it.isChecked }.keys
+                setEnabledProviderNames(picked)
+                prefs.edit()
+                    .putBoolean("all_providers_enabled", picked.size == names.size)
+                    .apply()
+                Toast.makeText(
+                    context,
+                    "${picked.size} of ${names.size} enabled — Save & Restart to apply",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  URL override dialog
+    // ═══════════════════════════════════════════════════════════════
     private fun showUrlOverrideDialog(context: Context) {
         val names = ProviderRegistry.names.sorted()
         val density = context.resources.displayMetrics.density
@@ -178,6 +306,9 @@ object Settings {
             .show()
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    //  Custom reader launcher
+    // ═══════════════════════════════════════════════════════════════
     private fun promptReaderUrl(context: Context) {
         val input = EditText(context).apply {
             inputType = InputType.TYPE_TEXT_VARIATION_URI
@@ -208,6 +339,9 @@ object Settings {
             .show()
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    //  Restart helper
+    // ═══════════════════════════════════════════════════════════════
     private fun restartApp(context: Context) {
         val intent = context.packageManager
             .getLaunchIntentForPackage(context.packageName)
