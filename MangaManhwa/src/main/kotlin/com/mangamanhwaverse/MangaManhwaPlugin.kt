@@ -3,12 +3,11 @@ package com.mangamanhwaverse
 import android.content.Context
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
-import com.mangamanhwaverse.providers.*
 
 @CloudstreamPlugin
 class MangaManhwaPlugin : Plugin() {
     override fun load(context: Context) {
-        // Madara theme sources
+        // Madara theme
         registerMainAPI(Manhuanext())
         registerMainAPI(HunlightScans())
         registerMainAPI(Toonily())
@@ -25,7 +24,7 @@ class MangaManhwaPlugin : Plugin() {
         registerMainAPI(HiveScans())
         registerMainAPI(AsuraScans())
 
-        // MangaThemesia theme sources
+        // MangaThemesia theme
         registerMainAPI(ManhwaFreakXyz())
         registerMainAPI(IgnisComic())
         registerMainAPI(MangaKakalot())
@@ -36,8 +35,7 @@ class MangaManhwaPlugin : Plugin() {
         registerMainAPI(ManhwaWorld())
         registerMainAPI(NyxScans())
 
-        // API-based sources
+        // API-based
         registerMainAPI(MangaDex())
-        registerMainAPI(TempleScan())
     }
 }
