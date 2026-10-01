@@ -1,5 +1,19 @@
 package com.mangamanhwaverse
 
 object ProviderRegistry {
-    var names: List<String> = emptyList()
+
+    val providers: List<MangaManhwaProvider> = listOf(
+        // Madara
+        Manhuanext(), HunlightScans(), Toonily(), KunManga(), MangaTX(),
+        ReaperScans(), FlameComics(), LuminousScans(), AquaManga(),
+        CosmicScans(), Disasterscans(), VyvyManga(), MangaBob(),
+        HiveScans(), AsuraScans(),
+        // MangaThemesia
+        ManhwaFreakXyz(), IgnisComic(), MangaKakalot(), MangaBat(),
+        MangaReader(), MangaPanda(), MangaFox(), ManhwaWorld(), NyxScans(),
+        // API
+        MangaDex(), ComixProvider()
+    )
+
+    val names: List<String> get() = providers.map { it.name }
 }
