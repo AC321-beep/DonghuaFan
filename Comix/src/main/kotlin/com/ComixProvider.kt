@@ -264,10 +264,6 @@ class ComixProvider : MainAPI() {
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Pagination for pages 2+
-    //  Strategy 1:  fetch  https://comix.to/?page=N   (SSR)
-    //               → parse initial-data
-    //  Strategy 2:  fetch  https://comix.to/browse?page=N&order=...  (SSR)
-    //  Strategy 3:  fetch  https://comix.to/api/v1/manga?...          (raw API)
     // ═══════════════════════════════════════════════════════════════════════
     private data class PageResult(
         val items: List<SearchResponse>,
@@ -280,32 +276,54 @@ class ComixProvider : MainAPI() {
     ): PageResult? {
         dbgSection("fetchQueryPage(page=$page, category='${request.data}')")
 
-        // ═══ Strategy 1: SSR at  https://comix.to/?page=N ═══
-        dbg("[fetchQueryPage] ▶ Strategy 1: SSR https://comix.to/?page=$page")
+        // ═══ Strategy 1: Raw API https://comix.to/api/v1/manga ═══
+        val apiUrl = when (request.data) {
+            "hot"    -> "$mainUrl/api/v1/manga?scope=hot&page=$page&order%5Bchapter_updated_at%5D=desc"
+            "latest" -> "$mainUrl/api/v1/manga?page=$page&order%5Bcreated_at%5D=desc"
+            else     -> null
+        }
+        
+        if (apiUrl != null) {
+            dbg("[fetchQueryPage] ▶ Strategy 1 (API): GET $apiUrl")
+            val apiRes = runCatching {
+                val headers = mutableMapOf(
+                    "Accept" to "application/json, text/plain, */*",
+                    "X-Requested-With" to "XMLHttpRequest"
+                )
+                cfgToken?.let { headers["x-cfg"] = it }
+                
+                app.get(apiUrl, interceptor = cfInterceptor, headers = browserHeaders(headers)).text
+            }.getOrNull()
+            
+            if (!apiRes.isNullOrBlank() && (apiRes.trim().startsWith("{") || apiRes.trim().startsWith("["))) {
+                val items = runCatching {
+                    val root = JSONObject(apiRes)
+                    val arr = root.optJSONArray("data") 
+                        ?: root.optJSONArray("items") 
+                        ?: root.optJSONObject("data")?.optJSONArray("items")
+                    arr?.let { arrToResults(it) }
+                }.getOrNull() ?: runCatching {
+                    arrToResults(JSONArray(apiRes))
+                }.getOrNull()
+                
+                if (!items.isNullOrEmpty()) {
+                    dbg("[fetchQueryPage] ✓ API Strategy matched: ${items.size} items")
+                    return PageResult(items, hasNext = items.size >= 10)
+                } else {
+                    dbg("[fetchQueryPage] ✗ API Strategy parsed 0 items.")
+                }
+            } else {
+                dbg("[fetchQueryPage] ✗ API Strategy failed or response was not JSON.")
+            }
+        }
+
+        // ═══ Strategy 2: SSR at https://comix.to/?page=N ═══
+        dbg("[fetchQueryPage] ▶ Strategy 2: SSR $mainUrl/?page=$page")
         val homeSsrUrl = "$mainUrl/?page=$page"
         val homeSsrHtml = runCatching { fetchHtml(homeSsrUrl) }.getOrNull()
         if (!homeSsrHtml.isNullOrBlank()) {
             val queries = extractInitialDataJson(homeSsrHtml)?.optJSONObject("queries")
-            dbg("[fetchQueryPage] SSR queries count: ${queries?.length() ?: 0}")
             if (queries != null) {
-                val keys = queries.keys()
-                while (keys.hasNext()) {
-                    val k = keys.next()
-                    val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
-                    val subtype = parsed.optString(1)
-                    val params = parsed.optJSONObject(2)
-                    val jsonPage = params?.optInt("page", -1) ?: -1
-                    val scope = params?.optString("scope") ?: ""
-                    val order = params?.optJSONObject("order")?.toString() ?: ""
-                    val len = when (val v = queries.opt(k)) {
-                        is JSONArray -> v.length()
-                        is JSONObject -> v.optJSONArray("items")?.length() ?: 0
-                        else -> 0
-                    }
-                    dbg("[fetchQueryPage] SSR key: subtype='$subtype' page=$jsonPage scope='$scope' order=$order → $len items")
-                }
-
-                // Try to match the desired page's query
                 val items = readQueries(extractInitialDataJson(homeSsrHtml)!!) { k ->
                     if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
                     val subtype = k.optString(1)
@@ -320,27 +338,27 @@ class ComixProvider : MainAPI() {
                     }
                 }
                 if (items.isNotEmpty()) {
-                    dbg("[fetchQueryPage] ✓ Strategy 1 matched: ${items.size} items")
+                    dbg("[fetchQueryPage] ✓ Strategy 2 matched: ${items.size} items")
                     return PageResult(items, hasNext = true)
                 }
             }
         }
 
-        // ═══ Strategy 2: SSR at  https://comix.to/browse?page=N ═══
+        // ═══ Strategy 3: SSR at https://comix.to/browse?page=N ═══
         val browseUrl = when (request.data) {
-            "hot"    -> "$mainUrl/browse?page=$page&order=chapter_updated_at:desc"
-            "latest" -> "$mainUrl/browse?page=$page&order=created_at:desc"
+            "hot"    -> "$mainUrl/browse?page=$page&scope=hot&order%5Bchapter_updated_at%5D=desc"
+            "latest" -> "$mainUrl/browse?page=$page&order%5Bcreated_at%5D=desc"
             else     -> return null
         }
-        dbg("[fetchQueryPage] ▶ Strategy 2: SSR $browseUrl")
+        dbg("[fetchQueryPage] ▶ Strategy 3: SSR $browseUrl")
         val browseHtml = runCatching { fetchHtml(browseUrl) }.getOrNull()
         if (!browseHtml.isNullOrBlank()) {
             val items = parseMainPage(browseHtml, request, page)
             if (items.isNotEmpty()) {
-                dbg("[fetchQueryPage] ✓ Strategy 2 matched: ${items.size} items")
+                dbg("[fetchQueryPage] ✓ Strategy 3 matched: ${items.size} items")
                 return PageResult(items, hasNext = items.size >= 10)
             }
-            dbg("[fetchQueryPage] ✗ Strategy 2 returned 0 items")
+            dbg("[fetchQueryPage] ✗ Strategy 3 returned 0 items")
         }
 
         dbg("[fetchQueryPage] ✗ all strategies returned nothing — returning null")
