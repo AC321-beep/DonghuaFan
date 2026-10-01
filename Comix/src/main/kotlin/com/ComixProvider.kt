@@ -48,7 +48,6 @@ import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.io.ByteArrayInputStream
 import java.io.File
 import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
@@ -208,11 +207,9 @@ class ComixProvider : MainAPI() {
      * detected and frozen.
      *
      * Because loadUrl means we can't guarantee our hook runs before the site's
-     * bundle, we install the hook in onPageStarted AND re-install on a 500 ms
-     * poll. We also fire a synthetic API call in onPageFinished (and on the
-     * poll) to force the client's signed-request path to run — the homepage
-     * SSR has everything it needs, so without a trigger the client never
-     * lazily constructs the cipher.
+     * bundle, we install the hook in onPageStarted AND re-install on a poll.
+     * We also simulate a UI click on a DOM link to force the site's SPA router 
+     * to perform a legitimate internal fetch, natively bypassing 403s.
      */
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun captureCipherMaterial(htmlOrNull: String?): CipherMaterial? = withContext(Dispatchers.Main) {
@@ -242,7 +239,8 @@ class ComixProvider : MainAPI() {
                 javaScriptEnabled = true
                 domStorageEnabled = true
                 databaseEnabled = true
-                blockNetworkImage = true
+                // Let the WebView act exactly like a normal Chrome browser. 
+                // Do not block images, as CF Turnstile often relies on 1x1 tracking pixels.
                 userAgentString = browserHeaders()["User-Agent"]
             }
 
@@ -274,65 +272,17 @@ class ComixProvider : MainAPI() {
             }
 
             web.webViewClient = object : WebViewClient() {
-                override fun shouldInterceptRequest(
-                    view: WebView,
-                    request: WebResourceRequest,
-                ): WebResourceResponse? {
-                    // Media blacklist only — never restrict hosts. Blocking CF
-                    // analytics or third-party challenge dependencies with a
-                    // whitelist causes ERR_CONNECTION_REFUSED and freezes the
-                    // Turnstile verification script.
-                    val path = request.url.path?.lowercase() ?: ""
-                    val isMedia = path.endsWith(".png")  || path.endsWith(".jpg") ||
-                                  path.endsWith(".jpeg") || path.endsWith(".webp") ||
-                                  path.endsWith(".gif")  || path.endsWith(".woff2") ||
-                                  path.endsWith(".woff") || path.endsWith(".ttf") ||
-                                  path.endsWith(".mp4")
-                    return if (isMedia) {
-                        WebResourceResponse(
-                            "text/plain", "utf-8",
-                            ByteArrayInputStream(ByteArray(0))
-                        )
-                    } else {
-                        super.shouldInterceptRequest(view, request)
-                    }
-                }
+                // Removed shouldInterceptRequest completely to prevent ERR_CONNECTION_REFUSED
+                // on Cloudflare challenge assets.
 
                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                     dbg("[cipher] onPageStarted: $url")
-                    // Best-effort early injection. May race with page JS; the
-                    // polling loop below re-installs it periodically.
                     view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
                     dbg("[cipher] onPageFinished: $url")
                     view?.evaluateJavascript(CAPTURE_SCRIPT, null)
-
-                    // Force the site's signed-request path to run. The
-                    // homepage SSR already contains everything, so the client
-                    // never lazily builds the cipher on its own. Firing an
-                    // API request makes the client's fetch/XHR wrapper sign
-                    // the call, which forces the cipher to be constructed.
-                    view?.evaluateJavascript(
-                        """
-                        (function () {
-                            try {
-                                if (typeof fetch === 'function') {
-                                    fetch('/api/v1/manga?page=1&limit=1', { credentials: 'include' })
-                                        .catch(function(){});
-                                }
-                            } catch (e) {}
-                            try {
-                                var x = new XMLHttpRequest();
-                                x.open('GET', '/api/v1/manga?page=1&limit=1', true);
-                                x.withCredentials = true;
-                                x.send();
-                            } catch (e) {}
-                        })();
-                        """.trimIndent(),
-                        null
-                    )
                 }
 
                 override fun onReceivedError(
@@ -340,7 +290,10 @@ class ComixProvider : MainAPI() {
                     request: WebResourceRequest?,
                     error: WebResourceError?,
                 ) {
-                    dbg("[cipher] onReceivedError: ${request?.url} -> ${error?.description}")
+                    // Only log main-frame errors to keep logcat clean
+                    if (request?.isForMainFrame == true) {
+                        dbg("[cipher] main frame error: ${request.url} -> ${error?.description}")
+                    }
                 }
 
                 override fun onReceivedHttpError(
@@ -348,7 +301,9 @@ class ComixProvider : MainAPI() {
                     request: WebResourceRequest?,
                     errorResponse: WebResourceResponse?,
                 ) {
-                    dbg("[cipher] onReceivedHttpError: ${request?.url} -> ${errorResponse?.statusCode}")
+                    if (request?.isForMainFrame == true) {
+                        dbg("[cipher] main frame http error: ${request.url} -> ${errorResponse?.statusCode}")
+                    }
                 }
             }
 
@@ -359,23 +314,34 @@ class ComixProvider : MainAPI() {
                 finish(null)
             }.also { handler.postDelayed(it, CIPHER_CAPTURE_TIMEOUT_MS) }
 
-            // Re-install the hook every 500 ms. With loadUrl we lose the
-            // ordering guarantee of loadDataWithBaseURL, so the site's bundle
-            // may run before our onPageStarted injection lands.
-            // CAPTURE_SCRIPT is idempotent (checks window.__comixCipherHook),
-            // so re-evaluating is safe. Also re-fires the fetch trigger in
-            // case the first attempt raced ahead of the wrapper install.
+            // Polling loop: Re-injects the hook to ensure it survives async bundle loads,
+            // and simulates a physical UI click to force the SPA router to make a valid API call.
             pollRunnable = object : Runnable {
                 override fun run() {
                     if (done.get()) return
                     web.evaluateJavascript(CAPTURE_SCRIPT, null)
+                    
                     web.evaluateJavascript(
-                        "(function(){try{fetch('/api/v1/manga?page=1&limit=1',{credentials:'include'}).catch(function(){});}catch(e){}})();",
+                        """
+                        (function(){
+                            if (window.__comixTriggered) return;
+                            // Find a pagination button, a browse link, or a manga card
+                            var el = document.querySelector('.npager a, a[href*="/browse"], a[href*="/title/"]');
+                            if (el) {
+                                window.__comixTriggered = true;
+                                try { ComixCipherBridge.progress('Triggering SPA click on: ' + el.href); } catch(e){}
+                                el.click(); // This forces the site's own API client to execute
+                            } else {
+                                // Fallback: Scroll to bottom to trigger lazy loaders
+                                window.scrollTo(0, document.body.scrollHeight);
+                            }
+                        })();
+                        """.trimIndent(),
                         null
                     )
-                    handler.postDelayed(this, 500L)
+                    handler.postDelayed(this, 800L)
                 }
-            }.also { handler.postDelayed(it, 500L) }
+            }.also { handler.postDelayed(it, 800L) }
 
             dbg("[cipher] executing natural loadUrl → $mainUrl")
             web.loadUrl(mainUrl)
@@ -945,7 +911,7 @@ class ComixProvider : MainAPI() {
                     }
                 }
             }
-        }.distinct()
+        }
 
         val latestChapterNum = d?.optInt("latestChapter", 0) ?: 0
         val firstChapterUrl  = d?.optString("firstChapterUrl")?.takeIf { it.isNotBlank() }
@@ -1019,12 +985,6 @@ class ComixProvider : MainAPI() {
     //  Companion constants
     // ═══════════════════════════════════════════════════════════════════════
     private companion object {
-        /**
-         * Natural loadUrl needs more headroom than loadDataWithBaseURL because
-         * we're waiting on the full network round-trip + Turnstile + site
-         * bundle + the triggered API fetch. Prewarm runs in the background so
-         * the user never waits on this.
-         */
         const val CIPHER_CAPTURE_TIMEOUT_MS = 30_000L
 
         val CAPTURE_SCRIPT = """
