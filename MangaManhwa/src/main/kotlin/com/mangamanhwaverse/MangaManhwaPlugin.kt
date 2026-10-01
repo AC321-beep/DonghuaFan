@@ -20,12 +20,11 @@ class MangaManhwaPlugin : Plugin() {
             // MangaThemesia (9)
             ManhwaFreakXyz(), IgnisComic(), MangaKakalot(), MangaBat(),
             MangaReader(), MangaPanda(), MangaFox(), ManhwaWorld(), NyxScans(),
-            // API-based (2)
+            // API (2)
             MangaDex(), ComixProvider()
         )
 
         ProviderRegistry.names = all.map { it.name }
-
         val disabled = Settings.disabledProviders()
         all.filter { it.name !in disabled }.forEach { registerMainAPI(it) }
 
