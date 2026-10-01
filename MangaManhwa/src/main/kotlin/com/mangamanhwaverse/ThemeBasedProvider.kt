@@ -20,13 +20,13 @@ object ThemeEngine {
             val title = (el.selectFirst(cfg.titleSelector)?.text()?.trim()
                 ?: a.text().trim()).takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val poster = el.selectFirst(cfg.imageSelector)?.let(::img)?.let { abs(it, base) }
-            newMovieSearchResponse(title, abs(href, base), TvType.Manga).apply { posterUrl = poster }
+            newMovieSearchResponse(title, abs(href, base), TvType.Others).apply { posterUrl = poster }
         }
 
     fun parseChapters(doc: Document, cfg: ThemeConfig, base: String): List<Episode> =
         doc.select(cfg.chapterSelector).mapNotNull { a ->
             val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            newEpisode(abs(href, base)) { name = a.text().trim() }
+            newEpisode(abs(href, base)) { this.name = a.text().trim() }
         }
 
     fun parsePages(doc: Document, cfg: ThemeConfig): List<String> =
@@ -47,28 +47,28 @@ object ThemeEngine {
 
 open class ThemeBasedProvider(
     private val config: ThemeConfig,
-    override val name: String,
-    override val mainUrl: String,
-    override val lang: String = "en"
+    override var name: String,
+    override var mainUrl: String,
+    override var lang: String = "en"
 ) : MangaManhwaProvider() {
 
     override val baseUrl get() = mainUrl
 
-    override suspend fun popular(page: Int) =
+    override suspend fun popular(page: Int): List<SearchResponse> =
         fetch(config.popularPath.replace("{page}", "$page"))
             ?.let { ThemeEngine.parseList(it, config, baseUrl) }.orEmpty()
 
-    override suspend fun latest(page: Int) =
+    override suspend fun latest(page: Int): List<SearchResponse> =
         fetch(config.latestPath.replace("{page}", "$page"))
             ?.let { ThemeEngine.parseList(it, config, baseUrl) }.orEmpty()
 
-    override suspend fun search(query: String, page: Int) =
+    override suspend fun searchPage(query: String, page: Int): List<SearchResponse> =
         fetch(config.searchPath
             .replace("{query}", URLEncoder.encode(query, "UTF-8"))
             .replace("{page}", "$page"))
             ?.let { ThemeEngine.parseList(it, config, baseUrl) }.orEmpty()
 
-    override suspend fun chapters(mangaUrl: String) =
+    override suspend fun chapters(mangaUrl: String): List<Episode> =
         fetch(mangaUrl)?.let { ThemeEngine.parseChapters(it, config, baseUrl) }.orEmpty()
 
     override suspend fun pages(chapterUrl: String): List<String> {
