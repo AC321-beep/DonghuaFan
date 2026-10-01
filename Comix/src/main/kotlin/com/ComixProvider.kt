@@ -55,6 +55,9 @@ class ComixProvider : MainAPI() {
 
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Debug helpers
+    // ═══════════════════════════════════════════════════════════════════════
     private fun dbg(msg: String) {
         println("ComixDebug: $msg")
         runCatching { android.util.Log.e("ComixDebug", msg) }
@@ -108,12 +111,35 @@ class ComixProvider : MainAPI() {
         return runCatching { JSONObject(text) }.getOrNull()
     }
 
+    /**
+     * Parses a manga/manga-card object. Tolerant of field-name variations
+     * because the SSR HTML and the JSON API sometimes use different keys
+     * (url vs slug vs href, poster vs cover vs thumbnail, etc.).
+     */
     private fun parseMangaFromJson(obj: JSONObject): SearchResponse? {
-        val title = obj.optString("title").takeIf { it.isNotBlank() } ?: return null
-        val relUrl = obj.optString("url").takeIf { it.isNotBlank() } ?: return null
-        val poster = obj.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
+        val title = (obj.optString("title").takeIf { it.isNotBlank() }
+            ?: obj.optString("name").takeIf { it.isNotBlank() }
+            ?: obj.optString("manga_title").takeIf { it.isNotBlank() }
+            ?: return null)
+
+        val relUrl = (obj.optString("url").takeIf { it.isNotBlank() }
+            ?: obj.optString("href").takeIf { it.isNotBlank() }
+            ?: obj.optString("slug").takeIf { it.isNotBlank() }?.let { "/title/$it" }
+            ?: obj.optString("link").takeIf { it.isNotBlank() }
+            ?: return null)
+
+        val poster = (obj.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
             ?: obj.optJSONObject("poster")?.optString("medium")?.takeIf { it.isNotBlank() }
-        val latest = obj.optInt("latestChapter", 0).takeIf { it > 0 }
+            ?: obj.optJSONObject("cover")?.optString("large")?.takeIf { it.isNotBlank() }
+            ?: obj.optJSONObject("cover")?.optString("medium")?.takeIf { it.isNotBlank() }
+            ?: obj.optString("cover").takeIf { it.isNotBlank() }
+            ?: obj.optString("thumbnail").takeIf { it.isNotBlank() }
+            ?: obj.optString("image").takeIf { it.isNotBlank() })
+
+        val latest = (obj.optInt("latestChapter", 0).takeIf { it > 0 }
+            ?: obj.optInt("latest_chapter", 0).takeIf { it > 0 }
+            ?: obj.optInt("chapters_count", 0).takeIf { it > 0 }
+            ?: obj.optJSONObject("latest_chapter")?.optInt("number", 0)?.takeIf { it > 0 })
 
         val res = newAnimeSearchResponse(title, fixUrl(relUrl), TvType.Anime)
         poster?.let { res.posterUrl = fixUrl(it) }
@@ -184,7 +210,58 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    //  Pagination types + helpers
+    // ═══════════════════════════════════════════════════════════════════════
+    private data class PageResult(
+        val items: List<SearchResponse>,
+        val hasNext: Boolean
+    )
+
+    /**
+     * Reads pagination metadata from a JSON envelope. Falls back to a
+     * conservative item-count heuristic only when no metadata exists.
+     */
+    private fun JSONObject.hasNextPage(page: Int, itemCount: Int): Boolean {
+        optJSONObject("meta")?.let { m ->
+            m.optInt("last_page", -1).takeIf { it > 0 }?.let { return page < it }
+            m.optInt("total_pages", -1).takeIf { it > 0 }?.let { return page < it }
+            m.optInt("page_count", -1).takeIf { it > 0 }?.let { return page < it }
+            if (m.has("has_next_page")) return m.optBoolean("has_next_page")
+            if (m.has("hasNext"))       return m.optBoolean("hasNext")
+            if (m.has("next_page")) {
+                val np = m.opt("next_page")
+                if (np != null && np.toString() != "null") return true
+            }
+        }
+        optJSONObject("pagination")?.let { m ->
+            m.optInt("last_page", -1).takeIf { it > 0 }?.let { return page < it }
+            m.optInt("total_pages", -1).takeIf { it > 0 }?.let { return page < it }
+            if (m.has("has_next_page")) return m.optBoolean("has_next_page")
+        }
+        optJSONObject("links")?.let { l ->
+            val next = l.optString("next")
+            if (next.isNotBlank() && next != "null") return true
+        }
+        if (has("has_next_page")) return optBoolean("has_next_page")
+        if (has("hasNext"))       return optBoolean("hasNext")
+        // Last-resort heuristic. Only trust this if metadata is truly absent.
+        return itemCount >= 20
+    }
+
+    private fun arrToResults(arr: JSONArray): List<SearchResponse> {
+        val out = mutableListOf<SearchResponse>()
+        for (i in 0 until arr.length()) {
+            arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
+        }
+        return out
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     //  Main page
+    //
+    //  hot / latest: route EVERY page (including 1) through the API so item
+    //  offsets line up. SSR is only used as a fallback if the API fails.
+    //  trending / follows: single-page, read from the homepage SSR.
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
@@ -192,29 +269,43 @@ class ComixProvider : MainAPI() {
     ): HomePageResponse? {
         dbgSection("getMainPage(page=$page, request='${request.data}')")
 
+        // One-page sections only
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
             if (items.isEmpty()) return null
-            return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = false)
+            return newHomePageResponse(
+                request,
+                items.distinctBy { it.url },
+                hasNext = false
+            )
         }
 
-        // Page 1 for hot/latest also uses the homepage SSR
+        // hot / latest — API for every page, so page 1 and page 2 are aligned.
+        val result = fetchQueryPage(request, page)
+        if (result != null && result.items.isNotEmpty()) {
+            dbg("[getMainPage] ✓ ${result.items.size} items, hasNext=${result.hasNext}")
+            return newHomePageResponse(
+                request,
+                result.items.distinctBy { it.url },
+                hasNext = result.hasNext
+            )
+        }
+
+        // Fallback: only page 1 can be recovered from the homepage SSR.
         if (page == 1) {
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
-            dbg("[getMainPage] page 1: ${items.size} items")
-            if (items.isEmpty()) return null
-            return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = true)
+            dbg("[getMainPage] fallback page 1: ${items.size} items")
+            if (items.isNotEmpty()) {
+                return newHomePageResponse(
+                    request,
+                    items.distinctBy { it.url },
+                    hasNext = true
+                )
+            }
         }
 
-        // Page 2+ — try SSR at ?page=N first, then fall back to the API
-        val result = fetchQueryPage(request, page) ?: return null
-        if (result.items.isEmpty()) return null
-        return newHomePageResponse(
-            request,
-            result.items.distinctBy { it.url },
-            hasNext = result.hasNext
-        )
+        return null
     }
 
     private fun parseMainPage(
@@ -263,91 +354,117 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Pagination for pages 2+
+    //  fetchQueryPage — paginated hot / latest
+    //
+    //  Strategy 1: GET /api/v1/manga?page=N&scope=...&order[key]=desc
+    //  Strategy 2: SSR  https://comix.to/?page=N     (usually still page 1)
+    //  Strategy 3: SSR  https://comix.to/browse?page=N&order[key]=desc
     // ═══════════════════════════════════════════════════════════════════════
-    private data class PageResult(
-        val items: List<SearchResponse>,
-        val hasNext: Boolean
-    )
-
     private suspend fun fetchQueryPage(
         request: MainPageRequest,
         page: Int
     ): PageResult? {
         dbgSection("fetchQueryPage(page=$page, category='${request.data}')")
 
-        // ═══ Strategy 1: Raw API https://comix.to/api/v1/manga ═══
+        // ═══ Strategy 1: raw API ═══
         val apiUrl = when (request.data) {
-            "hot"    -> "$mainUrl/api/v1/manga?scope=hot&page=$page&order%5Bchapter_updated_at%5D=desc"
-            "latest" -> "$mainUrl/api/v1/manga?page=$page&order%5Bcreated_at%5D=desc"
+            "hot"    -> "$mainUrl/api/v1/manga?scope=hot&page=$page&order[chapter_updated_at]=desc"
+            "latest" -> "$mainUrl/api/v1/manga?page=$page&order[created_at]=desc"
             else     -> null
         }
-        
+
         if (apiUrl != null) {
             dbg("[fetchQueryPage] ▶ Strategy 1 (API): GET $apiUrl")
-            val apiRes = runCatching {
-                val headers = mutableMapOf(
+
+            val apiHeaders = browserHeaders(
+                mapOf(
                     "Accept" to "application/json, text/plain, */*",
-                    "X-Requested-With" to "XMLHttpRequest"
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Referer" to "$mainUrl/",
+                    "Sec-Fetch-Dest" to "empty",
+                    "Sec-Fetch-Mode" to "cors",
+                    "Sec-Fetch-Site" to "same-origin"
                 )
-                cfgToken?.let { headers["x-cfg"] = it }
-                
-                app.get(apiUrl, interceptor = cfInterceptor, headers = browserHeaders(headers)).text
+            )
+
+            val apiRes = runCatching {
+                app.get(apiUrl, interceptor = cfInterceptor, headers = apiHeaders).text
             }.getOrNull()
-            
-            if (!apiRes.isNullOrBlank() && (apiRes.trim().startsWith("{") || apiRes.trim().startsWith("["))) {
-                val items = runCatching {
-                    val root = JSONObject(apiRes)
-                    val arr = root.optJSONArray("data") 
-                        ?: root.optJSONArray("items") 
-                        ?: root.optJSONObject("data")?.optJSONArray("items")
-                    arr?.let { arrToResults(it) }
-                }.getOrNull() ?: runCatching {
-                    arrToResults(JSONArray(apiRes))
-                }.getOrNull()
-                
-                if (!items.isNullOrEmpty()) {
-                    dbg("[fetchQueryPage] ✓ API Strategy matched: ${items.size} items")
-                    return PageResult(items, hasNext = items.size >= 10)
+
+            if (!apiRes.isNullOrBlank()) {
+                dbg("[fetchQueryPage] API raw (${apiRes.length} chars): ${apiRes.take(500).replace("\n", " ")}")
+
+                val root: Any? = runCatching { JSONObject(apiRes) }.getOrNull()
+                    ?: runCatching { JSONArray(apiRes) }.getOrNull()
+
+                if (root != null) {
+                    val arr: JSONArray? = when (root) {
+                        is JSONArray  -> root
+                        is JSONObject -> root.optJSONArray("data")
+                            ?: root.optJSONArray("items")
+                            ?: root.optJSONArray("results")
+                            ?: root.optJSONArray("mangas")
+                            ?: root.optJSONObject("data")?.optJSONArray("items")
+                            ?: root.optJSONObject("data")?.optJSONArray("data")
+                            ?: root.optJSONObject("data")?.optJSONArray("mangas")
+                            ?: root.optJSONObject("result")?.optJSONArray("items")
+                        else -> null
+                    }
+
+                    if (arr != null) {
+                        val items = arrToResults(arr)
+                        if (items.isNotEmpty()) {
+                            val hasNext = when (root) {
+                                is JSONObject -> root.hasNextPage(page, items.size)
+                                else -> items.size >= 20
+                            }
+                            dbg("[fetchQueryPage] ✓ API matched: ${items.size} items, hasNext=$hasNext")
+                            return PageResult(items, hasNext)
+                        } else {
+                            dbg("[fetchQueryPage] ✗ API parsed 0 items (field-name mismatch?)")
+                        }
+                    } else {
+                        dbg("[fetchQueryPage] ✗ API JSON had no recognised item array. Top keys: " +
+                            (root as? JSONObject)?.keys()?.asSequence()?.joinToString() ?: "n/a")
+                    }
                 } else {
-                    dbg("[fetchQueryPage] ✗ API Strategy parsed 0 items.")
+                    dbg("[fetchQueryPage] ✗ API response was not JSON.")
                 }
             } else {
-                dbg("[fetchQueryPage] ✗ API Strategy failed or response was not JSON.")
+                dbg("[fetchQueryPage] ✗ API request returned null/empty.")
             }
         }
 
-        // ═══ Strategy 2: SSR at https://comix.to/?page=N ═══
+        // ═══ Strategy 2: SSR ?page=N ═══
         dbg("[fetchQueryPage] ▶ Strategy 2: SSR $mainUrl/?page=$page")
-        val homeSsrUrl = "$mainUrl/?page=$page"
-        val homeSsrHtml = runCatching { fetchHtml(homeSsrUrl) }.getOrNull()
+        val homeSsrHtml = runCatching { fetchHtml("$mainUrl/?page=$page") }.getOrNull()
         if (!homeSsrHtml.isNullOrBlank()) {
-            val queries = extractInitialDataJson(homeSsrHtml)?.optJSONObject("queries")
-            if (queries != null) {
-                val items = readQueries(extractInitialDataJson(homeSsrHtml)!!) { k ->
+            val initial = extractInitialDataJson(homeSsrHtml)
+            if (initial != null) {
+                val items = readQueries(initial) { k ->
                     if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
                     val subtype = k.optString(1)
                     val params = k.optJSONObject(2) ?: return@readQueries false
                     val jsonPage = params.optInt("page", -1)
                     if (jsonPage != page) return@readQueries false
                     when (request.data) {
-                        "hot"      -> subtype == "list" && params.optString("scope") == "hot"
-                        "latest"   -> subtype == "list" &&
+                        "hot"    -> subtype == "list" && params.optString("scope") == "hot"
+                        "latest" -> subtype == "list" &&
                             params.optJSONObject("order")?.optString("created_at") == "desc"
                         else -> false
                     }
                 }
                 if (items.isNotEmpty()) {
-                    dbg("[fetchQueryPage] ✓ Strategy 2 matched: ${items.size} items")
+                    dbg("[fetchQueryPage] ✓ SSR ?page matched: ${items.size} items")
                     return PageResult(items, hasNext = true)
                 }
             }
         }
 
-        // ═══ Strategy 3: SSR at https://comix.to/browse?page=N ═══
+        // ═══ Strategy 3: SSR /browse?page=N ═══
         val browseUrl = when (request.data) {
-            "hot"    -> "$mainUrl/browse?page=$page&scope=hot&order%5Bchapter_updated_at%5D=desc"
-            "latest" -> "$mainUrl/browse?page=$page&order%5Bcreated_at%5D=desc"
+            "hot"    -> "$mainUrl/browse?page=$page&scope=hot&order[chapter_updated_at]=desc"
+            "latest" -> "$mainUrl/browse?page=$page&order[created_at]=desc"
             else     -> return null
         }
         dbg("[fetchQueryPage] ▶ Strategy 3: SSR $browseUrl")
@@ -355,22 +472,14 @@ class ComixProvider : MainAPI() {
         if (!browseHtml.isNullOrBlank()) {
             val items = parseMainPage(browseHtml, request, page)
             if (items.isNotEmpty()) {
-                dbg("[fetchQueryPage] ✓ Strategy 3 matched: ${items.size} items")
-                return PageResult(items, hasNext = items.size >= 10)
+                dbg("[fetchQueryPage] ✓ SSR /browse matched: ${items.size} items")
+                return PageResult(items, hasNext = items.size >= 20)
             }
-            dbg("[fetchQueryPage] ✗ Strategy 3 returned 0 items")
+            dbg("[fetchQueryPage] ✗ SSR /browse returned 0 items")
         }
 
         dbg("[fetchQueryPage] ✗ all strategies returned nothing — returning null")
         return null
-    }
-
-    private fun arrToResults(arr: JSONArray): List<SearchResponse> {
-        val out = mutableListOf<SearchResponse>()
-        for (i in 0 until arr.length()) {
-            arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
-        }
-        return out
     }
 
     // ═══════════════════════════════════════════════════════════════════════
