@@ -4,15 +4,29 @@ object ProviderRegistry {
 
     val providers: List<MangaManhwaProvider> = listOf(
         // Madara
-        Manhuanext(), HunlightScans(), Toonily(), KunManga(), MangaTX(),
-        ReaperScans(), FlameComics(), LuminousScans(), AquaManga(),
-        CosmicScans(), Disasterscans(), VyvyManga(), MangaBob(),
-        HiveScans(), AsuraScans(),
+        Manhuanext(),
+        Toonily(),
+        MangaTX(),
+        FlameComics(),
+        LuminousScans(),
+        CosmicScans(),
+        Disasterscans(),
+        VyvyManga(),
+        MangaBob(),
+        HiveScans(),
+        AsuraScans(),
         // MangaThemesia
-        ManhwaFreakXyz(), IgnisComic(), MangaKakalot(), MangaBat(),
-        MangaReader(), MangaPanda(), MangaFox(), ManhwaWorld(), NyxScans(),
+        IgnisComic(),
+        MangaKakalot(),
+        MangaBat(),
+        MangaReader(),
+        MangaPanda(),
+        MangaFox(),
+        ManhwaWorld(),
+        NyxScans(),
         // API
-        MangaDex(), ComixProvider()
+        MangaDex(),
+        ComixProvider()
     )
 
     val names: List<String> get() = providers.map { it.name }
