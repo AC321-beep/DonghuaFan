@@ -6,7 +6,7 @@ dependencies {
 
 cloudstream {
     description = "Read Manga, Manhwa & Manhua from 20+ sources"
-    authors = listOf("yourname")
+    authors = listOf("AC321-beep")
     status = 1
     tvTypes = listOf("Manga", "Manhwa")
     language = "en"
