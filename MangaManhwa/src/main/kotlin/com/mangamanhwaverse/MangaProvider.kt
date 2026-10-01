@@ -1,4 +1,4 @@
-package com.mangamanhwaverse.core
+package com.mangamanhwaverse
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.app
