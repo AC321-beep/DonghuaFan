@@ -1,7 +1,6 @@
-package com.mangamanhwaverse.themes
+package com.mangamanhwaverse
 
 import com.lagradost.cloudstream3.*
-import com.mangamanhwaverse.core.MangaProvider
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
