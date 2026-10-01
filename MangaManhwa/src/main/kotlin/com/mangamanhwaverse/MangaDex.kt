@@ -39,6 +39,14 @@ class MangaDex : MangaManhwaProvider() {
         "$baseUrl/manga?limit=30&offset=${(page - 1) * 30}&order[followedCount]=desc"
     )
 
+    override suspend fun latest(page: Int): List<SearchResponse> = list(
+        "$baseUrl/manga?limit=30&offset=${(page - 1) * 30}&order[latestUploadedChapter]=desc"
+    )
+
+    override suspend fun trending(page: Int): List<SearchResponse> = list(
+        "$baseUrl/manga?limit=30&offset=${(page - 1) * 30}&order[rating]=desc"
+    )
+
     override suspend fun searchPage(query: String, page: Int): List<SearchResponse> = list(
         "$baseUrl/manga?limit=30&offset=${(page - 1) * 30}&title=$query"
     )
