@@ -210,6 +210,7 @@ class ComixProvider : MangaManhwaProvider() {
         return runCatching { JSONObject(text) }.getOrNull()
     }
 
+    // ✅ FIX 1: newAnimeSearchResponse + TvType.Anime
     private fun parseCard(obj: JSONObject): SearchResponse? {
         val title = obj.optString("title").takeIf { it.isNotBlank() } ?: return null
         val rel = obj.optString("url").takeIf { it.isNotBlank() }
@@ -217,7 +218,7 @@ class ComixProvider : MangaManhwaProvider() {
             ?: return null
         val poster = obj.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
             ?: obj.optJSONObject("poster")?.optString("medium")
-        val res = newMovieSearchResponse(title, fixUrl(rel), TvType.Others)
+        val res = newAnimeSearchResponse(title, fixUrl(rel), TvType.Anime)
         poster?.let { res.posterUrl = fixUrl(it) }
         return res
     }
@@ -287,6 +288,7 @@ class ComixProvider : MangaManhwaProvider() {
 
     override suspend fun latest(page: Int): List<SearchResponse> = popular(page)
 
+    // ✅ FIX 2: newAnimeSearchResponse + TvType.Anime in search fallback
     override suspend fun searchPage(query: String, page: Int): List<SearchResponse> {
         val url = "$mainUrl/browse?q=${URLEncoder.encode(query, "UTF-8")}"
         val html = fetchHtml(url)
@@ -304,7 +306,7 @@ class ComixProvider : MangaManhwaProvider() {
             val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val title = a.selectFirst("h3, .title")?.text()?.trim()
                 ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            newMovieSearchResponse(title, fixUrl(href), TvType.Others)
+            newAnimeSearchResponse(title, fixUrl(href), TvType.Anime)
         }.distinctBy { it.url }
     }
 
@@ -375,6 +377,7 @@ class ComixProvider : MangaManhwaProvider() {
 
     override suspend fun pages(chapterUrl: String): List<String> = emptyList()
 
+    // ✅ FIX 3: added isFinishing/isDestroyed guard
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -383,8 +386,11 @@ class ComixProvider : MangaManhwaProvider() {
     ): Boolean {
         val activity = CommonActivity.activity as? androidx.appcompat.app.AppCompatActivity
             ?: return false
+        if (activity.isFinishing || activity.isDestroyed) return false
+
         val chapterName = Regex("-chapter-([\\d.]+)").find(data)
             ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
+
         activity.runOnUiThread {
             ReaderDialog.show(activity, name, chapterName, data, baseUrl, 0)
         }
