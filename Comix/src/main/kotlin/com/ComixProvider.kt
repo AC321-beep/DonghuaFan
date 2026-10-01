@@ -47,7 +47,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
-import org.jsoup.nodes.DataNode
 import org.jsoup.nodes.Element
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -202,147 +201,184 @@ class ComixProvider : MainAPI() {
         }
     }
 
+    /**
+     * Drives a WebView against the site with a NATURAL loadUrl (not
+     * loadDataWithBaseURL). The natural navigation is required for Cloudflare
+     * Turnstile to clear — synthetic loads via loadDataWithBaseURL are
+     * detected and frozen.
+     *
+     * Because loadUrl means we can't guarantee our hook runs before the site's
+     * bundle, we install the hook in onPageStarted AND re-install on a 500 ms
+     * poll. We also fire a synthetic API call in onPageFinished (and on the
+     * poll) to force the client's signed-request path to run — the homepage
+     * SSR has everything it needs, so without a trigger the client never
+     * lazily constructs the cipher.
+     */
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun captureCipherMaterial(htmlOrNull: String?): CipherMaterial? {
-        val rawHtml = htmlOrNull ?: runCatching { fetchHtml(mainUrl) }.getOrNull()
-        if (rawHtml.isNullOrBlank()) {
-            dbg("[cipher] no HTML to work with")
-            return null
+    private suspend fun captureCipherMaterial(htmlOrNull: String?): CipherMaterial? = withContext(Dispatchers.Main) {
+        val activity = CommonActivity.activity ?: run {
+            dbg("[cipher] no activity")
+            return@withContext null
         }
-        dbg("[cipher] got ${rawHtml.length} chars")
-val modifiedHtml = try {
-    val doc = Jsoup.parse(rawHtml, mainUrl)
-    val scriptTag = doc.createElement("script")
-    scriptTag.appendChild(DataNode(CAPTURE_SCRIPT))
-    doc.head().prependChild(scriptTag)
-    doc.outerHtml()
-} catch (t: Throwable) {
-    dbg("[cipher] inject failed: ${t.message}")
-    return null
-}
-        dbg("[cipher] hook injected into <head>")
 
-        return withContext(Dispatchers.Main) {
-            val activity = CommonActivity.activity ?: run {
-                dbg("[cipher] no activity")
-                return@withContext null
+        suspendCancellableCoroutine { cont ->
+            val web = WebView(activity)
+            val done = AtomicBoolean(false)
+            val handler = Handler(Looper.getMainLooper())
+            var timeoutRunnable: Runnable? = null
+            var pollRunnable: Runnable? = null
+
+            fun finish(result: CipherMaterial?) {
+                if (!done.compareAndSet(false, true)) return
+                timeoutRunnable?.let { handler.removeCallbacks(it) }
+                pollRunnable?.let { handler.removeCallbacks(it) }
+                runCatching { web.stopLoading() }
+                runCatching { web.loadUrl("about:blank") }
+                runCatching { web.destroy() }
+                if (cont.isActive) cont.resume(result)
             }
 
-            suspendCancellableCoroutine { cont ->
-                val web = WebView(activity)
-                val done = AtomicBoolean(false)
-                val handler = Handler(Looper.getMainLooper())
-                var timeoutRunnable: Runnable? = null
-
-                fun finish(result: CipherMaterial?) {
-                    if (!done.compareAndSet(false, true)) return
-                    timeoutRunnable?.let { handler.removeCallbacks(it) }
-                    runCatching { web.stopLoading() }
-                    runCatching { web.loadUrl("about:blank") }
-                    runCatching { web.destroy() }
-                    if (cont.isActive) cont.resume(result)
-                }
-
-                web.settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    blockNetworkImage = true
-                    userAgentString = browserHeaders()["User-Agent"]
-                }
-
-                web.addJavascriptInterface(object {
-                    @JavascriptInterface
-                    fun submit(json: String) {
-                        val mat = runCatching {
-                            CipherMaterial.fromJson(JSONObject(json))
-                        }.getOrNull()
-                        if (mat != null && mat.isValid()) {
-                            dbg("[cipher] captured 3 sboxes + 3 keys")
-                            finish(mat)
-                        } else {
-                            dbg("[cipher] bridge got invalid material")
-                        }
-                    }
-
-                    @JavascriptInterface
-                    fun progress(msg: String) {
-                        dbg("[cipher] $msg")
-                    }
-                }, "ComixCipherBridge")
-
-                web.webChromeClient = object : WebChromeClient() {
-                    override fun onConsoleMessage(msg: ConsoleMessage?): Boolean {
-                        msg?.let { dbg("[webview] ${it.message()}") }
-                        return true
-                    }
-                }
-
-                web.webViewClient = object : WebViewClient() {
-                    override fun shouldInterceptRequest(
-                        view: WebView,
-                        request: WebResourceRequest,
-                    ): WebResourceResponse? {
-                        // Blacklist: block heavy media/fonts so the page renders
-                        // quickly, but let every script/API/CF asset through.
-                        // A whitelist risks blocking Cloudflare Turnstile's
-                        // sub-resources and stalling the challenge forever.
-                        val path = request.url.path?.lowercase() ?: ""
-                        val isMedia = path.endsWith(".png") || path.endsWith(".jpg") ||
-                                      path.endsWith(".jpeg") || path.endsWith(".webp") ||
-                                      path.endsWith(".gif")  || path.endsWith(".woff2") ||
-                                      path.endsWith(".woff") || path.endsWith(".ttf") ||
-                                      path.endsWith(".mp4")
-                        return if (isMedia) {
-                            WebResourceResponse(
-                                "text/plain", "utf-8",
-                                ByteArrayInputStream(ByteArray(0))
-                            )
-                        } else {
-                            super.shouldInterceptRequest(view, request)
-                        }
-                    }
-
-                    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                        dbg("[cipher] onPageStarted: $url")
-                    }
-
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        dbg("[cipher] onPageFinished: $url")
-                        view?.evaluateJavascript(CAPTURE_SCRIPT, null)
-                    }
-
-                    override fun onReceivedError(
-                        view: WebView?,
-                        request: WebResourceRequest?,
-                        error: WebResourceError?,
-                    ) {
-                        dbg("[cipher] onReceivedError: ${request?.url} -> ${error?.description}")
-                    }
-
-                    override fun onReceivedHttpError(
-                        view: WebView?,
-                        request: WebResourceRequest?,
-                        errorResponse: WebResourceResponse?,
-                    ) {
-                        dbg("[cipher] onReceivedHttpError: ${request?.url} -> ${errorResponse?.statusCode}")
-                    }
-                }
-
-                cont.invokeOnCancellation { finish(null) }
-
-                timeoutRunnable = Runnable {
-                    dbg("[cipher] capture timed out after ${CIPHER_CAPTURE_TIMEOUT_MS / 1000}s")
-                    finish(null)
-                }.also { handler.postDelayed(it, CIPHER_CAPTURE_TIMEOUT_MS) }
-
-                web.loadDataWithBaseURL(
-                    mainUrl,
-                    modifiedHtml,
-                    "text/html",
-                    "utf-8",
-                    mainUrl,
-                )
+            web.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                databaseEnabled = true
+                blockNetworkImage = true
+                userAgentString = browserHeaders()["User-Agent"]
             }
+
+            web.addJavascriptInterface(object {
+                @JavascriptInterface
+                fun submit(json: String) {
+                    val mat = runCatching {
+                        CipherMaterial.fromJson(JSONObject(json))
+                    }.getOrNull()
+                    if (mat != null && mat.isValid()) {
+                        dbg("[cipher] captured 3 sboxes + 3 keys")
+                        finish(mat)
+                    } else {
+                        dbg("[cipher] bridge got invalid material")
+                    }
+                }
+
+                @JavascriptInterface
+                fun progress(msg: String) {
+                    dbg("[cipher] $msg")
+                }
+            }, "ComixCipherBridge")
+
+            web.webChromeClient = object : WebChromeClient() {
+                override fun onConsoleMessage(msg: ConsoleMessage?): Boolean {
+                    msg?.let { dbg("[webview] ${it.message()}") }
+                    return true
+                }
+            }
+
+            web.webViewClient = object : WebViewClient() {
+                override fun shouldInterceptRequest(
+                    view: WebView,
+                    request: WebResourceRequest,
+                ): WebResourceResponse? {
+                    // Media blacklist only — never restrict hosts. Blocking CF
+                    // analytics or third-party challenge dependencies with a
+                    // whitelist causes ERR_CONNECTION_REFUSED and freezes the
+                    // Turnstile verification script.
+                    val path = request.url.path?.lowercase() ?: ""
+                    val isMedia = path.endsWith(".png")  || path.endsWith(".jpg") ||
+                                  path.endsWith(".jpeg") || path.endsWith(".webp") ||
+                                  path.endsWith(".gif")  || path.endsWith(".woff2") ||
+                                  path.endsWith(".woff") || path.endsWith(".ttf") ||
+                                  path.endsWith(".mp4")
+                    return if (isMedia) {
+                        WebResourceResponse(
+                            "text/plain", "utf-8",
+                            ByteArrayInputStream(ByteArray(0))
+                        )
+                    } else {
+                        super.shouldInterceptRequest(view, request)
+                    }
+                }
+
+                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                    dbg("[cipher] onPageStarted: $url")
+                    // Best-effort early injection. May race with page JS; the
+                    // polling loop below re-installs it periodically.
+                    view?.evaluateJavascript(CAPTURE_SCRIPT, null)
+                }
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    dbg("[cipher] onPageFinished: $url")
+                    view?.evaluateJavascript(CAPTURE_SCRIPT, null)
+
+                    // Force the site's signed-request path to run. The
+                    // homepage SSR already contains everything, so the client
+                    // never lazily builds the cipher on its own. Firing an
+                    // API request makes the client's fetch/XHR wrapper sign
+                    // the call, which forces the cipher to be constructed.
+                    view?.evaluateJavascript(
+                        """
+                        (function () {
+                            try {
+                                if (typeof fetch === 'function') {
+                                    fetch('/api/v1/manga?page=1&limit=1', { credentials: 'include' })
+                                        .catch(function(){});
+                                }
+                            } catch (e) {}
+                            try {
+                                var x = new XMLHttpRequest();
+                                x.open('GET', '/api/v1/manga?page=1&limit=1', true);
+                                x.withCredentials = true;
+                                x.send();
+                            } catch (e) {}
+                        })();
+                        """.trimIndent(),
+                        null
+                    )
+                }
+
+                override fun onReceivedError(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                    error: WebResourceError?,
+                ) {
+                    dbg("[cipher] onReceivedError: ${request?.url} -> ${error?.description}")
+                }
+
+                override fun onReceivedHttpError(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                    errorResponse: WebResourceResponse?,
+                ) {
+                    dbg("[cipher] onReceivedHttpError: ${request?.url} -> ${errorResponse?.statusCode}")
+                }
+            }
+
+            cont.invokeOnCancellation { finish(null) }
+
+            timeoutRunnable = Runnable {
+                dbg("[cipher] capture timed out after ${CIPHER_CAPTURE_TIMEOUT_MS / 1000}s")
+                finish(null)
+            }.also { handler.postDelayed(it, CIPHER_CAPTURE_TIMEOUT_MS) }
+
+            // Re-install the hook every 500 ms. With loadUrl we lose the
+            // ordering guarantee of loadDataWithBaseURL, so the site's bundle
+            // may run before our onPageStarted injection lands.
+            // CAPTURE_SCRIPT is idempotent (checks window.__comixCipherHook),
+            // so re-evaluating is safe. Also re-fires the fetch trigger in
+            // case the first attempt raced ahead of the wrapper install.
+            pollRunnable = object : Runnable {
+                override fun run() {
+                    if (done.get()) return
+                    web.evaluateJavascript(CAPTURE_SCRIPT, null)
+                    web.evaluateJavascript(
+                        "(function(){try{fetch('/api/v1/manga?page=1&limit=1',{credentials:'include'}).catch(function(){});}catch(e){}})();",
+                        null
+                    )
+                    handler.postDelayed(this, 500L)
+                }
+            }.also { handler.postDelayed(it, 500L) }
+
+            dbg("[cipher] executing natural loadUrl → $mainUrl")
+            web.loadUrl(mainUrl)
         }
     }
 
@@ -983,7 +1019,13 @@ val modifiedHtml = try {
     //  Companion constants
     // ═══════════════════════════════════════════════════════════════════════
     private companion object {
-        const val CIPHER_CAPTURE_TIMEOUT_MS = 15_000L
+        /**
+         * Natural loadUrl needs more headroom than loadDataWithBaseURL because
+         * we're waiting on the full network round-trip + Turnstile + site
+         * bundle + the triggered API fetch. Prewarm runs in the background so
+         * the user never waits on this.
+         */
+        const val CIPHER_CAPTURE_TIMEOUT_MS = 30_000L
 
         val CAPTURE_SCRIPT = """
             (function () {
