@@ -1,14 +1,10 @@
 package com.mangamanhwaverse
 
 // ── Madara ──
+
 class Manhuanext : ThemeBasedProvider(
     Themes.Madara, "Manhuanext", "https://manhuanext.com",
-    fallbackUrls = listOf("https://manhuanext.net")
-)
-
-class HunlightScans : ThemeBasedProvider(
-    Themes.Madara, "HunlightScans", "https://hunlightscans.com",
-    fallbackUrls = listOf("https://hunlightscans.net", "https://hunlightscans.org")
+    fallbackUrls = listOf("https://manhuanext.net", "https://manhuanext.to")
 )
 
 class Toonily : ThemeBasedProvider(
@@ -16,24 +12,14 @@ class Toonily : ThemeBasedProvider(
     fallbackUrls = listOf("https://toonily.me", "https://toonily.net")
 )
 
-class KunManga : ThemeBasedProvider(
-    Themes.Madara, "KunManga", "https://kunmanga.com",
-    fallbackUrls = listOf("https://kunmanga.net")
-)
-
 class MangaTX : ThemeBasedProvider(
-    Themes.Madara, "MangaTX", "https://mangatx.com",
-    fallbackUrls = listOf("https://mangatx.net")
-)
-
-class ReaperScans : ThemeBasedProvider(
-    Themes.Madara, "ReaperScans", "https://reaperscans.com",
-    fallbackUrls = listOf("https://reaperscans.net")
+    Themes.Madara, "MangaTX", "https://mangatx.to",
+    fallbackUrls = listOf("https://mangatx.com", "https://mangatx.net")
 )
 
 class FlameComics : ThemeBasedProvider(
-    Themes.Madara, "FlameComics", "https://flamecomics.com",
-    fallbackUrls = listOf("https://flamecomics.xyz", "https://flamecomics.me")
+    Themes.Madara, "FlameComics", "https://flamecomics.xyz",
+    fallbackUrls = listOf("https://flamecomics.me", "https://flamecomics.com")
 )
 
 class LuminousScans : ThemeBasedProvider(
@@ -41,14 +27,14 @@ class LuminousScans : ThemeBasedProvider(
     fallbackUrls = listOf("https://luminousscans.net")
 )
 
-class AquaManga : ThemeBasedProvider(
-    Themes.Madara, "AquaManga", "https://aquamanga.com",
-    fallbackUrls = listOf("https://aquamanga.net")
-)
-
 class CosmicScans : ThemeBasedProvider(
-    Themes.Madara, "CosmicScans", "https://cosmicscans.com",
-    fallbackUrls = listOf("https://cosmicscans.net")
+    Themes.Madara, "CosmicScans", "https://01.cosmicscans.to",
+    fallbackUrls = listOf(
+        "https://02.cosmicscans.to",
+        "https://03.cosmicscans.to",
+        "https://04.cosmicscans.to",
+        "https://cosmicscans.to"
+    )
 )
 
 class Disasterscans : ThemeBasedProvider(
@@ -81,10 +67,6 @@ class AsuraScans : ThemeBasedProvider(
 )
 
 // ── MangaThemesia ──
-class ManhwaFreakXyz : ThemeBasedProvider(
-    Themes.MangaThemesia, "ManhwaFreakXyz", "https://manhwafreak.xyz",
-    fallbackUrls = listOf("https://manhwafreak.com", "https://manhwafreak.net")
-)
 
 class IgnisComic : ThemeBasedProvider(
     Themes.MangaThemesia, "IgnisComic", "https://igniscomic.com",
@@ -97,8 +79,8 @@ class MangaKakalot : ThemeBasedProvider(
 )
 
 class MangaBat : ThemeBasedProvider(
-    Themes.MangaThemesia, "MangaBat", "https://mangabat.com",
-    fallbackUrls = listOf("https://mangabat.net")
+    Themes.MangaThemesia, "MangaBat", "https://www.mangabats.com",
+    fallbackUrls = listOf("https://mangabat.com", "https://mangabat.net")
 )
 
 class MangaReader : ThemeBasedProvider(
