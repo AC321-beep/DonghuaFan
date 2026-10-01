@@ -12,39 +12,6 @@ data class ThemeConfig(
     val imageSelector: String = "img"
 )
 
-object ThemeEngine {
-    fun parseList(doc: Document, cfg: ThemeConfig, base: String): List<SearchResponse> =
-        doc.select(cfg.listSelector).mapNotNull { el ->
-            val a = el.selectFirst(cfg.linkSelector) ?: return@mapNotNull null
-            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val title = (el.selectFirst(cfg.titleSelector)?.text()?.trim()
-                ?: a.text().trim()).takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val poster = el.selectFirst(cfg.imageSelector)?.let(::img)?.let { abs(it, base) }
-            newMovieSearchResponse(title, abs(href, base), TvType.Others).apply { posterUrl = poster }
-        }
-
-    fun parseChapters(doc: Document, cfg: ThemeConfig, base: String): List<Episode> =
-        doc.select(cfg.chapterSelector).mapNotNull { a ->
-            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            newEpisode(abs(href, base)) { this.name = a.text().trim() }
-        }
-
-    fun parsePages(doc: Document, cfg: ThemeConfig): List<String> =
-        doc.select(cfg.pageSelector).mapNotNull(::img).distinct()
-
-    private fun img(el: Element): String? =
-        el.attr("src").takeIf { it.isNotBlank() }
-            ?: el.attr("data-src").takeIf { it.isNotBlank() }
-            ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() }
-            ?: el.attr("data-original").takeIf { it.isNotBlank() }
-            ?: el.attr("srcset").split(",").firstOrNull()?.trim()
-                ?.substringBefore(" ")?.takeIf { it.isNotBlank() }
-
-    private fun abs(url: String, base: String) =
-        if (url.startsWith("http")) url
-        else "$base${if (url.startsWith("/")) "" else "/"}$url"
-}
-
 open class ThemeBasedProvider(
     private val config: ThemeConfig,
     override var name: String,
@@ -54,27 +21,67 @@ open class ThemeBasedProvider(
 
     override val baseUrl get() = mainUrl
 
-    override suspend fun popular(page: Int): List<SearchResponse> =
-        fetch(config.popularPath.replace("{page}", "$page"))
-            ?.let { ThemeEngine.parseList(it, config, baseUrl) }.orEmpty()
+    override suspend fun popular(page: Int): List<SearchResponse> {
+        val doc = fetch(config.popularPath.replace("{page}", "$page")) ?: return emptyList()
+        return parseList(doc)
+    }
 
-    override suspend fun latest(page: Int): List<SearchResponse> =
-        fetch(config.latestPath.replace("{page}", "$page"))
-            ?.let { ThemeEngine.parseList(it, config, baseUrl) }.orEmpty()
+    override suspend fun latest(page: Int): List<SearchResponse> {
+        val doc = fetch(config.latestPath.replace("{page}", "$page")) ?: return emptyList()
+        return parseList(doc)
+    }
 
-    override suspend fun searchPage(query: String, page: Int): List<SearchResponse> =
-        fetch(config.searchPath
+    override suspend fun searchPage(query: String, page: Int): List<SearchResponse> {
+        val path = config.searchPath
             .replace("{query}", URLEncoder.encode(query, "UTF-8"))
-            .replace("{page}", "$page"))
-            ?.let { ThemeEngine.parseList(it, config, baseUrl) }.orEmpty()
+            .replace("{page}", "$page")
+        val doc = fetch(path) ?: return emptyList()
+        return parseList(doc)
+    }
 
-    override suspend fun chapters(mangaUrl: String): List<Episode> =
-        fetch(mangaUrl)?.let { ThemeEngine.parseChapters(it, config, baseUrl) }.orEmpty()
+    override suspend fun chapters(mangaUrl: String): List<Episode> {
+        val doc = fetch(mangaUrl) ?: return emptyList()
+        return parseChapters(doc)
+    }
 
     override suspend fun pages(chapterUrl: String): List<String> {
-        val raw = fetch(chapterUrl)?.let { ThemeEngine.parsePages(it, config) }.orEmpty()
+        val doc = fetch(chapterUrl) ?: return emptyList()
+        val raw = parsePages(doc)
         return if (Settings.dataSaver()) raw.map(::shrink) else raw
     }
+
+    // ── Parsing (inside the class so `this` is a MainAPI receiver) ──
+
+    private fun parseList(doc: Document): List<SearchResponse> =
+        doc.select(config.listSelector).mapNotNull { el ->
+            val a = el.selectFirst(config.linkSelector) ?: return@mapNotNull null
+            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val title = (el.selectFirst(config.titleSelector)?.text()?.trim()
+                ?: a.text().trim()).takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val poster = el.selectFirst(config.imageSelector)?.let(::img)?.let { abs(it) }
+            newMovieSearchResponse(title, abs(href), TvType.Others).apply {
+                posterUrl = poster
+            }
+        }
+
+    private fun parseChapters(doc: Document): List<Episode> =
+        doc.select(config.chapterSelector).mapNotNull { a ->
+            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            newEpisode(abs(href)) {
+                this.name = a.text().trim()
+            }
+        }
+
+    private fun parsePages(doc: Document): List<String> =
+        doc.select(config.pageSelector).mapNotNull(::img).distinct()
+
+    private fun img(el: Element): String? =
+        el.attr("src").takeIf { it.isNotBlank() }
+            ?: el.attr("data-src").takeIf { it.isNotBlank() }
+            ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() }
+            ?: el.attr("data-original").takeIf { it.isNotBlank() }
+            ?: el.attr("srcset").split(",").firstOrNull()?.trim()
+                ?.substringBefore(" ")?.takeIf { it.isNotBlank() }
 
     private fun shrink(url: String): String = when {
         url.contains("/large/") -> url.replace("/large/", "/small/")
