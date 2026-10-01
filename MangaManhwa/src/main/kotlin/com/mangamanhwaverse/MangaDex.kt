@@ -27,9 +27,10 @@ class MangaDex : MangaManhwaProvider() {
         val raw = getText(url) ?: return emptyList()
         val dto = runCatching { json.decodeFromString<ListDto>(raw) }.getOrNull()
         return dto?.data.orEmpty().map { m ->
-            newMovieSearchResponse(
+            newAnimeSearchResponse(
                 m.attributes.title["en"] ?: m.attributes.title.values.firstOrNull() ?: "Unknown",
-                "https://mangadex.org/title/${m.id}", TvType.Others
+                "https://mangadex.org/title/${m.id}",
+                TvType.Anime
             ).apply { posterUrl = "https://uploads.mangadex.org/covers/${m.id}" }
         }
     }
