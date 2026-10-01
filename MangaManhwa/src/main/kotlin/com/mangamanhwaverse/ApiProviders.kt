@@ -1,7 +1,6 @@
-package com.mangamanhwaverse.providers
+package com.mangamanhwaverse
 
 import com.lagradost.cloudstream3.*
-import com.mangamanhwaverse.core.MangaProvider
 import com.lagradost.cloudstream3.app
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.*
@@ -20,7 +19,6 @@ class MangaDex : MangaProvider() {
     @Serializable private data class ChapAttrs(val chapter: String? = null, val title: String? = null)
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true; coerceInputValues = true }
-
     private suspend fun getText(url: String): String? = runCatching { app.get(url).text }.getOrNull()
 
     private suspend fun list(url: String): List<SearchResponse> {
@@ -63,43 +61,5 @@ class MangaDex : MangaProvider() {
         val files = node.jsonObject["chapter"]?.jsonObject
             ?.get("data")?.jsonArray?.map { it.jsonPrimitive.content }.orEmpty()
         return files.map { "$base/data/$hash/$it" }
-    }
-}
-
-class TempleScan : MangaProvider() {
-    override val name = "TempleScan"
-    override val mainUrl = "https://templescan.net"
-    override val baseUrl = mainUrl
-    override val lang = "en"
-
-    override suspend fun popular(page: Int): List<SearchResponse> {
-        val doc = fetch("/series?page=$page") ?: return emptyList()
-        return doc.select("a[href^='/series/']").mapNotNull { a ->
-            val title = a.selectFirst("h3, h4, .title")?.text()?.trim()
-                ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val img = a.selectFirst("img")?.attr("src")
-            newMovieSearchResponse(title, abs(href), TvType.Manga)
-                .apply { posterUrl = img?.let { abs(it) } }
-        }
-    }
-
-    override suspend fun search(query: String, page: Int) =
-        popular(page).filter { it.name.contains(query, ignoreCase = true) }
-
-    override suspend fun chapters(mangaUrl: String): List<Episode> {
-        val doc = fetch(mangaUrl) ?: return emptyList()
-        return doc.select("a[href*='/chapter']").mapNotNull { a ->
-            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            newEpisode(abs(href)) { name = a.text().trim() }
-        }
-    }
-
-    override suspend fun pages(chapterUrl: String): List<String> {
-        val doc = fetch(chapterUrl) ?: return emptyList()
-        return doc.select("img[src*='cdn'], img[data-src]").mapNotNull {
-            it.attr("src").takeIf { s -> s.isNotBlank() }
-                ?: it.attr("data-src").takeIf { s -> s.isNotBlank() }
-        }.distinct()
     }
 }
