@@ -7,7 +7,6 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import okhttp3.Interceptor
 import okhttp3.Request
-import okhttp3.Response
 import org.jsoup.nodes.Document
 import java.net.URI
 
@@ -43,19 +42,12 @@ abstract class MangaManhwaProvider : MainAPI() {
     override val hasQuickSearch = true
     override val hasDownloadSupport = false
 
-    /** Multi-host CF pattern. Theme providers override to cover fallback URLs. */
     protected open val cfPattern: Regex
         get() = Regex(".*${hostOf(baseUrl)}.*")
 
-    private val cfResolver = WebViewResolver(cfPattern)
+    // by lazy: deferred until first fetch(), when all subclass fields are set
+    private val cfResolver by lazy { WebViewResolver(cfPattern) }
 
-    /**
-     * Unified interceptor:
-     *   1. Strips X-Requested-With (CF fingerprint signal)
-     *   2. Applies the per-host WebView UA (syncs with CFSolver)
-     *   3. Injects WebView cookies (set by WebViewResolver OR CFSolver)
-     *   4. Delegates to WebViewResolver for silent challenge solving
-     */
     private val unifiedInterceptor: Interceptor by lazy {
         Interceptor { chain ->
             val original = chain.request()
@@ -74,7 +66,6 @@ abstract class MangaManhwaProvider : MainAPI() {
                 }
             }.build()
 
-            // Hand the modified request to the CF resolver
             cfResolver.intercept(object : Interceptor.Chain by chain {
                 override fun request(): Request = modified
             })
@@ -149,8 +140,6 @@ abstract class MangaManhwaProvider : MainAPI() {
                 headers = browserHeaders()
             ).document
 
-            // If WebViewResolver failed silently and we're still on a CF page,
-            // fall back to the visible CFSolver dialog.
             if (isCfChallenge(doc)) {
                 log("CF challenge persists after silent solve — invoking dialog")
                 val solved = CFSolver(absolute).solve()
