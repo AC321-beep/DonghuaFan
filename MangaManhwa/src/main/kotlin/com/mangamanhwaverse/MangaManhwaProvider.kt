@@ -7,11 +7,13 @@ import org.jsoup.nodes.Document
 import java.net.URI
 
 abstract class MangaManhwaProvider : MainAPI() {
-    final override val supportedTypes = setOf(TvType.Manga, TvType.Manhwa)
+
+    final override val supportedTypes = setOf(TvType.Others)
     abstract val baseUrl: String
 
+    // Renamed from `search` to avoid hiding MainAPI.search(query)
+    abstract suspend fun searchPage(query: String, page: Int): List<SearchResponse>
     abstract suspend fun popular(page: Int): List<SearchResponse>
-    abstract suspend fun search(query: String, page: Int): List<SearchResponse>
     abstract suspend fun chapters(mangaUrl: String): List<Episode>
     abstract suspend fun pages(chapterUrl: String): List<String>
     open suspend fun latest(page: Int): List<SearchResponse> = popular(page)
@@ -30,20 +32,21 @@ abstract class MangaManhwaProvider : MainAPI() {
             if (request.name.equals("latest", true)) latest(page) else popular(page)
         )
 
-    override suspend fun search(query: String) =
-        runCatching { search(query, 1) }.getOrNull()
+    override suspend fun search(query: String): List<SearchResponse>? =
+        runCatching { searchPage(query, 1) }.getOrNull()
 
-    override suspend fun load(url: String) = runCatching {
+    override suspend fun load(url: String): LoadResponse? = runCatching {
         newTvSeriesLoadResponse(
             name = url.substringAfterLast("/").replace('-', ' '),
             url = url,
-            type = TvType.Manga,
+            type = TvType.Others,
             episodes = chapters(url)
         )
     }.getOrNull()
 
     override suspend fun loadLinks(
-        data: String, isCasting: Boolean,
+        data: String,
+        isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
@@ -67,7 +70,6 @@ abstract class MangaManhwaProvider : MainAPI() {
         return true
     }
 
-    /** Rate-limited, CF-aware fetch. */
     protected suspend fun fetch(url: String, referer: String? = baseUrl): Document? {
         val absolute = if (url.startsWith("http")) url else abs(url)
         return runCatching {
