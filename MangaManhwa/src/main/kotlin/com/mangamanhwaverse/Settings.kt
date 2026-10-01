@@ -2,7 +2,6 @@ package com.mangamanhwaverse
 
 import android.app.AlertDialog
 import android.content.Context
-import android.content.Intent
 import android.content.SharedPreferences
 import android.text.InputType
 import android.widget.CheckBox
@@ -13,7 +12,6 @@ import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
 
 object Settings {
     private lateinit var prefs: SharedPreferences
@@ -34,12 +32,15 @@ object Settings {
     fun verboseLog(): Boolean = prefs.getBoolean("verbose_log", false)
     fun setVerboseLog(v: Boolean) { prefs.edit().putBoolean("verbose_log", v).apply() }
 
-    fun disabledProviders(): Set<String> =
-        prefs.getStringSet("disabled_providers", emptySet()) ?: emptySet()
-    fun setDisabledProviders(s: Set<String>) {
-        prefs.edit().putStringSet("disabled_providers", s).apply()
+    fun allProvidersEnabled(): Boolean = prefs.getBoolean("all_providers_enabled", true)
+    fun setAllProvidersEnabled(v: Boolean) { prefs.edit().putBoolean("all_providers_enabled", v).apply() }
+
+    fun providerUrlOverride(name: String): String =
+        prefs.getString("url_override_$name", "") ?: ""
+
+    fun setProviderUrlOverride(name: String, url: String) {
+        prefs.edit().putString("url_override_$name", url.trim()).apply()
     }
-    fun isProviderEnabled(name: String) = name !in disabledProviders()
 
     fun show(context: Context) {
         if (!::prefs.isInitialized) init(context)
@@ -81,20 +82,21 @@ object Settings {
             text = "Verbose logging (Logcat)"
             isChecked = verboseLog()
         }
+        val cbAllProviders = CheckBox(context).apply {
+            text = "Enable all sources"
+            isChecked = allProvidersEnabled()
+        }
         layout.addView(cbDataSaver)
         layout.addView(cbPreload)
         layout.addView(cbVerbose)
+        layout.addView(cbAllProviders)
 
         layout.addView(TextView(context).apply {
-            text = "Sources — ${disabledProviders().size} disabled"
-            setPadding(0, dp(12), 0, dp(6))
-        })
-        layout.addView(TextView(context).apply {
-            text = "Manage sources"
-            setPadding(dp(10), dp(8), dp(10), dp(8))
+            text = "Override provider URL…"
+            setPadding(dp(10), dp(12), dp(10), dp(8))
             setBackgroundColor(0xFF151923.toInt())
             isClickable = true
-            setOnClickListener { showSourcesDialog(context) }
+            setOnClickListener { showUrlOverrideDialog(context) }
         })
 
         layout.addView(TextView(context).apply {
@@ -110,7 +112,7 @@ object Settings {
         AlertDialog.Builder(context)
             .setTitle("MangaManhwa Settings")
             .setView(scroll)
-            .setPositiveButton("Save") { _, _ ->
+            .setPositiveButton("Save & Restart") { _, _ ->
                 val dir = when (group.checkedRadioButtonId) {
                     2 -> "rtl"; 3 -> "vertical"; else -> "ltr"
                 }
@@ -118,42 +120,59 @@ object Settings {
                 setDataSaver(cbDataSaver.isChecked)
                 setPreloadNext(cbPreload.isChecked)
                 setVerboseLog(cbVerbose.isChecked)
-                Toast.makeText(context, "Saved — reload extension to apply source changes",
-                    Toast.LENGTH_SHORT).show()
+                setAllProvidersEnabled(cbAllProviders.isChecked)
+                restartApp(context)
             }
             .setNegativeButton("Cancel", null)
             .show()
     }
 
-    private fun showSourcesDialog(context: Context) {
-        val names = ProviderRegistry.names
-        val disabled = disabledProviders().toMutableSet()
-
+    private fun showUrlOverrideDialog(context: Context) {
+        val names = ProviderRegistry.names.sorted()
         val density = context.resources.displayMetrics.density
         fun dp(v: Int) = (v * density).toInt()
 
         val layout = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(8), dp(16), dp(8))
-        }
-        val boxes = mutableMapOf<String, CheckBox>()
-        names.sorted().forEach { name ->
-            val cb = CheckBox(context).apply {
-                text = name
-                isChecked = name !in disabled
-            }
-            boxes[name] = cb
-            layout.addView(cb)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
         }
 
-        val scroll = ScrollView(context).apply { addView(layout) }
+        layout.addView(TextView(context).apply {
+            text = "Provider name (e.g. AsuraScans)"
+            textSize = 12f
+        })
+        val nameInput = EditText(context).apply {
+            hint = names.firstOrNull() ?: "AsuraScans"
+        }
+        layout.addView(nameInput)
+
+        layout.addView(TextView(context).apply {
+            text = "New base URL (empty = use default)"
+            textSize = 12f
+            setPadding(0, dp(10), 0, 0)
+        })
+        val urlInput = EditText(context).apply {
+            inputType = InputType.TYPE_TEXT_VARIATION_URI
+            hint = "https://newdomain.com"
+        }
+        layout.addView(urlInput)
 
         AlertDialog.Builder(context)
-            .setTitle("Enable Sources")
-            .setView(scroll)
-            .setPositiveButton("Apply") { _, _ ->
-                val nowDisabled = boxes.filterValues { !it.isChecked }.keys
-                setDisabledProviders(nowDisabled)
+            .setTitle("Override Provider URL")
+            .setView(layout)
+            .setPositiveButton("Save") { _, _ ->
+                val n = nameInput.text.toString().trim()
+                val u = urlInput.text.toString().trim()
+                if (n.isBlank() || n !in names) {
+                    Toast.makeText(context, "Unknown provider: $n", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                setProviderUrlOverride(n, u)
+                Toast.makeText(
+                    context,
+                    if (u.isBlank()) "Cleared override for $n" else "Override set for $n",
+                    Toast.LENGTH_SHORT
+                ).show()
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -170,7 +189,7 @@ object Settings {
             .setPositiveButton("Open") { _, _ ->
                 val url = input.text.toString().trim()
                 if (url.isBlank()) return@setPositiveButton
-                val activity = context as? AppCompatActivity
+                val activity = context as? androidx.appcompat.app.AppCompatActivity
                 if (activity == null) {
                     Toast.makeText(context, "Cannot open reader from this context",
                         Toast.LENGTH_SHORT).show()
@@ -187,5 +206,22 @@ object Settings {
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    private fun restartApp(context: Context) {
+        val intent = context.packageManager
+            .getLaunchIntentForPackage(context.packageName)
+
+        if (intent != null) {
+            intent.addFlags(
+                android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK
+            )
+            context.startActivity(intent)
+        }
+
+        android.os.Process.killProcess(android.os.Process.myPid())
+        @Suppress("UNREACHABLE_CODE")
+        Runtime.getRuntime().exit(0)
     }
 }
