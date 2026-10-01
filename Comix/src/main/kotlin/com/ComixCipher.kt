@@ -35,15 +35,6 @@ data class CipherMaterial(
     }
 }
 
-/**
- * Port of the Tachiyomi Comix cipher.
- *
- *   sign(path, query)   -> Base64URL(no-pad) of three keyed-substitution rounds
- *   decrypt(value)      -> inverse of the same rounds
- *
- * The S-boxes and keys are supplied by the site's obfuscated JS at load time;
- * we capture them from atob() in a WebView (see ComixProvider.captureCipherMaterial).
- */
 class ComixCipher(material: CipherMaterial) {
 
     private val sboxes: List<IntArray> = material.sboxes.map { it.toIntArray() }
