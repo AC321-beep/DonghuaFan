@@ -5,6 +5,9 @@ import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
 import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
@@ -19,7 +22,6 @@ import com.lagradost.cloudstream3.ShowStatus
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.addEpisodes
-import com.lagradost.cloudstream3.addSub
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.fixUrl
 import com.lagradost.cloudstream3.mainPageOf
@@ -71,13 +73,9 @@ class ComixProvider : MainAPI() {
     @Volatile private var captureInFlight = false
     @Volatile private var prewarmStarted = false
 
-    /** Background scope for the cipher prewarm — survives the caller. */
     private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Network Helpers
-    // ═══════════════════════════════════════════════════════════════════════
     private fun browserHeaders(extra: Map<String, String> = emptyMap()): Map<String, String> =
         mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -97,9 +95,6 @@ class ComixProvider : MainAPI() {
         return app.get(url, interceptor = cfInterceptor, headers = browserHeaders()).text
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Cipher: state, cache, background prewarm, capture
-    // ═══════════════════════════════════════════════════════════════════════
     private val cipherCacheFile: File?
         get() {
             val ctx = CommonActivity.activity ?: return null
@@ -151,17 +146,11 @@ class ComixProvider : MainAPI() {
         if (prewarmStarted || cipher != null || loadCachedCipher() != null) return
         prewarmStarted = true
         bgScope.launch {
-            // Wait for UI grids to render before blocking the main thread with WebView instantiation
             delay(2000)
             captureCipher()
         }
     }
 
-    /**
-     * Drives a WebView against the site with a NATURAL loadUrl to seamlessly pass
-     * Cloudflare Turnstile verification. Simulates a UI click to force the SPA 
-     * router to perform an internal fetch, natively triggering the site's cipher.
-     */
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun captureCipherMaterial(): CipherMaterial? = withContext(Dispatchers.Main) {
         val activity = CommonActivity.activity ?: return@withContext null
@@ -218,8 +207,6 @@ class ComixProvider : MainAPI() {
                 finish(null)
             }.also { handler.postDelayed(it, CIPHER_CAPTURE_TIMEOUT_MS) }
 
-            // Polling loop: Re-injects the hook to ensure it survives async bundle loads,
-            // and simulates a physical UI click to force the SPA router to execute the API client.
             pollRunnable = object : Runnable {
                 override fun run() {
                     if (done.get()) return
@@ -246,10 +233,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    /**
-     * Race-safe invalidation: if this request's cipher is replaced by a concurrent 
-     * capture while we're in flight, we only drop the one we were using.
-     */
     private suspend fun getSigned(
         path: String,
         params: Map<String, List<String>>,
@@ -327,9 +310,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Data Extraction & Parsing
-    // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
             is Document -> htmlOrDoc
@@ -475,9 +455,6 @@ class ComixProvider : MainAPI() {
         return out
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Main Page Routing
-    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(
         page: Int,
         request: MainPageRequest
@@ -502,6 +479,17 @@ class ComixProvider : MainAPI() {
                 apiResult.items.distinctBy { it.url },
                 hasNext = apiResult.hasNext
             )
+        }
+
+        if (page == 1) {
+            val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
+            if (items.isNotEmpty()) {
+                return newHomePageResponse(
+                    request,
+                    items.distinctBy { it.url },
+                    hasNext = true 
+                )
+            }
         }
 
         return null
@@ -623,9 +611,6 @@ class ComixProvider : MainAPI() {
         return null
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Search
-    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
@@ -651,9 +636,6 @@ class ComixProvider : MainAPI() {
     private fun formatChapterNum(n: Double): String =
         if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Load
-    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
         val html = fetchHtml(url)
         if (html.isBlank()) return null
@@ -773,16 +755,12 @@ class ComixProvider : MainAPI() {
             val epName = realData?.first ?: "Ch. $key"
             val chNum = key.toFloatOrNull()?.toInt()
 
-            // Encode the index so loadLinks can correctly open the targeted chapter
             val dataString = "${fixUrl(epUrl)}||$index"
             
             newEpisode(dataString) {
                 this.name = epName
-                this.season = 1
                 if (chNum != null) {
                     this.episode = chNum
-                } else {
-                    this.episode = index + 1
                 }
                 this.posterUrl = posterUrl
             }
@@ -804,9 +782,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Load Links
-    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -822,8 +797,6 @@ class ComixProvider : MainAPI() {
         val chapterName = Regex("-chapter-([\\d.]+)").find(realUrl)
             ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
 
-        // If the cache contains the ||index, use it. Otherwise, estimate index from chapter name
-        // (to prevent cached entries from always defaulting to chapter 0).
         var targetIndex = parts.getOrNull(1)?.toIntOrNull()
         if (targetIndex == null) {
             val chNum = Regex("-chapter-([\\d.]+)").find(realUrl)?.groupValues?.get(1)?.toDoubleOrNull() ?: 1.0
@@ -877,8 +850,6 @@ class ComixProvider : MainAPI() {
                     return decoded;
                 };
 
-                // Spoof the native function signature so anti-bot checks that
-                // read Function.prototype.toString see a native binding.
                 var origFpToString = Function.prototype.toString;
                 Function.prototype.toString = function () {
                     if (this === stealthAtob) return 'function atob() { [native code] }';
