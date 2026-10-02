@@ -72,7 +72,6 @@ class ComixProvider : MainAPI() {
 
     /** Background scope for the cipher prewarm — survives the caller. */
     private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -769,12 +768,25 @@ class ComixProvider : MainAPI() {
         parsedChapterLinks.keys.forEach { allChapterKeys.add(it) }
         val sortedKeys = allChapterKeys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
 
+        val cleanUrl = url.removeSuffix("/")
         val episodes = sortedKeys.mapIndexed { index, key ->
             val realData = parsedChapterLinks[key]
-            val epUrl = if (realData != null) realData.second
-                else if (key == "0" && startsAtZero && firstChapterUrl != null) firstChapterUrl
-                else if (key == "1" && !startsAtZero && firstChapterUrl != null) firstChapterUrl
-                else "$url/chapter-$key"
+            
+            val epUrl = if (realData != null) {
+                realData.second
+            } else if (key == "0" && startsAtZero && firstChapterUrl != null) {
+                firstChapterUrl
+            } else if (key == "1" && !startsAtZero && firstChapterUrl != null) {
+                firstChapterUrl
+            } else {
+                val replaced = firstChapterUrl?.replace(Regex("-chapter-[\\d.]+", RegexOption.IGNORE_CASE), "-chapter-$key")
+                if (replaced != null && replaced != firstChapterUrl) {
+                    replaced
+                } else {
+                    "$cleanUrl-chapter-$key"
+                }
+            }
+            
             val epName = realData?.first ?: "Ch. $key"
             newEpisode(fixUrl(epUrl)) {
                 this.name = epName
