@@ -4,7 +4,12 @@ import android.annotation.SuppressLint
 import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
+import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
@@ -35,6 +40,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -70,7 +76,6 @@ class ComixProvider : MainAPI() {
     @Volatile private var captureInFlight = false
     @Volatile private var prewarmStarted = false
 
-    /** Background scope for the cipher prewarm — survives the caller. */
     private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
@@ -150,15 +155,13 @@ class ComixProvider : MainAPI() {
         if (prewarmStarted || cipher != null || loadCachedCipher() != null) return
         prewarmStarted = true
         bgScope.launch {
+            // Delay for 1.5s to allow the UI fragment to finish its layout animation 
+            // before we block the main thread initializing the WebView engine.
+            delay(1500)
             captureCipher(null)
         }
     }
 
-    /**
-     * Drives a WebView against the site with a NATURAL loadUrl to seamlessly pass
-     * Cloudflare Turnstile verification. Simulates a UI click to force the SPA 
-     * router to perform an internal fetch, natively triggering the site's cipher.
-     */
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun captureCipherMaterial(htmlOrNull: String?): CipherMaterial? = withContext(Dispatchers.Main) {
         val activity = CommonActivity.activity ?: return@withContext null
@@ -215,8 +218,6 @@ class ComixProvider : MainAPI() {
                 finish(null)
             }.also { handler.postDelayed(it, CIPHER_CAPTURE_TIMEOUT_MS) }
 
-            // Polling loop: Re-injects the hook to ensure it survives async bundle loads,
-            // and simulates a physical UI click to force the SPA router to execute the API client.
             pollRunnable = object : Runnable {
                 override fun run() {
                     if (done.get()) return
@@ -243,10 +244,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    /**
-     * Race-safe invalidation: if this request's cipher is replaced by a concurrent 
-     * capture while we're in flight, we only drop the one we were using.
-     */
     private suspend fun getSigned(
         path: String,
         params: Map<String, List<String>>,
@@ -339,11 +336,6 @@ class ComixProvider : MainAPI() {
         return runCatching { JSONObject(text) }.getOrNull()
     }
 
-    /**
-     * Parses a manga/manga-card object. Tolerates field-name drift between the
-     * SSR HTML and the JSON API. `url` is optional in the API model, and the path 
-     * is reconstructed from `hid` when absent.
-     */
     private fun parseMangaFromJson(obj: JSONObject): SearchResponse? {
         val title = (obj.optString("title").takeIf { it.isNotBlank() }
             ?: obj.optString("name").takeIf { it.isNotBlank() }
@@ -497,7 +489,6 @@ class ComixProvider : MainAPI() {
             )
         }
 
-        // Try signed API only if cipher is cached
         val apiResult = fetchQueryPage(request, page)
         if (apiResult != null && apiResult.items.isNotEmpty()) {
             return newHomePageResponse(
@@ -507,7 +498,6 @@ class ComixProvider : MainAPI() {
             )
         }
 
-        // SSR fallback for page 1 provides an instant first paint while cipher captures
         if (page == 1) {
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
             if (items.isNotEmpty()) {
@@ -768,10 +758,8 @@ class ComixProvider : MainAPI() {
         parsedChapterLinks.keys.forEach { allChapterKeys.add(it) }
         val sortedKeys = allChapterKeys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
 
-        val cleanUrl = url.removeSuffix("/")
         val episodes = sortedKeys.mapIndexed { index, key ->
             val realData = parsedChapterLinks[key]
-            
             val epUrl = if (realData != null) {
                 realData.second
             } else if (key == "0" && startsAtZero && firstChapterUrl != null) {
@@ -783,12 +771,16 @@ class ComixProvider : MainAPI() {
                 if (replaced != null && replaced != firstChapterUrl) {
                     replaced
                 } else {
-                    "$cleanUrl-chapter-$key"
+                    "${url.removeSuffix("/")}-chapter-$key"
                 }
             }
             
             val epName = realData?.first ?: "Ch. $key"
-            newEpisode(fixUrl(epUrl)) {
+            
+            // Encode the index into the data URL so loadLinks can correctly open the targeted chapter
+            val dataString = "${fixUrl(epUrl)}||$index"
+            
+            newEpisode(dataString) {
                 this.name = epName
                 this.season = 1
                 this.episode = index + 1
@@ -824,7 +816,11 @@ class ComixProvider : MainAPI() {
         val activity = CommonActivity.activity as? AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
-        val chapterName = Regex("-chapter-([\\d.]+)").find(data)
+        val parts = data.split("||")
+        val realUrl = parts[0]
+        val targetIndex = parts.getOrNull(1)?.toIntOrNull() ?: 0
+
+        val chapterName = Regex("-chapter-([\\d.]+)").find(realUrl)
             ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
 
         activity.runOnUiThread {
@@ -832,8 +828,8 @@ class ComixProvider : MainAPI() {
                 activity = activity,
                 title = name,
                 chapterName = chapterName,
-                chapterUrl = data,
-                targetChapter = 0
+                chapterUrl = realUrl,
+                targetChapter = targetIndex
             )
         }
         return true
