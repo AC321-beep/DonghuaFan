@@ -36,21 +36,18 @@ class ComixReaderDialogFragment : DialogFragment() {
         private const val ARG_TITLE = "arg_title"
         private const val ARG_CHAPTER_NAME = "arg_chapter_name"
         private const val ARG_CHAPTER_URL = "arg_chapter_url"
-        private const val ARG_TARGET_CHAPTER = "arg_target_chapter"
 
         val chapterUrlCache = ConcurrentHashMap<String, ConcurrentHashMap<String, String>>()
 
         fun newInstance(
             title: String,
             chapterName: String,
-            chapterUrl: String,
-            targetChapter: Int = 0
+            chapterUrl: String
         ) = ComixReaderDialogFragment().apply {
             arguments = Bundle().apply {
                 putString(ARG_TITLE, title)
                 putString(ARG_CHAPTER_NAME, chapterName)
                 putString(ARG_CHAPTER_URL, chapterUrl)
-                putInt(ARG_TARGET_CHAPTER, targetChapter)
             }
         }
 
@@ -59,7 +56,7 @@ class ComixReaderDialogFragment : DialogFragment() {
             title: String,
             chapterName: String,
             chapterUrl: String,
-            targetChapter: Int = 0
+            targetChapter: Int = 0 // Kept for backwards compatibility with ComixProvider calling signature
         ) {
             if (activity.isFinishing || activity.isDestroyed) return
             val fm = activity.supportFragmentManager
@@ -70,7 +67,7 @@ class ComixReaderDialogFragment : DialogFragment() {
                     existing.loadUrlDirectly(chapterName, chapterUrl)
                 } else {
                     fm.beginTransaction()
-                        .add(newInstance(title, chapterName, chapterUrl, targetChapter), TAG)
+                        .add(newInstance(title, chapterName, chapterUrl), TAG)
                         .commitAllowingStateLoss()
                 }
             }
