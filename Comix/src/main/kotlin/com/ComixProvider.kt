@@ -4,12 +4,7 @@ import android.annotation.SuppressLint
 import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
-import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
@@ -76,6 +71,7 @@ class ComixProvider : MainAPI() {
     @Volatile private var captureInFlight = false
     @Volatile private var prewarmStarted = false
 
+    /** Background scope for the cipher prewarm — survives the caller. */
     private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
@@ -133,7 +129,7 @@ class ComixProvider : MainAPI() {
         return loadCachedCipher()?.also { cipher = it }
     }
 
-    private suspend fun captureCipher(htmlOrNull: String?): ComixCipher? {
+    private suspend fun captureCipher(): ComixCipher? {
         cipher?.let { return it }
         loadCachedCipher()?.let { cipher = it; return it }
 
@@ -141,7 +137,7 @@ class ComixProvider : MainAPI() {
         
         captureInFlight = true
         return try {
-            val mat = captureCipherMaterial(htmlOrNull) ?: return null
+            val mat = captureCipherMaterial() ?: return null
             val c = ComixCipher(mat)
             cipher = c
             saveCachedCipher(mat)
@@ -155,15 +151,19 @@ class ComixProvider : MainAPI() {
         if (prewarmStarted || cipher != null || loadCachedCipher() != null) return
         prewarmStarted = true
         bgScope.launch {
-            // Delay for 1.5s to allow the UI fragment to finish its layout animation 
-            // before we block the main thread initializing the WebView engine.
-            delay(1500)
-            captureCipher(null)
+            // Wait for UI grids to render before blocking the main thread with WebView instantiation
+            delay(2000)
+            captureCipher()
         }
     }
 
+    /**
+     * Drives a WebView against the site with a NATURAL loadUrl to seamlessly pass
+     * Cloudflare Turnstile verification. Simulates a UI click to force the SPA 
+     * router to perform an internal fetch, natively triggering the site's cipher.
+     */
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun captureCipherMaterial(htmlOrNull: String?): CipherMaterial? = withContext(Dispatchers.Main) {
+    private suspend fun captureCipherMaterial(): CipherMaterial? = withContext(Dispatchers.Main) {
         val activity = CommonActivity.activity ?: return@withContext null
 
         suspendCancellableCoroutine { cont ->
@@ -218,6 +218,8 @@ class ComixProvider : MainAPI() {
                 finish(null)
             }.also { handler.postDelayed(it, CIPHER_CAPTURE_TIMEOUT_MS) }
 
+            // Polling loop: Re-injects the hook to ensure it survives async bundle loads,
+            // and simulates a physical UI click to force the SPA router to execute the API client.
             pollRunnable = object : Runnable {
                 override fun run() {
                     if (done.get()) return
@@ -244,6 +246,10 @@ class ComixProvider : MainAPI() {
         }
     }
 
+    /**
+     * Race-safe invalidation: if this request's cipher is replaced by a concurrent 
+     * capture while we're in flight, we only drop the one we were using.
+     */
     private suspend fun getSigned(
         path: String,
         params: Map<String, List<String>>,
@@ -496,17 +502,6 @@ class ComixProvider : MainAPI() {
                 apiResult.items.distinctBy { it.url },
                 hasNext = apiResult.hasNext
             )
-        }
-
-        if (page == 1) {
-            val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
-            if (items.isNotEmpty()) {
-                return newHomePageResponse(
-                    request,
-                    items.distinctBy { it.url },
-                    hasNext = true 
-                )
-            }
         }
 
         return null
@@ -776,14 +771,19 @@ class ComixProvider : MainAPI() {
             }
             
             val epName = realData?.first ?: "Ch. $key"
-            
-            // Encode the index into the data URL so loadLinks can correctly open the targeted chapter
+            val chNum = key.toFloatOrNull()?.toInt()
+
+            // Encode the index so loadLinks can correctly open the targeted chapter
             val dataString = "${fixUrl(epUrl)}||$index"
             
             newEpisode(dataString) {
                 this.name = epName
                 this.season = 1
-                this.episode = index + 1
+                if (chNum != null) {
+                    this.episode = chNum
+                } else {
+                    this.episode = index + 1
+                }
                 this.posterUrl = posterUrl
             }
         }
@@ -818,10 +818,17 @@ class ComixProvider : MainAPI() {
 
         val parts = data.split("||")
         val realUrl = parts[0]
-        val targetIndex = parts.getOrNull(1)?.toIntOrNull() ?: 0
-
+        
         val chapterName = Regex("-chapter-([\\d.]+)").find(realUrl)
             ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
+
+        // If the cache contains the ||index, use it. Otherwise, estimate index from chapter name
+        // (to prevent cached entries from always defaulting to chapter 0).
+        var targetIndex = parts.getOrNull(1)?.toIntOrNull()
+        if (targetIndex == null) {
+            val chNum = Regex("-chapter-([\\d.]+)").find(realUrl)?.groupValues?.get(1)?.toDoubleOrNull() ?: 1.0
+            targetIndex = (chNum - 1).toInt().coerceAtLeast(0)
+        }
 
         activity.runOnUiThread {
             ComixReaderDialogFragment.show(
