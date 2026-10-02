@@ -27,7 +27,6 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.fragment.app.DialogFragment
-import androidx.fragment.app.FragmentManager
 import java.util.concurrent.ConcurrentHashMap
 
 class ComixReaderDialogFragment : DialogFragment() {
@@ -39,7 +38,7 @@ class ComixReaderDialogFragment : DialogFragment() {
         private const val ARG_CHAPTER_URL = "arg_chapter_url"
         private const val ARG_TARGET_CHAPTER = "arg_target_chapter"
 
-        val chapterUrlCache = ConcurrentHashMap<String, ConcurrentHashMap<Int, String>>()
+        val chapterUrlCache = ConcurrentHashMap<String, ConcurrentHashMap<String, String>>()
 
         fun newInstance(
             title: String,
@@ -68,7 +67,7 @@ class ComixReaderDialogFragment : DialogFragment() {
             activity.runOnUiThread {
                 val existing = fm.findFragmentByTag(TAG) as? ComixReaderDialogFragment
                 if (existing?.isAdded == true) {
-                    existing.loadUrlDirectly(chapterName, chapterUrl, targetChapter)
+                    existing.loadUrlDirectly(chapterName, chapterUrl)
                 } else {
                     fm.beginTransaction()
                         .add(newInstance(title, chapterName, chapterUrl, targetChapter), TAG)
@@ -81,7 +80,7 @@ class ComixReaderDialogFragment : DialogFragment() {
     private var comicTitle = ""
     private var currentChapterName = ""
     private var currentChapterUrl = ""
-    private var targetChapterNumber = 0
+    private var targetChapterNumStr = ""
     private var currentZoom = 100
 
     private var webView: WebView? = null
@@ -98,14 +97,16 @@ class ComixReaderDialogFragment : DialogFragment() {
         comicTitle = a?.getString(ARG_TITLE) ?: "Comic Reader"
         currentChapterName = a?.getString(ARG_CHAPTER_NAME) ?: "Chapter"
         currentChapterUrl = a?.getString(ARG_CHAPTER_URL) ?: ""
-        targetChapterNumber = a?.getInt(ARG_TARGET_CHAPTER, 0) ?: 0
-
-        if (targetChapterNumber == 0) {
-            Regex("(?:chapter|ch\\.?)\\s*(\\d+)", RegexOption.IGNORE_CASE)
-                .find(currentChapterName)
-                ?.groupValues?.get(1)?.toIntOrNull()
-                ?.let { targetChapterNumber = it }
+        
+        targetChapterNumStr = extractChapterNumStr(currentChapterUrl)
+        if (targetChapterNumStr.isEmpty()) {
+            targetChapterNumStr = extractChapterNumStr(currentChapterName)
         }
+    }
+
+    private fun extractChapterNumStr(text: String): String {
+        return Regex("(?:chapter-|ch\\.?\\s*)(\\d+(\\.\\d+)?)", RegexOption.IGNORE_CASE)
+            .find(text)?.groupValues?.get(1) ?: ""
     }
 
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
@@ -228,23 +229,18 @@ class ComixReaderDialogFragment : DialogFragment() {
                     super.doUpdateVisitedHistory(view, url, isReload)
                     if (url.isNullOrBlank() || !url.contains("comix.to")) return
 
-                    val m = Regex("chapter-(\\d+(\\.\\d+)?)", RegexOption.IGNORE_CASE).find(url)
-                    val visited = m?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                    if (visited > 0 && targetChapterNumber > 0 && visited != targetChapterNumber) {
-                        targetChapterNumber = 0
+                    val visitedNumStr = extractChapterNumStr(url)
+                    if (visitedNumStr.isNotEmpty() && targetChapterNumStr.isNotEmpty() && visitedNumStr != targetChapterNumStr) {
+                        targetChapterNumStr = "" 
                     }
 
                     currentChapterUrl = url
-                    if (visited > 0) {
-                        currentChapterName = "Ch. $visited"
+                    if (visitedNumStr.isNotEmpty()) {
+                        currentChapterName = "Ch. $visitedNumStr"
                         chapterInfoTextView?.text = currentChapterName
                     }
 
-                    // Soft navigation: give the DOM a tick to settle, then re-apply
-                    // reader CSS + tap zones + report the new chapter title.
-                    view.postDelayed({
-                        injectReaderOptimizations(view)
-                    }, 220L)
+                    view.postDelayed({ injectReaderOptimizations(view) }, 220L)
                 }
 
                 override fun onPageFinished(view: WebView, url: String?) {
@@ -261,7 +257,7 @@ class ComixReaderDialogFragment : DialogFragment() {
         root.addView(webContainer)
 
         root.addView(buildToolbar(ctx, density))
-        loadUrlDirectly(currentChapterName, currentChapterUrl, targetChapterNumber)
+        loadUrlDirectly(currentChapterName, currentChapterUrl)
         return root
     }
 
@@ -318,7 +314,7 @@ class ComixReaderDialogFragment : DialogFragment() {
         }.apply { (layoutParams as? LinearLayout.LayoutParams)?.rightMargin = dp(5) })
 
         chapterInfoTextView = TextView(ctx).apply {
-            text = if (targetChapterNumber > 0) "Ch. $targetChapterNumber"
+            text = if (targetChapterNumStr.isNotEmpty()) "Ch. $targetChapterNumStr"
                    else currentChapterName.ifBlank { "Chapter" }
             textSize = 11.5f
             setTextColor(Color.parseColor("#94A3B8"))
@@ -490,17 +486,19 @@ class ComixReaderDialogFragment : DialogFragment() {
     }
 
     private fun checkAndJumpToTargetChapter(view: WebView) {
-        if (targetChapterNumber <= 0) return
-        val target = targetChapterNumber
+        if (targetChapterNumStr.isEmpty()) return
         val js = """
             (function() {
-              var targetCh = $target;
+              var targetChStr = "$targetChapterNumStr";
+              var targetCh = parseFloat(targetChStr);
+              if (isNaN(targetCh)) return;
+              
               var ticks = 0, opened = false, searched = false;
               var timer = setInterval(function() {
                 ticks++;
                 if (ticks > 80) {
                   clearInterval(timer);
-                  if (window.AndroidComix) window.AndroidComix.onTargetChapterReached(0);
+                  if (window.AndroidComix) window.AndroidComix.onTargetChapterReached("");
                   var c = document.querySelector('button.rpage-modal__close');
                   if (c) c.click();
                   return;
@@ -508,7 +506,7 @@ class ComixReaderDialogFragment : DialogFragment() {
                 var m = /chapter-(\d+(\.\d+)?)/i.exec(window.location.href);
                 if (m && parseFloat(m[1]) === targetCh) {
                   clearInterval(timer);
-                  if (window.AndroidComix) window.AndroidComix.onTargetChapterReached(targetCh);
+                  if (window.AndroidComix) window.AndroidComix.onTargetChapterReached(targetChStr);
                   var c = document.querySelector('button.rpage-modal__close');
                   if (c) c.click();
                   return;
@@ -526,11 +524,11 @@ class ComixReaderDialogFragment : DialogFragment() {
                   var n = btn.querySelector('.rpage-chaplist__num');
                   var txt = (n ? n.innerText : btn.innerText).trim();
                   var mm = /Ch\.?\s*(\d+(\.\d+)?)/i.exec(txt);
-                  return (mm && parseFloat(mm[1]) === targetCh) || txt === String(targetCh);
+                  return (mm && parseFloat(mm[1]) === targetCh) || txt === targetChStr;
                 });
                 if (hit) {
                   clearInterval(timer);
-                  if (window.AndroidComix) window.AndroidComix.onTargetChapterReached(targetCh);
+                  if (window.AndroidComix) window.AndroidComix.onTargetChapterReached(targetChStr);
                   hit.click();
                   return;
                 }
@@ -540,11 +538,11 @@ class ComixReaderDialogFragment : DialogFragment() {
                     searched = true;
                     try {
                       var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-                      setter.call(input, String(targetCh));
+                      setter.call(input, targetChStr);
                       input.dispatchEvent(new Event('input', { bubbles: true }));
                       input.dispatchEvent(new Event('change', { bubbles: true }));
                     } catch(e) {
-                      input.value = String(targetCh);
+                      input.value = targetChStr;
                       input.dispatchEvent(new Event('input', { bubbles: true }));
                     }
                   }
@@ -556,7 +554,7 @@ class ComixReaderDialogFragment : DialogFragment() {
     }
 
     private fun triggerNextChapter() {
-        targetChapterNumber = 0
+        targetChapterNumStr = ""
         webView?.evaluateJavascript(
             """
             (function() {
@@ -583,7 +581,7 @@ class ComixReaderDialogFragment : DialogFragment() {
     }
 
     private fun triggerPrevChapter() {
-        targetChapterNumber = 0
+        targetChapterNumStr = ""
         webView?.evaluateJavascript(
             """
             (function() {
@@ -621,7 +619,6 @@ class ComixReaderDialogFragment : DialogFragment() {
             """
             (function() {
               try {
-                /* ── 1. Hide comments / share / footer / recs ───────────── */
                 if (!document.getElementById('cs-reader-style')) {
                   var s = document.createElement('style');
                   s.id = 'cs-reader-style';
@@ -658,7 +655,6 @@ class ComixReaderDialogFragment : DialogFragment() {
                   document.head.appendChild(s);
                 }
 
-                /* ── 2. Report chapter title + map chapter URLs ─────────── */
                 function report() {
                   var chText = '';
                   var el = document.querySelector('.rpage-floatctl__chap .mono, .rpage-chap-ending__title, h1');
@@ -672,13 +668,12 @@ class ComixReaderDialogFragment : DialogFragment() {
                   }
                   document.querySelectorAll('.rpage-chaplist__item, a[href*="-chapter-"]').forEach(function(el) {
                     var href = el.getAttribute('href') || '';
-                    var m = /chapter-(\d+)/.exec(href);
-                    if (m && window.AndroidComix) window.AndroidComix.onChapterMapped(parseInt(m[1], 10), href);
+                    var m = /chapter-(\d+(\.\d+)?)/.exec(href);
+                    if (m && window.AndroidComix) window.AndroidComix.onChapterMapped(m[1], href);
                   });
                 }
                 report();
 
-                /* ── 3. Tap-to-scroll (Intelligent Next Chapter) ────────── */
                 if (!window.__comixTapZonesInstalled) {
                   window.__comixTapZonesInstalled = true;
 
@@ -706,7 +701,6 @@ class ComixReaderDialogFragment : DialogFragment() {
                     var w = window.innerWidth;
                     var h = window.innerHeight;
                     
-                    // Check scroll position (Internal scroll container OR window)
                     var isAtBottom = false;
                     var scrollContainer = document.querySelector('.rpage-main') || document.querySelector('.rpage-main--long-strip');
                     
@@ -721,12 +715,10 @@ class ComixReaderDialogFragment : DialogFragment() {
                     } catch(e) {}
 
                     if (x < w * 0.25) {
-                      // TAP LEFT: Scroll Up
                       if (scrollContainer) scrollContainer.scrollBy({ top: -(h * 0.8), behavior: 'smooth' });
                       window.scrollBy({ top: -(h * 0.8), behavior: 'smooth' });
                       flashTap(x, y);
                     } else if (x > w * 0.75) {
-                      // TAP RIGHT: Scroll Down OR Next Chapter
                       if (isAtBottom) {
                         flashTap(x, y);
                         if (window.AndroidComix) window.AndroidComix.onTriggerNextChapter();
@@ -736,7 +728,6 @@ class ComixReaderDialogFragment : DialogFragment() {
                         flashTap(x, y);
                       }
                     } else {
-                      // TAP CENTER / BOTTOM
                       if (isAtBottom && y > h * 0.75) {
                         flashTap(x, y);
                         if (window.AndroidComix) window.AndroidComix.onTriggerNextChapter();
@@ -785,7 +776,6 @@ class ComixReaderDialogFragment : DialogFragment() {
                   }, false);
                 }
 
-                /* ── 4. Re-run report on SPA soft navigations ───────────── */
                 if (!window.__comixSoftNavInstalled) {
                   window.__comixSoftNavInstalled = true;
                   var relisten = function() {
@@ -832,12 +822,19 @@ class ComixReaderDialogFragment : DialogFragment() {
         )
     }
 
-    fun loadUrlDirectly(name: String, url: String, targetChapter: Int) {
+    fun loadUrlDirectly(name: String, url: String) {
         if (url.isBlank()) return
         currentChapterName = name
         currentChapterUrl = url
-        targetChapterNumber = targetChapter
-        if (targetChapter > 0) currentChapterName = "Ch. $targetChapter"
+        
+        targetChapterNumStr = extractChapterNumStr(currentChapterUrl)
+        if (targetChapterNumStr.isEmpty()) {
+            targetChapterNumStr = extractChapterNumStr(currentChapterName)
+        }
+
+        if (targetChapterNumStr.isNotEmpty()) {
+            currentChapterName = "Ch. $targetChapterNumStr"
+        }
         chapterInfoTextView?.text = currentChapterName.ifBlank { "Chapter" }
 
         val headers = mapOf(
@@ -846,8 +843,8 @@ class ComixReaderDialogFragment : DialogFragment() {
         )
 
         val slug = extractSlug(currentChapterUrl)
-        val cached = if (slug.isNotBlank() && targetChapter > 0)
-            chapterUrlCache[slug]?.get(targetChapter) else null
+        val cached = if (slug.isNotBlank() && targetChapterNumStr.isNotBlank())
+            chapterUrlCache[slug]?.get(targetChapterNumStr) else null
 
         val finalUrl = cached ?: currentChapterUrl
         if (cached != null) currentChapterUrl = cached
@@ -864,16 +861,16 @@ class ComixReaderDialogFragment : DialogFragment() {
         }
 
         @JavascriptInterface
-        fun onChapterMapped(chapterNum: Int, chapterUrl: String) {
-            if (chapterNum <= 0 || chapterUrl.isBlank()) return
+        fun onChapterMapped(chapterNumStr: String, chapterUrl: String) {
+            if (chapterNumStr.isBlank() || chapterUrl.isBlank()) return
             val slug = dialog.extractSlug(dialog.currentChapterUrl)
             if (slug.isBlank()) return
-            chapterUrlCache.getOrPut(slug) { ConcurrentHashMap() }[chapterNum] = chapterUrl
+            chapterUrlCache.getOrPut(slug) { ConcurrentHashMap() }[chapterNumStr] = chapterUrl
         }
 
         @JavascriptInterface
-        fun onTargetChapterReached(chapterNum: Int) {
-            dialog.activity?.runOnUiThread { dialog.targetChapterNumber = 0 }
+        fun onTargetChapterReached(chapterNumStr: String) {
+            dialog.activity?.runOnUiThread { dialog.targetChapterNumStr = "" }
         }
 
         @JavascriptInterface
