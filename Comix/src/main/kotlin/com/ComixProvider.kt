@@ -5,9 +5,6 @@ import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
 import android.webkit.JavascriptInterface
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
@@ -348,10 +345,10 @@ class ComixProvider : MainAPI() {
             ?: obj.optInt("chapters_count", 0).takeIf { it > 0 }
             ?: obj.optJSONObject("latest_chapter")?.optInt("number", 0)?.takeIf { it > 0 })
 
-        val res = newAnimeSearchResponse(title, fixUrl(relUrl), TvType.Anime)
-        poster?.let { res.posterUrl = fixUrl(it) }
-        latest?.let { res.addSub(it) }
-        return res
+        return newAnimeSearchResponse(title, fixUrl(relUrl), TvType.Anime) {
+            poster?.let { this.posterUrl = fixUrl(it) }
+            latest?.let { addSub(it) }
+        }
     }
 
     private fun readQueries(
@@ -395,10 +392,10 @@ class ComixProvider : MainAPI() {
         val latestEp = card.selectFirst(".chapter, .latest-chapter, .lrow__chapter")
             ?.text()?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
 
-        val res = newAnimeSearchResponse(title, fixUrl(href), TvType.Anime)
-        poster?.let { res.posterUrl = fixUrl(it) }
-        if (latestEp != null && latestEp > 0) res.addSub(latestEp)
-        return res
+        return newAnimeSearchResponse(title, fixUrl(href), TvType.Anime) {
+            poster?.let { this.posterUrl = fixUrl(it) }
+            if (latestEp != null && latestEp > 0) addSub(latestEp)
+        }
     }
 
     private fun extractSearchResultsDom(doc: Document): List<SearchResponse> {
@@ -735,7 +732,7 @@ class ComixProvider : MainAPI() {
         parsedChapterLinks.keys.forEach { allChapterKeys.add(it) }
         val sortedKeys = allChapterKeys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
 
-        val episodes = sortedKeys.mapIndexed { index, key ->
+        val episodes = sortedKeys.mapIndexed { _, key ->
             val realData = parsedChapterLinks[key]
             val epUrl = if (realData != null) {
                 realData.second
@@ -755,9 +752,7 @@ class ComixProvider : MainAPI() {
             val epName = realData?.first ?: "Ch. $key"
             val chNum = key.toFloatOrNull()?.toInt()
 
-            val dataString = "${fixUrl(epUrl)}||$index"
-            
-            newEpisode(dataString) {
+            newEpisode(fixUrl(epUrl)) {
                 this.name = epName
                 if (chNum != null) {
                     this.episode = chNum
@@ -791,25 +786,16 @@ class ComixProvider : MainAPI() {
         val activity = CommonActivity.activity as? AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
-        val parts = data.split("||")
-        val realUrl = parts[0]
-        
-        val chapterName = Regex("-chapter-([\\d.]+)").find(realUrl)
+        val chapterName = Regex("-chapter-([\\d.]+)").find(data)
             ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
-
-        var targetIndex = parts.getOrNull(1)?.toIntOrNull()
-        if (targetIndex == null) {
-            val chNum = Regex("-chapter-([\\d.]+)").find(realUrl)?.groupValues?.get(1)?.toDoubleOrNull() ?: 1.0
-            targetIndex = (chNum - 1).toInt().coerceAtLeast(0)
-        }
 
         activity.runOnUiThread {
             ComixReaderDialogFragment.show(
                 activity = activity,
                 title = name,
                 chapterName = chapterName,
-                chapterUrl = realUrl,
-                targetChapter = targetIndex
+                chapterUrl = data,
+                targetChapter = 0 
             )
         }
         return true
