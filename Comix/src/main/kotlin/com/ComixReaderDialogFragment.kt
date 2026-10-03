@@ -60,7 +60,7 @@ class ComixReaderDialogFragment : DialogFragment() {
             activity.runOnUiThread {
                 val existing = fm.findFragmentByTag(TAG) as? ComixReaderDialogFragment
                 if (existing?.isAdded == true) {
-                    existing.loadUrlDirectly(activity, chapterName, chapterUrl)
+                    existing.loadUrlDirectly(chapterName, chapterUrl)
                 } else {
                     fm.beginTransaction()
                         .add(newInstance(title, chapterName, chapterUrl), TAG)
@@ -220,6 +220,7 @@ class ComixReaderDialogFragment : DialogFragment() {
                         currentChapterName = "Ch. $numStr"
                         chapterInfoTextView?.text = currentChapterName
 
+                        // Save the exact chapter URL to SharedPreferences for Auto-Resume
                         val slug = extractSlug(url)
                         if (slug.isNotBlank()) {
                             view.context.getSharedPreferences("comix_resume_prefs", Context.MODE_PRIVATE)
@@ -243,7 +244,7 @@ class ComixReaderDialogFragment : DialogFragment() {
         root.addView(webContainer)
 
         root.addView(buildToolbar(ctx, density))
-        loadUrlDirectly(ctx, currentChapterName, currentChapterUrl)
+        loadUrlDirectly(currentChapterName, currentChapterUrl)
         return root
     }
 
@@ -738,39 +739,19 @@ class ComixReaderDialogFragment : DialogFragment() {
         return slugRaw.substringBefore("-chapter-").trimEnd('-')
     }
 
-    fun loadUrlDirectly(context: Context, name: String, url: String) {
+    fun loadUrlDirectly(name: String, url: String) {
         if (url.isBlank()) return
         
+        val ctx = webView?.context ?: return
         val slug = extractSlug(url)
-        val prefs = context.getSharedPreferences("comix_resume_prefs", Context.MODE_PRIVATE)
+        val prefs = ctx.getSharedPreferences("comix_resume_prefs", Context.MODE_PRIVATE)
         val savedUrl = if (slug.isNotBlank()) prefs.getString(slug, null) else null
 
-        // If we found a saved URL and it is different from the starting URL
-        if (savedUrl != null && savedUrl != url) {
-            val savedChNum = Regex("-chapter-([\\d.]+)").find(savedUrl)?.groupValues?.get(1)
-            val msg = if (savedChNum != null) "Resume reading from Chapter $savedChNum?" else "Resume reading from where you left off?"
-
-            android.app.AlertDialog.Builder(context)
-                .setTitle("Resume")
-                .setMessage(msg)
-                .setPositiveButton("Resume") { _, _ ->
-                    executeLoadUrl(savedUrl, name)
-                }
-                .setNegativeButton("Start from Beginning") { _, _ ->
-                    prefs.edit().remove(slug).apply()
-                    executeLoadUrl(url, name)
-                }
-                .setCancelable(false)
-                .show()
-        } else {
-            executeLoadUrl(url, name)
-        }
-    }
-
-    private fun executeLoadUrl(targetUrl: String, defaultName: String) {
-        currentChapterUrl = targetUrl
+        // Silently execute auto-resume for the best UX
+        currentChapterUrl = savedUrl ?: url
+        
         val numStr = Regex("-chapter-([\\d.]+)").find(currentChapterUrl)?.groupValues?.get(1)
-        currentChapterName = if (numStr != null) "Ch. $numStr" else defaultName
+        currentChapterName = if (numStr != null) "Ch. $numStr" else name
         chapterInfoTextView?.text = currentChapterName.ifBlank { "Chapter" }
 
         val headers = mapOf(
