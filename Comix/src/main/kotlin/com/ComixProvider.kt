@@ -19,6 +19,7 @@ import com.lagradost.cloudstream3.ShowStatus
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.addEpisodes
+import com.lagradost.cloudstream3.addSub
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.fixUrl
 import com.lagradost.cloudstream3.mainPageOf
@@ -26,6 +27,7 @@ import com.lagradost.cloudstream3.newAnimeLoadResponse
 import com.lagradost.cloudstream3.newAnimeSearchResponse
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -67,6 +69,9 @@ class ComixProvider : MainAPI() {
     @Volatile private var prewarmStarted = false
 
     private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    
+    // RESTORED: This is required to bridge the Cloudflare clearance cookies into Cloudstream's OkHttp client
+    private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
     private fun browserHeaders(extra: Map<String, String> = emptyMap()): Map<String, String> =
         mapOf(
@@ -85,7 +90,8 @@ class ComixProvider : MainAPI() {
 
     private suspend fun fetchHtml(url: String): String {
         while (captureInFlight) { delay(300) }
-        return app.get(url, headers = browserHeaders()).text
+        // RESTORED: interceptor = cfInterceptor
+        return app.get(url, interceptor = cfInterceptor, headers = browserHeaders()).text
     }
 
     private val cipherCacheFile: File?
@@ -267,6 +273,7 @@ class ComixProvider : MainAPI() {
 
             val raw = app.get(
                 encoded,
+                interceptor = cfInterceptor, // RESTORED
                 headers = browserHeaders(
                     mapOf(
                         "Accept" to "application/json, text/plain, */*",
@@ -335,8 +342,14 @@ class ComixProvider : MainAPI() {
             ?: obj.optString("thumbnail").takeIf { it.isNotBlank() }
             ?: obj.optString("image").takeIf { it.isNotBlank() })
 
+        val latest = (obj.optInt("latestChapter", 0).takeIf { it > 0 }
+            ?: obj.optInt("latest_chapter", 0).takeIf { it > 0 }
+            ?: obj.optInt("chapters_count", 0).takeIf { it > 0 }
+            ?: obj.optJSONObject("latest_chapter")?.optInt("number", 0)?.takeIf { it > 0 })
+
         return newAnimeSearchResponse(title, fixUrl(relUrl), TvType.Anime) {
             poster?.let { this.posterUrl = fixUrl(it) }
+            latest?.let { addSub(it) }
         }
     }
 
@@ -378,9 +391,12 @@ class ComixProvider : MainAPI() {
         val poster = card.selectFirst("img")
             ?.let { it.attr("data-src").ifBlank { it.attr("src") } }
             ?.takeIf { it.isNotBlank() }
+        val latestEp = card.selectFirst(".chapter, .latest-chapter, .lrow__chapter")
+            ?.text()?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
 
         return newAnimeSearchResponse(title, fixUrl(href), TvType.Anime) {
             poster?.let { this.posterUrl = fixUrl(it) }
+            if (latestEp != null && latestEp > 0) addSub(latestEp)
         }
     }
 
@@ -661,7 +677,7 @@ class ComixProvider : MainAPI() {
 
         val latestChapterNum = d?.optInt("latestChapter", 0) ?: 0
         val firstChapterUrl  = d?.optString("firstChapterUrl")?.takeIf { it.isNotBlank() }
-            ?: document.selectFirst("a[href*='-chapter-']")?.attr("href")
+            ?: document.selectFirst("a.mchap-row__primary, a[href*='-chapter-']")?.attr("href")
             ?: url
 
         val startsAtZero = firstChapterUrl.contains("-chapter-0", ignoreCase = true)
