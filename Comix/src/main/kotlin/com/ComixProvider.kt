@@ -76,19 +76,12 @@ class CFInterceptor : Interceptor {
         // Prevent Cloudflare WAF from seeing Android package identity
         builder.removeHeader("X-Requested-With")
 
-        val cookies = CookieManager.getInstance().getCookie(original.url.toString())
+        val cookies = CookieManager.getInstance().getCookie("https://comix.to")
         if (!cookies.isNullOrEmpty()) {
             builder.header("Cookie", cookies)
         }
 
-        builder.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-        builder.header("Accept-Language", "en-US,en;q=0.5")
-        builder.header("Connection", "keep-alive")
-        builder.header("Upgrade-Insecure-Requests", "1")
-        builder.header("Sec-Fetch-Dest", "document")
-        builder.header("Sec-Fetch-Mode", "navigate")
-        builder.header("Sec-Fetch-Site", "none")
-
+        // Removed the Accept headers overwrite. This lets JSON API requests pass cleanly!
         return chain.proceed(builder.build())
     }
 }
@@ -134,26 +127,21 @@ class ComixProvider : MainAPI() {
         runCatching { cipherCacheFile?.writeText(mat.toJson().toString()) }
     }
 
-    private fun invalidateCipher() {
-        cipher = null
-        runCatching { cipherCacheFile?.delete() }
-    }
-
     private fun cachedCipher(): ComixCipher? {
         cipher?.let { return it }
         return loadCachedCipher()?.also { cipher = it }
     }
 
-    /**
-     * Resolves Cloudflare Turnstile using a visible dialog and extracts the cipher material.
-     */
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun resolveCloudflareAndCipher(): Boolean = withContext(Dispatchers.Main) {
         val activity = CommonActivity.activity ?: return@withContext false
         if (activity.isFinishing || activity.isDestroyed) return@withContext false
 
         suspendCancellableCoroutine { cont ->
-            val dialog = Dialog(activity)
+            val dialog = Dialog(activity).apply {
+                setCancelable(false) // Prevents accidental taps from aborting the solver!
+                setCanceledOnTouchOutside(false)
+            }
             val done = AtomicBoolean(false)
             val handler = Handler(Looper.getMainLooper())
 
@@ -305,12 +293,10 @@ class ComixProvider : MainAPI() {
         val lower = html.lowercase()
         return lower.contains("just a moment") || 
                lower.contains("cf-browser-verification") || 
-               lower.contains("turnstile") || 
-               html.trim().isEmpty()
+               lower.contains("turnstile")
     }
 
     private suspend fun fetchHtml(url: String): String {
-        // 1. Initial lock: Ensure we have a cookie before firing the request
         cfMutex.withLock {
             val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
             if (!cookies.contains("cf_clearance")) {
@@ -320,11 +306,8 @@ class ComixProvider : MainAPI() {
 
         var response = app.get(url, interceptor = cfInterceptor).text
 
-        // 2. Self-Healing fallback: If the existing cookie expired mid-session
         if (isCloudflareChallenge(response)) {
             cfMutex.withLock {
-                // If another parallel coroutine fixed the cookie while we were waiting at the lock, 
-                // test it again to prevent popping a redundant dialog.
                 response = app.get(url, interceptor = cfInterceptor).text
                 if (isCloudflareChallenge(response)) {
                     resolveCloudflareAndCipher()
