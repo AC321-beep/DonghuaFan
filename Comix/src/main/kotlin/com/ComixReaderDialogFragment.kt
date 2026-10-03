@@ -182,9 +182,13 @@ class ComixReaderDialogFragment : DialogFragment() {
                 setSupportZoom(true)
                 cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
                 mediaPlaybackRequiresUserGesture = false
-                userAgentString =
-                    "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 " +
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+                
+                // CRITICAL: Synchronize User-Agent with the CF solver so we don't instantly lose clearance!
+                if (CFState.userAgent.isNotBlank()) {
+                    userAgentString = CFState.userAgent
+                } else {
+                    CFState.userAgent = userAgentString
+                }
             }
 
             addJavascriptInterface(ComixJsBridge(this@ComixReaderDialogFragment), "AndroidComix")
@@ -211,13 +215,13 @@ class ComixReaderDialogFragment : DialogFragment() {
                     super.doUpdateVisitedHistory(view, url, isReload)
                     if (url.isNullOrBlank() || !url.contains("comix.to")) return
 
-                    currentChapterUrl = url
                     val numStr = Regex("-chapter-([\\d.]+)").find(url)?.groupValues?.get(1)
                     if (numStr != null) {
+                        currentChapterUrl = url
                         currentChapterName = "Ch. $numStr"
                         chapterInfoTextView?.text = currentChapterName
 
-                        // Save the last viewed chapter to SharedPreferences for the Resume feature
+                        // Save the exact chapter URL to SharedPreferences for Resume
                         val slug = extractSlug(url)
                         if (slug.isNotBlank()) {
                             view.context.getSharedPreferences("comix_resume_prefs", Context.MODE_PRIVATE)
@@ -731,9 +735,9 @@ class ComixReaderDialogFragment : DialogFragment() {
     }
 
     fun extractSlug(url: String): String {
-        var s = url.substringAfter("/comic/", "")
-        if (s.isEmpty() || s == url) s = url.substringAfter("/title/", "")
-        return s.substringBefore("-chapter-").substringBefore("#").trimEnd('-')
+        val match = Regex("/(?:comic|title)/([^/?#]+)").find(url)
+        val slugRaw = match?.groupValues?.get(1) ?: return ""
+        return slugRaw.substringBefore("-chapter-").trimEnd('-')
     }
 
     fun loadUrlDirectly(context: Context, name: String, url: String) {
