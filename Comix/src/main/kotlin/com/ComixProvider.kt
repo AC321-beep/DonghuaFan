@@ -113,7 +113,7 @@ class ComixProvider : MainAPI() {
 
     @Volatile private var cipher: ComixCipher? = null
     private val cfInterceptor = CFInterceptor()
-    private val cfMutex = Mutex() 
+    private val cfMutex = Mutex()
 
     private val cipherCacheFile: File?
         get() {
@@ -139,7 +139,6 @@ class ComixProvider : MainAPI() {
         return loadCachedCipher()?.also { cipher = it }
     }
 
-    // --- Image Helper Methods ---
     private fun getPosterHeaders(): Map<String, String> {
         val defaultUa = try { WebSettings.getDefaultUserAgent(CommonActivity.activity) } catch(e: Exception) { "Mozilla/5.0" }
         val headers = mutableMapOf(
@@ -171,11 +170,117 @@ class ComixProvider : MainAPI() {
         return null
     }
 
+    /**
+     * Stage 1: Attempt silent off-screen resolution.
+     */
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun resolveCloudflareAndCipher(): Boolean = withContext(Dispatchers.Main) {
-        val activity = CommonActivity.activity ?: return@withContext false
-        if (activity.isFinishing || activity.isDestroyed) return@withContext false
+    private suspend fun attemptSilentResolution(activity: android.app.Activity): Boolean = withContext(Dispatchers.Main) {
+        val decor = activity.window?.decorView as? ViewGroup ?: return@withContext false
 
+        suspendCancellableCoroutine { cont ->
+            val done = AtomicBoolean(false)
+            val handler = Handler(Looper.getMainLooper())
+            var checkRunnable: Runnable? = null
+            var timeoutRunnable: Runnable? = null
+
+            val webView = WebView(activity).apply {
+                layoutParams = ViewGroup.LayoutParams(
+                    activity.resources.displayMetrics.widthPixels,
+                    activity.resources.displayMetrics.heightPixels
+                )
+                translationX = 20000f // Off-screen rendering to allow canvas/metrics without showing UI
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
+                    cacheMode = WebSettings.LOAD_DEFAULT
+                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                }
+
+                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
+                if (CFState.userAgent.isBlank()) {
+                    CFState.userAgent = settings.userAgentString
+                } else {
+                    settings.userAgentString = CFState.userAgent
+                }
+
+                addJavascriptInterface(object {
+                    @JavascriptInterface
+                    fun submit(json: String) {
+                        val mat = runCatching { CipherMaterial.fromJson(JSONObject(json)) }.getOrNull()
+                        if (mat != null && mat.isValid()) {
+                            cipher = ComixCipher(mat)
+                            saveCachedCipher(mat)
+                        }
+                    }
+                }, "ComixCipherBridge")
+
+                webViewClient = object : WebViewClient() {
+                    @SuppressLint("WebViewClientOnReceivedSslError")
+                    override fun onReceivedSslError(view: WebView?, h: SslErrorHandler?, error: SslError?) {
+                        h?.proceed()
+                    }
+
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                        view?.evaluateJavascript(CAPTURE_SCRIPT, null)
+                    }
+
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        view?.evaluateJavascript(CAPTURE_SCRIPT, null)
+                    }
+                }
+            }
+
+            fun cleanup(success: Boolean) {
+                if (!done.compareAndSet(false, true)) return
+                checkRunnable?.let { handler.removeCallbacks(it) }
+                timeoutRunnable?.let { handler.removeCallbacks(it) }
+                runCatching {
+                    decor.removeView(webView)
+                    webView.stopLoading()
+                    webView.loadUrl("about:blank")
+                    webView.destroy()
+                }
+                if (success) CookieManager.getInstance().flush()
+                if (cont.isActive) cont.resume(success)
+            }
+
+            cont.invokeOnCancellation { cleanup(false) }
+
+            checkRunnable = object : Runnable {
+                override fun run() {
+                    if (done.get()) return
+                    val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
+                    val title = webView.title?.lowercase() ?: ""
+                    val isChallenge = listOf("just a moment", "attention required", "security verification", "cloudflare").any { title.contains(it) }
+
+                    if (!isChallenge && cookies.contains("cf_clearance")) {
+                        cleanup(true)
+                        return
+                    }
+                    handler.postDelayed(this, 500L)
+                }
+            }
+
+            timeoutRunnable = Runnable {
+                cleanup(false)
+            }
+
+            decor.addView(webView)
+            webView.loadUrl(mainUrl)
+            handler.postDelayed(checkRunnable!!, 800L)
+            handler.postDelayed(timeoutRunnable!!, 4500L) // 4.5s max for silent pass
+        }
+    }
+
+    /**
+     * Stage 2: Fallback dialog with visible UI for interactive taps.
+     */
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun attemptInteractiveResolution(activity: android.app.Activity): Boolean = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             val dialog = Dialog(activity).apply {
                 setCancelable(false)
@@ -190,7 +295,7 @@ class ComixProvider : MainAPI() {
             }
 
             val header = TextView(activity).apply {
-                text = "Verifying Comix... Please Wait"
+                text = "Verifying Comix... Please Complete Challenge"
                 setTextColor(Color.WHITE)
                 textSize = 15f
                 setPadding(32, 28, 32, 28)
@@ -222,12 +327,7 @@ class ComixProvider : MainAPI() {
                 }
 
                 CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-
-                if (CFState.userAgent.isBlank()) {
-                    CFState.userAgent = settings.userAgentString
-                } else {
-                    settings.userAgentString = CFState.userAgent
-                }
+                settings.userAgentString = CFState.userAgent.ifBlank { settings.userAgentString }
 
                 addJavascriptInterface(object {
                     @JavascriptInterface
@@ -268,41 +368,7 @@ class ComixProvider : MainAPI() {
                     }
 
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                        view?.evaluateJavascript(
-                            """
-                            (function () {
-                                if (window.__comixCipherHook) return;
-                                window.__comixCipherHook = true;
-                                var captures = window.__comixCipherCaptures = [];
-                                var seen = window.__comixSeenLengths = {};
-                                var originalAtob = window.atob;
-                                var stealthAtob = function (value) {
-                                    var decoded = originalAtob.call(window, value);
-                                    try {
-                                        var len = decoded.length;
-                                        var key = 'L' + len;
-                                        if (!seen[key]) { seen[key] = true; }
-                                        if (len === 256 || len === 24 || len === 32) {
-                                            var bytes = new Array(len);
-                                            for (var i = 0; i < len; i++) bytes[i] = decoded.charCodeAt(i) & 255;
-                                            captures.push(bytes);
-                                            var sboxes = captures.filter(function (x) { return x.length === 256; }).slice(0, 3);
-                                            var keys   = captures.filter(function (x) { return x.length === 24 || x.length === 32; }).slice(0, 3);
-                                            if (sboxes.length === 3 && keys.length === 3) {
-                                                try { ComixCipherBridge.submit(JSON.stringify({ sboxes: sboxes, keys: keys })); } catch (e) {}
-                                            }
-                                        }
-                                    } catch (e) {}
-                                    return decoded;
-                                };
-                                var origFpToString = Function.prototype.toString;
-                                Function.prototype.toString = function () {
-                                    if (this === stealthAtob) return 'function atob() { [native code] }';
-                                    return origFpToString.call(this);
-                                };
-                                Object.defineProperty(window, 'atob', { value: stealthAtob, writable: true, configurable: true });
-                            })();
-                            """.trimIndent(), null)
+                        view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
@@ -326,6 +392,18 @@ class ComixProvider : MainAPI() {
                 if (!done.get()) finish(false)
             }, 30_000L)
         }
+    }
+
+    private suspend fun resolveCloudflareAndCipher(): Boolean {
+        val activity = CommonActivity.activity ?: return false
+        if (activity.isFinishing || activity.isDestroyed) return false
+
+        // 1. Attempt silent resolution in background
+        val passedSilently = attemptSilentResolution(activity)
+        if (passedSilently) return true
+
+        // 2. Fallback to interactive dialog if user click is required
+        return attemptInteractiveResolution(activity)
     }
 
     private fun isCloudflareChallenge(html: String): Boolean {
@@ -513,45 +591,6 @@ class ComixProvider : MainAPI() {
         return results.distinctBy { it.url }
     }
 
-    private data class PageResult(
-        val items: List<SearchResponse>,
-        val hasNext: Boolean
-    )
-
-    private fun readHasNext(root: JSONObject?, page: Int, itemCount: Int): Boolean {
-        val resultObj = root?.optJSONObject("result")
-        val meta = resultObj?.optJSONObject("meta")
-            ?: resultObj?.optJSONObject("pagination")
-            ?: root?.optJSONObject("meta")
-
-        if (meta != null) {
-            val lastPage = meta.optInt("lastPage", meta.optInt("last_page", -1))
-            if (lastPage > 0) return page < lastPage
-            if (meta.has("hasNext"))       return meta.optBoolean("hasNext")
-            if (meta.has("has_next_page")) return meta.optBoolean("has_next_page")
-        }
-
-        resultObj?.optJSONObject("links")?.let { l ->
-            val next = l.optString("next")
-            if (next.isNotBlank() && next != "null") return true
-        }
-
-        if (root != null) {
-            if (root.has("has_next_page")) return root.optBoolean("has_next_page")
-            if (root.has("hasNext"))       return root.optBoolean("hasNext")
-        }
-
-        return itemCount >= 28
-    }
-
-    private fun arrToResults(arr: JSONArray): List<SearchResponse> {
-        val out = mutableListOf<SearchResponse>()
-        for (i in 0 until arr.length()) {
-            arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
-        }
-        return out
-    }
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
@@ -719,5 +758,52 @@ class ComixProvider : MainAPI() {
             )
         }
         return true
+    }
+
+    private companion object {
+        val CAPTURE_SCRIPT = """
+            (function () {
+                if (window.__comixCipherHook) return;
+                window.__comixCipherHook = true;
+                
+                var captures = window.__comixCipherCaptures = [];
+                var seen = window.__comixSeenLengths = {};
+                var originalAtob = window.atob;
+
+                var stealthAtob = function (value) {
+                    var decoded = originalAtob.call(window, value);
+                    try {
+                        var len = decoded.length;
+                        var key = 'L' + len;
+                        if (!seen[key]) { seen[key] = true; }
+                        
+                        if (len === 256 || len === 24 || len === 32) {
+                            var bytes = new Array(len);
+                            for (var i = 0; i < len; i++) bytes[i] = decoded.charCodeAt(i) & 255;
+                            captures.push(bytes);
+                            
+                            var sboxes = captures.filter(function (x) { return x.length === 256; }).slice(0, 3);
+                            var keys   = captures.filter(function (x) { return x.length === 24 || x.length === 32; }).slice(0, 3);
+                            if (sboxes.length === 3 && keys.length === 3) {
+                                try { ComixCipherBridge.submit(JSON.stringify({ sboxes: sboxes, keys: keys })); } catch (e) {}
+                            }
+                        }
+                    } catch (e) {}
+                    return decoded;
+                };
+
+                var origFpToString = Function.prototype.toString;
+                Function.prototype.toString = function () {
+                    if (this === stealthAtob) return 'function atob() { [native code] }';
+                    return origFpToString.call(this);
+                };
+
+                Object.defineProperty(window, 'atob', {
+                    value: stealthAtob,
+                    writable: true,
+                    configurable: true
+                });
+            })();
+        """.trimIndent()
     }
 }
