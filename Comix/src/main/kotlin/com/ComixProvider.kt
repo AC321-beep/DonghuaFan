@@ -31,6 +31,7 @@ import com.lagradost.cloudstream3.ShowStatus
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.addEpisodes
+import com.lagradost.cloudstream3.addSub
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.fixUrl
 import com.lagradost.cloudstream3.mainPageOf
@@ -73,15 +74,21 @@ class CFInterceptor : Interceptor {
         val ua = CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa
         builder.header("User-Agent", ua)
         
-        // Prevent Cloudflare WAF from seeing Android package identity
         builder.removeHeader("X-Requested-With")
 
-        val cookies = CookieManager.getInstance().getCookie("https://comix.to")
+        val cookies = CookieManager.getInstance().getCookie(original.url.toString())
         if (!cookies.isNullOrEmpty()) {
             builder.header("Cookie", cookies)
         }
 
-        // Removed the Accept headers overwrite. This lets JSON API requests pass cleanly!
+        builder.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        builder.header("Accept-Language", "en-US,en;q=0.5")
+        builder.header("Connection", "keep-alive")
+        builder.header("Upgrade-Insecure-Requests", "1")
+        builder.header("Sec-Fetch-Dest", "document")
+        builder.header("Sec-Fetch-Mode", "navigate")
+        builder.header("Sec-Fetch-Site", "none")
+
         return chain.proceed(builder.build())
     }
 }
@@ -106,7 +113,7 @@ class ComixProvider : MainAPI() {
 
     @Volatile private var cipher: ComixCipher? = null
     private val cfInterceptor = CFInterceptor()
-    private val cfMutex = Mutex() // Prevents overlapping verification dialogs
+    private val cfMutex = Mutex() 
 
     private val cipherCacheFile: File?
         get() {
@@ -132,6 +139,38 @@ class ComixProvider : MainAPI() {
         return loadCachedCipher()?.also { cipher = it }
     }
 
+    // --- Image Helper Methods ---
+    private fun getPosterHeaders(): Map<String, String> {
+        val defaultUa = try { WebSettings.getDefaultUserAgent(CommonActivity.activity) } catch(e: Exception) { "Mozilla/5.0" }
+        val headers = mutableMapOf(
+            "Referer" to "$mainUrl/",
+            "User-Agent" to (CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa)
+        )
+        val cookies = CookieManager.getInstance().getCookie(mainUrl)
+        if (!cookies.isNullOrEmpty()) {
+            headers["Cookie"] = cookies
+        }
+        return headers
+    }
+
+    private fun extractPoster(obj: JSONObject?): String? {
+        if (obj == null) return null
+        listOf("poster", "cover", "thumbnail", "image").forEach { key ->
+            val v = obj.opt(key)
+            if (v is JSONObject) {
+                val url = v.optString("large").takeIf { it.isNotBlank() }
+                    ?: v.optString("medium").takeIf { it.isNotBlank() }
+                    ?: v.optString("original").takeIf { it.isNotBlank() }
+                    ?: v.optString("small").takeIf { it.isNotBlank() }
+                    ?: v.optString("url").takeIf { it.isNotBlank() }
+                if (url != null) return url
+            } else if (v is String && v.isNotBlank()) {
+                return v
+            }
+        }
+        return null
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun resolveCloudflareAndCipher(): Boolean = withContext(Dispatchers.Main) {
         val activity = CommonActivity.activity ?: return@withContext false
@@ -139,7 +178,7 @@ class ComixProvider : MainAPI() {
 
         suspendCancellableCoroutine { cont ->
             val dialog = Dialog(activity).apply {
-                setCancelable(false) // Prevents accidental taps from aborting the solver!
+                setCancelable(false)
                 setCanceledOnTouchOutside(false)
             }
             val done = AtomicBoolean(false)
@@ -401,16 +440,16 @@ class ComixProvider : MainAPI() {
             ?: obj.optString("link").takeIf  { it.isNotBlank() }
             ?: return null)
 
-        val poster = (obj.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
-            ?: obj.optJSONObject("poster")?.optString("medium")?.takeIf { it.isNotBlank() }
-            ?: obj.optJSONObject("cover")?.optString("large")?.takeIf { it.isNotBlank() }
-            ?: obj.optJSONObject("cover")?.optString("medium")?.takeIf { it.isNotBlank() }
-            ?: obj.optString("cover").takeIf { it.isNotBlank() }
-            ?: obj.optString("thumbnail").takeIf { it.isNotBlank() }
-            ?: obj.optString("image").takeIf { it.isNotBlank() })
+        val posterUrlStr = extractPoster(obj)
+        val latest = (obj.optInt("latestChapter", 0).takeIf { it > 0 }
+            ?: obj.optInt("latest_chapter", 0).takeIf { it > 0 }
+            ?: obj.optInt("chapters_count", 0).takeIf { it > 0 }
+            ?: obj.optJSONObject("latest_chapter")?.optInt("number", 0)?.takeIf { it > 0 })
 
         return newAnimeSearchResponse(title, fixUrl(relUrl), TvType.Anime) {
-            poster?.let { this.posterUrl = fixUrl(it) }
+            posterUrlStr?.let { this.posterUrl = fixUrl(it) }
+            this.posterHeaders = getPosterHeaders()
+            latest?.let { addSub(it) }
         }
     }
 
@@ -446,12 +485,18 @@ class ComixProvider : MainAPI() {
             ?.text()?.trim()
             ?: anchor.attr("title").ifBlank { anchor.text().trim() }
         if (title.isBlank()) return null
-        val poster = card.selectFirst("img")
-            ?.let { it.attr("data-src").ifBlank { it.attr("src") } }
-            ?.takeIf { it.isNotBlank() }
+        
+        val poster = card.selectFirst("img")?.let { img ->
+            img.attr("data-src").ifBlank { img.attr("data-lazy-src") }.ifBlank { img.attr("src") }
+        }?.takeIf { it.isNotBlank() }
+        
+        val latestEp = card.selectFirst(".chapter, .latest-chapter, .lrow__chapter")
+            ?.text()?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
 
         return newAnimeSearchResponse(title, fixUrl(href), TvType.Anime) {
             poster?.let { this.posterUrl = fixUrl(it) }
+            this.posterHeaders = getPosterHeaders()
+            if (latestEp != null && latestEp > 0) addSub(latestEp)
         }
     }
 
@@ -466,6 +511,45 @@ class ComixProvider : MainAPI() {
             }
         }
         return results.distinctBy { it.url }
+    }
+
+    private data class PageResult(
+        val items: List<SearchResponse>,
+        val hasNext: Boolean
+    )
+
+    private fun readHasNext(root: JSONObject?, page: Int, itemCount: Int): Boolean {
+        val resultObj = root?.optJSONObject("result")
+        val meta = resultObj?.optJSONObject("meta")
+            ?: resultObj?.optJSONObject("pagination")
+            ?: root?.optJSONObject("meta")
+
+        if (meta != null) {
+            val lastPage = meta.optInt("lastPage", meta.optInt("last_page", -1))
+            if (lastPage > 0) return page < lastPage
+            if (meta.has("hasNext"))       return meta.optBoolean("hasNext")
+            if (meta.has("has_next_page")) return meta.optBoolean("has_next_page")
+        }
+
+        resultObj?.optJSONObject("links")?.let { l ->
+            val next = l.optString("next")
+            if (next.isNotBlank() && next != "null") return true
+        }
+
+        if (root != null) {
+            if (root.has("has_next_page")) return root.optBoolean("has_next_page")
+            if (root.has("hasNext"))       return root.optBoolean("hasNext")
+        }
+
+        return itemCount >= 28
+    }
+
+    private fun arrToResults(arr: JSONArray): List<SearchResponse> {
+        val out = mutableListOf<SearchResponse>()
+        for (i in 0 until arr.length()) {
+            arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
+        }
+        return out
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
@@ -558,8 +642,12 @@ class ComixProvider : MainAPI() {
             .split(' ').joinToString(" ") { it.replaceFirstChar { c -> c.uppercase() } }
 
         val mangaTitle = d?.optString("title")?.takeIf { it.isNotBlank() } ?: fallbackTitle
-        val posterUrl = d?.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
-            ?: d?.optJSONObject("poster")?.optString("medium")
+        
+        val posterUrlStr = extractPoster(d)
+            ?: document.selectFirst(".manga-poster img, .comic-poster img, picture img, img.cover")?.let { img ->
+                img.attr("data-src").ifBlank { img.attr("src") }
+            }
+            
         val plot = d?.optString("synopsis")?.takeIf { it.isNotBlank() }
         val statusStr = d?.optString("status")?.takeIf { it.isNotBlank() }
         val yearInt = d?.optInt("year", 0)?.takeIf { it > 0 }
@@ -593,13 +681,14 @@ class ComixProvider : MainAPI() {
         val episodes = listOf(
             newEpisode(fixUrl(firstChapterUrl)) {
                 this.name = epName
-                this.posterUrl = posterUrl
+                this.posterUrl = posterUrlStr?.let { fixUrl(it) }
                 this.episode = 1
             }
         )
 
         return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
-            this.posterUrl = posterUrl
+            this.posterUrl = posterUrlStr?.let { fixUrl(it) }
+            this.posterHeaders = getPosterHeaders()
             this.plot = plot
             this.tags = genres
             this.year = yearInt
