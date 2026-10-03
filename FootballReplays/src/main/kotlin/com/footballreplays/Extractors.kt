@@ -1,10 +1,18 @@
 package com.footballreplays
 
 import android.util.Log
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import java.net.URI
 import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
+import java.util.Base64
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 // ==========================================
 // HQCloud & HQLinks Extractors
@@ -22,7 +30,7 @@ open class HQCloud : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val path = Regex("""(https?://[^/]+)(/[^?]+)""").find(url)?.groupValues?.get(2) ?: ""
-        
+
         val domains = listOf(
             "audinifer.com",
             "vibuxere.com",
@@ -192,7 +200,6 @@ open class VkExtractor : ExtractorApi() {
         }
     }
 
-    // FIXED: Added 'suspend' modifier here
     private suspend fun linkcikart(
         text: String,
         userAgent: String,
@@ -235,3 +242,113 @@ open class VkExtractor : ExtractorApi() {
 class VkCom : VkExtractor() {
     override var mainUrl = "https://vk.com"
 }
+
+// ==========================================
+// Byse Extractor (AES-GCM protected playback)
+// ==========================================
+
+open class ByseSX : ExtractorApi() {
+    override var name = "Byse"
+    override var mainUrl = "https://byse.sx"
+    override val requiresReferer = true
+
+    private fun b64UrlDecode(s: String): ByteArray {
+        val fixed = s.replace('-', '+').replace('_', '/')
+        val pad = "=".repeat((4 - fixed.length % 4) % 4)
+        return Base64.getDecoder().decode(fixed + pad)
+    }
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        try {
+            val code = URI(url).path.trimEnd('/').substringAfterLast('/')
+            val base = URI(url).let { "${it.scheme}://${it.host}" }
+
+            val details = app.get("$base/api/videos/$code/embed/details")
+                .parsedSafe<ByseDetailsRoot>() ?: return
+
+            val embedFrameUrl = details.embedFrameUrl
+            val embedBase = URI(embedFrameUrl).let { "${it.scheme}://${it.host}" }
+            val embedCode = URI(embedFrameUrl).path.trimEnd('/').substringAfterLast('/')
+
+            val headers = mapOf(
+                "referer" to embedFrameUrl,
+                "x-embed-parent" to url
+            )
+
+            val playback = app.get(
+                "$embedBase/api/videos/$embedCode/embed/playback",
+                headers = headers
+            ).parsedSafe<BysePlaybackRoot>()?.playback ?: return
+
+            val key = b64UrlDecode(playback.keyParts[0]) + b64UrlDecode(playback.keyParts[1])
+
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(key, "AES"),
+                GCMParameterSpec(128, b64UrlDecode(playback.iv))
+            )
+
+            val decrypted = cipher.doFinal(b64UrlDecode(playback.payload))
+            val jsonStr = String(decrypted, StandardCharsets.UTF_8)
+                .let { if (it.startsWith("\uFEFF")) it.substring(1) else it }
+
+            val sources = tryParseJson<BysePlaybackDecrypt>(jsonStr)?.sources ?: emptyList()
+
+            sources.forEach { source ->
+                callback.invoke(
+                    newExtractorLink(
+                        name = this.name,
+                        source = this.name,
+                        url = source.url,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = embedFrameUrl
+                        this.headers = mutableMapOf(
+                            "Referer" to embedFrameUrl,
+                            "Origin" to embedBase,
+                            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                                    "Chrome/133.0.0.0 Safari/537.36"
+                        )
+                    }
+                )
+            }
+        } catch (e: Exception) {
+            Log.e("ByseSX", "Extraction failed: ${e.message}")
+        }
+    }
+}
+
+// ==========================================
+// Byse Data Classes
+// ==========================================
+
+data class ByseDetailsRoot(
+    val id: Long,
+    val code: String,
+    val title: String,
+    @JsonProperty("poster_url") val posterUrl: String,
+    val description: String,
+    @JsonProperty("embed_frame_url") val embedFrameUrl: String
+)
+
+data class BysePlaybackRoot(val playback: BysePlayback)
+data class BysePlayback(
+    val algorithm: String,
+    val iv: String,
+    val payload: String,
+    @JsonProperty("key_parts") val keyParts: List<String>
+)
+
+data class BysePlaybackDecrypt(val sources: List<BysePlaybackSource>)
+data class BysePlaybackSource(
+    val quality: String,
+    val label: String,
+    val url: String
+)
