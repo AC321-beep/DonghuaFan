@@ -183,7 +183,6 @@ class ComixReaderDialogFragment : DialogFragment() {
                 cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
                 mediaPlaybackRequiresUserGesture = false
                 
-                // CRITICAL: Synchronize User-Agent with the CF solver so we don't instantly lose clearance!
                 if (CFState.userAgent.isNotBlank()) {
                     userAgentString = CFState.userAgent
                 } else {
@@ -221,7 +220,6 @@ class ComixReaderDialogFragment : DialogFragment() {
                         currentChapterName = "Ch. $numStr"
                         chapterInfoTextView?.text = currentChapterName
 
-                        // Save the exact chapter URL to SharedPreferences for Resume
                         val slug = extractSlug(url)
                         if (slug.isNotBlank()) {
                             view.context.getSharedPreferences("comix_resume_prefs", Context.MODE_PRIVATE)
@@ -747,10 +745,32 @@ class ComixReaderDialogFragment : DialogFragment() {
         val prefs = context.getSharedPreferences("comix_resume_prefs", Context.MODE_PRIVATE)
         val savedUrl = if (slug.isNotBlank()) prefs.getString(slug, null) else null
 
-        currentChapterUrl = savedUrl ?: url
-        
+        // If we found a saved URL and it is different from the starting URL
+        if (savedUrl != null && savedUrl != url) {
+            val savedChNum = Regex("-chapter-([\\d.]+)").find(savedUrl)?.groupValues?.get(1)
+            val msg = if (savedChNum != null) "Resume reading from Chapter $savedChNum?" else "Resume reading from where you left off?"
+
+            android.app.AlertDialog.Builder(context)
+                .setTitle("Resume")
+                .setMessage(msg)
+                .setPositiveButton("Resume") { _, _ ->
+                    executeLoadUrl(savedUrl, name)
+                }
+                .setNegativeButton("Start from Beginning") { _, _ ->
+                    prefs.edit().remove(slug).apply()
+                    executeLoadUrl(url, name)
+                }
+                .setCancelable(false)
+                .show()
+        } else {
+            executeLoadUrl(url, name)
+        }
+    }
+
+    private fun executeLoadUrl(targetUrl: String, defaultName: String) {
+        currentChapterUrl = targetUrl
         val numStr = Regex("-chapter-([\\d.]+)").find(currentChapterUrl)?.groupValues?.get(1)
-        currentChapterName = if (numStr != null) "Ch. $numStr" else name
+        currentChapterName = if (numStr != null) "Ch. $numStr" else defaultName
         chapterInfoTextView?.text = currentChapterName.ifBlank { "Chapter" }
 
         val headers = mapOf(
