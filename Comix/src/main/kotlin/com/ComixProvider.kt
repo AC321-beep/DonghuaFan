@@ -2,6 +2,7 @@ package com.comix
 
 import android.annotation.SuppressLint
 import android.app.Dialog
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.http.SslError
 import android.os.Handler
@@ -40,6 +41,8 @@ import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.Interceptor
 import okhttp3.Response
@@ -110,6 +113,7 @@ class ComixProvider : MainAPI() {
 
     @Volatile private var cipher: ComixCipher? = null
     private val cfInterceptor = CFInterceptor()
+    private val cfMutex = Mutex() // Prevents overlapping verification dialogs
 
     private val cipherCacheFile: File?
         get() {
@@ -130,6 +134,11 @@ class ComixProvider : MainAPI() {
         runCatching { cipherCacheFile?.writeText(mat.toJson().toString()) }
     }
 
+    private fun invalidateCipher() {
+        cipher = null
+        runCatching { cipherCacheFile?.delete() }
+    }
+
     private fun cachedCipher(): ComixCipher? {
         cipher?.let { return it }
         return loadCachedCipher()?.also { cipher = it }
@@ -141,6 +150,7 @@ class ComixProvider : MainAPI() {
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun resolveCloudflareAndCipher(): Boolean = withContext(Dispatchers.Main) {
         val activity = CommonActivity.activity ?: return@withContext false
+        if (activity.isFinishing || activity.isDestroyed) return@withContext false
 
         suspendCancellableCoroutine { cont ->
             val dialog = Dialog(activity)
@@ -231,11 +241,44 @@ class ComixProvider : MainAPI() {
                     }
 
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                        view?.evaluateJavascript(CAPTURE_SCRIPT, null)
+                        view?.evaluateJavascript(
+                            """
+                            (function () {
+                                if (window.__comixCipherHook) return;
+                                window.__comixCipherHook = true;
+                                var captures = window.__comixCipherCaptures = [];
+                                var seen = window.__comixSeenLengths = {};
+                                var originalAtob = window.atob;
+                                var stealthAtob = function (value) {
+                                    var decoded = originalAtob.call(window, value);
+                                    try {
+                                        var len = decoded.length;
+                                        var key = 'L' + len;
+                                        if (!seen[key]) { seen[key] = true; }
+                                        if (len === 256 || len === 24 || len === 32) {
+                                            var bytes = new Array(len);
+                                            for (var i = 0; i < len; i++) bytes[i] = decoded.charCodeAt(i) & 255;
+                                            captures.push(bytes);
+                                            var sboxes = captures.filter(function (x) { return x.length === 256; }).slice(0, 3);
+                                            var keys   = captures.filter(function (x) { return x.length === 24 || x.length === 32; }).slice(0, 3);
+                                            if (sboxes.length === 3 && keys.length === 3) {
+                                                try { ComixCipherBridge.submit(JSON.stringify({ sboxes: sboxes, keys: keys })); } catch (e) {}
+                                            }
+                                        }
+                                    } catch (e) {}
+                                    return decoded;
+                                };
+                                var origFpToString = Function.prototype.toString;
+                                Function.prototype.toString = function () {
+                                    if (this === stealthAtob) return 'function atob() { [native code] }';
+                                    return origFpToString.call(this);
+                                };
+                                Object.defineProperty(window, 'atob', { value: stealthAtob, writable: true, configurable: true });
+                            })();
+                            """.trimIndent(), null)
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
-                        view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                         checkStatus(view)
                     }
                 }
@@ -258,20 +301,35 @@ class ComixProvider : MainAPI() {
         }
     }
 
+    private fun isCloudflareChallenge(html: String): Boolean {
+        val lower = html.lowercase()
+        return lower.contains("just a moment") || 
+               lower.contains("cf-browser-verification") || 
+               lower.contains("turnstile") || 
+               html.trim().isEmpty()
+    }
+
     private suspend fun fetchHtml(url: String): String {
-        val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
-        if (!cookies.contains("cf_clearance")) {
-            resolveCloudflareAndCipher()
+        // 1. Initial lock: Ensure we have a cookie before firing the request
+        cfMutex.withLock {
+            val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
+            if (!cookies.contains("cf_clearance")) {
+                resolveCloudflareAndCipher()
+            }
         }
 
         var response = app.get(url, interceptor = cfInterceptor).text
 
-        // Challenge detected mid-session: trigger dialog resolution and retry
-        val lower = response.lowercase()
-        if (lower.contains("just a moment") || lower.contains("cf-browser-verification") || lower.contains("turnstile")) {
-            val resolved = resolveCloudflareAndCipher()
-            if (resolved) {
+        // 2. Self-Healing fallback: If the existing cookie expired mid-session
+        if (isCloudflareChallenge(response)) {
+            cfMutex.withLock {
+                // If another parallel coroutine fixed the cookie while we were waiting at the lock, 
+                // test it again to prevent popping a redundant dialog.
                 response = app.get(url, interceptor = cfInterceptor).text
+                if (isCloudflareChallenge(response)) {
+                    resolveCloudflareAndCipher()
+                    response = app.get(url, interceptor = cfInterceptor).text
+                }
             }
         }
         return response
@@ -589,53 +647,5 @@ class ComixProvider : MainAPI() {
             )
         }
         return true
-    }
-
-    private companion object {
-        val CAPTURE_SCRIPT = """
-            (function () {
-                if (window.__comixCipherHook) return;
-                window.__comixCipherHook = true;
-                
-                var captures = window.__comixCipherCaptures = [];
-                var seen = window.__comixSeenLengths = {};
-                var originalAtob = window.atob;
-
-                var stealthAtob = function (value) {
-                    var decoded = originalAtob.call(window, value);
-                    try {
-                        var len = decoded.length;
-                        var key = 'L' + len;
-                        if (!seen[key]) { seen[key] = true; }
-                        
-                        if (len === 256 || len === 24 || len === 32) {
-                            var bytes = new Array(len);
-                            for (var i = 0; i < len; i++) bytes[i] = decoded.charCodeAt(i) & 255;
-                            captures.push(bytes);
-                            
-                            var sboxes = captures.filter(function (x) { return x.length === 256; }).slice(0, 3);
-                            var keys   = captures.filter(function (x) { return x.length === 24 || x.length === 32; }).slice(0, 3);
-                            if (sboxes.length === 3 && keys.length === 3) {
-                                var payload = JSON.stringify({ sboxes: sboxes, keys: keys });
-                                try { ComixCipherBridge.submit(payload); } catch (e) {}
-                            }
-                        }
-                    } catch (e) {}
-                    return decoded;
-                };
-
-                var origFpToString = Function.prototype.toString;
-                Function.prototype.toString = function () {
-                    if (this === stealthAtob) return 'function atob() { [native code] }';
-                    return origFpToString.call(this);
-                };
-
-                Object.defineProperty(window, 'atob', {
-                    value: stealthAtob,
-                    writable: true,
-                    configurable: true
-                });
-            })();
-        """.trimIndent()
     }
 }
