@@ -14,5 +14,6 @@ class FootballReplaysPlugin: Plugin() {
         registerExtractorAPI(HQLinks())
         registerExtractorAPI(VkCom())
         registerExtractorAPI(VkExtractor())
+        registerExtractorAPI(ByseSX())
     }
 }
