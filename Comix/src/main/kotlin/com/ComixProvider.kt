@@ -592,6 +592,7 @@ class ComixProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
+        // 1. Trending and Follows are single-page only (No Pagination)
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
             val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
@@ -599,13 +600,22 @@ class ComixProvider : MainAPI() {
             return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = false)
         }
 
-        if (page == 1) {
-            val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
-            if (items.isNotEmpty()) {
-                return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = true)
-            }
+        // 2. Hot and Latest support full pagination
+        val targetUrl = if (page == 1) {
+            "$mainUrl/" // Page 1 data is bundled directly in the homepage's JSON state
+        } else {
+            // For Page 2+, we hit the dedicated category endpoints
+            "$mainUrl/${request.data}?page=$page"
         }
-        return null
+
+        val items = parseMainPage(fetchHtml(targetUrl), request, page)
+        
+        if (items.isEmpty()) return null
+
+        // Stop paginating if we receive a short list (usually Comix returns 24-28 items per full page)
+        val hasNext = items.size >= 24
+
+        return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = hasNext)
     }
 
     private fun parseMainPage(html: String, request: MainPageRequest, page: Int): List<SearchResponse> {
@@ -638,20 +648,58 @@ class ComixProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
-        val searchUrl = "$mainUrl/browse?q=${URLEncoder.encode(cleanQuery, "UTF-8")}"
+
+        // Include both query params just in case Comix routing expects one over the other
+        val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
+        val searchUrl = "$mainUrl/browse?q=$encoded&keyword=$encoded"
 
         val html = fetchHtml(searchUrl)
         if (html.isBlank()) return emptyList()
 
-        var results: List<SearchResponse> = emptyList()
-        extractInitialDataJson(html)?.let { initial ->
-            results = readQueries(initial) { k -> k.length() >= 1 && k.optString(0) == "manga" }
-        }
-        if (results.isEmpty()) results = extractSearchResultsDom(Jsoup.parse(html))
+        val allItems = mutableListOf<SearchResponse>()
 
+        // 1. Aggressively extract EVERY manga loaded in the JSON state
+        extractInitialDataJson(html)?.let { initial ->
+            val queries = initial.optJSONObject("queries")
+            if (queries != null) {
+                val keys = queries.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
+                    
+                    // If the key relates to manga, parse all of its items
+                    if (parsed.length() >= 1 && parsed.optString(0) == "manga") {
+                        val value = queries.opt(k)
+                        val arr = when (value) {
+                            is JSONArray  -> value
+                            is JSONObject -> value.optJSONArray("items")
+                            else          -> null
+                        }
+                        if (arr != null) {
+                            for (i in 0 until arr.length()) {
+                                arr.optJSONObject(i)?.let { obj ->
+                                    parseMangaFromJson(obj)?.let { r -> allItems.add(r) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Fallback to DOM extraction if the JSON payload was empty
+        if (allItems.isEmpty()) {
+            allItems.addAll(extractSearchResultsDom(Jsoup.parse(html)))
+        }
+
+        // 3. Filter the aggregated list locally.
+        // This ensures we drop the "Trending" or "Hot" items that were loaded in the background,
+        // and ONLY return the items that actually match the user's search query!
         val lower = cleanQuery.lowercase()
-        val filtered = results.filter { it.name.lowercase().contains(lower) }
-        return (filtered.ifEmpty { results }).distinctBy { it.url }
+        val filtered = allItems.filter { it.name.lowercase().contains(lower) }
+
+        // If strict filtering yields nothing, fall back to the raw list just in case
+        return (filtered.ifEmpty { allItems }).distinctBy { it.url }
     }
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
