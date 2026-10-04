@@ -12,6 +12,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -20,6 +21,8 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -48,8 +51,10 @@ class ComixProvider : MangaManhwaProvider() {
     )
 
     @Volatile private var cipher: ComixCipher? = null
-    @Volatile private var captureInFlight = false
     @Volatile private var prewarmStarted = false
+
+    // FIX 3: replaces the racy `captureInFlight` boolean with a real lock.
+    private val captureLock = Mutex()
 
     private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
@@ -80,27 +85,39 @@ class ComixProvider : MangaManhwaProvider() {
         return loadCachedCipher()?.also { cipher = it }
     }
 
+    /**
+     * FIX 3: Mutex-guarded so two concurrent callers (e.g. two main-page
+     * tabs opening at cold start) can never spawn two capture WebViews.
+     * Double-check inside the lock — the first caller may have just finished.
+     */
     private suspend fun captureCipher(): ComixCipher? {
         cipher?.let { return it }
         loadCachedCipher()?.let { cipher = it; return it }
 
-        if (captureInFlight) return null
-        captureInFlight = true
-        return try {
-            val mat = captureCipherMaterial() ?: return null
+        return captureLock.withLock {
+            cipher?.let { return@withLock it }
+            loadCachedCipher()?.let { cipher = it; return@withLock it }
+
+            val mat = captureCipherMaterial() ?: return@withLock null
             val c = ComixCipher(mat)
             cipher = c
             saveCachedCipher(mat)
             c
-        } finally {
-            captureInFlight = false
         }
     }
 
+    /**
+     * FIX 1: reset `prewarmStarted` when the capture fails so a subsequent
+     * main-page call actually retries. Previously a single timeout would
+     * permanently disable prewarm for the whole app session.
+     */
     private fun maybeStartPrewarm() {
         if (prewarmStarted || cipher != null || loadCachedCipher() != null) return
         prewarmStarted = true
-        bgScope.launch { captureCipher() }
+        bgScope.launch {
+            val ok = captureCipher() != null
+            if (!ok) prewarmStarted = false
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -118,6 +135,7 @@ class ComixProvider : MangaManhwaProvider() {
                 if (!done.compareAndSet(false, true)) return
                 timeoutRunnable?.let { handler.removeCallbacks(it) }
                 pollRunnable?.let { handler.removeCallbacks(it) }
+                runCatching { web.removeJavascriptInterface("ComixCipherBridge") }
                 runCatching { web.stopLoading() }
                 runCatching { web.loadUrl("about:blank") }
                 runCatching { web.destroy() }
@@ -141,12 +159,23 @@ class ComixProvider : MangaManhwaProvider() {
                 }
             }, "ComixCipherBridge")
 
+            // FIX 5: only inject the atob hook when we're actually on Comix,
+            // not on the Cloudflare interstitial. Otherwise a random 256/24/32-
+            // byte decode from CF's own JS gets cached as a bogus cipher.
+            fun isCfPage(): Boolean {
+                val t = web.title?.lowercase().orEmpty()
+                return t.contains("just a moment") ||
+                       t.contains("attention required") ||
+                       t.contains("checking your browser") ||
+                       t.contains("security verification")
+            }
+
             web.webViewClient = object : WebViewClient() {
                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                    view?.evaluateJavascript(CAPTURE_SCRIPT, null)
+                    // no-op; wait for onPageFinished so we can inspect the title
                 }
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    view?.evaluateJavascript(CAPTURE_SCRIPT, null)
+                    if (!isCfPage()) view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                 }
             }
 
@@ -158,17 +187,19 @@ class ComixProvider : MangaManhwaProvider() {
             pollRunnable = object : Runnable {
                 override fun run() {
                     if (done.get()) return
-                    web.evaluateJavascript(CAPTURE_SCRIPT, null)
-                    web.evaluateJavascript(
-                        """
-                        (function(){
-                            if (window.__comixTriggered) return;
-                            var el = document.querySelector('.npager a, a[href*="/browse"], a[href*="/title/"]');
-                            if (el) { window.__comixTriggered = true; el.click(); }
-                            else { window.scrollTo(0, document.body.scrollHeight); }
-                        })();
-                        """.trimIndent(), null
-                    )
+                    if (!isCfPage()) {
+                        web.evaluateJavascript(CAPTURE_SCRIPT, null)
+                        web.evaluateJavascript(
+                            """
+                            (function(){
+                                if (window.__comixTriggered) return;
+                                var el = document.querySelector('.npager a, a[href*="/browse"], a[href*="/title/"]');
+                                if (el) { window.__comixTriggered = true; el.click(); }
+                                else { window.scrollTo(0, document.body.scrollHeight); }
+                            })();
+                            """.trimIndent(), null
+                        )
+                    }
                     handler.postDelayed(this, 800L)
                 }
             }.also { handler.postDelayed(it, 800L) }
@@ -247,6 +278,8 @@ class ComixProvider : MangaManhwaProvider() {
             if (root.has("e")) {
                 val decrypted = runCatching { c.decrypt(root.optString("e")) }.getOrNull()
                 if (decrypted == null) {
+                    // Cipher is genuinely stale — bad sboxes/keys. Wipe and
+                    // allow prewarm on the next main-page hit.
                     if (cipher === c) { invalidateCipher(); prewarmStarted = false }
                     return null
                 }
@@ -254,7 +287,9 @@ class ComixProvider : MangaManhwaProvider() {
             }
             raw
         } catch (_: Throwable) {
-            if (cipher === c) { invalidateCipher(); prewarmStarted = false }
+            // FIX 2: network errors do NOT invalidate the cipher. Only a
+            // failed decrypt (handled above) does. Previously any DNS blip
+            // or 5xx forced a full re-capture.
             null
         }
     }
@@ -751,28 +786,38 @@ class ComixProvider : MangaManhwaProvider() {
         val activity = CommonActivity.activity as? AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
-        val chapterNum = Regex("-chapter-([\\d.]+)").find(data)
+        // Keep the numeric value nullable so we can distinguish
+        // "regex didn't match" (real 'Chapter' fallback) from
+        // "chapter 0" (Prologue). Previously `?: 0` collapsed both.
+        val chapterNumRaw = Regex("-chapter-([\\d.]+)").find(data)
             ?.groupValues?.get(1)
             ?.toDoubleOrNull()
-            ?.toInt() ?: 0
+        val chapterNum = chapterNumRaw?.toInt() ?: 0
 
         val chapterName = when {
-            chapterNum <= 0 -> "Chapter"
-            chapterNum == 0 -> "Prologue"
-            else -> "Ch. $chapterNum"
+            chapterNumRaw == null -> "Chapter"
+            chapterNumRaw == 0.0  -> "Prologue"
+            else -> "Ch. ${formatChapterNum(chapterNumRaw)}"
         }
 
+        // FIX 4: report success to Cloudstream only after the dialog
+        // actually mounted. Previously a runOnUiThread fire-and-forget
+        // could fail silently and the player would open with no reader.
+        val mounted = CompletableDeferred<Boolean>()
         activity.runOnUiThread {
-            ReaderDialog.show(
-                activity = activity,
-                title = name,
-                chapterName = chapterName,
-                chapterUrl = data,
-                referer = baseUrl,
-                targetChapter = chapterNum
-            )
+            runCatching {
+                ReaderDialog.show(
+                    activity = activity,
+                    title = name,
+                    chapterName = chapterName,
+                    chapterUrl = data,
+                    referer = baseUrl,
+                    targetChapter = chapterNum
+                )
+            }.onSuccess { mounted.complete(true) }
+             .onFailure { mounted.complete(false) }
         }
-        return true
+        return mounted.await()
     }
 
     private companion object {
