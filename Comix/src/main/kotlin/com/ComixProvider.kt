@@ -41,9 +41,6 @@ import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -76,6 +73,7 @@ class CFInterceptor : Interceptor {
         }
         val ua = CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa
         builder.header("User-Agent", ua)
+        
         builder.removeHeader("X-Requested-With")
 
         val cookies = CookieManager.getInstance().getCookie(original.url.toString())
@@ -745,55 +743,14 @@ class ComixProvider : MainAPI() {
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Load Details
+    //  Load Details & Reader (Single Entry Point)
     // ═══════════════════════════════════════════════════════════════════════
-    private fun formatChapterNum(n: Double): String = if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
-
     override suspend fun load(url: String): LoadResponse? {
         val html = fetchHtml(url)
         if (html.isBlank()) return null
 
         val document = Jsoup.parse(html)
         val initialData = extractInitialDataJson(document)
-
-        val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
-
-        fun extractChaptersFromHtml(doc: Document) {
-            doc.select("a.mchap-row__primary, a[href*='-chapter-']").forEach { a ->
-                val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
-                val m = Regex("""-chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return@forEach
-                val numStr = m.groupValues[1].toDoubleOrNull()?.let { formatChapterNum(it) } ?: return@forEach
-                if (a.hasClass("mchap-row__primary") || a.parents().any { it.hasClass("mchap-item") }) {
-                    if (!parsedChapterLinks.containsKey(numStr)) {
-                        val visible = a.text().trim()
-                        parsedChapterLinks[numStr] = visible.ifBlank { "Ch. $numStr" } to href
-                    }
-                }
-            }
-        }
-
-        extractChaptersFromHtml(document)
-
-        var maxPage = 1
-        document.select(".npager__num").forEach { el ->
-            val p = el.text().toIntOrNull() ?: 1
-            if (p > maxPage) maxPage = p
-        }
-
-        if (maxPage > 1) {
-            val pages = (2..maxPage).toList()
-            for (chunk in pages.chunked(5)) {
-                coroutineScope {
-                    chunk.map { pageNum ->
-                        async {
-                            val pUrl = if (url.contains("?")) "$url&page=$pageNum" else "$url?page=$pageNum"
-                            val response = runCatching { fetchHtml(pUrl) }.getOrNull()
-                            if (!response.isNullOrBlank()) extractChaptersFromHtml(Jsoup.parse(response))
-                        }
-                    }.awaitAll()
-                }
-            }
-        }
 
         var detail: JSONObject? = null
         initialData?.optJSONObject("queries")?.let { queries ->
@@ -838,29 +795,28 @@ class ComixProvider : MainAPI() {
         }.distinct()
 
         val latestChapterNum = d?.optInt("latestChapter", 0) ?: 0
+        
+        // Grab the official first chapter URL directly from the JSON or DOM to ensure it's valid
         val firstChapterUrl  = d?.optString("firstChapterUrl")?.takeIf { it.isNotBlank() }
-        val startsAtZero = firstChapterUrl?.contains("-chapter-0", ignoreCase = true) == true
+            ?: document.selectFirst("a[href*='-chapter-']")?.attr("href")
+            ?: url
+
+        val startsAtZero = firstChapterUrl.contains("-chapter-0", ignoreCase = true)
         val startCh = if (startsAtZero) 0 else 1
 
-        val allChapterKeys = mutableSetOf<String>()
-        if (latestChapterNum > 0) for (i in startCh..latestChapterNum) allChapterKeys.add(i.toString())
-        parsedChapterLinks.keys.forEach { allChapterKeys.add(it) }
-        val sortedKeys = allChapterKeys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
-
-        val episodes = sortedKeys.mapIndexed { index, key ->
-            val realData = parsedChapterLinks[key]
-            val epUrl = if (realData != null) realData.second
-                else if (key == "0" && startsAtZero && firstChapterUrl != null) firstChapterUrl
-                else if (key == "1" && !startsAtZero && firstChapterUrl != null) firstChapterUrl
-                else "$url/chapter-$key"
-            val epName = realData?.first ?: "Ch. $key"
-            newEpisode(fixUrl(epUrl)) {
-                this.name = epName
-                this.season = 1
-                this.episode = index + 1
-                this.posterUrl = posterUrl
-            }
+        val epName = if (latestChapterNum > 0) {
+            "Chapters $startCh - $latestChapterNum"
+        } else {
+            "Read Manga"
         }
+
+        val episodes = listOf(
+            newEpisode(fixUrl(firstChapterUrl)) {
+                this.name = epName
+                this.posterUrl = posterUrl
+                this.episode = 1
+            }
+        )
 
         return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
             this.posterUrl = posterUrl
