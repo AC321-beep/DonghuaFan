@@ -856,7 +856,7 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    override suspend fun loadLinks(
+   override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -872,13 +872,11 @@ class ComixProvider : MainAPI() {
                 activity = activity,
                 title = name,
                 chapterName = chapterName,
-                chapterUrl = data,
-                targetChapter = 0
+                chapterUrl = data
             )
         }
         return true
     }
-
     private companion object {
         val CAPTURE_SCRIPT = """
             (function () {
