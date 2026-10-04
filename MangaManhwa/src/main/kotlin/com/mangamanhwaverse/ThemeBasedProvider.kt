@@ -2,6 +2,8 @@ package com.mangamanhwaverse
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.app
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
@@ -19,7 +21,9 @@ data class ThemeConfig(
     val titleSelector: String,
     val chapterSelector: String,
     val pageSelector: String,
-    val imageSelector: String = "img"
+    val imageSelector: String = "img",
+    /** Most themes list newest-first in the DOM. Reverse to oldest-first. */
+    val newestFirst: Boolean = true
 )
 
 open class ThemeBasedProvider(
@@ -31,6 +35,7 @@ open class ThemeBasedProvider(
 ) : MangaManhwaProvider() {
 
     @Volatile private var resolvedUrl: String? = null
+    private val resolveLock = Mutex()
 
     override val baseUrl: String
         get() {
@@ -41,7 +46,8 @@ open class ThemeBasedProvider(
 
     override val cfPattern: Regex
         get() {
-            val hosts = (listOf(mainUrl) + fallbackUrls)
+            val override = Settings.providerUrlOverride(name).takeIf { it.isNotBlank() }
+            val hosts = (listOf(mainUrl) + fallbackUrls + listOfNotNull(override))
                 .mapNotNull { runCatching { URI(it).host }.getOrNull() }
                 .distinct()
             val pattern = hosts.joinToString("|") { Regex.escape(it) }
@@ -53,15 +59,30 @@ open class ThemeBasedProvider(
         if (Settings.providerUrlOverride(name).isNotBlank()) return
         if (fallbackUrls.isEmpty()) { resolvedUrl = mainUrl; return }
 
-        for (url in listOf(mainUrl) + fallbackUrls) {
-            if (probe(url)) { resolvedUrl = url; return }
+        resolveLock.withLock {
+            if (resolvedUrl != null) return@withLock
+            for (url in listOf(mainUrl) + fallbackUrls) {
+                if (probe(url)) { resolvedUrl = url; return@withLock }
+            }
+            resolvedUrl = mainUrl
         }
-        resolvedUrl = mainUrl
     }
 
+    /**
+     * CF-protected mirrors answer 403/503 with a challenge header while
+     * still being alive. Treat those as reachable so the fallback resolver
+     * doesn't skip every working URL of a CF-protected provider.
+     */
     private suspend fun probe(url: String): Boolean =
         runCatching {
-            app.get(url, headers = browserHeaders()).code in 200..399
+            val resp = app.get(url, headers = browserHeaders())
+            when {
+                resp.code in 200..399 -> true
+                resp.code == 403 && resp.headers["cf-mitigated"]
+                    ?.contains("challenge", true) == true -> true
+                resp.code == 503 -> true
+                else -> false
+            }
         }.getOrDefault(false)
 
     override suspend fun popular(page: Int): List<SearchResponse> {
@@ -81,6 +102,12 @@ open class ThemeBasedProvider(
         val doc = fetch(config.trendingPath.replace("{page}", "$page")) ?: return emptyList()
         return parseList(doc)
     }
+
+    /** Default mapping: hot → trending-by-views. Override per-provider if needed. */
+    override suspend fun hot(page: Int): List<SearchResponse> = trending(page)
+
+    /** Default mapping: follows → popular. Override per-provider if needed. */
+    override suspend fun follows(page: Int): List<SearchResponse> = popular(page)
 
     override suspend fun completed(page: Int): List<SearchResponse> {
         ensureUrlResolved()
@@ -126,15 +153,15 @@ open class ThemeBasedProvider(
             newAnimeSearchResponse(title, abs(href), TvType.Anime).apply {
                 posterUrl = poster
             }
-        }
+        }.distinctBy { it.url }
 
-    private fun parseChapters(doc: Document): List<Episode> =
-        doc.select(config.chapterSelector).mapNotNull { a ->
+    private fun parseChapters(doc: Document): List<Episode> {
+        val eps = doc.select(config.chapterSelector).mapNotNull { a ->
             val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            newEpisode(abs(href)) {
-                this.name = a.text().trim()
-            }
-        }
+            newEpisode(abs(href)) { this.name = a.text().trim() }
+        }.distinctBy { it.data }
+        return if (config.newestFirst) eps.reversed() else eps
+    }
 
     private fun parsePages(doc: Document): List<String> =
         doc.select(config.pageSelector).mapNotNull(::img).distinct()
@@ -145,6 +172,8 @@ open class ThemeBasedProvider(
             ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() }
             ?: el.attr("data-original").takeIf { it.isNotBlank() }
             ?: el.attr("srcset").split(",").firstOrNull()?.trim()
+                ?.substringBefore(" ")?.takeIf { it.isNotBlank() }
+            ?: el.attr("data-srcset").split(",").firstOrNull()?.trim()
                 ?.substringBefore(" ")?.takeIf { it.isNotBlank() }
 
     private fun shrink(url: String): String = when {
@@ -171,6 +200,7 @@ object Themes {
         chapterSelector = "li.wp-manga-chapter > a",
         pageSelector    = "div.reading-content img, div.page-break img"
     )
+
     val MangaThemesia = ThemeConfig(
         popularPath   = "/manga/?page={page}&order=popular",
         latestPath    = "/manga/?page={page}&order=update",
