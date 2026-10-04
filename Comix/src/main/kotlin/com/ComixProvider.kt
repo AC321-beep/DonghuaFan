@@ -72,7 +72,7 @@ class CFInterceptor : Interceptor {
         val defaultUa = try {
             WebSettings.getDefaultUserAgent(CommonActivity.activity)
         } catch (e: Exception) {
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         val ua = CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa
         builder.header("User-Agent", ua)
@@ -174,7 +174,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Cloudflare & Cipher Resolver (Stage 1 & Stage 2)
+    //  Two-Stage Cloudflare Resolution
     // ═══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun attemptSilentResolution(activity: android.app.Activity): Boolean = withContext(Dispatchers.Main) {
@@ -191,7 +191,7 @@ class ComixProvider : MainAPI() {
                     activity.resources.displayMetrics.widthPixels,
                     activity.resources.displayMetrics.heightPixels
                 )
-                translationX = 20000f // Off-screen rendering
+                translationX = 20000f
                 settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
@@ -203,7 +203,12 @@ class ComixProvider : MainAPI() {
                 }
 
                 CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-                settings.userAgentString = CFState.userAgent.ifBlank { settings.userAgentString }
+
+                if (CFState.userAgent.isBlank()) {
+                    CFState.userAgent = settings.userAgentString
+                } else {
+                    settings.userAgentString = CFState.userAgent
+                }
 
                 addJavascriptInterface(object {
                     @JavascriptInterface
@@ -221,9 +226,11 @@ class ComixProvider : MainAPI() {
                     override fun onReceivedSslError(view: WebView?, h: SslErrorHandler?, error: SslError?) {
                         h?.proceed()
                     }
+
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                         view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                     }
+
                     override fun onPageFinished(view: WebView?, url: String?) {
                         view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                     }
@@ -253,7 +260,8 @@ class ComixProvider : MainAPI() {
                     val title = webView.title?.lowercase() ?: ""
                     val isChallenge = listOf("just a moment", "attention required", "security verification", "cloudflare").any { title.contains(it) }
 
-                    if (!isChallenge && cookies.contains("cf_clearance") && cipher != null) {
+                    // Only checks Cloudflare clearance. Never block on cipher here!
+                    if (!isChallenge && cookies.contains("cf_clearance")) {
                         cleanup(true)
                         return
                     }
@@ -266,14 +274,14 @@ class ComixProvider : MainAPI() {
             decor.addView(webView)
             webView.loadUrl(mainUrl)
             handler.postDelayed(checkRunnable!!, 800L)
-            handler.postDelayed(timeoutRunnable!!, 4500L) // 4.5s max for silent pass
+            handler.postDelayed(timeoutRunnable!!, 4500L)
         }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun attemptInteractiveResolution(activity: android.app.Activity): Boolean = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
-            val dialog = Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
+            val dialog = Dialog(activity).apply {
                 setCancelable(false)
                 setCanceledOnTouchOutside(false)
             }
@@ -337,7 +345,8 @@ class ComixProvider : MainAPI() {
                     val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
                     val isChallenge = listOf("just a moment", "attention required", "security verification", "cloudflare").any { title.contains(it) }
 
-                    if (!isChallenge && cookies.contains("cf_clearance") && cipher != null) {
+                    // Only checks Cloudflare clearance. Never block on cipher here!
+                    if (!isChallenge && cookies.contains("cf_clearance")) {
                         header.text = "Success! Loading..."
                         header.setTextColor(Color.GREEN)
                         handler.postDelayed({ finish(true) }, 800)
@@ -357,9 +366,11 @@ class ComixProvider : MainAPI() {
                     override fun onReceivedSslError(view: WebView?, h: SslErrorHandler?, error: SslError?) {
                         h?.proceed()
                     }
+
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                         view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                     }
+
                     override fun onPageFinished(view: WebView?, url: String?) {
                         checkStatus(view)
                     }
@@ -368,19 +379,28 @@ class ComixProvider : MainAPI() {
 
             layout.addView(webView)
             dialog.setContentView(layout)
-            dialog.setOnDismissListener { if (!done.get()) finish(false) }
+            dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+
+            dialog.setOnDismissListener {
+                if (!done.get()) finish(false)
+            }
 
             dialog.show()
             webView.loadUrl(mainUrl)
 
-            handler.postDelayed({ if (!done.get()) finish(false) }, 30_000L)
+            handler.postDelayed({
+                if (!done.get()) finish(false)
+            }, 30_000L)
         }
     }
 
     private suspend fun resolveCloudflareAndCipher(): Boolean {
         val activity = CommonActivity.activity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
-        if (attemptSilentResolution(activity)) return true
+
+        val passedSilently = attemptSilentResolution(activity)
+        if (passedSilently) return true
+
         return attemptInteractiveResolution(activity)
     }
 
@@ -391,13 +411,11 @@ class ComixProvider : MainAPI() {
                lower.contains("turnstile")
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Network Helpers
-    // ═══════════════════════════════════════════════════════════════════════
     private suspend fun fetchHtml(url: String): String {
         cfMutex.withLock {
             val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
-            if (!cookies.contains("cf_clearance") || cachedCipher() == null) {
+            // Strictly check cf_clearance only!
+            if (!cookies.contains("cf_clearance")) {
                 resolveCloudflareAndCipher()
             }
         }
@@ -474,9 +492,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Data Parsing Helpers
-    // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
             is Document -> htmlOrDoc
@@ -547,6 +562,42 @@ class ComixProvider : MainAPI() {
         return out
     }
 
+    private fun toSearchResult(card: Element): SearchResponse? {
+        val anchor = if (card.tagName() == "a") card
+                     else card.selectFirst("a[href*='/title/'], a[href]") ?: return null
+        val href = anchor.attr("href").takeIf { it.isNotBlank() } ?: return null
+        val title = card.selectFirst("h3, h2, .title, .manga-title, .lrow__title")
+            ?.text()?.trim()
+            ?: anchor.attr("title").ifBlank { anchor.text().trim() }
+        if (title.isBlank()) return null
+        
+        val poster = card.selectFirst("img")?.let { img ->
+            img.attr("data-src").ifBlank { img.attr("data-lazy-src") }.ifBlank { img.attr("src") }
+        }?.takeIf { it.isNotBlank() }
+        
+        val latestEp = card.selectFirst(".chapter, .latest-chapter, .lrow__chapter")
+            ?.text()?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
+
+        return newAnimeSearchResponse(title, fixUrl(href), TvType.Anime) {
+            poster?.let { this.posterUrl = fixUrl(it) }
+            this.posterHeaders = getPosterHeaders()
+            if (latestEp != null && latestEp > 0) addSub(latestEp)
+        }
+    }
+
+    private fun extractSearchResultsDom(doc: Document): List<SearchResponse> {
+        val results = mutableListOf<SearchResponse>()
+        doc.select(".list-grid .lrow, div.lrow, .lrow, .list-grid > div, .list-grid--cards > div")
+            .forEach { el -> toSearchResult(el)?.let { results.add(it) } }
+        if (results.isEmpty()) {
+            doc.select("article, .manga-card, .comic-item, a[href*='/title/']").forEach { el ->
+                if (el.tagName() == "a" && el.parents().any { p -> p.hasClass("lrow") || p.hasClass("list-grid") }) return@forEach
+                toSearchResult(el)?.let { results.add(it) }
+            }
+        }
+        return results.distinctBy { it.url }
+    }
+
     private fun readHasNext(root: JSONObject?, page: Int, itemCount: Int): Boolean {
         val resultObj = root?.optJSONObject("result") ?: root?.optJSONObject("data")
         val meta = resultObj?.optJSONObject("meta")
@@ -567,19 +618,22 @@ class ComixProvider : MainAPI() {
     //  Main Page & Pagination
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        // 1. Trending and Follows are strictly single-page top lists
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
-            val html = fetchHtml("$mainUrl/")
-            val initial = extractInitialDataJson(html) ?: return null
-            val items = readQueries(initial) { k -> 
-                k.length() >= 3 && k.optString(0) == "manga" && k.optString(1) == "top" && k.optJSONObject(2)?.optString("type") == request.data
-            }
+            val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
             if (items.isEmpty()) return null
             return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = false)
         }
 
-        // 2. Hot and Latest support full API pagination
+        // Page 1 for hot/latest uses homepage SSR
+        if (page == 1) {
+            val items = parseMainPage(fetchHtml("$mainUrl/"), request, 1)
+            if (items.isNotEmpty()) {
+                return newHomePageResponse(request, items.distinctBy { it.url }, hasNext = true)
+            }
+        }
+
+        // Page 2+ uses fetchQueryPage (Signed API first, SSR fallback second)
         val result = fetchQueryPage(request, page) ?: return null
         if (result.items.isEmpty()) return null
         return newHomePageResponse(request, result.items.distinctBy { it.url }, hasNext = result.hasNext)
@@ -603,11 +657,7 @@ class ComixProvider : MainAPI() {
             else -> return null
         }
 
-        // Must fetch via signed API for SPA pagination
-        if (cachedCipher() == null) {
-            resolveCloudflareAndCipher()
-        }
-
+        // 1. Try Signed API if cipher is available
         if (cachedCipher() != null) {
             val body = getSigned("/api/v1/manga", params)
             if (!body.isNullOrBlank()) {
@@ -625,7 +675,74 @@ class ComixProvider : MainAPI() {
                 }
             }
         }
+
+        // 2. Fallback: SSR at ?page=N
+        val homeSsrHtml = runCatching { fetchHtml("$mainUrl/?page=$page") }.getOrNull()
+        if (!homeSsrHtml.isNullOrBlank()) {
+            val initial = extractInitialDataJson(homeSsrHtml)
+            if (initial != null) {
+                val items = readQueries(initial) { k ->
+                    if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
+                    val subtype = k.optString(1)
+                    val p = k.optJSONObject(2) ?: return@readQueries false
+                    val jsonPage = p.optInt("page", -1)
+                    if (jsonPage != page) return@readQueries false
+                    when (request.data) {
+                        "hot"    -> subtype == "list" && p.optString("scope") == "hot"
+                        "latest" -> subtype == "list" && p.optJSONObject("order")?.optString("created_at") == "desc"
+                        else     -> false
+                    }
+                }
+                if (items.isNotEmpty()) {
+                    return PageResult(items, hasNext = true)
+                }
+            }
+        }
+
+        // 3. Fallback: SSR at /browse?page=N
+        val browseUrl = when (request.data) {
+            "hot"    -> "$mainUrl/browse?page=$page&order=chapter_updated_at:desc"
+            "latest" -> "$mainUrl/browse?page=$page&order=created_at:desc"
+            else     -> null
+        }
+        if (browseUrl != null) {
+            val browseHtml = runCatching { fetchHtml(browseUrl) }.getOrNull()
+            if (!browseHtml.isNullOrBlank()) {
+                val items = parseMainPage(browseHtml, request, page)
+                if (items.isNotEmpty()) {
+                    return PageResult(items, hasNext = items.size >= 10)
+                }
+            }
+        }
+
         return null
+    }
+
+    private fun parseMainPage(html: String, request: MainPageRequest, page: Int): List<SearchResponse> {
+        if (html.isBlank()) return emptyList()
+        var items: List<SearchResponse> = emptyList()
+
+        extractInitialDataJson(html)?.let { initial ->
+            val precise: ((String, JSONObject) -> Boolean)? = when (request.data) {
+                "trending" -> { st, p -> st == "top" && p.optString("type") == "trending" }
+                "follows"  -> { st, p -> st == "top" && p.optString("type") == "follows" }
+                "hot"      -> { st, p -> st == "list" && p.optString("scope") == "hot" }
+                "latest"   -> { st, p -> st == "list" && p.optJSONObject("order")?.optString("created_at") == "desc" }
+                else -> null
+            }
+            if (precise != null) {
+                items = readQueries(initial) { k ->
+                    if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
+                    val subtype = k.optString(1)
+                    val params = k.optJSONObject(2) ?: return@readQueries false
+                    val jsonPage = params.optInt("page", 1)
+                    if (page > 1 && jsonPage != page) return@readQueries false
+                    precise(subtype, params)
+                }
+            }
+        }
+        if (items.isEmpty()) items = extractSearchResultsDom(Jsoup.parse(html))
+        return items
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -635,33 +752,66 @@ class ComixProvider : MainAPI() {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
 
-        if (cachedCipher() == null) {
-            resolveCloudflareAndCipher()
-        }
-
+        // 1. Try Signed API if cipher is available
         if (cachedCipher() != null) {
             val params = mapOf("keyword" to listOf(cleanQuery), "limit" to listOf("28"))
             val body = getSigned("/api/v1/manga", params)
-            
             if (!body.isNullOrBlank()) {
                 val root = runCatching { JSONObject(body) }.getOrNull()
-                val arr: JSONArray? = root?.optJSONObject("result")?.optJSONArray("items")
+                val arr = root?.optJSONObject("result")?.optJSONArray("items")
                     ?: root?.optJSONArray("items")
                     ?: root?.optJSONObject("data")?.optJSONArray("items")
-                
                 if (arr != null) {
                     val items = arrToResults(arr).distinctBy { it.url }
                     if (items.isNotEmpty()) return items
                 }
             }
         }
-        return emptyList()
+
+        // 2. Fallback: HTML Search
+        val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
+        val searchUrl = "$mainUrl/browse?q=$encoded"
+        val html = fetchHtml(searchUrl)
+        if (html.isBlank()) return emptyList()
+
+        val allItems = mutableListOf<SearchResponse>()
+        extractInitialDataJson(html)?.let { initial ->
+            val queries = initial.optJSONObject("queries")
+            if (queries != null) {
+                val keys = queries.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
+                    if (parsed.length() >= 1 && parsed.optString(0) == "manga") {
+                        val value = queries.opt(k)
+                        val arr = when (value) {
+                            is JSONArray  -> value
+                            is JSONObject -> value.optJSONArray("items")
+                            else          -> null
+                        } ?: continue
+                        for (i in 0 until arr.length()) {
+                            arr.optJSONObject(i)?.let { obj ->
+                                parseMangaFromJson(obj)?.let { r -> allItems.add(r) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (allItems.isEmpty()) {
+            allItems.addAll(extractSearchResultsDom(Jsoup.parse(html)))
+        }
+
+        val lower = cleanQuery.lowercase()
+        val filtered = allItems.filter { it.name.lowercase().contains(lower) }
+        return (filtered.ifEmpty { allItems }).distinctBy { it.url }
     }
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Load Details (Exactly as Provided)
+    //  Load Details (Preserved intact)
     // ═══════════════════════════════════════════════════════════════════════
     private fun formatChapterNum(n: Double): String =
         if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
@@ -672,7 +822,6 @@ class ComixProvider : MainAPI() {
 
         val document = Jsoup.parse(html)
         val initialData = extractInitialDataJson(document)
-
         val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
 
         fun extractChaptersFromHtml(doc: Document) {
@@ -797,7 +946,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Reader Implementation (Exactly as Provided)
+    //  Reader Implementation (Preserved intact)
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun loadLinks(
         data: String,
