@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import kotlinx.coroutines.CompletableDeferred
 import okhttp3.Interceptor
 import okhttp3.Request
 import org.jsoup.nodes.Document
@@ -42,8 +43,10 @@ abstract class MangaManhwaProvider : MainAPI() {
     override val hasQuickSearch = true
     override val hasDownloadSupport = false
 
+    // FIX A: escape the host. `.` in "comix.to" is a regex wildcard and was
+    // matching unrelated domains (comixXto, comix-to.evil.example).
     protected open val cfPattern: Regex
-        get() = Regex(".*${hostOf(baseUrl)}.*")
+        get() = Regex(".*${Regex.escape(hostOf(baseUrl))}.*")
 
     private val cfResolver by lazy { WebViewResolver(cfPattern) }
 
@@ -93,12 +96,19 @@ abstract class MangaManhwaProvider : MainAPI() {
         runCatching { searchPage(query, 1) }.getOrNull()
 
     override suspend fun load(url: String): LoadResponse? = runCatching {
+        // FIX (P2): if chapters() throws, still return the title page with
+        // zero episodes instead of failing the whole load.
+        val episodes = runCatching { chapters(url) }.getOrDefault(emptyList())
+
         newAnimeLoadResponse(
-            url.substringAfterLast("/").replace('-', ' '),
+            // FIX (P2): format the slug-derived fallback into Title Case.
+            titleFromSlug(url),
             url,
             TvType.Anime
         ) {
-            addEpisodes(DubStatus.Subbed, chapters(url))
+            if (episodes.isNotEmpty()) {
+                addEpisodes(DubStatus.Subbed, episodes)
+            }
         }
     }.getOrNull()
 
@@ -112,29 +122,37 @@ abstract class MangaManhwaProvider : MainAPI() {
             ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
-        val chapterNum = Regex("(?:chapter|ch)[-\\s]?([\\d.]+)", RegexOption.IGNORE_CASE)
+        // FIX C: keep the nullable Double so 0.0 ("Prologue") is distinguishable
+        // from a regex miss (real "Chapter" fallback).
+        val chapterNumRaw = Regex("(?:chapter|ch)[-\\s]?([\\d.]+)", RegexOption.IGNORE_CASE)
             .find(data)
             ?.groupValues?.get(1)
             ?.toDoubleOrNull()
-            ?.toInt() ?: 0
+        val chapterNum = chapterNumRaw?.toInt() ?: 0
 
         val chapterName = when {
-            chapterNum <= 0 -> "Chapter"
-            chapterNum == 0 -> "Prologue"
-            else -> "Ch. $chapterNum"
+            chapterNumRaw == null -> "Chapter"
+            chapterNumRaw == 0.0  -> "Prologue"
+            chapterNumRaw % 1.0 == 0.0 -> "Ch. ${chapterNumRaw.toInt()}"
+            else -> "Ch. $chapterNumRaw"
         }
 
+        // FIX B: only report success after the dialog actually mounted.
+        val mounted = CompletableDeferred<Boolean>()
         activity.runOnUiThread {
-            ReaderDialog.show(
-                activity = activity,
-                title = name,
-                chapterName = chapterName,
-                chapterUrl = data,
-                referer = baseUrl,
-                targetChapter = chapterNum
-            )
+            runCatching {
+                ReaderDialog.show(
+                    activity = activity,
+                    title = name,
+                    chapterName = chapterName,
+                    chapterUrl = data,
+                    referer = baseUrl,
+                    targetChapter = chapterNum
+                )
+            }.onSuccess { mounted.complete(true) }
+             .onFailure { mounted.complete(false) }
         }
-        return true
+        return mounted.await()
     }
 
     protected suspend fun fetch(url: String, referer: String? = baseUrl): Document? {
@@ -209,6 +227,15 @@ abstract class MangaManhwaProvider : MainAPI() {
 
     private fun hostOf(url: String) =
         runCatching { URI(url).host }.getOrNull() ?: url
+
+    /** "solo-leveling" / "solo-leveling-chapter-3" → "Solo Leveling Chapter 3". */
+    private fun titleFromSlug(url: String): String {
+        val raw = url.substringAfterLast("/").replace('-', ' ').trim()
+        if (raw.isBlank()) return "Untitled"
+        return raw.split(' ').joinToString(" ") { w ->
+            if (w.isEmpty()) w else w[0].uppercase() + w.drop(1)
+        }
+    }
 
     companion object {
         const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
