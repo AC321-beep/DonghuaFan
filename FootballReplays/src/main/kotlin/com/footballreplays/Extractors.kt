@@ -139,7 +139,6 @@ open class HQCloud : ExtractorApi() {
             Log.e(TAG, "HQCloud var[$idx] httpValues=$httpValues")
 
             // Prefer .m3u8 URLs; fall back to any http URL.
-            // This prevents picking up "hls3 ... master.txt" when "hls2 ... master.m3u8" exists.
             val preferred = httpValues.firstOrNull { it.contains(".m3u8") }
                 ?: httpValues.firstOrNull()
 
@@ -373,6 +372,86 @@ open class ByseSX : ExtractorApi() {
         return decoded
     }
 
+    /** Try the SPA HTML + its JS bundle to discover the real playback path. */
+    private suspend fun discoverPlaybackPath(base: String, code: String): String? {
+        val candidateShells = listOf("$base/e/$code", "$base/d/$code")
+        for (shell in candidateShells) {
+            val html = try { app.get(shell).text } catch (e: Exception) {
+                Log.e(TAG, "Byse discovery: shell $shell failed: ${e.message}")
+                continue
+            }
+            if (html.isBlank()) continue
+            Log.e(TAG, "Byse discovery: shell $shell length=${html.length}")
+
+            val jsMatch = Regex("""src="([^"]*index-[^"]*\.js)""").find(html)
+                ?: Regex("""src='([^']*index-[^']*\.js)'""").find(html)
+            if (jsMatch == null) {
+                Log.e(TAG, "Byse discovery: no JS bundle URL found in $shell")
+                continue
+            }
+            val raw = jsMatch.groupValues[1]
+            val jsUrl = if (raw.startsWith("http")) raw else "$base$raw"
+            Log.e(TAG, "Byse discovery: JS bundle $jsUrl")
+
+            val js = try { app.get(jsUrl).text } catch (e: Exception) {
+                Log.e(TAG, "Byse discovery: JS fetch failed: ${e.message}")
+                continue
+            }
+
+            // Find every /api/... literal in the bundle
+            val apiPaths = Regex("""["'`](/api/[a-zA-Z0-9_/\-\.\{\}]+)["'`]""")
+                .findAll(js)
+                .map { it.groupValues[1] }
+                .toSet()
+            Log.e(TAG, "Byse discovery: api paths found = $apiPaths")
+
+            val playbackLike = apiPaths.filter {
+                it.contains("playback", ignoreCase = true) ||
+                it.contains("source", ignoreCase = true) ||
+                it.contains("stream", ignoreCase = true) ||
+                it.contains("video", ignoreCase = true)
+            }
+            Log.e(TAG, "Byse discovery: playback-like paths = $playbackLike")
+
+            val pick = playbackLike.firstOrNull { it.contains("playback", ignoreCase = true) }
+                ?: playbackLike.firstOrNull()
+            if (pick != null) return pick
+        }
+        return null
+    }
+
+    private suspend fun tryEndpoint(
+        url: String,
+        headers: Map<String, String>,
+        label: String
+    ): String? {
+        // Try GET
+        try {
+            val r = app.get(url, headers = headers)
+            Log.e(TAG, "Byse [$label] GET $url -> code=${r.code} body=${r.text.take(250)}")
+            if (r.code in 200..299) return r.text
+        } catch (e: Exception) {
+            Log.e(TAG, "Byse [$label] GET failed: ${e.message}")
+        }
+        // Try POST empty
+        try {
+            val r = app.post(url, headers = headers, data = emptyMap())
+            Log.e(TAG, "Byse [$label] POST $url -> code=${r.code} body=${r.text.take(250)}")
+            if (r.code in 200..299) return r.text
+        } catch (e: Exception) {
+            Log.e(TAG, "Byse [$label] POST failed: ${e.message}")
+        }
+        // Try PUT
+        try {
+            val r = app.put(url, headers = headers, data = emptyMap())
+            Log.e(TAG, "Byse [$label] PUT $url -> code=${r.code} body=${r.text.take(250)}")
+            if (r.code in 200..299) return r.text
+        } catch (e: Exception) {
+            Log.e(TAG, "Byse [$label] PUT failed: ${e.message}")
+        }
+        return null
+    }
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -393,49 +472,33 @@ open class ByseSX : ExtractorApi() {
             val detailsUrl = "$base/api/videos/$code/embed/details"
             Log.e(TAG, "Byse detailsUrl=$detailsUrl")
 
-            val detailsResponse = try {
-                app.get(detailsUrl)
-            } catch (e: Exception) {
-                Log.e(TAG, "Byse details get FAILED", e)
-                return
+            val detailsResponse = try { app.get(detailsUrl) } catch (e: Exception) {
+                Log.e(TAG, "Byse details get FAILED", e); return
             }
             Log.e(TAG, "Byse detailsResponse code=${detailsResponse.code}")
             Log.e(TAG, "Byse detailsResponse body=${detailsResponse.text.take(1500)}")
 
             val details = detailsResponse.parsedSafe<ByseDetailsRoot>()
             if (details == null) {
-                Log.e(TAG, "Byse FAILED: details parsedSafe returned null")
-                return
+                Log.e(TAG, "Byse FAILED: details parsedSafe returned null"); return
             }
             Log.e(TAG, "Byse details id=${details.id} code=${details.code} title=${details.title}")
             Log.e(TAG, "Byse details embedFrameUrl=${details.embedFrameUrl}")
 
             val embedFrameUrl = details.embedFrameUrl
             if (embedFrameUrl.isBlank()) {
-                Log.e(TAG, "Byse FAILED: embedFrameUrl blank")
-                return
+                Log.e(TAG, "Byse FAILED: embedFrameUrl blank"); return
             }
 
-            val embedUri = URI(embedFrameUrl)
-            val embedBase = "${embedUri.scheme}://${embedUri.host}"
+            val embedBase = "${URI(embedFrameUrl).scheme}://${URI(embedFrameUrl).host}"
             Log.e(TAG, "Byse embedBase=$embedBase")
 
-            // ---------- 2. Playback ----------
-            // FIX: the /embed/ namespace lives on the SOURCE domain (bysefujedu.com),
-            // NOT on the CDN embed-frame domain (n1mwq.org).
-            // Calling playback on the CDN domain returns 405 "method not allowed"
-            // for every HTTP method because the route simply doesn't exist there.
-            //
-            // Verified by HAR:
-            //   GET  bysefujedu.com/api/videos/{code}/embed/details   -> 200
-            //   POST n1mwq.org/api/videos/{code}/embed/playback       -> 405
-            //   GET  n1mwq.org/api/videos/{code}/embed/playback       -> 405
-            //
-            // So we call playback on the SOURCE domain.
-            val playbackUrl = "$base/api/videos/$code/embed/playback"
-            Log.e(TAG, "Byse playbackUrl=$playbackUrl (source domain)")
+            // ---------- 2. Discover real playback path from SPA JS ----------
+            val discoveredPath = discoverPlaybackPath(base, code)
+            Log.e(TAG, "Byse discovered playback path = $discoveredPath")
 
-            val playbackHeaders = mapOf(
+            // ---------- 3. Playback: try many candidate URLs & methods ----------
+            val headers = mapOf(
                 "Referer" to "$base/e/$code",
                 "Origin" to base,
                 "x-embed-parent" to url,
@@ -445,62 +508,47 @@ open class ByseSX : ExtractorApi() {
                         "AppleWebKit/537.36 (KHTML, like Gecko) " +
                         "Chrome/133.0.0.0 Safari/537.36"
             )
-            Log.e(TAG, "Byse playback headers=$playbackHeaders")
+
+            val candidates = mutableListOf<Pair<String, String>>()
+
+            // If JS told us a specific path, put it first.
+            if (!discoveredPath.isNullOrBlank()) {
+                candidates += "discovered-$base" to "$base$discoveredPath"
+                candidates += "discovered-$embedBase" to "$embedBase$discoveredPath"
+            }
+
+            // Common variants on both source and CDN domains.
+            for (host in listOf(base, embedBase)) {
+                candidates += "embed-playback-$host" to "$host/api/videos/$code/embed/playback"
+                candidates += "embed-playback-id-$host" to "$host/api/videos/${details.id}/embed/playback"
+                candidates += "playback-$host" to "$host/api/videos/$code/playback"
+                candidates += "embed-source-$host" to "$host/api/videos/$code/embed/source"
+                candidates += "embed-sources-$host" to "$host/api/videos/$code/embed/sources"
+                candidates += "embed-stream-$host" to "$host/api/videos/$code/embed/stream"
+                candidates += "embed-video-$host" to "$host/api/videos/$code/embed/video"
+                candidates += "api-embed-$host" to "$host/api/embed/$code/playback"
+                candidates += "api-embed-playback-$host" to "$host/api/embed/playback/$code"
+            }
 
             var playbackBody: String? = null
-
-            // Try POST first (typical for playback endpoints that may consume a token).
-            try {
-                Log.e(TAG, "Byse playback attempting POST")
-                val r = app.post(playbackUrl, headers = playbackHeaders, data = mapOf())
-                Log.e(TAG, "Byse playback POST code=${r.code}")
-                Log.e(TAG, "Byse playback POST body=${r.text.take(1500)}")
-                if (r.code in 200..299) {
-                    playbackBody = r.text
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Byse playback POST FAILED: ${e.message}", e)
-            }
-
-            // Fall back to GET if POST didn't succeed.
-            if (playbackBody == null) {
-                try {
-                    Log.e(TAG, "Byse playback POST failed, attempting GET")
-                    val r = app.get(playbackUrl, headers = playbackHeaders)
-                    Log.e(TAG, "Byse playback GET code=${r.code}")
-                    Log.e(TAG, "Byse playback GET body=${r.text.take(1500)}")
-                    if (r.code in 200..299) {
-                        playbackBody = r.text
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Byse playback GET FAILED: ${e.message}", e)
-                }
-            }
-
-            // Last-ditch fallback: try the CDN domain anyway (in case API moves back there later).
-            if (playbackBody == null) {
-                val cdnUrl = "$embedBase/api/videos/$code/embed/playback"
-                Log.e(TAG, "Byse playback source domain failed, trying CDN fallback: $cdnUrl")
-                try {
-                    val r = app.post(cdnUrl, headers = playbackHeaders, data = mapOf())
-                    Log.e(TAG, "Byse playback CDN POST code=${r.code}")
-                    Log.e(TAG, "Byse playback CDN POST body=${r.text.take(1500)}")
-                    if (r.code in 200..299) {
-                        playbackBody = r.text
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Byse playback CDN POST FAILED: ${e.message}", e)
+            for ((label, candidateUrl) in candidates) {
+                Log.e(TAG, "Byse trying candidate [$label] -> $candidateUrl")
+                playbackBody = tryEndpoint(candidateUrl, headers, label)
+                if (playbackBody != null) {
+                    Log.e(TAG, "Byse SUCCESS on candidate [$label] -> $candidateUrl")
+                    break
                 }
             }
 
             if (playbackBody == null) {
-                Log.e(TAG, "Byse FAILED: no playback endpoint returned a 2xx response")
+                Log.e(TAG, "Byse FAILED: no candidate endpoint returned 2xx")
                 return
             }
 
+            // ---------- 4. Parse, decrypt, emit ----------
             val playbackRoot = tryParseJson<BysePlaybackRoot>(playbackBody)
             if (playbackRoot == null) {
-                Log.e(TAG, "Byse FAILED: playbackRoot parse returned null")
+                Log.e(TAG, "Byse FAILED: playbackRoot parse returned null. Body was: ${playbackBody.take(500)}")
                 return
             }
 
@@ -511,8 +559,7 @@ open class ByseSX : ExtractorApi() {
             Log.e(TAG, "Byse playback payload length=${playback.payload.length}")
 
             if (playback.keyParts.size < 2) {
-                Log.e(TAG, "Byse FAILED: keyParts size < 2")
-                return
+                Log.e(TAG, "Byse FAILED: keyParts size < 2"); return
             }
 
             val keyPart0 = b64UrlDecode(playback.keyParts[0], "key0")
@@ -542,21 +589,15 @@ open class ByseSX : ExtractorApi() {
 
             val jsonStr = String(decrypted, StandardCharsets.UTF_8)
                 .let { if (it.startsWith("\uFEFF")) it.substring(1) else it }
-
             Log.e(TAG, "Byse decrypted JSON=${jsonStr.take(2000)}")
 
             val parsedDecrypt = tryParseJson<BysePlaybackDecrypt>(jsonStr)
             if (parsedDecrypt == null) {
-                Log.e(TAG, "Byse FAILED: tryParseJson returned null")
-                return
+                Log.e(TAG, "Byse FAILED: tryParseJson returned null"); return
             }
 
             val sources = parsedDecrypt.sources
             Log.e(TAG, "Byse sources count=${sources.size}")
-
-            if (sources.isEmpty()) {
-                Log.e(TAG, "Byse WARNING: sources list empty")
-            }
 
             sources.forEachIndexed { index, source ->
                 Log.e(TAG, "Byse source[$index] quality=${source.quality} label=${source.label}")
