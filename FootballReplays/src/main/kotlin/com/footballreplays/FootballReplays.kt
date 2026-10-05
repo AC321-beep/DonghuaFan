@@ -12,8 +12,7 @@ class FootballReplays : MainAPI() {
     override var lang = "en"
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Others)
-    
-    // REORDERED AND RENAMED MAIN PAGE CATEGORIES
+
     override val mainPage = mainPageOf(
         "${mainUrl}/international/" to "FIFA/International",
         "${mainUrl}/uefa/" to "UEFA",
@@ -28,8 +27,11 @@ class FootballReplays : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val siteurl = if (page > 1) "${request.data.removeSuffix("/")}/page/$page/" else request.data
+        Log.e(TAG, "getMainPage page=$page request.name=${request.name} siteurl=$siteurl")
+
         val document = app.get(siteurl).document
         val home = document.select("div.p-wrap").mapNotNull { it.toMainPageResult() }
+        Log.e(TAG, "getMainPage items=${home.size}")
 
         return newHomePageResponse(
             list = HomePageList(
@@ -43,8 +45,10 @@ class FootballReplays : MainAPI() {
     private fun Element.toMainPageResult(): SearchResponse? {
         val isnot = this.selectFirst("a.p-category")?.attr("href")?.contains("/news/") == true
         val categoryId = this.selectFirst("a.p-category")?.className()
-        if (isnot || categoryId?.contains("category-id-283") == true) return null
-
+        if (isnot || categoryId?.contains("category-id-283") == true) {
+            Log.e(TAG, "toMainPageResult skipped (news or category-283)")
+            return null
+        }
         return toRecommendationResult()
     }
 
@@ -54,9 +58,11 @@ class FootballReplays : MainAPI() {
         } else {
             "$mainUrl/page/$page/?s=$query"
         }
+        Log.e(TAG, "search query=$query page=$page url=$url")
 
         val document = app.get(url).document
         val aramaCevap = document.select("div.p-wrap").mapNotNull { it.toMainPageResult() }
+        Log.e(TAG, "search results=${aramaCevap.size}")
 
         return newSearchResponseList(aramaCevap, hasNext = true)
     }
@@ -64,34 +70,54 @@ class FootballReplays : MainAPI() {
     override suspend fun quickSearch(query: String): List<SearchResponse>? = search(query)
 
     override suspend fun load(url: String): LoadResponse? {
+        Log.e(TAG, "===== load START url=$url =====")
         val document = app.get(url).document
 
-        val title = document.selectFirst("h1.s-title")?.text()?.trim() ?: return null
+        val title = document.selectFirst("h1.s-title")?.text()?.trim() ?: run {
+            Log.e(TAG, "load FAILED: title not found")
+            return null
+        }
+        Log.e(TAG, "load title=$title")
+
         val poster = fixUrlNull(document.selectFirst("div.s-feat img")?.attr("src"))
+        Log.e(TAG, "load poster=$poster")
+
         val year = document.selectFirst("time.updated-date")?.attr("datetime")?.substringBefore("-")?.toIntOrNull()
-        
-        // Grab the raw description
+        Log.e(TAG, "load year=$year")
+
         val rawDescription = document.selectFirst("meta[property=og:description]")?.attr("content")?.trim() ?: ""
-        
-        // 1. Try to find the exact "Kick-off" time buried in the description
+        Log.e(TAG, "load rawDescription=${rawDescription.take(300)}")
+
         val kickOffRegex = Regex("""Kick-off:\s*([^.]+)""", RegexOption.IGNORE_CASE)
         val kickOffMatch = kickOffRegex.find(rawDescription)?.groupValues?.getOrNull(1)
+        Log.e(TAG, "load kickOffMatch=$kickOffMatch")
 
-        // 2. Fallback to the web article date, but strip the ugly "Last updated: " text
         val fallbackDate = document.selectFirst("time.updated-date")?.text()
             ?.replace("Last updated:", "", ignoreCase = true)?.trim()
+        Log.e(TAG, "load fallbackDate=$fallbackDate")
 
-        // Choose the best available date
         val displayDate = kickOffMatch ?: fallbackDate
+        Log.e(TAG, "load displayDate=$displayDate")
 
         val episodes = mutableListOf<Episode>()
-        document.select("table.video-table").forEach { table ->
+        document.select("table.video-table").forEachIndexed { tIdx, table ->
             val sourceName = table.selectFirst("thead tr th[colspan]")?.text()?.trim() ?: "Source"
-            table.select("tbody tr").forEach { tr ->
+            Log.e(TAG, "load table[$tIdx] sourceName=$sourceName")
+
+            table.select("tbody tr").forEachIndexed { rIdx, tr ->
                 val part = tr.select("td").firstOrNull()?.text()?.trim() ?: "Video"
-                val onclickAttr = tr.selectFirst("a.play-button")?.attr("onclick") ?: return@forEach
+                val onclickAttr = tr.selectFirst("a.play-button")?.attr("onclick") ?: run {
+                    Log.e(TAG, "load table[$tIdx] row[$rIdx] no play-button")
+                    return@forEachIndexed
+                }
+                Log.e(TAG, "load table[$tIdx] row[$rIdx] onclick=$onclickAttr")
+
                 val regex = Regex("""loadVideo\('([^']+)'\)""")
-                val videoUrl = regex.find(onclickAttr)?.groupValues?.get(1) ?: return@forEach
+                val videoUrl = regex.find(onclickAttr)?.groupValues?.get(1) ?: run {
+                    Log.e(TAG, "load table[$tIdx] row[$rIdx] loadVideo regex failed")
+                    return@forEachIndexed
+                }
+                Log.e(TAG, "load table[$tIdx] row[$rIdx] videoUrl=$videoUrl")
 
                 val episodeData = "$videoUrl|$sourceName - $part"
                 val currentEpisodeSize = episodes.size
@@ -105,7 +131,8 @@ class FootballReplays : MainAPI() {
             }
         }
 
-        // PERFECTLY FORMATTED SYNOPSIS
+        Log.e(TAG, "load total episodes=${episodes.size}")
+
         val plotText = buildString {
             if (!displayDate.isNullOrBlank()) {
                 append("🕒 Match Date: $displayDate\n\n")
@@ -116,7 +143,7 @@ class FootballReplays : MainAPI() {
             append("📡 Available Streams: ${episodes.size}")
         }
 
-        Log.d("FootballReplays", "Title: $title | Url: $url")
+        Log.e(TAG, "===== load SUCCESS title=$title episodes=${episodes.size} =====")
 
         return newTvSeriesLoadResponse(title, url, TvType.Others, episodes) {
             this.posterUrl = poster
@@ -127,7 +154,6 @@ class FootballReplays : MainAPI() {
         }
     }
 
-    // HOME PAGE CARD FORMATTER
     private fun Element.toRecommendationResult(): SearchResponse? {
         val baseTitle = this.selectFirst("h4.entry-title a, a.p-flink")?.attr("title")
             ?.takeIf { it.isNotBlank() } ?: this.selectFirst("h4.entry-title a")?.text()?.trim()
@@ -135,11 +161,9 @@ class FootballReplays : MainAPI() {
         val href = fixUrlNull(this.selectFirst("a.p-flink, h4.entry-title a")?.attr("href")) ?: return null
         val posterUrl = fixUrlNull(this.selectFirst("div.p-featured img")?.attr("src"))
 
-        // Grab the date from the homepage card and clean it up
         val dateText = this.selectFirst("time")?.text()
             ?.replace("Last updated:", "", ignoreCase = true)?.trim()
 
-        // Combine title and date for a perfect UI display (e.g. "Team A vs Team B • 28/06/2026")
         val displayTitle = if (!dateText.isNullOrBlank()) {
             "$baseTitle • $dateText"
         } else {
@@ -157,14 +181,26 @@ class FootballReplays : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        Log.e(TAG, "===== loadLinks START =====")
+        Log.e(TAG, "loadLinks raw data=$data")
+
         val parts = data.split("|")
-        val videoUrl = parts.getOrNull(0) ?: return false
+        val videoUrl = parts.getOrNull(0) ?: run {
+            Log.e(TAG, "loadLinks FAILED: no videoUrl part")
+            return false
+        }
         val customName = parts.getOrNull(1) ?: "Video"
         val iframeUrl = if (videoUrl.startsWith("//")) "https:$videoUrl" else videoUrl
-        
-        Log.d("FootballReplays", "Iframe Url: $iframeUrl")
 
+        Log.e(TAG, "loadLinks videoUrl=$videoUrl")
+        Log.e(TAG, "loadLinks customName=$customName")
+        Log.e(TAG, "loadLinks iframeUrl=$iframeUrl")
+
+        var emitted = 0
         loadExtractor(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
+            emitted++
+            Log.e(TAG, "loadLinks EMITTED #$emitted url=${link.url.take(200)} type=${link.type} name=${link.name}")
+
             val extractedLink = ExtractorLink(
                 source = customName,
                 name = customName,
@@ -177,6 +213,7 @@ class FootballReplays : MainAPI() {
             callback(extractedLink)
         }
 
+        Log.e(TAG, "===== loadLinks END emitted=$emitted =====")
         return true
     }
 }
