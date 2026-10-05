@@ -4,6 +4,7 @@ import android.util.Log
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
@@ -20,7 +21,22 @@ internal const val TAG = "FootballReplays"
 
 private const val BYSE_UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-    "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+
+/**
+ * Full Chrome 154 client-hint header set. Sending these makes the request look
+ * indistinguishable from a real Chrome XHR, which is required for WAFs that
+ * gate on sec-ch-ua / sec-fetch-* presence.
+ */
+private val CHROME_HINTS = mapOf(
+    "sec-ch-ua" to "\"Chromium\";v=\"154\", \"Google Chrome\";v=\"154\", \"Not A(Brand\";v=\"99\"",
+    "sec-ch-ua-mobile" to "?0",
+    "sec-ch-ua-platform" to "\"Windows\"",
+    "accept-language" to "en-US,en;q=0.9",
+    "cache-control" to "no-cache",
+    "pragma" to "no-cache",
+    "priority" to "u=1, i"
+)
 
 // ==========================================
 // HQCloud & HQLinks Extractors
@@ -187,7 +203,7 @@ open class VkExtractor : ExtractorApi() {
 class VkCom : VkExtractor() { override var mainUrl = "https://vk.com" }
 
 // ==========================================
-// Byse Extractor — Hybrid: WebView attest + Kotlin playback
+// Byse Extractor — Chrome-mimic + CloudflareKiller
 // ==========================================
 
 open class ByseSX : ExtractorApi() {
@@ -293,6 +309,26 @@ open class ByseSX : ExtractorApi() {
         return parsed.sources.isNotEmpty()
     }
 
+    /** Build the full Chrome header set for a given (origin, referer, parent) triple. */
+    private fun chromeHeaders(
+        origin: String,
+        referer: String,
+        embedParent: String,
+        contentTypeJson: Boolean = false
+    ): Map<String, String> {
+        val h = mutableMapOf<String, String>()
+        h.putAll(CHROME_HINTS)
+        h["Accept"] = if (contentTypeJson) "application/json, text/plain, */*" else "*/*"
+        h["Origin"] = origin
+        h["Referer"] = referer
+        h["User-Agent"] = BYSE_UA
+        h["x-embed-origin"] = "footreplays.com"
+        h["x-embed-parent"] = embedParent
+        h["x-embed-referer"] = "https://www.footreplays.com/"
+        if (contentTypeJson) h["Content-Type"] = "application/json"
+        return h
+    }
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -308,19 +344,20 @@ open class ByseSX : ExtractorApi() {
             val base = "${uri.scheme}://${uri.host}"
 
             // ---------- 1. Details ----------
-            val detailsHeaders = mapOf(
-                "Accept" to "*/*",
-                "Accept-Language" to "en-US,en;q=0.9",
-                "Referer" to "$base/e/$code",
-                "Origin" to base,
-                "x-embed-origin" to "footreplays.com",
-                "x-embed-parent" to "$base/e/$code",
-                "x-embed-referer" to "https://www.footreplays.com/",
-                "User-Agent" to BYSE_UA
+            // Full Chrome headers on the details call.
+            val detailsHeaders = chromeHeaders(
+                origin = base,
+                referer = "$base/e/$code",
+                embedParent = "$base/e/$code",
+                contentTypeJson = false
             )
+            Log.e(TAG, "Byse details headers=$detailsHeaders")
+
             val detailsResp = app.get("$base/api/videos/$code/embed/details", headers = detailsHeaders)
             Log.e(TAG, "Byse details code=${detailsResp.code}")
             Log.e(TAG, "Byse details body=${detailsResp.text.take(500)}")
+            Log.e(TAG, "Byse details x-byse-server=${detailsResp.headers["x-byse-server"]}")
+            Log.e(TAG, "Byse details set-cookie=${detailsResp.headers["set-cookie"]}")
 
             val details = detailsResp.parsedSafe<ByseDetailsRoot>()
                 ?: run { Log.e(TAG, "Byse FAILED: details null"); return }
@@ -331,83 +368,76 @@ open class ByseSX : ExtractorApi() {
 
             val embedBase = "${URI(embedFrameUrl).scheme}://${URI(embedFrameUrl).host}"
 
-            // ---------- 2. Warm-up ----------
-            // IMPORTANT: the CDN iframe only runs its SPA when its path starts with /e/.
-            // Loading https://n1mwq.org/<slug>/<code> makes the SPA bail out immediately
-            // because path.indexOf('/e/') !== 0. We must load the SPA SHELL on the source
-            // domain ($base/e/$code), which then embeds the CDN iframe in the right context.
+            // ---------- 2. Warm-up: CloudflareKiller first, WebViewResolver as fallback ----------
             var attest: AttestData? = null
             val shellUrl = "$base/e/$code"
-            val primeHeaders = mapOf(
-                "Referer" to "https://www.footreplays.com/",
-                "User-Agent" to BYSE_UA
-            )
 
-            // --- 2a. Prime: load SPA shell WITHOUT interception. Let it run its bootstrap
-            // and fire the challenge/attest XHRs internally. ---
+            // 2a. Try CloudflareKiller — solves WAF without needing a full SPA run.
             try {
-                Log.e(TAG, "Byse prime: loading SPA shell $shellUrl (no interception)")
-                val p = app.get(shellUrl, headers = primeHeaders)
-                Log.e(TAG, "Byse prime done: url=${p.url} len=${p.text.length}")
-            } catch (e: Exception) {
-                Log.e(TAG, "Byse prime FAILED: ${e.message}")
-            }
+                Log.e(TAG, "Byse warm-up [CK]: CloudflareKiller on $shellUrl")
+                val ck = app.get(shellUrl, interceptor = CloudflareKiller())
+                Log.e(TAG, "Byse warm-up [CK] url=${ck.url}")
+                Log.e(TAG, "Byse warm-up [CK] code=${ck.code} len=${ck.text.length}")
+                Log.e(TAG, "Byse warm-up [CK] set-cookie=${ck.headers["set-cookie"]}")
+                Log.e(TAG, "Byse warm-up [CK] head=${ck.text.take(400)}")
 
-            kotlinx.coroutines.delay(10_000L)
-
-            // --- 2b. Diagnostic: intercept ANY /api/videos/ call to see where SPA stopped ---
-            try {
-                Log.e(TAG, "Byse diag: intercepting /api/videos/*")
-                val d = app.get(
-                    shellUrl,
-                    interceptor = WebViewResolver(Regex(""".*/api/videos/.*""")),
-                    headers = primeHeaders
-                )
-                Log.e(TAG, "Byse diag url=${d.url}")
-                Log.e(TAG, "Byse diag body=${d.text.take(600)}")
-
-                when {
-                    d.url.contains("/access/attest") -> {
-                        attest = parseAttest(d.text)
-                        Log.e(TAG, "Byse diag: attest captured. captcha=${attest?.captchaToken?.take(30)} fp=${attest?.fingerprintToken?.take(30)}")
-                    }
-                    d.url.contains("/access/challenge") ->
-                        Log.e(TAG, "Byse diag: SPA reached /challenge but not /attest (PoW incomplete)")
-                    d.url.contains("/embed/settings") ->
-                        Log.e(TAG, "Byse diag: SPA only reached /settings (challenge never started)")
-                    else ->
-                        Log.e(TAG, "Byse diag: SPA made no matching API call (url=${d.url})")
+                if (ck.text.contains("\"key_parts\"") || ck.text.contains("fingerprint_token")) {
+                    attest = parseAttest(ck.text)
+                    Log.e(TAG, "Byse warm-up [CK] parsed: captcha=${attest?.captchaToken?.take(30)} fp=${attest?.fingerprintToken?.take(30)}")
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Byse diag FAILED: ${e.message}")
+                Log.e(TAG, "Byse warm-up [CK] FAILED: ${e.message}")
             }
 
-            // --- 2c. Narrow retry for /access/attest if diag didn't catch it ---
+            // 2b. Try CloudflareKiller on the CDN iframe URL, which is where /captcha lives.
             if (attest?.captchaToken == null || attest?.fingerprintToken == null) {
                 try {
-                    Log.e(TAG, "Byse warm-up retry: narrow intercept /access/attest")
-                    val resp = app.get(
+                    Log.e(TAG, "Byse warm-up [CK2]: CloudflareKiller on $embedFrameUrl")
+                    val ck2 = app.get(embedFrameUrl, interceptor = CloudflareKiller())
+                    Log.e(TAG, "Byse warm-up [CK2] url=${ck2.url}")
+                    Log.e(TAG, "Byse warm-up [CK2] code=${ck2.code} len=${ck2.text.length}")
+                    Log.e(TAG, "Byse warm-up [CK2] head=${ck2.text.take(400)}")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Byse warm-up [CK2] FAILED: ${e.message}")
+                }
+            }
+
+            // 2c. Fall back to WebViewResolver (previous approach).
+            if (attest?.captchaToken == null || attest?.fingerprintToken == null) {
+                try {
+                    Log.e(TAG, "Byse warm-up [WV]: WebViewResolver on $shellUrl")
+                    val wv = app.get(
                         shellUrl,
-                        interceptor = WebViewResolver(Regex(""".*/api/videos/access/attest.*""")),
-                        headers = primeHeaders
+                        interceptor = WebViewResolver(Regex(""".*/api/videos/.*""")),
+                        headers = mapOf(
+                            "Referer" to "https://www.footreplays.com/",
+                            "User-Agent" to BYSE_UA
+                        )
                     )
-                    Log.e(TAG, "Byse warm-up retry url=${resp.url} code=${resp.code}")
-                    Log.e(TAG, "Byse warm-up retry body=${resp.text.take(800)}")
-                    if (resp.url.contains("/access/attest")) {
-                        attest = parseAttest(resp.text)
-                        Log.e(TAG, "Byse warm-up retry parsed: captcha=${attest?.captchaToken?.take(30)} fp=${attest?.fingerprintToken?.take(30)}")
+                    Log.e(TAG, "Byse warm-up [WV] url=${wv.url}")
+                    Log.e(TAG, "Byse warm-up [WV] body=${wv.text.take(500)}")
+                    if (wv.url.contains("/access/attest")) {
+                        attest = parseAttest(wv.text)
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Byse warm-up retry FAILED: ${e.message}")
+                    Log.e(TAG, "Byse warm-up [WV] FAILED: ${e.message}")
                 }
             }
 
             kotlinx.coroutines.delay(2_000L)
 
-            // ---------- 3. Path A: Kotlin POST /playback using captured tokens ----------
+            // ---------- 3. Path A: Kotlin POST /captcha and /playback using captured tokens ----------
             val a = attest
             if (a != null && a.captchaToken != null && a.fingerprintToken != null) {
                 Log.e(TAG, "Byse Path A: direct POST /playback in Kotlin")
+
+                val playbackHeaders = chromeHeaders(
+                    origin = embedBase,
+                    referer = embedFrameUrl,
+                    embedParent = "$base/e/$code",
+                    contentTypeJson = true
+                ) + mapOf("x-captcha-token" to a.captchaToken)
+
                 try {
                     val bodyMap = mapOf(
                         "fingerprint" to mapOf(
@@ -420,17 +450,7 @@ open class ByseSX : ExtractorApi() {
 
                     val playbackResp = app.post(
                         "$embedBase/api/videos/$code/embed/playback",
-                        headers = mapOf(
-                            "Accept" to "*/*",
-                            "Accept-Language" to "en-US,en;q=0.9",
-                            "Origin" to embedBase,
-                            "Referer" to embedFrameUrl,
-                            "User-Agent" to BYSE_UA,
-                            "x-captcha-token" to a.captchaToken,
-                            "x-embed-origin" to "footreplays.com",
-                            "x-embed-parent" to "$base/e/$code",
-                            "x-embed-referer" to "https://www.footreplays.com/"
-                        ),
+                        headers = playbackHeaders,
                         json = bodyMap
                     )
                     Log.e(TAG, "Byse Path A playback.code=${playbackResp.code}")
@@ -452,13 +472,16 @@ open class ByseSX : ExtractorApi() {
                 Log.e(TAG, "Byse Path A skipped: captcha/fingerprint missing from attest")
             }
 
-            // ---------- 4. Path B: WebView load SPA shell, intercept /playback ----------
-            Log.e(TAG, "Byse Path B: loading SPA shell $shellUrl, intercepting /playback")
+            // ---------- 4. Path B: CloudflareKiller-loaded SPA, intercept /playback ----------
+            Log.e(TAG, "Byse Path B: SPA load with intercept for /playback")
             val wv = try {
                 app.get(
                     shellUrl,
                     interceptor = WebViewResolver(Regex(""".*/api/videos/[^/]+/embed/playback.*""")),
-                    headers = primeHeaders
+                    headers = mapOf(
+                        "Referer" to "https://www.footreplays.com/",
+                        "User-Agent" to BYSE_UA
+                    )
                 )
             } catch (e: Exception) {
                 Log.e(TAG, "Byse Path B FAILED: ${e.message}", e)
