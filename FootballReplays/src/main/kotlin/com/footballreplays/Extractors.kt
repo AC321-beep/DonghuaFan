@@ -203,10 +203,6 @@ open class ByseSX : ExtractorApi() {
         return out
     }
 
-    /**
-     * Search recursively in an arbitrary JSON object for a value whose key contains
-     * any of the supplied substrings. Returns the first string match.
-     */
     private fun findString(json: JSONObject, vararg keySubstrings: String): String? {
         val stack = ArrayDeque<JSONObject>()
         stack.addLast(json)
@@ -232,7 +228,6 @@ open class ByseSX : ExtractorApi() {
         return null
     }
 
-    /** Pull x-captcha-token and fingerprint JWT out of the attest response. */
     private data class AttestData(
         val captchaToken: String?,
         val fingerprintToken: String?,
@@ -244,12 +239,10 @@ open class ByseSX : ExtractorApi() {
     private fun parseAttest(body: String): AttestData? {
         return try {
             val j = JSONObject(body)
-
             val captcha = findString(j, "captcha_token", "captchaToken", "x-captcha-token", "captcha")
             val fingerprint = findString(j, "fingerprint_token", "fingerprintToken", "fingerprint")
             val viewerId = findString(j, "viewer_id", "viewerId")
             val deviceId = findString(j, "device_id", "deviceId")
-
             AttestData(captcha, fingerprint, viewerId, deviceId, body)
         } catch (e: Exception) {
             Log.e(TAG, "Byse attest parse failed: ${e.message}")
@@ -257,7 +250,6 @@ open class ByseSX : ExtractorApi() {
         }
     }
 
-    /** Emit each decrypted source as an ExtractorLink. */
     private suspend fun emitFromPlaybackJson(
         playbackBody: String,
         embedFrameUrl: String,
@@ -329,7 +321,6 @@ open class ByseSX : ExtractorApi() {
             val detailsResp = app.get("$base/api/videos/$code/embed/details", headers = detailsHeaders)
             Log.e(TAG, "Byse details code=${detailsResp.code}")
             Log.e(TAG, "Byse details body=${detailsResp.text.take(500)}")
-            Log.e(TAG, "Byse details set-cookie=${detailsResp.headers["set-cookie"]}")
 
             val details = detailsResp.parsedSafe<ByseDetailsRoot>()
                 ?: run { Log.e(TAG, "Byse FAILED: details null"); return }
@@ -340,31 +331,77 @@ open class ByseSX : ExtractorApi() {
 
             val embedBase = "${URI(embedFrameUrl).scheme}://${URI(embedFrameUrl).host}"
 
-            // ---------- 2. WebView warm-up: intercept /access/attest ----------
-            // This is where the SPA exchanges a solved PoW for the x-captcha-token
-            // and the fingerprint JWT. We need both to POST /playback ourselves.
+            // ---------- 2. Warm-up ----------
+            // IMPORTANT: the CDN iframe only runs its SPA when its path starts with /e/.
+            // Loading https://n1mwq.org/<slug>/<code> makes the SPA bail out immediately
+            // because path.indexOf('/e/') !== 0. We must load the SPA SHELL on the source
+            // domain ($base/e/$code), which then embeds the CDN iframe in the right context.
             var attest: AttestData? = null
+            val shellUrl = "$base/e/$code"
+            val primeHeaders = mapOf(
+                "Referer" to "https://www.footreplays.com/",
+                "User-Agent" to BYSE_UA
+            )
+
+            // --- 2a. Prime: load SPA shell WITHOUT interception. Let it run its bootstrap
+            // and fire the challenge/attest XHRs internally. ---
             try {
-                Log.e(TAG, "Byse warm-up: intercepting /access/attest")
-                val attestResp = app.get(
-                    embedFrameUrl,
-                    interceptor = WebViewResolver(Regex(""".*/api/videos/access/attest.*""")),
-                    headers = mapOf(
-                        "Referer" to "https://www.footreplays.com/",
-                        "User-Agent" to BYSE_UA
-                    )
-                )
-                Log.e(TAG, "Byse warm-up attest.url=${attestResp.url}")
-                Log.e(TAG, "Byse warm-up attest.code=${attestResp.code}")
-                Log.e(TAG, "Byse warm-up attest.body=${attestResp.text.take(1000)}")
-                Log.e(TAG, "Byse warm-up attest.set-cookie=${attestResp.headers["set-cookie"]}")
-                attest = parseAttest(attestResp.text)
-                Log.e(TAG, "Byse attest parsed: captcha=${attest?.captchaToken?.take(40)} fingerprint=${attest?.fingerprintToken?.take(40)}")
+                Log.e(TAG, "Byse prime: loading SPA shell $shellUrl (no interception)")
+                val p = app.get(shellUrl, headers = primeHeaders)
+                Log.e(TAG, "Byse prime done: url=${p.url} len=${p.text.length}")
             } catch (e: Exception) {
-                Log.e(TAG, "Byse warm-up FAILED: ${e.message}")
+                Log.e(TAG, "Byse prime FAILED: ${e.message}")
             }
 
-            // Give the SPA a moment to finish PoW + fingerprint signing.
+            kotlinx.coroutines.delay(10_000L)
+
+            // --- 2b. Diagnostic: intercept ANY /api/videos/ call to see where SPA stopped ---
+            try {
+                Log.e(TAG, "Byse diag: intercepting /api/videos/*")
+                val d = app.get(
+                    shellUrl,
+                    interceptor = WebViewResolver(Regex(""".*/api/videos/.*""")),
+                    headers = primeHeaders
+                )
+                Log.e(TAG, "Byse diag url=${d.url}")
+                Log.e(TAG, "Byse diag body=${d.text.take(600)}")
+
+                when {
+                    d.url.contains("/access/attest") -> {
+                        attest = parseAttest(d.text)
+                        Log.e(TAG, "Byse diag: attest captured. captcha=${attest?.captchaToken?.take(30)} fp=${attest?.fingerprintToken?.take(30)}")
+                    }
+                    d.url.contains("/access/challenge") ->
+                        Log.e(TAG, "Byse diag: SPA reached /challenge but not /attest (PoW incomplete)")
+                    d.url.contains("/embed/settings") ->
+                        Log.e(TAG, "Byse diag: SPA only reached /settings (challenge never started)")
+                    else ->
+                        Log.e(TAG, "Byse diag: SPA made no matching API call (url=${d.url})")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Byse diag FAILED: ${e.message}")
+            }
+
+            // --- 2c. Narrow retry for /access/attest if diag didn't catch it ---
+            if (attest?.captchaToken == null || attest?.fingerprintToken == null) {
+                try {
+                    Log.e(TAG, "Byse warm-up retry: narrow intercept /access/attest")
+                    val resp = app.get(
+                        shellUrl,
+                        interceptor = WebViewResolver(Regex(""".*/api/videos/access/attest.*""")),
+                        headers = primeHeaders
+                    )
+                    Log.e(TAG, "Byse warm-up retry url=${resp.url} code=${resp.code}")
+                    Log.e(TAG, "Byse warm-up retry body=${resp.text.take(800)}")
+                    if (resp.url.contains("/access/attest")) {
+                        attest = parseAttest(resp.text)
+                        Log.e(TAG, "Byse warm-up retry parsed: captcha=${attest?.captchaToken?.take(30)} fp=${attest?.fingerprintToken?.take(30)}")
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Byse warm-up retry FAILED: ${e.message}")
+                }
+            }
+
             kotlinx.coroutines.delay(2_000L)
 
             // ---------- 3. Path A: Kotlin POST /playback using captured tokens ----------
@@ -372,8 +409,6 @@ open class ByseSX : ExtractorApi() {
             if (a != null && a.captchaToken != null && a.fingerprintToken != null) {
                 Log.e(TAG, "Byse Path A: direct POST /playback in Kotlin")
                 try {
-                    // Build the JSON body as a Kotlin Map; Cloudstream's `json=` param
-                    // serializes it to raw JSON with Content-Type: application/json.
                     val bodyMap = mapOf(
                         "fingerprint" to mapOf(
                             "token" to a.fingerprintToken,
@@ -400,7 +435,6 @@ open class ByseSX : ExtractorApi() {
                     )
                     Log.e(TAG, "Byse Path A playback.code=${playbackResp.code}")
                     Log.e(TAG, "Byse Path A playback.body=${playbackResp.text.take(600)}")
-                    Log.e(TAG, "Byse Path A playback.set-cookie=${playbackResp.headers["set-cookie"]}")
 
                     if (playbackResp.code in 200..299 &&
                         playbackResp.text.contains("\"key_parts\"")) {
@@ -418,16 +452,13 @@ open class ByseSX : ExtractorApi() {
                 Log.e(TAG, "Byse Path A skipped: captcha/fingerprint missing from attest")
             }
 
-            // ---------- 4. Path B: second WebView load, intercept /playback ----------
-            Log.e(TAG, "Byse Path B: second WebView load, intercepting /playback")
+            // ---------- 4. Path B: WebView load SPA shell, intercept /playback ----------
+            Log.e(TAG, "Byse Path B: loading SPA shell $shellUrl, intercepting /playback")
             val wv = try {
                 app.get(
-                    embedFrameUrl,
+                    shellUrl,
                     interceptor = WebViewResolver(Regex(""".*/api/videos/[^/]+/embed/playback.*""")),
-                    headers = mapOf(
-                        "Referer" to "https://www.footreplays.com/",
-                        "User-Agent" to BYSE_UA
-                    )
+                    headers = primeHeaders
                 )
             } catch (e: Exception) {
                 Log.e(TAG, "Byse Path B FAILED: ${e.message}", e)
