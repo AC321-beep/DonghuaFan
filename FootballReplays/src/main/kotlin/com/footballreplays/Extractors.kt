@@ -22,7 +22,7 @@ private const val BYSE_UA =
     "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
 // ==========================================
-// HQCloud & HQLinks Extractors (unchanged)
+// HQCloud & HQLinks Extractors
 // ==========================================
 
 open class HQCloud : ExtractorApi() {
@@ -87,7 +87,7 @@ open class HQCloud : ExtractorApi() {
             if (preferred != null) { finalUrl = preferred; break }
         }
 
-        if (finalUrl.isEmpty()) return
+        if (finalUrl.isEmpty()) { Log.e(TAG, "HQCloud FAILED: no finalUrl"); return }
 
         val cookieString = buildString {
             append("file_id=$fileId; aff=$aff; tsn=7")
@@ -105,7 +105,7 @@ open class HQCloud : ExtractorApi() {
 class HQLinks : HQCloud() { override var mainUrl = "https://hglink.to" }
 
 // ==========================================
-// VK Extractors (unchanged)
+// VK Extractors
 // ==========================================
 
 open class VkExtractor : ExtractorApi() {
@@ -114,7 +114,8 @@ open class VkExtractor : ExtractorApi() {
     override val requiresReferer = true
 
     override suspend fun getUrl(
-        url: String, referer: String?,
+        url: String,
+        referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
@@ -152,23 +153,32 @@ open class VkExtractor : ExtractorApi() {
         }
     }
 
-    private fun linkcikart(text: String, ua: String, callback: (ExtractorLink) -> Unit): Boolean {
+    private suspend fun linkcikart(
+        text: String,
+        ua: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
         var any = false
-        Regex("\"(hls|hls_ondemand|dash|dash_sep|dash_ondemand)\"\\s*:\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE)
-            .findAll(text).forEach { m ->
-                val t = m.groupValues[1].lowercase()
-                val u = m.groupValues[2].replace("\\", "")
-                if (u.isNotBlank()) {
-                    any = true
-                    val isDash = t.contains("dash")
-                    callback.invoke(newExtractorLink(
-                        "${name} ${if (isDash) "Dash" else "HLS"}",
-                        "${name} ${if (isDash) "Dash" else "HLS"}",
-                        u,
-                        if (isDash) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
-                    ) { this.referer = mainUrl; this.headers = mapOf("User-Agent" to ua, "Referer" to mainUrl) })
-                }
+        Regex(
+            "\"(hls|hls_ondemand|dash|dash_sep|dash_ondemand)\"\\s*:\\s*\"([^\"]+)\"",
+            RegexOption.IGNORE_CASE
+        ).findAll(text).forEach { m ->
+            val t = m.groupValues[1].lowercase()
+            val u = m.groupValues[2].replace("\\", "")
+            if (u.isNotBlank()) {
+                any = true
+                val isDash = t.contains("dash")
+                callback.invoke(newExtractorLink(
+                    "${name} ${if (isDash) "Dash" else "HLS"}",
+                    "${name} ${if (isDash) "Dash" else "HLS"}",
+                    u,
+                    if (isDash) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
+                ) {
+                    this.referer = mainUrl
+                    this.headers = mapOf("User-Agent" to ua, "Referer" to mainUrl)
+                })
             }
+        }
         return any
     }
 }
@@ -204,7 +214,8 @@ open class ByseSX : ExtractorApi() {
     )
 
     override suspend fun getUrl(
-        url: String, referer: String?,
+        url: String,
+        referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
@@ -238,14 +249,12 @@ open class ByseSX : ExtractorApi() {
 
             // ---------- 2a. Warm-up load ----------
             // Mimics the FIRST click: SPA runs settings -> challenge -> attest,
-            // stores the attestation token in memory/sessionStorage, but does NOT
-            // fire /playback yet. Discard the result.
+            // stores the attestation token, but does NOT fire /playback yet.
             Log.e(TAG, "Byse WebView: warm-up load (challenge/attest)")
             try {
                 app.get(
                     embedFrameUrl,
                     interceptor = WebViewResolver(
-                        // Match the settings response; that's as far as the SPA gets on first click.
                         Regex(""".*/api/videos/[^/]+/embed/settings.*""")
                     ),
                     headers = mapOf(
