@@ -135,20 +135,27 @@ open class HQCloud : ExtractorApi() {
                 .toList()
             Log.e(TAG, "HQCloud var[$idx] values=$values")
 
+            val httpValues = values.filter { it.startsWith("http") }
+            Log.e(TAG, "HQCloud var[$idx] httpValues=$httpValues")
+
+            // Prefer .m3u8 URLs; fall back to any http URL.
+            // This prevents picking up "hls3 ... master.txt" when "hls2 ... master.m3u8" exists.
+            val preferred = httpValues.firstOrNull { it.contains(".m3u8") }
+                ?: httpValues.firstOrNull()
+
+            if (preferred != null) {
+                finalUrl = preferred
+                Log.e(TAG, "HQCloud var[$idx] selected finalUrl=$finalUrl")
+                break
+            }
+
             val pathValue = values.firstOrNull {
                 it.startsWith("/") && !it.startsWith("/dl") && !it.startsWith("/assets")
             }
 
             if (pathValue != null) {
                 finalUrl = baseUrl + pathValue
-                Log.e(TAG, "HQCloud found path value=$pathValue -> finalUrl=$finalUrl")
-                break
-            }
-
-            val httpValue = values.firstOrNull { it.startsWith("http") }
-            if (httpValue != null) {
-                finalUrl = httpValue
-                Log.e(TAG, "HQCloud found http value -> finalUrl=$finalUrl")
+                Log.e(TAG, "HQCloud var[$idx] path value -> finalUrl=$finalUrl")
                 break
             }
         }
@@ -416,21 +423,51 @@ open class ByseSX : ExtractorApi() {
 
             val headers = mapOf(
                 "referer" to embedFrameUrl,
-                "x-embed-parent" to url
+                "Referer" to embedFrameUrl,
+                "Origin" to embedBase,
+                "x-embed-parent" to url,
+                "Accept" to "application/json, text/plain, */*",
+                "Content-Type" to "application/json"
             )
             Log.e(TAG, "Byse playback headers=$headers")
 
             val playbackUrl = "$embedBase/api/videos/$embedCode/embed/playback"
             Log.e(TAG, "Byse playbackUrl=$playbackUrl")
 
-            val playbackResponse = try {
-                app.get(playbackUrl, headers = headers)
+            // ---------- Playback request: POST first, GET fallback ----------
+            // The endpoint returns HTTP 405 for GET, so POST is required.
+            var playbackResponse: com.lagradost.cloudstream3.network.Response? = null
+
+            try {
+                Log.e(TAG, "Byse playback attempting POST (empty body)")
+                val r = app.post(playbackUrl, headers = headers, data = mapOf())
+                Log.e(TAG, "Byse playback POST code=${r.code}")
+                Log.e(TAG, "Byse playback POST body=${r.text.take(1500)}")
+                if (r.code in 200..299) {
+                    playbackResponse = r
+                }
             } catch (e: Exception) {
-                Log.e(TAG, "Byse playback get FAILED", e)
+                Log.e(TAG, "Byse playback POST FAILED: ${e.message}", e)
+            }
+
+            if (playbackResponse == null) {
+                try {
+                    Log.e(TAG, "Byse playback POST failed, attempting GET fallback")
+                    val r = app.get(playbackUrl, headers = headers)
+                    Log.e(TAG, "Byse playback GET code=${r.code}")
+                    Log.e(TAG, "Byse playback GET body=${r.text.take(1500)}")
+                    if (r.code in 200..299) {
+                        playbackResponse = r
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Byse playback GET FAILED: ${e.message}", e)
+                }
+            }
+
+            if (playbackResponse == null) {
+                Log.e(TAG, "Byse FAILED: playback request returned no success response")
                 return
             }
-            Log.e(TAG, "Byse playbackResponse code=${playbackResponse.code}")
-            Log.e(TAG, "Byse playbackResponse body=${playbackResponse.text.take(1500)}")
 
             val playbackRoot = playbackResponse.parsedSafe<BysePlaybackRoot>()
             if (playbackRoot == null) {
@@ -523,21 +560,6 @@ open class ByseSX : ExtractorApi() {
         }
     }
 }
-
-// ---- Byse rotating domain subclasses ----
-// These ensure Cloudstream's URL matcher recognises the extractor for common Byse domains.
-class Bysefujedu : ByseSX() { override var mainUrl = "https://bysefujedu.com" }
-class Bysebimahe : ByseSX() { override var mainUrl = "https://bysebimahe.com" }
-class Bysebuho   : ByseSX() { override var mainUrl = "https://bysebuho.com" }
-class Bysefast   : ByseSX() { override var mainUrl = "https://bysefast.com" }
-class Bysenexo   : ByseSX() { override var mainUrl = "https://bysenexo.com" }
-class Bysewiwo   : ByseSX() { override var mainUrl = "https://bysewiwo.com" }
-class Bysevipa   : ByseSX() { override var mainUrl = "https://bysevipa.com" }
-class Bysedopo   : ByseSX() { override var mainUrl = "https://bysedopo.com" }
-class Bysekuwo   : ByseSX() { override var mainUrl = "https://bysekuwo.com" }
-class Bysetego   : ByseSX() { override var mainUrl = "https://bysetego.com" }
-class Byseroxo   : ByseSX() { override var mainUrl = "https://byseroxo.com" }
-class Bysejaro   : ByseSX() { override var mainUrl = "https://bysejaro.com" }
 
 // ==========================================
 // Byse Data Classes
