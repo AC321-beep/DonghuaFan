@@ -524,6 +524,21 @@ open class ByseSX : ExtractorApi() {
     }
 }
 
+// ---- Byse rotating domain subclasses ----
+// These ensure Cloudstream's URL matcher recognises the extractor for common Byse domains.
+class Bysefujedu : ByseSX() { override var mainUrl = "https://bysefujedu.com" }
+class Bysebimahe : ByseSX() { override var mainUrl = "https://bysebimahe.com" }
+class Bysebuho   : ByseSX() { override var mainUrl = "https://bysebuho.com" }
+class Bysefast   : ByseSX() { override var mainUrl = "https://bysefast.com" }
+class Bysenexo   : ByseSX() { override var mainUrl = "https://bysenexo.com" }
+class Bysewiwo   : ByseSX() { override var mainUrl = "https://bysewiwo.com" }
+class Bysevipa   : ByseSX() { override var mainUrl = "https://bysevipa.com" }
+class Bysedopo   : ByseSX() { override var mainUrl = "https://bysedopo.com" }
+class Bysekuwo   : ByseSX() { override var mainUrl = "https://bysekuwo.com" }
+class Bysetego   : ByseSX() { override var mainUrl = "https://bysetego.com" }
+class Byseroxo   : ByseSX() { override var mainUrl = "https://byseroxo.com" }
+class Bysejaro   : ByseSX() { override var mainUrl = "https://bysejaro.com" }
+
 // ==========================================
 // Byse Data Classes
 // ==========================================
