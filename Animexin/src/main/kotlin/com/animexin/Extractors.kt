@@ -1,163 +1,590 @@
-package com.Animexin
+package com.footballreplays
 
-import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.extractors.Filesim
-import com.lagradost.cloudstream3.extractors.StreamSB
-import com.lagradost.cloudstream3.extractors.StreamWishExtractor
+import android.util.Log
+import com.fasterxml.jackson.annotation.JsonProperty
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
-import org.json.JSONObject
+import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import java.net.URI
+import java.net.URLEncoder
+import java.nio.charset.StandardCharsets
+import java.util.Base64
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
-class FileMoonSx : Filesim() {
-    override val name = "FileMoonSx"
-    override val mainUrl = "https://filemoon.sx"
-}
+internal const val TAG = "FootballReplays"
 
-class Waaw : StreamSB() {
-    override var mainUrl = "https://waaw.to"
-}
+// ==========================================
+// HQCloud & HQLinks Extractors
+// ==========================================
 
-class Wishfast : StreamWishExtractor() {
-    override val name = "StreamWish"
-    override val mainUrl = "https://wishfast.top"
-}
-
-class Vtbe : ExtractorApi() {
-    override val name = "Vtbe"
-    override val mainUrl = "https://vtbe.to"
+open class HQCloud : ExtractorApi() {
+    override val name = "HQCloud"
+    override val mainUrl = "https://hgcloud.to"
     override val requiresReferer = true
 
-    override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
-        try {
-            val response = app.get(url, referer = mainUrl).document
-            val script = response.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return null
-            val unpacked = JsUnpacker(script).unpack() ?: return null
-            val link = Regex("""sources:\s*\[\s*\{\s*file:\s*['"](.*?)['"]""").find(unpacked)?.groupValues?.get(1) ?: return null
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        Log.e(TAG, "===== START HQCloud =====")
+        Log.e(TAG, "HQCloud input url=$url referer=$referer")
 
-            return listOf(
-                ExtractorLink(
-                    source = name,
-                    name = name,
-                    url = link,
-                    referer = referer ?: mainUrl,
-                    quality = Qualities.Unknown.value,
-                    type = ExtractorLinkType.M3U8
-                )
-            )
-        } catch (e: Exception) {
-            return null
+        val path = Regex("""(https?://[^/]+)(/[^?]+)""").find(url)?.groupValues?.get(2) ?: ""
+        Log.e(TAG, "HQCloud extracted path=$path")
+
+        if (path.isEmpty()) {
+            Log.e(TAG, "HQCloud FAILED: could not extract path from url")
+            return
         }
-    }
-}
 
-class OkRu : ExtractorApi() {
-    override val name = "OkRu" 
-    override val mainUrl = "https://ok.ru"
-    override val requiresReferer = false
+        val domains = listOf(
+            "audinifer.com",
+            "vibuxere.com",
+            "streamhg.com",
+            "dhcplay.com",
+            "cybervynx.com"
+        )
 
-    override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
-        try {
-            val id = Regex("""/video(?:embed)?/(\d+)""").find(url)?.groupValues?.get(1) ?: url.substringAfterLast("/").substringBefore("?")
-            if (id.isBlank()) return null
+        var html = ""
+        var baseUrl = ""
 
-            val jsonStr = app.post("https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id").text
-            if (!jsonStr.startsWith("{")) return null
-            val json = JSONObject(jsonStr)
-
-            val links = mutableListOf<ExtractorLink>()
-            val videos = json.optJSONArray("videos")
-            
-            if (videos != null && videos.length() > 0) {
-                for (i in 0 until videos.length()) {
-                    val video = videos.getJSONObject(i)
-                    val qName = video.optString("name").lowercase()
-                    val vidUrl = video.optString("url")
-
-                    if (vidUrl.isBlank() || vidUrl.contains("usr_login")) continue
-
-                    val qualityValue = when (qName) {
-                        "mobile" -> Qualities.P144.value
-                        "lowest" -> Qualities.P240.value
-                        "low" -> Qualities.P360.value
-                        "sd" -> Qualities.P480.value
-                        "hd" -> Qualities.P720.value
-                        "full" -> Qualities.P1080.value
-                        "quad" -> Qualities.P1440.value
-                        "ultra" -> Qualities.P2160.value
-                        else -> Qualities.Unknown.value
-                    }
-
-                    links.add(
-                        newExtractorLink(name = "${this.name} MP4", source = "${this.name} MP4", url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"), type = INFER_TYPE) {
-                            this.referer = "https://ok.ru/"
-                            this.quality = qualityValue
-                        }
-                    )
+        for (domain in domains) {
+            val newUrl = "https://$domain$path"
+            Log.e(TAG, "HQCloud trying domain=$domain url=$newUrl")
+            try {
+                val response = app.get(newUrl, referer = "https://hgcloud.to/")
+                Log.e(TAG, "HQCloud response code=${response.code} length=${response.text.length}")
+                if (response.text.length > 2000) {
+                    html = response.text
+                    baseUrl = "https://$domain"
+                    Log.e(TAG, "HQCloud SUCCESS using domain=$domain")
+                    break
+                } else {
+                    Log.e(TAG, "HQCloud response too short (${response.text.length}), skipping")
                 }
+            } catch (e: Exception) {
+                Log.e(TAG, "HQCloud domain fail: $domain", e)
             }
-
-            val hlsUrl = json.optString("hlsManifestUrl")
-            if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
-                links.addAll(M3u8Helper.generateM3u8("$name HLS", hlsUrl.replace("\\u0026", "&").replace("\\/", "/"), url))
-            }
-
-            return links
-        } catch (e: Exception) {
-            return null
         }
+
+        if (html.length < 2000) {
+            Log.e(TAG, "HQCloud FAILED: no valid html found (final length=${html.length})")
+            return
+        }
+
+        Log.e(TAG, "HQCloud baseUrl=$baseUrl")
+
+        val fileId = Regex("""\$\.cookie\('file_id',\s*'([^']+)'""").find(html)?.groupValues?.get(1)
+        if (fileId == null) {
+            Log.e(TAG, "HQCloud FAILED: fileId not found in html")
+            return
+        }
+        Log.e(TAG, "HQCloud fileId=$fileId")
+
+        val aff = Regex("""\$\.cookie\('aff',\s*'([^']+)'""").find(html)?.groupValues?.get(1) ?: ""
+        Log.e(TAG, "HQCloud aff=$aff")
+
+        val refUrl = Regex("""\$\.cookie\('ref_url',\s*'([^']+)'""").find(html)?.groupValues?.get(1)
+        Log.e(TAG, "HQCloud refUrl=$refUrl")
+
+        val packerRegex = Regex(
+            """(?s)eval\(function\(p,a,c,k,e,d\)\{.*?\}\('((?:[^'\\]|\\.)*)',\s*\d+,\s*\d+,\s*'((?:[^'\\]|\\.)*)'\s*(?:\.split\('\|'\))?\)"""
+        )
+        val match = packerRegex.find(html)
+        if (match == null) {
+            Log.e(TAG, "HQCloud FAILED: packer regex did not match")
+            return
+        }
+        Log.e(TAG, "HQCloud packer regex matched")
+
+        var unpacked = match.groupValues[1]
+        val k = match.groupValues[2].split("|")
+        Log.e(TAG, "HQCloud packer k size=${k.size}")
+
+        for (i in k.indices.reversed()) {
+            val word = i.toString(36)
+            if (k[i].isNotEmpty()) {
+                unpacked = unpacked.replace(Regex("\\b$word\\b"), k[i])
+            }
+        }
+        Log.e(TAG, "HQCloud unpacked length=${unpacked.length}")
+        Log.e(TAG, "HQCloud unpacked preview=${unpacked.take(1000)}")
+
+        var finalUrl = ""
+        val varObjRegex = Regex("""var\s+\w+\s*=\s*\{([^}]*)\}""")
+        val varMatches = varObjRegex.findAll(unpacked).toList()
+        Log.e(TAG, "HQCloud var object matches=${varMatches.size}")
+
+        for ((idx, vm) in varMatches.withIndex()) {
+            val objBody = vm.groupValues[1]
+            Log.e(TAG, "HQCloud var[$idx] body=${objBody.take(400)}")
+
+            if (!objBody.contains("http")) {
+                Log.e(TAG, "HQCloud var[$idx] skipped (no http)")
+                continue
+            }
+
+            val values = Regex(""":\s*"([^"]+)"""")
+                .findAll(objBody)
+                .map { it.groupValues[1] }
+                .toList()
+            Log.e(TAG, "HQCloud var[$idx] values=$values")
+
+            val httpValues = values.filter { it.startsWith("http") }
+            Log.e(TAG, "HQCloud var[$idx] httpValues=$httpValues")
+
+            // Prefer .m3u8 URLs; fall back to any http URL.
+            // This prevents picking up "hls3 ... master.txt" when "hls2 ... master.m3u8" exists.
+            val preferred = httpValues.firstOrNull { it.contains(".m3u8") }
+                ?: httpValues.firstOrNull()
+
+            if (preferred != null) {
+                finalUrl = preferred
+                Log.e(TAG, "HQCloud var[$idx] selected finalUrl=$finalUrl")
+                break
+            }
+
+            val pathValue = values.firstOrNull {
+                it.startsWith("/") && !it.startsWith("/dl") && !it.startsWith("/assets")
+            }
+
+            if (pathValue != null) {
+                finalUrl = baseUrl + pathValue
+                Log.e(TAG, "HQCloud var[$idx] path value -> finalUrl=$finalUrl")
+                break
+            }
+        }
+
+        if (finalUrl.isEmpty()) {
+            Log.e(TAG, "HQCloud no url found in var objects, trying m3u8 regex fallback")
+            val m3u8Match = Regex("""["']([^"']*m3u8[^"']*)["']""").find(unpacked)
+            if (m3u8Match != null) {
+                finalUrl = m3u8Match.groupValues[1]
+                if (finalUrl.startsWith("/")) finalUrl = baseUrl + finalUrl
+                Log.e(TAG, "HQCloud m3u8 fallback matched finalUrl=$finalUrl")
+            } else {
+                Log.e(TAG, "HQCloud m3u8 fallback no match")
+            }
+        }
+
+        if (finalUrl.isEmpty()) {
+            Log.e(TAG, "HQCloud FAILED: finalUrl empty")
+            return
+        }
+
+        val cookieString = buildString {
+            append("file_id=$fileId; aff=$aff; tsn=7")
+            if (refUrl != null) {
+                append("; ref_url=${URLEncoder.encode(refUrl, "UTF-8")}")
+            }
+        }
+        Log.e(TAG, "HQCloud cookieString=$cookieString")
+
+        Log.e(TAG, "HQCloud EMITTING link url=$finalUrl")
+        callback.invoke(
+            newExtractorLink(
+                name = this.name,
+                source = this.name,
+                url = finalUrl,
+                type = ExtractorLinkType.M3U8
+            ) {
+                this.referer = baseUrl
+                this.headers = mutableMapOf("Cookie" to cookieString)
+            }
+        )
+        Log.e(TAG, "===== END HQCloud SUCCESS =====")
     }
 }
 
-class Dtube : ExtractorApi() {
-    override val name = "DTube"
-    override val mainUrl = "https://play.d.tube"
-    override val requiresReferer = false
+class HQLinks : HQCloud() {
+    override var mainUrl = "https://hglink.to"
+}
 
-    override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
+// ==========================================
+// VK Extractors
+// ==========================================
+
+open class VkExtractor : ExtractorApi() {
+    override val name = "Vk"
+    override val mainUrl = "https://vkvideo.ru"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        Log.e(TAG, "===== START VkExtractor =====")
+        Log.e(TAG, "Vk input url=$url referer=$referer")
+
+        val commonUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+
+        val headers = mapOf(
+            "User-Agent" to commonUserAgent,
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer" to mainUrl,
+        )
+
+        var response = try {
+            app.get(url, headers = headers)
+        } catch (e: Exception) {
+            Log.e(TAG, "Vk initial get FAILED", e)
+            return
+        }
+        Log.e(TAG, "Vk initial response code=${response.code} length=${response.text.length}")
+
+        if (response.text.contains("hash429") || response.text.contains("challenge.html")) {
+            Log.e(TAG, "Vk challenge detected, retrying with WebViewResolver")
+            response = try {
+                app.get(url, interceptor = WebViewResolver(Regex(".*video_ext\\.php.*")), headers = headers)
+            } catch (e: Exception) {
+                Log.e(TAG, "Vk WebViewResolver retry FAILED", e)
+                return
+            }
+            Log.e(TAG, "Vk webview response code=${response.code} length=${response.text.length}")
+        }
+
+        val foundLinks = linkcikart(response.text, commonUserAgent, callback)
+        Log.e(TAG, "Vk linkcikart foundLinks=$foundLinks")
+
+        if (!foundLinks && url.contains("hash=")) {
+            Log.e(TAG, "Vk no direct links, attempting API fallback with hash param")
+
+            val oid = Regex("""oid=([^&]+)""").find(url)?.groupValues?.get(1)
+            val id = Regex("""id=([^&]+)""").find(url)?.groupValues?.get(1)
+            val hash = Regex("""hash=([^&]+)""").find(url)?.groupValues?.get(1)
+
+            Log.e(TAG, "Vk oid=$oid id=$id hash=$hash")
+
+            if (oid != null && id != null && hash != null) {
+                val tokenRegex = Regex("""anonym\.eyJ[\w\.\-]+""")
+                val fallbackTokenRegex = Regex(""""access_token"\s*:\s*"([^"]+)"""")
+
+                val token = tokenRegex.find(response.text)?.value
+                    ?: fallbackTokenRegex.find(response.text)?.groupValues?.get(1)
+                Log.e(TAG, "Vk token=${token?.take(40)}...")
+
+                if (token != null) {
+                    val apiUrl = "https://api.vk.com/method/video.get?v=5.269&client_id=52461373"
+                    val postData = mapOf(
+                        "owner_id" to "",
+                        "videos" to "${oid}_${id}_${hash}",
+                        "extended" to "0",
+                        "is_embed" to "true",
+                        "track_code" to "",
+                        "access_token" to token
+                    )
+
+                    val apiResponse = try {
+                        app.post(apiUrl, headers = headers, data = postData)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Vk API post FAILED", e)
+                        return
+                    }
+                    Log.e(TAG, "Vk API response code=${apiResponse.code}")
+                    Log.e(TAG, "Vk API response body=${apiResponse.text.take(1500)}")
+
+                    val apiFound = linkcikart(apiResponse.text, commonUserAgent, callback)
+                    Log.e(TAG, "Vk API linkcikart result=$apiFound")
+                } else {
+                    Log.e(TAG, "Vk FAILED: token not found")
+                }
+            } else {
+                Log.e(TAG, "Vk FAILED: oid/id/hash missing")
+            }
+        }
+        Log.e(TAG, "===== END VkExtractor =====")
+    }
+
+    private suspend fun linkcikart(
+        text: String,
+        userAgent: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        Log.e(TAG, "Vk linkcikart input text length=${text.length}")
+        var foundAny = false
+
+        val streamRegex = Regex(
+            "\"(hls|hls_ondemand|dash|dash_sep|dash_ondemand)\"\\s*:\\s*\"([^\"]+)\"",
+            RegexOption.IGNORE_CASE
+        )
+
+        streamRegex.findAll(text).forEach { match ->
+            val typeRaw = match.groupValues[1].lowercase()
+            val videoUrl = match.groupValues[2].replace("\\", "")
+
+            Log.e(TAG, "Vk linkcikart matched type=$typeRaw url=${videoUrl.take(200)}")
+
+            if (videoUrl.isNotBlank()) {
+                foundAny = true
+                val isDash = typeRaw.contains("dash")
+                val typeName = if (isDash) "Dash" else "HLS"
+                val linkType = if (isDash) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
+
+                Log.e(TAG, "Vk EMITTING typeName=$typeName url=${videoUrl.take(120)}")
+
+                callback.invoke(
+                    newExtractorLink(
+                        "${this.name} $typeName",
+                        "${this.name} $typeName",
+                        videoUrl,
+                        linkType
+                    ) {
+                        this.referer = mainUrl
+                        this.headers = mapOf(
+                            "User-Agent" to userAgent,
+                            "Referer" to mainUrl
+                        )
+                    }
+                )
+            }
+        }
+
+        Log.e(TAG, "Vk linkcikart result foundAny=$foundAny")
+        return foundAny
+    }
+}
+
+class VkCom : VkExtractor() {
+    override var mainUrl = "https://vk.com"
+}
+
+// ==========================================
+// Byse Extractor (AES-GCM protected playback)
+// ==========================================
+
+open class ByseSX : ExtractorApi() {
+    override var name = "Byse"
+    override var mainUrl = "https://byse.sx"
+    override val requiresReferer = true
+
+    private fun b64UrlDecode(s: String, label: String): ByteArray {
+        Log.e(TAG, "Byse b64UrlDecode[$label] input=$s")
+        val fixed = s.replace('-', '+').replace('_', '/')
+        val pad = "=".repeat((4 - fixed.length % 4) % 4)
+        val decoded = Base64.getDecoder().decode(fixed + pad)
+        Log.e(TAG, "Byse b64UrlDecode[$label] output length=${decoded.size}")
+        return decoded
+    }
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        Log.e(TAG, "===== START ByseSX =====")
+        Log.e(TAG, "Byse input url=$url referer=$referer")
+
         try {
-            var videoId = Regex("""([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})""", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
-            val shortId = Regex("""[?&]v=([a-zA-Z0-9_-]+)""").find(url)?.groupValues?.get(1) ?: if (videoId == null) url.substringAfterLast("/").takeIf { it.isNotBlank() } else null
+            val uri = URI(url)
+            val code = uri.path.trimEnd('/').substringAfterLast('/')
+            val base = "${uri.scheme}://${uri.host}"
 
-            val lookupId = shortId ?: videoId
-            if (lookupId != null) {
+            Log.e(TAG, "Byse parsed code=$code base=$base")
+
+            val detailsUrl = "$base/api/videos/$code/embed/details"
+            Log.e(TAG, "Byse detailsUrl=$detailsUrl")
+
+            val detailsResponse = try {
+                app.get(detailsUrl)
+            } catch (e: Exception) {
+                Log.e(TAG, "Byse details get FAILED", e)
+                return
+            }
+            Log.e(TAG, "Byse detailsResponse code=${detailsResponse.code}")
+            Log.e(TAG, "Byse detailsResponse body=${detailsResponse.text.take(1500)}")
+
+            val details = detailsResponse.parsedSafe<ByseDetailsRoot>()
+            if (details == null) {
+                Log.e(TAG, "Byse FAILED: details parsedSafe returned null")
+                return
+            }
+            Log.e(TAG, "Byse details id=${details.id} code=${details.code} title=${details.title}")
+            Log.e(TAG, "Byse details embedFrameUrl=${details.embedFrameUrl}")
+
+            val embedFrameUrl = details.embedFrameUrl
+            if (embedFrameUrl.isBlank()) {
+                Log.e(TAG, "Byse FAILED: embedFrameUrl blank")
+                return
+            }
+
+            val embedUri = URI(embedFrameUrl)
+            val embedBase = "${embedUri.scheme}://${embedUri.host}"
+            val embedCode = embedUri.path.trimEnd('/').substringAfterLast('/')
+
+            Log.e(TAG, "Byse embedBase=$embedBase embedCode=$embedCode")
+
+            val headers = mapOf(
+                "referer" to embedFrameUrl,
+                "Referer" to embedFrameUrl,
+                "Origin" to embedBase,
+                "x-embed-parent" to url,
+                "Accept" to "application/json, text/plain, */*",
+                "Content-Type" to "application/json"
+            )
+            Log.e(TAG, "Byse playback headers=$headers")
+
+            val playbackUrl = "$embedBase/api/videos/$embedCode/embed/playback"
+            Log.e(TAG, "Byse playbackUrl=$playbackUrl")
+
+            // ---------- Playback request: POST first, GET fallback ----------
+            // The endpoint returns HTTP 405 for GET, so POST is required.
+            var playbackResponse: com.lagradost.cloudstream3.network.Response? = null
+
+            try {
+                Log.e(TAG, "Byse playback attempting POST (empty body)")
+                val r = app.post(playbackUrl, headers = headers, data = mapOf())
+                Log.e(TAG, "Byse playback POST code=${r.code}")
+                Log.e(TAG, "Byse playback POST body=${r.text.take(1500)}")
+                if (r.code in 200..299) {
+                    playbackResponse = r
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Byse playback POST FAILED: ${e.message}", e)
+            }
+
+            if (playbackResponse == null) {
                 try {
-                    val apiResponse = app.get("https://api.d.tube/videos/$lookupId").text
-                    if (apiResponse.startsWith("{")) {
-                        val json = JSONObject(apiResponse)
-                        videoId = json.optString("_id").takeIf { it.isNotBlank() }
-                            ?: json.optString("id").takeIf { it.isNotBlank() }
-                            ?: json.optString("uuid").takeIf { it.isNotBlank() }
-                            ?: videoId
-
-                        val directHls = json.optString("hlsUrl").takeIf { it.isNotBlank() }
-                            ?: json.optString("manifestUrl").takeIf { it.isNotBlank() }
-                            ?: json.optString("gatewayUrl").takeIf { it.isNotBlank() }
-
-                        if (!directHls.isNullOrBlank()) {
-                            return M3u8Helper.generateM3u8(name, directHls, url)
-                        }
+                    Log.e(TAG, "Byse playback POST failed, attempting GET fallback")
+                    val r = app.get(playbackUrl, headers = headers)
+                    Log.e(TAG, "Byse playback GET code=${r.code}")
+                    Log.e(TAG, "Byse playback GET body=${r.text.take(1500)}")
+                    if (r.code in 200..299) {
+                        playbackResponse = r
                     }
                 } catch (e: Exception) {
-                    // Suppress API exceptions, fallback to probing nodes
+                    Log.e(TAG, "Byse playback GET FAILED: ${e.message}", e)
                 }
             }
 
-            if (videoId != null) {
-                val nasNodes = listOf("nas1", "nas2", "nas3", "nas4", "video", "ipfs")
-                for (node in nasNodes) {
-                    val m3u8Url = "https://$node.d.tube/videos/$videoId/master.m3u8"
-                    try {
-                        if (app.get(m3u8Url).isSuccessful) {
-                            return M3u8Helper.generateM3u8(name, m3u8Url, url)
-                        }
-                    } catch (e: Exception) {
-                        // Suppress node failure, try next node
-                    }
-                }
+            if (playbackResponse == null) {
+                Log.e(TAG, "Byse FAILED: playback request returned no success response")
+                return
             }
+
+            val playbackRoot = playbackResponse.parsedSafe<BysePlaybackRoot>()
+            if (playbackRoot == null) {
+                Log.e(TAG, "Byse FAILED: playbackRoot parsedSafe returned null")
+                return
+            }
+
+            val playback = playbackRoot.playback
+            Log.e(TAG, "Byse playback algorithm=${playback.algorithm}")
+            Log.e(TAG, "Byse playback iv=${playback.iv}")
+            Log.e(TAG, "Byse playback keyParts count=${playback.keyParts.size}")
+            Log.e(TAG, "Byse playback keyParts=${playback.keyParts}")
+            Log.e(TAG, "Byse playback payload length=${playback.payload.length}")
+
+            if (playback.keyParts.size < 2) {
+                Log.e(TAG, "Byse FAILED: keyParts size < 2")
+                return
+            }
+
+            val keyPart0 = b64UrlDecode(playback.keyParts[0], "key0")
+            val keyPart1 = b64UrlDecode(playback.keyParts[1], "key1")
+            val key = keyPart0 + keyPart1
+            Log.e(TAG, "Byse combined key length=${key.size}")
+
+            if (key.size != 16 && key.size != 24 && key.size != 32) {
+                Log.e(TAG, "Byse WARNING: AES key length ${key.size} is not 16/24/32")
+            }
+
+            val ivBytes = b64UrlDecode(playback.iv, "iv")
+            Log.e(TAG, "Byse iv length=${ivBytes.size}")
+
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                SecretKeySpec(key, "AES"),
+                GCMParameterSpec(128, ivBytes)
+            )
+
+            val encryptedPayload = b64UrlDecode(playback.payload, "payload")
+            Log.e(TAG, "Byse encryptedPayload length=${encryptedPayload.size}")
+
+            val decrypted = cipher.doFinal(encryptedPayload)
+            Log.e(TAG, "Byse decrypted length=${decrypted.size}")
+
+            val jsonStr = String(decrypted, StandardCharsets.UTF_8)
+                .let { if (it.startsWith("\uFEFF")) it.substring(1) else it }
+
+            Log.e(TAG, "Byse decrypted JSON=${jsonStr.take(2000)}")
+
+            val parsedDecrypt = tryParseJson<BysePlaybackDecrypt>(jsonStr)
+            if (parsedDecrypt == null) {
+                Log.e(TAG, "Byse FAILED: tryParseJson returned null")
+                return
+            }
+
+            val sources = parsedDecrypt.sources
+            Log.e(TAG, "Byse sources count=${sources.size}")
+
+            if (sources.isEmpty()) {
+                Log.e(TAG, "Byse WARNING: sources list empty")
+            }
+
+            sources.forEachIndexed { index, source ->
+                Log.e(TAG, "Byse source[$index] quality=${source.quality} label=${source.label}")
+                Log.e(TAG, "Byse source[$index] url=${source.url.take(200)}")
+
+                callback.invoke(
+                    newExtractorLink(
+                        name = this.name,
+                        source = this.name,
+                        url = source.url,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = embedFrameUrl
+                        this.headers = mutableMapOf(
+                            "Referer" to embedFrameUrl,
+                            "Origin" to embedBase,
+                            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                                    "Chrome/133.0.0.0 Safari/537.36"
+                        )
+                    }
+                )
+            }
+
+            Log.e(TAG, "===== END ByseSX SUCCESS =====")
         } catch (e: Exception) {
-            // Fails silently
+            Log.e(TAG, "Byse extraction FAILED: ${e.message}", e)
+            Log.e(TAG, "Byse stack trace: ${Log.getStackTraceString(e)}")
         }
-        return null
     }
 }
+
+// ==========================================
+// Byse Data Classes
+// ==========================================
+
+data class ByseDetailsRoot(
+    val id: Long,
+    val code: String,
+    val title: String,
+    @JsonProperty("poster_url") val posterUrl: String,
+    val description: String,
+    @JsonProperty("embed_frame_url") val embedFrameUrl: String
+)
+
+data class BysePlaybackRoot(val playback: BysePlayback)
+data class BysePlayback(
+    val algorithm: String,
+    val iv: String,
+    val payload: String,
+    @JsonProperty("key_parts") val keyParts: List<String>
+)
+
+data class BysePlaybackDecrypt(val sources: List<BysePlaybackSource>)
+data class BysePlaybackSource(
+    val quality: String,
+    val label: String,
+    val url: String
+)
