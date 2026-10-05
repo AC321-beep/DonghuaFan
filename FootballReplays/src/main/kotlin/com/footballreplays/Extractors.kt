@@ -17,8 +17,12 @@ import javax.crypto.spec.SecretKeySpec
 
 internal const val TAG = "FootballReplays"
 
+private const val BYSE_UA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+    "(KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+
 // ==========================================
-// HQCloud & HQLinks Extractors
+// HQCloud & HQLinks Extractors (unchanged)
 // ==========================================
 
 open class HQCloud : ExtractorApi() {
@@ -101,7 +105,7 @@ open class HQCloud : ExtractorApi() {
 class HQLinks : HQCloud() { override var mainUrl = "https://hglink.to" }
 
 // ==========================================
-// VK Extractors
+// VK Extractors (unchanged)
 // ==========================================
 
 open class VkExtractor : ExtractorApi() {
@@ -114,7 +118,7 @@ open class VkExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
+        val ua = BYSE_UA
         val headers = mapOf("User-Agent" to ua, "Referer" to mainUrl)
 
         var response = try { app.get(url, headers = headers) } catch (e: Exception) { return }
@@ -172,15 +176,13 @@ open class VkExtractor : ExtractorApi() {
 class VkCom : VkExtractor() { override var mainUrl = "https://vk.com" }
 
 // ==========================================
-// Byse Extractor (AES-GCM protected playback)
+// Byse Extractor — WebView-based (PoW + attestation)
 // ==========================================
 
 open class ByseSX : ExtractorApi() {
     override var name = "Byse"
     override var mainUrl = "https://byse.sx"
     override val requiresReferer = true
-
-    private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
     private fun b64(s: String, label: String): ByteArray {
         val fixed = s.replace('-', '+').replace('_', '/')
@@ -190,49 +192,17 @@ open class ByseSX : ExtractorApi() {
         return out
     }
 
-    /** Log response headers so we can see Allow / WWW-Authenticate etc. */
-    private fun logHeaders(label: String, headers: Map<String, List<String>>) {
-        headers.forEach { (k, v) ->
-            if (k.equals("allow", true) || k.equals("www-authenticate", true) ||
-                k.equals("access-control-allow-methods", true) || k.equals("set-cookie", true)) {
-                Log.e(TAG, "Byse HDR[$label] $k = $v")
-            }
-        }
-    }
-
-    private suspend fun tryEndpoint(
-        url: String, headers: Map<String, String>, label: String
-    ): String? {
-        // GET
-        try {
-            val r = app.get(url, headers = headers)
-            logHeaders("$label-GET", r.headers)
-            Log.e(TAG, "Byse [$label] GET -> ${r.code} ${r.text.take(120)}")
-            if (r.code in 200..299) return r.text
-        } catch (e: Exception) { Log.e(TAG, "Byse [$label] GET err=${e.message}") }
-        // POST empty
-        try {
-            val r = app.post(url, headers = headers, data = emptyMap<String, String>())
-            logHeaders("$label-POST", r.headers)
-            Log.e(TAG, "Byse [$label] POST -> ${r.code} ${r.text.take(120)}")
-            if (r.code in 200..299) return r.text
-        } catch (e: Exception) { Log.e(TAG, "Byse [$label] POST err=${e.message}") }
-        // PATCH
-        try {
-            val r = app.patch(url, headers = headers, data = emptyMap<String, String>())
-            logHeaders("$label-PATCH", r.headers)
-            Log.e(TAG, "Byse [$label] PATCH -> ${r.code} ${r.text.take(120)}")
-            if (r.code in 200..299) return r.text
-        } catch (e: Exception) { Log.e(TAG, "Byse [$label] PATCH err=${e.message}") }
-        // DELETE
-        try {
-            val r = app.delete(url, headers = headers)
-            logHeaders("$label-DELETE", r.headers)
-            Log.e(TAG, "Byse [$label] DELETE -> ${r.code} ${r.text.take(120)}")
-            if (r.code in 200..299) return r.text
-        } catch (e: Exception) { Log.e(TAG, "Byse [$label] DELETE err=${e.message}") }
-        return null
-    }
+    /** Build the required x-embed-* headers that the server WAF checks. */
+    private fun byseHeaders(base: String, code: String): Map<String, String> = mapOf(
+        "Accept" to "*/*",
+        "Accept-Language" to "en-US,en;q=0.9",
+        "Referer" to "$base/e/$code",
+        "Origin" to base,
+        "x-embed-origin" to "footreplays.com",
+        "x-embed-parent" to "$base/e/$code",
+        "x-embed-referer" to "https://www.footreplays.com/",
+        "User-Agent" to BYSE_UA
+    )
 
     override suspend fun getUrl(
         url: String, referer: String?,
@@ -247,138 +217,74 @@ open class ByseSX : ExtractorApi() {
             val code = uri.path.trimEnd('/').substringAfterLast('/')
             val base = "${uri.scheme}://${uri.host}"
 
-            // ---------- 1. Details ----------
-            val detailsResp = try {
-                app.get("$base/api/videos/$code/embed/details")
-            } catch (e: Exception) { Log.e(TAG, "Byse details err", e); return }
+            // ---------- 1. Details (with the required x-embed-* headers) ----------
+            val detailsHeaders = byseHeaders(base, code)
+            Log.e(TAG, "Byse details headers=$detailsHeaders")
 
+            val detailsResp = app.get("$base/api/videos/$code/embed/details", headers = detailsHeaders)
             Log.e(TAG, "Byse details code=${detailsResp.code}")
-            Log.e(TAG, "Byse details body=${detailsResp.text.take(800)}")
-            Log.e(TAG, "Byse details Set-Cookie=${detailsResp.headers["set-cookie"]}")
+            Log.e(TAG, "Byse details body=${detailsResp.text.take(500)}")
+            Log.e(TAG, "Byse details x-byse-server=${detailsResp.headers["x-byse-server"]}")
+            Log.e(TAG, "Byse details set-cookie=${detailsResp.headers["set-cookie"]}")
 
             val details = detailsResp.parsedSafe<ByseDetailsRoot>()
                 ?: run { Log.e(TAG, "Byse FAILED: details null"); return }
 
             val embedFrameUrl = details.embedFrameUrl
-            Log.e(TAG, "Byse embedFrameUrl=$embedFrameUrl id=${details.id}")
+            Log.e(TAG, "Byse embedFrameUrl=$embedFrameUrl")
 
-            // ---------- 2. PRIMARY: WebView intercept playback ----------
-            var playbackBody: String? = null
-            var winner = ""
+            if (embedFrameUrl.isBlank()) {
+                Log.e(TAG, "Byse FAILED: blank embedFrameUrl"); return
+            }
 
-            // 2a. Intercept a response that looks like playback JSON
-            try {
-                Log.e(TAG, "Byse WebView: loading embed iframe, intercepting playback JSON")
-                val resp = app.get(
+            val embedBase = "${URI(embedFrameUrl).scheme}://${URI(embedFrameUrl).host}"
+
+            // ---------- 2. WebView: let the SPA run PoW + attest + playback ----------
+            // The WebView executes the JS that computes the PoW, obtains the attestation
+            // token from /api/videos/access/attest, and then fires the real playback XHR.
+            // WebViewResolver intercepts that request and returns its response to us.
+            Log.e(TAG, "Byse WebView: loading embedFrameUrl, intercepting playback")
+            val wv = try {
+                app.get(
                     embedFrameUrl,
                     interceptor = WebViewResolver(
-                        Regex(""".*(/embed/playback|/playback|playback\?|api/videos/\w+/playback).*""")
+                        Regex(""".*/api/videos/[^/]+/(embed/)?(playback|sources?).*""")
                     ),
                     headers = mapOf(
                         "Referer" to "https://www.footreplays.com/",
-                        "User-Agent" to ua
+                        "User-Agent" to BYSE_UA
                     )
                 )
-                Log.e(TAG, "Byse WebView resp url=${resp.url} code=${resp.code} len=${resp.text.length}")
-                Log.e(TAG, "Byse WebView body=${resp.text.take(800)}")
-                if (resp.code in 200..299 &&
-                    (resp.text.contains("\"playback\"") || resp.text.contains("\"key_parts\""))) {
-                    playbackBody = resp.text
-                    winner = "webview-playback"
-                    Log.e(TAG, "Byse SUCCESS webview intercepted playback: ${resp.url}")
-                }
             } catch (e: Exception) {
-                Log.e(TAG, "Byse webview playback err=${e.message}")
-            }
-
-            // 2b. Fallback: intercept an m3u8 directly
-            if (playbackBody == null) {
-                try {
-                    Log.e(TAG, "Byse WebView: intercepting .m3u8")
-                    val resp = app.get(
-                        embedFrameUrl,
-                        interceptor = WebViewResolver(Regex(""".*\.m3u8.*""")),
-                        headers = mapOf("Referer" to "https://www.footreplays.com/", "User-Agent" to ua)
-                    )
-                    Log.e(TAG, "Byse WebView m3u8 url=${resp.url} code=${resp.code}")
-                    if (resp.url.contains(".m3u8")) {
-                        callback.invoke(newExtractorLink(name, name, resp.url, ExtractorLinkType.M3U8) {
-                            this.referer = embedFrameUrl
-                            this.headers = mapOf("Referer" to embedFrameUrl, "User-Agent" to ua)
-                        })
-                        Log.e(TAG, "Byse SUCCESS via webview m3u8: ${resp.url}")
-                        return
-                    }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Byse webview m3u8 err=${e.message}")
-                }
-            }
-
-            // ---------- 3. FALLBACK: candidate matrix ----------
-            if (playbackBody == null) {
-                val embedBase = "${URI(embedFrameUrl).scheme}://${URI(embedFrameUrl).host}"
-                val pathSeg = URI(embedFrameUrl).path.trimEnd('/').substringBeforeLast('/').trimStart('/')
-
-                val srcHeaders = mapOf(
-                    "Referer" to "$base/e/$code",
-                    "Origin" to base,
-                    "x-embed-parent" to url,
-                    "X-Requested-With" to "XMLHttpRequest",
-                    "Accept" to "application/json, text/plain, */*",
-                    "Content-Type" to "application/json",
-                    "User-Agent" to ua
-                )
-                val cdnHeaders = srcHeaders + mapOf(
-                    "Referer" to embedFrameUrl,
-                    "Origin" to embedBase
-                )
-
-                val candidates = mutableListOf<Pair<String, Map<String, String>>>()
-                for ((profileName, hdrs) in listOf("src" to srcHeaders, "cdn" to cdnHeaders)) {
-                    for (host in listOf(base, embedBase)) {
-                        for (suffix in listOf(
-                            "api/videos/$code/embed/playback",
-                            "api/videos/${details.id}/embed/playback",
-                            "api/videos/$code/playback",
-                            "api/$pathSeg/$code/playback",
-                            "api/$pathSeg/$code",
-                            "$pathSeg/$code/playback",
-                            "api/videos/$code/embed/play",
-                            "api/playback/$code",
-                            "api/playback/videos/$code",
-                            "api/videos/$code/sources",
-                            "api/videos/$code/embed/sources"
-                        )) {
-                            candidates += "$profileName-$host-$suffix" to (hdrs + mapOf("__url" to "https://$host/$suffix"))
-                        }
-                    }
-                }
-
-                outer@ for ((label, hdrs) in candidates) {
-                    val candUrl = hdrs["__url"] ?: continue
-                    val cleanHeaders = hdrs.filterKeys { it != "__url" }
-                    val body = tryEndpoint(candUrl, cleanHeaders, label)
-                    if (body != null) {
-                        playbackBody = body
-                        winner = label
-                        Log.e(TAG, "Byse SUCCESS candidate [$label] body=${body.take(300)}")
-                        break@outer
-                    }
-                }
-            }
-
-            if (playbackBody == null) {
-                Log.e(TAG, "Byse FAILED: no playback body from any method")
+                Log.e(TAG, "Byse WebView FAILED: ${e.message}", e)
                 return
             }
 
-            // ---------- 4. Decrypt ----------
+            Log.e(TAG, "Byse WebView resp.url=${wv.url}")
+            Log.e(TAG, "Byse WebView resp.code=${wv.code}")
+            Log.e(TAG, "Byse WebView resp.body=${wv.text.take(600)}")
+
+            // The intercepted body must be the encrypted playback JSON.
+            val playbackBody: String = when {
+                wv.text.contains("\"playback\"") && wv.text.contains("\"key_parts\"") -> wv.text
+                wv.text.contains("\"key_parts\"") -> "{\"playback\":${wv.text}}"
+                else -> {
+                    Log.e(TAG, "Byse FAILED: intercepted body is not playback JSON. url=${wv.url}")
+                    return
+                }
+            }
+
             val root = tryParseJson<BysePlaybackRoot>(playbackBody)
-                ?: run { Log.e(TAG, "Byse FAILED: parse playback body. Winner=$winner"); return }
+                ?: run { Log.e(TAG, "Byse FAILED: playback parse null"); return }
 
             val pb = root.playback
             Log.e(TAG, "Byse pb algo=${pb.algorithm} ivLen=${pb.iv.length} keys=${pb.keyParts.size} payloadLen=${pb.payload.length}")
 
+            if (pb.keyParts.size < 2) {
+                Log.e(TAG, "Byse FAILED: keyParts.size < 2"); return
+            }
+
+            // ---------- 3. AES-GCM decrypt ----------
             val key = b64(pb.keyParts[0], "k0") + b64(pb.keyParts[1], "k1")
             val iv = b64(pb.iv, "iv")
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -392,21 +298,20 @@ open class ByseSX : ExtractorApi() {
             val parsed = tryParseJson<BysePlaybackDecrypt>(json)
                 ?: run { Log.e(TAG, "Byse FAILED: parse decrypted"); return }
 
-            val embedBase = "${URI(embedFrameUrl).scheme}://${URI(embedFrameUrl).host}"
-
+            // ---------- 4. Emit sources ----------
             parsed.sources.forEachIndexed { i, s ->
-                Log.e(TAG, "Byse src[$i] q=${s.quality} url=${s.url.take(180)}")
+                Log.e(TAG, "Byse src[$i] q=${s.quality} label=${s.label} url=${s.url.take(200)}")
                 callback.invoke(newExtractorLink(name, name, s.url, ExtractorLinkType.M3U8) {
                     this.referer = embedFrameUrl
                     this.headers = mutableMapOf(
                         "Referer" to embedFrameUrl,
                         "Origin" to embedBase,
-                        "User-Agent" to ua
+                        "User-Agent" to BYSE_UA
                     )
                 })
             }
 
-            Log.e(TAG, "===== END ByseSX SUCCESS via $winner =====")
+            Log.e(TAG, "===== END ByseSX SUCCESS (${parsed.sources.size} sources) =====")
         } catch (e: Exception) {
             Log.e(TAG, "Byse FAILED: ${e.message}", e)
         }
