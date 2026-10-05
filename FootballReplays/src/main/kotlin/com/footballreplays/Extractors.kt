@@ -436,7 +436,9 @@ open class ByseSX : ExtractorApi() {
 
             // ---------- Playback request: POST first, GET fallback ----------
             // The endpoint returns HTTP 405 for GET, so POST is required.
-            var playbackResponse: com.lagradost.cloudstream3.network.Response? = null
+            // We only keep the text body — never the Response object itself,
+            // because its type is not part of the public plugin API.
+            var playbackBody: String? = null
 
             try {
                 Log.e(TAG, "Byse playback attempting POST (empty body)")
@@ -444,34 +446,34 @@ open class ByseSX : ExtractorApi() {
                 Log.e(TAG, "Byse playback POST code=${r.code}")
                 Log.e(TAG, "Byse playback POST body=${r.text.take(1500)}")
                 if (r.code in 200..299) {
-                    playbackResponse = r
+                    playbackBody = r.text
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Byse playback POST FAILED: ${e.message}", e)
             }
 
-            if (playbackResponse == null) {
+            if (playbackBody == null) {
                 try {
                     Log.e(TAG, "Byse playback POST failed, attempting GET fallback")
                     val r = app.get(playbackUrl, headers = headers)
                     Log.e(TAG, "Byse playback GET code=${r.code}")
                     Log.e(TAG, "Byse playback GET body=${r.text.take(1500)}")
                     if (r.code in 200..299) {
-                        playbackResponse = r
+                        playbackBody = r.text
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Byse playback GET FAILED: ${e.message}", e)
                 }
             }
 
-            if (playbackResponse == null) {
+            if (playbackBody == null) {
                 Log.e(TAG, "Byse FAILED: playback request returned no success response")
                 return
             }
 
-            val playbackRoot = playbackResponse.parsedSafe<BysePlaybackRoot>()
+            val playbackRoot = tryParseJson<BysePlaybackRoot>(playbackBody)
             if (playbackRoot == null) {
-                Log.e(TAG, "Byse FAILED: playbackRoot parsedSafe returned null")
+                Log.e(TAG, "Byse FAILED: playbackRoot parse returned null")
                 return
             }
 
