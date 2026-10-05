@@ -4,6 +4,7 @@ import android.util.Log
 import org.jsoup.nodes.Element
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import java.net.URI
 
 class FootballReplays : MainAPI() {
     override var mainUrl = "https://www.footreplays.com"
@@ -211,6 +212,40 @@ class FootballReplays : MainAPI() {
                 headers = link.headers
             )
             callback(extractedLink)
+        }
+
+        // Fallback for unmapped Byse rotating domains (e.g. bysefujedu.com).
+        // Cloudstream's auto-matcher only fires for extractors whose mainUrl matches.
+        // Byse domains rotate constantly, so we detect the "/d/<id>" pattern and call
+        // ByseSX directly.
+        if (emitted == 0) {
+            val uri = try { URI(iframeUrl) } catch (_: Exception) { null }
+            val looksLikeByse = uri != null && uri.path?.contains("/d/") == true
+
+            if (looksLikeByse) {
+                Log.e(TAG, "loadLinks no extractor matched, trying ByseSX fallback for $iframeUrl")
+                try {
+                    ByseSX().getUrl(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
+                        emitted++
+                        Log.e(TAG, "loadLinks ByseSX fallback EMITTED #$emitted url=${link.url.take(200)} type=${link.type}")
+
+                        val extractedLink = ExtractorLink(
+                            source = customName,
+                            name = customName,
+                            url = link.url,
+                            referer = link.referer,
+                            quality = link.quality,
+                            type = link.type,
+                            headers = link.headers
+                        )
+                        callback(extractedLink)
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "loadLinks ByseSX fallback FAILED", e)
+                }
+            } else {
+                Log.e(TAG, "loadLinks no extractor matched and URL doesn't look Byse-like, giving up")
+            }
         }
 
         Log.e(TAG, "===== loadLinks END emitted=$emitted =====")
