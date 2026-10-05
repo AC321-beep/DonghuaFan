@@ -192,7 +192,6 @@ open class ByseSX : ExtractorApi() {
         return out
     }
 
-    /** Build the required x-embed-* headers that the server WAF checks. */
     private fun byseHeaders(base: String, code: String): Map<String, String> = mapOf(
         "Accept" to "*/*",
         "Accept-Language" to "en-US,en;q=0.9",
@@ -217,10 +216,8 @@ open class ByseSX : ExtractorApi() {
             val code = uri.path.trimEnd('/').substringAfterLast('/')
             val base = "${uri.scheme}://${uri.host}"
 
-            // ---------- 1. Details (with the required x-embed-* headers) ----------
+            // ---------- 1. Details ----------
             val detailsHeaders = byseHeaders(base, code)
-            Log.e(TAG, "Byse details headers=$detailsHeaders")
-
             val detailsResp = app.get("$base/api/videos/$code/embed/details", headers = detailsHeaders)
             Log.e(TAG, "Byse details code=${detailsResp.code}")
             Log.e(TAG, "Byse details body=${detailsResp.text.take(500)}")
@@ -239,11 +236,34 @@ open class ByseSX : ExtractorApi() {
 
             val embedBase = "${URI(embedFrameUrl).scheme}://${URI(embedFrameUrl).host}"
 
-            // ---------- 2. WebView: let the SPA run PoW + attest + playback ----------
-            // The WebView executes the JS that computes the PoW, obtains the attestation
-            // token from /api/videos/access/attest, and then fires the real playback XHR.
-            // WebViewResolver intercepts that request and returns its response to us.
-            Log.e(TAG, "Byse WebView: loading embedFrameUrl, intercepting playback")
+            // ---------- 2a. Warm-up load ----------
+            // Mimics the FIRST click: SPA runs settings -> challenge -> attest,
+            // stores the attestation token in memory/sessionStorage, but does NOT
+            // fire /playback yet. Discard the result.
+            Log.e(TAG, "Byse WebView: warm-up load (challenge/attest)")
+            try {
+                app.get(
+                    embedFrameUrl,
+                    interceptor = WebViewResolver(
+                        // Match the settings response; that's as far as the SPA gets on first click.
+                        Regex(""".*/api/videos/[^/]+/embed/settings.*""")
+                    ),
+                    headers = mapOf(
+                        "Referer" to "https://www.footreplays.com/",
+                        "User-Agent" to BYSE_UA
+                    )
+                )
+                Log.e(TAG, "Byse warm-up: settings intercepted (challenge/attest should now be cached)")
+            } catch (e: Exception) {
+                Log.e(TAG, "Byse warm-up FAILED: ${e.message}")
+            }
+
+            // Give the SPA a moment to finish the PoW computation + attest call
+            kotlinx.coroutines.delay(4_000L)
+
+            // ---------- 2b. Intercept load ----------
+            // Mimics the SECOND click: token is cached, SPA immediately fires /playback.
+            Log.e(TAG, "Byse WebView: intercept load (playback)")
             val wv = try {
                 app.get(
                     embedFrameUrl,
@@ -256,7 +276,7 @@ open class ByseSX : ExtractorApi() {
                     )
                 )
             } catch (e: Exception) {
-                Log.e(TAG, "Byse WebView FAILED: ${e.message}", e)
+                Log.e(TAG, "Byse WebView intercept FAILED: ${e.message}", e)
                 return
             }
 
@@ -264,7 +284,6 @@ open class ByseSX : ExtractorApi() {
             Log.e(TAG, "Byse WebView resp.code=${wv.code}")
             Log.e(TAG, "Byse WebView resp.body=${wv.text.take(600)}")
 
-            // The intercepted body must be the encrypted playback JSON.
             val playbackBody: String = when {
                 wv.text.contains("\"playback\"") && wv.text.contains("\"key_parts\"") -> wv.text
                 wv.text.contains("\"key_parts\"") -> "{\"playback\":${wv.text}}"
