@@ -368,33 +368,35 @@ open class ByseSX : ExtractorApi() {
             kotlinx.coroutines.delay(2_000L)
 
             // ---------- 3. Path A: Kotlin POST /playback using captured tokens ----------
-            if (attest?.captchaToken != null && attest.fingerprintToken != null) {
+            val a = attest
+            if (a != null && a.captchaToken != null && a.fingerprintToken != null) {
                 Log.e(TAG, "Byse Path A: direct POST /playback in Kotlin")
                 try {
-                    val body = JSONObject().apply {
-                        put("fingerprint", JSONObject().apply {
-                            put("token", attest.fingerprintToken)
-                            put("viewer_id", attest.viewerId ?: "")
-                            put("device_id", attest.deviceId ?: "")
-                            put("confidence", 0.77)
-                        })
-                    }.toString()
+                    // Build the JSON body as a Kotlin Map; Cloudstream's `json=` param
+                    // serializes it to raw JSON with Content-Type: application/json.
+                    val bodyMap = mapOf(
+                        "fingerprint" to mapOf(
+                            "token" to a.fingerprintToken,
+                            "viewer_id" to (a.viewerId ?: ""),
+                            "device_id" to (a.deviceId ?: ""),
+                            "confidence" to 0.77
+                        )
+                    )
 
                     val playbackResp = app.post(
                         "$embedBase/api/videos/$code/embed/playback",
                         headers = mapOf(
                             "Accept" to "*/*",
                             "Accept-Language" to "en-US,en;q=0.9",
-                            "Content-Type" to "application/json",
                             "Origin" to embedBase,
                             "Referer" to embedFrameUrl,
                             "User-Agent" to BYSE_UA,
-                            "x-captcha-token" to attest.captchaToken,
+                            "x-captcha-token" to a.captchaToken,
                             "x-embed-origin" to "footreplays.com",
                             "x-embed-parent" to "$base/e/$code",
                             "x-embed-referer" to "https://www.footreplays.com/"
                         ),
-                        data = body
+                        json = bodyMap
                     )
                     Log.e(TAG, "Byse Path A playback.code=${playbackResp.code}")
                     Log.e(TAG, "Byse Path A playback.body=${playbackResp.text.take(600)}")
