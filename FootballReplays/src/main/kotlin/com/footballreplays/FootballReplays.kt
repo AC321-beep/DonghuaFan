@@ -1,7 +1,6 @@
 package com.footballreplays
 
 import android.annotation.SuppressLint
-import android.util.Log
 import org.jsoup.nodes.Element
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -63,7 +62,6 @@ object CloudflareResolver {
     suspend fun attemptSilentResolution(activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>): Boolean = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             val root = activity.window?.decorView as? android.view.ViewGroup
-            Log.e("FootballReplays", "CloudflareResolver: Stage 1 (Silent) Started. Attached=${root != null}")
 
             val done = AtomicBoolean(false)
             val handler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -129,7 +127,6 @@ object CloudflareResolver {
             }
 
             timeoutRunnable = Runnable { 
-                Log.e("FootballReplays", "CloudflareResolver: Stage 1 Timed Out")
                 cleanup(false) 
             }
 
@@ -143,7 +140,6 @@ object CloudflareResolver {
     @SuppressLint("SetJavaScriptEnabled")
     suspend fun attemptInteractiveResolution(activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>): Boolean = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
-            Log.e("FootballReplays", "CloudflareResolver: Stage 2 (Interactive) Started")
             val dialog = android.app.Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
                 setCancelable(false)
                 setCanceledOnTouchOutside(false)
@@ -307,7 +303,6 @@ class FootballReplays : MainAPI() {
         return try {
             val response = app.get(url, interceptor = CFInterceptor()).text
             if (CloudflareResolver.isCloudflareChallenge(response)) {
-                Log.e("FootballReplays", "Cloudflare challenge detected on $url")
                 CloudflareResolver.resolve(mainUrl, getPosterHeaders())
                 app.get(url, interceptor = CFInterceptor()).text
             } else {
@@ -315,16 +310,13 @@ class FootballReplays : MainAPI() {
             }
         } catch (e: Exception) {
             if (e.message?.contains("403") == true || e.message?.contains("503") == true) {
-                Log.e("FootballReplays", "Cloudflare block (403/503) detected on $url")
                 CloudflareResolver.resolve(mainUrl, getPosterHeaders())
                 try {
                     app.get(url, interceptor = CFInterceptor()).text
                 } catch (e2: Exception) {
-                    Log.e("FootballReplays", "Failed to fetch HTML after resolution", e2)
                     ""
                 }
             } else {
-                Log.e("FootballReplays", "Generic fetch error", e)
                 ""
             }
         }
@@ -332,12 +324,10 @@ class FootballReplays : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val siteurl = if (page > 1) "${request.data.removeSuffix("/")}/page/$page/" else request.data
-        Log.e("FootballReplays", "getMainPage page=$page request.name=${request.name} siteurl=$siteurl")
 
         val html = fetchHtml(siteurl)
         val document = org.jsoup.Jsoup.parse(html)
         val home = document.select("div.p-wrap").mapNotNull { it.toMainPageResult() }
-        Log.e("FootballReplays", "getMainPage items=${home.size}")
 
         return newHomePageResponse(
             list = HomePageList(
@@ -363,12 +353,10 @@ class FootballReplays : MainAPI() {
         } else {
             "$mainUrl/page/$page/?s=$query"
         }
-        Log.e("FootballReplays", "search query=$query page=$page url=$url")
 
         val html = fetchHtml(url)
         val document = org.jsoup.Jsoup.parse(html)
         val aramaCevap = document.select("div.p-wrap").mapNotNull { it.toMainPageResult() }
-        Log.e("FootballReplays", "search results=${aramaCevap.size}")
 
         return newSearchResponseList(aramaCevap, hasNext = true)
     }
@@ -376,15 +364,10 @@ class FootballReplays : MainAPI() {
     override suspend fun quickSearch(query: String): List<SearchResponse>? = search(query)
 
     override suspend fun load(url: String): LoadResponse? {
-        Log.e("FootballReplays", "===== load START url=$url =====")
         val html = fetchHtml(url)
         val document = org.jsoup.Jsoup.parse(html)
 
-        val title = document.selectFirst("h1.s-title")?.text()?.trim() ?: run {
-            Log.e("FootballReplays", "load FAILED: title not found")
-            return null
-        }
-        Log.e("FootballReplays", "load title=$title")
+        val title = document.selectFirst("h1.s-title")?.text()?.trim() ?: return null
 
         val poster = fixUrlNull(document.selectFirst("div.s-feat img")?.attr("src"))
         val year = document.selectFirst("time.updated-date")?.attr("datetime")?.substringBefore("-")?.toIntOrNull()
@@ -420,8 +403,6 @@ class FootballReplays : MainAPI() {
             }
         }
 
-        Log.e("FootballReplays", "load total episodes=${episodes.size}")
-
         val plotText = buildString {
             if (!displayDate.isNullOrBlank()) {
                 append("🕒 Match Date: $displayDate\n\n")
@@ -431,8 +412,6 @@ class FootballReplays : MainAPI() {
             }
             append("📡 Available Streams: ${episodes.size}")
         }
-
-        Log.e("FootballReplays", "===== load SUCCESS title=$title episodes=${episodes.size} =====")
 
         return newTvSeriesLoadResponse(title, url, TvType.Others, episodes) {
             this.posterUrl = poster
@@ -472,15 +451,11 @@ class FootballReplays : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        Log.e("FootballReplays", "===== loadLinks START =====")
-        Log.e("FootballReplays", "loadLinks raw data=$data")
 
         val parts = data.split("|")
         val videoUrl = parts.getOrNull(0) ?: return false
         val customName = parts.getOrNull(1) ?: "Video"
         val iframeUrl = if (videoUrl.startsWith("//")) "https:$videoUrl" else videoUrl
-
-        Log.e("FootballReplays", "loadLinks iframeUrl=$iframeUrl")
 
         var emitted = 0
         val extractedLinks = mutableListOf<ExtractorLink>()
@@ -491,7 +466,6 @@ class FootballReplays : MainAPI() {
 
         for (link in extractedLinks) {
             emitted++
-            Log.e("FootballReplays", "loadLinks EMITTED #$emitted url=${link.url.take(200)} type=${link.type} name=${link.name}")
             val newLink = newExtractorLink(
                 source = customName,
                 name = customName,
@@ -516,7 +490,6 @@ class FootballReplays : MainAPI() {
             )
 
             if (looksLikeByse) {
-                Log.e("FootballReplays", "loadLinks no extractor matched, trying ByseSX fallback for $iframeUrl")
                 try {
                     val byseLinks = mutableListOf<ExtractorLink>()
                     
@@ -526,7 +499,6 @@ class FootballReplays : MainAPI() {
                     
                     for (link in byseLinks) {
                         emitted++
-                        Log.e("FootballReplays", "loadLinks ByseSX fallback EMITTED #$emitted url=${link.url.take(200)} type=${link.type}")
                         val newLink = newExtractorLink(
                             source = customName,
                             name = customName,
@@ -540,13 +512,10 @@ class FootballReplays : MainAPI() {
                         callback(newLink)
                     }
                 } catch (e: Exception) {
-                    Log.e("FootballReplays", "loadLinks ByseSX fallback FAILED", e)
                 }
             } else {
-                Log.e("FootballReplays", "loadLinks no extractor matched and URL doesn't look Byse-like, giving up")
             }
         }
-        Log.e("FootballReplays", "===== loadLinks END emitted=$emitted =====")
         return true
     }
 }
