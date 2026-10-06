@@ -1,11 +1,232 @@
 package com.footballreplays
 
+import android.annotation.SuppressLint
 import android.util.Log
 import org.jsoup.nodes.Element
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import java.net.URI
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
 
+// ==========================================
+// Cloudflare Bypass Utilities
+// ==========================================
+internal object CFState {
+    var userAgent: String = ""
+}
+
+internal class CFInterceptor : okhttp3.Interceptor {
+    override fun intercept(chain: okhttp3.Interceptor.Chain): okhttp3.Response {
+        val original = chain.request()
+        val builder = original.newBuilder()
+
+        val defaultUa = try {
+            android.webkit.WebSettings.getDefaultUserAgent(CommonActivity.activity)
+        } catch (e: Exception) {
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        }
+        val ua = CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa
+        builder.header("User-Agent", ua)
+        builder.removeHeader("X-Requested-With") // CRITICAL: Removes app detection flag
+
+        val cookies = android.webkit.CookieManager.getInstance().getCookie(original.url.toString())
+        if (!cookies.isNullOrEmpty()) {
+            builder.header("Cookie", cookies)
+        }
+
+        if (original.header("Accept") == null) builder.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        if (original.header("Accept-Language") == null) builder.header("Accept-Language", "en-US,en;q=0.5")
+        if (original.header("Connection") == null) builder.header("Connection", "keep-alive")
+        if (original.header("Upgrade-Insecure-Requests") == null) builder.header("Upgrade-Insecure-Requests", "1")
+        if (original.header("Sec-Fetch-Dest") == null) builder.header("Sec-Fetch-Dest", "document")
+        if (original.header("Sec-Fetch-Mode") == null) builder.header("Sec-Fetch-Mode", "navigate")
+        if (original.header("Sec-Fetch-Site") == null) builder.header("Sec-Fetch-Site", "none")
+
+        return chain.proceed(builder.build())
+    }
+}
+
+internal object CloudflareResolver {
+    fun isCloudflareChallenge(html: String): Boolean {
+        val lower = html.lowercase()
+        return lower.contains("just a moment") || 
+               lower.contains("cf-browser-verification") || 
+               lower.contains("turnstile") ||
+               lower.contains("cloudflare")
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    suspend fun attemptSilentResolution(activity: android.app.Activity, urlToResolve: String): Boolean = withContext(Dispatchers.Main) {
+        val decor = activity.window?.decorView as? android.view.ViewGroup ?: return@withContext false
+        suspendCancellableCoroutine { cont ->
+            val done = AtomicBoolean(false)
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            var checkRunnable: Runnable? = null
+            var timeoutRunnable: Runnable? = null
+
+            val webView = android.webkit.WebView(activity).apply {
+                layoutParams = android.view.ViewGroup.LayoutParams(1, 1) // Invisible 1x1 pixel
+                translationX = 20000f
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
+                    cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
+                    mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    userAgentString = CFState.userAgent.ifBlank { userAgentString }
+                }
+                android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
+                webViewClient = object : android.webkit.WebViewClient() {
+                    @SuppressLint("WebViewClientOnReceivedSslError")
+                    override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
+                }
+            }
+
+            fun cleanup(success: Boolean) {
+                if (!done.compareAndSet(false, true)) return
+                checkRunnable?.let { handler.removeCallbacks(it) }
+                timeoutRunnable?.let { handler.removeCallbacks(it) }
+                runCatching {
+                    decor.removeView(webView)
+                    webView.stopLoading()
+                    webView.destroy()
+                }
+                if (success) android.webkit.CookieManager.getInstance().flush()
+                if (cont.isActive) cont.resume(success)
+            }
+
+            cont.invokeOnCancellation { cleanup(false) }
+
+            checkRunnable = object : Runnable {
+                override fun run() {
+                    if (done.get()) return
+                    val cookies = android.webkit.CookieManager.getInstance().getCookie(urlToResolve) ?: ""
+                    val title = webView.title?.lowercase() ?: ""
+                    val isChallenge = listOf("just a moment", "attention required", "security verification", "cloudflare").any { title.contains(it) }
+
+                    if (!isChallenge && cookies.contains("cf_clearance")) {
+                        cleanup(true)
+                        return
+                    }
+                    handler.postDelayed(this, 500L)
+                }
+            }
+
+            timeoutRunnable = Runnable { cleanup(false) }
+
+            decor.addView(webView)
+            webView.loadUrl(urlToResolve)
+            handler.postDelayed(checkRunnable!!, 800L)
+            handler.postDelayed(timeoutRunnable!!, 8000L) // Give silent resolution 8 seconds
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    suspend fun attemptInteractiveResolution(activity: android.app.Activity, urlToResolve: String): Boolean = withContext(Dispatchers.Main) {
+        suspendCancellableCoroutine { cont ->
+            val dialog = android.app.Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
+                setCancelable(false)
+                setCanceledOnTouchOutside(false)
+            }
+            val done = AtomicBoolean(false)
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+
+            val layout = android.widget.LinearLayout(activity).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                setBackgroundColor(android.graphics.Color.parseColor("#1A1A1A"))
+            }
+
+            val header = android.widget.TextView(activity).apply {
+                text = "Bypassing Security... Please Complete Challenge"
+                setTextColor(android.graphics.Color.WHITE)
+                textSize = 15f
+                setPadding(32, 28, 32, 28)
+            }
+            layout.addView(header)
+
+            val progressBar = android.widget.ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
+                layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, 8)
+            }
+            layout.addView(progressBar)
+
+            fun finish(success: Boolean) {
+                if (!done.compareAndSet(false, true)) return
+                android.webkit.CookieManager.getInstance().flush()
+                runCatching { dialog.dismiss() }
+                if (cont.isActive) cont.resume(success)
+            }
+
+            val webView = android.webkit.WebView(activity).apply {
+                layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT)
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
+                    cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
+                    mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    userAgentString = CFState.userAgent.ifBlank { userAgentString }
+                }
+                android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
+                fun checkStatus(view: android.webkit.WebView?) {
+                    if (done.get()) return
+                    val title = view?.title?.lowercase() ?: ""
+                    val cookies = android.webkit.CookieManager.getInstance().getCookie(urlToResolve) ?: ""
+                    val isChallenge = listOf("just a moment", "attention required", "security verification", "cloudflare").any { title.contains(it) }
+
+                    if (!isChallenge && cookies.contains("cf_clearance")) {
+                        header.text = "Success! Loading..."
+                        header.setTextColor(android.graphics.Color.GREEN)
+                        handler.postDelayed({ finish(true) }, 800)
+                    }
+                }
+
+                webChromeClient = object : android.webkit.WebChromeClient() {
+                    override fun onProgressChanged(view: android.webkit.WebView?, newProgress: Int) {
+                        progressBar.progress = newProgress
+                        progressBar.visibility = if (newProgress == 100) android.view.View.GONE else android.view.View.VISIBLE
+                        if (newProgress == 100) checkStatus(view)
+                    }
+                }
+
+                webViewClient = object : android.webkit.WebViewClient() {
+                    @SuppressLint("WebViewClientOnReceivedSslError")
+                    override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
+                    override fun onPageFinished(view: android.webkit.WebView?, url: String?) { checkStatus(view) }
+                }
+            }
+
+            layout.addView(webView)
+            dialog.setContentView(layout)
+            dialog.setOnDismissListener { if (!done.get()) finish(false) }
+
+            dialog.show()
+            webView.loadUrl(urlToResolve)
+
+            handler.postDelayed({ if (!done.get()) finish(false) }, 30_000L)
+        }
+    }
+    
+    suspend fun resolve(url: String): Boolean {
+        val activity = CommonActivity.activity ?: return false
+        if (activity.isFinishing || activity.isDestroyed) return false
+        if (attemptSilentResolution(activity, url)) return true
+        return attemptInteractiveResolution(activity, url)
+    }
+}
+
+// ==========================================
+// Main Provider Class
+// ==========================================
 class FootballReplays : MainAPI() {
     override var mainUrl = "https://www.footreplays.com"
     override var name = "FootballReplays"
@@ -26,11 +247,37 @@ class FootballReplays : MainAPI() {
         "${mainUrl}/other/" to "Other"
     )
 
+    // Helper to fetch HTML and automatically trigger Cloudflare resolution if blocked
+    private suspend fun fetchHtml(url: String): String {
+        var response = app.get(url, interceptor = CFInterceptor()).text
+        if (CloudflareResolver.isCloudflareChallenge(response)) {
+            Log.e(TAG, "Cloudflare challenge detected on $url")
+            CloudflareResolver.resolve(mainUrl)
+            response = app.get(url, interceptor = CFInterceptor()).text
+        }
+        return response
+    }
+
+    // Helper to attach Cloudflare clearance cookies to Coil image requests
+    private fun getPosterHeaders(): Map<String, String> {
+        val defaultUa = try { android.webkit.WebSettings.getDefaultUserAgent(CommonActivity.activity) } catch(e: Exception) { "Mozilla/5.0" }
+        val headers = mutableMapOf(
+            "Referer" to "$mainUrl/",
+            "User-Agent" to (CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa)
+        )
+        val cookies = android.webkit.CookieManager.getInstance().getCookie(mainUrl)
+        if (!cookies.isNullOrEmpty()) {
+            headers["Cookie"] = cookies
+        }
+        return headers
+    }
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val siteurl = if (page > 1) "${request.data.removeSuffix("/")}/page/$page/" else request.data
         Log.e(TAG, "getMainPage page=$page request.name=${request.name} siteurl=$siteurl")
 
-        val document = app.get(siteurl).document
+        val html = fetchHtml(siteurl)
+        val document = org.jsoup.Jsoup.parse(html)
         val home = document.select("div.p-wrap").mapNotNull { it.toMainPageResult() }
         Log.e(TAG, "getMainPage items=${home.size}")
 
@@ -61,7 +308,8 @@ class FootballReplays : MainAPI() {
         }
         Log.e(TAG, "search query=$query page=$page url=$url")
 
-        val document = app.get(url).document
+        val html = fetchHtml(url)
+        val document = org.jsoup.Jsoup.parse(html)
         val aramaCevap = document.select("div.p-wrap").mapNotNull { it.toMainPageResult() }
         Log.e(TAG, "search results=${aramaCevap.size}")
 
@@ -72,7 +320,8 @@ class FootballReplays : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         Log.e(TAG, "===== load START url=$url =====")
-        val document = app.get(url).document
+        val html = fetchHtml(url)
+        val document = org.jsoup.Jsoup.parse(html)
 
         val title = document.selectFirst("h1.s-title")?.text()?.trim() ?: run {
             Log.e(TAG, "load FAILED: title not found")
@@ -148,6 +397,7 @@ class FootballReplays : MainAPI() {
 
         return newTvSeriesLoadResponse(title, url, TvType.Others, episodes) {
             this.posterUrl = poster
+            this.posterHeaders = getPosterHeaders() // Fixes Coil 403 Errors
             this.plot = plotText
             this.year = year
             this.tags = document.select("div.efoot-bar.tag-bar a").map { it.text() }
@@ -173,6 +423,7 @@ class FootballReplays : MainAPI() {
 
         return newTvSeriesSearchResponse(displayTitle, href, TvType.TvSeries) {
             this.posterUrl = posterUrl
+            this.posterHeaders = getPosterHeaders() // Fixes Coil 403 Errors
         }
     }
 
