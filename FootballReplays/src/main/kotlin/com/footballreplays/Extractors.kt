@@ -473,7 +473,7 @@ open class ByseSX : ExtractorApi() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
                     
-                    // Upgraded Dual-Method Auto-Clicker Injection
+                    // Optimized Auto-Clicker: Stops clicking once the video starts
                     override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
                         val js = """
                             (function() {
@@ -481,17 +481,20 @@ open class ByseSX : ExtractorApi() {
                                     Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
                                     Object.defineProperty(document, 'hidden', {get: function() { return false; }});
                                     setInterval(function() {
-                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid, [class*="play"]');
-                                        buttons.forEach(b => {
-                                            b.click();
-                                            b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
-                                        });
                                         var vids = document.querySelectorAll('video');
-                                        vids.forEach(v => { 
-                                            v.muted = true; 
-                                            var p = v.play();
-                                            if (p !== undefined) p.catch(e => {}); 
-                                        });
+                                        var isPlaying = false;
+                                        vids.forEach(v => { if (!v.paused) isPlaying = true; });
+                                        
+                                        if (!isPlaying) {
+                                            var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
+                                            buttons.forEach(b => b.click());
+                                            
+                                            vids.forEach(v => { 
+                                                v.muted = true; 
+                                                var p = v.play();
+                                                if (p !== undefined) p.catch(e => {}); 
+                                            });
+                                        }
                                     }, 1000);
                                 } catch(e) {}
                             })();
@@ -522,8 +525,8 @@ open class ByseSX : ExtractorApi() {
 
             root?.addView(wv)
             wv.loadUrl(urlToResolve, headers)
-            // INCREASED to 25 seconds to give Stage 1 a genuine chance to solve Cloudflare
-            handler.postDelayed(timeoutRunnable!!, 25000L) 
+            // Reduced to 4.5 seconds to minimize delay and pass off session cookies to Stage 2 quickly
+            handler.postDelayed(timeoutRunnable!!, 4500L) 
         }
     }
 
@@ -605,7 +608,7 @@ open class ByseSX : ExtractorApi() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
 
-                    // Upgraded Dual-Method Auto-Clicker Injection (Synchronized with Stage 1)
+                    // Optimized Auto-Clicker (Synchronized with Stage 1)
                     override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
                         val js = """
                             (function() {
@@ -613,17 +616,20 @@ open class ByseSX : ExtractorApi() {
                                     Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
                                     Object.defineProperty(document, 'hidden', {get: function() { return false; }});
                                     setInterval(function() {
-                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid, [class*="play"]');
-                                        buttons.forEach(b => {
-                                            b.click();
-                                            b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
-                                        });
                                         var vids = document.querySelectorAll('video');
-                                        vids.forEach(v => { 
-                                            v.muted = true; 
-                                            var p = v.play();
-                                            if (p !== undefined) p.catch(e => {}); 
-                                        });
+                                        var isPlaying = false;
+                                        vids.forEach(v => { if (!v.paused) isPlaying = true; });
+                                        
+                                        if (!isPlaying) {
+                                            var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
+                                            buttons.forEach(b => b.click());
+                                            
+                                            vids.forEach(v => { 
+                                                v.muted = true; 
+                                                var p = v.play();
+                                                if (p !== undefined) p.catch(e => {}); 
+                                            });
+                                        }
                                     }, 1000);
                                 } catch(e) {}
                             })();
