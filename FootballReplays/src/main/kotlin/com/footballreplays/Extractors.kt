@@ -716,6 +716,7 @@ open class ByseSX : ExtractorApi() {
                 this.referer = shellUrl
                 this.headers = result.headers
             })
+        } else {
         }
     }
 }
