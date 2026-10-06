@@ -15,11 +15,11 @@ import kotlin.coroutines.resume
 // ==========================================
 // Cloudflare Bypass Utilities
 // ==========================================
-internal object CFState {
+object CFState {
     var userAgent: String = ""
 }
 
-internal class CFInterceptor : okhttp3.Interceptor {
+class CFInterceptor : okhttp3.Interceptor {
     override fun intercept(chain: okhttp3.Interceptor.Chain): okhttp3.Response {
         val original = chain.request()
         val builder = original.newBuilder()
@@ -50,10 +50,9 @@ internal class CFInterceptor : okhttp3.Interceptor {
     }
 }
 
-internal object CloudflareResolver {
+object CloudflareResolver {
     fun isCloudflareChallenge(html: String): Boolean {
         val lower = html.lowercase()
-        // Removed generic "cloudflare" to prevent false positives on Nginx error pages
         return lower.contains("just a moment") || 
                lower.contains("cf-browser-verification") || 
                lower.contains("turnstile") ||
@@ -123,7 +122,7 @@ internal object CloudflareResolver {
             timeoutRunnable = Runnable { cleanup(false) }
 
             decor.addView(webView)
-            // FIXED: Passing headers to the WebView prevents the Nginx 403 Forbidden Error
+            // Passes Headers to bypass Nginx 403 Forbidden
             webView.loadUrl(urlToResolve, headers)
             handler.postDelayed(checkRunnable!!, 800L)
             handler.postDelayed(timeoutRunnable!!, 8000L) // Give silent resolution 8 seconds
@@ -212,7 +211,7 @@ internal object CloudflareResolver {
             dialog.setOnDismissListener { if (!done.get()) finish(false) }
 
             dialog.show()
-            // FIXED: Passing headers to the WebView prevents the Nginx 403 Forbidden Error
+            // Passes Headers to bypass Nginx 403 Forbidden
             webView.loadUrl(urlToResolve, headers)
 
             handler.postDelayed({ if (!done.get()) finish(false) }, 30_000L)
@@ -266,7 +265,7 @@ class FootballReplays : MainAPI() {
     private suspend fun fetchHtml(url: String): String {
         var response = app.get(url, interceptor = CFInterceptor()).text
         if (CloudflareResolver.isCloudflareChallenge(response)) {
-            Log.e(TAG, "Cloudflare challenge detected on $url")
+            Log.e("FootballReplays", "Cloudflare challenge detected on $url")
             CloudflareResolver.resolve(mainUrl, getPosterHeaders())
             response = app.get(url, interceptor = CFInterceptor()).text
         }
@@ -275,12 +274,12 @@ class FootballReplays : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val siteurl = if (page > 1) "${request.data.removeSuffix("/")}/page/$page/" else request.data
-        Log.e(TAG, "getMainPage page=$page request.name=${request.name} siteurl=$siteurl")
+        Log.e("FootballReplays", "getMainPage page=$page request.name=${request.name} siteurl=$siteurl")
 
         val html = fetchHtml(siteurl)
         val document = org.jsoup.Jsoup.parse(html)
         val home = document.select("div.p-wrap").mapNotNull { it.toMainPageResult() }
-        Log.e(TAG, "getMainPage items=${home.size}")
+        Log.e("FootballReplays", "getMainPage items=${home.size}")
 
         return newHomePageResponse(
             list = HomePageList(
@@ -295,7 +294,7 @@ class FootballReplays : MainAPI() {
         val isnot = this.selectFirst("a.p-category")?.attr("href")?.contains("/news/") == true
         val categoryId = this.selectFirst("a.p-category")?.className()
         if (isnot || categoryId?.contains("category-id-283") == true) {
-            Log.e(TAG, "toMainPageResult skipped (news or category-283)")
+            Log.e("FootballReplays", "toMainPageResult skipped (news or category-283)")
             return null
         }
         return toRecommendationResult()
@@ -307,12 +306,12 @@ class FootballReplays : MainAPI() {
         } else {
             "$mainUrl/page/$page/?s=$query"
         }
-        Log.e(TAG, "search query=$query page=$page url=$url")
+        Log.e("FootballReplays", "search query=$query page=$page url=$url")
 
         val html = fetchHtml(url)
         val document = org.jsoup.Jsoup.parse(html)
         val aramaCevap = document.select("div.p-wrap").mapNotNull { it.toMainPageResult() }
-        Log.e(TAG, "search results=${aramaCevap.size}")
+        Log.e("FootballReplays", "search results=${aramaCevap.size}")
 
         return newSearchResponseList(aramaCevap, hasNext = true)
     }
@@ -320,55 +319,55 @@ class FootballReplays : MainAPI() {
     override suspend fun quickSearch(query: String): List<SearchResponse>? = search(query)
 
     override suspend fun load(url: String): LoadResponse? {
-        Log.e(TAG, "===== load START url=$url =====")
+        Log.e("FootballReplays", "===== load START url=$url =====")
         val html = fetchHtml(url)
         val document = org.jsoup.Jsoup.parse(html)
 
         val title = document.selectFirst("h1.s-title")?.text()?.trim() ?: run {
-            Log.e(TAG, "load FAILED: title not found")
+            Log.e("FootballReplays", "load FAILED: title not found")
             return null
         }
-        Log.e(TAG, "load title=$title")
+        Log.e("FootballReplays", "load title=$title")
 
         val poster = fixUrlNull(document.selectFirst("div.s-feat img")?.attr("src"))
-        Log.e(TAG, "load poster=$poster")
+        Log.e("FootballReplays", "load poster=$poster")
 
         val year = document.selectFirst("time.updated-date")?.attr("datetime")?.substringBefore("-")?.toIntOrNull()
-        Log.e(TAG, "load year=$year")
+        Log.e("FootballReplays", "load year=$year")
 
         val rawDescription = document.selectFirst("meta[property=og:description]")?.attr("content")?.trim() ?: ""
-        Log.e(TAG, "load rawDescription=${rawDescription.take(300)}")
+        Log.e("FootballReplays", "load rawDescription=${rawDescription.take(300)}")
 
         val kickOffRegex = Regex("""Kick-off:\s*([^.]+)""", RegexOption.IGNORE_CASE)
         val kickOffMatch = kickOffRegex.find(rawDescription)?.groupValues?.getOrNull(1)
-        Log.e(TAG, "load kickOffMatch=$kickOffMatch")
+        Log.e("FootballReplays", "load kickOffMatch=$kickOffMatch")
 
         val fallbackDate = document.selectFirst("time.updated-date")?.text()
             ?.replace("Last updated:", "", ignoreCase = true)?.trim()
-        Log.e(TAG, "load fallbackDate=$fallbackDate")
+        Log.e("FootballReplays", "load fallbackDate=$fallbackDate")
 
         val displayDate = kickOffMatch ?: fallbackDate
-        Log.e(TAG, "load displayDate=$displayDate")
+        Log.e("FootballReplays", "load displayDate=$displayDate")
 
         val episodes = mutableListOf<Episode>()
         document.select("table.video-table").forEachIndexed { tIdx, table ->
             val sourceName = table.selectFirst("thead tr th[colspan]")?.text()?.trim() ?: "Source"
-            Log.e(TAG, "load table[$tIdx] sourceName=$sourceName")
+            Log.e("FootballReplays", "load table[$tIdx] sourceName=$sourceName")
 
             table.select("tbody tr").forEachIndexed { rIdx, tr ->
                 val part = tr.select("td").firstOrNull()?.text()?.trim() ?: "Video"
                 val onclickAttr = tr.selectFirst("a.play-button")?.attr("onclick") ?: run {
-                    Log.e(TAG, "load table[$tIdx] row[$rIdx] no play-button")
+                    Log.e("FootballReplays", "load table[$tIdx] row[$rIdx] no play-button")
                     return@forEachIndexed
                 }
-                Log.e(TAG, "load table[$tIdx] row[$rIdx] onclick=$onclickAttr")
+                Log.e("FootballReplays", "load table[$tIdx] row[$rIdx] onclick=$onclickAttr")
 
                 val regex = Regex("""loadVideo\('([^']+)'\)""")
                 val videoUrl = regex.find(onclickAttr)?.groupValues?.get(1) ?: run {
-                    Log.e(TAG, "load table[$tIdx] row[$rIdx] loadVideo regex failed")
+                    Log.e("FootballReplays", "load table[$tIdx] row[$rIdx] loadVideo regex failed")
                     return@forEachIndexed
                 }
-                Log.e(TAG, "load table[$tIdx] row[$rIdx] videoUrl=$videoUrl")
+                Log.e("FootballReplays", "load table[$tIdx] row[$rIdx] videoUrl=$videoUrl")
 
                 val episodeData = "$videoUrl|$sourceName - $part"
                 val currentEpisodeSize = episodes.size
@@ -382,7 +381,7 @@ class FootballReplays : MainAPI() {
             }
         }
 
-        Log.e(TAG, "load total episodes=${episodes.size}")
+        Log.e("FootballReplays", "load total episodes=${episodes.size}")
 
         val plotText = buildString {
             if (!displayDate.isNullOrBlank()) {
@@ -394,7 +393,7 @@ class FootballReplays : MainAPI() {
             append("📡 Available Streams: ${episodes.size}")
         }
 
-        Log.e(TAG, "===== load SUCCESS title=$title episodes=${episodes.size} =====")
+        Log.e("FootballReplays", "===== load SUCCESS title=$title episodes=${episodes.size} =====")
 
         return newTvSeriesLoadResponse(title, url, TvType.Others, episodes) {
             this.posterUrl = poster
@@ -434,20 +433,20 @@ class FootballReplays : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        Log.e(TAG, "===== loadLinks START =====")
-        Log.e(TAG, "loadLinks raw data=$data")
+        Log.e("FootballReplays", "===== loadLinks START =====")
+        Log.e("FootballReplays", "loadLinks raw data=$data")
 
         val parts = data.split("|")
         val videoUrl = parts.getOrNull(0) ?: run {
-            Log.e(TAG, "loadLinks FAILED: no videoUrl part")
+            Log.e("FootballReplays", "loadLinks FAILED: no videoUrl part")
             return false
         }
         val customName = parts.getOrNull(1) ?: "Video"
         val iframeUrl = if (videoUrl.startsWith("//")) "https:$videoUrl" else videoUrl
 
-        Log.e(TAG, "loadLinks videoUrl=$videoUrl")
-        Log.e(TAG, "loadLinks customName=$customName")
-        Log.e(TAG, "loadLinks iframeUrl=$iframeUrl")
+        Log.e("FootballReplays", "loadLinks videoUrl=$videoUrl")
+        Log.e("FootballReplays", "loadLinks customName=$customName")
+        Log.e("FootballReplays", "loadLinks iframeUrl=$iframeUrl")
 
         var emitted = 0
         val extractedLinks = mutableListOf<ExtractorLink>()
@@ -458,7 +457,7 @@ class FootballReplays : MainAPI() {
 
         extractedLinks.forEach { link ->
             emitted++
-            Log.e(TAG, "loadLinks EMITTED #$emitted url=${link.url.take(200)} type=${link.type} name=${link.name}")
+            Log.e("FootballReplays", "loadLinks EMITTED #$emitted url=${link.url.take(200)} type=${link.type} name=${link.name}")
             val newLink = newExtractorLink(
                 source = customName,
                 name = customName,
@@ -483,7 +482,7 @@ class FootballReplays : MainAPI() {
             )
 
             if (looksLikeByse) {
-                Log.e(TAG, "loadLinks no extractor matched, trying ByseSX fallback for $iframeUrl")
+                Log.e("FootballReplays", "loadLinks no extractor matched, trying ByseSX fallback for $iframeUrl")
                 try {
                     val byseLinks = mutableListOf<ExtractorLink>()
                     
@@ -493,7 +492,7 @@ class FootballReplays : MainAPI() {
                     
                     byseLinks.forEach { link ->
                         emitted++
-                        Log.e(TAG, "loadLinks ByseSX fallback EMITTED #$emitted url=${link.url.take(200)} type=${link.type}")
+                        Log.e("FootballReplays", "loadLinks ByseSX fallback EMITTED #$emitted url=${link.url.take(200)} type=${link.type}")
                         val newLink = newExtractorLink(
                             source = customName,
                             name = customName,
@@ -507,13 +506,13 @@ class FootballReplays : MainAPI() {
                         callback(newLink)
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "loadLinks ByseSX fallback FAILED", e)
+                    Log.e("FootballReplays", "loadLinks ByseSX fallback FAILED", e)
                 }
             } else {
-                Log.e(TAG, "loadLinks no extractor matched and URL doesn't look Byse-like, giving up")
+                Log.e("FootballReplays", "loadLinks no extractor matched and URL doesn't look Byse-like, giving up")
             }
         }
-        Log.e(TAG, "===== loadLinks END emitted=$emitted =====")
+        Log.e("FootballReplays", "===== loadLinks END emitted=$emitted =====")
         return true
     }
 }
