@@ -10,8 +10,6 @@ import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
 import com.lagradost.cloudstream3.extractors.DoodLaExtractor
-import com.lagradost.cloudstream3.extractors.StreamSB
-import com.lagradost.cloudstream3.extractors.Filesim
 import com.lagradost.cloudstream3.extractors.Voe
 import java.net.URI
 import java.net.URLEncoder
@@ -21,28 +19,9 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import org.json.JSONObject
 
-internal const val TAG = "FootballReplays"
-
-private const val BYSE_UA =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
-
 // ==========================================
 // Inbuilt Cloudstream Core Overrides
 // ==========================================
-class FileMoonSx : Filesim() {
-    override val name = "FileMoonSx"
-    override val mainUrl = "https://filemoon.sx"
-}
-
-class Waaw : StreamSB() {
-    override var mainUrl = "https://waaw.to"
-}
-
-class Wishfast : StreamWishExtractor() {
-    override val name = "StreamWish"
-    override val mainUrl = "https://wishfast.top"
-}
-
 class VidhidePlus : StreamWishExtractor() {
     override val name = "VidHide"
     override val mainUrl = "https://vidhideplus.com"
@@ -196,7 +175,6 @@ open class HQCloud : ExtractorApi() {
         for (domain in domains) {
             val newUrl = "https://$domain$path"
             try {
-                // Use CFInterceptor to ensure Cloudflare doesn't block the extractor
                 val response = app.get(newUrl, referer = "https://hgcloud.to/", interceptor = CFInterceptor())
                 if (response.text.length > 2000) {
                     html = response.text; baseUrl = "https://$domain"
@@ -256,148 +234,6 @@ open class HQCloud : ExtractorApi() {
 class HQLinks : HQCloud() { override var mainUrl = "https://hglink.to" }
 
 // ==========================================
-// VK Extractors
-// ==========================================
-open class VkExtractor : ExtractorApi() {
-    override val name = "Vk"
-    override val mainUrl = "https://vkvideo.ru"
-    override val requiresReferer = true
-
-    override suspend fun getUrl(
-        url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
-    ) {
-        val headers = mapOf("User-Agent" to BYSE_UA, "Referer" to mainUrl)
-        var response = try { app.get(url, headers = headers) } catch (e: Exception) { return }
-        
-        if (response.text.contains("hash429") || response.text.contains("challenge.html")) {
-            response = try {
-                app.get(url, interceptor = WebViewResolver(Regex(".*video_ext\\.php.*")), headers = headers)
-            } catch (e: Exception) { return }
-        }
-
-        val found = linkcikart(response.text, callback)
-        if (!found && url.contains("hash=")) {
-            val oid = Regex("""oid=([^&]+)""").find(url)?.groupValues?.get(1)
-            val id = Regex("""id=([^&]+)""").find(url)?.groupValues?.get(1)
-            val hash = Regex("""hash=([^&]+)""").find(url)?.groupValues?.get(1)
-            if (oid != null && id != null && hash != null) {
-                val token = Regex("""anonym\.eyJ[\w\.\-]+""").find(response.text)?.value
-                    ?: Regex(""""access_token"\s*:\s*"([^"]+)"""").find(response.text)?.groupValues?.get(1)
-                if (token != null) {
-                    val apiResp = app.post(
-                        "https://api.vk.com/method/video.get?v=5.269&client_id=52461373",
-                        headers = headers,
-                        data = mapOf("owner_id" to "", "videos" to "${oid}_${id}_${hash}", "extended" to "0", "is_embed" to "true", "track_code" to "", "access_token" to token)
-                    )
-                    linkcikart(apiResp.text, callback)
-                }
-            }
-        }
-    }
-
-    private suspend fun linkcikart(text: String, callback: (ExtractorLink) -> Unit): Boolean {
-        var any = false
-        Regex("\"(hls|hls_ondemand|dash|dash_sep|dash_ondemand)\"\\s*:\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).findAll(text).forEach { m ->
-            val t = m.groupValues[1].lowercase()
-            val u = m.groupValues[2].replace("\\", "")
-            if (u.isNotBlank()) {
-                any = true
-                val isDash = t.contains("dash")
-                callback.invoke(newExtractorLink("${name} ${if (isDash) "Dash" else "HLS"}", "${name} ${if (isDash) "Dash" else "HLS"}", u, if (isDash) ExtractorLinkType.DASH else ExtractorLinkType.M3U8) {
-                    this.referer = mainUrl
-                    this.headers = mapOf("User-Agent" to BYSE_UA, "Referer" to mainUrl)
-                })
-            }
-        }
-        return any
-    }
-}
-class VkCom : VkExtractor() { override var mainUrl = "https://vk.com" }
-
-// ==========================================
-// DTube Extractor
-// ==========================================
-class Dtube : ExtractorApi() {
-    override val name = "DTube"
-    override val mainUrl = "https://play.d.tube"
-    override val requiresReferer = false
-
-    override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
-        try {
-            var videoId = Regex("""([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})""", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
-            val shortId = Regex("""[?&]v=([a-zA-Z0-9_-]+)""").find(url)?.groupValues?.get(1) ?: if (videoId == null) url.substringAfterLast("/").takeIf { it.isNotBlank() } else null
-
-            val lookupId = shortId ?: videoId
-            if (lookupId != null) {
-                try {
-                    val apiResponse = app.get("https://api.d.tube/videos/$lookupId").text
-                    if (apiResponse.startsWith("{")) {
-                        val json = JSONObject(apiResponse)
-                        videoId = json.optString("_id").takeIf { it.isNotBlank() }
-                            ?: json.optString("id").takeIf { it.isNotBlank() }
-                            ?: json.optString("uuid").takeIf { it.isNotBlank() }
-                            ?: videoId
-
-                        val directHls = json.optString("hlsUrl").takeIf { it.isNotBlank() }
-                            ?: json.optString("manifestUrl").takeIf { it.isNotBlank() }
-                            ?: json.optString("gatewayUrl").takeIf { it.isNotBlank() }
-
-                        if (!directHls.isNullOrBlank()) {
-                            return M3u8Helper.generateM3u8(name, directHls, url)
-                        }
-                    }
-                } catch (e: Exception) { }
-            }
-
-            if (videoId != null) {
-                val nasNodes = listOf("nas1", "nas2", "nas3", "nas4", "video", "ipfs")
-                for (node in nasNodes) {
-                    val m3u8Url = "https://$node.d.tube/videos/$videoId/master.m3u8"
-                    try {
-                        if (app.get(m3u8Url).isSuccessful) {
-                            return M3u8Helper.generateM3u8(name, m3u8Url, url)
-                        }
-                    } catch (e: Exception) { }
-                }
-            }
-        } catch (e: Exception) { }
-        return null
-    }
-} 
-
-// ==========================================
-// Vtbe Extractor
-// ==========================================
-class Vtbe : ExtractorApi() {
-    override val name = "Vtbe"
-    override val mainUrl = "https://vtbe.to"
-    override val requiresReferer = true
-
-    override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
-        try {
-            val response = app.get(url, referer = mainUrl).document
-            val script = response.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return null
-            val unpacked = JsUnpacker(script).unpack() ?: return null
-            val link = Regex("""sources:\s*\[\s*\{\s*file:\s*['"](.*?)['"]""").find(unpacked)?.groupValues?.get(1) ?: return null
-
-            return listOf(
-                newExtractorLink(
-                    source = name,
-                    name = name,
-                    url = link,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = referer ?: mainUrl
-                    this.quality = Qualities.Unknown.value
-                }
-            )
-        } catch (e: Exception) {
-            return null
-        }
-    }
-}
-
-// ==========================================
 // Byse Extractor
 // ==========================================
 open class ByseSX : ExtractorApi() {
@@ -446,7 +282,11 @@ open class ByseSX : ExtractorApi() {
             Log.e(TAG, "Byse src[$i] q=${s.quality} label=${s.label} url=${s.url.take(220)}")
             callback.invoke(newExtractorLink(name, name, s.url, ExtractorLinkType.M3U8) {
                 this.referer = embedFrameUrl
-                this.headers = mutableMapOf("Referer" to embedFrameUrl, "Origin" to embedBase, "User-Agent" to BYSE_UA)
+                this.headers = mutableMapOf(
+                    "Referer" to embedFrameUrl, 
+                    "Origin" to embedBase, 
+                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+                )
             })
         }
         return parsed.sources.isNotEmpty()
@@ -462,8 +302,9 @@ open class ByseSX : ExtractorApi() {
         val base = "${uri.scheme}://${uri.host}"
         val shellUrl = "$base/e/$code"
 
+        // FIXED: Explicitly pass Referer to satisfy Byse's Nginx rules preventing the 403 Forbidden
+        val headers = mapOf("Referer" to "https://www.footreplays.com/", "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36")
         Log.e(TAG, "Byse: Fetching main page with CFInterceptor")
-        val headers = mapOf("Referer" to "https://www.footreplays.com/", "User-Agent" to BYSE_UA)
 
         var html = try {
             app.get(shellUrl, headers = headers, interceptor = CFInterceptor()).text
@@ -472,16 +313,15 @@ open class ByseSX : ExtractorApi() {
             ""
         }
 
-        // If Byse itself has Cloudflare protecting the embed, trigger the resolver
         if (CloudflareResolver.isCloudflareChallenge(html)) {
             Log.e(TAG, "Byse: Cloudflare challenge detected, resolving...")
-            CloudflareResolver.resolve(base)
+            // FIXED: Using shellUrl and passing headers to bypass the 403
+            CloudflareResolver.resolve(shellUrl, headers) 
             html = try {
                 app.get(shellUrl, headers = headers, interceptor = CFInterceptor()).text
             } catch(e: Exception) { "" }
         }
 
-        // Try extracting SSR state variables injected directly from the HTML source (bypassing the need for API endpoints entirely)
         val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         val iv = Regex(""""iv"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         val payload = Regex(""""payload"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
@@ -497,7 +337,6 @@ open class ByseSX : ExtractorApi() {
             }
         }
 
-        // Final fallback: Webview m3u8 catcher if HTML doesn't have it
         Log.e(TAG, "Byse: Falling back to WebViewResolver for m3u8")
         try {
             val wvM3u8 = app.get(
