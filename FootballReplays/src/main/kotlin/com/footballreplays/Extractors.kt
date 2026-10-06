@@ -473,29 +473,35 @@ open class ByseSX : ExtractorApi() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
                     
-                    // Optimized Auto-Clicker: Stops clicking once the video starts
+                    // SMART SINGLE-FIRE AUTO-CLICKER
                     override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
                         val js = """
                             (function() {
                                 try {
                                     Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
                                     Object.defineProperty(document, 'hidden', {get: function() { return false; }});
-                                    setInterval(function() {
+                                    
+                                    var attemptClick = setInterval(function() {
                                         var vids = document.querySelectorAll('video');
-                                        var isPlaying = false;
-                                        vids.forEach(v => { if (!v.paused) isPlaying = true; });
+                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
                                         
-                                        if (!isPlaying) {
-                                            var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
-                                            buttons.forEach(b => b.click());
+                                        // Wait until the player is actually injected into the DOM
+                                        if (vids.length > 0 || buttons.length > 0) {
+                                            buttons.forEach(b => {
+                                                b.click();
+                                                b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+                                            });
                                             
                                             vids.forEach(v => { 
                                                 v.muted = true; 
                                                 var p = v.play();
                                                 if (p !== undefined) p.catch(e => {}); 
                                             });
+                                            
+                                            // Click successful: Stop the loop permanently so it never double-clicks
+                                            clearInterval(attemptClick);
                                         }
-                                    }, 1000);
+                                    }, 500);
                                 } catch(e) {}
                             })();
                         """.trimIndent()
@@ -525,8 +531,8 @@ open class ByseSX : ExtractorApi() {
 
             root?.addView(wv)
             wv.loadUrl(urlToResolve, headers)
-            // Reduced to 4.5 seconds to minimize delay and pass off session cookies to Stage 2 quickly
-            handler.postDelayed(timeoutRunnable!!, 4500L) 
+            // Strict 4.5 second timeout
+            handler.postDelayed(timeoutRunnable!!, 6000L) 
         }
     }
 
@@ -608,29 +614,35 @@ open class ByseSX : ExtractorApi() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
 
-                    // Optimized Auto-Clicker (Synchronized with Stage 1)
+                    // SMART SINGLE-FIRE AUTO-CLICKER
                     override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
                         val js = """
                             (function() {
                                 try {
                                     Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
                                     Object.defineProperty(document, 'hidden', {get: function() { return false; }});
-                                    setInterval(function() {
+                                    
+                                    var attemptClick = setInterval(function() {
                                         var vids = document.querySelectorAll('video');
-                                        var isPlaying = false;
-                                        vids.forEach(v => { if (!v.paused) isPlaying = true; });
+                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
                                         
-                                        if (!isPlaying) {
-                                            var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
-                                            buttons.forEach(b => b.click());
+                                        // Wait until the player is actually injected into the DOM
+                                        if (vids.length > 0 || buttons.length > 0) {
+                                            buttons.forEach(b => {
+                                                b.click();
+                                                b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+                                            });
                                             
                                             vids.forEach(v => { 
                                                 v.muted = true; 
                                                 var p = v.play();
                                                 if (p !== undefined) p.catch(e => {}); 
                                             });
+                                            
+                                            // Click successful: Stop the loop permanently so it never double-clicks
+                                            clearInterval(attemptClick);
                                         }
-                                    }, 1000);
+                                    }, 500);
                                 } catch(e) {}
                             })();
                         """.trimIndent()
