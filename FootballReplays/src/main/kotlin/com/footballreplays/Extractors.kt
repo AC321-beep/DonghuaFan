@@ -386,7 +386,6 @@ class Vtbe : ExtractorApi() {
 // ==========================================
 // Byse Extractor (Ultimate Interceptor Pattern)
 // ==========================================
-
 open class ByseSX : ExtractorApi() {
     override var name = "Byse"
     override var mainUrl = "https://byse.sx"
@@ -440,11 +439,13 @@ open class ByseSX : ExtractorApi() {
             val done = AtomicBoolean(false)
             val handler = android.os.Handler(android.os.Looper.getMainLooper())
             var timeoutRunnable: Runnable? = null
+            var clickRunnable: Runnable? = null
             var webView: android.webkit.WebView? = null 
 
             fun finish(result: InterceptResult?) {
                 if (!done.compareAndSet(false, true)) return
                 timeoutRunnable?.let { handler.removeCallbacks(it) }
+                clickRunnable?.let { handler.removeCallbacks(it) }
                 runCatching {
                     webView?.let { wv ->
                         root?.removeView(wv)
@@ -474,48 +475,6 @@ open class ByseSX : ExtractorApi() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
                     
-                    // CLOUDFLARE-AWARE AUTO-CLICKER
-                    override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
-                        val js = """
-                            (function() {
-                                try {
-                                    Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
-                                    Object.defineProperty(document, 'hidden', {get: function() { return false; }});
-                                    
-                                    var attemptClick = setInterval(function() {
-                                        // CRITICAL FIX: Do not spam clicks if Cloudflare is currently active
-                                        var pageTitle = document.title.toLowerCase();
-                                        if (pageTitle.includes("just a moment") || pageTitle.includes("attention required") || document.querySelector('#turnstile-wrapper')) {
-                                            return; // Skip this tick, wait for CF to pass
-                                        }
-
-                                        var vids = document.querySelectorAll('video');
-                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid, [class*="play"]');
-                                        var isPlaying = false;
-                                        
-                                        vids.forEach(v => { if (!v.paused) isPlaying = true; });
-                                        
-                                        if (!isPlaying && (vids.length > 0 || buttons.length > 0)) {
-                                            buttons.forEach(b => {
-                                                b.click();
-                                                b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
-                                            });
-                                            vids.forEach(v => { 
-                                                v.muted = true; 
-                                                var p = v.play();
-                                                if (p !== undefined) p.catch(e => {}); 
-                                            });
-                                        } else if (isPlaying) {
-                                            // Successfully started playing, stop clicking permanently
-                                            clearInterval(attemptClick);
-                                        }
-                                    }, 800); // Slowed down slightly to be safer
-                                } catch(e) {}
-                            })();
-                        """.trimIndent()
-                        view?.evaluateJavascript(js, null)
-                    }
-
                     override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: return null
                         if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
@@ -532,6 +491,39 @@ open class ByseSX : ExtractorApi() {
 
             cont.invokeOnCancellation { finish(null) }
 
+            // KOTLIN-CONTROLLED STEALTH AUTO-CLICKER (Bypasses CF Bot Detection)
+            clickRunnable = object : Runnable {
+                override fun run() {
+                    if (done.get()) return
+                    val js = """
+                        (function() {
+                            // Do nothing if CF is visibly active
+                            if (document.title.toLowerCase().includes('just a moment')) return;
+                            if (document.title.toLowerCase().includes('attention required')) return;
+                            
+                            var vids = document.querySelectorAll('video');
+                            var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .plyr__control--overlaid, [class*="play"]');
+                            
+                            if (vids.length > 0 || buttons.length > 0) {
+                                buttons.forEach(b => {
+                                    b.click();
+                                    b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+                                });
+                                vids.forEach(v => { 
+                                    v.muted = true; 
+                                    var p = v.play();
+                                    if (p !== undefined) p.catch(e => {}); 
+                                });
+                            }
+                        })();
+                    """.trimIndent()
+                    webView?.evaluateJavascript(js, null)
+                    
+                    // Keep trying gently every 1 second
+                    handler.postDelayed(this, 1000L)
+                }
+            }
+
             timeoutRunnable = Runnable { 
                 Log.e("FootballReplays", "Byse: Stage 1 Timed Out")
                 finish(null) 
@@ -539,7 +531,12 @@ open class ByseSX : ExtractorApi() {
 
             root?.addView(wv)
             wv.loadUrl(urlToResolve, headers)
-            handler.postDelayed(timeoutRunnable!!, 6000L) // 6 Second Timeout
+            
+            // DELAY THE CLICKER: Let CF run naturally for 2.5 seconds without any JS interference
+            handler.postDelayed(clickRunnable!!, 2500L)
+            
+            // Strict 6 second timeout
+            handler.postDelayed(timeoutRunnable!!, 6000L) 
         }
     }
 
@@ -558,6 +555,9 @@ open class ByseSX : ExtractorApi() {
             }
             val done = AtomicBoolean(false)
             val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            var clickRunnable: Runnable? = null
+            var timeoutRunnable: Runnable? = null
+            var webView: android.webkit.WebView? = null
 
             val layout = android.widget.LinearLayout(activity).apply {
                 orientation = android.widget.LinearLayout.VERTICAL
@@ -575,10 +575,10 @@ open class ByseSX : ExtractorApi() {
                 layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
             
-            var webView: android.webkit.WebView? = null
-
             fun finish(result: InterceptResult?) {
                 if (!done.compareAndSet(false, true)) return
+                clickRunnable?.let { handler.removeCallbacks(it) }
+                timeoutRunnable?.let { handler.removeCallbacks(it) }
                 android.webkit.CookieManager.getInstance().flush()
                 runCatching { 
                     webView?.let { wv ->
@@ -630,48 +630,6 @@ open class ByseSX : ExtractorApi() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
 
-                    // CLOUDFLARE-AWARE AUTO-CLICKER
-                    override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
-                        val js = """
-                            (function() {
-                                try {
-                                    Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
-                                    Object.defineProperty(document, 'hidden', {get: function() { return false; }});
-                                    
-                                    var attemptClick = setInterval(function() {
-                                        // CRITICAL FIX: Do not spam clicks if Cloudflare is currently active
-                                        var pageTitle = document.title.toLowerCase();
-                                        if (pageTitle.includes("just a moment") || pageTitle.includes("attention required") || document.querySelector('#turnstile-wrapper')) {
-                                            return; // Skip this tick, wait for CF to pass
-                                        }
-
-                                        var vids = document.querySelectorAll('video');
-                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid, [class*="play"]');
-                                        var isPlaying = false;
-                                        
-                                        vids.forEach(v => { if (!v.paused) isPlaying = true; });
-                                        
-                                        if (!isPlaying && (vids.length > 0 || buttons.length > 0)) {
-                                            buttons.forEach(b => {
-                                                b.click();
-                                                b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
-                                            });
-                                            vids.forEach(v => { 
-                                                v.muted = true; 
-                                                var p = v.play();
-                                                if (p !== undefined) p.catch(e => {}); 
-                                            });
-                                        } else if (isPlaying) {
-                                            // Successfully started playing, stop clicking permanently
-                                            clearInterval(attemptClick);
-                                        }
-                                    }, 800); // Slowed down slightly to be safer
-                                } catch(e) {}
-                            })();
-                        """.trimIndent()
-                        view?.evaluateJavascript(js, null)
-                    }
-                    
                     override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: return null
                         if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
@@ -685,6 +643,37 @@ open class ByseSX : ExtractorApi() {
                 }
             }
             webView = wv
+            
+            // KOTLIN-CONTROLLED STEALTH AUTO-CLICKER
+            clickRunnable = object : Runnable {
+                override fun run() {
+                    if (done.get()) return
+                    val js = """
+                        (function() {
+                            if (document.title.toLowerCase().includes('just a moment')) return;
+                            if (document.title.toLowerCase().includes('attention required')) return;
+                            
+                            var vids = document.querySelectorAll('video');
+                            var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .plyr__control--overlaid, [class*="play"]');
+                            
+                            if (vids.length > 0 || buttons.length > 0) {
+                                buttons.forEach(b => {
+                                    b.click();
+                                    b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+                                });
+                                vids.forEach(v => { 
+                                    v.muted = true; 
+                                    var p = v.play();
+                                    if (p !== undefined) p.catch(e => {}); 
+                                });
+                            }
+                        })();
+                    """.trimIndent()
+                    webView?.evaluateJavascript(js, null)
+                    
+                    handler.postDelayed(this, 1000L)
+                }
+            }
 
             layout.addView(wv)
             dialog.setContentView(layout)
@@ -693,7 +682,11 @@ open class ByseSX : ExtractorApi() {
             dialog.show()
             wv.loadUrl(urlToResolve, headers)
 
-            handler.postDelayed({ if (!done.get()) finish(null) }, 25_000L) // 25s Timeout
+            // DELAY THE CLICKER: Let CF run naturally for 3.5 seconds
+            handler.postDelayed(clickRunnable!!, 3500L)
+
+            timeoutRunnable = Runnable { finish(null) }
+            handler.postDelayed(timeoutRunnable!!, 25_000L) // 25s Timeout
         }
     }
 
