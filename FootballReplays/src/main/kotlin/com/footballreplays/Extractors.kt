@@ -274,7 +274,7 @@ open class VkExtractor : ExtractorApi() {
         }
     }
 
-    private suspend fun linkcikart(text: String, callback: (ExtractorLink) -> Unit): Boolean {
+    private fun linkcikart(text: String, callback: (ExtractorLink) -> Unit): Boolean {
         var any = false
         for (m in Regex("\"(hls|hls_ondemand|dash|dash_sep|dash_ondemand)\"\\s*:\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).findAll(text)) {
             val t = m.groupValues[1].lowercase()
@@ -409,7 +409,7 @@ open class ByseSX : ExtractorApi() {
         return Base64.decode(fixed + pad, Base64.DEFAULT)
     }
 
-    private suspend fun emitFromPlaybackJson(
+    private fun emitFromPlaybackJson(
         playbackBody: String, embedFrameUrl: String, embedBase: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
         return runCatching {
@@ -470,13 +470,27 @@ open class ByseSX : ExtractorApi() {
         // Stage 2: Fallback to Cloudstream's native WebViewResolver
         Log.d(TAG, "Byse: Fast AES failed, falling back to native WebViewResolver")
         
+        // JavaScript to auto-click the play buttons so the m3u8 request triggers
+        val autoPlayScript = """
+            setInterval(function() {
+                var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
+                buttons.forEach(b => b.click());
+                var vids = document.querySelectorAll('video');
+                vids.forEach(v => { v.muted = true; v.play(); });
+            }, 500);
+        """.trimIndent()
+
+        // Cloudstream's built-in headless resolver
         val interceptor = WebViewResolver(
-            interceptUrl = Regex("""\.m3u8|\.m3u""")
+            interceptUrl = Regex("""\.m3u8|\.m3u"""),
+            additionalScripts = listOf(autoPlayScript)
         )
 
         try {
             val response = app.get(shellUrl, headers = headers, interceptor = interceptor)
             
+            // If the WebViewResolver catches a matching URL, it returns a NiceResponse 
+            // where the URL is the intercepted target
             val resolvedUrl = response.url
             if (resolvedUrl.contains(".m3u8") || resolvedUrl.contains(".m3u")) {
                 callback.invoke(newExtractorLink(name, name, resolvedUrl, ExtractorLinkType.M3U8) {
