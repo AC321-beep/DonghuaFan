@@ -153,18 +153,9 @@ class FootballReplays : MainAPI() {
         var emitted = 0
         loadExtractor(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
             emitted++
-            // FIXED: Using newExtractorLink instead of deprecated ExtractorLink constructor
-            val extractedLink = newExtractorLink(
-                source = customName,
-                name = customName,
-                url = link.url,
-                type = link.type
-            ) {
-                this.referer = link.referer
-                this.quality = link.quality
-                this.headers = link.headers
-            }
-            callback(extractedLink)
+            // FIXED: Using Kotlin's native .copy() function safely replicates the data class
+            // without needing the deprecated constructor or suspending newExtractorLink function.
+            callback(link.copy(source = customName, name = customName))
         }
 
         // Fallback for unmapped Byse rotating domains
@@ -182,18 +173,7 @@ class FootballReplays : MainAPI() {
                 try {
                     ByseSX().getUrl(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
                         emitted++
-                        // FIXED: Using newExtractorLink instead of deprecated ExtractorLink constructor
-                        val extractedLink = newExtractorLink(
-                            source = customName,
-                            name = customName,
-                            url = link.url,
-                            type = link.type
-                        ) {
-                            this.referer = link.referer
-                            this.quality = link.quality
-                            this.headers = link.headers
-                        }
-                        callback(extractedLink)
+                        callback(link.copy(source = customName, name = customName))
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "ByseSX fallback FAILED", e)
