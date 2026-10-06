@@ -6,6 +6,7 @@ import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
@@ -390,7 +391,6 @@ open class ByseSX : ExtractorApi() {
     override var mainUrl = "https://byse.sx"
     override val requiresReferer = true
 
-    // Decrypts payload if injected server-side
     private fun b64(s: String): ByteArray {
         val fixed = s.replace('-', '+').replace('_', '/')
         val pad = "=".repeat((4 - fixed.length % 4) % 4)
@@ -423,9 +423,75 @@ open class ByseSX : ExtractorApi() {
         return parsed.sources.isNotEmpty()
     }
 
-    // Interactive M3U8 Catcher
     data class InterceptResult(val url: String, val headers: Map<String, String>)
 
+    // STAGE 1: Silent M3U8 Interceptor
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun runSilentM3u8Interceptor(
+        activity: android.app.Activity, 
+        urlToResolve: String, 
+        headers: Map<String, String>
+    ): InterceptResult? = withContext(Dispatchers.Main) {
+        val decor = activity.window?.decorView as? android.view.ViewGroup ?: return@withContext null
+        suspendCancellableCoroutine { cont ->
+            val done = AtomicBoolean(false)
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            var timeoutRunnable: Runnable? = null
+
+            val webView = android.webkit.WebView(activity).apply {
+                layoutParams = android.view.ViewGroup.LayoutParams(
+                    activity.resources.displayMetrics.widthPixels,
+                    activity.resources.displayMetrics.heightPixels
+                )
+                translationX = 20000f // Keep offscreen
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
+                    mediaPlaybackRequiresUserGesture = false 
+                    userAgentString = BYSE_UA
+                }
+
+                webViewClient = object : android.webkit.WebViewClient() {
+                    @SuppressLint("WebViewClientOnReceivedSslError")
+                    override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
+                    
+                    override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
+                        val reqUrl = request?.url?.toString() ?: return null
+                        if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
+                            Log.e("FootballReplays", "Stage 1 Intercepted stream: $reqUrl")
+                            val reqHeaders = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
+                            reqHeaders["Referer"] = urlToResolve
+                            activity.runOnUiThread { finish(InterceptResult(reqUrl, reqHeaders)) }
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
+                }
+            }
+
+            fun finish(result: InterceptResult?) {
+                if (!done.compareAndSet(false, true)) return
+                timeoutRunnable?.let { handler.removeCallbacks(it) }
+                runCatching {
+                    decor.removeView(webView)
+                    webView.stopLoading()
+                    webView.destroy()
+                }
+                if (cont.isActive) cont.resume(result)
+            }
+
+            cont.invokeOnCancellation { finish(null) }
+
+            timeoutRunnable = Runnable { finish(null) }
+
+            decor.addView(webView)
+            webView.loadUrl(urlToResolve, headers)
+            handler.postDelayed(timeoutRunnable!!, 6000L) // Fast 6-second timeout
+        }
+    }
+
+    // STAGE 2: Interactive M3U8 Interceptor
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun runInteractiveM3u8Interceptor(
         activity: android.app.Activity, 
@@ -502,11 +568,10 @@ open class ByseSX : ExtractorApi() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
                     
-                    // The magic method: Intercept the m3u8 request
                     override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: return null
                         if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
-                            Log.e("FootballReplays", "Intercepted stream: $reqUrl")
+                            Log.e("FootballReplays", "Stage 2 Intercepted stream: $reqUrl")
                             val reqHeaders = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
                             reqHeaders["Referer"] = urlToResolve
                             activity.runOnUiThread { finish(InterceptResult(reqUrl, reqHeaders)) }
@@ -537,7 +602,6 @@ open class ByseSX : ExtractorApi() {
         val shellUrl = "$base/e/$code"
         val headers = mapOf("Referer" to "https://www.footreplays.com/", "User-Agent" to BYSE_UA)
 
-        // 1. Try Fast Extraction (No WebView)
         val html = try {
             app.get(shellUrl, headers = headers, interceptor = CFInterceptor()).text
         } catch(e: Exception) { "" }
@@ -556,12 +620,17 @@ open class ByseSX : ExtractorApi() {
             }
         }
 
-        // 2. Interactive Interceptor Fallback
-        Log.e("FootballReplays", "Byse: Fast extraction failed, launching Interactive Interceptor")
         val activity = CommonActivity.activity ?: return
         if (activity.isFinishing || activity.isDestroyed) return
 
-        val result = runInteractiveM3u8Interceptor(activity, shellUrl, headers)
+        Log.e("FootballReplays", "Byse: Fast extraction failed, launching Stage 1 (Silent) Interceptor")
+        var result = runSilentM3u8Interceptor(activity, shellUrl, headers)
+        
+        if (result == null) {
+            Log.e("FootballReplays", "Byse: Stage 1 failed/timed out, launching Stage 2 (Interactive) Interceptor")
+            result = runInteractiveM3u8Interceptor(activity, shellUrl, headers)
+        }
+
         if (result != null) {
             callback.invoke(newExtractorLink(name, name, result.url, ExtractorLinkType.M3U8) {
                 this.referer = shellUrl
