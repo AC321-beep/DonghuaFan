@@ -1,7 +1,6 @@
 package com.footballreplays
 
 import android.annotation.SuppressLint
-import android.util.Log
 import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -170,9 +169,7 @@ open class HQCloud : ExtractorApi() {
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
-        Log.e("FootballReplays", "===== START HQCloud =====")
         val path = Regex("""(https?://[^/]+)(/[^?]+)""").find(url)?.groupValues?.get(2) ?: run {
-            Log.e("FootballReplays", "HQCloud FAILED: no path")
             return
         }
         val domains = listOf("audinifer.com", "vibuxere.com", "streamhg.com", "dhcplay.com", "cybervynx.com")
@@ -186,16 +183,13 @@ open class HQCloud : ExtractorApi() {
                 val response = app.get(newUrl, referer = "https://hgcloud.to/", interceptor = CFInterceptor())
                 if (response.text.length > 2000) {
                     html = response.text; baseUrl = "https://$domain"
-                    Log.e("FootballReplays", "HQCloud SUCCESS domain=$domain len=${response.text.length}")
                     break
                 }
             } catch (e: Exception) { 
-                Log.e("FootballReplays", "HQCloud domain fail $domain", e)
             }
         }
 
         if (html.length < 2000) {
-            Log.e("FootballReplays", "HQCloud FAILED: no html")
             return
         }
 
@@ -223,7 +217,6 @@ open class HQCloud : ExtractorApi() {
         }
 
         if (finalUrl.isEmpty()) {
-            Log.e("FootballReplays", "HQCloud FAILED: no finalUrl")
             return
         }
 
@@ -236,7 +229,6 @@ open class HQCloud : ExtractorApi() {
             this.referer = baseUrl
             this.headers = mutableMapOf("Cookie" to cookieString)
         })
-        Log.e("FootballReplays", "===== END HQCloud SUCCESS =====")
     }
 }
 class HQLinks : HQCloud() { override var mainUrl = "https://hglink.to" }
@@ -414,7 +406,6 @@ open class ByseSX : ExtractorApi() {
         val parsed = tryParseJson<BysePlaybackDecrypt>(json) ?: return false
 
         for (s in parsed.sources) {
-            Log.e("FootballReplays", "Byse Fast AES src q=${s.quality} url=${s.url.take(150)}")
             callback.invoke(newExtractorLink(name, name, s.url, ExtractorLinkType.M3U8) {
                 this.referer = embedFrameUrl
                 this.headers = mapOf("Referer" to embedFrameUrl, "Origin" to embedBase, "User-Agent" to BYSE_UA)
@@ -434,7 +425,6 @@ open class ByseSX : ExtractorApi() {
     ): InterceptResult? = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             val root = activity.window?.decorView as? android.view.ViewGroup
-            Log.e("FootballReplays", "Byse: Stage 1 (Silent) Started. Attached=${root != null}")
             
             val done = AtomicBoolean(false)
             val handler = android.os.Handler(android.os.Looper.getMainLooper())
@@ -478,7 +468,6 @@ open class ByseSX : ExtractorApi() {
                     override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: return null
                         if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
-                            Log.e("FootballReplays", "Stage 1 Intercepted stream: $reqUrl")
                             val reqHeaders = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
                             reqHeaders["Referer"] = urlToResolve
                             activity.runOnUiThread { finish(InterceptResult(reqUrl, reqHeaders)) }
@@ -525,7 +514,6 @@ open class ByseSX : ExtractorApi() {
             }
 
             timeoutRunnable = Runnable { 
-                Log.e("FootballReplays", "Byse: Stage 1 Timed Out")
                 finish(null) 
             }
 
@@ -548,7 +536,6 @@ open class ByseSX : ExtractorApi() {
         headers: Map<String, String>
     ): InterceptResult? = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
-            Log.e("FootballReplays", "Byse: Stage 2 (Interactive) Started")
             val dialog = android.app.Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
                 setCancelable(false)
                 setCanceledOnTouchOutside(false)
@@ -633,7 +620,6 @@ open class ByseSX : ExtractorApi() {
                     override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: return null
                         if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
-                            Log.e("FootballReplays", "Stage 2 Intercepted stream: $reqUrl")
                             val reqHeaders = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
                             reqHeaders["Referer"] = urlToResolve
                             activity.runOnUiThread { finish(InterceptResult(reqUrl, reqHeaders)) }
@@ -693,7 +679,6 @@ open class ByseSX : ExtractorApi() {
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
-        Log.e("FootballReplays", "===== START ByseSX =====")
         val uri = URI(url)
         val code = uri.path.trimEnd('/').substringAfterLast('/')
         val base = "${uri.scheme}://${uri.host}"
@@ -713,7 +698,6 @@ open class ByseSX : ExtractorApi() {
             val keyParts = keyPartsStr.split(",").map { it.replace("\"", "").trim() }
             val pbJson = """{"playback":{"algorithm":"$algorithm","iv":"$iv","payload":"$payload","key_parts":[${keyParts.joinToString(",") { "\"$it\"" }}]}}"""
             if (emitFromPlaybackJson(pbJson, shellUrl, base, callback)) {
-                Log.e("FootballReplays", "===== END ByseSX SUCCESS via Fast AES =====")
                 return
             }
         }
@@ -721,11 +705,9 @@ open class ByseSX : ExtractorApi() {
         val activity = CommonActivity.activity ?: return
         if (activity.isFinishing || activity.isDestroyed) return
 
-        Log.e("FootballReplays", "Byse: Fast extraction failed, launching Stage 1 (Silent) Interceptor")
         var result = runSilentM3u8Interceptor(activity, shellUrl, headers)
         
         if (result == null) {
-            Log.e("FootballReplays", "Byse: Stage 1 failed/timed out, launching Stage 2 (Interactive) Interceptor")
             result = runInteractiveM3u8Interceptor(activity, shellUrl, headers)
         }
 
@@ -734,9 +716,7 @@ open class ByseSX : ExtractorApi() {
                 this.referer = shellUrl
                 this.headers = result.headers
             })
-            Log.e("FootballReplays", "===== END ByseSX SUCCESS via Interceptor =====")
         } else {
-            Log.e("FootballReplays", "===== END ByseSX FAILED =====")
         }
     }
 }
