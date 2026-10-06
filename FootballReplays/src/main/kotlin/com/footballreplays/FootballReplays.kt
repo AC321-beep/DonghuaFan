@@ -455,7 +455,7 @@ class FootballReplays : MainAPI() {
             extractedLinks.add(link)
         }
 
-        extractedLinks.forEach { link ->
+        for (link in extractedLinks) {
             emitted++
             Log.e("FootballReplays", "loadLinks EMITTED #$emitted url=${link.url.take(200)} type=${link.type} name=${link.name}")
             val newLink = newExtractorLink(
@@ -490,7 +490,7 @@ class FootballReplays : MainAPI() {
                         byseLinks.add(link)
                     }
                     
-                    byseLinks.forEach { link ->
+                    for (link in byseLinks) {
                         emitted++
                         Log.e("FootballReplays", "loadLinks ByseSX fallback EMITTED #$emitted url=${link.url.take(200)} type=${link.type}")
                         val newLink = newExtractorLink(
