@@ -5,7 +5,6 @@ import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
@@ -26,16 +25,6 @@ internal const val TAG = "FootballReplays"
 
 private const val BYSE_UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
-
-private val CHROME_HINTS = mapOf(
-    "sec-ch-ua" to "\"Chromium\";v=\"154\", \"Google Chrome\";v=\"154\", \"Not A(Brand\";v=\"99\"",
-    "sec-ch-ua-mobile" to "?0",
-    "sec-ch-ua-platform" to "\"Windows\"",
-    "accept-language" to "en-US,en;q=0.9",
-    "cache-control" to "no-cache",
-    "pragma" to "no-cache",
-    "priority" to "u=1, i"
-)
 
 // ==========================================
 // Inbuilt Cloudstream Core Overrides
@@ -207,7 +196,8 @@ open class HQCloud : ExtractorApi() {
         for (domain in domains) {
             val newUrl = "https://$domain$path"
             try {
-                val response = app.get(newUrl, referer = "https://hgcloud.to/")
+                // Use CFInterceptor to ensure Cloudflare doesn't block the extractor
+                val response = app.get(newUrl, referer = "https://hgcloud.to/", interceptor = CFInterceptor())
                 if (response.text.length > 2000) {
                     html = response.text; baseUrl = "https://$domain"
                     Log.e(TAG, "HQCloud SUCCESS domain=$domain len=${response.text.length}")
@@ -472,22 +462,26 @@ open class ByseSX : ExtractorApi() {
         val base = "${uri.scheme}://${uri.host}"
         val shellUrl = "$base/e/$code"
 
-        val headers = mapOf(
-            "Referer" to "https://www.footreplays.com/",
-            "User-Agent" to BYSE_UA
-        )
+        Log.e(TAG, "Byse: Fetching main page with CFInterceptor")
+        val headers = mapOf("Referer" to "https://www.footreplays.com/", "User-Agent" to BYSE_UA)
 
-        Log.e(TAG, "Byse: Fetching main page with CloudflareKiller")
-        val mainPageResp = try {
-            app.get(shellUrl, headers = headers, interceptor = CloudflareKiller())
+        var html = try {
+            app.get(shellUrl, headers = headers, interceptor = CFInterceptor()).text
         } catch(e: Exception) {
             Log.e(TAG, "Byse: Main page fetch failed", e)
-            null
+            ""
         }
 
-        val html = mainPageResp?.text ?: ""
+        // If Byse itself has Cloudflare protecting the embed, trigger the resolver
+        if (CloudflareResolver.isCloudflareChallenge(html)) {
+            Log.e(TAG, "Byse: Cloudflare challenge detected, resolving...")
+            CloudflareResolver.resolve(base)
+            html = try {
+                app.get(shellUrl, headers = headers, interceptor = CFInterceptor()).text
+            } catch(e: Exception) { "" }
+        }
 
-        // Try extracting SSR state variables injected by Nuxt/Next directly from the HTML source
+        // Try extracting SSR state variables injected directly from the HTML source (bypassing the need for API endpoints entirely)
         val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         val iv = Regex(""""iv"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         val payload = Regex(""""payload"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
