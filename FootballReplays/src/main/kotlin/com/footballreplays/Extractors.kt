@@ -1,26 +1,29 @@
 package com.footballreplays
 
+import android.annotation.SuppressLint
 import android.util.Log
 import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
 import com.lagradost.cloudstream3.extractors.DoodLaExtractor
 import com.lagradost.cloudstream3.extractors.Voe
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
-import java.util.ArrayDeque
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import org.json.JSONObject
+import kotlin.coroutines.resume
 
-// No internal const val TAG to prevent visibility errors
 private const val BYSE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
 
 // ==========================================
@@ -126,7 +129,6 @@ class VideaHu : ExtractorApi() {
             val api = "https://videa.hu/videaplayer_get_res.php?v=$id"
             val response = app.get(api).text
             
-            // Replaced forEach lambda with standard 'for' loop to completely avoid coroutine suspension issues
             for (match in Regex("""quality="([^"]+)".*?mp4="([^"]+)"""").findAll(response)) {
                 val q = match.groupValues[1]
                 var link = match.groupValues[2]
@@ -180,7 +182,6 @@ open class HQCloud : ExtractorApi() {
         for (domain in domains) {
             val newUrl = "https://$domain$path"
             try {
-                // Intercept with CFInterceptor to pass Cloudflare verification
                 val response = app.get(newUrl, referer = "https://hgcloud.to/", interceptor = CFInterceptor())
                 if (response.text.length > 2000) {
                     html = response.text; baseUrl = "https://$domain"
@@ -239,359 +240,200 @@ open class HQCloud : ExtractorApi() {
 }
 class HQLinks : HQCloud() { override var mainUrl = "https://hglink.to" }
 
-// ==========================================
-// VK Extractors
-// ==========================================
-open class VkExtractor : ExtractorApi() {
-    override val name = "Vk"
-    override val mainUrl = "https://vkvideo.ru"
-    override val requiresReferer = true
-
-    override suspend fun getUrl(
-        url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
-    ) {
-        val headers = mapOf("User-Agent" to BYSE_UA, "Referer" to mainUrl)
-        var response = try { app.get(url, headers = headers) } catch (e: Exception) { return }
-        
-        if (response.text.contains("hash429") || response.text.contains("challenge.html")) {
-            response = try {
-                app.get(url, interceptor = WebViewResolver(Regex(".*video_ext\\.php.*")), headers = headers)
-            } catch (e: Exception) { return }
-        }
-
-        val found = linkcikart(response.text, callback)
-        if (!found && url.contains("hash=")) {
-            val oid = Regex("""oid=([^&]+)""").find(url)?.groupValues?.get(1)
-            val id = Regex("""id=([^&]+)""").find(url)?.groupValues?.get(1)
-            val hash = Regex("""hash=([^&]+)""").find(url)?.groupValues?.get(1)
-            if (oid != null && id != null && hash != null) {
-                val token = Regex("""anonym\.eyJ[\w\.\-]+""").find(response.text)?.value
-                    ?: Regex(""""access_token"\s*:\s*"([^"]+)"""").find(response.text)?.groupValues?.get(1)
-                if (token != null) {
-                    val apiResp = app.post(
-                        "https://api.vk.com/method/video.get?v=5.269&client_id=52461373",
-                        headers = headers,
-                        data = mapOf("owner_id" to "", "videos" to "${oid}_${id}_${hash}", "extended" to "0", "is_embed" to "true", "track_code" to "", "access_token" to token)
-                    )
-                    linkcikart(apiResp.text, callback)
-                }
-            }
-        }
-    }
-
-    private suspend fun linkcikart(text: String, callback: (ExtractorLink) -> Unit): Boolean {
-        var any = false
-        // Replaced forEach lambda with standard 'for' loop to completely avoid coroutine suspension issues
-        for (m in Regex("\"(hls|hls_ondemand|dash|dash_sep|dash_ondemand)\"\\s*:\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).findAll(text)) {
-            val t = m.groupValues[1].lowercase()
-            val u = m.groupValues[2].replace("\\", "")
-            if (u.isNotBlank()) {
-                any = true
-                val isDash = t.contains("dash")
-                callback.invoke(newExtractorLink("${name} ${if (isDash) "Dash" else "HLS"}", "${name} ${if (isDash) "Dash" else "HLS"}", u, if (isDash) ExtractorLinkType.DASH else ExtractorLinkType.M3U8) {
-                    this.referer = mainUrl
-                    this.headers = mapOf("User-Agent" to BYSE_UA, "Referer" to mainUrl)
-                })
-            }
-        }
-        return any
-    }
-}
-class VkCom : VkExtractor() { override var mainUrl = "https://vk.com" }
 
 // ==========================================
-// DTube Extractor
-// ==========================================
-class Dtube : ExtractorApi() {
-    override val name = "DTube"
-    override val mainUrl = "https://play.d.tube"
-    override val requiresReferer = false
-
-    override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
-        try {
-            var videoId = Regex("""([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})""", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
-            val shortId = Regex("""[?&]v=([a-zA-Z0-9_-]+)""").find(url)?.groupValues?.get(1) ?: if (videoId == null) url.substringAfterLast("/").takeIf { it.isNotBlank() } else null
-
-            val lookupId = shortId ?: videoId
-            if (lookupId != null) {
-                try {
-                    val apiResponse = app.get("https://api.d.tube/videos/$lookupId").text
-                    if (apiResponse.startsWith("{")) {
-                        val json = JSONObject(apiResponse)
-                        videoId = json.optString("_id").takeIf { it.isNotBlank() }
-                            ?: json.optString("id").takeIf { it.isNotBlank() }
-                            ?: json.optString("uuid").takeIf { it.isNotBlank() }
-                            ?: videoId
-
-                        val directHls = json.optString("hlsUrl").takeIf { it.isNotBlank() }
-                            ?: json.optString("manifestUrl").takeIf { it.isNotBlank() }
-                            ?: json.optString("gatewayUrl").takeIf { it.isNotBlank() }
-
-                        if (!directHls.isNullOrBlank()) {
-                            return M3u8Helper.generateM3u8(name, directHls, url)
-                        }
-                    }
-                } catch (e: Exception) { }
-            }
-
-            if (videoId != null) {
-                val nasNodes = listOf("nas1", "nas2", "nas3", "nas4", "video", "ipfs")
-                for (node in nasNodes) {
-                    val m3u8Url = "https://$node.d.tube/videos/$videoId/master.m3u8"
-                    try {
-                        if (app.get(m3u8Url).isSuccessful) {
-                            return M3u8Helper.generateM3u8(name, m3u8Url, url)
-                        }
-                    } catch (e: Exception) { }
-                }
-            }
-        } catch (e: Exception) { }
-        return null
-    }
-} 
-
-// ==========================================
-// Vtbe Extractor
-// ==========================================
-class Vtbe : ExtractorApi() {
-    override val name = "Vtbe"
-    override val mainUrl = "https://vtbe.to"
-    override val requiresReferer = true
-
-    override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
-        try {
-            val response = app.get(url, referer = mainUrl).document
-            val script = response.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return null
-            val unpacked = JsUnpacker(script).unpack() ?: return null
-            val link = Regex("""sources:\s*\[\s*\{\s*file:\s*['"](.*?)['"]""").find(unpacked)?.groupValues?.get(1) ?: return null
-
-            return listOf(
-                newExtractorLink(
-                    source = name,
-                    name = name,
-                    url = link,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = referer ?: mainUrl
-                    this.quality = Qualities.Unknown.value
-                }
-            )
-        } catch (e: Exception) {
-            return null
-        }
-    }
-}
-
-// ==========================================
-// Byse Extractor
+// Byse Extractor (Ultimate Interceptor Pattern)
 // ==========================================
 open class ByseSX : ExtractorApi() {
     override var name = "Byse"
     override var mainUrl = "https://byse.sx"
     override val requiresReferer = true
 
-    private fun b64(s: String, label: String): ByteArray {
+    // Decrypts payload if injected server-side
+    private fun b64(s: String): ByteArray {
         val fixed = s.replace('-', '+').replace('_', '/')
         val pad = "=".repeat((4 - fixed.length % 4) % 4)
-        val out = android.util.Base64.decode(fixed + pad, android.util.Base64.DEFAULT)
-        Log.e("FootballReplays", "Byse b64[$label] outLen=${out.size}")
-        return out
-    }
-
-    private fun parseAttest(body: String): JSONObject? {
-        return try {
-            JSONObject(body)
-        } catch (e: Exception) { 
-            Log.e("FootballReplays", "Byse attest parse failed", e)
-            null 
-        }
-    }
-
-    private fun findString(json: JSONObject, vararg keySubstrings: String): String? {
-        val stack = ArrayDeque<JSONObject>()
-        stack.addLast(json)
-        while (stack.isNotEmpty()) {
-            val cur = stack.removeLast()
-            val keys = cur.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                val v = cur.opt(k)
-                val lowerK = k.lowercase()
-                if (v is String && keySubstrings.any { lowerK.contains(it.lowercase()) }) return v
-                if (v is JSONObject) stack.addLast(v)
-                if (v is org.json.JSONArray) {
-                    for (i in 0 until v.length()) {
-                        val item = v.opt(i)
-                        if (item is JSONObject) stack.addLast(item)
-                    }
-                }
-            }
-        }
-        return null
+        return Base64.decode(fixed + pad, Base64.DEFAULT)
     }
 
     private suspend fun emitFromPlaybackJson(
         playbackBody: String, embedFrameUrl: String, embedBase: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val root = tryParseJson<BysePlaybackRoot>(playbackBody) ?: run {
-            Log.e("FootballReplays", "Byse emit: playback parse null")
-            return false
-        }
+        val root = tryParseJson<BysePlaybackRoot>(playbackBody) ?: return false
         val pb = root.playback
-        Log.e("FootballReplays", "Byse pb algo=${pb.algorithm} ivLen=${pb.iv.length} keys=${pb.keyParts.size} payloadLen=${pb.payload.length}")
-
-        if (pb.keyParts.size < 2) {
-            Log.e("FootballReplays", "Byse emit: keyParts.size < 2")
-            return false
-        }
+        if (pb.keyParts.size < 2) return false
         
-        val key = b64(pb.keyParts[0], "k0") + b64(pb.keyParts[1], "k1")
-        val iv = b64(pb.iv, "iv")
+        val key = b64(pb.keyParts[0]) + b64(pb.keyParts[1])
+        val iv = b64(pb.iv)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
 
-        val decrypted = cipher.doFinal(b64(pb.payload, "payload"))
+        val decrypted = cipher.doFinal(b64(pb.payload))
         val json = String(decrypted, StandardCharsets.UTF_8).let { if (it.startsWith("\uFEFF")) it.substring(1) else it }
-        Log.e("FootballReplays", "Byse decrypted=${json.take(1500)}")
-        
-        val parsed = tryParseJson<BysePlaybackDecrypt>(json) ?: run {
-            Log.e("FootballReplays", "Byse emit: parse decrypted null")
-            return false
-        }
+        val parsed = tryParseJson<BysePlaybackDecrypt>(json) ?: return false
 
-        // Replaced forEach lambda with standard 'for' loop to completely avoid coroutine suspension issues
         for (s in parsed.sources) {
-            Log.e("FootballReplays", "Byse src q=${s.quality} label=${s.label} url=${s.url.take(220)}")
+            Log.e("FootballReplays", "Byse Fast AES src q=${s.quality} url=${s.url.take(150)}")
             callback.invoke(newExtractorLink(name, name, s.url, ExtractorLinkType.M3U8) {
                 this.referer = embedFrameUrl
-                this.headers = mutableMapOf(
-                    "Referer" to embedFrameUrl, 
-                    "Origin" to embedBase, 
-                    "User-Agent" to BYSE_UA
-                )
+                this.headers = mapOf("Referer" to embedFrameUrl, "Origin" to embedBase, "User-Agent" to BYSE_UA)
             })
         }
         return parsed.sources.isNotEmpty()
+    }
+
+    // Interactive M3U8 Catcher (Failsafe for 403s and API changes)
+    data class InterceptResult(val url: String, val headers: Map<String, String>)
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun runInteractiveM3u8Interceptor(
+        activity: android.app.Activity, 
+        urlToResolve: String, 
+        headers: Map<String, String>
+    ): InterceptResult? = withContext(Dispatchers.Main) {
+        suspendCancellableCoroutine { cont ->
+            val dialog = android.app.Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
+                setCancelable(false)
+                setCanceledOnTouchOutside(false)
+            }
+            val done = AtomicBoolean(false)
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+
+            val layout = android.widget.LinearLayout(activity).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                setBackgroundColor(android.graphics.Color.parseColor("#1A1A1A"))
+            }
+
+            val headerLayout = android.widget.LinearLayout(activity).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
+                setPadding(32, 28, 32, 28)
+            }
+            val header = android.widget.TextView(activity).apply {
+                text = "Decrypting Video Stream... Please Wait"
+                setTextColor(android.graphics.Color.WHITE)
+                textSize = 15f
+                layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            
+            fun finish(result: InterceptResult?) {
+                if (!done.compareAndSet(false, true)) return
+                android.webkit.CookieManager.getInstance().flush()
+                runCatching { dialog.dismiss() }
+                if (cont.isActive) cont.resume(result)
+            }
+
+            val closeBtn = android.widget.TextView(activity).apply {
+                text = "✖"
+                setTextColor(android.graphics.Color.WHITE)
+                textSize = 18f
+                setPadding(20, 0, 0, 0)
+                setOnClickListener { finish(null) }
+            }
+
+            headerLayout.addView(header)
+            headerLayout.addView(closeBtn)
+            layout.addView(headerLayout)
+
+            val progressBar = android.widget.ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
+                layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, 8)
+            }
+            layout.addView(progressBar)
+
+            val webView = android.webkit.WebView(activity).apply {
+                layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT)
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
+                    mediaPlaybackRequiresUserGesture = false // Crucial for auto-fetching video links
+                    userAgentString = BYSE_UA
+                }
+
+                webChromeClient = object : android.webkit.WebChromeClient() {
+                    override fun onProgressChanged(view: android.webkit.WebView?, newProgress: Int) {
+                        progressBar.progress = newProgress
+                        progressBar.visibility = if (newProgress == 100) android.view.View.GONE else android.view.View.VISIBLE
+                    }
+                }
+
+                webViewClient = object : android.webkit.WebViewClient() {
+                    @SuppressLint("WebViewClientOnReceivedSslError")
+                    override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
+                    
+                    // The magic method: We catch the exact request the player makes to fetch the video
+                    override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
+                        val reqUrl = request?.url?.toString() ?: return null
+                        if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
+                            Log.e("FootballReplays", "Intercepted stream: $reqUrl")
+                            val reqHeaders = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
+                            reqHeaders["Referer"] = urlToResolve
+                            activity.runOnUiThread { finish(InterceptResult(reqUrl, reqHeaders)) }
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
+                }
+            }
+
+            layout.addView(webView)
+            dialog.setContentView(layout)
+            dialog.setOnDismissListener { if (!done.get()) finish(null) }
+
+            dialog.show()
+            webView.loadUrl(urlToResolve, headers)
+
+            handler.postDelayed({ if (!done.get()) finish(null) }, 25_000L) // Fail-safe timeout
+        }
     }
 
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
         Log.e("FootballReplays", "===== START ByseSX =====")
-        Log.e("FootballReplays", "Byse input url=$url")
         val uri = URI(url)
         val code = uri.path.trimEnd('/').substringAfterLast('/')
         val base = "${uri.scheme}://${uri.host}"
         val shellUrl = "$base/e/$code"
-
         val headers = mapOf("Referer" to "https://www.footreplays.com/", "User-Agent" to BYSE_UA)
-        Log.e("FootballReplays", "Byse: Fetching main page with CFInterceptor")
 
-        var html = try {
+        // 1. Try Fast Extraction (No WebView)
+        val html = try {
             app.get(shellUrl, headers = headers, interceptor = CFInterceptor()).text
-        } catch(e: Exception) {
-            // Trigger resolver manually if we hit an immediate 403 or 503 before HTML loads
-            if (e.message?.contains("403") == true || e.message?.contains("503") == true) {
-                Log.e("FootballReplays", "Byse: Immediate Block, resolving on BASE domain...")
-                CloudflareResolver.resolve("$base/", headers) 
-                try { app.get(shellUrl, headers = headers, interceptor = CFInterceptor()).text } catch (e2: Exception) { "" }
-            } else {
-                Log.e("FootballReplays", "Byse: Main page fetch failed", e)
-                ""
-            }
-        }
+        } catch(e: Exception) { "" }
 
-        // If Byse returns HTML but it's a Cloudflare challenge, resolve on BASE DOMAIN to skip Nginx 403
-        if (CloudflareResolver.isCloudflareChallenge(html)) {
-            Log.e("FootballReplays", "Byse: Cloudflare challenge detected, resolving on BASE domain...")
-            CloudflareResolver.resolve("$base/", headers) 
-            html = try {
-                app.get(shellUrl, headers = headers, interceptor = CFInterceptor()).text
-            } catch(e: Exception) { "" }
-        }
-
-        // Strategy 1: HTML SSR Data Extraction (Fastest)
         val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         val iv = Regex(""""iv"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         val payload = Regex(""""payload"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         val keyPartsStr = Regex(""""key_parts"\s*:\s*\[(.*?)\]""").find(html)?.groupValues?.get(1)
         
         if (algorithm != null && iv != null && payload != null && keyPartsStr != null) {
-            Log.e("FootballReplays", "Byse: Found playback data in HTML directly")
             val keyParts = keyPartsStr.split(",").map { it.replace("\"", "").trim() }
             val pbJson = """{"playback":{"algorithm":"$algorithm","iv":"$iv","payload":"$payload","key_parts":[${keyParts.joinToString(",") { "\"$it\"" }}]}}"""
             if (emitFromPlaybackJson(pbJson, shellUrl, base, callback)) {
-                Log.e("FootballReplays", "===== END ByseSX SUCCESS via HTML Data =====")
+                Log.e("FootballReplays", "===== END ByseSX SUCCESS via Fast AES =====")
                 return
             }
         }
 
-        // Strategy 2: API Request Fallback (Restored for maximum reliability)
-        Log.e("FootballReplays", "Byse: Falling back to API Strategy")
-        try {
-            val detailsResp = app.get("$base/api/videos/$code/embed/details", headers = headers, interceptor = CFInterceptor())
-            val embedFrameUrl = detailsResp.parsedSafe<ByseDetailsRoot>()?.embedFrameUrl ?: shellUrl
-            val embedBase = try { "${URI(embedFrameUrl).scheme}://${URI(embedFrameUrl).host}" } catch (e: Exception) { base }
+        // 2. Interactive Interceptor Fallback
+        Log.e("FootballReplays", "Byse: Fast extraction failed, launching Interactive Interceptor")
+        val activity = CommonActivity.activity ?: return
+        if (activity.isFinishing || activity.isDestroyed) return
 
-            val attestResp = app.get("$embedBase/access/attest", headers = headers, interceptor = CFInterceptor())
-            val j = parseAttest(attestResp.text)
-            
-            if (j != null) {
-                val captchaToken = findString(j, "captcha_token", "captchaToken", "x-captcha-token", "captcha")
-                val fingerprintToken = findString(j, "fingerprint_token", "fingerprintToken", "fingerprint")
-                val viewerId = findString(j, "viewer_id", "viewerId") ?: ""
-                val deviceId = findString(j, "device_id", "deviceId") ?: ""
-
-                if (captchaToken != null) {
-                    val playbackHeaders = headers + mapOf("x-captcha-token" to captchaToken, "Content-Type" to "application/json")
-                    val bodyMap = mapOf(
-                        "fingerprint" to mapOf("token" to (fingerprintToken ?: ""), "viewer_id" to viewerId, "device_id" to deviceId, "confidence" to 0.77)
-                    )
-                    val pbResp = app.post("$embedBase/api/videos/$code/embed/playback", headers = playbackHeaders, json = bodyMap, interceptor = CFInterceptor())
-                    if (pbResp.text.contains("\"key_parts\"")) {
-                        val pbJson = if (pbResp.text.contains("\"playback\"")) pbResp.text else "{\"playback\":${pbResp.text}}"
-                        if (emitFromPlaybackJson(pbJson, embedFrameUrl, embedBase, callback)) {
-                            Log.e("FootballReplays", "===== END ByseSX SUCCESS via API Data =====")
-                            return
-                        }
-                    }
-                }
-            }
-        } catch (e: Exception) { Log.e("FootballReplays", "Byse: API Strategy failed", e) }
-
-        // Strategy 3: WebViewResolver Fallback
-        Log.e("FootballReplays", "Byse: Falling back to WebViewResolver for m3u8")
-        try {
-            val wvM3u8 = app.get(
-                shellUrl,
-                interceptor = WebViewResolver(Regex(""".*\.(m3u8|m3u).*"""), timeout = 10000),
-                headers = headers
-            )
-            if (wvM3u8.url.contains("m3u8") || wvM3u8.url.contains("m3u")) {
-                callback.invoke(newExtractorLink(name, name, wvM3u8.url, ExtractorLinkType.M3U8) {
-                    this.referer = base
-                    this.headers = mapOf("Origin" to base, "Referer" to base)
-                })
-                Log.e("FootballReplays", "===== END ByseSX SUCCESS via WebView =====")
-                return
-            }
-        } catch (e: Exception) {
-            Log.e("FootballReplays", "Byse: WebViewResolver failed", e)
+        val result = runInteractiveM3u8Interceptor(activity, shellUrl, headers)
+        if (result != null) {
+            callback.invoke(newExtractorLink(name, name, result.url, ExtractorLinkType.M3U8) {
+                this.referer = shellUrl
+                this.headers = result.headers
+            })
+            Log.e("FootballReplays", "===== END ByseSX SUCCESS via Interceptor =====")
+        } else {
+            Log.e("FootballReplays", "===== END ByseSX FAILED =====")
         }
-
-        Log.e("FootballReplays", "===== END ByseSX FAILED =====")
     }
 }
 
 // Byse Data Classes
-@JsonIgnoreProperties(ignoreUnknown = true)
-data class ByseDetailsRoot(
-    val id: Long, val code: String, val title: String,
-    @JsonProperty("poster_url") val posterUrl: String,
-    val description: String,
-    @JsonProperty("embed_frame_url") val embedFrameUrl: String
-)
-
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class BysePlaybackRoot(val playback: BysePlayback)
 
