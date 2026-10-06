@@ -437,8 +437,22 @@ open class ByseSX : ExtractorApi() {
             val done = AtomicBoolean(false)
             val handler = android.os.Handler(android.os.Looper.getMainLooper())
             var timeoutRunnable: Runnable? = null
+            var webView: android.webkit.WebView? = null // FIXED: Declared before finish()
 
-            val webView = android.webkit.WebView(activity).apply {
+            fun finish(result: InterceptResult?) {
+                if (!done.compareAndSet(false, true)) return
+                timeoutRunnable?.let { handler.removeCallbacks(it) }
+                runCatching {
+                    webView?.let { wv ->
+                        decor.removeView(wv)
+                        wv.stopLoading()
+                        wv.destroy()
+                    }
+                }
+                if (cont.isActive) cont.resume(result)
+            }
+
+            val wv = android.webkit.WebView(activity).apply {
                 layoutParams = android.view.ViewGroup.LayoutParams(
                     activity.resources.displayMetrics.widthPixels,
                     activity.resources.displayMetrics.heightPixels
@@ -469,25 +483,15 @@ open class ByseSX : ExtractorApi() {
                     }
                 }
             }
-
-            fun finish(result: InterceptResult?) {
-                if (!done.compareAndSet(false, true)) return
-                timeoutRunnable?.let { handler.removeCallbacks(it) }
-                runCatching {
-                    decor.removeView(webView)
-                    webView.stopLoading()
-                    webView.destroy()
-                }
-                if (cont.isActive) cont.resume(result)
-            }
+            webView = wv // Assign to the variable we declared above
 
             cont.invokeOnCancellation { finish(null) }
 
             timeoutRunnable = Runnable { finish(null) }
 
-            decor.addView(webView)
-            webView.loadUrl(urlToResolve, headers)
-            handler.postDelayed(timeoutRunnable!!, 6000L) // Fast 6-second timeout
+            decor.addView(wv)
+            wv.loadUrl(urlToResolve, headers)
+            handler.postDelayed(timeoutRunnable!!, 5000L) // Fast 5-second timeout
         }
     }
 
