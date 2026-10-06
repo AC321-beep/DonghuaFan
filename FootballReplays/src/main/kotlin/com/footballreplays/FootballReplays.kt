@@ -87,12 +87,12 @@ class FootballReplays : MainAPI() {
                 val regex = Regex("""loadVideo\('([^']+)'\)""")
                 val videoUrl = regex.find(onclickAttr)?.groupValues?.get(1) ?: return@forEachIndexed
                 
-                val episodeData = "$videoUrl|$sourceName - $part"
+                val episodeData = "$videoUrl|$sourceName -$part"
                 val currentEpisodeSize = episodes.size
 
                 episodes.add(
                     newEpisode(data = episodeData) {
-                        this.name = "$sourceName - $part"
+                        this.name = "$sourceName -$part"
                         this.episode = currentEpisodeSize + 1
                     }
                 )
@@ -151,11 +151,27 @@ class FootballReplays : MainAPI() {
         val iframeUrl = if (videoUrl.startsWith("//")) "https:$videoUrl" else videoUrl
 
         var emitted = 0
+        val extractedLinks = mutableListOf<ExtractorLink>()
+
+        // 1. Collect all links from loadExtractor first (since we are inside a non-suspend lambda)
         loadExtractor(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
+            extractedLinks.add(link)
+        }
+
+        // 2. Iterate outside the lambda where we can safely call the suspend function `newExtractorLink`
+        extractedLinks.forEach { link ->
             emitted++
-            // FIXED: Using Kotlin's native .copy() function safely replicates the data class
-            // without needing the deprecated constructor or suspending newExtractorLink function.
-            callback(link.copy(source = customName, name = customName))
+            val newLink = newExtractorLink(
+                source = customName,
+                name = customName,
+                url = link.url,
+                type = link.type
+            ) {
+                this.referer = link.referer
+                this.quality = link.quality
+                this.headers = link.headers
+            }
+            callback(newLink)
         }
 
         // Fallback for unmapped Byse rotating domains
@@ -171,9 +187,27 @@ class FootballReplays : MainAPI() {
 
             if (looksLikeByse) {
                 try {
+                    val byseLinks = mutableListOf<ExtractorLink>()
+                    
+                    // 1. Collect links from ByseSX
                     ByseSX().getUrl(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
+                        byseLinks.add(link)
+                    }
+                    
+                    // 2. Process them cleanly outside the lambda
+                    byseLinks.forEach { link ->
                         emitted++
-                        callback(link.copy(source = customName, name = customName))
+                        val newLink = newExtractorLink(
+                            source = customName,
+                            name = customName,
+                            url = link.url,
+                            type = link.type
+                        ) {
+                            this.referer = link.referer
+                            this.quality = link.quality
+                            this.headers = link.headers
+                        }
+                        callback(newLink)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "ByseSX fallback FAILED", e)
