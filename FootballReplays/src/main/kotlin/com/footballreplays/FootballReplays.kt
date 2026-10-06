@@ -153,15 +153,17 @@ class FootballReplays : MainAPI() {
         var emitted = 0
         loadExtractor(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
             emitted++
-            val extractedLink = ExtractorLink(
+            // FIXED: Using newExtractorLink instead of deprecated ExtractorLink constructor
+            val extractedLink = newExtractorLink(
                 source = customName,
                 name = customName,
                 url = link.url,
-                referer = link.referer,
-                quality = link.quality,
-                type = link.type,
-                headers = link.headers
-            )
+                type = link.type
+            ) {
+                this.referer = link.referer
+                this.quality = link.quality
+                this.headers = link.headers
+            }
             callback(extractedLink)
         }
 
@@ -169,7 +171,6 @@ class FootballReplays : MainAPI() {
         if (emitted == 0) {
             val uri = try { URI(iframeUrl) } catch (_: Exception) { null }
             val path = uri?.path ?: ""
-            // Supports /d/, /e/, /v/, or domains containing "byse"
             val looksLikeByse = uri != null && (
                 path.contains("/d/") || 
                 path.contains("/e/") || 
@@ -181,15 +182,17 @@ class FootballReplays : MainAPI() {
                 try {
                     ByseSX().getUrl(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
                         emitted++
-                        val extractedLink = ExtractorLink(
+                        // FIXED: Using newExtractorLink instead of deprecated ExtractorLink constructor
+                        val extractedLink = newExtractorLink(
                             source = customName,
                             name = customName,
                             url = link.url,
-                            referer = link.referer,
-                            quality = link.quality,
-                            type = link.type,
-                            headers = link.headers
-                        )
+                            type = link.type
+                        ) {
+                            this.referer = link.referer
+                            this.quality = link.quality
+                            this.headers = link.headers
+                        }
                         callback(extractedLink)
                     }
                 } catch (e: Exception) {
