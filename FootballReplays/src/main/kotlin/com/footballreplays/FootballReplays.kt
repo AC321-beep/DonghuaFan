@@ -53,14 +53,15 @@ internal class CFInterceptor : okhttp3.Interceptor {
 internal object CloudflareResolver {
     fun isCloudflareChallenge(html: String): Boolean {
         val lower = html.lowercase()
+        // Removed generic "cloudflare" to prevent false positives on Nginx error pages
         return lower.contains("just a moment") || 
                lower.contains("cf-browser-verification") || 
                lower.contains("turnstile") ||
-               lower.contains("cloudflare")
+               lower.contains("ray id")
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    suspend fun attemptSilentResolution(activity: android.app.Activity, urlToResolve: String): Boolean = withContext(Dispatchers.Main) {
+    suspend fun attemptSilentResolution(activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>): Boolean = withContext(Dispatchers.Main) {
         val decor = activity.window?.decorView as? android.view.ViewGroup ?: return@withContext false
         suspendCancellableCoroutine { cont ->
             val done = AtomicBoolean(false)
@@ -109,7 +110,7 @@ internal object CloudflareResolver {
                     if (done.get()) return
                     val cookies = android.webkit.CookieManager.getInstance().getCookie(urlToResolve) ?: ""
                     val title = webView.title?.lowercase() ?: ""
-                    val isChallenge = listOf("just a moment", "attention required", "security verification", "cloudflare").any { title.contains(it) }
+                    val isChallenge = listOf("just a moment", "attention required", "security verification").any { title.contains(it) }
 
                     if (!isChallenge && cookies.contains("cf_clearance")) {
                         cleanup(true)
@@ -122,14 +123,15 @@ internal object CloudflareResolver {
             timeoutRunnable = Runnable { cleanup(false) }
 
             decor.addView(webView)
-            webView.loadUrl(urlToResolve)
+            // FIXED: Passing headers to the WebView prevents the Nginx 403 Forbidden Error
+            webView.loadUrl(urlToResolve, headers)
             handler.postDelayed(checkRunnable!!, 800L)
             handler.postDelayed(timeoutRunnable!!, 8000L) // Give silent resolution 8 seconds
         }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    suspend fun attemptInteractiveResolution(activity: android.app.Activity, urlToResolve: String): Boolean = withContext(Dispatchers.Main) {
+    suspend fun attemptInteractiveResolution(activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>): Boolean = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             val dialog = android.app.Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
                 setCancelable(false)
@@ -181,7 +183,7 @@ internal object CloudflareResolver {
                     if (done.get()) return
                     val title = view?.title?.lowercase() ?: ""
                     val cookies = android.webkit.CookieManager.getInstance().getCookie(urlToResolve) ?: ""
-                    val isChallenge = listOf("just a moment", "attention required", "security verification", "cloudflare").any { title.contains(it) }
+                    val isChallenge = listOf("just a moment", "attention required", "security verification").any { title.contains(it) }
 
                     if (!isChallenge && cookies.contains("cf_clearance")) {
                         header.text = "Success! Loading..."
@@ -210,17 +212,18 @@ internal object CloudflareResolver {
             dialog.setOnDismissListener { if (!done.get()) finish(false) }
 
             dialog.show()
-            webView.loadUrl(urlToResolve)
+            // FIXED: Passing headers to the WebView prevents the Nginx 403 Forbidden Error
+            webView.loadUrl(urlToResolve, headers)
 
             handler.postDelayed({ if (!done.get()) finish(false) }, 30_000L)
         }
     }
     
-    suspend fun resolve(url: String): Boolean {
+    suspend fun resolve(url: String, headers: Map<String, String> = emptyMap()): Boolean {
         val activity = CommonActivity.activity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
-        if (attemptSilentResolution(activity, url)) return true
-        return attemptInteractiveResolution(activity, url)
+        if (attemptSilentResolution(activity, url, headers)) return true
+        return attemptInteractiveResolution(activity, url, headers)
     }
 }
 
@@ -247,18 +250,6 @@ class FootballReplays : MainAPI() {
         "${mainUrl}/other/" to "Other"
     )
 
-    // Helper to fetch HTML and automatically trigger Cloudflare resolution if blocked
-    private suspend fun fetchHtml(url: String): String {
-        var response = app.get(url, interceptor = CFInterceptor()).text
-        if (CloudflareResolver.isCloudflareChallenge(response)) {
-            Log.e(TAG, "Cloudflare challenge detected on $url")
-            CloudflareResolver.resolve(mainUrl)
-            response = app.get(url, interceptor = CFInterceptor()).text
-        }
-        return response
-    }
-
-    // Helper to attach Cloudflare clearance cookies to Coil image requests
     private fun getPosterHeaders(): Map<String, String> {
         val defaultUa = try { android.webkit.WebSettings.getDefaultUserAgent(CommonActivity.activity) } catch(e: Exception) { "Mozilla/5.0" }
         val headers = mutableMapOf(
@@ -270,6 +261,16 @@ class FootballReplays : MainAPI() {
             headers["Cookie"] = cookies
         }
         return headers
+    }
+
+    private suspend fun fetchHtml(url: String): String {
+        var response = app.get(url, interceptor = CFInterceptor()).text
+        if (CloudflareResolver.isCloudflareChallenge(response)) {
+            Log.e(TAG, "Cloudflare challenge detected on $url")
+            CloudflareResolver.resolve(mainUrl, getPosterHeaders())
+            response = app.get(url, interceptor = CFInterceptor()).text
+        }
+        return response
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -397,7 +398,7 @@ class FootballReplays : MainAPI() {
 
         return newTvSeriesLoadResponse(title, url, TvType.Others, episodes) {
             this.posterUrl = poster
-            this.posterHeaders = getPosterHeaders() // Fixes Coil 403 Errors
+            this.posterHeaders = getPosterHeaders() 
             this.plot = plotText
             this.year = year
             this.tags = document.select("div.efoot-bar.tag-bar a").map { it.text() }
@@ -423,7 +424,7 @@ class FootballReplays : MainAPI() {
 
         return newTvSeriesSearchResponse(displayTitle, href, TvType.TvSeries) {
             this.posterUrl = posterUrl
-            this.posterHeaders = getPosterHeaders() // Fixes Coil 403 Errors
+            this.posterHeaders = getPosterHeaders()
         }
     }
 
