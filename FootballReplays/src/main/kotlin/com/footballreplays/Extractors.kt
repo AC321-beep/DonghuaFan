@@ -384,7 +384,7 @@ class Vtbe : ExtractorApi() {
 }
 
 // ==========================================
-// Byse Extractor (Ultimate Interceptor Pattern)
+// Byse Extractor (Unified Dialog Interceptor)
 // ==========================================
 open class ByseSX : ExtractorApi() {
     override var name = "Byse"
@@ -425,109 +425,15 @@ open class ByseSX : ExtractorApi() {
 
     data class InterceptResult(val url: String, val headers: Map<String, String>)
 
-    // STAGE 1: Silent M3U8 Interceptor
+    // UNIFIED: Interactive M3U8 Interceptor (Bypasses CF by being genuinely visible)
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun runSilentM3u8Interceptor(
+    private suspend fun runM3u8Interceptor(
         activity: android.app.Activity, 
         urlToResolve: String, 
         headers: Map<String, String>
     ): InterceptResult? = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
-            val root = activity.window?.decorView as? android.view.ViewGroup
-            Log.e("FootballReplays", "Byse: Stage 1 (Silent) Started. Attached=${root != null}")
-            
-            val done = AtomicBoolean(false)
-            val handler = android.os.Handler(android.os.Looper.getMainLooper())
-            var timeoutRunnable: Runnable? = null
-            var webView: android.webkit.WebView? = null 
-
-            fun finish(result: InterceptResult?) {
-                if (!done.compareAndSet(false, true)) return
-                timeoutRunnable?.let { handler.removeCallbacks(it) }
-                runCatching {
-                    webView?.let { wv ->
-                        root?.removeView(wv)
-                        wv.stopLoading()
-                        wv.destroy()
-                    }
-                }
-                if (cont.isActive) cont.resume(result)
-            }
-
-            val wv = android.webkit.WebView(activity).apply {
-                layoutParams = android.view.ViewGroup.LayoutParams(
-                    activity.resources.displayMetrics.widthPixels,
-                    activity.resources.displayMetrics.heightPixels
-                )
-                translationX = 20000f // Keep offscreen
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    useWideViewPort = true
-                    loadWithOverviewMode = true
-                    mediaPlaybackRequiresUserGesture = false 
-                    userAgentString = BYSE_UA
-                }
-
-                webViewClient = object : android.webkit.WebViewClient() {
-                    @SuppressLint("WebViewClientOnReceivedSslError")
-                    override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
-                    
-                    // Auto-Clicker Injection
-                    override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
-                        val js = """
-                            (function() {
-                                try {
-                                    Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
-                                    Object.defineProperty(document, 'hidden', {get: function() { return false; }});
-                                    setInterval(function() {
-                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
-                                        buttons.forEach(b => b.click());
-                                        var vids = document.querySelectorAll('video');
-                                        vids.forEach(v => { v.muted = true; v.play(); });
-                                    }, 1000);
-                                } catch(e) {}
-                            })();
-                        """.trimIndent()
-                        view?.evaluateJavascript(js, null)
-                    }
-
-                    override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
-                        val reqUrl = request?.url?.toString() ?: return null
-                        if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
-                            Log.e("FootballReplays", "Stage 1 Intercepted stream: $reqUrl")
-                            val reqHeaders = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
-                            reqHeaders["Referer"] = urlToResolve
-                            activity.runOnUiThread { finish(InterceptResult(reqUrl, reqHeaders)) }
-                        }
-                        return super.shouldInterceptRequest(view, request)
-                    }
-                }
-            }
-            webView = wv 
-
-            cont.invokeOnCancellation { finish(null) }
-
-            timeoutRunnable = Runnable { 
-                Log.e("FootballReplays", "Byse: Stage 1 Timed Out")
-                finish(null) 
-            }
-
-            root?.addView(wv)
-            wv.loadUrl(urlToResolve, headers)
-            handler.postDelayed(timeoutRunnable!!, 6500L) // 6.5-second timeout for JS execution
-        }
-    }
-
-    // STAGE 2: Interactive M3U8 Interceptor
-    @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun runInteractiveM3u8Interceptor(
-        activity: android.app.Activity, 
-        urlToResolve: String, 
-        headers: Map<String, String>
-    ): InterceptResult? = withContext(Dispatchers.Main) {
-        suspendCancellableCoroutine { cont ->
-            Log.e("FootballReplays", "Byse: Stage 2 (Interactive) Started")
+            Log.e("FootballReplays", "Byse: Cloudflare Dialog Interceptor Started")
             val dialog = android.app.Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
                 setCancelable(false)
                 setCanceledOnTouchOutside(false)
@@ -597,7 +503,7 @@ open class ByseSX : ExtractorApi() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
 
-                    // Auto-Clicker Injection (Added to Stage 2 to prevent manual clicking)
+                    // Robust Auto-Clicker Injection to force video start once CF passes
                     override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
                         val js = """
                             (function() {
@@ -605,10 +511,16 @@ open class ByseSX : ExtractorApi() {
                                     Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
                                     Object.defineProperty(document, 'hidden', {get: function() { return false; }});
                                     setInterval(function() {
-                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
-                                        buttons.forEach(b => b.click());
+                                        var ev = new MouseEvent('click', {view: window, bubbles: true, cancelable: true});
+                                        var targets = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid, video, .vjs-play-control');
+                                        targets.forEach(t => t.dispatchEvent(ev));
+                                        
                                         var vids = document.querySelectorAll('video');
-                                        vids.forEach(v => { v.muted = true; v.play(); });
+                                        vids.forEach(v => { 
+                                            v.muted = true; 
+                                            var p = v.play();
+                                            if (p !== undefined) { p.catch(e => {}); }
+                                        });
                                     }, 1000);
                                 } catch(e) {}
                             })();
@@ -619,7 +531,7 @@ open class ByseSX : ExtractorApi() {
                     override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: return null
                         if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
-                            Log.e("FootballReplays", "Stage 2 Intercepted stream: $reqUrl")
+                            Log.e("FootballReplays", "Interceptor caught stream: $reqUrl")
                             val reqHeaders = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
                             reqHeaders["Referer"] = urlToResolve
                             activity.runOnUiThread { finish(InterceptResult(reqUrl, reqHeaders)) }
@@ -636,7 +548,8 @@ open class ByseSX : ExtractorApi() {
             dialog.show()
             webView.loadUrl(urlToResolve, headers)
 
-            handler.postDelayed({ if (!done.get()) finish(null) }, 25_000L) // 25s Timeout
+            // Keeping a 30s timeout here just to be safe.
+            handler.postDelayed({ if (!done.get()) finish(null) }, 30_000L) 
         }
     }
 
@@ -671,13 +584,10 @@ open class ByseSX : ExtractorApi() {
         val activity = CommonActivity.activity ?: return
         if (activity.isFinishing || activity.isDestroyed) return
 
-        Log.e("FootballReplays", "Byse: Fast extraction failed, launching Stage 1 (Silent) Interceptor")
-        var result = runSilentM3u8Interceptor(activity, shellUrl, headers)
+        Log.e("FootballReplays", "Byse: Fast extraction failed, launching Dialog Interceptor")
         
-        if (result == null) {
-            Log.e("FootballReplays", "Byse: Stage 1 failed/timed out, launching Stage 2 (Interactive) Interceptor")
-            result = runInteractiveM3u8Interceptor(activity, shellUrl, headers)
-        }
+        // Skip straight to the reliable Dialog interceptor
+        val result = runM3u8Interceptor(activity, shellUrl, headers)
 
         if (result != null) {
             callback.invoke(newExtractorLink(name, name, result.url, ExtractorLinkType.M3U8) {
