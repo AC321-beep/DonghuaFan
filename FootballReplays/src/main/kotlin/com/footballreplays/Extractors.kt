@@ -19,6 +19,9 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import org.json.JSONObject
 
+private const val BYSE_UA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+
 // ==========================================
 // Inbuilt Cloudstream Core Overrides
 // ==========================================
@@ -162,9 +165,9 @@ open class HQCloud : ExtractorApi() {
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
-        Log.e(TAG, "===== START HQCloud =====")
+        Log.e("FootballReplays", "===== START HQCloud =====")
         val path = Regex("""(https?://[^/]+)(/[^?]+)""").find(url)?.groupValues?.get(2) ?: run {
-            Log.e(TAG, "HQCloud FAILED: no path")
+            Log.e("FootballReplays", "HQCloud FAILED: no path")
             return
         }
         val domains = listOf("audinifer.com", "vibuxere.com", "streamhg.com", "dhcplay.com", "cybervynx.com")
@@ -178,16 +181,16 @@ open class HQCloud : ExtractorApi() {
                 val response = app.get(newUrl, referer = "https://hgcloud.to/", interceptor = CFInterceptor())
                 if (response.text.length > 2000) {
                     html = response.text; baseUrl = "https://$domain"
-                    Log.e(TAG, "HQCloud SUCCESS domain=$domain len=${response.text.length}")
+                    Log.e("FootballReplays", "HQCloud SUCCESS domain=$domain len=${response.text.length}")
                     break
                 }
             } catch (e: Exception) { 
-                Log.e(TAG, "HQCloud domain fail $domain", e)
+                Log.e("FootballReplays", "HQCloud domain fail $domain", e)
             }
         }
 
         if (html.length < 2000) {
-            Log.e(TAG, "HQCloud FAILED: no html")
+            Log.e("FootballReplays", "HQCloud FAILED: no html")
             return
         }
 
@@ -215,7 +218,7 @@ open class HQCloud : ExtractorApi() {
         }
 
         if (finalUrl.isEmpty()) {
-            Log.e(TAG, "HQCloud FAILED: no finalUrl")
+            Log.e("FootballReplays", "HQCloud FAILED: no finalUrl")
             return
         }
 
@@ -228,10 +231,69 @@ open class HQCloud : ExtractorApi() {
             this.referer = baseUrl
             this.headers = mutableMapOf("Cookie" to cookieString)
         })
-        Log.e(TAG, "===== END HQCloud SUCCESS =====")
+        Log.e("FootballReplays", "===== END HQCloud SUCCESS =====")
     }
 }
 class HQLinks : HQCloud() { override var mainUrl = "https://hglink.to" }
+
+// ==========================================
+// VK Extractors
+// ==========================================
+open class VkExtractor : ExtractorApi() {
+    override val name = "Vk"
+    override val mainUrl = "https://vkvideo.ru"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+    ) {
+        val headers = mapOf("User-Agent" to BYSE_UA, "Referer" to mainUrl)
+        var response = try { app.get(url, headers = headers) } catch (e: Exception) { return }
+        
+        if (response.text.contains("hash429") || response.text.contains("challenge.html")) {
+            response = try {
+                app.get(url, interceptor = WebViewResolver(Regex(".*video_ext\\.php.*")), headers = headers)
+            } catch (e: Exception) { return }
+        }
+
+        val found = linkcikart(response.text, callback)
+        if (!found && url.contains("hash=")) {
+            val oid = Regex("""oid=([^&]+)""").find(url)?.groupValues?.get(1)
+            val id = Regex("""id=([^&]+)""").find(url)?.groupValues?.get(1)
+            val hash = Regex("""hash=([^&]+)""").find(url)?.groupValues?.get(1)
+            if (oid != null && id != null && hash != null) {
+                val token = Regex("""anonym\.eyJ[\w\.\-]+""").find(response.text)?.value
+                    ?: Regex(""""access_token"\s*:\s*"([^"]+)"""").find(response.text)?.groupValues?.get(1)
+                if (token != null) {
+                    val apiResp = app.post(
+                        "https://api.vk.com/method/video.get?v=5.269&client_id=52461373",
+                        headers = headers,
+                        data = mapOf("owner_id" to "", "videos" to "${oid}_${id}_${hash}", "extended" to "0", "is_embed" to "true", "track_code" to "", "access_token" to token)
+                    )
+                    linkcikart(apiResp.text, callback)
+                }
+            }
+        }
+    }
+
+    private suspend fun linkcikart(text: String, callback: (ExtractorLink) -> Unit): Boolean {
+        var any = false
+        Regex("\"(hls|hls_ondemand|dash|dash_sep|dash_ondemand)\"\\s*:\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).findAll(text).forEach { m ->
+            val t = m.groupValues[1].lowercase()
+            val u = m.groupValues[2].replace("\\", "")
+            if (u.isNotBlank()) {
+                any = true
+                val isDash = t.contains("dash")
+                callback.invoke(newExtractorLink("${name} ${if (isDash) "Dash" else "HLS"}", "${name} ${if (isDash) "Dash" else "HLS"}", u, if (isDash) ExtractorLinkType.DASH else ExtractorLinkType.M3U8) {
+                    this.referer = mainUrl
+                    this.headers = mapOf("User-Agent" to BYSE_UA, "Referer" to mainUrl)
+                })
+            }
+        }
+        return any
+    }
+}
+class VkCom : VkExtractor() { override var mainUrl = "https://vk.com" }
 
 // ==========================================
 // Byse Extractor
@@ -245,7 +307,7 @@ open class ByseSX : ExtractorApi() {
         val fixed = s.replace('-', '+').replace('_', '/')
         val pad = "=".repeat((4 - fixed.length % 4) % 4)
         val out = android.util.Base64.decode(fixed + pad, android.util.Base64.DEFAULT)
-        Log.e(TAG, "Byse b64[$label] outLen=${out.size}")
+        Log.e("FootballReplays", "Byse b64[$label] outLen=${out.size}")
         return out
     }
 
@@ -253,14 +315,14 @@ open class ByseSX : ExtractorApi() {
         playbackBody: String, embedFrameUrl: String, embedBase: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
         val root = tryParseJson<BysePlaybackRoot>(playbackBody) ?: run {
-            Log.e(TAG, "Byse emit: playback parse null")
+            Log.e("FootballReplays", "Byse emit: playback parse null")
             return false
         }
         val pb = root.playback
-        Log.e(TAG, "Byse pb algo=${pb.algorithm} ivLen=${pb.iv.length} keys=${pb.keyParts.size} payloadLen=${pb.payload.length}")
+        Log.e("FootballReplays", "Byse pb algo=${pb.algorithm} ivLen=${pb.iv.length} keys=${pb.keyParts.size} payloadLen=${pb.payload.length}")
 
         if (pb.keyParts.size < 2) {
-            Log.e(TAG, "Byse emit: keyParts.size < 2")
+            Log.e("FootballReplays", "Byse emit: keyParts.size < 2")
             return false
         }
         
@@ -271,21 +333,21 @@ open class ByseSX : ExtractorApi() {
 
         val decrypted = cipher.doFinal(b64(pb.payload, "payload"))
         val json = String(decrypted, StandardCharsets.UTF_8).let { if (it.startsWith("\uFEFF")) it.substring(1) else it }
-        Log.e(TAG, "Byse decrypted=${json.take(1500)}")
+        Log.e("FootballReplays", "Byse decrypted=${json.take(1500)}")
         
         val parsed = tryParseJson<BysePlaybackDecrypt>(json) ?: run {
-            Log.e(TAG, "Byse emit: parse decrypted null")
+            Log.e("FootballReplays", "Byse emit: parse decrypted null")
             return false
         }
 
         parsed.sources.forEachIndexed { i, s ->
-            Log.e(TAG, "Byse src[$i] q=${s.quality} label=${s.label} url=${s.url.take(220)}")
+            Log.e("FootballReplays", "Byse src[$i] q=${s.quality} label=${s.label} url=${s.url.take(220)}")
             callback.invoke(newExtractorLink(name, name, s.url, ExtractorLinkType.M3U8) {
                 this.referer = embedFrameUrl
                 this.headers = mutableMapOf(
                     "Referer" to embedFrameUrl, 
                     "Origin" to embedBase, 
-                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+                    "User-Agent" to BYSE_UA
                 )
             })
         }
@@ -295,27 +357,25 @@ open class ByseSX : ExtractorApi() {
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
-        Log.e(TAG, "===== START ByseSX =====")
-        Log.e(TAG, "Byse input url=$url")
+        Log.e("FootballReplays", "===== START ByseSX =====")
+        Log.e("FootballReplays", "Byse input url=$url")
         val uri = URI(url)
         val code = uri.path.trimEnd('/').substringAfterLast('/')
         val base = "${uri.scheme}://${uri.host}"
         val shellUrl = "$base/e/$code"
 
-        // FIXED: Explicitly pass Referer to satisfy Byse's Nginx rules preventing the 403 Forbidden
-        val headers = mapOf("Referer" to "https://www.footreplays.com/", "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36")
-        Log.e(TAG, "Byse: Fetching main page with CFInterceptor")
+        val headers = mapOf("Referer" to "https://www.footreplays.com/", "User-Agent" to BYSE_UA)
+        Log.e("FootballReplays", "Byse: Fetching main page with CFInterceptor")
 
         var html = try {
             app.get(shellUrl, headers = headers, interceptor = CFInterceptor()).text
         } catch(e: Exception) {
-            Log.e(TAG, "Byse: Main page fetch failed", e)
+            Log.e("FootballReplays", "Byse: Main page fetch failed", e)
             ""
         }
 
         if (CloudflareResolver.isCloudflareChallenge(html)) {
-            Log.e(TAG, "Byse: Cloudflare challenge detected, resolving...")
-            // FIXED: Using shellUrl and passing headers to bypass the 403
+            Log.e("FootballReplays", "Byse: Cloudflare challenge detected, resolving...")
             CloudflareResolver.resolve(shellUrl, headers) 
             html = try {
                 app.get(shellUrl, headers = headers, interceptor = CFInterceptor()).text
@@ -328,16 +388,16 @@ open class ByseSX : ExtractorApi() {
         val keyPartsStr = Regex(""""key_parts"\s*:\s*\[(.*?)\]""").find(html)?.groupValues?.get(1)
         
         if (algorithm != null && iv != null && payload != null && keyPartsStr != null) {
-            Log.e(TAG, "Byse: Found playback data in HTML directly")
+            Log.e("FootballReplays", "Byse: Found playback data in HTML directly")
             val keyParts = keyPartsStr.split(",").map { it.replace("\"", "").trim() }
             val pbJson = """{"playback":{"algorithm":"$algorithm","iv":"$iv","payload":"$payload","key_parts":[${keyParts.joinToString(",") { "\"$it\"" }}]}}"""
             if (emitFromPlaybackJson(pbJson, shellUrl, base, callback)) {
-                Log.e(TAG, "===== END ByseSX SUCCESS via HTML Data =====")
+                Log.e("FootballReplays", "===== END ByseSX SUCCESS via HTML Data =====")
                 return
             }
         }
 
-        Log.e(TAG, "Byse: Falling back to WebViewResolver for m3u8")
+        Log.e("FootballReplays", "Byse: Falling back to WebViewResolver for m3u8")
         try {
             val wvM3u8 = app.get(
                 shellUrl,
@@ -349,14 +409,14 @@ open class ByseSX : ExtractorApi() {
                     this.referer = base
                     this.headers = mapOf("Origin" to base, "Referer" to base)
                 })
-                Log.e(TAG, "===== END ByseSX SUCCESS via WebView =====")
+                Log.e("FootballReplays", "===== END ByseSX SUCCESS via WebView =====")
                 return
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Byse: WebViewResolver failed", e)
+            Log.e("FootballReplays", "Byse: WebViewResolver failed", e)
         }
 
-        Log.e(TAG, "===== END ByseSX FAILED =====")
+        Log.e("FootballReplays", "===== END ByseSX FAILED =====")
     }
 }
 
