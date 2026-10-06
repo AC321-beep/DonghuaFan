@@ -1,9 +1,11 @@
 package com.footballreplays
 
 import android.util.Log
+import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.CloudflareKiller
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
@@ -15,7 +17,6 @@ import com.lagradost.cloudstream3.extractors.Voe
 import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
-import java.util.Base64
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -417,52 +418,9 @@ open class ByseSX : ExtractorApi() {
     private fun b64(s: String, label: String): ByteArray {
         val fixed = s.replace('-', '+').replace('_', '/')
         val pad = "=".repeat((4 - fixed.length % 4) % 4)
-        val out = Base64.getDecoder().decode(fixed + pad)
+        val out = android.util.Base64.decode(fixed + pad, android.util.Base64.DEFAULT)
         Log.e(TAG, "Byse b64[$label] outLen=${out.size}")
         return out
-    }
-
-    private fun findString(json: JSONObject, vararg keySubstrings: String): String? {
-        val stack = ArrayDeque<JSONObject>()
-        stack.addLast(json)
-        while (stack.isNotEmpty()) {
-            val cur = stack.removeLast()
-            val keys = cur.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                val v = cur.opt(k)
-                val lowerK = k.lowercase()
-                if (v is String && keySubstrings.any { lowerK.contains(it.lowercase()) }) return v
-                if (v is JSONObject) stack.addLast(v)
-                if (v is org.json.JSONArray) {
-                    for (i in 0 until v.length()) {
-                        val item = v.opt(i)
-                        if (item is JSONObject) stack.addLast(item)
-                    }
-                }
-            }
-        }
-        return null
-    }
-
-    private data class AttestData(
-        val captchaToken: String?, val fingerprintToken: String?, val viewerId: String?, val deviceId: String?, val raw: String
-    )
-
-    private fun parseAttest(body: String): AttestData? {
-        return try {
-            val j = JSONObject(body)
-            AttestData(
-                findString(j, "captcha_token", "captchaToken", "x-captcha-token", "captcha"),
-                findString(j, "fingerprint_token", "fingerprintToken", "fingerprint"),
-                findString(j, "viewer_id", "viewerId"),
-                findString(j, "device_id", "deviceId"),
-                body
-            )
-        } catch (e: Exception) { 
-            Log.e(TAG, "Byse attest parse failed: ${e.message}")
-            null 
-        }
     }
 
     private suspend fun emitFromPlaybackJson(
@@ -504,22 +462,6 @@ open class ByseSX : ExtractorApi() {
         return parsed.sources.isNotEmpty()
     }
 
-    private fun chromeHeaders(
-        origin: String, referer: String, embedParent: String, contentTypeJson: Boolean = false
-    ): Map<String, String> {
-        val h = mutableMapOf<String, String>()
-        h.putAll(CHROME_HINTS)
-        h["Accept"] = if (contentTypeJson) "application/json, text/plain, */*" else "*/*"
-        h["Origin"] = origin
-        h["Referer"] = referer
-        h["User-Agent"] = BYSE_UA
-        h["x-embed-origin"] = "footreplays.com"
-        h["x-embed-parent"] = embedParent
-        h["x-embed-referer"] = "https://www.footreplays.com/"
-        if (contentTypeJson) h["Content-Type"] = "application/json"
-        return h
-    }
-
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
@@ -530,66 +472,58 @@ open class ByseSX : ExtractorApi() {
         val base = "${uri.scheme}://${uri.host}"
         val shellUrl = "$base/e/$code"
 
-        // Strategy 1: Intercept the JSON playback payload via WebView
-        try {
-            val wvPlayback = app.get(
-                shellUrl,
-                interceptor = WebViewResolver(Regex(""".*/playback.*"""), timeout = 15000),
-                headers = mapOf("Referer" to "https://www.footreplays.com/", "User-Agent" to BYSE_UA)
-            )
-            val body = wvPlayback.text
-            if (body.contains("\"playback\"") || body.contains("\"key_parts\"")) {
-                val json = if (body.contains("\"playback\"")) body else "{\"playback\":$body}"
-                if (emitFromPlaybackJson(json, shellUrl, base, callback)) {
-                    Log.e(TAG, "===== END ByseSX SUCCESS via Path 1 =====")
-                    return
-                }
-            }
-        } catch (e: Exception) { Log.e(TAG, "Byse Strategy 1 failed", e) }
+        val headers = mapOf(
+            "Referer" to "https://www.footreplays.com/",
+            "User-Agent" to BYSE_UA
+        )
 
-        // Strategy 2: Intercept the m3u8 directly via WebView
+        Log.e(TAG, "Byse: Fetching main page with CloudflareKiller")
+        val mainPageResp = try {
+            app.get(shellUrl, headers = headers, interceptor = CloudflareKiller())
+        } catch(e: Exception) {
+            Log.e(TAG, "Byse: Main page fetch failed", e)
+            null
+        }
+
+        val html = mainPageResp?.text ?: ""
+
+        // Try extracting SSR state variables injected by Nuxt/Next directly from the HTML source
+        val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+        val iv = Regex(""""iv"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+        val payload = Regex(""""payload"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+        val keyPartsStr = Regex(""""key_parts"\s*:\s*\[(.*?)\]""").find(html)?.groupValues?.get(1)
+        
+        if (algorithm != null && iv != null && payload != null && keyPartsStr != null) {
+            Log.e(TAG, "Byse: Found playback data in HTML directly")
+            val keyParts = keyPartsStr.split(",").map { it.replace("\"", "").trim() }
+            val pbJson = """{"playback":{"algorithm":"$algorithm","iv":"$iv","payload":"$payload","key_parts":[${keyParts.joinToString(",") { "\"$it\"" }}]}}"""
+            if (emitFromPlaybackJson(pbJson, shellUrl, base, callback)) {
+                Log.e(TAG, "===== END ByseSX SUCCESS via HTML Data =====")
+                return
+            }
+        }
+
+        // Final fallback: Webview m3u8 catcher if HTML doesn't have it
+        Log.e(TAG, "Byse: Falling back to WebViewResolver for m3u8")
         try {
             val wvM3u8 = app.get(
                 shellUrl,
-                interceptor = WebViewResolver(Regex(""".*\.m3u8.*"""), timeout = 15000),
-                headers = mapOf("Referer" to "https://www.footreplays.com/", "User-Agent" to BYSE_UA)
+                interceptor = WebViewResolver(Regex(""".*\.(m3u8|m3u).*"""), timeout = 10000),
+                headers = headers
             )
-            if (wvM3u8.url.contains(".m3u8")) {
+            if (wvM3u8.url.contains("m3u8") || wvM3u8.url.contains("m3u")) {
                 callback.invoke(newExtractorLink(name, name, wvM3u8.url, ExtractorLinkType.M3U8) {
                     this.referer = base
                     this.headers = mapOf("Origin" to base, "Referer" to base)
                 })
-                Log.e(TAG, "===== END ByseSX SUCCESS via Path 2 =====")
+                Log.e(TAG, "===== END ByseSX SUCCESS via WebView =====")
                 return
             }
-        } catch (e: Exception) { Log.e(TAG, "Byse Strategy 2 failed", e) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Byse: WebViewResolver failed", e)
+        }
 
-        // Strategy 3: API Fallback via Kotlin App HTTP requests
-        try {
-            val detailsHeaders = chromeHeaders(base, shellUrl, shellUrl, false)
-            val detailsResp = app.get("$base/api/videos/$code/embed/details", headers = detailsHeaders)
-            val embedFrameUrl = detailsResp.parsedSafe<ByseDetailsRoot>()?.embedFrameUrl ?: shellUrl
-            val embedBase = try { "${URI(embedFrameUrl).scheme}://${URI(embedFrameUrl).host}" } catch (e: Exception) { base }
-
-            val attestResp = app.get("$embedBase/access/attest", headers = detailsHeaders)
-            val attest = parseAttest(attestResp.text)
-
-            if (attest != null && attest.captchaToken != null) {
-                val playbackHeaders = detailsHeaders + mapOf("x-captcha-token" to attest.captchaToken, "Content-Type" to "application/json")
-                val bodyMap = mapOf(
-                    "fingerprint" to mapOf("token" to (attest.fingerprintToken ?: ""), "viewer_id" to (attest.viewerId ?: ""), "device_id" to (attest.deviceId ?: ""), "confidence" to 0.77)
-                )
-                val pbResp = app.post("$embedBase/api/videos/$code/embed/playback", headers = playbackHeaders, json = bodyMap)
-                if (pbResp.text.contains("\"key_parts\"")) {
-                    val json = if (pbResp.text.contains("\"playback\"")) pbResp.text else "{\"playback\":${pbResp.text}}"
-                    if (emitFromPlaybackJson(json, embedFrameUrl, embedBase, callback)) {
-                        Log.e(TAG, "===== END ByseSX SUCCESS via Path 3 =====")
-                        return
-                    }
-                }
-            }
-        } catch (e: Exception) { Log.e(TAG, "Byse Strategy 3 failed", e) }
-        Log.e(TAG, "===== END ByseSX FAILED (all paths) =====")
+        Log.e(TAG, "===== END ByseSX FAILED =====")
     }
 }
 
