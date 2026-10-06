@@ -1,26 +1,31 @@
 package com.footballreplays
 
-import android.util.Base64
+import android.annotation.SuppressLint
 import android.util.Log
+import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.extractors.DoodLaExtractor
-import com.lagradost.cloudstream3.extractors.StreamWishExtractor
-import com.lagradost.cloudstream3.extractors.Voe
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
-import org.json.JSONObject
+import com.lagradost.cloudstream3.extractors.StreamWishExtractor
+import com.lagradost.cloudstream3.extractors.DoodLaExtractor
+import com.lagradost.cloudstream3.extractors.Voe
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import org.json.JSONObject
+import kotlin.coroutines.resume
 
 private const val BYSE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
-private const val TAG = "FootballReplays"
 
 // ==========================================
 // Inbuilt Cloudstream Core Overrides
@@ -57,9 +62,8 @@ class OkRu : ExtractorApi() {
     override val requiresReferer = false
 
     override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
-        return runCatching {
-            val id = Regex("""/video(?:embed)?/(\d+)""").find(url)?.groupValues?.get(1)
-                ?: url.substringAfterLast("/").substringBefore("?")
+        try {
+            val id = Regex("""/video(?:embed)?/(\d+)""").find(url)?.groupValues?.get(1) ?: url.substringAfterLast("/").substringBefore("?")
             if (id.isBlank()) return null
 
             val jsonStr = app.post("https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id").text
@@ -68,7 +72,7 @@ class OkRu : ExtractorApi() {
 
             val links = mutableListOf<ExtractorLink>()
             val videos = json.optJSONArray("videos")
-
+            
             if (videos != null && videos.length() > 0) {
                 for (i in 0 until videos.length()) {
                     val video = videos.getJSONObject(i)
@@ -89,9 +93,8 @@ class OkRu : ExtractorApi() {
                         else -> Qualities.Unknown.value
                     }
 
-                    val cleanUrl = vidUrl.replace("\\u0026", "&").replace("\\/", "/")
                     links.add(
-                        newExtractorLink(name = "$name MP4", source = "$name MP4", url = cleanUrl, type = INFER_TYPE) {
+                        newExtractorLink(name = "${this.name} MP4", source = "${this.name} MP4", url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"), type = INFER_TYPE) {
                             this.referer = "https://ok.ru/"
                             this.quality = qualityValue
                         }
@@ -101,12 +104,13 @@ class OkRu : ExtractorApi() {
 
             val hlsUrl = json.optString("hlsManifestUrl")
             if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
-                val cleanHls = hlsUrl.replace("\\u0026", "&").replace("\\/", "/")
-                links.addAll(M3u8Helper.generateM3u8("$name HLS", cleanHls, url))
+                links.addAll(M3u8Helper.generateM3u8("$name HLS", hlsUrl.replace("\\u0026", "&").replace("\\/", "/"), url))
             }
 
-            links.ifEmpty { null }
-        }.getOrNull()
+            return links
+        } catch (e: Exception) {
+            return null
+        }
     }
 }
 
@@ -121,16 +125,16 @@ class VideaHu : ExtractorApi() {
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
-        runCatching {
+        try {
             val id = Regex("""v=([a-zA-Z0-9_-]+)""").find(url)?.groupValues?.get(1) ?: return
             val api = "https://videa.hu/videaplayer_get_res.php?v=$id"
             val response = app.get(api).text
-
+            
             for (match in Regex("""quality="([^"]+)".*?mp4="([^"]+)"""").findAll(response)) {
                 val q = match.groupValues[1]
                 var link = match.groupValues[2]
                 if (link.startsWith("//")) link = "https:$link"
-
+                
                 val qualityValue = when (q) {
                     "360p" -> Qualities.P360.value
                     "480p" -> Qualities.P480.value
@@ -138,15 +142,20 @@ class VideaHu : ExtractorApi() {
                     "1080p" -> Qualities.P1080.value
                     else -> Qualities.Unknown.value
                 }
-
+                
                 callback.invoke(
-                    newExtractorLink(source = name, name = "$name $q", url = link, type = INFER_TYPE) {
+                    newExtractorLink(
+                        source = name,
+                        name = "$name $q",
+                        url = link,
+                        type = INFER_TYPE
+                    ) {
                         this.referer = mainUrl
                         this.quality = qualityValue
                     }
                 )
             }
-        }.onFailure { Log.e(TAG, "VideaHu failed: ${it.message}") }
+        } catch (e: Exception) { }
     }
 }
 
@@ -161,9 +170,9 @@ open class HQCloud : ExtractorApi() {
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
-        Log.d(TAG, "===== START HQCloud =====")
+        Log.e("FootballReplays", "===== START HQCloud =====")
         val path = Regex("""(https?://[^/]+)(/[^?]+)""").find(url)?.groupValues?.get(2) ?: run {
-            Log.e(TAG, "HQCloud FAILED: no path")
+            Log.e("FootballReplays", "HQCloud FAILED: no path")
             return
         }
         val domains = listOf("audinifer.com", "vibuxere.com", "streamhg.com", "dhcplay.com", "cybervynx.com")
@@ -176,18 +185,17 @@ open class HQCloud : ExtractorApi() {
             try {
                 val response = app.get(newUrl, referer = "https://hgcloud.to/", interceptor = CFInterceptor())
                 if (response.text.length > 2000) {
-                    html = response.text
-                    baseUrl = "https://$domain"
-                    Log.d(TAG, "HQCloud SUCCESS domain=$domain len=${response.text.length}")
+                    html = response.text; baseUrl = "https://$domain"
+                    Log.e("FootballReplays", "HQCloud SUCCESS domain=$domain len=${response.text.length}")
                     break
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "HQCloud domain fail $domain", e)
+            } catch (e: Exception) { 
+                Log.e("FootballReplays", "HQCloud domain fail $domain", e)
             }
         }
 
         if (html.length < 2000) {
-            Log.e(TAG, "HQCloud FAILED: no html")
+            Log.e("FootballReplays", "HQCloud FAILED: no html")
             return
         }
 
@@ -215,7 +223,7 @@ open class HQCloud : ExtractorApi() {
         }
 
         if (finalUrl.isEmpty()) {
-            Log.e(TAG, "HQCloud FAILED: no finalUrl")
+            Log.e("FootballReplays", "HQCloud FAILED: no finalUrl")
             return
         }
 
@@ -228,10 +236,9 @@ open class HQCloud : ExtractorApi() {
             this.referer = baseUrl
             this.headers = mutableMapOf("Cookie" to cookieString)
         })
-        Log.d(TAG, "===== END HQCloud SUCCESS =====")
+        Log.e("FootballReplays", "===== END HQCloud SUCCESS =====")
     }
 }
-
 class HQLinks : HQCloud() { override var mainUrl = "https://hglink.to" }
 
 // ==========================================
@@ -246,12 +253,12 @@ open class VkExtractor : ExtractorApi() {
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
         val headers = mapOf("User-Agent" to BYSE_UA, "Referer" to mainUrl)
-        var response = runCatching { app.get(url, headers = headers) }.getOrNull() ?: return
-
+        var response = try { app.get(url, headers = headers) } catch (e: Exception) { return }
+        
         if (response.text.contains("hash429") || response.text.contains("challenge.html")) {
-            response = runCatching {
+            response = try {
                 app.get(url, interceptor = WebViewResolver(Regex(".*video_ext\\.php.*")), headers = headers)
-            }.getOrNull() ?: return
+            } catch (e: Exception) { return }
         }
 
         val found = linkcikart(response.text, callback)
@@ -274,7 +281,7 @@ open class VkExtractor : ExtractorApi() {
         }
     }
 
-    private fun linkcikart(text: String, callback: (ExtractorLink) -> Unit): Boolean {
+    private suspend fun linkcikart(text: String, callback: (ExtractorLink) -> Unit): Boolean {
         var any = false
         for (m in Regex("\"(hls|hls_ondemand|dash|dash_sep|dash_ondemand)\"\\s*:\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).findAll(text)) {
             val t = m.groupValues[1].lowercase()
@@ -291,7 +298,6 @@ open class VkExtractor : ExtractorApi() {
         return any
     }
 }
-
 class VkCom : VkExtractor() { override var mainUrl = "https://vk.com" }
 
 // ==========================================
@@ -303,14 +309,13 @@ class Dtube : ExtractorApi() {
     override val requiresReferer = false
 
     override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
-        return runCatching {
+        try {
             var videoId = Regex("""([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})""", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
-            val shortId = Regex("""[?&]v=([a-zA-Z0-9_-]+)""").find(url)?.groupValues?.get(1)
-                ?: if (videoId == null) url.substringAfterLast("/").takeIf { it.isNotBlank() } else null
+            val shortId = Regex("""[?&]v=([a-zA-Z0-9_-]+)""").find(url)?.groupValues?.get(1) ?: if (videoId == null) url.substringAfterLast("/").takeIf { it.isNotBlank() } else null
 
             val lookupId = shortId ?: videoId
             if (lookupId != null) {
-                runCatching {
+                try {
                     val apiResponse = app.get("https://api.d.tube/videos/$lookupId").text
                     if (apiResponse.startsWith("{")) {
                         val json = JSONObject(apiResponse)
@@ -327,22 +332,22 @@ class Dtube : ExtractorApi() {
                             return M3u8Helper.generateM3u8(name, directHls, url)
                         }
                     }
-                }
+                } catch (e: Exception) { }
             }
 
             if (videoId != null) {
                 val nasNodes = listOf("nas1", "nas2", "nas3", "nas4", "video", "ipfs")
                 for (node in nasNodes) {
                     val m3u8Url = "https://$node.d.tube/videos/$videoId/master.m3u8"
-                    runCatching {
+                    try {
                         if (app.get(m3u8Url).isSuccessful) {
                             return M3u8Helper.generateM3u8(name, m3u8Url, url)
                         }
-                    }
+                    } catch (e: Exception) { }
                 }
             }
-            null
-        }.getOrNull()
+        } catch (e: Exception) { }
+        return null
     }
 } 
 
@@ -355,49 +360,32 @@ class Vtbe : ExtractorApi() {
     override val requiresReferer = true
 
     override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
-        return runCatching {
+        try {
             val response = app.get(url, referer = mainUrl).document
             val script = response.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return null
             val unpacked = JsUnpacker(script).unpack() ?: return null
             val link = Regex("""sources:\s*\[\s*\{\s*file:\s*['"](.*?)['"]""").find(unpacked)?.groupValues?.get(1) ?: return null
 
-            listOf(
-                newExtractorLink(source = name, name = name, url = link, type = ExtractorLinkType.M3U8) {
+            return listOf(
+                newExtractorLink(
+                    source = name,
+                    name = name,
+                    url = link,
+                    type = ExtractorLinkType.M3U8
+                ) {
                     this.referer = referer ?: mainUrl
                     this.quality = Qualities.Unknown.value
                 }
             )
-        }.getOrNull()
+        } catch (e: Exception) {
+            return null
+        }
     }
 }
 
 // ==========================================
-// Byse Models & Extractor
+// Byse Extractor (Ultimate Interceptor Pattern)
 // ==========================================
-@JsonIgnoreProperties(ignoreUnknown = true)
-data class BysePlaybackRoot(
-    @JsonProperty("playback") val playback: BysePlayback = BysePlayback()
-)
-
-@JsonIgnoreProperties(ignoreUnknown = true)
-data class BysePlayback(
-    @JsonProperty("algorithm") val algorithm: String = "",
-    @JsonProperty("iv") val iv: String = "",
-    @JsonProperty("payload") val payload: String = "",
-    @JsonProperty("key_parts") val keyParts: List<String> = emptyList()
-)
-
-@JsonIgnoreProperties(ignoreUnknown = true)
-data class BysePlaybackDecrypt(
-    @JsonProperty("sources") val sources: List<ByseSource> = emptyList()
-)
-
-@JsonIgnoreProperties(ignoreUnknown = true)
-data class ByseSource(
-    @JsonProperty("file") val url: String = "",
-    @JsonProperty("quality") val quality: String = ""
-)
-
 open class ByseSX : ExtractorApi() {
     override var name = "Byse"
     override var mainUrl = "https://byse.sx"
@@ -409,100 +397,314 @@ open class ByseSX : ExtractorApi() {
         return Base64.decode(fixed + pad, Base64.DEFAULT)
     }
 
-    private fun emitFromPlaybackJson(
+    private suspend fun emitFromPlaybackJson(
         playbackBody: String, embedFrameUrl: String, embedBase: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        return runCatching {
-            val root = tryParseJson<BysePlaybackRoot>(playbackBody) ?: return false
-            val pb = root.playback
-            if (pb.keyParts.size < 2) return false
+        val root = tryParseJson<BysePlaybackRoot>(playbackBody) ?: return false
+        val pb = root.playback
+        if (pb.keyParts.size < 2) return false
+        
+        val key = b64(pb.keyParts[0]) + b64(pb.keyParts[1])
+        val iv = b64(pb.iv)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
 
-            val key = b64(pb.keyParts[0]) + b64(pb.keyParts[1])
-            val iv = b64(pb.iv)
-            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, iv))
+        val decrypted = cipher.doFinal(b64(pb.payload))
+        val json = String(decrypted, StandardCharsets.UTF_8).let { if (it.startsWith("\uFEFF")) it.substring(1) else it }
+        val parsed = tryParseJson<BysePlaybackDecrypt>(json) ?: return false
 
-            val decrypted = cipher.doFinal(b64(pb.payload))
-            val json = String(decrypted, StandardCharsets.UTF_8).let { if (it.startsWith("\uFEFF")) it.substring(1) else it }
-            val parsed = tryParseJson<BysePlaybackDecrypt>(json) ?: return false
+        for (s in parsed.sources) {
+            Log.e("FootballReplays", "Byse Fast AES src q=${s.quality} url=${s.url.take(150)}")
+            callback.invoke(newExtractorLink(name, name, s.url, ExtractorLinkType.M3U8) {
+                this.referer = embedFrameUrl
+                this.headers = mapOf("Referer" to embedFrameUrl, "Origin" to embedBase, "User-Agent" to BYSE_UA)
+            })
+        }
+        return parsed.sources.isNotEmpty()
+    }
 
-            for (s in parsed.sources) {
-                if (s.url.isBlank()) continue
-                Log.d(TAG, "Byse Fast AES src q=${s.quality} url=${s.url.take(150)}")
-                callback.invoke(newExtractorLink(name, name, s.url, ExtractorLinkType.M3U8) {
-                    this.referer = embedFrameUrl
-                    this.headers = mapOf("Referer" to embedFrameUrl, "Origin" to embedBase, "User-Agent" to BYSE_UA)
-                })
+    data class InterceptResult(val url: String, val headers: Map<String, String>)
+
+    // STAGE 1: Silent M3U8 Interceptor
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun runSilentM3u8Interceptor(
+        activity: android.app.Activity, 
+        urlToResolve: String, 
+        headers: Map<String, String>
+    ): InterceptResult? = withContext(Dispatchers.Main) {
+        suspendCancellableCoroutine { cont ->
+            val root = activity.window?.decorView as? android.view.ViewGroup
+            Log.e("FootballReplays", "Byse: Stage 1 (Silent) Started. Attached=${root != null}")
+            
+            val done = AtomicBoolean(false)
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            var timeoutRunnable: Runnable? = null
+            var webView: android.webkit.WebView? = null 
+
+            fun finish(result: InterceptResult?) {
+                if (!done.compareAndSet(false, true)) return
+                timeoutRunnable?.let { handler.removeCallbacks(it) }
+                runCatching {
+                    webView?.let { wv ->
+                        root?.removeView(wv)
+                        wv.stopLoading()
+                        wv.destroy()
+                    }
+                }
+                if (cont.isActive) cont.resume(result)
             }
-            parsed.sources.isNotEmpty()
-        }.getOrDefault(false)
+
+            val wv = android.webkit.WebView(activity).apply {
+                layoutParams = android.view.ViewGroup.LayoutParams(
+                    activity.resources.displayMetrics.widthPixels,
+                    activity.resources.displayMetrics.heightPixels
+                )
+                translationX = 20000f // Keep offscreen
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
+                    mediaPlaybackRequiresUserGesture = false 
+                    userAgentString = BYSE_UA
+                }
+
+                webViewClient = object : android.webkit.WebViewClient() {
+                    @SuppressLint("WebViewClientOnReceivedSslError")
+                    override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
+                    
+                    // Auto-Clicker Injection
+                    override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
+                        val js = """
+                            (function() {
+                                try {
+                                    Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
+                                    Object.defineProperty(document, 'hidden', {get: function() { return false; }});
+                                    setInterval(function() {
+                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
+                                        buttons.forEach(b => b.click());
+                                        var vids = document.querySelectorAll('video');
+                                        vids.forEach(v => { v.muted = true; v.play(); });
+                                    }, 1000);
+                                } catch(e) {}
+                            })();
+                        """.trimIndent()
+                        view?.evaluateJavascript(js, null)
+                    }
+
+                    override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
+                        val reqUrl = request?.url?.toString() ?: return null
+                        if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
+                            Log.e("FootballReplays", "Stage 1 Intercepted stream: $reqUrl")
+                            val reqHeaders = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
+                            reqHeaders["Referer"] = urlToResolve
+                            activity.runOnUiThread { finish(InterceptResult(reqUrl, reqHeaders)) }
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
+                }
+            }
+            webView = wv 
+
+            cont.invokeOnCancellation { finish(null) }
+
+            timeoutRunnable = Runnable { 
+                Log.e("FootballReplays", "Byse: Stage 1 Timed Out")
+                finish(null) 
+            }
+
+            root?.addView(wv)
+            wv.loadUrl(urlToResolve, headers)
+            handler.postDelayed(timeoutRunnable!!, 6500L) // 6.5-second timeout for JS execution
+        }
+    }
+
+    // STAGE 2: Interactive M3U8 Interceptor
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun runInteractiveM3u8Interceptor(
+        activity: android.app.Activity, 
+        urlToResolve: String, 
+        headers: Map<String, String>
+    ): InterceptResult? = withContext(Dispatchers.Main) {
+        suspendCancellableCoroutine { cont ->
+            Log.e("FootballReplays", "Byse: Stage 2 (Interactive) Started")
+            val dialog = android.app.Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
+                setCancelable(false)
+                setCanceledOnTouchOutside(false)
+            }
+            val done = AtomicBoolean(false)
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+
+            val layout = android.widget.LinearLayout(activity).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                setBackgroundColor(android.graphics.Color.parseColor("#1A1A1A"))
+            }
+
+            val headerLayout = android.widget.LinearLayout(activity).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
+                setPadding(32, 28, 32, 28)
+            }
+            val header = android.widget.TextView(activity).apply {
+                text = "Decrypting Video Stream... Please Wait"
+                setTextColor(android.graphics.Color.WHITE)
+                textSize = 15f
+                layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            
+            fun finish(result: InterceptResult?) {
+                if (!done.compareAndSet(false, true)) return
+                android.webkit.CookieManager.getInstance().flush()
+                runCatching { dialog.dismiss() }
+                if (cont.isActive) cont.resume(result)
+            }
+
+            val closeBtn = android.widget.TextView(activity).apply {
+                text = "✖"
+                setTextColor(android.graphics.Color.WHITE)
+                textSize = 18f
+                setPadding(20, 0, 0, 0)
+                setOnClickListener { finish(null) }
+            }
+
+            headerLayout.addView(header)
+            headerLayout.addView(closeBtn)
+            layout.addView(headerLayout)
+
+            val progressBar = android.widget.ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
+                layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, 8)
+            }
+            layout.addView(progressBar)
+
+            val webView = android.webkit.WebView(activity).apply {
+                layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT)
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
+                    mediaPlaybackRequiresUserGesture = false 
+                    userAgentString = BYSE_UA
+                }
+
+                webChromeClient = object : android.webkit.WebChromeClient() {
+                    override fun onProgressChanged(view: android.webkit.WebView?, newProgress: Int) {
+                        progressBar.progress = newProgress
+                        progressBar.visibility = if (newProgress == 100) android.view.View.GONE else android.view.View.VISIBLE
+                    }
+                }
+
+                webViewClient = object : android.webkit.WebViewClient() {
+                    @SuppressLint("WebViewClientOnReceivedSslError")
+                    override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
+
+                    // Auto-Clicker Injection (Added to Stage 2 to prevent manual clicking)
+                    override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
+                        val js = """
+                            (function() {
+                                try {
+                                    Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
+                                    Object.defineProperty(document, 'hidden', {get: function() { return false; }});
+                                    setInterval(function() {
+                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
+                                        buttons.forEach(b => b.click());
+                                        var vids = document.querySelectorAll('video');
+                                        vids.forEach(v => { v.muted = true; v.play(); });
+                                    }, 1000);
+                                } catch(e) {}
+                            })();
+                        """.trimIndent()
+                        view?.evaluateJavascript(js, null)
+                    }
+                    
+                    override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
+                        val reqUrl = request?.url?.toString() ?: return null
+                        if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
+                            Log.e("FootballReplays", "Stage 2 Intercepted stream: $reqUrl")
+                            val reqHeaders = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
+                            reqHeaders["Referer"] = urlToResolve
+                            activity.runOnUiThread { finish(InterceptResult(reqUrl, reqHeaders)) }
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
+                }
+            }
+
+            layout.addView(webView)
+            dialog.setContentView(layout)
+            dialog.setOnDismissListener { if (!done.get()) finish(null) }
+
+            dialog.show()
+            webView.loadUrl(urlToResolve, headers)
+
+            handler.postDelayed({ if (!done.get()) finish(null) }, 25_000L) // 25s Timeout
+        }
     }
 
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
-        Log.d(TAG, "===== START ByseSX =====")
+        Log.e("FootballReplays", "===== START ByseSX =====")
         val uri = URI(url)
         val code = uri.path.trimEnd('/').substringAfterLast('/')
         val base = "${uri.scheme}://${uri.host}"
         val shellUrl = "$base/e/$code"
         val headers = mapOf("Referer" to "https://www.footreplays.com/", "User-Agent" to BYSE_UA)
 
-        // Stage 1: Try Fast AES Decryption first
-        val html = runCatching {
-            app.get(shellUrl, headers = headers).text
-        }.getOrDefault("")
+        val html = try {
+            app.get(shellUrl, headers = headers, interceptor = CFInterceptor()).text
+        } catch(e: Exception) { "" }
 
         val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         val iv = Regex(""""iv"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         val payload = Regex(""""payload"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
-        val keyPartsStr = Regex(""""key_parts"\s*:\s*\[(.*?)\]"""").find(html)?.groupValues?.get(1)
-
+        val keyPartsStr = Regex(""""key_parts"\s*:\s*\[(.*?)\]""").find(html)?.groupValues?.get(1)
+        
         if (algorithm != null && iv != null && payload != null && keyPartsStr != null) {
             val keyParts = keyPartsStr.split(",").map { it.replace("\"", "").trim() }
             val pbJson = """{"playback":{"algorithm":"$algorithm","iv":"$iv","payload":"$payload","key_parts":[${keyParts.joinToString(",") { "\"$it\"" }}]}}"""
             if (emitFromPlaybackJson(pbJson, shellUrl, base, callback)) {
-                Log.d(TAG, "===== END ByseSX SUCCESS via Fast AES =====")
+                Log.e("FootballReplays", "===== END ByseSX SUCCESS via Fast AES =====")
                 return
             }
         }
 
-        // Stage 2: Fallback to Cloudstream's native WebViewResolver
-        Log.d(TAG, "Byse: Fast AES failed, falling back to native WebViewResolver")
+        val activity = CommonActivity.activity ?: return
+        if (activity.isFinishing || activity.isDestroyed) return
+
+        Log.e("FootballReplays", "Byse: Fast extraction failed, launching Stage 1 (Silent) Interceptor")
+        var result = runSilentM3u8Interceptor(activity, shellUrl, headers)
         
-        // JavaScript to auto-click the play buttons so the m3u8 request triggers
-        val autoPlayScript = """
-            setInterval(function() {
-                var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
-                buttons.forEach(b => b.click());
-                var vids = document.querySelectorAll('video');
-                vids.forEach(v => { v.muted = true; v.play(); });
-            }, 500);
-        """.trimIndent()
+        if (result == null) {
+            Log.e("FootballReplays", "Byse: Stage 1 failed/timed out, launching Stage 2 (Interactive) Interceptor")
+            result = runInteractiveM3u8Interceptor(activity, shellUrl, headers)
+        }
 
-        // Cloudstream's built-in headless resolver
-        val interceptor = WebViewResolver(
-            interceptUrl = Regex("""\.m3u8|\.m3u"""),
-            additionalScripts = listOf(autoPlayScript)
-        )
-
-        try {
-            val response = app.get(shellUrl, headers = headers, interceptor = interceptor)
-            
-            // If the WebViewResolver catches a matching URL, it returns a NiceResponse 
-            // where the URL is the intercepted target
-            val resolvedUrl = response.url
-            if (resolvedUrl.contains(".m3u8") || resolvedUrl.contains(".m3u")) {
-                callback.invoke(newExtractorLink(name, name, resolvedUrl, ExtractorLinkType.M3U8) {
-                    this.referer = shellUrl
-                    this.headers = mapOf("Referer" to shellUrl, "User-Agent" to BYSE_UA)
-                })
-                Log.d(TAG, "===== END ByseSX SUCCESS via WebViewResolver =====")
-            } else {
-                Log.e(TAG, "ByseSX Failed: Intercepted URL was not an m3u8 stream: $resolvedUrl")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "ByseSX Interceptor failed", e)
+        if (result != null) {
+            callback.invoke(newExtractorLink(name, name, result.url, ExtractorLinkType.M3U8) {
+                this.referer = shellUrl
+                this.headers = result.headers
+            })
+            Log.e("FootballReplays", "===== END ByseSX SUCCESS via Interceptor =====")
+        } else {
+            Log.e("FootballReplays", "===== END ByseSX FAILED =====")
         }
     }
 }
+
+// Byse Data Classes
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class BysePlaybackRoot(val playback: BysePlayback)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class BysePlayback(
+    val algorithm: String, val iv: String, val payload: String,
+    @JsonProperty("key_parts") val keyParts: List<String>
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class BysePlaybackDecrypt(val sources: List<BysePlaybackSource>)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class BysePlaybackSource(
+    val quality: String, val label: String, val url: String
+)
