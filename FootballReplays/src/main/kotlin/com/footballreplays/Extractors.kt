@@ -473,6 +473,25 @@ open class ByseSX : ExtractorApi() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
                     
+                    // Auto-Clicker Injection
+                    override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
+                        val js = """
+                            (function() {
+                                try {
+                                    Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
+                                    Object.defineProperty(document, 'hidden', {get: function() { return false; }});
+                                    setInterval(function() {
+                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
+                                        buttons.forEach(b => b.click());
+                                        var vids = document.querySelectorAll('video');
+                                        vids.forEach(v => { v.muted = true; v.play(); });
+                                    }, 1000);
+                                } catch(e) {}
+                            })();
+                        """.trimIndent()
+                        view?.evaluateJavascript(js, null)
+                    }
+
                     override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: return null
                         if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
@@ -496,7 +515,7 @@ open class ByseSX : ExtractorApi() {
 
             root?.addView(wv)
             wv.loadUrl(urlToResolve, headers)
-            handler.postDelayed(timeoutRunnable!!, 5000L) // Fast 5-second timeout
+            handler.postDelayed(timeoutRunnable!!, 6500L) // 6.5-second timeout for JS execution
         }
     }
 
@@ -577,6 +596,25 @@ open class ByseSX : ExtractorApi() {
                 webViewClient = object : android.webkit.WebViewClient() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
+
+                    // Auto-Clicker Injection (Added to Stage 2 to prevent manual clicking)
+                    override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
+                        val js = """
+                            (function() {
+                                try {
+                                    Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
+                                    Object.defineProperty(document, 'hidden', {get: function() { return false; }});
+                                    setInterval(function() {
+                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
+                                        buttons.forEach(b => b.click());
+                                        var vids = document.querySelectorAll('video');
+                                        vids.forEach(v => { v.muted = true; v.play(); });
+                                    }, 1000);
+                                } catch(e) {}
+                            })();
+                        """.trimIndent()
+                        view?.evaluateJavascript(js, null)
+                    }
                     
                     override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: return null
@@ -633,9 +671,11 @@ open class ByseSX : ExtractorApi() {
         val activity = CommonActivity.activity ?: return
         if (activity.isFinishing || activity.isDestroyed) return
 
+        Log.e("FootballReplays", "Byse: Fast extraction failed, launching Stage 1 (Silent) Interceptor")
         var result = runSilentM3u8Interceptor(activity, shellUrl, headers)
         
         if (result == null) {
+            Log.e("FootballReplays", "Byse: Stage 1 failed/timed out, launching Stage 2 (Interactive) Interceptor")
             result = runInteractiveM3u8Interceptor(activity, shellUrl, headers)
         }
 
