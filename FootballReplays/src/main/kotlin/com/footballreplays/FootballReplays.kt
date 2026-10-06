@@ -59,6 +59,83 @@ object CloudflareResolver {
                lower.contains("ray id")
     }
 
+    // STAGE 1: Silent background resolution using real screen metrics to fool bot-detection
+    @SuppressLint("SetJavaScriptEnabled")
+    suspend fun attemptSilentResolution(activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>): Boolean = withContext(Dispatchers.Main) {
+        val decor = activity.window?.decorView as? android.view.ViewGroup ?: return@withContext false
+        suspendCancellableCoroutine { cont ->
+            val done = AtomicBoolean(false)
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            var checkRunnable: Runnable? = null
+            var timeoutRunnable: Runnable? = null
+
+            val webView = android.webkit.WebView(activity).apply {
+                // Uses real device resolution instead of 1x1 pixel so CF doesn't flag it instantly
+                layoutParams = android.view.ViewGroup.LayoutParams(
+                    activity.resources.displayMetrics.widthPixels,
+                    activity.resources.displayMetrics.heightPixels
+                )
+                translationX = 20000f // Renders completely off-screen
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
+                    cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
+                    mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    userAgentString = CFState.userAgent.ifBlank { userAgentString }
+                }
+                android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
+                webViewClient = object : android.webkit.WebViewClient() {
+                    @SuppressLint("WebViewClientOnReceivedSslError")
+                    override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
+                }
+            }
+
+            fun cleanup(success: Boolean) {
+                if (!done.compareAndSet(false, true)) return
+                checkRunnable?.let { handler.removeCallbacks(it) }
+                timeoutRunnable?.let { handler.removeCallbacks(it) }
+                runCatching {
+                    decor.removeView(webView)
+                    webView.stopLoading()
+                    webView.destroy()
+                }
+                if (success) android.webkit.CookieManager.getInstance().flush()
+                if (cont.isActive) cont.resume(success)
+            }
+
+            cont.invokeOnCancellation { cleanup(false) }
+
+            checkRunnable = object : Runnable {
+                override fun run() {
+                    if (done.get()) return
+                    val cookies = android.webkit.CookieManager.getInstance().getCookie(urlToResolve) ?: ""
+                    val title = webView.title?.lowercase() ?: ""
+                    val isChallenge = title.contains("just a moment") || title.contains("attention required") || title.contains("security verification")
+
+                    if (!isChallenge && cookies.contains("cf_clearance")) {
+                        cleanup(true)
+                        return
+                    }
+                    handler.postDelayed(this, 500L)
+                }
+            }
+
+            timeoutRunnable = Runnable { cleanup(false) }
+
+            decor.addView(webView)
+            webView.loadUrl(urlToResolve, headers)
+            handler.postDelayed(checkRunnable!!, 800L)
+            
+            // Short 6-second timeout. If it takes longer, it's a Turnstile click challenge requiring Stage 2.
+            handler.postDelayed(timeoutRunnable!!, 6000L) 
+        }
+    }
+
+    // STAGE 2: Interactive fallback if Stage 1 times out
     @SuppressLint("SetJavaScriptEnabled")
     suspend fun attemptInteractiveResolution(activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>): Boolean = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
@@ -129,7 +206,6 @@ object CloudflareResolver {
                     val cookies = android.webkit.CookieManager.getInstance().getCookie(urlToResolve) ?: ""
                     val isChallenge = title.contains("just a moment") || title.contains("attention required") || title.contains("security verification")
 
-                    // Success if we get the CF cookie OR the page title implies it successfully loaded
                     val isSuccess = (!isChallenge && cookies.contains("cf_clearance")) || 
                                     (!isChallenge && (title.contains("football replays") || title.contains("football")))
 
@@ -169,6 +245,11 @@ object CloudflareResolver {
     suspend fun resolve(url: String, headers: Map<String, String> = emptyMap()): Boolean {
         val activity = CommonActivity.activity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
+        
+        Log.e("FootballReplays", "CloudflareResolver: Stage 1 (Silent Attempt)")
+        if (attemptSilentResolution(activity, url, headers)) return true
+        
+        Log.e("FootballReplays", "CloudflareResolver: Stage 2 (Interactive Dialog)")
         return attemptInteractiveResolution(activity, url, headers)
     }
 }
