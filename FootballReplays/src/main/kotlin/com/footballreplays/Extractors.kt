@@ -432,19 +432,21 @@ open class ByseSX : ExtractorApi() {
         urlToResolve: String, 
         headers: Map<String, String>
     ): InterceptResult? = withContext(Dispatchers.Main) {
-        val decor = activity.window?.decorView as? android.view.ViewGroup ?: return@withContext null
         suspendCancellableCoroutine { cont ->
+            val root = activity.window?.decorView as? android.view.ViewGroup
+            Log.e("FootballReplays", "Byse: Stage 1 (Silent) Started. Attached=${root != null}")
+            
             val done = AtomicBoolean(false)
             val handler = android.os.Handler(android.os.Looper.getMainLooper())
             var timeoutRunnable: Runnable? = null
-            var webView: android.webkit.WebView? = null // FIXED: Declared before finish()
+            var webView: android.webkit.WebView? = null 
 
             fun finish(result: InterceptResult?) {
                 if (!done.compareAndSet(false, true)) return
                 timeoutRunnable?.let { handler.removeCallbacks(it) }
                 runCatching {
                     webView?.let { wv ->
-                        decor.removeView(wv)
+                        root?.removeView(wv)
                         wv.stopLoading()
                         wv.destroy()
                     }
@@ -483,13 +485,16 @@ open class ByseSX : ExtractorApi() {
                     }
                 }
             }
-            webView = wv // Assign to the variable we declared above
+            webView = wv 
 
             cont.invokeOnCancellation { finish(null) }
 
-            timeoutRunnable = Runnable { finish(null) }
+            timeoutRunnable = Runnable { 
+                Log.e("FootballReplays", "Byse: Stage 1 Timed Out")
+                finish(null) 
+            }
 
-            decor.addView(wv)
+            root?.addView(wv)
             wv.loadUrl(urlToResolve, headers)
             handler.postDelayed(timeoutRunnable!!, 5000L) // Fast 5-second timeout
         }
@@ -503,6 +508,7 @@ open class ByseSX : ExtractorApi() {
         headers: Map<String, String>
     ): InterceptResult? = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
+            Log.e("FootballReplays", "Byse: Stage 2 (Interactive) Started")
             val dialog = android.app.Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
                 setCancelable(false)
                 setCanceledOnTouchOutside(false)
@@ -627,11 +633,9 @@ open class ByseSX : ExtractorApi() {
         val activity = CommonActivity.activity ?: return
         if (activity.isFinishing || activity.isDestroyed) return
 
-        Log.e("FootballReplays", "Byse: Fast extraction failed, launching Stage 1 (Silent) Interceptor")
         var result = runSilentM3u8Interceptor(activity, shellUrl, headers)
         
         if (result == null) {
-            Log.e("FootballReplays", "Byse: Stage 1 failed/timed out, launching Stage 2 (Interactive) Interceptor")
             result = runInteractiveM3u8Interceptor(activity, shellUrl, headers)
         }
 
