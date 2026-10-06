@@ -193,7 +193,11 @@ open class HQCloud : ExtractorApi() {
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
-        val path = Regex("""(https?://[^/]+)(/[^?]+)""").find(url)?.groupValues?.get(2) ?: return
+        Log.e(TAG, "===== START HQCloud =====")
+        val path = Regex("""(https?://[^/]+)(/[^?]+)""").find(url)?.groupValues?.get(2) ?: run {
+            Log.e(TAG, "HQCloud FAILED: no path")
+            return
+        }
         val domains = listOf("audinifer.com", "vibuxere.com", "streamhg.com", "dhcplay.com", "cybervynx.com")
 
         var html = ""
@@ -205,12 +209,19 @@ open class HQCloud : ExtractorApi() {
                 val response = app.get(newUrl, referer = "https://hgcloud.to/")
                 if (response.text.length > 2000) {
                     html = response.text; baseUrl = "https://$domain"
+                    Log.e(TAG, "HQCloud SUCCESS domain=$domain len=${response.text.length}")
                     break
                 }
-            } catch (e: Exception) { }
+            } catch (e: Exception) { 
+                Log.e(TAG, "HQCloud domain fail $domain", e)
+            }
         }
 
-        if (html.length < 2000) return
+        if (html.length < 2000) {
+            Log.e(TAG, "HQCloud FAILED: no html")
+            return
+        }
+
         val fileId = Regex("""\$\.cookie\('file_id',\s*'([^']+)'""").find(html)?.groupValues?.get(1) ?: return
         val aff = Regex("""\$\.cookie\('aff',\s*'([^']+)'""").find(html)?.groupValues?.get(1) ?: ""
         val refUrl = Regex("""\$\.cookie\('ref_url',\s*'([^']+)'""").find(html)?.groupValues?.get(1)
@@ -234,7 +245,10 @@ open class HQCloud : ExtractorApi() {
             if (preferred != null) { finalUrl = preferred; break }
         }
 
-        if (finalUrl.isEmpty()) return
+        if (finalUrl.isEmpty()) {
+            Log.e(TAG, "HQCloud FAILED: no finalUrl")
+            return
+        }
 
         val cookieString = buildString {
             append("file_id=$fileId; aff=$aff; tsn=7")
@@ -245,6 +259,7 @@ open class HQCloud : ExtractorApi() {
             this.referer = baseUrl
             this.headers = mutableMapOf("Cookie" to cookieString)
         })
+        Log.e(TAG, "===== END HQCloud SUCCESS =====")
     }
 }
 class HQLinks : HQCloud() { override var mainUrl = "https://hglink.to" }
@@ -289,7 +304,6 @@ open class VkExtractor : ExtractorApi() {
         }
     }
 
-    // FIXED: Added "suspend" keyword here
     private suspend fun linkcikart(text: String, callback: (ExtractorLink) -> Unit): Boolean {
         var any = false
         Regex("\"(hls|hls_ondemand|dash|dash_sep|dash_ondemand)\"\\s*:\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).findAll(text).forEach { m ->
@@ -375,7 +389,6 @@ class Vtbe : ExtractorApi() {
             val unpacked = JsUnpacker(script).unpack() ?: return null
             val link = Regex("""sources:\s*\[\s*\{\s*file:\s*['"](.*?)['"]""").find(unpacked)?.groupValues?.get(1) ?: return null
 
-            // FIXED: Using newExtractorLink instead of deprecated ExtractorLink constructor
             return listOf(
                 newExtractorLink(
                     source = name,
@@ -404,7 +417,9 @@ open class ByseSX : ExtractorApi() {
     private fun b64(s: String, label: String): ByteArray {
         val fixed = s.replace('-', '+').replace('_', '/')
         val pad = "=".repeat((4 - fixed.length % 4) % 4)
-        return Base64.getDecoder().decode(fixed + pad)
+        val out = Base64.getDecoder().decode(fixed + pad)
+        Log.e(TAG, "Byse b64[$label] outLen=${out.size}")
+        return out
     }
 
     private fun findString(json: JSONObject, vararg keySubstrings: String): String? {
@@ -444,16 +459,27 @@ open class ByseSX : ExtractorApi() {
                 findString(j, "device_id", "deviceId"),
                 body
             )
-        } catch (e: Exception) { null }
+        } catch (e: Exception) { 
+            Log.e(TAG, "Byse attest parse failed: ${e.message}")
+            null 
+        }
     }
 
     private suspend fun emitFromPlaybackJson(
         playbackBody: String, embedFrameUrl: String, embedBase: String, callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val root = tryParseJson<BysePlaybackRoot>(playbackBody) ?: return false
+        val root = tryParseJson<BysePlaybackRoot>(playbackBody) ?: run {
+            Log.e(TAG, "Byse emit: playback parse null")
+            return false
+        }
         val pb = root.playback
+        Log.e(TAG, "Byse pb algo=${pb.algorithm} ivLen=${pb.iv.length} keys=${pb.keyParts.size} payloadLen=${pb.payload.length}")
 
-        if (pb.keyParts.size < 2) return false
+        if (pb.keyParts.size < 2) {
+            Log.e(TAG, "Byse emit: keyParts.size < 2")
+            return false
+        }
+        
         val key = b64(pb.keyParts[0], "k0") + b64(pb.keyParts[1], "k1")
         val iv = b64(pb.iv, "iv")
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -461,9 +487,15 @@ open class ByseSX : ExtractorApi() {
 
         val decrypted = cipher.doFinal(b64(pb.payload, "payload"))
         val json = String(decrypted, StandardCharsets.UTF_8).let { if (it.startsWith("\uFEFF")) it.substring(1) else it }
-        val parsed = tryParseJson<BysePlaybackDecrypt>(json) ?: return false
+        Log.e(TAG, "Byse decrypted=${json.take(1500)}")
+        
+        val parsed = tryParseJson<BysePlaybackDecrypt>(json) ?: run {
+            Log.e(TAG, "Byse emit: parse decrypted null")
+            return false
+        }
 
-        parsed.sources.forEach { s ->
+        parsed.sources.forEachIndexed { i, s ->
+            Log.e(TAG, "Byse src[$i] q=${s.quality} label=${s.label} url=${s.url.take(220)}")
             callback.invoke(newExtractorLink(name, name, s.url, ExtractorLinkType.M3U8) {
                 this.referer = embedFrameUrl
                 this.headers = mutableMapOf("Referer" to embedFrameUrl, "Origin" to embedBase, "User-Agent" to BYSE_UA)
@@ -491,6 +523,8 @@ open class ByseSX : ExtractorApi() {
     override suspend fun getUrl(
         url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ) {
+        Log.e(TAG, "===== START ByseSX =====")
+        Log.e(TAG, "Byse input url=$url")
         val uri = URI(url)
         val code = uri.path.trimEnd('/').substringAfterLast('/')
         val base = "${uri.scheme}://${uri.host}"
@@ -506,7 +540,10 @@ open class ByseSX : ExtractorApi() {
             val body = wvPlayback.text
             if (body.contains("\"playback\"") || body.contains("\"key_parts\"")) {
                 val json = if (body.contains("\"playback\"")) body else "{\"playback\":$body}"
-                if (emitFromPlaybackJson(json, shellUrl, base, callback)) return
+                if (emitFromPlaybackJson(json, shellUrl, base, callback)) {
+                    Log.e(TAG, "===== END ByseSX SUCCESS via Path 1 =====")
+                    return
+                }
             }
         } catch (e: Exception) { Log.e(TAG, "Byse Strategy 1 failed", e) }
 
@@ -522,6 +559,7 @@ open class ByseSX : ExtractorApi() {
                     this.referer = base
                     this.headers = mapOf("Origin" to base, "Referer" to base)
                 })
+                Log.e(TAG, "===== END ByseSX SUCCESS via Path 2 =====")
                 return
             }
         } catch (e: Exception) { Log.e(TAG, "Byse Strategy 2 failed", e) }
@@ -544,10 +582,14 @@ open class ByseSX : ExtractorApi() {
                 val pbResp = app.post("$embedBase/api/videos/$code/embed/playback", headers = playbackHeaders, json = bodyMap)
                 if (pbResp.text.contains("\"key_parts\"")) {
                     val json = if (pbResp.text.contains("\"playback\"")) pbResp.text else "{\"playback\":${pbResp.text}}"
-                    if (emitFromPlaybackJson(json, embedFrameUrl, embedBase, callback)) return
+                    if (emitFromPlaybackJson(json, embedFrameUrl, embedBase, callback)) {
+                        Log.e(TAG, "===== END ByseSX SUCCESS via Path 3 =====")
+                        return
+                    }
                 }
             }
         } catch (e: Exception) { Log.e(TAG, "Byse Strategy 3 failed", e) }
+        Log.e(TAG, "===== END ByseSX FAILED (all paths) =====")
     }
 }
 
