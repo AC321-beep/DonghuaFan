@@ -6,7 +6,6 @@ import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
@@ -242,7 +241,7 @@ open class HQCloud : ExtractorApi() {
 class HQLinks : HQCloud() { override var mainUrl = "https://hglink.to" }
 
 // ==========================================
-// VK Extractors (Restored)
+// VK Extractors
 // ==========================================
 open class VkExtractor : ExtractorApi() {
     override val name = "Vk"
@@ -301,7 +300,7 @@ open class VkExtractor : ExtractorApi() {
 class VkCom : VkExtractor() { override var mainUrl = "https://vk.com" }
 
 // ==========================================
-// DTube Extractor (Restored)
+// DTube Extractor
 // ==========================================
 class Dtube : ExtractorApi() {
     override val name = "DTube"
@@ -352,7 +351,7 @@ class Dtube : ExtractorApi() {
 } 
 
 // ==========================================
-// Vtbe Extractor (Restored)
+// Vtbe Extractor
 // ==========================================
 class Vtbe : ExtractorApi() {
     override val name = "Vtbe"
@@ -424,7 +423,7 @@ open class ByseSX : ExtractorApi() {
         return parsed.sources.isNotEmpty()
     }
 
-    // Interactive M3U8 Catcher (Failsafe for 403s and API changes)
+    // Interactive M3U8 Catcher
     data class InterceptResult(val url: String, val headers: Map<String, String>)
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -488,7 +487,7 @@ open class ByseSX : ExtractorApi() {
                     domStorageEnabled = true
                     useWideViewPort = true
                     loadWithOverviewMode = true
-                    mediaPlaybackRequiresUserGesture = false // Crucial for auto-fetching video links
+                    mediaPlaybackRequiresUserGesture = false 
                     userAgentString = BYSE_UA
                 }
 
@@ -503,7 +502,7 @@ open class ByseSX : ExtractorApi() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
                     
-                    // The magic method: We catch the exact request the player makes to fetch the video
+                    // The magic method: Intercept the m3u8 request
                     override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
                         val reqUrl = request?.url?.toString() ?: return null
                         if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
@@ -524,7 +523,7 @@ open class ByseSX : ExtractorApi() {
             dialog.show()
             webView.loadUrl(urlToResolve, headers)
 
-            handler.postDelayed({ if (!done.get()) finish(null) }, 25_000L) // Fail-safe timeout
+            handler.postDelayed({ if (!done.get()) finish(null) }, 25_000L) // 25s Timeout
         }
     }
 
