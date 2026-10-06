@@ -167,14 +167,15 @@ class VideaHu : ExtractorApi() {
                 }
                 
                 callback.invoke(
-                    ExtractorLink(
+                    newExtractorLink(
                         source = name,
                         name = "$name $q",
                         url = link,
-                        referer = mainUrl,
-                        quality = qualityValue,
                         type = INFER_TYPE
-                    )
+                    ) {
+                        this.referer = mainUrl
+                        this.quality = qualityValue
+                    }
                 )
             }
         } catch (e: Exception) { }
@@ -288,7 +289,8 @@ open class VkExtractor : ExtractorApi() {
         }
     }
 
-    private fun linkcikart(text: String, callback: (ExtractorLink) -> Unit): Boolean {
+    // FIXED: Added "suspend" keyword here
+    private suspend fun linkcikart(text: String, callback: (ExtractorLink) -> Unit): Boolean {
         var any = false
         Regex("\"(hls|hls_ondemand|dash|dash_sep|dash_ondemand)\"\\s*:\\s*\"([^\"]+)\"", RegexOption.IGNORE_CASE).findAll(text).forEach { m ->
             val t = m.groupValues[1].lowercase()
@@ -373,15 +375,17 @@ class Vtbe : ExtractorApi() {
             val unpacked = JsUnpacker(script).unpack() ?: return null
             val link = Regex("""sources:\s*\[\s*\{\s*file:\s*['"](.*?)['"]""").find(unpacked)?.groupValues?.get(1) ?: return null
 
+            // FIXED: Using newExtractorLink instead of deprecated ExtractorLink constructor
             return listOf(
-                ExtractorLink(
+                newExtractorLink(
                     source = name,
                     name = name,
                     url = link,
-                    referer = referer ?: mainUrl,
-                    quality = Qualities.Unknown.value,
                     type = ExtractorLinkType.M3U8
-                )
+                ) {
+                    this.referer = referer ?: mainUrl
+                    this.quality = Qualities.Unknown.value
+                }
             )
         } catch (e: Exception) {
             return null
