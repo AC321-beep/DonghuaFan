@@ -386,6 +386,7 @@ class Vtbe : ExtractorApi() {
 // ==========================================
 // Byse Extractor (Ultimate Interceptor Pattern)
 // ==========================================
+
 open class ByseSX : ExtractorApi() {
     override var name = "Byse"
     override var mainUrl = "https://byse.sx"
@@ -473,19 +474,42 @@ open class ByseSX : ExtractorApi() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
                     
-                    // Auto-Clicker Injection
+                    // CLOUDFLARE-AWARE AUTO-CLICKER
                     override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
                         val js = """
                             (function() {
                                 try {
                                     Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
                                     Object.defineProperty(document, 'hidden', {get: function() { return false; }});
-                                    setInterval(function() {
-                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
-                                        buttons.forEach(b => b.click());
+                                    
+                                    var attemptClick = setInterval(function() {
+                                        // CRITICAL FIX: Do not spam clicks if Cloudflare is currently active
+                                        var pageTitle = document.title.toLowerCase();
+                                        if (pageTitle.includes("just a moment") || pageTitle.includes("attention required") || document.querySelector('#turnstile-wrapper')) {
+                                            return; // Skip this tick, wait for CF to pass
+                                        }
+
                                         var vids = document.querySelectorAll('video');
-                                        vids.forEach(v => { v.muted = true; v.play(); });
-                                    }, 1000);
+                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid, [class*="play"]');
+                                        var isPlaying = false;
+                                        
+                                        vids.forEach(v => { if (!v.paused) isPlaying = true; });
+                                        
+                                        if (!isPlaying && (vids.length > 0 || buttons.length > 0)) {
+                                            buttons.forEach(b => {
+                                                b.click();
+                                                b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+                                            });
+                                            vids.forEach(v => { 
+                                                v.muted = true; 
+                                                var p = v.play();
+                                                if (p !== undefined) p.catch(e => {}); 
+                                            });
+                                        } else if (isPlaying) {
+                                            // Successfully started playing, stop clicking permanently
+                                            clearInterval(attemptClick);
+                                        }
+                                    }, 800); // Slowed down slightly to be safer
                                 } catch(e) {}
                             })();
                         """.trimIndent()
@@ -515,7 +539,7 @@ open class ByseSX : ExtractorApi() {
 
             root?.addView(wv)
             wv.loadUrl(urlToResolve, headers)
-            handler.postDelayed(timeoutRunnable!!, 6500L) // 6.5-second timeout for JS execution
+            handler.postDelayed(timeoutRunnable!!, 6000L) // 6 Second Timeout
         }
     }
 
@@ -551,10 +575,19 @@ open class ByseSX : ExtractorApi() {
                 layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
             
+            var webView: android.webkit.WebView? = null
+
             fun finish(result: InterceptResult?) {
                 if (!done.compareAndSet(false, true)) return
                 android.webkit.CookieManager.getInstance().flush()
-                runCatching { dialog.dismiss() }
+                runCatching { 
+                    webView?.let { wv ->
+                        layout.removeView(wv)
+                        wv.stopLoading()
+                        wv.destroy()
+                    }
+                    dialog.dismiss() 
+                }
                 if (cont.isActive) cont.resume(result)
             }
 
@@ -575,7 +608,7 @@ open class ByseSX : ExtractorApi() {
             }
             layout.addView(progressBar)
 
-            val webView = android.webkit.WebView(activity).apply {
+            val wv = android.webkit.WebView(activity).apply {
                 layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT)
                 settings.apply {
                     javaScriptEnabled = true
@@ -597,19 +630,42 @@ open class ByseSX : ExtractorApi() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
 
-                    // Auto-Clicker Injection (Added to Stage 2 to prevent manual clicking)
+                    // CLOUDFLARE-AWARE AUTO-CLICKER
                     override fun onPageFinished(view: android.webkit.WebView?, url: String?) {
                         val js = """
                             (function() {
                                 try {
                                     Object.defineProperty(document, 'visibilityState', {get: function() { return 'visible'; }});
                                     Object.defineProperty(document, 'hidden', {get: function() { return false; }});
-                                    setInterval(function() {
-                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid');
-                                        buttons.forEach(b => b.click());
+                                    
+                                    var attemptClick = setInterval(function() {
+                                        // CRITICAL FIX: Do not spam clicks if Cloudflare is currently active
+                                        var pageTitle = document.title.toLowerCase();
+                                        if (pageTitle.includes("just a moment") || pageTitle.includes("attention required") || document.querySelector('#turnstile-wrapper')) {
+                                            return; // Skip this tick, wait for CF to pass
+                                        }
+
                                         var vids = document.querySelectorAll('video');
-                                        vids.forEach(v => { v.muted = true; v.play(); });
-                                    }, 1000);
+                                        var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .jw-display-icon-display, .plyr__control--overlaid, [class*="play"]');
+                                        var isPlaying = false;
+                                        
+                                        vids.forEach(v => { if (!v.paused) isPlaying = true; });
+                                        
+                                        if (!isPlaying && (vids.length > 0 || buttons.length > 0)) {
+                                            buttons.forEach(b => {
+                                                b.click();
+                                                b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+                                            });
+                                            vids.forEach(v => { 
+                                                v.muted = true; 
+                                                var p = v.play();
+                                                if (p !== undefined) p.catch(e => {}); 
+                                            });
+                                        } else if (isPlaying) {
+                                            // Successfully started playing, stop clicking permanently
+                                            clearInterval(attemptClick);
+                                        }
+                                    }, 800); // Slowed down slightly to be safer
                                 } catch(e) {}
                             })();
                         """.trimIndent()
@@ -628,13 +684,14 @@ open class ByseSX : ExtractorApi() {
                     }
                 }
             }
+            webView = wv
 
-            layout.addView(webView)
+            layout.addView(wv)
             dialog.setContentView(layout)
             dialog.setOnDismissListener { if (!done.get()) finish(null) }
 
             dialog.show()
-            webView.loadUrl(urlToResolve, headers)
+            wv.loadUrl(urlToResolve, headers)
 
             handler.postDelayed({ if (!done.get()) finish(null) }, 25_000L) // 25s Timeout
         }
