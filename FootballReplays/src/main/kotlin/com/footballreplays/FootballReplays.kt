@@ -31,7 +31,7 @@ class CFInterceptor : okhttp3.Interceptor {
         }
         val ua = CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa
         builder.header("User-Agent", ua)
-        builder.removeHeader("X-Requested-With") // CRITICAL: Removes app detection flag
+        builder.removeHeader("X-Requested-With")
 
         val cookies = android.webkit.CookieManager.getInstance().getCookie(original.url.toString())
         if (!cookies.isNullOrEmpty()) {
@@ -60,76 +60,6 @@ object CloudflareResolver {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    suspend fun attemptSilentResolution(activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>): Boolean = withContext(Dispatchers.Main) {
-        val decor = activity.window?.decorView as? android.view.ViewGroup ?: return@withContext false
-        suspendCancellableCoroutine { cont ->
-            val done = AtomicBoolean(false)
-            val handler = android.os.Handler(android.os.Looper.getMainLooper())
-            var checkRunnable: Runnable? = null
-            var timeoutRunnable: Runnable? = null
-
-            val webView = android.webkit.WebView(activity).apply {
-                layoutParams = android.view.ViewGroup.LayoutParams(1, 1) // Invisible 1x1 pixel
-                translationX = 20000f
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    useWideViewPort = true
-                    loadWithOverviewMode = true
-                    cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
-                    mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    userAgentString = CFState.userAgent.ifBlank { userAgentString }
-                }
-                android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-
-                webViewClient = object : android.webkit.WebViewClient() {
-                    @SuppressLint("WebViewClientOnReceivedSslError")
-                    override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
-                }
-            }
-
-            fun cleanup(success: Boolean) {
-                if (!done.compareAndSet(false, true)) return
-                checkRunnable?.let { handler.removeCallbacks(it) }
-                timeoutRunnable?.let { handler.removeCallbacks(it) }
-                runCatching {
-                    decor.removeView(webView)
-                    webView.stopLoading()
-                    webView.destroy()
-                }
-                if (success) android.webkit.CookieManager.getInstance().flush()
-                if (cont.isActive) cont.resume(success)
-            }
-
-            cont.invokeOnCancellation { cleanup(false) }
-
-            checkRunnable = object : Runnable {
-                override fun run() {
-                    if (done.get()) return
-                    val cookies = android.webkit.CookieManager.getInstance().getCookie(urlToResolve) ?: ""
-                    val title = webView.title?.lowercase() ?: ""
-                    val isChallenge = listOf("just a moment", "attention required", "security verification").any { title.contains(it) }
-
-                    if (!isChallenge && cookies.contains("cf_clearance")) {
-                        cleanup(true)
-                        return
-                    }
-                    handler.postDelayed(this, 500L)
-                }
-            }
-
-            timeoutRunnable = Runnable { cleanup(false) }
-
-            decor.addView(webView)
-            // Passes Headers to bypass Nginx 403 Forbidden
-            webView.loadUrl(urlToResolve, headers)
-            handler.postDelayed(checkRunnable!!, 800L)
-            handler.postDelayed(timeoutRunnable!!, 8000L) // Give silent resolution 8 seconds
-        }
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
     suspend fun attemptInteractiveResolution(activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>): Boolean = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             val dialog = android.app.Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
@@ -144,25 +74,40 @@ object CloudflareResolver {
                 setBackgroundColor(android.graphics.Color.parseColor("#1A1A1A"))
             }
 
-            val header = android.widget.TextView(activity).apply {
-                text = "Bypassing Security... Please Complete Challenge"
-                setTextColor(android.graphics.Color.WHITE)
-                textSize = 15f
+            val headerLayout = android.widget.LinearLayout(activity).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
                 setPadding(32, 28, 32, 28)
             }
-            layout.addView(header)
-
-            val progressBar = android.widget.ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
-                layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, 8)
+            val header = android.widget.TextView(activity).apply {
+                text = "Bypassing Security... Please Wait"
+                setTextColor(android.graphics.Color.WHITE)
+                textSize = 15f
+                layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             }
-            layout.addView(progressBar)
-
+            
             fun finish(success: Boolean) {
                 if (!done.compareAndSet(false, true)) return
                 android.webkit.CookieManager.getInstance().flush()
                 runCatching { dialog.dismiss() }
                 if (cont.isActive) cont.resume(success)
             }
+
+            val closeBtn = android.widget.TextView(activity).apply {
+                text = "✖"
+                setTextColor(android.graphics.Color.WHITE)
+                textSize = 18f
+                setPadding(20, 0, 0, 0)
+                setOnClickListener { finish(false) }
+            }
+
+            headerLayout.addView(header)
+            headerLayout.addView(closeBtn)
+            layout.addView(headerLayout)
+
+            val progressBar = android.widget.ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
+                layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, 8)
+            }
+            layout.addView(progressBar)
 
             val webView = android.webkit.WebView(activity).apply {
                 layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT)
@@ -182,9 +127,13 @@ object CloudflareResolver {
                     if (done.get()) return
                     val title = view?.title?.lowercase() ?: ""
                     val cookies = android.webkit.CookieManager.getInstance().getCookie(urlToResolve) ?: ""
-                    val isChallenge = listOf("just a moment", "attention required", "security verification").any { title.contains(it) }
+                    val isChallenge = title.contains("just a moment") || title.contains("attention required") || title.contains("security verification")
 
-                    if (!isChallenge && cookies.contains("cf_clearance")) {
+                    // Success if we get the CF cookie OR the page title implies it successfully loaded
+                    val isSuccess = (!isChallenge && cookies.contains("cf_clearance")) || 
+                                    (!isChallenge && (title.contains("football replays") || title.contains("football")))
+
+                    if (isSuccess) {
                         header.text = "Success! Loading..."
                         header.setTextColor(android.graphics.Color.GREEN)
                         handler.postDelayed({ finish(true) }, 800)
@@ -211,7 +160,6 @@ object CloudflareResolver {
             dialog.setOnDismissListener { if (!done.get()) finish(false) }
 
             dialog.show()
-            // Passes Headers to bypass Nginx 403 Forbidden
             webView.loadUrl(urlToResolve, headers)
 
             handler.postDelayed({ if (!done.get()) finish(false) }, 30_000L)
@@ -221,7 +169,6 @@ object CloudflareResolver {
     suspend fun resolve(url: String, headers: Map<String, String> = emptyMap()): Boolean {
         val activity = CommonActivity.activity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
-        if (attemptSilentResolution(activity, url, headers)) return true
         return attemptInteractiveResolution(activity, url, headers)
     }
 }
@@ -263,13 +210,30 @@ class FootballReplays : MainAPI() {
     }
 
     private suspend fun fetchHtml(url: String): String {
-        var response = app.get(url, interceptor = CFInterceptor()).text
-        if (CloudflareResolver.isCloudflareChallenge(response)) {
-            Log.e("FootballReplays", "Cloudflare challenge detected on $url")
-            CloudflareResolver.resolve(mainUrl, getPosterHeaders())
-            response = app.get(url, interceptor = CFInterceptor()).text
+        return try {
+            val response = app.get(url, interceptor = CFInterceptor()).text
+            if (CloudflareResolver.isCloudflareChallenge(response)) {
+                Log.e("FootballReplays", "Cloudflare challenge detected on $url")
+                CloudflareResolver.resolve(mainUrl, getPosterHeaders())
+                app.get(url, interceptor = CFInterceptor()).text
+            } else {
+                response
+            }
+        } catch (e: Exception) {
+            if (e.message?.contains("403") == true || e.message?.contains("503") == true) {
+                Log.e("FootballReplays", "Cloudflare block (403/503) detected on $url")
+                CloudflareResolver.resolve(mainUrl, getPosterHeaders())
+                try {
+                    app.get(url, interceptor = CFInterceptor()).text
+                } catch (e2: Exception) {
+                    Log.e("FootballReplays", "Failed to fetch HTML after resolution", e2)
+                    ""
+                }
+            } else {
+                Log.e("FootballReplays", "Generic fetch error", e)
+                ""
+            }
         }
-        return response
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -294,7 +258,6 @@ class FootballReplays : MainAPI() {
         val isnot = this.selectFirst("a.p-category")?.attr("href")?.contains("/news/") == true
         val categoryId = this.selectFirst("a.p-category")?.className()
         if (isnot || categoryId?.contains("category-id-283") == true) {
-            Log.e("FootballReplays", "toMainPageResult skipped (news or category-283)")
             return null
         }
         return toRecommendationResult()
@@ -330,45 +293,27 @@ class FootballReplays : MainAPI() {
         Log.e("FootballReplays", "load title=$title")
 
         val poster = fixUrlNull(document.selectFirst("div.s-feat img")?.attr("src"))
-        Log.e("FootballReplays", "load poster=$poster")
-
         val year = document.selectFirst("time.updated-date")?.attr("datetime")?.substringBefore("-")?.toIntOrNull()
-        Log.e("FootballReplays", "load year=$year")
-
         val rawDescription = document.selectFirst("meta[property=og:description]")?.attr("content")?.trim() ?: ""
-        Log.e("FootballReplays", "load rawDescription=${rawDescription.take(300)}")
 
         val kickOffRegex = Regex("""Kick-off:\s*([^.]+)""", RegexOption.IGNORE_CASE)
         val kickOffMatch = kickOffRegex.find(rawDescription)?.groupValues?.getOrNull(1)
-        Log.e("FootballReplays", "load kickOffMatch=$kickOffMatch")
-
+        
         val fallbackDate = document.selectFirst("time.updated-date")?.text()
             ?.replace("Last updated:", "", ignoreCase = true)?.trim()
-        Log.e("FootballReplays", "load fallbackDate=$fallbackDate")
-
         val displayDate = kickOffMatch ?: fallbackDate
-        Log.e("FootballReplays", "load displayDate=$displayDate")
 
         val episodes = mutableListOf<Episode>()
         document.select("table.video-table").forEachIndexed { tIdx, table ->
             val sourceName = table.selectFirst("thead tr th[colspan]")?.text()?.trim() ?: "Source"
-            Log.e("FootballReplays", "load table[$tIdx] sourceName=$sourceName")
-
+            
             table.select("tbody tr").forEachIndexed { rIdx, tr ->
                 val part = tr.select("td").firstOrNull()?.text()?.trim() ?: "Video"
-                val onclickAttr = tr.selectFirst("a.play-button")?.attr("onclick") ?: run {
-                    Log.e("FootballReplays", "load table[$tIdx] row[$rIdx] no play-button")
-                    return@forEachIndexed
-                }
-                Log.e("FootballReplays", "load table[$tIdx] row[$rIdx] onclick=$onclickAttr")
-
+                val onclickAttr = tr.selectFirst("a.play-button")?.attr("onclick") ?: return@forEachIndexed
+                
                 val regex = Regex("""loadVideo\('([^']+)'\)""")
-                val videoUrl = regex.find(onclickAttr)?.groupValues?.get(1) ?: run {
-                    Log.e("FootballReplays", "load table[$tIdx] row[$rIdx] loadVideo regex failed")
-                    return@forEachIndexed
-                }
-                Log.e("FootballReplays", "load table[$tIdx] row[$rIdx] videoUrl=$videoUrl")
-
+                val videoUrl = regex.find(onclickAttr)?.groupValues?.get(1) ?: return@forEachIndexed
+                
                 val episodeData = "$videoUrl|$sourceName - $part"
                 val currentEpisodeSize = episodes.size
 
@@ -437,15 +382,10 @@ class FootballReplays : MainAPI() {
         Log.e("FootballReplays", "loadLinks raw data=$data")
 
         val parts = data.split("|")
-        val videoUrl = parts.getOrNull(0) ?: run {
-            Log.e("FootballReplays", "loadLinks FAILED: no videoUrl part")
-            return false
-        }
+        val videoUrl = parts.getOrNull(0) ?: return false
         val customName = parts.getOrNull(1) ?: "Video"
         val iframeUrl = if (videoUrl.startsWith("//")) "https:$videoUrl" else videoUrl
 
-        Log.e("FootballReplays", "loadLinks videoUrl=$videoUrl")
-        Log.e("FootballReplays", "loadLinks customName=$customName")
         Log.e("FootballReplays", "loadLinks iframeUrl=$iframeUrl")
 
         var emitted = 0
