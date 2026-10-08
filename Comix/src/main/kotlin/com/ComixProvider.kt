@@ -141,6 +141,11 @@ class ComixProvider : MainAPI() {
     @Volatile private var lastCipherAttemptMs: Long = 0L
     private val cipherRetryCooldownMs = 5 * 60 * 1000L   // 5 minutes
 
+    /** Ensures we do the silent WebView warm-up at most once per app process.
+     *  This is what establishes session cookies + captures the cipher as a
+     *  side effect, without ever opening the interactive dialog. */
+    @Volatile private var sessionWarmedUp = false
+
     private val cipherCacheFile: File?
         get() {
             val ctx = CommonActivity.activity ?: return null
@@ -252,7 +257,7 @@ class ComixProvider : MainAPI() {
      * @param waitForCipher when true, the caller wants cipher material.
      * @param requireCipher when true, success is ONLY granted when cipher has
      *                      actually been captured. Used by silent cipher
-     *                      acquisition, so the grace-period escape hatch
+     *                      acquisition so the grace-period escape hatch
      *                      doesn't turn a failed capture into a false positive.
      */
     @SuppressLint("SetJavaScriptEnabled")
@@ -565,6 +570,28 @@ class ComixProvider : MainAPI() {
     }
 
     /**
+     * Silent, once-per-session warm-up. Opens a headless WebView to the main URL
+     * so that:
+     *   - the site's session cookies are established, and
+     *   - the CAPTURE_SCRIPT hook captures cipher material as a side effect.
+     *
+     * Never opens the interactive dialog; if cipher material isn't available,
+     * the grace-period escape hatch lets the silent resolver succeed anyway.
+     */
+    private suspend fun ensureSessionWarmedUp() {
+        if (sessionWarmedUp) return
+        sessionWarmedUp = true
+
+        val activity = CommonActivity.activity ?: return
+        if (activity.isFinishing || activity.isDestroyed) return
+
+        runCatching {
+            attemptSilentResolution(activity, waitForCipher = true, requireCipher = false)
+        }
+        CookieManager.getInstance().flush()
+    }
+
+    /**
      * Silently capture the cipher via a headless WebView. NEVER opens a dialog.
      *
      * Used by pagination / search as an independent step from CF bypass — the
@@ -590,15 +617,22 @@ class ComixProvider : MainAPI() {
 
     private fun isCloudflareChallenge(html: String): Boolean {
         if (html.isBlank()) return true
+
         val lower = html.lowercase()
+
+        // If the real site's data marker is present, this is not a challenge page.
+        if (lower.contains("id=\"initial-data\"") || lower.contains("id='initial-data'")) {
+            return false
+        }
+        // Real CF interstitials are tiny; anything substantial is the real page.
+        if (html.length > 50_000) return false
+
         return lower.contains("cf-browser-verification") ||
-               lower.contains("cf-chl-") ||
+               lower.contains("_cf_chl_opt") ||
                lower.contains("__cf_chl_") ||
-               lower.contains("challenge-platform") ||
-               (lower.contains("just a moment") && lower.contains("cloudflare")) ||
-               (lower.contains("attention required") && lower.contains("cloudflare")) ||
-               (lower.contains("checking your browser") && lower.contains("cloudflare")) ||
-               lower.contains("enable javascript and cookies to continue")
+               lower.contains("<title>just a moment") ||
+               lower.contains("enable javascript and cookies to continue") ||
+               (lower.contains("attention required") && lower.contains("cloudflare"))
     }
 
     /**
@@ -606,15 +640,19 @@ class ComixProvider : MainAPI() {
      * if the direct request was actually answered with a CF challenge page.
      */
     private suspend fun fetchHtml(url: String): String {
-        // Attempt 1: direct
+        // 1. First HTML fetch of the session triggers a silent WebView warm-up,
+        //    which establishes cookies and captures the cipher.
+        ensureSessionWarmedUp()
+
+        // 2. Direct attempt
         var response = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
         if (response.isNotBlank() && !isCloudflareChallenge(response)) return response
 
-        // Attempt 2: one retry for transient failures
+        // 3. One retry for transient failures
         response = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
         if (response.isNotBlank() && !isCloudflareChallenge(response)) return response
 
-        // Only now — the server actually answered with a challenge — do we invoke CF.
+        // 4. Actual CF challenge — invoke resolver (may open dialog if silent fails).
         cfMutex.withLock {
             resolveCloudflareAndCipher(waitForCipher = false)
             CookieManager.getInstance().flush()
@@ -922,7 +960,16 @@ class ComixProvider : MainAPI() {
                     precise(subtype, params)
                 }
             }
+
+            // Page 1 safety net — if the precise matcher found nothing,
+            // accept the first non-empty manga query of any kind.
+            if (items.isEmpty() && page == 1) {
+                items = readQueries(initial) { k ->
+                    k.length() >= 2 && k.optString(0) == "manga"
+                }
+            }
         }
+
         if (items.isEmpty()) items = extractSearchResultsDom(Jsoup.parse(html))
         return items
     }
