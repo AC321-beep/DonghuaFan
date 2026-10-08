@@ -15,12 +15,9 @@ import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.view.Window
-import android.view.WindowManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
@@ -71,252 +68,6 @@ class ComixReaderDialogFragment : DialogFragment() {
                 }
             }
         }
-
-        private val SCRIPT_NEXT_CHAPTER = """
-            (function() {
-              try {
-                var s = document.getElementById('syncData');
-                if (s && s.textContent) {
-                  var d = JSON.parse(s.textContent);
-                  if (d && d.next_chapter_url) { window.location.href = d.next_chapter_url; return true; }
-                }
-              } catch(e) {}
-              var b = document.querySelector(
-                'button[aria-label="Next chapter"], button[title="Next chapter"], ' +
-                '.rpage-floatctl__row button:last-of-type, ' +
-                '.rpage-chap-ending__nav-btn:last-of-type, ' +
-                '.rpage-dir2__btn:last-of-type'
-              );
-              if (b && !b.disabled) { b.click(); return true; }
-              window.dispatchEvent(new KeyboardEvent('keydown',
-                { key: 'ArrowRight', keyCode: 39, code: 'ArrowRight', bubbles: true }));
-              return false;
-            })();
-        """.trimIndent()
-
-        private val SCRIPT_PREV_CHAPTER = """
-            (function() {
-              var b = document.querySelector(
-                'button[aria-label="Previous chapter"], button[title="Previous chapter"], ' +
-                '.rpage-floatctl__row button:first-of-type, ' +
-                '.rpage-chap-ending__nav-btn:first-of-type, ' +
-                '.rpage-dir2__btn:first-of-type'
-              );
-              if (b && !b.disabled) { b.click(); return true; }
-              window.dispatchEvent(new KeyboardEvent('keydown',
-                { key: 'ArrowLeft', keyCode: 37, code: 'ArrowLeft', bubbles: true }));
-              return false;
-            })();
-        """.trimIndent()
-
-        private val SCRIPT_OPEN_LIST = """
-            (function() {
-              var b = document.querySelector(
-                '.rpage-floatctl__chap, button[aria-label="Chapter list"], button[title="Chapter list"]'
-              );
-              if (b) { b.click(); return true; }
-              return false;
-            })();
-        """.trimIndent()
-
-        private val SCRIPT_READER_OPTIMIZATIONS = """
-            (function() {
-              try {
-                if (!document.getElementById('cs-reader-style')) {
-                  var s = document.createElement('style');
-                  s.id = 'cs-reader-style';
-                  s.innerHTML = `
-                    body { background-color: #07080C !important; margin: 0 !important; padding: 0 !important; }
-                    header, footer,
-                    .header, .navbar, .site-header,
-                    [class*="ad-"], [id*="ad-"],
-                    iframe[src*="ads"], iframe[src*="pop"],
-                    .google-anno, .cookie-notice,
-                    .rpage-floatctl__col, .rpage-bottombar, .rpage-hoverzone, .rpage-dir2 {
-                      display: none !important;
-                    }
-                    .rpage-strip-comments,
-                    .cm-widget,
-                    .share-block,
-                    .social-share,
-                    .mpage__recs,
-                    #comments {
-                      display: none !important;
-                    }
-                    .rpage-chap-ending {
-                      padding-bottom: 8px !important;
-                      margin-bottom: 0 !important;
-                    }
-                    .rpage-chap-ending__nav { margin-bottom: 8px !important; }
-                    .rpage-main,
-                    .rpage-main--long-strip,
-                    .rpage-main__inner {
-                      padding-bottom: 0 !important;
-                      margin-bottom: 0 !important;
-                    }
-                  `;
-                  document.head.appendChild(s);
-                }
-
-                function report() {
-                  var chText = '';
-                  var el = document.querySelector('.rpage-floatctl__chap .mono, .rpage-chap-ending__title, h1');
-                  if (el) chText = el.innerText.trim();
-                  if (!chText || chText === 'Ch. 0' || chText === 'Ch.0') {
-                    var m = /chapter-(\d+(\.\d+)?)/i.exec(window.location.href);
-                    if (m) chText = 'Ch. ' + m[1];
-                  }
-                  if (chText && chText !== 'Ch. 0' && chText !== 'Ch.0') {
-                    if (window.AndroidComix) window.AndroidComix.onChapterDetected(chText, window.location.href);
-                  }
-                }
-                report();
-
-                if (!window.__comixTapZonesInstalled) {
-                  window.__comixTapZonesInstalled = true;
-
-                  var TAP_MAX_MOVE  = 14;   
-                  var TAP_MAX_TIME  = 350;  
-                  var TAP_DEBOUNCE  = 180;  
-
-                  var startX = 0, startY = 0, startT = 0, lastTapEnd = 0;
-                  var moved = false;
-
-                  function isIgnored(target) {
-                    if (!target || !target.closest) return false;
-                    return !!target.closest(
-                      'a, button, input, textarea, select, ' +
-                      '.rpage-modal, .rpage-chaplist, .rpage-settings, ' +
-                      '.rpage-chappanel, .rpage-cmpanel, [role="dialog"]'
-                    );
-                  }
-
-                  function handleTap(x, y) {
-                    var now = Date.now();
-                    if (now - lastTapEnd < TAP_DEBOUNCE) return;
-                    lastTapEnd = now;
-
-                    var w = window.innerWidth;
-                    var h = window.innerHeight;
-                    
-                    var isAtBottom = false;
-                    var scrollContainer = document.querySelector('.rpage-main') || document.querySelector('.rpage-main--long-strip');
-                    
-                    try {
-                        if (scrollContainer && scrollContainer.scrollHeight > scrollContainer.clientHeight) {
-                            isAtBottom = (scrollContainer.scrollTop + scrollContainer.clientHeight) >= (scrollContainer.scrollHeight - 150);
-                        } else {
-                            var scrollPos = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
-                            var docHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-                            isAtBottom = (scrollPos + h) >= (docHeight - 150);
-                        }
-                    } catch(e) {}
-
-                    if (x < w * 0.25) {
-                      if (scrollContainer) scrollContainer.scrollBy({ top: -(h * 0.8), behavior: 'smooth' });
-                      window.scrollBy({ top: -(h * 0.8), behavior: 'smooth' });
-                      flashTap(x, y);
-                    } else if (x > w * 0.75) {
-                      if (isAtBottom) {
-                        flashTap(x, y);
-                        if (window.AndroidComix) window.AndroidComix.onTriggerNextChapter();
-                      } else {
-                        if (scrollContainer) scrollContainer.scrollBy({ top: (h * 0.8), behavior: 'smooth' });
-                        window.scrollBy({ top:  (h * 0.8), behavior: 'smooth' });
-                        flashTap(x, y);
-                      }
-                    } else {
-                      if (isAtBottom && y > h * 0.75) {
-                        flashTap(x, y);
-                        if (window.AndroidComix) window.AndroidComix.onTriggerNextChapter();
-                      } else {
-                        if (window.AndroidComix) window.AndroidComix.onTapZone('center');
-                      }
-                    }
-                  }
-
-                  document.addEventListener('touchstart', function(e) {
-                    if (e.touches.length !== 1) return;
-                    var t = e.touches[0];
-                    startX = t.clientX; startY = t.clientY;
-                    startT = Date.now();
-                    moved = false;
-                  }, { passive: true, capture: true });
-
-                  document.addEventListener('touchmove', function(e) {
-                    if (e.touches.length !== 1) return;
-                    var t = e.touches[0];
-                    if (Math.abs(t.clientX - startX) > TAP_MAX_MOVE ||
-                        Math.abs(t.clientY - startY) > TAP_MAX_MOVE) {
-                      moved = true;
-                    }
-                  }, { passive: true, capture: true });
-
-                  document.addEventListener('touchend', function(e) {
-                    if (e.changedTouches.length !== 1) return;
-                    if (moved) return;
-                    var t = e.changedTouches[0];
-                    if (Math.abs(t.clientX - startX) > TAP_MAX_MOVE) return;
-                    if (Math.abs(t.clientY - startY) > TAP_MAX_MOVE) return;
-                    if (Date.now() - startT > TAP_MAX_TIME) return;
-                    if (isIgnored(t.target || e.target)) return;
-                    handleTap(t.clientX, t.clientY);
-                  }, { passive: true, capture: true });
-
-                  document.addEventListener('touchcancel', function() {
-                    moved = true;
-                  }, { passive: true, capture: true });
-
-                  document.addEventListener('click', function(e) {
-                    if ('ontouchstart' in window) return; 
-                    if (isIgnored(e.target)) return;
-                    handleTap(e.clientX, e.clientY);
-                  }, false);
-                }
-
-                if (!window.__comixSoftNavInstalled) {
-                  window.__comixSoftNavInstalled = true;
-                  var relisten = function() {
-                    setTimeout(function() {
-                      try { report(); } catch(e) {}
-                      if (!document.getElementById('cs-reader-style')) {
-                        if (window.__comixReinject) window.__comixReinject();
-                      }
-                    }, 120);
-                  };
-                  window.addEventListener('turbo:initial-updated', relisten);
-                  window.addEventListener('turbo:request-completed', relisten);
-                  window.addEventListener('popstate', relisten);
-                }
-
-                window.__comixReinject = function() {
-                  try {
-                    if (window.AndroidComix && window.AndroidComix.onReaderNeedsReinject) {
-                      window.AndroidComix.onReaderNeedsReinject();
-                    }
-                  } catch(e) {}
-                };
-
-                function flashTap(x, y) {
-                  try {
-                    var dot = document.createElement('div');
-                    dot.style.cssText =
-                      'position:fixed;pointer-events:none;width:56px;height:56px;' +
-                      'border-radius:50%;background:rgba(99,102,241,0.28);z-index:2147483647;' +
-                      'transform:translate(-50%,-50%);transition:opacity .35s,transform .35s;opacity:1';
-                    dot.style.left = x + 'px';
-                    dot.style.top  = y + 'px';
-                    document.body.appendChild(dot);
-                    requestAnimationFrame(function(){
-                      dot.style.opacity = '0';
-                      dot.style.transform = 'translate(-50%,-50%) scale(1.4)';
-                    });
-                    setTimeout(function(){ dot.remove(); }, 450);
-                  } catch(e) {}
-                }
-              } catch(e) {}
-            })();
-        """.trimIndent()
     }
 
     private var comicTitle = ""
@@ -342,12 +93,12 @@ class ComixReaderDialogFragment : DialogFragment() {
 
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
         val dialog = super.onCreateDialog(savedInstanceState)
-        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        dialog.requestWindowFeature(1)
         dialog.window?.apply {
             setBackgroundDrawable(ColorDrawable(Color.BLACK))
             setDimAmount(1f)
-            addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
-            addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            addFlags(1024)
+            addFlags(128)
         }
         dialog.setOnKeyListener { _, keyCode, event ->
             if (keyCode != KeyEvent.KEYCODE_BACK || event.action != KeyEvent.ACTION_UP) {
@@ -365,24 +116,16 @@ class ComixReaderDialogFragment : DialogFragment() {
         return dialog
     }
 
-    @Suppress("DEPRECATION")
     override fun onStart() {
         super.onStart()
         dialog?.window?.apply {
             setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-            decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                    or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                    or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                    or View.SYSTEM_UI_FLAG_FULLSCREEN)
+            decorView.systemUiVisibility = 5380
         }
     }
 
     override fun onDestroyView() {
         webView?.apply {
-            (parent as? ViewGroup)?.removeView(this@apply)
-            removeJavascriptInterface("AndroidComix")
             stopLoading()
             loadUrl("about:blank")
             clearHistory()
@@ -390,10 +133,6 @@ class ComixReaderDialogFragment : DialogFragment() {
             destroy()
         }
         webView = null
-        progressBar = null
-        chapterInfoTextView = null
-        zoomValueBtn = null
-        toolbarView = null
         super.onDestroyView()
     }
 
@@ -431,8 +170,6 @@ class ComixReaderDialogFragment : DialogFragment() {
             setBackgroundColor(Color.parseColor("#07080C"))
             isVerticalScrollBarEnabled = true
             isHorizontalScrollBarEnabled = false
-            
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
 
             settings.apply {
                 javaScriptEnabled = true
@@ -443,11 +180,13 @@ class ComixReaderDialogFragment : DialogFragment() {
                 builtInZoomControls = true
                 displayZoomControls = false
                 setSupportZoom(true)
-                cacheMode = WebSettings.LOAD_DEFAULT 
+                cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
                 mediaPlaybackRequiresUserGesture = false
                 
                 if (CFState.userAgent.isNotBlank()) {
-                    userAgentString = CFState.userAgent 
+                    userAgentString = CFState.userAgent
+                } else {
+                    CFState.userAgent = userAgentString
                 }
             }
 
@@ -481,6 +220,7 @@ class ComixReaderDialogFragment : DialogFragment() {
                         currentChapterName = "Ch. $numStr"
                         chapterInfoTextView?.text = currentChapterName
 
+                        // Save the exact chapter URL to SharedPreferences for Auto-Resume
                         val slug = extractSlug(url)
                         if (slug.isNotBlank()) {
                             view.context.getSharedPreferences("comix_resume_prefs", Context.MODE_PRIVATE)
@@ -704,11 +444,11 @@ class ComixReaderDialogFragment : DialogFragment() {
                   document.head.appendChild(style);
                 }
                 style.innerHTML = `
-                  :root { --rpage-max-w: ${'$'}{zoom}% !important; }
+                  :root { --rpage-max-w: ${zoom}% !important; }
                   .rpage-main, .rpage-main--long-strip { overflow-x: auto !important; }
                   .rpage-main__inner, .rpage-view, .rpage-view--pages {
-                    width: ${'$'}{zoom}% !important;
-                    max-width: ${'$'}{zoom}% !important;
+                    width: ${zoom}% !important;
+                    max-width: ${zoom}% !important;
                     margin: 0 auto !important;
                     transition: width .15s ease-out, max-width .15s ease-out !important;
                   }
@@ -732,22 +472,268 @@ class ComixReaderDialogFragment : DialogFragment() {
     }
 
     private fun triggerNextChapter() {
-        webView?.evaluateJavascript(SCRIPT_NEXT_CHAPTER, null)
+        webView?.evaluateJavascript(
+            """
+            (function() {
+              try {
+                var s = document.getElementById('syncData');
+                if (s && s.textContent) {
+                  var d = JSON.parse(s.textContent);
+                  if (d && d.next_chapter_url) { window.location.href = d.next_chapter_url; return true; }
+                }
+              } catch(e) {}
+              var b = document.querySelector(
+                'button[aria-label="Next chapter"], button[title="Next chapter"], ' +
+                '.rpage-floatctl__row button:last-of-type, ' +
+                '.rpage-chap-ending__nav-btn:last-of-type, ' +
+                '.rpage-dir2__btn:last-of-type'
+              );
+              if (b && !b.disabled) { b.click(); return true; }
+              window.dispatchEvent(new KeyboardEvent('keydown',
+                { key: 'ArrowRight', keyCode: 39, code: 'ArrowRight', bubbles: true }));
+              return false;
+            })();
+            """.trimIndent(), null
+        )
     }
 
     private fun triggerPrevChapter() {
-        webView?.evaluateJavascript(SCRIPT_PREV_CHAPTER, null)
+        webView?.evaluateJavascript(
+            """
+            (function() {
+              var b = document.querySelector(
+                'button[aria-label="Previous chapter"], button[title="Previous chapter"], ' +
+                '.rpage-floatctl__row button:first-of-type, ' +
+                '.rpage-chap-ending__nav-btn:first-of-type, ' +
+                '.rpage-dir2__btn:first-of-type'
+              );
+              if (b && !b.disabled) { b.click(); return true; }
+              window.dispatchEvent(new KeyboardEvent('keydown',
+                { key: 'ArrowLeft', keyCode: 37, code: 'ArrowLeft', bubbles: true }));
+              return false;
+            })();
+            """.trimIndent(), null
+        )
     }
 
     private fun openInPageChapterList() {
-        webView?.evaluateJavascript(SCRIPT_OPEN_LIST, null)
+        webView?.evaluateJavascript(
+            """
+            (function() {
+              var b = document.querySelector(
+                '.rpage-floatctl__chap, button[aria-label="Chapter list"], button[title="Chapter list"]'
+              );
+              if (b) { b.click(); return true; }
+              return false;
+            })();
+            """.trimIndent(), null
+        )
     }
 
     private fun injectReaderOptimizations(view: WebView) {
-        view.evaluateJavascript(SCRIPT_READER_OPTIMIZATIONS, null)
+        view.evaluateJavascript(
+            """
+            (function() {
+              try {
+                if (!document.getElementById('cs-reader-style')) {
+                  var s = document.createElement('style');
+                  s.id = 'cs-reader-style';
+                  s.innerHTML = `
+                    body { background-color: #07080C !important; margin: 0 !important; padding: 0 !important; }
+                    header, footer,
+                    .header, .navbar, .site-header,
+                    [class*="ad-"], [id*="ad-"],
+                    iframe[src*="ads"], iframe[src*="pop"],
+                    .google-anno, .cookie-notice,
+                    .rpage-floatctl__col, .rpage-bottombar, .rpage-hoverzone, .rpage-dir2 {
+                      display: none !important;
+                    }
+                    .rpage-strip-comments,
+                    .cm-widget,
+                    .share-block,
+                    .social-share,
+                    .mpage__recs,
+                    #comments {
+                      display: none !important;
+                    }
+                    .rpage-chap-ending {
+                      padding-bottom: 8px !important;
+                      margin-bottom: 0 !important;
+                    }
+                    .rpage-chap-ending__nav { margin-bottom: 8px !important; }
+                    .rpage-main,
+                    .rpage-main--long-strip,
+                    .rpage-main__inner {
+                      padding-bottom: 0 !important;
+                      margin-bottom: 0 !important;
+                    }
+                  `;
+                  document.head.appendChild(s);
+                }
+
+                function report() {
+                  var chText = '';
+                  var el = document.querySelector('.rpage-floatctl__chap .mono, .rpage-chap-ending__title, h1');
+                  if (el) chText = el.innerText.trim();
+                  if (!chText || chText === 'Ch. 0' || chText === 'Ch.0') {
+                    var m = /chapter-(\d+(\.\d+)?)/i.exec(window.location.href);
+                    if (m) chText = 'Ch. ' + m[1];
+                  }
+                  if (chText && chText !== 'Ch. 0' && chText !== 'Ch.0') {
+                    if (window.AndroidComix) window.AndroidComix.onChapterDetected(chText, window.location.href);
+                  }
+                }
+                report();
+
+                if (!window.__comixTapZonesInstalled) {
+                  window.__comixTapZonesInstalled = true;
+
+                  var TAP_MAX_MOVE  = 14;   
+                  var TAP_MAX_TIME  = 350;  
+                  var TAP_DEBOUNCE  = 180;  
+
+                  var startX = 0, startY = 0, startT = 0, lastTapEnd = 0;
+                  var moved = false;
+
+                  function isIgnored(target) {
+                    if (!target || !target.closest) return false;
+                    return !!target.closest(
+                      'a, button, input, textarea, select, ' +
+                      '.rpage-modal, .rpage-chaplist, .rpage-settings, ' +
+                      '.rpage-chappanel, .rpage-cmpanel, [role="dialog"]'
+                    );
+                  }
+
+                  function handleTap(x, y) {
+                    var now = Date.now();
+                    if (now - lastTapEnd < TAP_DEBOUNCE) return;
+                    lastTapEnd = now;
+
+                    var w = window.innerWidth;
+                    var h = window.innerHeight;
+                    
+                    var isAtBottom = false;
+                    var scrollContainer = document.querySelector('.rpage-main') || document.querySelector('.rpage-main--long-strip');
+                    
+                    try {
+                        if (scrollContainer && scrollContainer.scrollHeight > scrollContainer.clientHeight) {
+                            isAtBottom = (scrollContainer.scrollTop + scrollContainer.clientHeight) >= (scrollContainer.scrollHeight - 150);
+                        } else {
+                            var scrollPos = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
+                            var docHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+                            isAtBottom = (scrollPos + h) >= (docHeight - 150);
+                        }
+                    } catch(e) {}
+
+                    if (x < w * 0.25) {
+                      if (scrollContainer) scrollContainer.scrollBy({ top: -(h * 0.8), behavior: 'smooth' });
+                      window.scrollBy({ top: -(h * 0.8), behavior: 'smooth' });
+                      flashTap(x, y);
+                    } else if (x > w * 0.75) {
+                      if (isAtBottom) {
+                        flashTap(x, y);
+                        if (window.AndroidComix) window.AndroidComix.onTriggerNextChapter();
+                      } else {
+                        if (scrollContainer) scrollContainer.scrollBy({ top: (h * 0.8), behavior: 'smooth' });
+                        window.scrollBy({ top:  (h * 0.8), behavior: 'smooth' });
+                        flashTap(x, y);
+                      }
+                    } else {
+                      if (isAtBottom && y > h * 0.75) {
+                        flashTap(x, y);
+                        if (window.AndroidComix) window.AndroidComix.onTriggerNextChapter();
+                      } else {
+                        if (window.AndroidComix) window.AndroidComix.onTapZone('center');
+                      }
+                    }
+                  }
+
+                  document.addEventListener('touchstart', function(e) {
+                    if (e.touches.length !== 1) return;
+                    var t = e.touches[0];
+                    startX = t.clientX; startY = t.clientY;
+                    startT = Date.now();
+                    moved = false;
+                  }, { passive: true, capture: true });
+
+                  document.addEventListener('touchmove', function(e) {
+                    if (e.touches.length !== 1) return;
+                    var t = e.touches[0];
+                    if (Math.abs(t.clientX - startX) > TAP_MAX_MOVE ||
+                        Math.abs(t.clientY - startY) > TAP_MAX_MOVE) {
+                      moved = true;
+                    }
+                  }, { passive: true, capture: true });
+
+                  document.addEventListener('touchend', function(e) {
+                    if (e.changedTouches.length !== 1) return;
+                    if (moved) return;
+                    var t = e.changedTouches[0];
+                    if (Math.abs(t.clientX - startX) > TAP_MAX_MOVE) return;
+                    if (Math.abs(t.clientY - startY) > TAP_MAX_MOVE) return;
+                    if (Date.now() - startT > TAP_MAX_TIME) return;
+                    if (isIgnored(t.target || e.target)) return;
+                    handleTap(t.clientX, t.clientY);
+                  }, { passive: true, capture: true });
+
+                  document.addEventListener('touchcancel', function() {
+                    moved = true;
+                  }, { passive: true, capture: true });
+
+                  document.addEventListener('click', function(e) {
+                    if ('ontouchstart' in window) return; 
+                    if (isIgnored(e.target)) return;
+                    handleTap(e.clientX, e.clientY);
+                  }, false);
+                }
+
+                if (!window.__comixSoftNavInstalled) {
+                  window.__comixSoftNavInstalled = true;
+                  var relisten = function() {
+                    setTimeout(function() {
+                      try { report(); } catch(e) {}
+                      if (!document.getElementById('cs-reader-style')) {
+                        if (window.__comixReinject) window.__comixReinject();
+                      }
+                    }, 120);
+                  };
+                  window.addEventListener('turbo:initial-updated', relisten);
+                  window.addEventListener('turbo:request-completed', relisten);
+                  window.addEventListener('popstate', relisten);
+                }
+
+                window.__comixReinject = function() {
+                  try {
+                    if (window.AndroidComix && window.AndroidComix.onReaderNeedsReinject) {
+                      window.AndroidComix.onReaderNeedsReinject();
+                    }
+                  } catch(e) {}
+                };
+
+                function flashTap(x, y) {
+                  try {
+                    var dot = document.createElement('div');
+                    dot.style.cssText =
+                      'position:fixed;pointer-events:none;width:56px;height:56px;' +
+                      'border-radius:50%;background:rgba(99,102,241,0.28);z-index:2147483647;' +
+                      'transform:translate(-50%,-50%);transition:opacity .35s,transform .35s;opacity:1';
+                    dot.style.left = x + 'px';
+                    dot.style.top  = y + 'px';
+                    document.body.appendChild(dot);
+                    requestAnimationFrame(function(){
+                      dot.style.opacity = '0';
+                      dot.style.transform = 'translate(-50%,-50%) scale(1.4)';
+                    });
+                    setTimeout(function(){ dot.remove(); }, 450);
+                  } catch(e) {}
+                }
+              } catch(e) {}
+            })();
+            """.trimIndent(), null
+        )
     }
 
-    private fun extractSlug(url: String): String {
+    fun extractSlug(url: String): String {
         val match = Regex("/(?:comic|title)/([^/?#]+)").find(url)
         val slugRaw = match?.groupValues?.get(1) ?: return ""
         return slugRaw.substringBefore("-chapter-").trimEnd('-')
@@ -761,6 +747,7 @@ class ComixReaderDialogFragment : DialogFragment() {
         val prefs = ctx.getSharedPreferences("comix_resume_prefs", Context.MODE_PRIVATE)
         val savedUrl = if (slug.isNotBlank()) prefs.getString(slug, null) else null
 
+        // Silently execute auto-resume for the best UX
         currentChapterUrl = savedUrl ?: url
         
         val numStr = Regex("-chapter-([\\d.]+)").find(currentChapterUrl)?.groupValues?.get(1)
