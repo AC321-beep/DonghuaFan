@@ -7,11 +7,14 @@ import android.graphics.Color
 import android.net.http.SslError
 import android.os.Handler
 import android.os.Looper
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -19,8 +22,6 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import androidx.webkit.WebViewCompat
-import androidx.webkit.WebViewFeature
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.HomePageResponse
@@ -42,10 +43,12 @@ import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Interceptor
 import okhttp3.Response
 import org.json.JSONArray
@@ -191,26 +194,59 @@ class ComixProvider : MainAPI() {
     }
 
     /**
-     * Install the cipher-capture hook BEFORE any page script runs.
-     *
-     * AndroidX WebKit's addDocumentStartJavaScript() guarantees execution at document-start,
-     * which is exactly when Comix's inline cipher script runs. The onPageStarted
-     * evaluateJavascript fallback is kept for devices/WebView builds where the
-     * document-start feature isn't supported (rare — Android 5+ with updated WebView support it).
+     * Fetch a URL synchronously (used from shouldInterceptRequest on a WebView IO thread).
+     * Returns null on any failure so the WebView falls back to its native loader.
      */
-    private fun installCipherHook(webView: WebView) {
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-            runCatching {
-                WebViewCompat.addDocumentStartJavaScript(
-                    webView,
-                    CAPTURE_SCRIPT,
-                    setOf("*")
-                )
+    private fun blockingFetchHtml(url: String): String? {
+        return try {
+            runBlocking(Dispatchers.IO) {
+                withTimeoutOrNull(8_000L) {
+                    runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrNull()
+                }
             }
+        } catch (t: Throwable) {
+            null
         }
-        // Fallback for the unlikely case DOCUMENT_START_SCRIPT isn't supported.
-        // It runs slightly late but at least covers the non-inline-script paths.
-        webView.evaluateJavascript(CAPTURE_SCRIPT, null)
+    }
+
+    /**
+     * Inject the cipher capture hook at the very top of <head>, so that it runs
+     * before any of Comix's own inline/loaded scripts.
+     */
+    private fun injectCipherHookIntoHtml(html: String): String {
+        val script = "<script>${CAPTURE_SCRIPT.replace("</", "<\\/")}</script>"
+        val headOpenIdx = html.indexOf("<head", ignoreCase = true)
+        if (headOpenIdx < 0) return "$script$html"
+        val headCloseIdx = html.indexOf('>', headOpenIdx)
+        if (headCloseIdx < 0) return "$script$html"
+        return html.substring(0, headCloseIdx + 1) + script + html.substring(headCloseIdx + 1)
+    }
+
+    /**
+     * Returns a patched WebResourceResponse for the initial HTML document of comix.to,
+     * or null to let WebView handle the request normally (challenges, sub-resources, etc).
+     */
+    private fun buildPatchedMainFrameResponse(request: WebResourceRequest): WebResourceResponse? {
+        val url = request.url?.toString() ?: return null
+        if (!request.isForMainFrame) return null
+        if (!url.contains("comix.to", ignoreCase = true)) return null
+        if (isCloudflareInternalUrl(url)) return null
+
+        val html = blockingFetchHtml(url) ?: return null
+        // If the fetch got a CF interstitial, hand it back to the WebView so the
+        // user/native challenge solver can deal with it.
+        if (isCloudflareChallenge(html)) return null
+
+        val patched = injectCipherHookIntoHtml(html)
+        // We intentionally omit headers (no CSP) so our inline <script> always runs.
+        return WebResourceResponse(
+            "text/html",
+            "UTF-8",
+            200,
+            "OK",
+            emptyMap(),
+            patched.byteInputStream(Charsets.UTF_8)
+        )
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -264,16 +300,22 @@ class ComixProvider : MainAPI() {
                     }
                 }, "ComixCipherBridge")
 
-                // KEY FIX: install hook at document-start, before loadUrl() below.
-                installCipherHook(this)
-
                 webViewClient = object : WebViewClient() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: WebView?, h: SslErrorHandler?, error: SslError?) {
                         h?.proceed()
                     }
+
+                    override fun shouldInterceptRequest(
+                        view: WebView?,
+                        request: WebResourceRequest?
+                    ): WebResourceResponse? {
+                        if (request == null) return null
+                        return runCatching { buildPatchedMainFrameResponse(request) }.getOrNull()
+                    }
+
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                        // Redundant safety re-inject (cheap).
+                        // Safety net in case shouldInterceptRequest didn't fire (redirects, etc.)
                         view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                     }
                     override fun onPageFinished(view: WebView?, url: String?) {
@@ -323,7 +365,6 @@ class ComixProvider : MainAPI() {
                         cleanup(true)
                         return
                     }
-
                     handler.postDelayed(this, 400L)
                 }
             }
@@ -376,10 +417,9 @@ class ComixProvider : MainAPI() {
             }
 
             val finalPageLoaded = AtomicBoolean(false)
-            // Hard sub-deadline for cipher acquisition once the page is fully loaded.
-            // Prevents the "Generating session keys..." screen from hanging forever.
-            val cipherDeadlineAt = AtomicBoolean(false) // set to true once we've waited long enough
-            var cipherDeadlineRunnable: Runnable? = null
+            // After this flips to true, we stop waiting for cipher material and let the
+            // dialog close anyway. Prevents the "Generating session keys..." hang.
+            val cipherDeadlineHit = AtomicBoolean(false)
 
             val webView = WebView(activity).apply {
                 layoutParams = LinearLayout.LayoutParams(
@@ -418,10 +458,8 @@ class ComixProvider : MainAPI() {
                     val noChallengeNeeded = finalPageLoaded.get() && onTarget && titleReady
 
                     if (passedChallenge || noChallengeNeeded) {
-                        // If cipher isn't needed, or we already have it, or we've waited long
-                        // enough for cipher material, close with success.
                         val cipherRequirementSatisfied =
-                            !waitForCipher || cipher != null || cipherDeadlineAt.get()
+                            !waitForCipher || cipher != null || cipherDeadlineHit.get()
 
                         if (cipherRequirementSatisfied) {
                             header.text = "Success! Loading..."
@@ -445,9 +483,6 @@ class ComixProvider : MainAPI() {
                     }
                 }, "ComixCipherBridge")
 
-                // KEY FIX: install hook before loadUrl() below.
-                installCipherHook(this)
-
                 webChromeClient = object : WebChromeClient() {
                     override fun onProgressChanged(view: WebView?, newProgress: Int) {
                         progressBar.progress = newProgress
@@ -461,6 +496,15 @@ class ComixProvider : MainAPI() {
                     override fun onReceivedSslError(view: WebView?, h: SslErrorHandler?, error: SslError?) {
                         h?.proceed()
                     }
+
+                    override fun shouldInterceptRequest(
+                        view: WebView?,
+                        request: WebResourceRequest?
+                    ): WebResourceResponse? {
+                        if (request == null) return null
+                        return runCatching { buildPatchedMainFrameResponse(request) }.getOrNull()
+                    }
+
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                         view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                     }
@@ -479,13 +523,8 @@ class ComixProvider : MainAPI() {
 
             dialog.show()
 
-            // Give the cipher 6 seconds after the page finishes loading.
-            cipherDeadlineRunnable = Runnable {
-                cipherDeadlineAt.set(true)
-                // Re-run checkStatus to close the dialog if the page is already loaded.
-                runCatching { webView.evaluateJavascript("void 0", null) }
-            }
-            handler.postDelayed(cipherDeadlineRunnable!!, 6_000L)
+            // 6 s after the page starts, stop waiting for cipher even if it never arrived.
+            handler.postDelayed({ cipherDeadlineHit.set(true) }, 6_000L)
 
             webView.loadUrl(mainUrl)
 
