@@ -71,7 +71,6 @@ class ComixReaderDialogFragment : DialogFragment() {
             }
         }
 
-        // --- Extracted JavaScript Constants for cleaner code ---
         private val SCRIPT_NEXT_CHAPTER = """
             (function() {
               try {
@@ -370,7 +369,6 @@ class ComixReaderDialogFragment : DialogFragment() {
         super.onStart()
         dialog?.window?.apply {
             setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-            // Replaced magic number 5380 with proper Immersive flags
             decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                     or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                     or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
@@ -381,7 +379,6 @@ class ComixReaderDialogFragment : DialogFragment() {
     }
 
     override fun onDestroyView() {
-        // Prevent memory leaks by strictly separating WebView from Parent and removing interfaces
         webView?.apply {
             (parent as? ViewGroup)?.removeView(this)
             removeJavascriptInterface("AndroidComix")
@@ -434,7 +431,6 @@ class ComixReaderDialogFragment : DialogFragment() {
             isVerticalScrollBarEnabled = true
             isHorizontalScrollBarEnabled = false
             
-            // Enable hardware acceleration for smooth manga image scrolling
             setLayerType(View.LAYER_TYPE_HARDWARE, null)
 
             settings.apply {
@@ -446,14 +442,11 @@ class ComixReaderDialogFragment : DialogFragment() {
                 builtInZoomControls = true
                 displayZoomControls = false
                 setSupportZoom(true)
-                cacheMode = WebSettings.LOAD_DEFAULT
+                cacheMode = android.webkit.WebSettings.LOAD_DEFAULT // Correctly Patched
                 mediaPlaybackRequiresUserGesture = false
                 
-                if (CFState.userAgent.isNotBlank()) {
-                    userAgentString = CFState.userAgent
-                } else {
-                    CFState.userAgent = userAgentString
-                }
+                // Directly applies the cached, synchronized User Agent computed from ComixProvider.kt
+                userAgentString = CFState.userAgent 
             }
 
             addJavascriptInterface(ComixJsBridge(this@ComixReaderDialogFragment), "AndroidComix")
@@ -766,7 +759,6 @@ class ComixReaderDialogFragment : DialogFragment() {
         val prefs = ctx.getSharedPreferences("comix_resume_prefs", Context.MODE_PRIVATE)
         val savedUrl = if (slug.isNotBlank()) prefs.getString(slug, null) else null
 
-        // Silently execute auto-resume for the best UX
         currentChapterUrl = savedUrl ?: url
         
         val numStr = Regex("-chapter-([\\d.]+)").find(currentChapterUrl)?.groupValues?.get(1)
