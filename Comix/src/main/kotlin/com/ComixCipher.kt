@@ -40,7 +40,6 @@ class ComixCipher(material: CipherMaterial) {
     private val sboxes: List<IntArray> = material.sboxes.map { it.toIntArray() }
     private val keys: List<IntArray> = material.keys.map { it.toIntArray() }
     
-    // 🚀 OPTIMIZATION: Pre-calculate the inverse S-boxes once upon object creation.
     private val invSboxes: List<IntArray> = sboxes.map { sbox ->
         IntArray(256).apply {
             for (i in sbox.indices) {
@@ -73,7 +72,6 @@ class ComixCipher(material: CipherMaterial) {
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
         )
         for (round in 2 downTo 0) {
-            // Pass the pre-calculated invSbox here instead of the standard sbox
             data = substituteInverse(data, invSboxes[round], keys[round], PREVIOUS[round])
         }
         return data.toString(Charsets.UTF_8)
