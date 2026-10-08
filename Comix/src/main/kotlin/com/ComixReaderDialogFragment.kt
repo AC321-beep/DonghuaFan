@@ -182,7 +182,7 @@ class ComixReaderDialogFragment : DialogFragment() {
                 setSupportZoom(true)
                 cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
                 mediaPlaybackRequiresUserGesture = false
-                
+
                 if (CFState.userAgent.isNotBlank()) {
                     userAgentString = CFState.userAgent
                 } else {
@@ -220,7 +220,6 @@ class ComixReaderDialogFragment : DialogFragment() {
                         currentChapterName = "Ch. $numStr"
                         chapterInfoTextView?.text = currentChapterName
 
-                        // Save the exact chapter URL to SharedPreferences for Auto-Resume
                         val slug = extractSlug(url)
                         if (slug.isNotBlank()) {
                             view.context.getSharedPreferences("comix_resume_prefs", Context.MODE_PRIVATE)
@@ -588,9 +587,9 @@ class ComixReaderDialogFragment : DialogFragment() {
                 if (!window.__comixTapZonesInstalled) {
                   window.__comixTapZonesInstalled = true;
 
-                  var TAP_MAX_MOVE  = 14;   
-                  var TAP_MAX_TIME  = 350;  
-                  var TAP_DEBOUNCE  = 180;  
+                  var TAP_MAX_MOVE  = 14;
+                  var TAP_MAX_TIME  = 350;
+                  var TAP_DEBOUNCE  = 180;
 
                   var startX = 0, startY = 0, startT = 0, lastTapEnd = 0;
                   var moved = false;
@@ -611,10 +610,10 @@ class ComixReaderDialogFragment : DialogFragment() {
 
                     var w = window.innerWidth;
                     var h = window.innerHeight;
-                    
+
                     var isAtBottom = false;
                     var scrollContainer = document.querySelector('.rpage-main') || document.querySelector('.rpage-main--long-strip');
-                    
+
                     try {
                         if (scrollContainer && scrollContainer.scrollHeight > scrollContainer.clientHeight) {
                             isAtBottom = (scrollContainer.scrollTop + scrollContainer.clientHeight) >= (scrollContainer.scrollHeight - 150);
@@ -681,7 +680,7 @@ class ComixReaderDialogFragment : DialogFragment() {
                   }, { passive: true, capture: true });
 
                   document.addEventListener('click', function(e) {
-                    if ('ontouchstart' in window) return; 
+                    if ('ontouchstart' in window) return;
                     if (isIgnored(e.target)) return;
                     handleTap(e.clientX, e.clientY);
                   }, false);
@@ -741,15 +740,14 @@ class ComixReaderDialogFragment : DialogFragment() {
 
     fun loadUrlDirectly(name: String, url: String) {
         if (url.isBlank()) return
-        
+
         val ctx = webView?.context ?: return
         val slug = extractSlug(url)
         val prefs = ctx.getSharedPreferences("comix_resume_prefs", Context.MODE_PRIVATE)
         val savedUrl = if (slug.isNotBlank()) prefs.getString(slug, null) else null
 
-        // Silently execute auto-resume for the best UX
         currentChapterUrl = savedUrl ?: url
-        
+
         val numStr = Regex("-chapter-([\\d.]+)").find(currentChapterUrl)?.groupValues?.get(1)
         currentChapterName = if (numStr != null) "Ch. $numStr" else name
         chapterInfoTextView?.text = currentChapterName.ifBlank { "Chapter" }
