@@ -5,7 +5,6 @@ import android.app.Dialog
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
-import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.net.http.SslError
 import android.os.Build
@@ -241,13 +240,14 @@ class ComixProvider : MainAPI() {
             val handler = Handler(Looper.getMainLooper())
             var checkRunnable: Runnable? = null
             var timeoutRunnable: Runnable? = null
+            var reloaded = false
 
             val webView = WebView(activity).apply {
                 layoutParams = ViewGroup.LayoutParams(
                     activity.resources.displayMetrics.widthPixels,
                     activity.resources.displayMetrics.heightPixels
                 )
-                translationX = 20000f // Off-screen rendering
+                translationX = 20000f 
                 setLayerType(View.LAYER_TYPE_HARDWARE, null)
                 setupBypassWebView(this)
 
@@ -291,13 +291,19 @@ class ComixProvider : MainAPI() {
                     if (done.get()) return
                     
                     val title = webView.title?.lowercase() ?: ""
-                    val challengeWords = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt")
+                    val challengeWords = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt", "checking your browser")
                     val isChallenge = challengeWords.any { title.contains(it) }
 
-                    // DYNAMIC FIX: No longer blindly relying on cf_clearance cookie.
-                    // If the page loaded and isn't a challenge page, it's successful!
                     if (title.isNotBlank() && !isChallenge) {
-                        if (!waitForCipher || cipher != null) {
+                        if (waitForCipher) {
+                            if (cipher != null) {
+                                cleanup(true)
+                                return
+                            } else if (!reloaded) {
+                                reloaded = true
+                                webView.reload()
+                            }
+                        } else {
                             cleanup(true)
                             return
                         }
@@ -326,6 +332,8 @@ class ComixProvider : MainAPI() {
             
             val done = AtomicBoolean(false)
             val handler = Handler(Looper.getMainLooper())
+            var escapeHatchTriggered = false
+            
             val density = activity.resources.displayMetrics.density
             fun dp(v: Int) = (v * density).toInt()
 
@@ -373,7 +381,7 @@ class ComixProvider : MainAPI() {
             dialogBox.addView(statusText)
 
             val webView = WebView(activity).apply {
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1) // Initially hidden
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1) 
                 alpha = 0f
                 setBackgroundColor(Color.parseColor("#121212"))
                 setupBypassWebView(this)
@@ -398,11 +406,10 @@ class ComixProvider : MainAPI() {
                 if (done.get()) return
                 val title = view?.title?.lowercase() ?: ""
                 
-                val challengeWords = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt")
+                val challengeWords = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt", "checking your browser")
                 val isChallenge = challengeWords.any { title.contains(it) }
 
                 if (isChallenge) {
-                    // Show WebView because it's a Cloudflare challenge
                     if (webView.alpha == 0f) {
                         webView.alpha = 1f
                         webView.layoutParams.height = dp(400)
@@ -410,7 +417,6 @@ class ComixProvider : MainAPI() {
                         statusText.text = "Please complete the challenge below..."
                     }
                 } else if (title.isNotBlank() && !isChallenge) {
-                    // Collapse WebView instantly so user never sees the loaded website trapped in the popup
                     if (webView.layoutParams.height != 1) {
                         webView.layoutParams.height = 1
                         webView.alpha = 0f
@@ -423,8 +429,12 @@ class ComixProvider : MainAPI() {
                         progressBar.visibility = View.GONE
                         handler.postDelayed({ finish(true) }, 600)
                     } else {
-                        statusText.text = "Generating session keys... Please wait"
+                        statusText.text = "Finalizing secure connection..."
                         statusText.setTextColor(Color.parseColor("#FFC107"))
+                        if (!escapeHatchTriggered) {
+                            escapeHatchTriggered = true
+                            handler.postDelayed({ finish(true) }, 2000) 
+                        }
                     }
                 }
             }
@@ -477,15 +487,26 @@ class ComixProvider : MainAPI() {
                 if (!done.get() && dialog.isShowing) {
                     dialog.dismiss() 
                 }
-            }, 45_000L)
+            }, 30_000L)
         }
     }
 
-    private suspend fun resolveCloudflareAndCipher(waitForCipher: Boolean): Boolean {
+    private suspend fun resolveCloudflareAndCipher(waitForCipher: Boolean): Boolean = cfMutex.withLock {
+        val hasCipher = cipher != null
+        if (waitForCipher && hasCipher) return true
+
         val activity = CommonActivity.activity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
-        if (attemptSilentResolution(activity, waitForCipher)) return true
-        return attemptInteractiveResolution(activity, waitForCipher)
+        
+        val silentSuccess = attemptSilentResolution(activity, waitForCipher)
+        if (silentSuccess) return true
+
+        val checkHtml = runCatching { app.get(mainUrl, interceptor = cfInterceptor).text }.getOrNull() ?: ""
+        if (isCloudflareChallenge(checkHtml)) {
+            return attemptInteractiveResolution(activity, waitForCipher)
+        }
+        
+        return false
     }
 
     private fun isCloudflareChallenge(html: String): Boolean {
@@ -495,13 +516,9 @@ class ComixProvider : MainAPI() {
     }
 
     private suspend fun fetchHtml(url: String): String {
-        // DYNAMIC FIX: Try OkHttp immediately without forcing the Cloudflare logic first. 
-        // If Cloudflare is off, this succeeds instantly and bypasses all the heavy dialogs.
         var response = app.get(url, interceptor = cfInterceptor).text
-        
         if (isCloudflareChallenge(response)) {
             cfMutex.withLock {
-                // Check again in case another coroutine just solved it while we waited for the lock
                 response = app.get(url, interceptor = cfInterceptor).text
                 if (isCloudflareChallenge(response)) {
                     resolveCloudflareAndCipher(waitForCipher = false)
@@ -567,9 +584,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Data Parsing Helpers
-    // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
             is Document -> htmlOrDoc
@@ -685,9 +699,6 @@ class ComixProvider : MainAPI() {
         return itemCount >= 28
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Main Page & Pagination
-    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
