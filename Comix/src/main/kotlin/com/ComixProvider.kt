@@ -171,10 +171,27 @@ class ComixProvider : MainAPI() {
         return headers
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Cloudflare & Cipher Resolver (ONLY UI AND BYPASS CONDITIONS UPDATED)
-    // ═══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
+    private fun setupBypassWebView(webView: WebView) {
+        webView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            useWideViewPort = true
+            loadWithOverviewMode = true
+            cacheMode = WebSettings.LOAD_DEFAULT
+            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            mediaPlaybackRequiresUserGesture = false 
+            
+            if (CFState.userAgent.isBlank()) {
+                CFState.userAgent = userAgentString
+            } else {
+                userAgentString = CFState.userAgent
+            }
+        }
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+    }
+
     private suspend fun attemptSilentResolution(activity: android.app.Activity, waitForCipher: Boolean): Boolean = withContext(Dispatchers.Main) {
         val decor = activity.window?.decorView as? ViewGroup ?: return@withContext false
 
@@ -190,25 +207,7 @@ class ComixProvider : MainAPI() {
                     activity.resources.displayMetrics.heightPixels
                 )
                 translationX = 20000f // Off-screen rendering
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    useWideViewPort = true
-                    loadWithOverviewMode = true
-                    cacheMode = WebSettings.LOAD_DEFAULT
-                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    mediaPlaybackRequiresUserGesture = false 
-                    
-                    // Critical Fix: Sync exact UA to prevent Cloudflare Fingerprint rejection mid-session
-                    if (CFState.userAgent.isBlank()) {
-                        CFState.userAgent = userAgentString
-                    } else {
-                        userAgentString = CFState.userAgent
-                    }
-                }
-
-                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                setupBypassWebView(this)
 
                 addJavascriptInterface(object {
                     @JavascriptInterface
@@ -251,20 +250,12 @@ class ComixProvider : MainAPI() {
                     if (done.get()) return
                     val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
                     val title = webView.title?.lowercase() ?: ""
-                    val isChallenge = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt").any { title.contains(it) }
+                    val isChallenge = listOf("just a moment", "attention required", "security verification", "cloudflare").any { title.contains(it) }
 
-                    // Better success detection so it doesn't wait indefinitely
-                    if (!isChallenge && title.isNotBlank()) {
-                        if (waitForCipher) {
-                            if (cipher != null) {
-                                cleanup(true)
-                                return
-                            }
-                        } else {
-                            if (cookies.contains("cf_clearance") || title.contains("comix") || title.contains("read manga")) {
-                                cleanup(true)
-                                return
-                            }
+                    if (!isChallenge && cookies.contains("cf_clearance")) {
+                        if (!waitForCipher || cipher != null) {
+                            cleanup(true)
+                            return
                         }
                     }
                     handler.postDelayed(this, 500L)
@@ -283,7 +274,6 @@ class ComixProvider : MainAPI() {
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun attemptInteractiveResolution(activity: android.app.Activity, waitForCipher: Boolean): Boolean = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
-            // Replaced black full-screen with Translucent floating Dialog
             val dialog = Dialog(activity, android.R.style.Theme_Translucent_NoTitleBar).apply {
                 setCancelable(true)
                 setCanceledOnTouchOutside(false)
@@ -346,34 +336,16 @@ class ComixProvider : MainAPI() {
             }
 
             val webView = WebView(activity).apply {
-                // Instantly hiding the webview fixes the website being trapped inside the popup issue.
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1) // Hidden initially
                 alpha = 0f
                 setBackgroundColor(Color.parseColor("#121212"))
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    useWideViewPort = true
-                    loadWithOverviewMode = true
-                    cacheMode = WebSettings.LOAD_DEFAULT
-                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    mediaPlaybackRequiresUserGesture = false 
-                    
-                    if (CFState.userAgent.isBlank()) {
-                        CFState.userAgent = userAgentString
-                    } else {
-                        userAgentString = CFState.userAgent
-                    }
-                }
-                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                setupBypassWebView(this)
 
                 fun checkStatus(view: WebView?) {
                     if (done.get()) return
                     val title = view?.title?.lowercase() ?: ""
                     val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
-                    val challengeWords = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt")
-                    val isChallenge = challengeWords.any { title.contains(it) }
+                    val isChallenge = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt").any { title.contains(it) }
 
                     if (isChallenge) {
                         if (alpha == 0f) {
@@ -383,7 +355,7 @@ class ComixProvider : MainAPI() {
                             statusText.text = "Please complete the challenge below..."
                         }
                     } else if (title.isNotBlank()) {
-                        // Site successfully loaded, instantly hide the website so the user doesn't see it trapped
+                        // Collapse WebView instantly to ensure the user never sees the loaded website trapped in the popup
                         if (layoutParams.height != 1) {
                             layoutParams.height = 1
                             alpha = 0f
@@ -397,11 +369,11 @@ class ComixProvider : MainAPI() {
                                 progressBar.visibility = View.GONE
                                 handler.postDelayed({ finish(true) }, 600)
                             } else {
-                                statusText.text = "Finalizing secure connection..."
+                                statusText.text = "Generating session keys... Please wait"
                                 statusText.setTextColor(Color.parseColor("#FFC107"))
                             }
                         } else {
-                            if (cookies.contains("cf_clearance") || title.contains("comix")) {
+                            if (cookies.contains("cf_clearance") || title.contains("comix") || title.contains("read manga")) {
                                 statusText.text = "Success! Loading..."
                                 statusText.setTextColor(Color.parseColor("#4CAF50"))
                                 progressBar.visibility = View.GONE
@@ -467,29 +439,32 @@ class ComixProvider : MainAPI() {
 
             handler.postDelayed({ 
                 if (!done.get()) {
-                    // Escape hatch to prevent hanging forever
                     if (!waitForCipher || cipher != null) finish(true) else finish(false)
                 }
             }, 30_000L)
         }
     }
 
-    // ORIGINAL LOGIC RETAINED EXACTLY
     private suspend fun resolveCloudflareAndCipher(waitForCipher: Boolean): Boolean {
         val activity = CommonActivity.activity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
+        
         if (attemptSilentResolution(activity, waitForCipher)) return true
-        return attemptInteractiveResolution(activity, waitForCipher)
+        
+        val checkHtml = runCatching { app.get(mainUrl, interceptor = cfInterceptor).text }.getOrNull() ?: ""
+        if (isCloudflareChallenge(checkHtml) || (waitForCipher && cipher == null)) {
+            return attemptInteractiveResolution(activity, waitForCipher)
+        }
+        
+        return false
     }
 
     private fun isCloudflareChallenge(html: String): Boolean {
         val lower = html.lowercase()
-        return lower.contains("just a moment") || 
-               lower.contains("cf-browser-verification") || 
-               lower.contains("turnstile")
+        val challengeWords = listOf("just a moment", "cf-browser-verification", "turnstile", "cf_chl_opt", "checking your browser")
+        return challengeWords.any { lower.contains(it) }
     }
 
-    // ORIGINAL LOGIC RETAINED EXACTLY
     private suspend fun fetchHtml(url: String): String {
         cfMutex.withLock {
             val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
@@ -510,7 +485,6 @@ class ComixProvider : MainAPI() {
         return response
     }
 
-    // ORIGINAL LOGIC RETAINED EXACTLY
     private suspend fun getSigned(path: String, params: Map<String, List<String>>): String? {
         val c = cachedCipher() ?: return null
         return try {
@@ -544,17 +518,25 @@ class ComixProvider : MainAPI() {
                 append("_=").append(URLEncoder.encode(token, "UTF-8"))
             }
 
-            val raw = app.get(
-                encoded,
-                interceptor = cfInterceptor,
-                headers = mapOf(
-                    "Accept" to "application/json, text/plain, */*",
-                    "Referer" to "$mainUrl/",
-                    "Sec-Fetch-Dest" to "empty",
-                    "Sec-Fetch-Mode" to "cors",
-                    "Sec-Fetch-Site" to "same-origin"
-                )
-            ).text
+            val headers = mapOf(
+                "Accept" to "application/json, text/plain, */*",
+                "Referer" to "$mainUrl/",
+                "Sec-Fetch-Dest" to "empty",
+                "Sec-Fetch-Mode" to "cors",
+                "Sec-Fetch-Site" to "same-origin"
+            )
+
+            var raw = app.get(encoded, interceptor = cfInterceptor, headers = headers).text
+            
+            if (isCloudflareChallenge(raw)) {
+                cfMutex.withLock {
+                    raw = app.get(encoded, interceptor = cfInterceptor, headers = headers).text
+                    if (isCloudflareChallenge(raw)) {
+                        resolveCloudflareAndCipher(waitForCipher = false)
+                        raw = app.get(encoded, interceptor = cfInterceptor, headers = headers).text
+                    }
+                }
+            }
 
             val root = runCatching { JSONObject(raw) }.getOrNull() ?: return null
             if (root.has("e")) {
@@ -566,9 +548,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Data Parsing Helpers (ORIGINAL RETAINED EXACTLY)
-    // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
             is Document -> htmlOrDoc
@@ -684,7 +663,6 @@ class ComixProvider : MainAPI() {
         return itemCount >= 28
     }
 
-    // ORIGINAL LOGIC RETAINED EXACTLY
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
@@ -709,7 +687,6 @@ class ComixProvider : MainAPI() {
 
     private data class PageResult(val items: List<SearchResponse>, val hasNext: Boolean)
 
-    // ORIGINAL LOGIC RETAINED EXACTLY
     private suspend fun fetchQueryPage(request: MainPageRequest, page: Int): PageResult? {
         val params: Map<String, List<String>> = when (request.data) {
             "hot" -> mapOf("scope" to listOf("hot"), "page" to listOf(page.toString()), "order[chapter_updated_at]" to listOf("desc"), "limit" to listOf("28"))
@@ -784,7 +761,6 @@ class ComixProvider : MainAPI() {
         return items
     }
 
-    // ORIGINAL LOGIC RETAINED EXACTLY
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
@@ -950,5 +926,52 @@ class ComixProvider : MainAPI() {
             )
         }
         return true
+    }
+
+    companion object {
+        const val CAPTURE_SCRIPT = """
+            (function () {
+                if (window.__comixCipherHook) return;
+                window.__comixCipherHook = true;
+                
+                var captures = window.__comixCipherCaptures = [];
+                var seen = window.__comixSeenLengths = {};
+                var originalAtob = window.atob;
+
+                var stealthAtob = function (value) {
+                    var decoded = originalAtob.call(window, value);
+                    try {
+                        var len = decoded.length;
+                        var key = 'L' + len;
+                        if (!seen[key]) { seen[key] = true; }
+                        
+                        if (len === 256 || len === 24 || len === 32) {
+                            var bytes = new Array(len);
+                            for (var i = 0; i < len; i++) bytes[i] = decoded.charCodeAt(i) & 255;
+                            captures.push(bytes);
+                            
+                            var sboxes = captures.filter(function (x) { return x.length === 256; }).slice(0, 3);
+                            var keys   = captures.filter(function (x) { return x.length === 24 || x.length === 32; }).slice(0, 3);
+                            if (sboxes.length === 3 && keys.length === 3) {
+                                try { ComixCipherBridge.submit(JSON.stringify({ sboxes: sboxes, keys: keys })); } catch (e) {}
+                            }
+                        }
+                    } catch (e) {}
+                    return decoded;
+                };
+
+                var origFpToString = Function.prototype.toString;
+                Function.prototype.toString = function () {
+                    if (this === stealthAtob) return 'function atob() { [native code] }';
+                    return origFpToString.call(this);
+                };
+
+                Object.defineProperty(window, 'atob', {
+                    value: stealthAtob,
+                    writable: true,
+                    configurable: true
+                });
+            })();
+        """
     }
 }
