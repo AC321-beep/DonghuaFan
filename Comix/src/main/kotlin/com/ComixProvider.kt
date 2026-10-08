@@ -5,7 +5,10 @@ import android.app.Dialog
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
 import android.net.http.SslError
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
@@ -18,6 +21,7 @@ import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -105,11 +109,7 @@ const val CAPTURE_SCRIPT = """
 """
 
 object CFState {
-    val userAgent: String by lazy {
-        runCatching {
-            WebSettings.getDefaultUserAgent(CommonActivity.activity)
-        }.getOrNull() ?: "Mozilla/5.0 (Linux; Android 13; SM-G991U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
-    }
+    var userAgent: String = ""
 }
 
 class CFInterceptor : Interceptor {
@@ -117,7 +117,14 @@ class CFInterceptor : Interceptor {
         val original = chain.request()
         val builder = original.newBuilder()
 
-        builder.header("User-Agent", CFState.userAgent)
+        val defaultUa = try {
+            WebSettings.getDefaultUserAgent(CommonActivity.activity)
+        } catch (e: Exception) {
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        }
+        val ua = CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa
+        builder.header("User-Agent", ua)
+        
         builder.removeHeader("X-Requested-With")
 
         val cookies = CookieManager.getInstance().getCookie(original.url.toString())
@@ -198,9 +205,10 @@ class ComixProvider : MainAPI() {
     }
 
     private fun getPosterHeaders(): Map<String, String> {
+        val defaultUa = try { WebSettings.getDefaultUserAgent(CommonActivity.activity) } catch(e: Exception) { "Mozilla/5.0" }
         val headers = mutableMapOf(
             "Referer" to "$mainUrl/",
-            "User-Agent" to CFState.userAgent
+            "User-Agent" to (CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa)
         )
         val cookies = CookieManager.getInstance().getCookie(mainUrl)
         if (!cookies.isNullOrEmpty()) {
@@ -220,7 +228,7 @@ class ComixProvider : MainAPI() {
             cacheMode = WebSettings.LOAD_DEFAULT
             mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             mediaPlaybackRequiresUserGesture = false 
-            userAgentString = CFState.userAgent
+            userAgentString = CFState.userAgent.ifBlank { userAgentString }
         }
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
     }
@@ -239,7 +247,7 @@ class ComixProvider : MainAPI() {
                     activity.resources.displayMetrics.widthPixels,
                     activity.resources.displayMetrics.heightPixels
                 )
-                translationX = 20000f 
+                translationX = 20000f // Off-screen rendering
                 setLayerType(View.LAYER_TYPE_HARDWARE, null)
                 setupBypassWebView(this)
 
@@ -286,20 +294,12 @@ class ComixProvider : MainAPI() {
                     val challengeWords = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt")
                     val isChallenge = challengeWords.any { title.contains(it) }
 
-                    // Only declare success if we are NOT on a challenge page
-                    if (!isChallenge) {
-                        if (waitForCipher) {
-                            if (cipher != null) {
-                                cleanup(true)
-                                return
-                            }
-                        } else {
-                            val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
-                            // Site successfully loaded
-                            if (cookies.contains("cf_clearance") || title.contains("comix") || title.contains("read manga") || cipher != null) {
-                                cleanup(true)
-                                return
-                            }
+                    // DYNAMIC FIX: No longer blindly relying on cf_clearance cookie.
+                    // If the page loaded and isn't a challenge page, it's successful!
+                    if (title.isNotBlank() && !isChallenge) {
+                        if (!waitForCipher || cipher != null) {
+                            cleanup(true)
+                            return
                         }
                     }
                     handler.postDelayed(this, 500L)
@@ -319,72 +319,73 @@ class ComixProvider : MainAPI() {
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun attemptInteractiveResolution(activity: android.app.Activity, waitForCipher: Boolean): Boolean = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
-            val dialog = Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
+            val dialog = Dialog(activity, android.R.style.Theme_Translucent_NoTitleBar).apply {
                 setCancelable(true) 
                 setCanceledOnTouchOutside(false)
             }
             
             val done = AtomicBoolean(false)
             val handler = Handler(Looper.getMainLooper())
+            val density = activity.resources.displayMetrics.density
+            fun dp(v: Int) = (v * density).toInt()
 
-            val rootLayout = LinearLayout(activity).apply {
-                orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.parseColor("#121212")) 
+            val dimContainer = FrameLayout(activity).apply {
+                setBackgroundColor(Color.parseColor("#B3000000"))
+                layoutParams = ViewGroup.LayoutParams(-1, -1)
             }
 
-            val topBar = LinearLayout(activity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                setPadding(48, 48, 48, 48)
-                setBackgroundColor(Color.parseColor("#1E1E1E"))
-                gravity = Gravity.CENTER_VERTICAL
+            val dialogBox = LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                background = GradientDrawable().apply {
+                    setColor(Color.parseColor("#121212"))
+                    cornerRadius = dp(16).toFloat()
+                }
+                layoutParams = FrameLayout.LayoutParams(-1, -2).apply {
+                    gravity = Gravity.CENTER
+                    setMargins(dp(32), dp(24), dp(32), dp(24))
+                }
+                if (Build.VERSION.SDK_INT >= 21) clipToOutline = true
             }
 
             val header = TextView(activity).apply {
                 text = "Security Verification"
                 setTextColor(Color.WHITE)
-                textSize = 18f
+                textSize = 16f
                 typeface = Typeface.DEFAULT_BOLD
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                setPadding(dp(20), dp(16), dp(20), dp(16))
+                setBackgroundColor(Color.parseColor("#1A1A1A"))
             }
-
-            val closeBtn = TextView(activity).apply {
-                text = "✕"
-                setTextColor(Color.parseColor("#AAAAAA"))
-                textSize = 24f
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(24, 8, 8, 8)
-                setOnClickListener { dialog.cancel() }
-            }
-
-            topBar.addView(header)
-            topBar.addView(closeBtn)
-            rootLayout.addView(topBar)
+            dialogBox.addView(header)
 
             val progressBar = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 8)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(4))
                 isIndeterminate = false
             }
-            rootLayout.addView(progressBar)
+            dialogBox.addView(progressBar)
 
             val statusText = TextView(activity).apply {
-                text = "Please complete the challenge below to continue..."
-                setTextColor(Color.parseColor("#B0B0B0"))
+                text = "Loading challenge..."
+                setTextColor(Color.parseColor("#A0A0A0"))
                 textSize = 14f
-                setPadding(48, 32, 48, 16)
+                gravity = Gravity.CENTER
+                setPadding(dp(16), dp(24), dp(16), dp(16))
             }
-            rootLayout.addView(statusText)
+            dialogBox.addView(statusText)
 
             val webView = WebView(activity).apply {
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1) // Initially hidden
+                alpha = 0f
+                setBackgroundColor(Color.parseColor("#121212"))
                 setupBypassWebView(this)
             }
-            rootLayout.addView(webView)
+            dialogBox.addView(webView)
+            dimContainer.addView(dialogBox)
 
             fun finish(success: Boolean) {
                 if (!done.compareAndSet(false, true)) return
                 CookieManager.getInstance().flush()
                 runCatching {
-                    rootLayout.removeView(webView)
+                    dialogBox.removeView(webView)
                     webView.stopLoading()
                     webView.loadUrl("about:blank")
                     webView.destroy()
@@ -400,26 +401,30 @@ class ComixProvider : MainAPI() {
                 val challengeWords = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt")
                 val isChallenge = challengeWords.any { title.contains(it) }
 
-                // The site actually loaded successfully, process conditions:
-                if (!isChallenge) {
-                    if (waitForCipher) {
-                        if (cipher != null) {
-                            statusText.text = "Success! Content secured..."
-                            statusText.setTextColor(Color.parseColor("#4CAF50"))
-                            progressBar.visibility = View.GONE
-                            handler.postDelayed({ finish(true) }, 600)
-                        } else {
-                            statusText.text = "Generating secure session keys... Please wait"
-                            statusText.setTextColor(Color.parseColor("#FFC107"))
-                        }
+                if (isChallenge) {
+                    // Show WebView because it's a Cloudflare challenge
+                    if (webView.alpha == 0f) {
+                        webView.alpha = 1f
+                        webView.layoutParams.height = dp(400)
+                        webView.requestLayout()
+                        statusText.text = "Please complete the challenge below..."
+                    }
+                } else if (title.isNotBlank() && !isChallenge) {
+                    // Collapse WebView instantly so user never sees the loaded website trapped in the popup
+                    if (webView.layoutParams.height != 1) {
+                        webView.layoutParams.height = 1
+                        webView.alpha = 0f
+                        webView.requestLayout()
+                    }
+
+                    if (!waitForCipher || cipher != null) {
+                        statusText.text = "Success! Loading..."
+                        statusText.setTextColor(Color.parseColor("#4CAF50"))
+                        progressBar.visibility = View.GONE
+                        handler.postDelayed({ finish(true) }, 600)
                     } else {
-                        val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
-                        if (cookies.contains("cf_clearance") || title.contains("comix") || title.contains("read manga") || cipher != null) {
-                            statusText.text = "Success! Loading content..."
-                            statusText.setTextColor(Color.parseColor("#4CAF50"))
-                            progressBar.visibility = View.GONE
-                            handler.postDelayed({ finish(true) }, 600)
-                        }
+                        statusText.text = "Generating session keys... Please wait"
+                        statusText.setTextColor(Color.parseColor("#FFC107"))
                     }
                 }
             }
@@ -452,45 +457,57 @@ class ComixProvider : MainAPI() {
                 override fun onPageFinished(view: WebView?, url: String?) { checkStatus(view) }
             }
 
-            dialog.setOnCancelListener { if (!done.get()) finish(false) }
-            dialog.setOnDismissListener { if (!done.get()) finish(false) }
-
-            dialog.setContentView(rootLayout)
-            dialog.show()
+            dialog.setContentView(dimContainer)
             
+            dialog.setOnDismissListener { 
+                if (!done.get()) {
+                    runCatching {
+                        dialogBox.removeView(webView)
+                        webView.stopLoading()
+                        webView.destroy()
+                    }
+                    if (cont.isActive) cont.resume(false)
+                }
+            }
+
+            dialog.show()
             webView.loadUrl(mainUrl)
-            handler.postDelayed({ if (!done.get()) finish(false) }, 45_000L)
+
+            handler.postDelayed({ 
+                if (!done.get() && dialog.isShowing) {
+                    dialog.dismiss() 
+                }
+            }, 45_000L)
         }
     }
 
-    private suspend fun resolveCloudflareAndCipher(waitForCipher: Boolean): Boolean = cfMutex.withLock {
-        // Evaluate conditions properly BEFORE spawning webviews
-        val hasCipher = cipher != null
-        if (waitForCipher && hasCipher) return true
-
-        val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
-        val hasClearance = cookies.contains("cf_clearance")
-        if (!waitForCipher && hasClearance) return true
-
+    private suspend fun resolveCloudflareAndCipher(waitForCipher: Boolean): Boolean {
         val activity = CommonActivity.activity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
-        
         if (attemptSilentResolution(activity, waitForCipher)) return true
         return attemptInteractiveResolution(activity, waitForCipher)
     }
 
     private fun isCloudflareChallenge(html: String): Boolean {
         val lower = html.lowercase()
-        val challengeWords = listOf("just a moment", "cf-browser-verification", "turnstile", "cf_chl_opt")
+        val challengeWords = listOf("just a moment", "cf-browser-verification", "turnstile", "cf_chl_opt", "checking your browser")
         return challengeWords.any { lower.contains(it) }
     }
 
     private suspend fun fetchHtml(url: String): String {
+        // DYNAMIC FIX: Try OkHttp immediately without forcing the Cloudflare logic first. 
+        // If Cloudflare is off, this succeeds instantly and bypasses all the heavy dialogs.
         var response = app.get(url, interceptor = cfInterceptor).text
-        // Reactively intercept Cloudflare blocking only if it actually occurs
+        
         if (isCloudflareChallenge(response)) {
-            resolveCloudflareAndCipher(waitForCipher = false)
-            response = app.get(url, interceptor = cfInterceptor).text
+            cfMutex.withLock {
+                // Check again in case another coroutine just solved it while we waited for the lock
+                response = app.get(url, interceptor = cfInterceptor).text
+                if (isCloudflareChallenge(response)) {
+                    resolveCloudflareAndCipher(waitForCipher = false)
+                    response = app.get(url, interceptor = cfInterceptor).text
+                }
+            }
         }
         return response
     }
@@ -550,6 +567,9 @@ class ComixProvider : MainAPI() {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Data Parsing Helpers
+    // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
             is Document -> htmlOrDoc
@@ -665,6 +685,9 @@ class ComixProvider : MainAPI() {
         return itemCount >= 28
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    //  Main Page & Pagination
+    // ═══════════════════════════════════════════════════════════════════════
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
@@ -697,7 +720,11 @@ class ComixProvider : MainAPI() {
         }
 
         if (cachedCipher() == null) {
-            resolveCloudflareAndCipher(waitForCipher = true)
+            cfMutex.withLock {
+                if (cachedCipher() == null) {
+                    resolveCloudflareAndCipher(waitForCipher = true)
+                }
+            }
         }
 
         if (cachedCipher() != null) {
@@ -768,7 +795,11 @@ class ComixProvider : MainAPI() {
         if (cleanQuery.isEmpty()) return emptyList()
 
         if (cachedCipher() == null) {
-            resolveCloudflareAndCipher(waitForCipher = true)
+            cfMutex.withLock {
+                if (cachedCipher() == null) {
+                    resolveCloudflareAndCipher(waitForCipher = true)
+                }
+            }
         }
 
         if (cachedCipher() != null) {
