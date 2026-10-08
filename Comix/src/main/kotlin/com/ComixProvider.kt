@@ -59,7 +59,6 @@ import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
-// Safely declare the script at the top level to guarantee compiler resolution
 const val CAPTURE_SCRIPT = """
     (function () {
         if (window.__comixCipherHook) return;
@@ -282,16 +281,25 @@ class ComixProvider : MainAPI() {
             checkRunnable = object : Runnable {
                 override fun run() {
                     if (done.get()) return
-                    val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
-                    val title = webView.title?.lowercase() ?: ""
                     
+                    val title = webView.title?.lowercase() ?: ""
                     val challengeWords = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt")
                     val isChallenge = challengeWords.any { title.contains(it) }
 
-                    if (!isChallenge && cookies.contains("cf_clearance")) {
-                        if (!waitForCipher || cipher != null) {
-                            cleanup(true)
-                            return
+                    // Only declare success if we are NOT on a challenge page
+                    if (!isChallenge) {
+                        if (waitForCipher) {
+                            if (cipher != null) {
+                                cleanup(true)
+                                return
+                            }
+                        } else {
+                            val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
+                            // Site successfully loaded
+                            if (cookies.contains("cf_clearance") || title.contains("comix") || title.contains("read manga") || cipher != null) {
+                                cleanup(true)
+                                return
+                            }
                         }
                     }
                     handler.postDelayed(this, 500L)
@@ -388,20 +396,30 @@ class ComixProvider : MainAPI() {
             fun checkStatus(view: WebView?) {
                 if (done.get()) return
                 val title = view?.title?.lowercase() ?: ""
-                val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
                 
                 val challengeWords = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt")
                 val isChallenge = challengeWords.any { title.contains(it) }
 
-                if (!isChallenge && cookies.contains("cf_clearance")) {
-                    if (!waitForCipher || cipher != null) {
-                        statusText.text = "Success! Loading content..."
-                        statusText.setTextColor(Color.parseColor("#4CAF50"))
-                        progressBar.visibility = View.GONE
-                        handler.postDelayed({ finish(true) }, 600)
+                // The site actually loaded successfully, process conditions:
+                if (!isChallenge) {
+                    if (waitForCipher) {
+                        if (cipher != null) {
+                            statusText.text = "Success! Content secured..."
+                            statusText.setTextColor(Color.parseColor("#4CAF50"))
+                            progressBar.visibility = View.GONE
+                            handler.postDelayed({ finish(true) }, 600)
+                        } else {
+                            statusText.text = "Generating secure session keys... Please wait"
+                            statusText.setTextColor(Color.parseColor("#FFC107"))
+                        }
                     } else {
-                        statusText.text = "Success! Generating secure session keys..."
-                        statusText.setTextColor(Color.parseColor("#FFC107"))
+                        val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
+                        if (cookies.contains("cf_clearance") || title.contains("comix") || title.contains("read manga") || cipher != null) {
+                            statusText.text = "Success! Loading content..."
+                            statusText.setTextColor(Color.parseColor("#4CAF50"))
+                            progressBar.visibility = View.GONE
+                            handler.postDelayed({ finish(true) }, 600)
+                        }
                     }
                 }
             }
@@ -446,13 +464,13 @@ class ComixProvider : MainAPI() {
     }
 
     private suspend fun resolveCloudflareAndCipher(waitForCipher: Boolean): Boolean = cfMutex.withLock {
+        // Evaluate conditions properly BEFORE spawning webviews
+        val hasCipher = cipher != null
+        if (waitForCipher && hasCipher) return true
+
         val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
         val hasClearance = cookies.contains("cf_clearance")
-        val hasCipher = cipher != null
-
-        if (hasClearance && (!waitForCipher || hasCipher)) {
-            return true
-        }
+        if (!waitForCipher && hasClearance) return true
 
         val activity = CommonActivity.activity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
@@ -468,12 +486,8 @@ class ComixProvider : MainAPI() {
     }
 
     private suspend fun fetchHtml(url: String): String {
-        val initialCookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
-        if (!initialCookies.contains("cf_clearance")) {
-            resolveCloudflareAndCipher(waitForCipher = false)
-        }
-        
         var response = app.get(url, interceptor = cfInterceptor).text
+        // Reactively intercept Cloudflare blocking only if it actually occurs
         if (isCloudflareChallenge(response)) {
             resolveCloudflareAndCipher(waitForCipher = false)
             response = app.get(url, interceptor = cfInterceptor).text
@@ -682,7 +696,9 @@ class ComixProvider : MainAPI() {
             else -> return null
         }
 
-        resolveCloudflareAndCipher(waitForCipher = true)
+        if (cachedCipher() == null) {
+            resolveCloudflareAndCipher(waitForCipher = true)
+        }
 
         if (cachedCipher() != null) {
             val body = getSigned("/api/v1/manga", params)
@@ -751,7 +767,9 @@ class ComixProvider : MainAPI() {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
 
-        resolveCloudflareAndCipher(waitForCipher = true)
+        if (cachedCipher() == null) {
+            resolveCloudflareAndCipher(waitForCipher = true)
+        }
 
         if (cachedCipher() != null) {
             val params = mapOf("keyword" to listOf(cleanQuery), "limit" to listOf("28"))
