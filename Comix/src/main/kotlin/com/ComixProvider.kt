@@ -62,6 +62,51 @@ import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
+const val CAPTURE_SCRIPT = """
+    (function () {
+        if (window.__comixCipherHook) return;
+        window.__comixCipherHook = true;
+        
+        var captures = window.__comixCipherCaptures = [];
+        var seen = window.__comixSeenLengths = {};
+        var originalAtob = window.atob;
+
+        var stealthAtob = function (value) {
+            var decoded = originalAtob.call(window, value);
+            try {
+                var len = decoded.length;
+                var key = 'L' + len;
+                if (!seen[key]) { seen[key] = true; }
+                
+                if (len === 256 || len === 24 || len === 32) {
+                    var bytes = new Array(len);
+                    for (var i = 0; i < len; i++) bytes[i] = decoded.charCodeAt(i) & 255;
+                    captures.push(bytes);
+                    
+                    var sboxes = captures.filter(function (x) { return x.length === 256; }).slice(0, 3);
+                    var keys   = captures.filter(function (x) { return x.length === 24 || x.length === 32; }).slice(0, 3);
+                    if (sboxes.length === 3 && keys.length === 3) {
+                        try { ComixCipherBridge.submit(JSON.stringify({ sboxes: sboxes, keys: keys })); } catch (e) {}
+                    }
+                }
+            } catch (e) {}
+            return decoded;
+        };
+
+        var origFpToString = Function.prototype.toString;
+        Function.prototype.toString = function () {
+            if (this === stealthAtob) return 'function atob() { [native code] }';
+            return origFpToString.call(this);
+        };
+
+        Object.defineProperty(window, 'atob', {
+            value: stealthAtob,
+            writable: true,
+            configurable: true
+        });
+    })();
+"""
+
 object CFState {
     var userAgent: String = ""
 }
@@ -206,7 +251,7 @@ class ComixProvider : MainAPI() {
                     activity.resources.displayMetrics.widthPixels,
                     activity.resources.displayMetrics.heightPixels
                 )
-                translationX = 20000f // Off-screen rendering
+                translationX = 20000f 
                 setupBypassWebView(this)
 
                 addJavascriptInterface(object {
@@ -354,31 +399,21 @@ class ComixProvider : MainAPI() {
                             requestLayout()
                             statusText.text = "Please complete the challenge below..."
                         }
-                    } else if (title.isNotBlank()) {
-                        // Collapse WebView instantly to ensure the user never sees the loaded website trapped in the popup
+                    } else if (cookies.contains("cf_clearance")) {
                         if (layoutParams.height != 1) {
                             layoutParams.height = 1
                             alpha = 0f
                             requestLayout()
                         }
 
-                        if (waitForCipher) {
-                            if (cipher != null) {
-                                statusText.text = "Success! Loading..."
-                                statusText.setTextColor(Color.parseColor("#4CAF50"))
-                                progressBar.visibility = View.GONE
-                                handler.postDelayed({ finish(true) }, 600)
-                            } else {
-                                statusText.text = "Generating session keys... Please wait"
-                                statusText.setTextColor(Color.parseColor("#FFC107"))
-                            }
+                        if (!waitForCipher || cipher != null) {
+                            statusText.text = "Success! Loading..."
+                            statusText.setTextColor(Color.parseColor("#4CAF50"))
+                            progressBar.visibility = View.GONE
+                            handler.postDelayed({ finish(true) }, 600)
                         } else {
-                            if (cookies.contains("cf_clearance") || title.contains("comix") || title.contains("read manga")) {
-                                statusText.text = "Success! Loading..."
-                                statusText.setTextColor(Color.parseColor("#4CAF50"))
-                                progressBar.visibility = View.GONE
-                                handler.postDelayed({ finish(true) }, 600)
-                            }
+                            statusText.text = "Generating session keys... Please wait"
+                            statusText.setTextColor(Color.parseColor("#FFC107"))
                         }
                     }
                 }
@@ -439,7 +474,7 @@ class ComixProvider : MainAPI() {
 
             handler.postDelayed({ 
                 if (!done.get()) {
-                    if (!waitForCipher || cipher != null) finish(true) else finish(false)
+                    finish(false)
                 }
             }, 30_000L)
         }
@@ -448,21 +483,16 @@ class ComixProvider : MainAPI() {
     private suspend fun resolveCloudflareAndCipher(waitForCipher: Boolean): Boolean {
         val activity = CommonActivity.activity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
-        
         if (attemptSilentResolution(activity, waitForCipher)) return true
-        
-        val checkHtml = runCatching { app.get(mainUrl, interceptor = cfInterceptor).text }.getOrNull() ?: ""
-        if (isCloudflareChallenge(checkHtml) || (waitForCipher && cipher == null)) {
-            return attemptInteractiveResolution(activity, waitForCipher)
-        }
-        
-        return false
+        return attemptInteractiveResolution(activity, waitForCipher)
     }
 
     private fun isCloudflareChallenge(html: String): Boolean {
         val lower = html.lowercase()
-        val challengeWords = listOf("just a moment", "cf-browser-verification", "turnstile", "cf_chl_opt", "checking your browser")
-        return challengeWords.any { lower.contains(it) }
+        return lower.contains("just a moment") || 
+               lower.contains("cf-browser-verification") || 
+               lower.contains("turnstile") ||
+               lower.contains("cf_chl_opt")
     }
 
     private suspend fun fetchHtml(url: String): String {
@@ -487,65 +517,58 @@ class ComixProvider : MainAPI() {
 
     private suspend fun getSigned(path: String, params: Map<String, List<String>>): String? {
         val c = cachedCipher() ?: return null
-        return try {
-            val canonical = params.toSortedMap().entries.joinToString("&") { (rawName, values) ->
+        
+        val canonical = params.toSortedMap().entries.joinToString("&") { (rawName, values) ->
+            val name = rawName.removeSuffix("[]")
+            if (values.size == 1 && !rawName.endsWith("[]")) {
+                "$name=${values.single().trim()}"
+            } else {
+                values.mapIndexed { i, v -> "$name[$i]=${v.trim()}" }.joinToString("&")
+            }
+        }
+        val token = c.sign(path, canonical)
+
+        val encoded = buildString {
+            append(mainUrl).append(path).append("?")
+            var first = true
+            params.toSortedMap().forEach { (rawName, values) ->
                 val name = rawName.removeSuffix("[]")
+                fun emit(k: String, v: String) {
+                    if (!first) append("&")
+                    first = false
+                    append(URLEncoder.encode(k, "UTF-8")).append("=").append(URLEncoder.encode(v.trim(), "UTF-8"))
+                }
                 if (values.size == 1 && !rawName.endsWith("[]")) {
-                    "$name=${values.single().trim()}"
+                    emit(name, values.single())
                 } else {
-                    values.mapIndexed { i, v -> "$name[$i]=${v.trim()}" }.joinToString("&")
+                    values.forEachIndexed { i, v -> emit("$name[$i]", v) }
                 }
             }
-            val token = c.sign(path, canonical)
+            if (!first) append("&")
+            append("_=").append(URLEncoder.encode(token, "UTF-8"))
+        }
 
-            val encoded = buildString {
-                append(mainUrl).append(path).append("?")
-                var first = true
-                params.toSortedMap().forEach { (rawName, values) ->
-                    val name = rawName.removeSuffix("[]")
-                    fun emit(k: String, v: String) {
-                        if (!first) append("&")
-                        first = false
-                        append(URLEncoder.encode(k, "UTF-8")).append("=").append(URLEncoder.encode(v.trim(), "UTF-8"))
-                    }
-                    if (values.size == 1 && !rawName.endsWith("[]")) {
-                        emit(name, values.single())
-                    } else {
-                        values.forEachIndexed { i, v -> emit("$name[$i]", v) }
-                    }
-                }
-                if (!first) append("&")
-                append("_=").append(URLEncoder.encode(token, "UTF-8"))
-            }
-
-            val headers = mapOf(
+        // 🚀 CRITICAL FIX: If app.get() fails (e.g., IPv6 connection timeout as seen in the image), 
+        // it throws an Exception. We intentionally DO NOT catch it here. 
+        // This ensures the network error correctly bubbles up to the UI so you can hit Retry 
+        // without falsely invalidating and deleting your encryption keys.
+        val raw = app.get(
+            encoded,
+            interceptor = cfInterceptor,
+            headers = mapOf(
                 "Accept" to "application/json, text/plain, */*",
                 "Referer" to "$mainUrl/",
                 "Sec-Fetch-Dest" to "empty",
                 "Sec-Fetch-Mode" to "cors",
                 "Sec-Fetch-Site" to "same-origin"
             )
+        ).text
 
-            var raw = app.get(encoded, interceptor = cfInterceptor, headers = headers).text
-            
-            if (isCloudflareChallenge(raw)) {
-                cfMutex.withLock {
-                    raw = app.get(encoded, interceptor = cfInterceptor, headers = headers).text
-                    if (isCloudflareChallenge(raw)) {
-                        resolveCloudflareAndCipher(waitForCipher = false)
-                        raw = app.get(encoded, interceptor = cfInterceptor, headers = headers).text
-                    }
-                }
-            }
-
-            val root = runCatching { JSONObject(raw) }.getOrNull() ?: return null
-            if (root.has("e")) {
-                return runCatching { c.decrypt(root.optString("e")) }.getOrNull()
-            }
-            raw
-        } catch (t: Throwable) {
-            null
+        val root = runCatching { JSONObject(raw) }.getOrNull() ?: return null
+        if (root.has("e")) {
+            return runCatching { c.decrypt(root.optString("e")) }.getOrNull()
         }
+        return raw
     }
 
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
@@ -700,17 +723,22 @@ class ComixProvider : MainAPI() {
 
         if (cachedCipher() != null) {
             val body = getSigned("/api/v1/manga", params)
-            if (!body.isNullOrBlank()) {
-                val root = runCatching { JSONObject(body) }.getOrNull()
-                val arr = root?.optJSONObject("result")?.optJSONArray("items") ?: root?.optJSONArray("items") ?: root?.optJSONObject("data")?.optJSONArray("items")
-                if (arr != null) {
-                    val items = arrToResults(arr)
-                    val hasNext = if (items.isEmpty()) false else readHasNext(root, page, items.size)
-                    return PageResult(items, hasNext)
+            if (body != null) {
+                if (body.isNotBlank()) {
+                    val root = runCatching { JSONObject(body) }.getOrNull()
+                    val arr = root?.optJSONObject("result")?.optJSONArray("items") ?: root?.optJSONArray("items") ?: root?.optJSONObject("data")?.optJSONArray("items")
+                    if (arr != null) {
+                        val items = arrToResults(arr)
+                        val hasNext = if (items.isEmpty()) false else readHasNext(root, page, items.size)
+                        return PageResult(items, hasNext)
+                    } else {
+                        cipher = null
+                        cipherCacheFile?.delete()
+                    }
+                } else {
+                    cipher = null
+                    cipherCacheFile?.delete()
                 }
-            } else {
-                cipher = null
-                cipherCacheFile?.delete()
             }
         }
 
@@ -926,52 +954,5 @@ class ComixProvider : MainAPI() {
             )
         }
         return true
-    }
-
-    companion object {
-        const val CAPTURE_SCRIPT = """
-            (function () {
-                if (window.__comixCipherHook) return;
-                window.__comixCipherHook = true;
-                
-                var captures = window.__comixCipherCaptures = [];
-                var seen = window.__comixSeenLengths = {};
-                var originalAtob = window.atob;
-
-                var stealthAtob = function (value) {
-                    var decoded = originalAtob.call(window, value);
-                    try {
-                        var len = decoded.length;
-                        var key = 'L' + len;
-                        if (!seen[key]) { seen[key] = true; }
-                        
-                        if (len === 256 || len === 24 || len === 32) {
-                            var bytes = new Array(len);
-                            for (var i = 0; i < len; i++) bytes[i] = decoded.charCodeAt(i) & 255;
-                            captures.push(bytes);
-                            
-                            var sboxes = captures.filter(function (x) { return x.length === 256; }).slice(0, 3);
-                            var keys   = captures.filter(function (x) { return x.length === 24 || x.length === 32; }).slice(0, 3);
-                            if (sboxes.length === 3 && keys.length === 3) {
-                                try { ComixCipherBridge.submit(JSON.stringify({ sboxes: sboxes, keys: keys })); } catch (e) {}
-                            }
-                        }
-                    } catch (e) {}
-                    return decoded;
-                };
-
-                var origFpToString = Function.prototype.toString;
-                Function.prototype.toString = function () {
-                    if (this === stealthAtob) return 'function atob() { [native code] }';
-                    return origFpToString.call(this);
-                };
-
-                Object.defineProperty(window, 'atob', {
-                    value: stealthAtob,
-                    writable: true,
-                    configurable: true
-                });
-            })();
-        """
     }
 }
