@@ -20,6 +20,7 @@ import android.view.WindowManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
@@ -380,7 +381,7 @@ class ComixReaderDialogFragment : DialogFragment() {
 
     override fun onDestroyView() {
         webView?.apply {
-            (parent as? ViewGroup)?.removeView(this)
+            (parent as? ViewGroup)?.removeView(this@apply)
             removeJavascriptInterface("AndroidComix")
             stopLoading()
             loadUrl("about:blank")
@@ -442,11 +443,12 @@ class ComixReaderDialogFragment : DialogFragment() {
                 builtInZoomControls = true
                 displayZoomControls = false
                 setSupportZoom(true)
-                cacheMode = android.webkit.WebSettings.LOAD_DEFAULT // Correctly Patched
+                cacheMode = WebSettings.LOAD_DEFAULT 
                 mediaPlaybackRequiresUserGesture = false
                 
-                // Directly applies the cached, synchronized User Agent computed from ComixProvider.kt
-                userAgentString = CFState.userAgent 
+                if (CFState.userAgent.isNotBlank()) {
+                    userAgentString = CFState.userAgent 
+                }
             }
 
             addJavascriptInterface(ComixJsBridge(this@ComixReaderDialogFragment), "AndroidComix")
@@ -745,7 +747,7 @@ class ComixReaderDialogFragment : DialogFragment() {
         view.evaluateJavascript(SCRIPT_READER_OPTIMIZATIONS, null)
     }
 
-    fun extractSlug(url: String): String {
+    private fun extractSlug(url: String): String {
         val match = Regex("/(?:comic|title)/([^/?#]+)").find(url)
         val slugRaw = match?.groupValues?.get(1) ?: return ""
         return slugRaw.substringBefore("-chapter-").trimEnd('-')
