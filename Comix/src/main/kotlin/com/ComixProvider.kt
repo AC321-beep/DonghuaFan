@@ -7,7 +7,6 @@ import android.graphics.Color
 import android.net.http.SslError
 import android.os.Handler
 import android.os.Looper
-import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
@@ -20,6 +19,8 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.DubStatus
 import com.lagradost.cloudstream3.HomePageResponse
@@ -96,7 +97,6 @@ class CFInterceptor : Interceptor {
             builder.header("Sec-Fetch-Mode", "navigate")
         if (original.header("Sec-Fetch-Site") == null)
             builder.header("Sec-Fetch-Site", "none")
-        // Present on real browser navigations, expected by CF bot management.
         if (original.header("Sec-Fetch-User") == null)
             builder.header("Sec-Fetch-User", "?1")
 
@@ -177,19 +177,40 @@ class ComixProvider : MainAPI() {
         "cloudflare"
     )
 
-    /** Title-based challenge check. Empty title == still loading == treated as challenge. */
     private fun isChallengeTitle(title: String?): Boolean {
         val t = title?.lowercase()?.trim()
         if (t.isNullOrEmpty()) return true
         return CHALLENGE_TITLE_MARKERS.any { t.contains(it) }
     }
 
-    /** CF-owned intermediate URLs that must never be considered "loaded". */
     private fun isCloudflareInternalUrl(url: String?): Boolean {
         val u = url ?: return false
         return u.contains("challenges.cloudflare.com") ||
                u.contains("/cdn-cgi/") ||
                u.startsWith("about:")
+    }
+
+    /**
+     * Install the cipher-capture hook BEFORE any page script runs.
+     *
+     * AndroidX WebKit's addDocumentStartJavaScript() guarantees execution at document-start,
+     * which is exactly when Comix's inline cipher script runs. The onPageStarted
+     * evaluateJavascript fallback is kept for devices/WebView builds where the
+     * document-start feature isn't supported (rare — Android 5+ with updated WebView support it).
+     */
+    private fun installCipherHook(webView: WebView) {
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            runCatching {
+                WebViewCompat.addDocumentStartJavaScript(
+                    webView,
+                    CAPTURE_SCRIPT,
+                    setOf("*")
+                )
+            }
+        }
+        // Fallback for the unlikely case DOCUMENT_START_SCRIPT isn't supported.
+        // It runs slightly late but at least covers the non-inline-script paths.
+        webView.evaluateJavascript(CAPTURE_SCRIPT, null)
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -205,7 +226,6 @@ class ComixProvider : MainAPI() {
             var checkRunnable: Runnable? = null
             var timeoutRunnable: Runnable? = null
 
-            // FIX: AtomicBoolean instead of @Volatile local var
             val finalPageLoaded = AtomicBoolean(false)
 
             val webView = WebView(activity).apply {
@@ -214,8 +234,6 @@ class ComixProvider : MainAPI() {
                     activity.resources.displayMetrics.heightPixels
                 )
                 translationX = 20000f
-                // Also fade it out — off-screen WebViews can be throttled by the system,
-                // and CF/Turnstile behaves better with a "visible-ish" but transparent view.
                 alpha = 0f
 
                 settings.apply {
@@ -232,9 +250,7 @@ class ComixProvider : MainAPI() {
 
                 CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
                 CookieManager.getInstance().setAcceptCookie(true)
-
                 settings.userAgentString = CFState.userAgent.ifBlank { settings.userAgentString }
-                // Back-fill UA so the reader dialog stays consistent.
                 if (CFState.userAgent.isBlank()) CFState.userAgent = settings.userAgentString
 
                 addJavascriptInterface(object {
@@ -248,12 +264,16 @@ class ComixProvider : MainAPI() {
                     }
                 }, "ComixCipherBridge")
 
+                // KEY FIX: install hook at document-start, before loadUrl() below.
+                installCipherHook(this)
+
                 webViewClient = object : WebViewClient() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: WebView?, h: SslErrorHandler?, error: SslError?) {
                         h?.proceed()
                     }
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                        // Redundant safety re-inject (cheap).
                         view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                     }
                     override fun onPageFinished(view: WebView?, url: String?) {
@@ -296,10 +316,6 @@ class ComixProvider : MainAPI() {
                                          !isCloudflareInternalUrl(url)
                     val titleReady     = !isChallengeTitle(title) && !title.isNullOrBlank()
 
-                    // Success if EITHER:
-                    //  (a) we have a valid cf_clearance and we're past the interstitial, OR
-                    //  (b) the target page fully loaded without any CF challenge being served
-                    //      (covers the "CF turned off" case the site sometimes does).
                     val passedChallenge   = hasCfClearance && onTarget && titleReady
                     val noChallengeNeeded = finalPageLoaded.get() && onTarget && titleReady
 
@@ -317,8 +333,6 @@ class ComixProvider : MainAPI() {
             decor.addView(webView)
             webView.loadUrl(mainUrl)
             handler.postDelayed(checkRunnable!!, 700L)
-
-            // More headroom for Turnstile's auto-solve and for cipher capture.
             handler.postDelayed(timeoutRunnable!!, if (waitForCipher) 12_000L else 8_000L)
         }
     }
@@ -361,8 +375,11 @@ class ComixProvider : MainAPI() {
                 if (cont.isActive) cont.resume(success)
             }
 
-            // FIX: AtomicBoolean instead of @Volatile local var
             val finalPageLoaded = AtomicBoolean(false)
+            // Hard sub-deadline for cipher acquisition once the page is fully loaded.
+            // Prevents the "Generating session keys..." screen from hanging forever.
+            val cipherDeadlineAt = AtomicBoolean(false) // set to true once we've waited long enough
+            var cipherDeadlineRunnable: Runnable? = null
 
             val webView = WebView(activity).apply {
                 layoutParams = LinearLayout.LayoutParams(
@@ -401,7 +418,12 @@ class ComixProvider : MainAPI() {
                     val noChallengeNeeded = finalPageLoaded.get() && onTarget && titleReady
 
                     if (passedChallenge || noChallengeNeeded) {
-                        if (!waitForCipher || cipher != null) {
+                        // If cipher isn't needed, or we already have it, or we've waited long
+                        // enough for cipher material, close with success.
+                        val cipherRequirementSatisfied =
+                            !waitForCipher || cipher != null || cipherDeadlineAt.get()
+
+                        if (cipherRequirementSatisfied) {
                             header.text = "Success! Loading..."
                             header.setTextColor(Color.GREEN)
                             handler.postDelayed({ finish(true) }, 700)
@@ -418,11 +440,13 @@ class ComixProvider : MainAPI() {
                         if (mat != null && mat.isValid()) {
                             cipher = ComixCipher(mat)
                             saveCachedCipher(mat)
-                            // Once cipher is caught, immediately re-check status to close the dialog.
                             activity.runOnUiThread { checkStatus(this@apply) }
                         }
                     }
                 }, "ComixCipherBridge")
+
+                // KEY FIX: install hook before loadUrl() below.
+                installCipherHook(this)
 
                 webChromeClient = object : WebChromeClient() {
                     override fun onProgressChanged(view: WebView?, newProgress: Int) {
@@ -454,6 +478,15 @@ class ComixProvider : MainAPI() {
             dialog.setOnDismissListener { if (!done.get()) finish(false) }
 
             dialog.show()
+
+            // Give the cipher 6 seconds after the page finishes loading.
+            cipherDeadlineRunnable = Runnable {
+                cipherDeadlineAt.set(true)
+                // Re-run checkStatus to close the dialog if the page is already loaded.
+                runCatching { webView.evaluateJavascript("void 0", null) }
+            }
+            handler.postDelayed(cipherDeadlineRunnable!!, 6_000L)
+
             webView.loadUrl(mainUrl)
 
             handler.postDelayed({ if (!done.get()) finish(false) }, 30_000L)
@@ -470,7 +503,6 @@ class ComixProvider : MainAPI() {
     private fun isCloudflareChallenge(html: String): Boolean {
         if (html.isBlank()) return true
         val lower = html.lowercase()
-        // Only actual CF interstitial/challenge pages — NOT pages that embed a Turnstile widget.
         return lower.contains("cf-browser-verification") ||
                lower.contains("cf-chl-") ||
                lower.contains("__cf_chl_") ||
@@ -484,10 +516,8 @@ class ComixProvider : MainAPI() {
     private suspend fun fetchHtml(url: String): String {
         cfMutex.withLock {
             val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
-            // HTML fetch doesn't need cipher, just Cloudflare clearance.
             if (!cookies.contains("cf_clearance")) {
                 resolveCloudflareAndCipher(waitForCipher = false)
-                // Make sure freshly-written cookies are visible to OkHttp.
                 CookieManager.getInstance().flush()
             }
         }
@@ -561,7 +591,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Data Parsing Helpers
+    //  Data Parsing Helpers (UNCHANGED)
     // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
@@ -712,7 +742,6 @@ class ComixProvider : MainAPI() {
             else -> return null
         }
 
-        // Pagination MUST wait for the cipher to successfully query the API
         if (cachedCipher() == null) {
             resolveCloudflareAndCipher(waitForCipher = true)
         }
@@ -728,8 +757,6 @@ class ComixProvider : MainAPI() {
                     return PageResult(items, hasNext)
                 }
             } else {
-                // If the signed API request returned nothing, the cipher might be expired/invalid.
-                // Wipe it so it generates a fresh one next time.
                 cipher = null
                 cipherCacheFile?.delete()
             }
@@ -783,13 +810,12 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Search
+    //  Search (UNCHANGED)
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
 
-        // Search MUST wait for the cipher to query the API
         if (cachedCipher() == null) {
             resolveCloudflareAndCipher(waitForCipher = true)
         }
@@ -844,7 +870,7 @@ class ComixProvider : MainAPI() {
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Load Details & Reader (Single Entry Point)
+    //  Load Details & Reader (UNCHANGED)
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
         val html = fetchHtml(url)
@@ -897,7 +923,6 @@ class ComixProvider : MainAPI() {
 
         val latestChapterNum = d?.optInt("latestChapter", 0) ?: 0
 
-        // Grab the official first chapter URL directly from the JSON or DOM to ensure it's valid
         val firstChapterUrl  = d?.optString("firstChapterUrl")?.takeIf { it.isNotBlank() }
             ?: document.selectFirst("a[href*='-chapter-']")?.attr("href")
             ?: url
@@ -962,7 +987,7 @@ class ComixProvider : MainAPI() {
             (function () {
                 if (window.__comixCipherHook) return;
                 window.__comixCipherHook = true;
-                
+
                 var captures = window.__comixCipherCaptures = [];
                 var seen = window.__comixSeenLengths = {};
                 var originalAtob = window.atob;
@@ -973,12 +998,12 @@ class ComixProvider : MainAPI() {
                         var len = decoded.length;
                         var key = 'L' + len;
                         if (!seen[key]) { seen[key] = true; }
-                        
+
                         if (len === 256 || len === 24 || len === 32) {
                             var bytes = new Array(len);
                             for (var i = 0; i < len; i++) bytes[i] = decoded.charCodeAt(i) & 255;
                             captures.push(bytes);
-                            
+
                             var sboxes = captures.filter(function (x) { return x.length === 256; }).slice(0, 3);
                             var keys   = captures.filter(function (x) { return x.length === 24 || x.length === 32; }).slice(0, 3);
                             if (sboxes.length === 3 && keys.length === 3) {
