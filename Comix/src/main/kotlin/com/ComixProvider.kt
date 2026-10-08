@@ -205,7 +205,8 @@ class ComixProvider : MainAPI() {
             var checkRunnable: Runnable? = null
             var timeoutRunnable: Runnable? = null
 
-            @Volatile var finalPageLoaded = false
+            // FIX: AtomicBoolean instead of @Volatile local var
+            val finalPageLoaded = AtomicBoolean(false)
 
             val webView = WebView(activity).apply {
                 layoutParams = ViewGroup.LayoutParams(
@@ -260,7 +261,7 @@ class ComixProvider : MainAPI() {
                         val onTarget = url?.contains("comix.to", ignoreCase = true) == true &&
                                        !isCloudflareInternalUrl(url)
                         if (onTarget && !isChallengeTitle(view?.title)) {
-                            finalPageLoaded = true
+                            finalPageLoaded.set(true)
                         }
                     }
                 }
@@ -300,7 +301,7 @@ class ComixProvider : MainAPI() {
                     //  (b) the target page fully loaded without any CF challenge being served
                     //      (covers the "CF turned off" case the site sometimes does).
                     val passedChallenge   = hasCfClearance && onTarget && titleReady
-                    val noChallengeNeeded = finalPageLoaded && onTarget && titleReady
+                    val noChallengeNeeded = finalPageLoaded.get() && onTarget && titleReady
 
                     if ((passedChallenge || noChallengeNeeded) && (!waitForCipher || cipher != null)) {
                         cleanup(true)
@@ -360,7 +361,8 @@ class ComixProvider : MainAPI() {
                 if (cont.isActive) cont.resume(success)
             }
 
-            @Volatile var finalPageLoaded = false
+            // FIX: AtomicBoolean instead of @Volatile local var
+            val finalPageLoaded = AtomicBoolean(false)
 
             val webView = WebView(activity).apply {
                 layoutParams = LinearLayout.LayoutParams(
@@ -396,7 +398,7 @@ class ComixProvider : MainAPI() {
                     val hasCf      = cookies.contains("cf_clearance")
 
                     val passedChallenge   = hasCf && onTarget && titleReady
-                    val noChallengeNeeded = finalPageLoaded && onTarget && titleReady
+                    val noChallengeNeeded = finalPageLoaded.get() && onTarget && titleReady
 
                     if (passedChallenge || noChallengeNeeded) {
                         if (!waitForCipher || cipher != null) {
@@ -441,7 +443,7 @@ class ComixProvider : MainAPI() {
                     override fun onPageFinished(view: WebView?, url: String?) {
                         val onTarget = url?.contains("comix.to", ignoreCase = true) == true &&
                                        !isCloudflareInternalUrl(url)
-                        if (onTarget && !isChallengeTitle(view?.title)) finalPageLoaded = true
+                        if (onTarget && !isChallengeTitle(view?.title)) finalPageLoaded.set(true)
                         checkStatus(view)
                     }
                 }
