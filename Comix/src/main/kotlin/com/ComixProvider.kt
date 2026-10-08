@@ -247,7 +247,7 @@ class ComixProvider : MainAPI() {
                     activity.resources.displayMetrics.widthPixels,
                     activity.resources.displayMetrics.heightPixels
                 )
-                translationX = 20000f // Off-screen rendering
+                translationX = 20000f 
                 setLayerType(View.LAYER_TYPE_HARDWARE, null)
                 setupBypassWebView(this)
 
@@ -291,22 +291,20 @@ class ComixProvider : MainAPI() {
                     if (done.get()) return
                     
                     val title = webView.title?.lowercase() ?: ""
-                    val challengeWords = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt", "checking your browser")
+                    val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
+                    val challengeWords = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt")
                     val isChallenge = challengeWords.any { title.contains(it) }
 
-                    // DYNAMIC FIX: If the page loaded fully without a Cloudflare block
-                    if (title.isNotBlank() && !isChallenge) {
-                        if (waitForCipher) {
-                            if (cipher != null) {
-                                cleanup(true)
-                                return
-                            } else if (!reloaded) {
-                                // Race Condition Fix: Page loaded so fast it missed the JS hook.
-                                // Reload it once internally to guarantee we catch the keys.
-                                reloaded = true
-                                webView.reload()
-                            }
-                        } else {
+                    if (waitForCipher) {
+                        if (cipher != null) {
+                            cleanup(true)
+                            return
+                        } else if (title.contains("comix") && !reloaded) {
+                            reloaded = true
+                            webView.reload() // Force cipher extraction if loaded too fast
+                        }
+                    } else {
+                        if (!isChallenge && (cookies.contains("cf_clearance") || title.contains("comix"))) {
                             cleanup(true)
                             return
                         }
@@ -328,7 +326,6 @@ class ComixProvider : MainAPI() {
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun attemptInteractiveResolution(activity: android.app.Activity, waitForCipher: Boolean): Boolean = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
-            // Proper floating popup dialog
             val dialog = Dialog(activity, android.R.style.Theme_Translucent_NoTitleBar).apply {
                 setCancelable(true) 
                 setCanceledOnTouchOutside(false)
@@ -385,7 +382,7 @@ class ComixProvider : MainAPI() {
             dialogBox.addView(statusText)
 
             val webView = WebView(activity).apply {
-                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1) // Initially hidden
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1) 
                 alpha = 0f
                 setBackgroundColor(Color.parseColor("#121212"))
                 setupBypassWebView(this)
@@ -409,40 +406,43 @@ class ComixProvider : MainAPI() {
             fun checkStatus(view: WebView?) {
                 if (done.get()) return
                 val title = view?.title?.lowercase() ?: ""
-                
-                val challengeWords = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt", "checking your browser")
+                val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
+                val challengeWords = listOf("just a moment", "attention required", "security verification", "cloudflare", "cf_chl_opt")
                 val isChallenge = challengeWords.any { title.contains(it) }
 
                 if (isChallenge) {
-                    // Show WebView because it's an ACTUAL Cloudflare challenge requiring a tap
                     if (webView.alpha == 0f) {
                         webView.alpha = 1f
                         webView.layoutParams.height = dp(400)
                         webView.requestLayout()
                         statusText.text = "Please complete the challenge below..."
                     }
-                } else if (title.isNotBlank() && !isChallenge) {
-                    // Collapse WebView instantly so user never sees the loaded website trapped in the popup
+                } else if (title.contains("comix") || cookies.contains("cf_clearance") || cipher != null) {
                     if (webView.layoutParams.height != 1) {
                         webView.layoutParams.height = 1
                         webView.alpha = 0f
                         webView.requestLayout()
                     }
 
-                    if (!waitForCipher || cipher != null) {
+                    if (waitForCipher) {
+                        if (cipher != null) {
+                            statusText.text = "Success! Loading..."
+                            statusText.setTextColor(Color.parseColor("#4CAF50"))
+                            progressBar.visibility = View.GONE
+                            handler.postDelayed({ finish(true) }, 600)
+                        } else {
+                            statusText.text = "Finalizing secure connection..."
+                            statusText.setTextColor(Color.parseColor("#FFC107"))
+                            if (!escapeHatchTriggered) {
+                                escapeHatchTriggered = true
+                                handler.postDelayed({ finish(true) }, 2500) 
+                            }
+                        }
+                    } else {
                         statusText.text = "Success! Loading..."
                         statusText.setTextColor(Color.parseColor("#4CAF50"))
                         progressBar.visibility = View.GONE
                         handler.postDelayed({ finish(true) }, 600)
-                    } else {
-                        // ESCAPE HATCH: The site loaded fine (no CF), but we couldn't get the keys.
-                        // Force-close the dialog so the user isn't trapped looking at "Generating keys".
-                        statusText.text = "Finalizing secure connection..."
-                        statusText.setTextColor(Color.parseColor("#FFC107"))
-                        if (!escapeHatchTriggered) {
-                            escapeHatchTriggered = true
-                            handler.postDelayed({ finish(true) }, 2000) 
-                        }
                     }
                 }
             }
@@ -475,20 +475,11 @@ class ComixProvider : MainAPI() {
                 override fun onPageFinished(view: WebView?, url: String?) { checkStatus(view) }
             }
 
+            dialog.setOnCancelListener { if (!done.get()) finish(false) }
+            dialog.setOnDismissListener { if (!done.get()) finish(false) }
             dialog.setContentView(dimContainer)
-            
-            dialog.setOnDismissListener { 
-                if (!done.get()) {
-                    runCatching {
-                        dialogBox.removeView(webView)
-                        webView.stopLoading()
-                        webView.destroy()
-                    }
-                    if (cont.isActive) cont.resume(false)
-                }
-            }
-
             dialog.show()
+            
             webView.loadUrl(mainUrl)
 
             handler.postDelayed({ 
@@ -500,31 +491,18 @@ class ComixProvider : MainAPI() {
     }
 
     private suspend fun resolveCloudflareAndCipher(waitForCipher: Boolean): Boolean {
-        // Dynamic Quick Check: Don't spawn webviews if we already have what we need
-        val hasCipher = cipher != null
-        if (waitForCipher && hasCipher) return true
-        
-        val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
-        if (!waitForCipher && cookies.contains("cf_clearance")) return true
-
         val activity = CommonActivity.activity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
-        
         if (attemptSilentResolution(activity, waitForCipher)) return true
-        
-        // Final Safety Check before forcing interactive popup
-        val checkHtml = runCatching { app.get(mainUrl, interceptor = cfInterceptor).text }.getOrNull() ?: ""
-        if (isCloudflareChallenge(checkHtml) || (waitForCipher && cipher == null)) {
-            return attemptInteractiveResolution(activity, waitForCipher)
-        }
-        
-        return false
+        return attemptInteractiveResolution(activity, waitForCipher)
     }
 
     private fun isCloudflareChallenge(html: String): Boolean {
         val lower = html.lowercase()
-        val challengeWords = listOf("just a moment", "cf-browser-verification", "turnstile", "cf_chl_opt", "checking your browser")
-        return challengeWords.any { lower.contains(it) }
+        return lower.contains("just a moment") || 
+               lower.contains("cf-browser-verification") || 
+               lower.contains("turnstile") ||
+               lower.contains("cf_chl_opt")
     }
 
     private suspend fun fetchHtml(url: String): String {
@@ -602,9 +580,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Data Parsing Helpers
-    // ═══════════════════════════════════════════════════════════════════════
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
             is Document -> htmlOrDoc
@@ -720,9 +695,7 @@ class ComixProvider : MainAPI() {
         return itemCount >= 28
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  Main Page & Pagination
-    // ═══════════════════════════════════════════════════════════════════════
+    // ORIGINAL fetchQueryPage RESTORED EXACTLY AS YOU WROTE IT
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
@@ -754,12 +727,9 @@ class ComixProvider : MainAPI() {
             else -> return null
         }
 
+        // Pagination MUST wait for the cipher to successfully query the API
         if (cachedCipher() == null) {
-            cfMutex.withLock {
-                if (cachedCipher() == null) {
-                    resolveCloudflareAndCipher(waitForCipher = true)
-                }
-            }
+            resolveCloudflareAndCipher(waitForCipher = true)
         }
 
         if (cachedCipher() != null) {
@@ -773,6 +743,8 @@ class ComixProvider : MainAPI() {
                     return PageResult(items, hasNext)
                 }
             } else {
+                // If the signed API request returned nothing, the cipher might be expired/invalid. 
+                // Wipe it so it generates a fresh one next time.
                 cipher = null
                 cipherCacheFile?.delete()
             }
@@ -825,16 +797,14 @@ class ComixProvider : MainAPI() {
         return items
     }
 
+    // ORIGINAL search RESTORED EXACTLY AS YOU WROTE IT
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
 
+        // Search MUST wait for the cipher to query the API
         if (cachedCipher() == null) {
-            cfMutex.withLock {
-                if (cachedCipher() == null) {
-                    resolveCloudflareAndCipher(waitForCipher = true)
-                }
-            }
+            resolveCloudflareAndCipher(waitForCipher = true)
         }
 
         if (cachedCipher() != null) {
