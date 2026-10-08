@@ -41,6 +41,9 @@ import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -80,20 +83,27 @@ class CFInterceptor : Interceptor {
             builder.header("Cookie", cookies)
         }
 
-        if (original.header("Accept") == null)
+        if (original.header("Accept") == null) {
             builder.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-        if (original.header("Accept-Language") == null)
+        }
+        if (original.header("Accept-Language") == null) {
             builder.header("Accept-Language", "en-US,en;q=0.5")
-        if (original.header("Connection") == null)
+        }
+        if (original.header("Connection") == null) {
             builder.header("Connection", "keep-alive")
-        if (original.header("Upgrade-Insecure-Requests") == null)
+        }
+        if (original.header("Upgrade-Insecure-Requests") == null) {
             builder.header("Upgrade-Insecure-Requests", "1")
-        if (original.header("Sec-Fetch-Dest") == null)
+        }
+        if (original.header("Sec-Fetch-Dest") == null) {
             builder.header("Sec-Fetch-Dest", "document")
-        if (original.header("Sec-Fetch-Mode") == null)
+        }
+        if (original.header("Sec-Fetch-Mode") == null) {
             builder.header("Sec-Fetch-Mode", "navigate")
-        if (original.header("Sec-Fetch-Site") == null)
+        }
+        if (original.header("Sec-Fetch-Site") == null) {
             builder.header("Sec-Fetch-Site", "none")
+        }
 
         return chain.proceed(builder.build())
     }
@@ -121,15 +131,11 @@ class ComixProvider : MainAPI() {
     private val cfInterceptor = CFInterceptor()
     private val cfMutex = Mutex()
 
-    /**
-     * Rate-limit for silent cipher acquisition attempts.
-     *
-     * Burned on BOTH success and failure. A failed capture costs ~10 s in the
-     * headless WebView; repeating that per page is worse than a short delay
-     * before the next attempt.
-     */
     @Volatile private var lastCipherAttemptMs: Long = 0L
     private val cipherRetryCooldownMs = 90_000L
+
+    /** How long to keep waiting for the cipher after a real page load. */
+    private val cipherGraceMs = 2_000L
 
     private val cipherCacheFile: File?
         get() {
@@ -156,10 +162,9 @@ class ComixProvider : MainAPI() {
     }
 
     /**
-     * Poster headers deliberately omit the Cookie header.
-     *
-     * A stale cf_clearance from a previous CF solve adds latency on a site
-     * that no longer uses Cloudflare. The poster CDN does not need it.
+     * Poster headers deliberately omit the Cookie header. A stale cf_clearance
+     * from a previous CF solve adds latency on a site that no longer uses
+     * Cloudflare; the poster CDN does not need it.
      */
     private fun getPosterHeaders(): Map<String, String> {
         val defaultUa = try {
@@ -174,9 +179,6 @@ class ComixProvider : MainAPI() {
 
     // ═══════════════════════════════════════════════════════════════════════
     //  Cloudflare & Cipher Resolver
-    //
-    //  Fallback only. Reached when a direct HTTP request is answered with a
-    //  Cloudflare interstitial, or when a signed-API call needs a cipher.
     // ═══════════════════════════════════════════════════════════════════════
 
     private val CHALLENGE_TITLE_MARKERS = listOf(
@@ -195,6 +197,24 @@ class ComixProvider : MainAPI() {
         return CHALLENGE_TITLE_MARKERS.any { t.contains(it) }
     }
 
+    /**
+     * Reached the real comix.to page?
+     *
+     * Deliberately mode-agnostic — the only condition is a non-challenge title
+     * on a comix.to URL. Whether the site is behind Cloudflare right now or
+     * not, the moment a WebView is on the real page the S-boxes have already
+     * been decoded by the page's own JS, so CAPTURE_SCRIPT has fired. That is
+     * what makes the resolver work identically in both states and what makes
+     * a CF state flip a non-event.
+     */
+    private fun resolverSuccessConditionMet(webView: WebView?): Boolean {
+        val url = webView?.url ?: return false
+        if (!url.contains("comix.to", ignoreCase = true)) return false
+        val title = webView.title
+        if (title.isNullOrBlank()) return false
+        return !isChallengeTitle(title)
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun attemptSilentResolution(
         activity: android.app.Activity,
@@ -207,6 +227,7 @@ class ComixProvider : MainAPI() {
             val handler = Handler(Looper.getMainLooper())
             var checkRunnable: Runnable? = null
             var timeoutRunnable: Runnable? = null
+            var graceDeadline: Long = 0L
 
             val webView = WebView(activity).apply {
                 layoutParams = ViewGroup.LayoutParams(
@@ -278,19 +299,26 @@ class ComixProvider : MainAPI() {
                 override fun run() {
                     if (done.get()) return
 
-                    val title = webView.title
-                    val url = webView.url
-                    val onTarget = url?.contains("comix.to", ignoreCase = true) == true
-                    val titleReady = !isChallengeTitle(title) && !title.isNullOrBlank()
-
-                    // Success = reached the real page. No cf_clearance requirement.
-                    if (onTarget && titleReady) {
-                        if (!waitForCipher || cipher != null) {
+                    if (resolverSuccessConditionMet(webView)) {
+                        val cipherReady = !waitForCipher || cipher != null
+                        if (cipherReady) {
+                            cleanup(true)
+                            return
+                        }
+                        // Real page reached but the cipher hasn't been captured.
+                        // The S-boxes are decoded during the page's own script
+                        // execution, so a short grace window is enough. If they
+                        // don't appear, accept anyway — a real page load is the
+                        // meaningful signal.
+                        val now = System.currentTimeMillis()
+                        if (graceDeadline == 0L) {
+                            graceDeadline = now + cipherGraceMs
+                        } else if (now >= graceDeadline) {
                             cleanup(true)
                             return
                         }
                     }
-                    handler.postDelayed(this, 500L)
+                    handler.postDelayed(this, 400L)
                 }
             }
 
@@ -315,6 +343,7 @@ class ComixProvider : MainAPI() {
             }
             val done = AtomicBoolean(false)
             val handler = Handler(Looper.getMainLooper())
+            var graceDeadline: Long = 0L
 
             val layout = LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
@@ -365,19 +394,24 @@ class ComixProvider : MainAPI() {
 
                 fun checkStatus(view: WebView?) {
                     if (done.get()) return
-                    val title = view?.title
-                    val url = view?.url
-                    val onTarget = url?.contains("comix.to", ignoreCase = true) == true
-                    val titleReady = !isChallengeTitle(title) && !title.isNullOrBlank()
+                    if (!resolverSuccessConditionMet(view)) return
 
-                    if (onTarget && titleReady) {
-                        if (!waitForCipher || cipher != null) {
-                            header.text = "Success! Loading..."
-                            header.setTextColor(Color.GREEN)
-                            handler.postDelayed({ finish(true) }, 700)
-                        } else {
-                            header.text = "Generating session keys... Please wait"
-                        }
+                    val cipherReady = !waitForCipher || cipher != null
+                    if (cipherReady) {
+                        header.text = "Success! Loading..."
+                        header.setTextColor(Color.GREEN)
+                        handler.postDelayed({ finish(true) }, 700)
+                        return
+                    }
+                    // Same grace logic as the silent resolver.
+                    val now = System.currentTimeMillis()
+                    if (graceDeadline == 0L) {
+                        graceDeadline = now + cipherGraceMs
+                        header.text = "Generating session keys... Please wait"
+                    } else if (now >= graceDeadline) {
+                        header.text = "Success! Loading..."
+                        header.setTextColor(Color.GREEN)
+                        handler.postDelayed({ finish(true) }, 700)
                     }
                 }
 
@@ -434,9 +468,8 @@ class ComixProvider : MainAPI() {
     }
 
     /**
-     * Strict Cloudflare-challenge detection. Returns false for blank input
-     * (network error != challenge) and for any HTML that already contains the
-     * real site's `initial-data` marker or is otherwise substantial.
+     * Strict Cloudflare-interstitial detection. Returns false for blank input
+     * (network errors are not challenges) and for real pages.
      */
     private fun isCloudflareChallenge(html: String): Boolean {
         if (html.isBlank()) return false
@@ -457,17 +490,41 @@ class ComixProvider : MainAPI() {
     }
 
     /**
-     * Request-first. The CF resolver only runs when the direct request was
-     * actually answered with a challenge page.
+     * Request-first, CF only when actually challenged.
+     *
+     *   1. Direct GET. Real HTML → return.
+     *   2. Blank response → likely a network-level failure. One retry, then
+     *      give up: running the resolver for a DNS error is pointless.
+     *   3. Challenge response → one more direct GET (CDN cache often serves
+     *      the real page on the second try).
+     *   4. Still challenging → run the resolver under a mutex. Inside the
+     *      mutex we probe once more in case a concurrent caller already
+     *      solved it while we were waiting for the lock.
+     *   5. Return whatever the final GET gives.
+     *
+     * This is what makes a CF state flip a non-event: the next challenge
+     * simply triggers the resolver again, and the resolver's success condition
+     * (reached real page) is valid in either state.
      */
     private suspend fun fetchHtml(url: String): String {
         val first = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
         if (first.isNotBlank() && !isCloudflareChallenge(first)) return first
 
-        val second = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
-        if (second.isNotBlank() && !isCloudflareChallenge(second)) return second
+        if (first.isBlank()) {
+            val retry = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
+            if (retry.isBlank()) return ""
+            if (!isCloudflareChallenge(retry)) return retry
+        } else {
+            // first was a challenge — one more direct attempt before the resolver.
+            val second = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
+            if (second.isNotBlank() && !isCloudflareChallenge(second)) return second
+        }
 
+        // Genuine challenge. Serialize and re-probe inside the lock.
         cfMutex.withLock {
+            val probe = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
+            if (probe.isNotBlank() && !isCloudflareChallenge(probe)) return probe
+
             resolveCloudflareAndCipher(waitForCipher = false)
             CookieManager.getInstance().flush()
         }
@@ -530,11 +587,9 @@ class ComixProvider : MainAPI() {
     }
 
     /**
-     * Silent, headless cipher capture. Never opens a dialog.
-     *
-     * Cooldown is burned on BOTH success and failure so a site with no cipher
-     * material doesn't waste ~10 s per page. If a cipher is captured the next
-     * call short-circuits on `cachedCipher() != null`.
+     * Silent, headless cipher capture. Never opens a dialog. Cooldown is
+     * burned on both outcomes so a site with no cipher material doesn't cost
+     * ~10 s per page.
      */
     private suspend fun trySilentCipherAcquisition(): Boolean {
         if (cachedCipher() != null) return true
@@ -730,9 +785,24 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // 2. SSR fallback. Multiple URL patterns, relaxed matcher, DOM fallback.
-        //    ?page=N alone is not enough: the homepage's initial-data is
-        //    server-rendered for page 1 and does not carry paginated items.
+        // 2. Silent cipher acquisition. Works in both CF states.
+        if (cachedCipher() == null && trySilentCipherAcquisition()) {
+            val body = getSigned("/api/v1/manga", params)
+            if (!body.isNullOrBlank()) {
+                val root = runCatching { JSONObject(body) }.getOrNull()
+                val arr = root?.optJSONObject("result")?.optJSONArray("items")
+                    ?: root?.optJSONArray("items")
+                    ?: root?.optJSONObject("data")?.optJSONArray("items")
+                if (arr != null) {
+                    val items = arrToResults(arr)
+                    if (items.isNotEmpty()) {
+                        return PageResult(items, readHasNext(root, page, items.size))
+                    }
+                }
+            }
+        }
+
+        // 3. SSR fallback across several URL shapes.
         val ssrCandidates = buildList {
             add("$mainUrl/?page=$page")
             when (request.data) {
@@ -751,41 +821,22 @@ class ComixProvider : MainAPI() {
             val html = runCatching { fetchHtml(ssrUrl) }.getOrNull() ?: continue
             if (html.isBlank()) continue
 
-            // 2a. initial-data, relaxed matcher — no strict page equality.
             val initial = extractInitialDataJson(html)
             if (initial != null) {
                 val items = readQueries(initial) { k ->
                     if (k.length() < 2 || k.optString(0) != "manga") return@readQueries false
                     when (request.data) {
-                        "hot"    -> k.optString(1) == "list" &&
-                                    k.optJSONObject(2)?.optString("scope", "hot") == "hot"
+                        "hot" -> k.optString(1) == "list" &&
+                                 k.optJSONObject(2)?.optString("scope", "hot") == "hot"
                         "latest" -> k.optString(1) == "list"
-                        else     -> false
+                        else -> false
                     }
                 }
                 if (items.isNotEmpty()) return PageResult(items, hasNext = true)
             }
 
-            // 2b. DOM fallback — same extraction the main page uses.
             val domItems = extractSearchResultsDom(Jsoup.parse(html))
             if (domItems.isNotEmpty()) return PageResult(domItems, hasNext = true)
-        }
-
-        // 3. Silent cipher, cooldown-limited (see trySilentCipherAcquisition).
-        if (cachedCipher() == null && trySilentCipherAcquisition()) {
-            val body = getSigned("/api/v1/manga", params)
-            if (!body.isNullOrBlank()) {
-                val root = runCatching { JSONObject(body) }.getOrNull()
-                val arr = root?.optJSONObject("result")?.optJSONArray("items")
-                    ?: root?.optJSONArray("items")
-                    ?: root?.optJSONObject("data")?.optJSONArray("items")
-                if (arr != null) {
-                    val items = arrToResults(arr)
-                    if (items.isNotEmpty()) {
-                        return PageResult(items, readHasNext(root, page, items.size))
-                    }
-                }
-            }
         }
 
         return PageResult(emptyList(), false)
@@ -831,43 +882,6 @@ class ComixProvider : MainAPI() {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
 
-        // 1. SSR first — no CF, no cipher, no dialog.
-        val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
-        val searchUrl = "$mainUrl/browse?q=$encoded"
-        val html = fetchHtml(searchUrl)
-        if (html.isNotBlank()) {
-            val allItems = mutableListOf<SearchResponse>()
-            extractInitialDataJson(html)?.let { initial ->
-                val queries = initial.optJSONObject("queries")
-                if (queries != null) {
-                    val keys = queries.keys()
-                    while (keys.hasNext()) {
-                        val k = keys.next()
-                        val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
-                        if (parsed.length() >= 1 && parsed.optString(0) == "manga") {
-                            val value = queries.opt(k)
-                            val arr = when (value) {
-                                is JSONArray  -> value
-                                is JSONObject -> value.optJSONArray("items")
-                                else          -> null
-                            } ?: continue
-                            for (i in 0 until arr.length()) {
-                                arr.optJSONObject(i)?.let { obj ->
-                                    parseMangaFromJson(obj)?.let { r -> allItems.add(r) }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if (allItems.isEmpty()) allItems.addAll(extractSearchResultsDom(Jsoup.parse(html)))
-            val lower = cleanQuery.lowercase()
-            val filtered = allItems.filter { it.name.lowercase().contains(lower) }
-            val out = (filtered.ifEmpty { allItems }).distinctBy { it.url }
-            if (out.isNotEmpty()) return out
-        }
-
-        // 2. Signed API with cached cipher (no dialog).
         if (cachedCipher() != null) {
             val params = mapOf("keyword" to listOf(cleanQuery), "limit" to listOf("28"))
             val body = getSigned("/api/v1/manga", params)
@@ -883,7 +897,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // 3. Silent cipher acquisition (no dialog), then retry the API.
         if (cachedCipher() == null && trySilentCipherAcquisition()) {
             val params = mapOf("keyword" to listOf(cleanQuery), "limit" to listOf("28"))
             val body = getSigned("/api/v1/manga", params)
@@ -899,20 +912,96 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        return emptyList()
+        val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
+        val searchUrl = "$mainUrl/browse?q=$encoded"
+        val html = fetchHtml(searchUrl)
+        if (html.isBlank()) return emptyList()
+
+        val allItems = mutableListOf<SearchResponse>()
+        extractInitialDataJson(html)?.let { initial ->
+            val queries = initial.optJSONObject("queries")
+            if (queries != null) {
+                val keys = queries.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
+                    if (parsed.length() >= 1 && parsed.optString(0) == "manga") {
+                        val value = queries.opt(k)
+                        val arr = when (value) {
+                            is JSONArray  -> value
+                            is JSONObject -> value.optJSONArray("items")
+                            else          -> null
+                        } ?: continue
+                        for (i in 0 until arr.length()) {
+                            arr.optJSONObject(i)?.let { obj -> parseMangaFromJson(obj)?.let { r -> allItems.add(r) } }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (allItems.isEmpty()) allItems.addAll(extractSearchResultsDom(Jsoup.parse(html)))
+        val lower = cleanQuery.lowercase()
+        val filtered = allItems.filter { it.name.lowercase().contains(lower) }
+        return (filtered.ifEmpty { allItems }).distinctBy { it.url }
     }
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Load Details & Reader
+    //  Load Details
     // ═══════════════════════════════════════════════════════════════════════
+    private fun formatChapterNum(n: Double): String = if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
+
+    private fun chapterPageUrl(base: String, pageNum: Int): String =
+        if (base.contains("?")) "$base&page=$pageNum" else "$base?page=$pageNum"
+
     override suspend fun load(url: String): LoadResponse? {
         val html = fetchHtml(url)
         if (html.isBlank()) return null
 
         val document = Jsoup.parse(html)
         val initialData = extractInitialDataJson(document)
+
+        val parsedChapterLinks = mutableMapOf<String, Pair<String, String>>()
+
+        fun extractChaptersFromHtml(doc: Document) {
+            doc.select("a.mchap-row__primary, a[href*='-chapter-']").forEach { a ->
+                val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
+                val m = Regex("""-chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return@forEach
+                val numStr = m.groupValues[1].toDoubleOrNull()?.let { formatChapterNum(it) } ?: return@forEach
+                if (a.hasClass("mchap-row__primary") || a.parents().any { it.hasClass("mchap-item") }) {
+                    if (!parsedChapterLinks.containsKey(numStr)) {
+                        val visible = a.text().trim()
+                        parsedChapterLinks[numStr] = visible.ifBlank { "Ch. $numStr" } to href
+                    }
+                }
+            }
+        }
+
+        extractChaptersFromHtml(document)
+
+        var maxPage = 1
+        document.select(".npager__num").forEach { el ->
+            val p = el.text().toIntOrNull() ?: 1
+            if (p > maxPage) maxPage = p
+        }
+
+        if (maxPage > 1) {
+            val pages = (2..maxPage).toList()
+            for (chunk in pages.chunked(3)) {
+                coroutineScope {
+                    chunk.map { pageNum ->
+                        async {
+                            val pUrl = chapterPageUrl(url, pageNum)
+                            val response = runCatching { fetchHtml(pUrl) }.getOrNull() ?: return@async
+                            if (response.isBlank()) return@async
+                            extractChaptersFromHtml(Jsoup.parse(response))
+                        }
+                    }.awaitAll()
+                }
+            }
+        }
 
         var detail: JSONObject? = null
         initialData?.optJSONObject("queries")?.let { queries ->
@@ -957,27 +1046,29 @@ class ComixProvider : MainAPI() {
         }.distinct()
 
         val latestChapterNum = d?.optInt("latestChapter", 0) ?: 0
-
         val firstChapterUrl  = d?.optString("firstChapterUrl")?.takeIf { it.isNotBlank() }
-            ?: document.selectFirst("a[href*='-chapter-']")?.attr("href")
-            ?: url
-
-        val startsAtZero = firstChapterUrl.contains("-chapter-0", ignoreCase = true)
+        val startsAtZero = firstChapterUrl?.contains("-chapter-0", ignoreCase = true) == true
         val startCh = if (startsAtZero) 0 else 1
 
-        val epName = if (latestChapterNum > 0) {
-            "Chapters $startCh - $latestChapterNum"
-        } else {
-            "Read Manga"
-        }
+        val allChapterKeys = mutableSetOf<String>()
+        if (latestChapterNum > 0) for (i in startCh..latestChapterNum) allChapterKeys.add(i.toString())
+        parsedChapterLinks.keys.forEach { allChapterKeys.add(it) }
+        val sortedKeys = allChapterKeys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
 
-        val episodes = listOf(
-            newEpisode(fixUrl(firstChapterUrl)) {
+        val episodes = sortedKeys.mapIndexed { index, key ->
+            val realData = parsedChapterLinks[key]
+            val epUrl = if (realData != null) realData.second
+                else if (key == "0" && startsAtZero && firstChapterUrl != null) firstChapterUrl
+                else if (key == "1" && !startsAtZero && firstChapterUrl != null) firstChapterUrl
+                else "$url/chapter-$key"
+            val epName = realData?.first ?: "Ch. $key"
+            newEpisode(fixUrl(epUrl)) {
                 this.name = epName
+                this.season = 1
+                this.episode = index + 1
                 this.posterUrl = posterUrl
-                this.episode = 1
             }
-        )
+        }
 
         return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
             this.posterUrl = posterUrl
