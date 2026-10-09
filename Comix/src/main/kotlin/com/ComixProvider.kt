@@ -254,7 +254,7 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ── NEW: diagnostic-only, receives the localStorage dump ───────────
+        // ── Diagnostic-only, receives the localStorage dump ────────────────
         @JavascriptInterface
         fun submitLocalStorageDump(dump: String) {
             Log.e(TAG, "=== LOCALSTORAGE DUMP START ===")
@@ -626,7 +626,7 @@ class ComixProvider : MainAPI() {
                     }
                     override fun onPageFinished(view: WebView?, url: String?) {
                         view?.evaluateJavascript(CAPTURE_SCRIPT, null)
-                        // ── NEW: fire the localStorage diagnostic ────────
+                        // Fire the localStorage diagnostic (synchronous first shot).
                         view?.evaluateJavascript(LOCAL_STORAGE_DUMP_SCRIPT, null)
                     }
                 }
@@ -1271,17 +1271,16 @@ class ComixProvider : MainAPI() {
         data class ApiKey(val tab: String, val page: Int)
 
         /**
-         * Diagnostic-only. Dumps all localStorage keys 3 times, spaced 1.5 s
-         * apart, to catch both "before settings are written" and "after
-         * settings are written" states. Runs once per WebView.
+         * Diagnostic-only. Fires shot 1 synchronously (before the WebView is
+         * destroyed), then schedules shots 2 and 3 at 400 ms and 1000 ms —
+         * both well within the WebView's ~1 s lifespan.
          */
         val LOCAL_STORAGE_DUMP_SCRIPT = """
             (function () {
                 if (window.__comixLsDumped) return;
                 window.__comixLsDumped = true;
-                var shots = 0;
-                var iv = setInterval(function () {
-                    shots++;
+
+                function snap(shot) {
                     try {
                         var out = [];
                         for (var i = 0; i < localStorage.length; i++) {
@@ -1291,15 +1290,18 @@ class ComixProvider : MainAPI() {
                             out.push(k + ' = ' + v);
                         }
                         ComixCipherBridge.submitLocalStorageDump(
-                            '[shot ' + shots + '] ' + out.length + ' keys\n' + out.join('\n')
+                            '[shot ' + shot + '] ' + out.length + ' keys\n' + out.join('\n')
                         );
                     } catch (e) {
                         ComixCipherBridge.submitLocalStorageDump(
-                            '[shot ' + shots + '] error: ' + (e && e.message ? e.message : 'unknown')
+                            '[shot ' + shot + '] error: ' + (e && e.message ? e.message : 'unknown')
                         );
                     }
-                    if (shots >= 3) clearInterval(iv);
-                }, 1500);
+                }
+
+                snap(1);
+                setTimeout(function () { snap(2); }, 400);
+                setTimeout(function () { snap(3); }, 1000);
             })();
         """.trimIndent()
 
