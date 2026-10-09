@@ -1332,6 +1332,14 @@ class ComixProvider : MainAPI() {
 
         data class ApiKey(val tab: String, val page: Int)
 
+        /**
+         * Runs at document-start. Seeds `list.filters.v2.contentRating` with
+         * all four ratings, then proxies setItem/getItem for that key so any
+         * subsequent SPA write is forced back to all four. Also observes the
+         * DOM to keep the CONTENT RATING dropdown label synced.
+         *
+         * Diagnostic logging retained for reference.
+         */
         val LOCAL_STORAGE_SEED_SCRIPT = """
             (function () {
                 try {
@@ -1404,40 +1412,20 @@ class ComixProvider : MainAPI() {
             })();
         """.trimIndent()
 
+        /**
+         * Diagnostic + capture script. Hooks atob, XHR, and fetch to:
+         *   1. Detect cipher material (sboxes/keys) via atob heuristic
+         *   2. Log every /api/ XHR and fetch to see what the site requests
+         *   3. Cache every /api/v1/manga response body for pagination + search
+         *
+         * URL rewriting is intentionally NOT performed — the server validates
+         * the `_=` signature against the exact query string, so injecting
+         * extra params invalidates the signature.
+         */
         val CAPTURE_SCRIPT = """
             (function () {
                 if (window.__comixCipherHook) return;
                 window.__comixCipherHook = true;
-
-                function rewriteUrl(url) {
-                    try {
-                        if (typeof url !== 'string') return url;
-                        if (url.indexOf('/api/v1/manga') === -1) return url;
-                        if (url.indexOf('content_rating') === -1 && url.indexOf('page=') === -1) return url;
-
-                        var frag = '';
-                        var hashIdx = url.indexOf('#');
-                        if (hashIdx >= 0) { frag = url.substring(hashIdx); url = url.substring(0, hashIdx); }
-
-                        var qIdx = url.indexOf('?');
-                        if (qIdx < 0) return url + frag;
-                        var base = url.substring(0, qIdx);
-                        var qs = url.substring(qIdx + 1);
-
-                        var parts = qs.split('&').filter(function (p) {
-                            return p.indexOf('content_rating') !== 0 &&
-                                   p.indexOf('content_rating%5B%5D') !== 0 &&
-                                   p.indexOf('content_rating[]') !== 0;
-                        });
-
-                        parts.push('content_rating%5B%5D=safe');
-                        parts.push('content_rating%5B%5D=suggestive');
-                        parts.push('content_rating%5B%5D=erotica');
-                        parts.push('content_rating%5B%5D=pornographic');
-
-                        return base + '?' + parts.join('&') + frag;
-                    } catch (e) { return url; }
-                }
 
                 var captures = window.__comixCipherCaptures = [];
                 var seen = window.__comixSeenLengths = {};
@@ -1512,16 +1500,9 @@ class ComixProvider : MainAPI() {
                         var origOpen = XHR.prototype.open;
                         var origSend = XHR.prototype.send;
                         XHR.prototype.open = function (method, url) {
-                            var rewritten = rewriteUrl(url);
-                            if (rewritten !== url) {
-                                ComixCipherBridge.submitDiagnostic('XHR-REWRITE',
-                                    'orig=' + url.substring(0, 160));
-                                ComixCipherBridge.submitDiagnostic('XHR-REWRITE',
-                                    'new =' + rewritten.substring(0, 200));
-                            }
-                            this.__comixUrl = rewritten;
-                            reportSigned(rewritten);
-                            return origOpen.call(this, method, rewritten);
+                            this.__comixUrl = url;
+                            reportSigned(url);
+                            return origOpen.apply(this, arguments);
                         };
                         XHR.prototype.send = function () {
                             var self = this;
@@ -1548,25 +1529,14 @@ class ComixProvider : MainAPI() {
                             var url = typeof input === 'string'
                                 ? input
                                 : (input && input.url) ? input.url : '';
-                            var rewritten = rewriteUrl(url);
-                            if (rewritten !== url) {
-                                ComixCipherBridge.submitDiagnostic('FETCH-REWRITE',
-                                    'orig=' + url.substring(0, 160));
-                                ComixCipherBridge.submitDiagnostic('FETCH-REWRITE',
-                                    'new =' + rewritten.substring(0, 200));
-                            }
-                            reportSigned(rewritten);
-                            if (rewritten !== url) {
-                                if (typeof input === 'string') input = rewritten;
-                                else if (input && input.url) input = new Request(rewritten, input);
-                            }
-                            var p = origFetch.call(this, input, init);
+                            reportSigned(url);
+                            var p = origFetch.apply(this, arguments);
                             try {
                                 p.then(function (res) {
                                     try {
                                         res.clone().text().then(function (body) {
-                                            reportApiBody(rewritten, body);
-                                            reportCipherBody(rewritten, body);
+                                            reportApiBody(url, body);
+                                            reportCipherBody(url, body);
                                         });
                                     } catch (e) {}
                                 });
