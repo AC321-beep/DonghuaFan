@@ -258,7 +258,7 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ── Diagnostic-only, receives arbitrary tagged messages from JS ──
+        // Diagnostic-only
         @JavascriptInterface
         fun submitDiagnostic(tag: String, message: String) {
             Log.e(TAG, "DIAG[$tag] $message")
@@ -508,13 +508,53 @@ class ComixProvider : MainAPI() {
         }
     }
 
+    /**
+     * Patches HTML on three fronts:
+     *   1. Injects the seed script right after <head> — runs before any site JS.
+     *   2. Rewrites the SSR'd initial-data JSON's list.params to include
+     *      content_rating — defeats SPA boot logic that reads initial params.
+     *   3. (Seed script itself also patches the DOM label via MutationObserver.)
+     */
     private fun injectSeedIntoHtml(html: String): String? {
-        val seed = "<script>${LOCAL_STORAGE_SEED_SCRIPT.replace("</", "<\\/")}</script>"
+        val seedTag = "<script>${LOCAL_STORAGE_SEED_SCRIPT.replace("</", "<\\/")}</script>"
+
+        // 1) Insert seed script right after <head>
         val headOpenIdx = html.indexOf("<head", ignoreCase = true)
         if (headOpenIdx < 0) return null
         val headCloseIdx = html.indexOf('>', headOpenIdx)
         if (headCloseIdx < 0) return null
-        return html.substring(0, headCloseIdx + 1) + seed + html.substring(headCloseIdx + 1)
+        var patched = html.substring(0, headCloseIdx + 1) + seedTag + html.substring(headCloseIdx + 1)
+
+        // 2) Inject content_rating into the initial-data JSON's list.params
+        try {
+            val idMarker = "id=\"initial-data\""
+            val idMarkerAlt = "id='initial-data'"
+            val initialStart = if (patched.contains(idMarker))
+                patched.indexOf(idMarker) else patched.indexOf(idMarkerAlt)
+            if (initialStart >= 0) {
+                val jsonStart = patched.indexOf('>', initialStart)
+                val jsonEnd = patched.indexOf("</script>", jsonStart)
+                if (jsonStart >= 0 && jsonEnd > jsonStart) {
+                    val jsonText = patched.substring(jsonStart + 1, jsonEnd)
+                    val root = JSONObject(jsonText)
+                    val list = root.optJSONObject("list")
+                    val params = list?.optJSONObject("params")
+                    if (params != null && !params.has("content_rating")) {
+                        params.put(
+                            "content_rating",
+                            JSONArray(listOf("safe", "suggestive", "erotica", "pornographic"))
+                        )
+                        val newJson = root.toString()
+                        patched = patched.substring(0, jsonStart + 1) + newJson + patched.substring(jsonEnd)
+                        Log.e(TAG, "injectSeedIntoHtml → added content_rating to initial-data params")
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "injectSeedIntoHtml JSON patch failed: ${t.message}")
+        }
+
+        return patched
     }
 
     private suspend fun fetchHomeHtml(): String {
@@ -1333,13 +1373,16 @@ class ComixProvider : MainAPI() {
         data class ApiKey(val tab: String, val page: Int)
 
         /**
-         * Diagnostic build of the seed script. Seeds `list.filters.v2` with
-         * all four ratings, then proxies setItem/getItem to (a) force our
-         * value on every write and (b) log every interaction so we can see
-         * exactly what the SPA does with the filter state.
+         * Diagnostic seed script — attacks the filter from three angles:
          *
-         * Also snapshots the SSR'd filter UI labels after page load to detect
-         * whether the SPA reads from the DOM instead of localStorage.
+         *   1. Seeds `list.filters.v2.contentRating` with all four ratings.
+         *   2. Proxies `localStorage.setItem`/`getItem` for that key so any
+         *      subsequent SPA write is forced back to all four.
+         *   3. Uses a MutationObserver to replace the SSR'd "Safe + 1" label
+         *      in the CONTENT RATING dropdown with "Any", in case the SPA
+         *      reads from the DOM.
+         *
+         * Logs everything so we can see which mechanism the SPA honours.
          */
         val LOCAL_STORAGE_SEED_SCRIPT = """
             (function () {
@@ -1355,67 +1398,66 @@ class ComixProvider : MainAPI() {
                             var parsed = JSON.parse(json);
                             parsed.contentRating = DESIRED;
                             return JSON.stringify(parsed);
-                        } catch (e) {
-                            return json;
-                        }
+                        } catch (e) { return json; }
                     }
 
-                    // Snapshot before we touch anything
                     var initial = originalGet(KEY);
                     ComixCipherBridge.submitDiagnostic('SEED-INITIAL',
-                        (initial || '(null)').substring(0, 300));
-
-                    // Initial seed
+                        (initial || '(null)').substring(0, 250));
                     originalSet(KEY, patch(initial || '{}'));
                     ComixCipherBridge.submitDiagnostic('SEED-AFTER',
-                        (originalGet(KEY) || '(null)').substring(0, 300));
+                        (originalGet(KEY) || '(null)').substring(0, 250));
 
-                    // Intercept writes
                     localStorage.setItem = function (k, v) {
                         if (k === KEY && typeof v === 'string') {
                             var patched = patch(v);
                             ComixCipherBridge.submitDiagnostic('SET-ITEM',
-                                'incoming=' + v.substring(0, 200) +
-                                ' | forcing=' + patched.substring(0, 200));
+                                'incoming=' + v.substring(0, 150) +
+                                ' forcing=' + patched.substring(0, 150));
                             return originalSet(k, patched);
                         }
                         return originalSet(k, v);
                     };
-
-                    // Intercept reads (log only first call)
-                    var firstGetLogged = false;
                     localStorage.getItem = function (k) {
                         var v = originalGet(k);
                         if (k === KEY && typeof v === 'string') {
                             var patched = patch(v);
                             if (patched !== v) originalSet(k, patched);
-                            if (!firstGetLogged) {
-                                firstGetLogged = true;
-                                ComixCipherBridge.submitDiagnostic('GET-ITEM',
-                                    'returning=' + patched.substring(0, 250));
-                            }
                             return patched;
                         }
                         return v;
                     };
-
-                    // Snapshot the SSR'd filter UI labels after load
-                    setTimeout(function () {
-                        try {
-                            var labels = [];
-                            document.querySelectorAll('.fdrop').forEach(function (d) {
-                                var lbl = d.querySelector('.fdrop__label');
-                                var val = d.querySelector('.fdrop__value');
-                                if (lbl && val) {
-                                    labels.push(lbl.innerText.trim() + '=' + val.innerText.trim());
-                                }
-                            });
-                            ComixCipherBridge.submitDiagnostic('UI-FILTERS',
-                                labels.join(' | ').substring(0, 300));
-                        } catch (e) {}
-                    }, 200);
                 } catch (e) {
                     ComixCipherBridge.submitDiagnostic('SEED-ERROR', '' + e);
+                }
+
+                // ── DOM label patch via MutationObserver ────────────────
+                try {
+                    var patchedOnce = false;
+                    var observer = new MutationObserver(function () {
+                        var labels = document.querySelectorAll('.fdrop__label');
+                        for (var i = 0; i < labels.length; i++) {
+                            var txt = (labels[i].textContent || '').toUpperCase();
+                            if (txt.indexOf('CONTENT RATING') !== -1) {
+                                var parent = labels[i].parentElement;
+                                if (!parent) continue;
+                                var btn = parent.querySelector('.fdrop__value');
+                                if (btn && btn.textContent !== 'Any') {
+                                    btn.textContent = 'Any';
+                                    if (!patchedOnce) {
+                                        patchedOnce = true;
+                                        ComixCipherBridge.submitDiagnostic('DOM-PATCH',
+                                            'CONTENT RATING → Any');
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    observer.observe(document.documentElement, {
+                        childList: true, subtree: true, characterData: true
+                    });
+                } catch (e) {
+                    ComixCipherBridge.submitDiagnostic('OBSERVER-ERROR', '' + e);
                 }
             })();
         """.trimIndent()
