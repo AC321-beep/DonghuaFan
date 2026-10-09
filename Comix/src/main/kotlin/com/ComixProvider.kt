@@ -565,10 +565,15 @@ class ComixProvider : MainAPI() {
         return m.groupValues[1]
     }
 
+    /**
+     * Injects ONLY the localStorage seed. The previous version also injected
+     * an initial-data patcher, but the logcat showed that patch reset the
+     * SPA's reactive store back to 2 ratings on every mount — the exact
+     * opposite of what we wanted.
+     */
     private fun injectSeedIntoHtml(html: String): String? {
         val seedBody = LOCAL_STORAGE_SEED_SCRIPT.replace("</", "<\\/")
-        val patchBody = INITIAL_DATA_PATCH_SCRIPT.replace("</", "<\\/")
-        val seed = "<script>$seedBody</script><script>$patchBody</script>"
+        val seed = "<script>$seedBody</script>"
         val headOpenIdx = html.indexOf("<head", ignoreCase = true)
         if (headOpenIdx < 0) return null
         val headCloseIdx = html.indexOf('>', headOpenIdx)
@@ -668,12 +673,6 @@ class ComixProvider : MainAPI() {
         )
     }
 
-    /**
-     * Browse URL — NO content_rating[] params. The logcat proved that including
-     * them makes the SPA's URL parser collapse the four values into two, which
-     * then poisons the reactive store for the entire session. Relying on the
-     * localStorage seed instead yields a clean 4-rating state on every mount.
-     */
     private fun browseUrlFor(tab: String, page: Int): String? {
         val order = when (tab) {
             "hot"      -> "chapter_updated_at" to "desc"
@@ -686,7 +685,7 @@ class ComixProvider : MainAPI() {
             "followsApi" -> "follows_total" to "desc"
             else -> return null
         }
-        return "$mainUrl/browse?order[${order.first}]=${order.second}&page=$page&limit=28"
+        return "$mainUrl/browse?order[${order.first}]=${order.second}&page=$page&limit=28$CONTENT_RATINGS_QUERY"
     }
 
     private fun maybePrefetchPage2(request: MainPageRequest) {
@@ -1227,8 +1226,7 @@ class ComixProvider : MainAPI() {
         }
 
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
-        // No content_rating[] params — same rationale as browseUrlFor.
-        val browseUrl = "$mainUrl/browse?q=$encoded"
+        val browseUrl = "$mainUrl/browse?q=$encoded$CONTENT_RATINGS_QUERY"
         Log.e(TAG, "search WebView fallback url=$browseUrl")
 
         val apiRoot = captureSearchApi(browseUrl, cleanQuery)
@@ -1387,6 +1385,9 @@ class ComixProvider : MainAPI() {
 
         val CONTENT_RATINGS = listOf("safe", "suggestive", "erotica", "pornographic")
 
+        val CONTENT_RATINGS_QUERY: String =
+            CONTENT_RATINGS.joinToString("") { "&content_rating[]=$it" }
+
         val signedApiCache = ConcurrentHashMap<ApiKey, String>()
         val signedApiCacheRatingCount = ConcurrentHashMap<ApiKey, Int>()
         val searchApiCache = ConcurrentHashMap<String, String>()
@@ -1409,10 +1410,10 @@ class ComixProvider : MainAPI() {
         data class ApiKey(val tab: String, val page: Int)
 
         /**
-         * localStorage seed only — no UI click sweep. The logcat proved the
-         * SPA already mounts with 4 ratings when this seed is the only source
-         * of truth. The UI click was actively harmful because it triggered a
-         * re-render that reset the store.
+         * localStorage seed only — no UI click sweep, no initial-data patch.
+         * The logcat showed the initial-data patch was resetting the SPA's
+         * reactive store back to 2 ratings, and the click sweep was racing
+         * the SPA's re-render. Just seed localStorage and let the SPA read it.
          */
         val LOCAL_STORAGE_SEED_SCRIPT = """
             (function () {
@@ -1458,51 +1459,18 @@ class ComixProvider : MainAPI() {
             })();
         """.trimIndent()
 
-        val INITIAL_DATA_PATCH_SCRIPT = """
-            (function () {
-                var RATINGS = ['safe','suggestive','erotica','pornographic'];
-                function patch() {
-                    var el = document.getElementById('initial-data');
-                    if (!el || el.__patched) return false;
-                    try {
-                        var text = el.textContent || el.innerHTML || '';
-                        if (!text) return false;
-                        var data = JSON.parse(text);
-                        if (data && data.list && data.list.params) {
-                            data.list.params.contentRating = RATINGS;
-                            data.list.params.content_rating = RATINGS;
-                            el.textContent = JSON.stringify(data);
-                            el.__patched = true;
-                            try { ComixCipherBridge.submitDiagnostic('PATCH-INITIAL', 'ok'); } catch (e) {}
-                            return true;
-                        }
-                    } catch (e) {
-                        try { ComixCipherBridge.submitDiagnostic('PATCH-INITIAL-ERR', '' + e); } catch (ex) {}
-                    }
-                    return false;
-                }
-                patch();
-                try {
-                    new MutationObserver(function () { patch(); })
-                        .observe(document.documentElement || document, { childList: true, subtree: true });
-                } catch (e) {}
-                document.addEventListener('DOMContentLoaded', patch);
-            })();
-        """.trimIndent()
-
         /**
-         * Broader cipher capture. The previous version only hooked atob /
-         * importKey / Uint8Array.from — none of them fired on this SPA.
-         *
-         * Added hooks:
-         *  - crypto.subtle.digest output (most likely path for KDF)
-         *  - Uint8Array constructor via Proxy (catches `new Uint8Array([...])`)
-         *  - Array.from (catches `Array.from(bufferLike)`)
-         *  - String.fromCharCode (catches char-code loop construction)
+         * Broadened cipher capture. Now hooks:
+         *  - atob
+         *  - String.fromCharCode
+         *  - ArrayBuffer constructor (via Proxy)
+         *  - crypto.subtle.digest output + importKey
+         *  - Uint8Array constructor (via Proxy) + Uint8Array.from
+         *  - Array.from
          *  - TextDecoder.prototype.decode
          *
-         * Content-based dedup so distinct sboxes with the same length are all
-         * retained. Submit only at 3+3 (what CipherMaterial.isValid requires).
+         * Content-based dedup; submit only at 3 sboxes + 3 keys (what
+         * CipherMaterial.isValid requires).
          */
         val CAPTURE_SCRIPT = """
             (function () {
@@ -1582,7 +1550,44 @@ class ComixProvider : MainAPI() {
                     Object.defineProperty(window, 'atob', { value: stealthAtob, writable: true, configurable: true });
                 } catch (e) {}
 
-                // crypto.subtle.digest + importKey
+                // String.fromCharCode
+                try {
+                    var origFromCharCode = String.fromCharCode;
+                    String.fromCharCode = function () {
+                        var s = origFromCharCode.apply(String, arguments);
+                        try {
+                            if (s.length === 256 || s.length === 24 || s.length === 32) {
+                                var bytes = new Uint8Array(s.length);
+                                for (var i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i) & 255;
+                                consider(bytes);
+                            }
+                        } catch (e) {}
+                        return s;
+                    };
+                } catch (e) {}
+
+                // ArrayBuffer constructor
+                try {
+                    var OrigAB = window.ArrayBuffer;
+                    var ABProxy = new Proxy(OrigAB, {
+                        construct: function (target, args) {
+                            var inst = Reflect.construct(target, args);
+                            try {
+                                if (inst.byteLength === 256 || inst.byteLength === 24 || inst.byteLength === 32) {
+                                    setTimeout(function () {
+                                        try { consider(new Uint8Array(inst)); } catch (e) {}
+                                    }, 0);
+                                }
+                            } catch (e) {}
+                            return inst;
+                        }
+                    });
+                    Object.defineProperty(window, 'ArrayBuffer', {
+                        value: ABProxy, writable: true, configurable: true
+                    });
+                } catch (e) {}
+
+                // crypto.subtle
                 try {
                     if (window.crypto && window.crypto.subtle) {
                         var subtle = window.crypto.subtle;
@@ -1648,14 +1653,13 @@ class ComixProvider : MainAPI() {
                     };
                 } catch (e) {}
 
-                // Array.from — catches Array.from(typedArray)
+                // Array.from
                 try {
                     var origArrayFrom = Array.from;
                     Array.from = function (src) {
                         var res = origArrayFrom.apply(this, arguments);
                         try {
                             if (Array.isArray(res) && (res.length === 256 || res.length === 24 || res.length === 32)) {
-                                // Only convert if it's array-like of numbers
                                 var isBytes = true;
                                 for (var i = 0; i < Math.min(res.length, 8); i++) {
                                     if (typeof res[i] !== 'number') { isBytes = false; break; }
@@ -1667,7 +1671,7 @@ class ComixProvider : MainAPI() {
                     };
                 } catch (e) {}
 
-                // TextDecoder.decode
+                // TextDecoder
                 try {
                     if (window.TextDecoder && TextDecoder.prototype && TextDecoder.prototype.decode) {
                         var origDecode = TextDecoder.prototype.decode;
