@@ -251,8 +251,14 @@ class ComixProvider : MainAPI() {
                     url.contains("order%5Bcreated_at%5D")         -> "latest"
                     else -> return
                 }
-                signedApiCache[ApiKey(tab, page)] = body
-                Log.e(TAG, "API RESPONSE cached tab=$tab page=$page len=${body.length}")
+                val key = ApiKey(tab, page)
+                signedApiCache[key] = body
+                val ratingCount = Regex("content_rating").findAll(url).count()
+                val previous = signedApiCacheRatingCount[key] ?: 0
+                if (ratingCount >= previous) {
+                    signedApiCacheRatingCount[key] = ratingCount
+                }
+                Log.e(TAG, "API RESPONSE cached tab=$tab page=$page len=${body.length} ratings=$ratingCount")
             } catch (t: Throwable) {
                 Log.e(TAG, "submitApiResponse error: ${t.message}")
             }
@@ -607,7 +613,7 @@ class ComixProvider : MainAPI() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun captureApiResponse(
-        browseUrl: String, tab: String, page: Int, timeoutMs: Long = 10_000L
+        browseUrl: String, tab: String, page: Int, timeoutMs: Long = 12_000L
     ): JSONObject? = withContext(Dispatchers.Main) {
         val activity = CommonActivity.activity ?: return@withContext null
         if (activity.isFinishing || activity.isDestroyed) return@withContext null
@@ -696,20 +702,31 @@ class ComixProvider : MainAPI() {
             pollRunnable = object : Runnable {
                 override fun run() {
                     if (done.get()) return
-                    val raw = signedApiCache[ApiKey(tab, page)]
+                    val key = ApiKey(tab, page)
+                    val raw = signedApiCache[key]
                     if (raw != null) {
-                        val json = runCatching { JSONObject(raw) }.getOrNull()
-                        if (json != null) {
-                            Log.e(TAG, "captureApiResponse[$tab/$page] captured len=${raw.length}")
-                            cleanup(json); return
+                        val ratingCount = signedApiCacheRatingCount[key] ?: 0
+                        // Accept the wider response as soon as it arrives.
+                        if (ratingCount >= 4) {
+                            val json = runCatching { JSONObject(raw) }.getOrNull()
+                            if (json != null) {
+                                Log.e(TAG, "captureApiResponse[$tab/$page] captured len=${raw.length} ratings=$ratingCount")
+                                cleanup(json)
+                                return
+                            }
                         }
                     }
                     handler.postDelayed(this, 200L)
                 }
             }
             timeoutRunnable = Runnable {
-                Log.e(TAG, "captureApiResponse[$tab/$page] TIMEOUT")
-                cleanup(null)
+                // Timeout: accept whichever response we have (likely the 2-rating one).
+                val key = ApiKey(tab, page)
+                val raw = signedApiCache[key]
+                val ratingCount = signedApiCacheRatingCount[key] ?: 0
+                val json = raw?.let { runCatching { JSONObject(it) }.getOrNull() }
+                Log.e(TAG, "captureApiResponse[$tab/$page] TIMEOUT (cached len=${raw?.length ?: 0} ratings=$ratingCount)")
+                cleanup(json)
             }
 
             decor.addView(webView)
@@ -721,7 +738,7 @@ class ComixProvider : MainAPI() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun captureSearchApi(
-        browseUrl: String, query: String, timeoutMs: Long = 12_000L
+        browseUrl: String, query: String, timeoutMs: Long = 14_000L
     ): JSONObject? = withContext(Dispatchers.Main) {
         val activity = CommonActivity.activity ?: return@withContext null
         if (activity.isFinishing || activity.isDestroyed) return@withContext null
@@ -1308,12 +1325,13 @@ class ComixProvider : MainAPI() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  Companion — caches, locks, seed script, capture script
+    //  Companion — caches, locks, seed script with UI click, capture script
     // ══════════════════════════════════════════════════════════════════════
 
     private companion object {
 
         val signedApiCache = ConcurrentHashMap<ApiKey, String>()
+        val signedApiCacheRatingCount = ConcurrentHashMap<ApiKey, Int>()
         val searchApiCache = ConcurrentHashMap<String, String>()
         val mainPageCache  = ConcurrentHashMap<String, Pair<List<SearchResponse>, Long>>()
 
@@ -1338,7 +1356,10 @@ class ComixProvider : MainAPI() {
          * subsequent SPA write is forced back to all four. Also observes the
          * DOM to keep the CONTENT RATING dropdown label synced.
          *
-         * Diagnostic logging retained for reference.
+         * Finally, attempts a programmatic UI click on the CONTENT RATING
+         * dropdown to select "Show all". The SPA then re-issues its own signed
+         * XHR with all four ratings — and only the SPA can produce a valid
+         * signature. The response is picked up by `captureApiResponse`.
          */
         val LOCAL_STORAGE_SEED_SCRIPT = """
             (function () {
@@ -1382,6 +1403,7 @@ class ComixProvider : MainAPI() {
                 } catch (e) {
                     ComixCipherBridge.submitDiagnostic('SEED-ERROR', '' + e);
                 }
+
                 try {
                     var patchedOnce = false;
                     var observer = new MutationObserver(function () {
@@ -1409,19 +1431,60 @@ class ComixProvider : MainAPI() {
                 } catch (e) {
                     ComixCipherBridge.submitDiagnostic('OBSERVER-ERROR', '' + e);
                 }
+
+                // ── Programmatic UI click on CONTENT RATING dropdown ────
+                (function () {
+                    var state = 'idle';
+                    var deadline = Date.now() + 6000;
+
+                    function loop() {
+                        if (Date.now() > deadline || state === 'done') return;
+
+                        if (state === 'idle') {
+                            var labels = document.querySelectorAll('.fdrop__label');
+                            for (var i = 0; i < labels.length; i++) {
+                                if ((labels[i].textContent || '').toUpperCase().indexOf('CONTENT RATING') !== -1) {
+                                    var parent = labels[i].parentElement;
+                                    if (!parent) continue;
+                                    var btn = parent.querySelector('.fdrop__btn');
+                                    if (btn) {
+                                        try { btn.click(); } catch (e) {}
+                                        ComixCipherBridge.submitDiagnostic('UI-CLICK', 'dropdown clicked');
+                                        state = 'dropdown-clicked';
+                                        setTimeout(loop, 250);
+                                        return;
+                                    }
+                                }
+                            }
+                        } else if (state === 'dropdown-clicked') {
+                            var options = document.querySelectorAll('[role="option"], .fdrop__opt');
+                            for (var j = 0; j < options.length; j++) {
+                                var t = (options[j].textContent || '').trim();
+                                if (t === 'Show all' || t === 'Show All' || t === 'Any') {
+                                    try { options[j].click(); } catch (e) {}
+                                    ComixCipherBridge.submitDiagnostic('UI-CLICK', 'selected: ' + t);
+                                    state = 'done';
+                                    return;
+                                }
+                            }
+                            var btns = document.querySelectorAll('button, li');
+                            for (var k = 0; k < btns.length; k++) {
+                                var t2 = (btns[k].textContent || '').trim();
+                                if ((t2 === 'Show all' || t2 === 'Show All' || t2 === 'Any') && btns[k].children.length < 3) {
+                                    try { btns[k].click(); } catch (e) {}
+                                    ComixCipherBridge.submitDiagnostic('UI-CLICK', 'selected fallback: ' + t2);
+                                    state = 'done';
+                                    return;
+                                }
+                            }
+                        }
+                        setTimeout(loop, 100);
+                    }
+                    setTimeout(loop, 300);
+                })();
             })();
         """.trimIndent()
 
-        /**
-         * Diagnostic + capture script. Hooks atob, XHR, and fetch to:
-         *   1. Detect cipher material (sboxes/keys) via atob heuristic
-         *   2. Log every /api/ XHR and fetch to see what the site requests
-         *   3. Cache every /api/v1/manga response body for pagination + search
-         *
-         * URL rewriting is intentionally NOT performed — the server validates
-         * the `_=` signature against the exact query string, so injecting
-         * extra params invalidates the signature.
-         */
         val CAPTURE_SCRIPT = """
             (function () {
                 if (window.__comixCipherHook) return;
