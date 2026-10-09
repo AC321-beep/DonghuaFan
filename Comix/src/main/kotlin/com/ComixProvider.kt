@@ -546,19 +546,9 @@ class ComixProvider : MainAPI() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  Prefetch — fire-and-forget page 2 for hot/latest
+    //  Prefetch
     // ══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Launch a background fetch of page 2 for [request.data] if:
-     *   - the tab hasn't been prefetched this session, and
-     *   - page 2 isn't already in the cache.
-     *
-     * Fire-and-forget: the returned coroutine is not awaited, errors are
-     * swallowed, and the whole thing runs on a background dispatcher. The
-     * actual WebView work inside captureApiResponse hops to Dispatchers.Main
-     * automatically.
-     */
     private fun maybePrefetchPage2(request: MainPageRequest) {
         if (request.data != "hot" && request.data != "latest") return
         if (!prefetchedTabs.add(request.data)) return
@@ -568,7 +558,6 @@ class ComixProvider : MainAPI() {
         }
         prefetchScope.launch {
             prefetchMutex.withLock {
-                // Re-check under the lock — another prefetch may have beaten us.
                 if (signedApiCache.containsKey(ApiKey(request.data, 2))) return@withLock
                 Log.e(TAG, "prefetch ${request.data} page=2 (background)")
                 val t0 = System.currentTimeMillis()
@@ -896,11 +885,7 @@ class ComixProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val mutex = tabMutexes.getOrPut(request.data) { Mutex() }
         val resp = mutex.withLock { getMainPageLocked(page, request) }
-        // Trigger prefetch on a successful page-1 return. The prefetch itself
-        // fires-and-forgets — nothing here waits for it.
-        if (page == 1 && resp != null) {
-            maybePrefetchPage2(request)
-        }
+        if (page == 1 && resp != null) maybePrefetchPage2(request)
         return resp
     }
 
@@ -999,9 +984,10 @@ class ComixProvider : MainAPI() {
             }
         }
 
+        // ── Extended content_rating params appended to the browse URL ──
         val browseUrl = when (request.data) {
-            "hot"    -> "$mainUrl/browse?scope=hot&order[chapter_updated_at]=desc&page=$page&limit=28"
-            "latest" -> "$mainUrl/browse?order[created_at]=desc&page=$page&limit=28"
+            "hot"    -> "$mainUrl/browse?scope=hot&order[chapter_updated_at]=desc&page=$page&limit=28$EXTENDED_RATINGS_PARAMS"
+            "latest" -> "$mainUrl/browse?order[created_at]=desc&page=$page&limit=28$EXTENDED_RATINGS_PARAMS"
             else     -> return null
         }
         Log.e(TAG, "fetchQueryPage captureApiResponse url=$browseUrl")
@@ -1078,7 +1064,7 @@ class ComixProvider : MainAPI() {
         }
 
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
-        val browseUrl = "$mainUrl/browse?q=$encoded"
+        val browseUrl = "$mainUrl/browse?q=$encoded$EXTENDED_RATINGS_PARAMS"
         Log.e(TAG, "search captureSearchApi url=$browseUrl")
 
         val apiRoot = captureSearchApi(browseUrl, cleanQuery)
@@ -1238,36 +1224,41 @@ class ComixProvider : MainAPI() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  Companion — caches, locks, prefetch scope
+    //  Companion — caches, locks, extended-rating constant, capture script
     // ══════════════════════════════════════════════════════════════════════
 
     private companion object {
+
+        /**
+         * Extra content_rating[] params appended to every browse URL.
+         *
+         * The site's own SPA defaults to safe+suggestive when it builds its
+         * /api/v1/manga XHR. Adding these params to the browse URL causes the
+         * site's own request to include the extended set, which is what we
+         * then capture. Includes all four levels to override the default
+         * regardless of whether the SPA merges or replaces.
+         *
+         * Remove `&content_rating[]=pornographic` below if you only want
+         * erotica (plot-driven adult) and not explicitly pornographic titles.
+         */
+        const val EXTENDED_RATINGS_PARAMS =
+            "&content_rating[]=safe" +
+            "&content_rating[]=suggestive" +
+            "&content_rating[]=erotica" +
+            "&content_rating[]=pornographic"
 
         val signedApiCache = ConcurrentHashMap<ApiKey, String>()
         val searchApiCache = ConcurrentHashMap<String, String>()
         val mainPageCache  = ConcurrentHashMap<String, Pair<List<SearchResponse>, Long>>()
 
-        /** One Mutex per tab so parallel getMainPage calls serialize. */
         val tabMutexes = ConcurrentHashMap<String, Mutex>()
-
-        /** Single-flight lock for the homepage SSR fetch. */
         val homeFetchMutex = Mutex()
 
         @Volatile var homeHtml: String? = null
         @Volatile var homeHtmlAt: Long = 0L
 
-        /**
-         * Dedicated scope for background prefetch. SupervisorJob ensures one
-         * failed prefetch doesn't kill the scope; IO dispatcher keeps it off
-         * the main thread. WebView work inside captureApiResponse hops back
-         * to Dispatchers.Main automatically.
-         */
         val prefetchScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-
-        /** Serializes prefetches so two WebViews don't spawn in parallel. */
         val prefetchMutex = Mutex()
-
-        /** Tabs we've already prefetched this session. */
         val prefetchedTabs: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
         const val MAIN_PAGE_CACHE_TTL_MS = 60_000L
