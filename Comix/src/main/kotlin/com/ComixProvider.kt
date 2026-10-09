@@ -41,7 +41,10 @@ import com.lagradost.cloudstream3.newAnimeSearchResponse
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -187,7 +190,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  JS bridge — every WebView gets one of these
+    //  JS bridge
     // ══════════════════════════════════════════════════════════════════════
     private fun makeBridge() = object {
         @JavascriptInterface
@@ -220,11 +223,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        /**
-         * Caches the site's own /api/v1/manga responses.
-         *  - Pagination → signedApiCache[ApiKey(tab, page)]
-         *  - Search     → searchApiCache[lowercased keyword]
-         */
         @JavascriptInterface
         fun submitApiResponse(url: String, body: String) {
             try {
@@ -486,10 +484,6 @@ class ComixProvider : MainAPI() {
         return runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
     }
 
-    /**
-     * Single-flight homepage fetch with a 5-second cache. All four tabs
-     * share one request on cold start; on tab switches the cache is reused.
-     */
     private suspend fun fetchHomeHtml(): String {
         val cached = homeHtml
         val at = homeHtmlAt
@@ -549,6 +543,40 @@ class ComixProvider : MainAPI() {
         val ok = attemptSilentResolution(activity, waitForCipher = true)
         lastCipherAttemptMs = now
         return ok
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  Prefetch — fire-and-forget page 2 for hot/latest
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Launch a background fetch of page 2 for [request.data] if:
+     *   - the tab hasn't been prefetched this session, and
+     *   - page 2 isn't already in the cache.
+     *
+     * Fire-and-forget: the returned coroutine is not awaited, errors are
+     * swallowed, and the whole thing runs on a background dispatcher. The
+     * actual WebView work inside captureApiResponse hops to Dispatchers.Main
+     * automatically.
+     */
+    private fun maybePrefetchPage2(request: MainPageRequest) {
+        if (request.data != "hot" && request.data != "latest") return
+        if (!prefetchedTabs.add(request.data)) return
+        if (signedApiCache.containsKey(ApiKey(request.data, 2))) {
+            Log.e(TAG, "prefetch ${request.data} page=2 skipped (already cached)")
+            return
+        }
+        prefetchScope.launch {
+            prefetchMutex.withLock {
+                // Re-check under the lock — another prefetch may have beaten us.
+                if (signedApiCache.containsKey(ApiKey(request.data, 2))) return@withLock
+                Log.e(TAG, "prefetch ${request.data} page=2 (background)")
+                val t0 = System.currentTimeMillis()
+                val ok = runCatching { fetchQueryPage(request, 2) }.getOrNull()
+                val ms = System.currentTimeMillis() - t0
+                Log.e(TAG, "prefetch ${request.data} page=2 done in ${ms}ms items=${ok?.items?.size ?: 0}")
+            }
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -867,7 +895,13 @@ class ComixProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val mutex = tabMutexes.getOrPut(request.data) { Mutex() }
-        return mutex.withLock { getMainPageLocked(page, request) }
+        val resp = mutex.withLock { getMainPageLocked(page, request) }
+        // Trigger prefetch on a successful page-1 return. The prefetch itself
+        // fires-and-forgets — nothing here waits for it.
+        if (page == 1 && resp != null) {
+            maybePrefetchPage2(request)
+        }
+        return resp
     }
 
     private suspend fun getMainPageLocked(
@@ -875,7 +909,6 @@ class ComixProvider : MainAPI() {
     ): HomePageResponse? {
         Log.e(TAG, "───── getMainPage page=$page request.data=${request.data} ─────")
 
-        // ── trending / follows: page 1 only, cached ─────────────────────
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
             val now = System.currentTimeMillis()
@@ -899,7 +932,6 @@ class ComixProvider : MainAPI() {
             return newHomePageResponse(request, distinct, hasNext = false)
         }
 
-        // ── hot / latest page 1: cached ─────────────────────────────────
         if (page == 1) {
             val now = System.currentTimeMillis()
             mainPageCache[request.data]?.let { (cached, at) ->
@@ -915,7 +947,6 @@ class ComixProvider : MainAPI() {
                 Log.e(TAG, "getMainPage ${request.data} page=1 SSR → items=${distinct.size} (stored)")
                 return newHomePageResponse(request, distinct, hasNext = true)
             }
-            // fall through to WebView capture
         }
 
         val result = fetchQueryPage(request, page) ?: return null
@@ -928,7 +959,6 @@ class ComixProvider : MainAPI() {
     private suspend fun fetchQueryPage(request: MainPageRequest, page: Int): PageResult? {
         Log.e(TAG, "▷ fetchQueryPage data=${request.data} page=$page")
 
-        // ── memory cache hit ────────────────────────────────────────────
         signedApiCache[ApiKey(request.data, page)]?.let { raw ->
             val root = runCatching { JSONObject(raw) }.getOrNull()
             if (root != null) {
@@ -940,7 +970,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ── legacy signed cipher path (never hits on current site) ──────
         if (cachedCipher() != null) {
             val params: Map<String, List<String>> = when (request.data) {
                 "hot" -> mapOf(
@@ -970,7 +999,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ── WebView capture of the site's own signed API call ───────────
         val browseUrl = when (request.data) {
             "hot"    -> "$mainUrl/browse?scope=hot&order[chapter_updated_at]=desc&page=$page&limit=28"
             "latest" -> "$mainUrl/browse?order[created_at]=desc&page=$page&limit=28"
@@ -1038,7 +1066,6 @@ class ComixProvider : MainAPI() {
         val key = cleanQuery.lowercase()
         Log.e(TAG, "search query='$cleanQuery'")
 
-        // ── memory cache hit ────────────────────────────────────────────
         searchApiCache[key]?.let { raw ->
             val root = runCatching { JSONObject(raw) }.getOrNull()
             if (root != null) {
@@ -1050,7 +1077,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ── WebView capture of the site's own search API call ───────────
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
         val browseUrl = "$mainUrl/browse?q=$encoded"
         Log.e(TAG, "search captureSearchApi url=$browseUrl")
@@ -1065,7 +1091,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ── SSR fallback ────────────────────────────────────────────────
         Log.e(TAG, "search SSR fallback url=$browseUrl")
         val html = fetchHtml(browseUrl)
         if (html.isNotBlank()) {
@@ -1213,7 +1238,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  Companion — global caches, single-flight locks, capture script
+    //  Companion — caches, locks, prefetch scope
     // ══════════════════════════════════════════════════════════════════════
 
     private companion object {
@@ -1230,6 +1255,20 @@ class ComixProvider : MainAPI() {
 
         @Volatile var homeHtml: String? = null
         @Volatile var homeHtmlAt: Long = 0L
+
+        /**
+         * Dedicated scope for background prefetch. SupervisorJob ensures one
+         * failed prefetch doesn't kill the scope; IO dispatcher keeps it off
+         * the main thread. WebView work inside captureApiResponse hops back
+         * to Dispatchers.Main automatically.
+         */
+        val prefetchScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        /** Serializes prefetches so two WebViews don't spawn in parallel. */
+        val prefetchMutex = Mutex()
+
+        /** Tabs we've already prefetched this session. */
+        val prefetchedTabs: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
         const val MAIN_PAGE_CACHE_TTL_MS = 60_000L
         const val HOME_CACHE_TTL_MS      = 5_000L
