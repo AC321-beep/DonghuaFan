@@ -91,13 +91,9 @@ class CFInterceptor : Interceptor {
         if (!cookies.isNullOrEmpty()) builder.header("Cookie", cookies)
 
         val isApi = original.url.encodedPath.contains("/api/")
-        if (isApi) {
-            if (original.header("Accept") == null)
-                builder.header("Accept", "application/json, text/plain, */*")
-        } else {
-            if (original.header("Accept") == null)
-                builder.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-        }
+        if (original.header("Accept") == null)
+            builder.header("Accept", if (isApi) "application/json, text/plain, */*"
+                else "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
         if (original.header("Accept-Language") == null)
             builder.header("Accept-Language", "en-US,en;q=0.5")
         if (original.header("Connection") == null)
@@ -156,6 +152,7 @@ class ComixProvider : MainAPI() {
         if (!f.exists() || f.length() == 0L) return null
         return runCatching {
             val mat = CipherMaterial.fromJson(JSONObject(f.readText())) ?: return null
+            if (!mat.isValid()) return null
             ComixCipher(mat)
         }.getOrNull()
     }
@@ -166,7 +163,10 @@ class ComixProvider : MainAPI() {
 
     private fun cachedCipher(): ComixCipher? {
         cipher?.let { return it }
-        return loadCachedCipher()?.also { cipher = it }
+        return loadCachedCipher()?.also {
+            cipher = it
+            Log.e(TAG, "Cipher loaded from cache file")
+        }
     }
 
     private fun getPosterHeaders(): Map<String, String> {
@@ -208,11 +208,21 @@ class ComixProvider : MainAPI() {
     private fun makeBridge() = object {
         @JavascriptInterface
         fun submit(json: String) {
-            val mat = runCatching { CipherMaterial.fromJson(JSONObject(json)) }.getOrNull()
-            if (mat != null && mat.isValid()) {
-                cipher = ComixCipher(mat)
-                saveCachedCipher(mat)
-                Log.e(TAG, "Cipher captured via JS heuristic")
+            try {
+                val root = JSONObject(json)
+                val sb = root.optJSONArray("sboxes")?.length() ?: 0
+                val kb = root.optJSONArray("keys")?.length() ?: 0
+                Log.e(TAG, "Cipher submit: sboxes=$sb keys=$kb")
+                val mat = runCatching { CipherMaterial.fromJson(root) }.getOrNull()
+                if (mat != null && mat.isValid()) {
+                    cipher = ComixCipher(mat)
+                    saveCachedCipher(mat)
+                    Log.e(TAG, "Cipher captured via JS heuristic ✓")
+                } else {
+                    Log.e(TAG, "Cipher rejected: mat=${mat != null} valid=${mat?.isValid()}")
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "Cipher submit error: ${t.message}")
             }
         }
 
@@ -228,7 +238,7 @@ class ComixProvider : MainAPI() {
             if (mat != null && mat.isValid()) {
                 cipher = ComixCipher(mat)
                 saveCachedCipher(mat)
-                Log.e(TAG, "Cipher captured from network response")
+                Log.e(TAG, "Cipher captured from network response ✓")
             }
         }
 
@@ -282,7 +292,11 @@ class ComixProvider : MainAPI() {
 
         @JavascriptInterface
         fun submitDiagnostic(tag: String, message: String) {
-            Log.e(TAG, "DIAG[$tag] $message")
+            // Downgrade noisy diagnostics to a single tag so logcat stays readable.
+            when (tag) {
+                "ATOB-LEN", "DIGEST-OUT", "SUBTLESIGN" -> Log.e(TAG, "DIAG[$tag] $message")
+                else -> Log.e(TAG, "DIAG[$tag] $message")
+            }
         }
     }
 
@@ -379,7 +393,7 @@ class ComixProvider : MainAPI() {
             decor.addView(webView)
             webView.loadUrl(mainUrl)
             handler.postDelayed(checkRunnable!!, 700L)
-            handler.postDelayed(timeoutRunnable!!, if (waitForCipher) 18_000L else 8_000L)
+            handler.postDelayed(timeoutRunnable!!, if (waitForCipher) 20_000L else 8_000L)
         }
     }
 
@@ -467,7 +481,7 @@ class ComixProvider : MainAPI() {
             dialog.setOnDismissListener { if (!done.get()) finish(false) }
             dialog.show()
             webView.loadUrl(mainUrl)
-            handler.postDelayed({ if (!done.get()) finish(false) }, 30_000L)
+            handler.postDelayed({ if (!done.get()) finish(false) }, 35_000L)
         }
     }
 
@@ -525,18 +539,12 @@ class ComixProvider : MainAPI() {
         } catch (t: Throwable) { null }
     }
 
-    /** Reads `<meta name="cfg" content="…">` — seed material for the cipher. */
     private fun extractCfgMeta(html: String): String? {
         val m = Regex("""<meta\s+name=["']cfg["']\s+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             .find(html) ?: return null
         return m.groupValues[1]
     }
 
-    /**
-     * Injects the seed + initial-data patch into `<head>`. Both run before the
-     * deferred SPA module so the store's content-rating filter is already
-     * hydrated with all four ratings when the SPA mounts.
-     */
     private fun injectSeedIntoHtml(html: String): String? {
         val seedBody = LOCAL_STORAGE_SEED_SCRIPT.replace("</", "<\\/")
         val patchBody = INITIAL_DATA_PATCH_SCRIPT.replace("</", "<\\/")
@@ -570,13 +578,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    /**
-     * Signed GET. Array params whose raw key ends with "[]" are emitted as
-     * `name[]=v` in both the canonical string and the query string, matching
-     * the SPA's own signing. A `Referer` header is attached because the SPA's
-     * own XHRs always send one, and some CF edges are strict about it on
-     * `/api/` calls.
-     */
     private suspend fun getSigned(
         path: String,
         params: Map<String, List<String>>,
@@ -621,18 +622,16 @@ class ComixProvider : MainAPI() {
             Log.e(TAG, "GET-SIGNED $encoded")
             val headers = referer?.let { mapOf("Referer" to it) } ?: emptyMap()
             app.get(encoded, interceptor = cfInterceptor, headers = headers).text
-        } catch (t: Throwable) { null }
+        } catch (t: Throwable) {
+            Log.e(TAG, "getSigned failed: ${t.message}")
+            null
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
     //  Query-param builders
     // ══════════════════════════════════════════════════════════════════════
 
-    /**
-     * Maps a tab to the exact param set the server expects. Falls back to the
-     * site's own default for that page when unknown. `scope=hot` is *not*
-     * accepted by `/api/v1/manga` — sorting is done via `order[…]`.
-     */
     private fun apiParamsFor(tab: String, page: Int): Map<String, List<String>>? {
         val order = when (tab) {
             "hot"      -> "chapter_updated_at" to "desc"
@@ -653,7 +652,6 @@ class ComixProvider : MainAPI() {
         )
     }
 
-    /** Browse URL corresponding to the same order, with content-rating hint. */
     private fun browseUrlFor(tab: String, page: Int): String? {
         val order = when (tab) {
             "hot"      -> "chapter_updated_at" to "desc"
@@ -681,7 +679,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  Prefetch — limited to the two primary tabs to avoid a WebView storm
+    //  Prefetch
     // ══════════════════════════════════════════════════════════════════════
 
     private fun maybePrefetchPage2(request: MainPageRequest) {
@@ -802,13 +800,13 @@ class ComixProvider : MainAPI() {
                         val ratingCount = signedApiCacheRatingCount[key] ?: 0
                         val json = runCatching { JSONObject(raw) }.getOrNull()
                         if (json != null && ratingCount >= 4) {
-                            Log.e(TAG, "captureApiResponse[$tab/$page] captured (all ratings) len=${raw.length}")
+                            Log.e(TAG, "captureApiResponse[$tab/$page] captured (4 ratings) len=${raw.length}")
                             cleanup(json); return
                         }
                         if (json != null) {
                             if (graceAt == 0L) graceAt = System.currentTimeMillis() + 1_500L
                             else if (System.currentTimeMillis() >= graceAt) {
-                                Log.e(TAG, "captureApiResponse[$tab/$page] accepting first response (ratings=$ratingCount)")
+                                Log.e(TAG, "captureApiResponse[$tab/$page] accepting (ratings=$ratingCount)")
                                 cleanup(json); return
                             }
                         }
@@ -821,7 +819,7 @@ class ComixProvider : MainAPI() {
                 val raw = signedApiCache[key]
                 val ratingCount = signedApiCacheRatingCount[key] ?: 0
                 val json = raw?.let { runCatching { JSONObject(it) }.getOrNull() }
-                Log.e(TAG, "captureApiResponse[$tab/$page] TIMEOUT (cached len=${raw?.length ?: 0} ratings=$ratingCount)")
+                Log.e(TAG, "captureApiResponse[$tab/$page] TIMEOUT (len=${raw?.length ?: 0} ratings=$ratingCount)")
                 cleanup(json)
             }
 
@@ -846,8 +844,6 @@ class ComixProvider : MainAPI() {
             val handler = Handler(Looper.getMainLooper())
             var pollRunnable: Runnable? = null
             var timeoutRunnable: Runnable? = null
-            // Grace window: prefer the 4-rating response, but don't pay the
-            // full timeout if only the 2/3-rating variant shows up.
             var graceAt: Long = 0L
 
             val webView = WebView(activity).apply {
@@ -928,13 +924,13 @@ class ComixProvider : MainAPI() {
                         val ratingCount = searchApiCacheRatingCount[key] ?: 0
                         val json = runCatching { JSONObject(raw) }.getOrNull()
                         if (json != null && ratingCount >= 4) {
-                            Log.e(TAG, "captureSearchApi['$key'] captured (all ratings) len=${raw.length}")
+                            Log.e(TAG, "captureSearchApi['$key'] captured (4 ratings) len=${raw.length}")
                             cleanup(json); return
                         }
                         if (json != null) {
                             if (graceAt == 0L) graceAt = System.currentTimeMillis() + 1_500L
                             else if (System.currentTimeMillis() >= graceAt) {
-                                Log.e(TAG, "captureSearchApi['$key'] accepting first response (ratings=$ratingCount)")
+                                Log.e(TAG, "captureSearchApi['$key'] accepting (ratings=$ratingCount)")
                                 cleanup(json); return
                             }
                         }
@@ -966,813 +962,4 @@ class ComixProvider : MainAPI() {
             else        -> return null
         }
         val script = doc.selectFirst("script#initial-data") ?: return null
-        val text = script.data().ifBlank { script.html() }.trim()
-        if (text.isEmpty()) return null
-        return runCatching { JSONObject(text) }.getOrNull()
-    }
-
-    private fun parseMangaFromJson(obj: JSONObject): SearchResponse? {
-        val title = (obj.optString("title").takeIf { it.isNotBlank() }
-            ?: obj.optString("name").takeIf { it.isNotBlank() }
-            ?: obj.optString("manga_title").takeIf { it.isNotBlank() } ?: return null)
-        val relUrl = (obj.optString("url").takeIf  { it.isNotBlank() }
-            ?: obj.optString("href").takeIf  { it.isNotBlank() }
-            ?: obj.optString("slug").takeIf  { it.isNotBlank() }?.let { "/title/$it" }
-            ?: obj.optString("hid").takeIf   { it.isNotBlank() }?.let { "/title/$it" }
-            ?: obj.optString("link").takeIf  { it.isNotBlank() } ?: return null)
-        val posterUrlStr = obj.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() && !it.startsWith("data:") }
-            ?: obj.optJSONObject("poster")?.optString("medium")?.takeIf { it.isNotBlank() && !it.startsWith("data:") }
-            ?: obj.optString("image").takeIf { it.isNotBlank() && !it.startsWith("data:") }
-        val latest = (obj.optInt("latestChapter", 0).takeIf { it > 0 }
-            ?: obj.optInt("latest_chapter", 0).takeIf { it > 0 }
-            ?: obj.optInt("chapters_count", 0).takeIf { it > 0 }
-            ?: obj.optJSONObject("latest_chapter")?.optInt("number", 0)?.takeIf { it > 0 })
-        return newAnimeSearchResponse(title, fixUrl(relUrl), TvType.Anime) {
-            posterUrlStr?.let { this.posterUrl = fixUrl(it) }
-            this.posterHeaders = getPosterHeaders()
-            latest?.let { addSub(it) }
-        }
-    }
-
-    private fun readQueries(initial: JSONObject, matcher: (JSONArray) -> Boolean): List<SearchResponse> {
-        val queries = initial.optJSONObject("queries") ?: return emptyList()
-        val out = mutableListOf<SearchResponse>()
-        val keys = queries.keys()
-        while (keys.hasNext()) {
-            val k = keys.next()
-            val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
-            if (!matcher(parsed)) continue
-            val value = queries.opt(k)
-            val arr = when (value) {
-                is JSONArray  -> value
-                is JSONObject -> value.optJSONArray("items")
-                else          -> null
-            } ?: continue
-            for (i in 0 until arr.length()) {
-                arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
-            }
-            if (out.isNotEmpty()) break
-        }
-        return out
-    }
-
-    private fun arrToResults(arr: JSONArray): List<SearchResponse> {
-        val out = mutableListOf<SearchResponse>()
-        for (i in 0 until arr.length()) {
-            arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> out.add(r) } }
-        }
-        return out
-    }
-
-    private fun extractResultsFromApiJson(root: JSONObject): Pair<List<SearchResponse>, Boolean>? {
-        val arr = root.optJSONObject("result")?.optJSONArray("items")
-            ?: root.optJSONArray("items")
-            ?: root.optJSONObject("data")?.optJSONArray("items")
-            ?: root.optJSONObject("result")?.optJSONArray("data")
-            ?: root.optJSONArray("data")
-            ?: return null
-        val items = arrToResults(arr)
-        val hasNext = readHasNext(root, 0, items.size)
-        return items to hasNext
-    }
-
-    private fun toSearchResult(card: Element): SearchResponse? {
-        val anchor = if (card.tagName() == "a") card
-                     else card.selectFirst("a[href*='/title/'], a[href]") ?: return null
-        val href = anchor.attr("href").takeIf { it.isNotBlank() } ?: return null
-        val title = card.selectFirst("h3, h2, .title, .manga-title, .lrow__title")?.text()?.trim()
-            ?: anchor.attr("title").ifBlank { anchor.text().trim() }
-        if (title.isBlank()) return null
-        val poster = card.selectFirst("img")?.let { img ->
-            img.attr("data-src").ifBlank { img.attr("data-lazy-src") }.ifBlank { img.attr("src") }
-        }?.takeIf { it.isNotBlank() && !it.startsWith("data:") }
-        val latestEp = card.selectFirst(".chapter, .latest-chapter, .lrow__chapter")
-            ?.text()?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
-        return newAnimeSearchResponse(title, fixUrl(href), TvType.Anime) {
-            poster?.let { this.posterUrl = fixUrl(it) }
-            this.posterHeaders = getPosterHeaders()
-            if (latestEp != null && latestEp > 0) addSub(latestEp)
-        }
-    }
-
-    private fun extractSearchResultsDom(doc: Document): List<SearchResponse> {
-        val results = mutableListOf<SearchResponse>()
-        doc.select(".list-grid .lrow, div.lrow, .lrow, .list-grid > div, .list-grid--cards > div")
-            .forEach { el -> toSearchResult(el)?.let { results.add(it) } }
-        if (results.isEmpty()) {
-            doc.select("article, .manga-card, .comic-item, a[href*='/title/']").forEach { el ->
-                if (el.tagName() == "a" &&
-                    el.parents().any { p -> p.hasClass("lrow") || p.hasClass("list-grid") }
-                ) return@forEach
-                toSearchResult(el)?.let { results.add(it) }
-            }
-        }
-        return results.distinctBy { it.url }
-    }
-
-    private fun readHasNext(root: JSONObject?, page: Int, itemCount: Int): Boolean {
-        val resultObj = root?.optJSONObject("result") ?: root?.optJSONObject("data")
-        val meta = resultObj?.optJSONObject("meta")
-            ?: resultObj?.optJSONObject("pagination")
-            ?: root?.optJSONObject("meta")
-        if (meta != null) {
-            val lastPage = meta.optInt("lastPage", meta.optInt("last_page", -1))
-            if (lastPage > 0) return page < lastPage
-            if (meta.has("hasNext"))       return meta.optBoolean("hasNext")
-            if (meta.has("has_next_page")) return meta.optBoolean("has_next_page")
-        }
-        return itemCount >= 28
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  Main page
-    // ══════════════════════════════════════════════════════════════════════
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        val mutex = tabMutexes.getOrPut(request.data) { Mutex() }
-        val resp = mutex.withLock { getMainPageLocked(page, request) }
-        if (page == 1 && resp != null) maybePrefetchPage2(request)
-        return resp
-    }
-
-    private suspend fun getMainPageLocked(
-        page: Int, request: MainPageRequest
-    ): HomePageResponse? {
-        Log.e(TAG, "───── getMainPage page=$page request.data=${request.data} ─────")
-
-        // Trending / Follows come from the home page's SSR "top" section.
-        if (request.data == "trending" || request.data == "follows") {
-            if (page > 1) return null
-            val now = System.currentTimeMillis()
-            mainPageCache[request.data]?.let { (cached, at) ->
-                if (now - at < MAIN_PAGE_CACHE_TTL_MS && cached.isNotEmpty()) {
-                    Log.e(TAG, "getMainPage ${request.data} CACHE HIT (${cached.size})")
-                    return newHomePageResponse(request, cached, hasNext = false)
-                }
-            }
-            val html = fetchHomeHtml()
-            val initial = extractInitialDataJson(html) ?: return null
-            val items = readQueries(initial) { k ->
-                k.length() >= 3 && k.optString(0) == "manga" &&
-                k.optString(1) == "top" &&
-                k.optJSONObject(2)?.optString("type") == request.data
-            }
-            if (items.isEmpty()) return null
-            val distinct = items.distinctBy { it.url }
-            mainPageCache[request.data] = distinct to now
-            Log.e(TAG, "getMainPage ${request.data} SSR → items=${distinct.size} (stored)")
-            return newHomePageResponse(request, distinct, hasNext = false)
-        }
-
-        // /browse SSR ships an empty queries{} — only the API has list content.
-        val result = fetchQueryPage(request, page) ?: return null
-        if (result.items.isEmpty()) return null
-        return newHomePageResponse(request, result.items.distinctBy { it.url }, hasNext = result.hasNext)
-    }
-
-    private data class PageResult(val items: List<SearchResponse>, val hasNext: Boolean)
-
-    private suspend fun fetchQueryPage(request: MainPageRequest, page: Int): PageResult? {
-        Log.e(TAG, "▷ fetchQueryPage data=${request.data} page=$page")
-
-        signedApiCache[ApiKey(request.data, page)]?.let { raw ->
-            val root = runCatching { JSONObject(raw) }.getOrNull()
-            if (root != null) {
-                val parsed = extractResultsFromApiJson(root)
-                if (parsed != null && parsed.first.isNotEmpty()) {
-                    Log.e(TAG, "fetchQueryPage CACHE HIT tab=${request.data} page=$page items=${parsed.first.size}")
-                    return PageResult(parsed.first, hasNext = parsed.second || parsed.first.isNotEmpty())
-                }
-            }
-        }
-
-        val apiParams = apiParamsFor(request.data, page)
-        if (apiParams != null && cachedCipher() != null) {
-            val body = getSigned("/api/v1/manga", apiParams, referer = "$mainUrl/browse")
-            if (!body.isNullOrBlank()) {
-                val root = runCatching { JSONObject(body) }.getOrNull()
-                if (root != null) {
-                    val parsed = extractResultsFromApiJson(root)
-                    if (parsed != null && parsed.first.isNotEmpty()) {
-                        return PageResult(parsed.first, parsed.second)
-                    }
-                }
-            } else {
-                cipher = null; cipherCacheFile?.delete()
-            }
-        }
-
-        val browseUrl = browseUrlFor(request.data, page) ?: return null
-        Log.e(TAG, "fetchQueryPage captureApiResponse url=$browseUrl")
-        val apiRoot = captureApiResponse(browseUrl, request.data, page)
-        if (apiRoot != null) {
-            val parsed = extractResultsFromApiJson(apiRoot)
-            if (parsed != null && parsed.first.isNotEmpty()) {
-                Log.e(TAG, "fetchQueryPage captured items=${parsed.first.size}")
-                return PageResult(parsed.first, hasNext = true)
-            }
-        }
-
-        Log.e(TAG, "fetchQueryPage → EMPTY (all steps exhausted)")
-        return PageResult(emptyList(), false)
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  Search — direct-signed primary path, WebView only as fallback
-    // ══════════════════════════════════════════════════════════════════════
-
-    override suspend fun search(query: String): List<SearchResponse> {
-        val cleanQuery = query.trim()
-        if (cleanQuery.isEmpty()) return emptyList()
-        val key = cleanQuery.lowercase()
-        Log.e(TAG, "search query='$cleanQuery'")
-
-        searchApiCache[key]?.let { raw ->
-            val root = runCatching { JSONObject(raw) }.getOrNull()
-            if (root != null) {
-                val parsed = extractResultsFromApiJson(root)
-                if (parsed != null && parsed.first.isNotEmpty()) {
-                    Log.e(TAG, "search CACHE HIT '$key' items=${parsed.first.size}")
-                    return parsed.first.distinctBy { it.url }
-                }
-            }
-        }
-
-        // ── Direct signed API ─────────────────────────────────────────
-        // The site itself signs search as:
-        //   /api/v1/manga?order[chapter_updated_at]=desc&page=1&limit=28
-        //     &content_rating[]=…&keyword=<q>&_=<sig>
-        // We can produce the same request with the cached cipher, so all
-        // four ratings go into content_rating[] on the very first request
-        // — no WebView, no SPA filter interference.
-        if (cachedCipher() != null) {
-            val params = mapOf(
-                "page" to listOf("1"),
-                "order[chapter_updated_at]" to listOf("desc"),
-                "limit" to listOf("28"),
-                "content_rating[]" to CONTENT_RATINGS,
-                "keyword" to listOf(cleanQuery)
-            )
-            val body = getSigned(
-                "/api/v1/manga",
-                params,
-                referer = "$mainUrl/browse?q=${URLEncoder.encode(cleanQuery, "UTF-8")}"
-            )
-            if (!body.isNullOrBlank()) {
-                val root = runCatching { JSONObject(body) }.getOrNull()
-                val parsed = root?.let { extractResultsFromApiJson(it) }
-                if (parsed != null && parsed.first.isNotEmpty()) {
-                    searchApiCache[key] = body
-                    val ratingCount = Regex("content_rating").findAll(body).count()
-                    searchApiCacheRatingCount[key] = CONTENT_RATINGS.size
-                    val items = parsed.first.distinctBy { it.url }
-                    Log.e(TAG, "search DIRECT-SIGNED items=${items.size} (ratings=${CONTENT_RATINGS.size})")
-                    return items
-                }
-            } else {
-                Log.e(TAG, "search DIRECT-SIGNED failed, invalidating cipher; falling back to WebView")
-                cipher = null; cipherCacheFile?.delete()
-            }
-        }
-
-        // ── WebView fallback ──────────────────────────────────────────
-        val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
-        val browseUrl = "$mainUrl/browse?q=$encoded$CONTENT_RATINGS_QUERY"
-        Log.e(TAG, "search captureSearchApi url=$browseUrl")
-
-        val apiRoot = captureSearchApi(browseUrl, cleanQuery)
-        if (apiRoot != null) {
-            val parsed = extractResultsFromApiJson(apiRoot)
-            if (parsed != null && parsed.first.isNotEmpty()) {
-                val items = parsed.first.distinctBy { it.url }
-                Log.e(TAG, "search captured items=${items.size}")
-                return items
-            }
-        }
-
-        // ── SSR fallback ──────────────────────────────────────────────
-        Log.e(TAG, "search SSR fallback url=$browseUrl")
-        val html = fetchHtml(browseUrl)
-        if (html.isNotBlank()) {
-            val allItems = mutableListOf<SearchResponse>()
-            extractInitialDataJson(html)?.let { initial ->
-                val queries = initial.optJSONObject("queries")
-                if (queries != null) {
-                    val keys = queries.keys()
-                    while (keys.hasNext()) {
-                        val k = keys.next()
-                        val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
-                        if (parsed.length() >= 1 && parsed.optString(0) == "manga") {
-                            val value = queries.opt(k)
-                            val arr = when (value) {
-                                is JSONArray  -> value
-                                is JSONObject -> value.optJSONArray("items")
-                                else          -> null
-                            } ?: continue
-                            for (i in 0 until arr.length()) {
-                                arr.optJSONObject(i)?.let { obj ->
-                                    parseMangaFromJson(obj)?.let { r -> allItems.add(r) }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if (allItems.isEmpty()) allItems.addAll(extractSearchResultsDom(Jsoup.parse(html)))
-            if (allItems.isNotEmpty()) {
-                val out = allItems.distinctBy { it.url }
-                Log.e(TAG, "search SSR items=${out.size}")
-                return out
-            }
-        }
-
-        Log.e(TAG, "search → EMPTY (all steps exhausted)")
-        return emptyList()
-    }
-
-    override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  Load details — single-range episode entry
-    // ══════════════════════════════════════════════════════════════════════
-
-    override suspend fun load(url: String): LoadResponse? {
-        val html = fetchHtml(url)
-        if (html.isBlank()) return null
-
-        val document = Jsoup.parse(html)
-        val initialData = extractInitialDataJson(document)
-
-        var detail: JSONObject? = null
-        initialData?.optJSONObject("queries")?.let { queries ->
-            val keys = queries.keys()
-            while (keys.hasNext()) {
-                val k = keys.next()
-                val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
-                if (parsed.length() >= 2 && parsed.optString(0) == "manga" &&
-                    parsed.optString(1) == "detail"
-                ) {
-                    detail = queries.optJSONObject(k)
-                    if (detail != null) break
-                }
-            }
-        }
-        val d = detail
-
-        val fallbackTitle: String = run {
-            val slug = url.substringAfter("/title/", "").substringAfter("-", "")
-            val guess = slug.replace('-', ' ').trim()
-            if (guess.isBlank()) "Untitled" else
-                guess.split(' ').joinToString(" ") { w ->
-                    if (w.isEmpty()) w else w[0].uppercase() + w.drop(1)
-                }
-        }
-        val mangaTitle = d?.optString("title")?.takeIf { it.isNotBlank() } ?: fallbackTitle
-        val posterUrl = d?.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() && !it.startsWith("data:") }
-            ?: d?.optJSONObject("poster")?.optString("medium")?.takeIf { it.isNotBlank() && !it.startsWith("data:") }
-        val plot = d?.optString("synopsis")?.takeIf { it.isNotBlank() }
-        val statusStr = d?.optString("status")?.takeIf { it.isNotBlank() }
-        val yearInt = d?.optInt("year", 0)?.takeIf { it > 0 }
-        val genres = buildList {
-            if (d != null) {
-                listOf("genres", "tags", "demographics", "formats").forEach { f ->
-                    d.optJSONArray(f)?.let { arr ->
-                        for (i in 0 until arr.length()) {
-                            arr.optJSONObject(i)?.optString("title")
-                                ?.takeIf { it.isNotBlank() }?.let { add(it) }
-                        }
-                    }
-                }
-            }
-        }.distinct()
-
-        val latestChapterNum = d?.optInt("latestChapter", 0) ?: 0
-        val rawFirstChapter  = d?.optString("firstChapterUrl")?.takeIf { it.isNotBlank() }
-        val firstChapterUrl = when {
-            rawFirstChapter == null -> url
-            rawFirstChapter.startsWith("http") -> rawFirstChapter
-            rawFirstChapter.startsWith("/")    -> "$mainUrl$rawFirstChapter"
-            else                               -> "$mainUrl/$rawFirstChapter"
-        }
-        val startsAtZero = firstChapterUrl.contains("-chapter-0", ignoreCase = true)
-        val startCh = if (startsAtZero) 0 else 1
-        val epName = if (latestChapterNum > 0) "Chapters $startCh - $latestChapterNum" else "Read Manga"
-
-        val episodes = listOf(
-            newEpisode(fixUrl(firstChapterUrl)) {
-                this.name = epName
-                this.season = 1
-                this.episode = 1
-                this.posterUrl = posterUrl
-            }
-        )
-
-        return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
-            this.posterUrl = posterUrl
-            this.plot      = plot
-            this.tags      = genres
-            this.year      = yearInt
-            this.showStatus = when (statusStr?.lowercase()) {
-                "completed", "finished"             -> ShowStatus.Completed
-                "releasing", "ongoing", "on_hiatus" -> ShowStatus.Ongoing
-                else -> null
-            }
-            if (episodes.isNotEmpty()) addEpisodes(DubStatus.Subbed, episodes)
-        }
-    }
-
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val activity = CommonActivity.activity as? AppCompatActivity ?: return false
-        if (activity.isFinishing || activity.isDestroyed) return false
-        val chapterName = Regex("-chapter-([\\d.]+)").find(data)
-            ?.groupValues?.get(1)?.let { "Ch. $it" } ?: "Chapter"
-        activity.runOnUiThread {
-            ComixReaderDialogFragment.show(activity, name, chapterName, data)
-        }
-        return true
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  Companion
-    // ══════════════════════════════════════════════════════════════════════
-
-    private companion object {
-
-        val CONTENT_RATINGS = listOf("safe", "suggestive", "erotica", "pornographic")
-
-        /**
-         * Query-string suffix appended to every /browse URL. The SSR encodes
-         * this into `list.params` and the SPA's store hydrates from it, so
-         * this is what makes the site *itself* request all four ratings.
-         */
-        val CONTENT_RATINGS_QUERY: String =
-            CONTENT_RATINGS.joinToString("") { "&content_rating[]=$it" }
-
-        val signedApiCache = ConcurrentHashMap<ApiKey, String>()
-        val signedApiCacheRatingCount = ConcurrentHashMap<ApiKey, Int>()
-        val searchApiCache = ConcurrentHashMap<String, String>()
-        val searchApiCacheRatingCount = ConcurrentHashMap<String, Int>()
-        val mainPageCache  = ConcurrentHashMap<String, Pair<List<SearchResponse>, Long>>()
-
-        val tabMutexes = ConcurrentHashMap<String, Mutex>()
-        val homeFetchMutex = Mutex()
-
-        @Volatile var homeHtml: String? = null
-        @Volatile var homeHtmlAt: Long = 0L
-
-        val prefetchScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val prefetchMutex = Mutex()
-        val prefetchedTabs: MutableSet<String> = ConcurrentHashMap.newKeySet()
-
-        const val MAIN_PAGE_CACHE_TTL_MS = 60_000L
-        const val HOME_CACHE_TTL_MS      = 5_000L
-
-        data class ApiKey(val tab: String, val page: Int)
-
-        /**
-         * Runs at document-start on /browse pages (injected into <head>).
-         *
-         * 1. Seeds `list.filters.v2.contentRating` in localStorage with all
-         *    four ratings and proxies setItem/getItem so later writes are
-         *    forced back to the four-rating set. Persistence only.
-         *
-         * 2. Opens the real CONTENT RATING dropdown and clicks every rating
-         *    option, so the SPA's reactive store ends up holding all four —
-         *    this is what actually drives the *signer*. No label-faking.
-         */
-        val LOCAL_STORAGE_SEED_SCRIPT = """
-            (function () {
-                try {
-                    var KEY = 'list.filters.v2';
-                    var DESIRED = ['safe','suggestive','erotica','pornographic'];
-                    var originalGet = localStorage.getItem.bind(localStorage);
-                    var originalSet = localStorage.setItem.bind(localStorage);
-                    function patch(json) {
-                        try {
-                            var parsed = JSON.parse(json);
-                            parsed.contentRating = DESIRED;
-                            return JSON.stringify(parsed);
-                        } catch (e) { return json; }
-                    }
-                    var initial = originalGet(KEY);
-                    ComixCipherBridge.submitDiagnostic('SEED-INITIAL',
-                        (initial || '(null)').substring(0, 250));
-                    originalSet(KEY, patch(initial || '{}'));
-                    localStorage.setItem = function (k, v) {
-                        if (k === KEY && typeof v === 'string') {
-                            try {
-                                ComixCipherBridge.submitDiagnostic('SET-ITEM',
-                                    'incoming=' + v.substring(0, 120) +
-                                    ' forcing=' + patch(v).substring(0, 120));
-                            } catch (e) {}
-                            return originalSet(k, patch(v));
-                        }
-                        return originalSet(k, v);
-                    };
-                    localStorage.getItem = function (k) {
-                        var v = originalGet(k);
-                        if (k === KEY && typeof v === 'string') {
-                            var patched = patch(v);
-                            if (patched !== v) originalSet(k, patched);
-                            return patched;
-                        }
-                        return v;
-                    };
-                } catch (e) {
-                    try { ComixCipherBridge.submitDiagnostic('SEED-ERROR', '' + e); } catch (_) {}
-                }
-
-                // ── Sweep the CONTENT RATING dropdown ──────────────────
-                (function () {
-                    var state = 'idle';
-                    var deadline = Date.now() + 8000;
-                    var targetLabels = ['safe', 'suggestive', 'erotica', 'pornographic'];
-
-                    function findRatingContainer() {
-                        var labels = document.querySelectorAll('.fdrop__label');
-                        for (var i = 0; i < labels.length; i++) {
-                            if ((labels[i].textContent || '').toUpperCase().indexOf('CONTENT RATING') !== -1) {
-                                return labels[i].parentElement;
-                            }
-                        }
-                        return null;
-                    }
-                    function findPopover(c) {
-                        if (!c) return null;
-                        return c.querySelector('.fdrop__pop, .fdrop__menu, .fdrop__dropdown, [role="listbox"], [role="menu"]')
-                            || c.querySelector('.fdrop__btn ~ *') || null;
-                    }
-                    function collectRatingItems(scope) {
-                        var out = [];
-                        var nodes = scope.querySelectorAll(
-                            'input[type="checkbox"], [role="checkbox"], [role="option"], ' +
-                            '.fdrop__opt, label, li, button'
-                        );
-                        for (var i = 0; i < nodes.length; i++) {
-                            var n = nodes[i];
-                            var t = (n.textContent || '').trim().toLowerCase();
-                            for (var j = 0; j < targetLabels.length; j++) {
-                                if (t === targetLabels[j] || t.indexOf(targetLabels[j]) === 0) {
-                                    out.push(n);
-                                    break;
-                                }
-                            }
-                        }
-                        return out;
-                    }
-                    function loop() {
-                        if (Date.now() > deadline || state === 'done') return;
-                        if (state === 'idle') {
-                            var c = findRatingContainer();
-                            if (c) {
-                                var btn = c.querySelector('.fdrop__btn');
-                                if (btn) {
-                                    try { btn.click(); } catch (e) {}
-                                    try { ComixCipherBridge.submitDiagnostic('UI-CLICK', 'rating dropdown opened'); } catch (e) {}
-                                    state = 'sweep';
-                                    setTimeout(loop, 300);
-                                    return;
-                                }
-                            }
-                        } else if (state === 'sweep') {
-                            var c2 = findRatingContainer();
-                            var scope = findPopover(c2) || document;
-                            var items = collectRatingItems(scope);
-                            var clicked = 0, already = 0;
-                            for (var k = 0; k < items.length; k++) {
-                                var n = items[k];
-                                var cb = (n.matches && n.matches('input[type="checkbox"]'))
-                                    ? n : (n.querySelector ? n.querySelector('input[type="checkbox"]') : null);
-                                if (cb) {
-                                    if (!cb.checked) { try { cb.click(); } catch (e) {} clicked++; }
-                                    else already++;
-                                } else {
-                                    try { n.click(); } catch (e) {}
-                                    clicked++;
-                                }
-                            }
-                            try {
-                                ComixCipherBridge.submitDiagnostic('UI-CLICK',
-                                    'rating sweep clicked=' + clicked + ' already=' + already + ' total=' + items.length);
-                            } catch (e) {}
-                            if (c2) {
-                                var btn2 = c2.querySelector('.fdrop__btn');
-                                if (btn2) { try { btn2.click(); } catch (e) {} }
-                            }
-                            state = 'done';
-                            return;
-                        }
-                        setTimeout(loop, 100);
-                    }
-                    setTimeout(loop, 400);
-                })();
-            })();
-        """.trimIndent()
-
-        /**
-         * Runs at document-start, BEFORE the deferred SPA module. Patches
-         * `<script id="initial-data">` client-side the moment it's parsed,
-         * forcing `list.params.contentRating` to the four-rating array.
-         */
-        val INITIAL_DATA_PATCH_SCRIPT = """
-            (function () {
-                var RATINGS = ['safe','suggestive','erotica','pornographic'];
-                function patch() {
-                    var el = document.getElementById('initial-data');
-                    if (!el || el.__patched) return false;
-                    try {
-                        var text = el.textContent || el.innerHTML || '';
-                        if (!text) return false;
-                        var data = JSON.parse(text);
-                        if (data && data.list && data.list.params) {
-                            data.list.params.contentRating = RATINGS;
-                            data.list.params.content_rating = RATINGS;
-                            el.textContent = JSON.stringify(data);
-                            el.__patched = true;
-                            try { ComixCipherBridge.submitDiagnostic('PATCH-INITIAL', 'ok'); } catch (e) {}
-                            return true;
-                        }
-                    } catch (e) {
-                        try { ComixCipherBridge.submitDiagnostic('PATCH-INITIAL-ERR', '' + e); } catch (ex) {}
-                    }
-                    return false;
-                }
-                patch();
-                try {
-                    new MutationObserver(function () { patch(); })
-                        .observe(document.documentElement || document, { childList: true, subtree: true });
-                } catch (e) {}
-                document.addEventListener('DOMContentLoaded', patch);
-            })();
-        """.trimIndent()
-
-        /**
-         * Captures cipher material from every path we've observed.
-         */
-        val CAPTURE_SCRIPT = """
-            (function () {
-                if (window.__comixCipherHook) return;
-                window.__comixCipherHook = true;
-
-                var captures = window.__comixCipherCaptures = [];
-                var seen = window.__comixSeenLengths = {};
-                function consider(bytes) {
-                    if (!bytes) return;
-                    var len = bytes.length;
-                    if (len !== 256 && len !== 24 && len !== 32) return;
-                    var key = 'L' + len;
-                    if (seen[key]) return;
-                    seen[key] = true;
-                    var arr = new Array(len);
-                    for (var i = 0; i < len; i++) arr[i] = bytes[i] & 255;
-                    captures.push(arr);
-                    var sboxes = captures.filter(function (x) { return x.length === 256; }).slice(0, 3);
-                    var keys   = captures.filter(function (x) { return x.length === 24 || x.length === 32; }).slice(0, 3);
-                    if (sboxes.length === 3 && keys.length === 3) {
-                        try { ComixCipherBridge.submit(JSON.stringify({ sboxes: sboxes, keys: keys })); } catch (e) {}
-                    }
-                }
-
-                try {
-                    var cfg = document.querySelector('meta[name="cfg"]');
-                    if (cfg) {
-                        try { ComixCipherBridge.submitDiagnostic('CFG',
-                            (cfg.getAttribute('content') || '').substring(0, 200)); } catch (e) {}
-                    }
-                } catch (e) {}
-
-                try {
-                    var originalAtob = window.atob;
-                    var stealthAtob = function (value) {
-                        var decoded = originalAtob.call(window, value);
-                        try {
-                            var len = decoded.length;
-                            if (len === 256 || len === 24 || len === 32) {
-                                var bytes = new Uint8Array(len);
-                                for (var i = 0; i < len; i++) bytes[i] = decoded.charCodeAt(i) & 255;
-                                consider(bytes);
-                            }
-                        } catch (e) {}
-                        return decoded;
-                    };
-                    var origFpToString = Function.prototype.toString;
-                    Function.prototype.toString = function () {
-                        if (this === stealthAtob) return 'function atob() { [native code] }';
-                        return origFpToString.call(this);
-                    };
-                    Object.defineProperty(window, 'atob', { value: stealthAtob, writable: true, configurable: true });
-                } catch (e) {}
-
-                try {
-                    if (window.crypto && window.crypto.subtle) {
-                        var subtle = window.crypto.subtle;
-                        var origImport = subtle.importKey.bind(subtle);
-                        subtle.importKey = function (fmt, keyData, algo, extractable, usages) {
-                            try {
-                                var bytes = keyData instanceof ArrayBuffer ? new Uint8Array(keyData)
-                                    : ArrayBuffer.isView(keyData) ? new Uint8Array(keyData.buffer, keyData.byteOffset, keyData.byteLength)
-                                    : null;
-                                if (bytes && (bytes.length === 24 || bytes.length === 32)) consider(bytes);
-                            } catch (e) {}
-                            return origImport.apply(this, arguments);
-                        };
-                    }
-                } catch (e) {}
-
-                try {
-                    var origFrom = Uint8Array.from;
-                    Uint8Array.from = function (iterable) {
-                        var arr = origFrom.apply(this, arguments);
-                        try {
-                            if (arr.length === 256 || arr.length === 24 || arr.length === 32) consider(arr);
-                        } catch (e) {}
-                        return arr;
-                    };
-                } catch (e) {}
-
-                function reportSigned(url) {
-                    try {
-                        if (typeof url !== 'string') return;
-                        if (url.indexOf('/api/') === -1) return;
-                        if (url.indexOf('_=') > -1) ComixCipherBridge.submitSignedUrl(url);
-                        else ComixCipherBridge.submitUnsignedApi(url);
-                    } catch (e) {}
-                }
-                function reportApiBody(url, body) {
-                    try {
-                        if (typeof url !== 'string' || typeof body !== 'string') return;
-                        if (url.indexOf('/api/v1/manga') === -1) return;
-                        ComixCipherBridge.submitApiResponse(url, body);
-                    } catch (e) {}
-                }
-                function reportCipherBody(url, body) {
-                    try {
-                        if (typeof body !== 'string') return;
-                        if (body.length < 60 || body.length > 500000) return;
-                        if (body.indexOf('sbox') !== -1 || body.indexOf('"keys"') !== -1 ||
-                            body.indexOf('"sboxes"') !== -1) {
-                            ComixCipherBridge.submitCipherFetch(url, body);
-                        }
-                    } catch (e) {}
-                }
-
-                try {
-                    var XHR = window.XMLHttpRequest;
-                    if (XHR && XHR.prototype) {
-                        var origOpen = XHR.prototype.open;
-                        var origSend = XHR.prototype.send;
-                        XHR.prototype.open = function (method, url) {
-                            this.__comixUrl = url;
-                            reportSigned(url);
-                            return origOpen.apply(this, arguments);
-                        };
-                        XHR.prototype.send = function () {
-                            var self = this;
-                            try {
-                                self.addEventListener('load', function () {
-                                    try {
-                                        var text = self.responseType === 'json'
-                                            ? JSON.stringify(self.response)
-                                            : self.responseText;
-                                        reportApiBody(self.__comixUrl, text);
-                                        reportCipherBody(self.__comixUrl, text);
-                                    } catch (e) {}
-                                });
-                            } catch (e) {}
-                            return origSend.apply(this, arguments);
-                        };
-                    }
-                } catch (e) {}
-
-                try {
-                    var origFetch = window.fetch;
-                    if (origFetch) {
-                        window.fetch = function (input, init) {
-                            var url = typeof input === 'string'
-                                ? input
-                                : (input && input.url) ? input.url : '';
-                            reportSigned(url);
-                            var p = origFetch.apply(this, arguments);
-                            try {
-                                p.then(function (res) {
-                                    try {
-                                        res.clone().text().then(function (body) {
-                                            reportApiBody(url, body);
-                                            reportCipherBody(url, body);
-                                        });
-                                    } catch (e) {}
-                                });
-                            } catch (e) {}
-                            return p;
-                        };
-                    }
-                } catch (e) {}
-            })();
-        """.trimIndent()
-    }
-}
+        val text = script.data().ifBlank {
