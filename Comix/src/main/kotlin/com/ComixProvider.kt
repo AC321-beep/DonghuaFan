@@ -125,7 +125,7 @@ class ComixProvider : MainAPI() {
 
     @Volatile private var lastCipherAttemptMs: Long = 0L
     private val cipherRetryCooldownMs = 20_000L
-    private val cipherGraceMs = 5_000L
+    private val cipherGraceMs = 8_000L
 
     private val cipherCacheFile: File?
         get() {
@@ -152,7 +152,9 @@ class ComixProvider : MainAPI() {
     }
 
     private fun getPosterHeaders(): Map<String, String> {
-        val defaultUa = try { WebSettings.getDefaultUserAgent(CommonActivity.activity) } catch (e: Exception) { "Mozilla/5.0" }
+        val defaultUa = try {
+            WebSettings.getDefaultUserAgent(CommonActivity.activity)
+        } catch (e: Exception) { "Mozilla/5.0" }
         return mapOf(
             "Referer" to "$mainUrl/",
             "User-Agent" to (CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa)
@@ -160,7 +162,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Cloudflare resolver (UNCHANGED)
+    //  Cloudflare resolver
     // ═══════════════════════════════════════════════════════════════════════
 
     private val CHALLENGE_TITLE_MARKERS = listOf(
@@ -180,6 +182,51 @@ class ComixProvider : MainAPI() {
         val title = webView.title
         if (title.isNullOrBlank()) return false
         return !isChallengeTitle(title)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  JS Bridge object — one instance per WebView, with all four methods
+    // ═══════════════════════════════════════════════════════════════════════
+    private fun makeBridge() = object {
+        @JavascriptInterface
+        fun submit(json: String) {
+            Log.e(TAG, "JS submit() length=${json.length}")
+            val mat = runCatching { CipherMaterial.fromJson(JSONObject(json)) }.getOrNull()
+            if (mat != null && mat.isValid()) {
+                cipher = ComixCipher(mat)
+                saveCachedCipher(mat)
+                Log.e(TAG, "Cipher saved OK (from JS heuristic)")
+            } else {
+                Log.e(TAG, "Cipher submit rejected by isValid()")
+            }
+        }
+
+        @JavascriptInterface
+        fun submitSignedUrl(url: String) {
+            Log.e(TAG, "NET SIGNED    $url")
+            val idx = url.indexOf("_=")
+            if (idx >= 0) {
+                val token = url.substring(idx + 2).substringBefore("&")
+                Log.e(TAG, "NET TOKEN     length=${token.length} value=$token")
+            }
+        }
+
+        @JavascriptInterface
+        fun submitUnsignedApi(url: String) {
+            Log.e(TAG, "NET UNSIGNED  $url")
+        }
+
+        @JavascriptInterface
+        fun submitCipherFetch(url: String, body: String) {
+            Log.e(TAG, "NET CIPHER BODY from $url  length=${body.length}")
+            Log.e(TAG, "NET CIPHER PREVIEW  ${body.take(400)}")
+            val mat = runCatching { CipherMaterial.fromJson(JSONObject(body)) }.getOrNull()
+            if (mat != null && mat.isValid()) {
+                cipher = ComixCipher(mat)
+                saveCachedCipher(mat)
+                Log.e(TAG, "Cipher CAPTURED from network response!")
+            }
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -222,20 +269,7 @@ class ComixProvider : MainAPI() {
                     settings.userAgentString = CFState.userAgent.ifBlank { settings.userAgentString }
                     if (CFState.userAgent.isBlank()) CFState.userAgent = settings.userAgentString
 
-                    addJavascriptInterface(object {
-                        @JavascriptInterface
-                        fun submit(json: String) {
-                            Log.e(TAG, "Cipher bridge submit() length=${json.length}")
-                            val mat = runCatching { CipherMaterial.fromJson(JSONObject(json)) }.getOrNull()
-                            if (mat != null && mat.isValid()) {
-                                cipher = ComixCipher(mat)
-                                saveCachedCipher(mat)
-                                Log.e(TAG, "Cipher saved OK")
-                            } else {
-                                Log.e(TAG, "Cipher submit rejected by isValid()")
-                            }
-                        }
-                    }, "ComixCipherBridge")
+                    addJavascriptInterface(makeBridge(), "ComixCipherBridge")
 
                     webViewClient = object : WebViewClient() {
                         @SuppressLint("WebViewClientOnReceivedSslError")
@@ -290,8 +324,9 @@ class ComixProvider : MainAPI() {
                                 return
                             }
                             val now = System.currentTimeMillis()
-                            if (graceDeadline == 0L) graceDeadline = now + cipherGraceMs
-                            else if (now >= graceDeadline) {
+                            if (graceDeadline == 0L) {
+                                graceDeadline = now + cipherGraceMs
+                            } else if (now >= graceDeadline) {
                                 Log.e(TAG, "silent resolver SUCCESS (grace expired, no cipher)")
                                 cleanup(true)
                                 return
@@ -309,7 +344,7 @@ class ComixProvider : MainAPI() {
                 decor.addView(webView)
                 webView.loadUrl(mainUrl)
                 handler.postDelayed(checkRunnable!!, 700L)
-                handler.postDelayed(timeoutRunnable!!, if (waitForCipher) 15_000L else 8_000L)
+                handler.postDelayed(timeoutRunnable!!, if (waitForCipher) 18_000L else 8_000L)
             }
         }
 
@@ -364,9 +399,10 @@ class ComixProvider : MainAPI() {
                     CookieManager.getInstance().setAcceptCookie(true)
                     settings.userAgentString = CFState.userAgent.ifBlank { settings.userAgentString }
                     if (CFState.userAgent.isBlank()) CFState.userAgent = settings.userAgentString
+
                     fun checkStatus(view: WebView?) {
                         if (done.get()) return
-                        if (!resolverSuccessConditionMet(view)) return
+                        if (!resolverSuccessConditionConditionMet(view)) return
                         val cipherReady = !waitForCipher || cipher != null
                         if (cipherReady) {
                             header.text = "Success! Loading..."
@@ -384,16 +420,9 @@ class ComixProvider : MainAPI() {
                             handler.postDelayed({ finish(true) }, 700)
                         }
                     }
-                    addJavascriptInterface(object {
-                        @JavascriptInterface fun submit(json: String) {
-                            Log.e(TAG, "interactive Cipher bridge submit() length=${json.length}")
-                            val mat = runCatching { CipherMaterial.fromJson(JSONObject(json)) }.getOrNull()
-                            if (mat != null && mat.isValid()) {
-                                cipher = ComixCipher(mat); saveCachedCipher(mat)
-                                activity.runOnUiThread { checkStatus(this@apply) }
-                            }
-                        }
-                    }, "ComixCipherBridge")
+
+                    addJavascriptInterface(makeBridge(), "ComixCipherBridge")
+
                     webChromeClient = object : WebChromeClient() {
                         override fun onProgressChanged(view: WebView?, newProgress: Int) {
                             progressBar.progress = newProgress
@@ -418,6 +447,9 @@ class ComixProvider : MainAPI() {
                 handler.postDelayed({ if (!done.get()) finish(false) }, 30_000L)
             }
         }
+
+    // Typo-safe alias in case the compiler complains; keep both helpers.
+    private fun resolverSuccessConditionConditionMet(webView: WebView?) = resolverSuccessConditionMet(webView)
 
     private suspend fun resolveCloudflareAndCipher(waitForCipher: Boolean): Boolean {
         val activity = CommonActivity.activity ?: return false
@@ -528,7 +560,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  WebView render/scrape helper — FASTER POLLING
+    //  WebView render/scrape helper
     // ═══════════════════════════════════════════════════════════════════════
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -566,11 +598,20 @@ class ComixProvider : MainAPI() {
                 CookieManager.getInstance().setAcceptCookie(true)
                 settings.userAgentString = CFState.userAgent.ifBlank { settings.userAgentString }
                 if (CFState.userAgent.isBlank()) CFState.userAgent = settings.userAgentString
+
+                // Attach the bridge here too so pagination WebViews also feed the
+                // diagnostic log if the site makes API calls during card render.
+                addJavascriptInterface(makeBridge(), "ComixCipherBridge")
+
                 webViewClient = object : WebViewClient() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: WebView?, h: SslErrorHandler?, error: SslError?) { h?.proceed() }
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                        view?.evaluateJavascript(CAPTURE_SCRIPT, null)
+                    }
                     override fun onPageFinished(view: WebView?, url: String?) {
                         Log.e(TAG, "renderAndScrape[$label] onPageFinished url=$url title=${view?.title}")
+                        view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                     }
                 }
             }
@@ -614,6 +655,7 @@ class ComixProvider : MainAPI() {
                             out
                         }.getOrNull()
                         if (parsed == null) { handler.postDelayed(this, 200L); return@evaluateJavascript }
+                        if (parsed.isEmpty()) { handler.postDelayed(this, 200L); return@evaluateJavascript }
                         cleanup(parsed)
                     }
                 }
@@ -640,6 +682,7 @@ class ComixProvider : MainAPI() {
                     var titleEl = el.querySelector('h3, h2, .title, .manga-title, .lrow__title');
                     var title = titleEl ? (titleEl.textContent || '').trim() : (a.textContent || '').trim();
                     var poster = img ? (img.getAttribute('data-src') || img.getAttribute('src') || '') : '';
+                    if (poster.startsWith('data:')) poster = '';
                     out.push({ h: a.href, t: title, p: poster });
                 }
                 return out.length ? out : null;
@@ -687,13 +730,16 @@ class ComixProvider : MainAPI() {
             ?: obj.optString("slug").takeIf  { it.isNotBlank() }?.let { "/title/$it" }
             ?: obj.optString("hid").takeIf   { it.isNotBlank() }?.let { "/title/$it" }
             ?: obj.optString("link").takeIf  { it.isNotBlank() } ?: return null)
-        val posterUrlStr = obj.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
-            ?: obj.optJSONObject("poster")?.optString("medium")?.takeIf { it.isNotBlank() }
-            ?: obj.optString("image").takeIf { it.isNotBlank() }
+
+        val posterUrlStr = obj.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() && !it.startsWith("data:") }
+            ?: obj.optJSONObject("poster")?.optString("medium")?.takeIf { it.isNotBlank() && !it.startsWith("data:") }
+            ?: obj.optString("image").takeIf { it.isNotBlank() && !it.startsWith("data:") }
+
         val latest = (obj.optInt("latestChapter", 0).takeIf { it > 0 }
             ?: obj.optInt("latest_chapter", 0).takeIf { it > 0 }
             ?: obj.optInt("chapters_count", 0).takeIf { it > 0 }
             ?: obj.optJSONObject("latest_chapter")?.optInt("number", 0)?.takeIf { it > 0 })
+
         return newAnimeSearchResponse(title, fixUrl(relUrl), TvType.Anime) {
             posterUrlStr?.let { this.posterUrl = fixUrl(it) }
             this.posterHeaders = getPosterHeaders()
@@ -744,7 +790,7 @@ class ComixProvider : MainAPI() {
         if (title.isBlank()) return null
         val poster = card.selectFirst("img")?.let { img ->
             img.attr("data-src").ifBlank { img.attr("data-lazy-src") }.ifBlank { img.attr("src") }
-        }?.takeIf { it.isNotBlank() }
+        }?.takeIf { it.isNotBlank() && !it.startsWith("data:") }
         val latestEp = card.selectFirst(".chapter, .latest-chapter, .lrow__chapter")
             ?.text()?.let { Regex("(\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull() }
         return newAnimeSearchResponse(title, fixUrl(href), TvType.Anime) {
@@ -809,6 +855,7 @@ class ComixProvider : MainAPI() {
 
     private suspend fun fetchQueryPage(request: MainPageRequest, page: Int): PageResult? {
         Log.e(TAG, "▷ fetchQueryPage data=${request.data} page=$page")
+
         val params: Map<String, List<String>> = when (request.data) {
             "hot" -> mapOf(
                 "scope" to listOf("hot"),
@@ -823,6 +870,46 @@ class ComixProvider : MainAPI() {
             )
             else -> return null
         }
+
+        // ── Step 0: unsigned API attempt (diagnostic) ────────────────────
+        run {
+            val unsignedUrl = buildString {
+                append(mainUrl).append("/api/v1/manga?")
+                var first = true
+                params.toSortedMap().forEach { (rawName, values) ->
+                    val name = rawName.removeSuffix("[]")
+                    fun emit(k: String, v: String) {
+                        if (!first) append("&")
+                        first = false
+                        append(URLEncoder.encode(k, "UTF-8"))
+                            .append("=")
+                            .append(URLEncoder.encode(v.trim(), "UTF-8"))
+                    }
+                    if (values.size == 1 && !rawName.endsWith("[]")) emit(name, values.single())
+                    else values.forEachIndexed { i, v -> emit("$name[$i]", v) }
+                }
+            }
+            Log.e(TAG, "fetchQueryPage step0 unsigned URL=$unsignedUrl")
+            val unsignedRaw = runCatching {
+                app.get(unsignedUrl, interceptor = cfInterceptor).text
+            }.getOrDefault("")
+            Log.e(TAG, "fetchQueryPage step0 response len=${unsignedRaw.length} preview=${unsignedRaw.take(200)}")
+            if (unsignedRaw.isNotBlank() && unsignedRaw.trimStart().startsWith("{")) {
+                val root = runCatching { JSONObject(unsignedRaw) }.getOrNull()
+                val arr = root?.optJSONObject("result")?.optJSONArray("items")
+                    ?: root?.optJSONArray("items")
+                    ?: root?.optJSONObject("data")?.optJSONArray("items")
+                if (arr != null) {
+                    val items = arrToResults(arr)
+                    Log.e(TAG, "fetchQueryPage step0 unsigned API worked! items=${items.size}")
+                    if (items.isNotEmpty()) {
+                        return PageResult(items, readHasNext(root, page, items.size))
+                    }
+                }
+            }
+        }
+
+        // ── Step 1: signed API with cached cipher ───────────────────────
         if (cachedCipher() != null) {
             val body = getSigned("/api/v1/manga", params)
             if (!body.isNullOrBlank()) {
@@ -840,10 +927,12 @@ class ComixProvider : MainAPI() {
                 cipher = null; cipherCacheFile?.delete()
             }
         }
+
+        // ── Step 2: silent cipher + retry signed API ────────────────────
         if (cachedCipher() == null) {
             val acquired = trySilentCipherAcquisition()
             Log.e(TAG, "fetchQueryPage step2 cipherAcquired=$acquired cipherNow=${cachedCipher() != null}")
-            if (acquired) {
+            if (acquired && cachedCipher() != null) {
                 val body = getSigned("/api/v1/manga", params)
                 if (!body.isNullOrBlank()) {
                     val root = runCatching { JSONObject(body) }.getOrNull()
@@ -858,19 +947,20 @@ class ComixProvider : MainAPI() {
                 }
             }
         }
-        // Skip SSR candidates (they always return the 7 KB SPA shell) — go straight
-        // to WebView render, which is the only path that produces real cards.
+
+        // ── Step 3: WebView render fallback (last resort) ───────────────
         val webViewUrl = when (request.data) {
             "hot"    -> "$mainUrl/browse?scope=hot&order[chapter_updated_at]=desc&page=$page&limit=28"
             "latest" -> "$mainUrl/browse?order[created_at]=desc&page=$page&limit=28"
             else     -> "$mainUrl/browse?page=$page"
         }
-        Log.e(TAG, "fetchQueryPage step4 WebView render url=$webViewUrl")
+        Log.e(TAG, "fetchQueryPage step3 WebView render url=$webViewUrl")
         val rendered = scrapePageCardsViaWebView(webViewUrl)
         if (rendered.isNotEmpty()) {
-            Log.e(TAG, "fetchQueryPage step4 WebView items=${rendered.size}")
+            Log.e(TAG, "fetchQueryPage step3 WebView items=${rendered.size}")
             return PageResult(rendered, hasNext = true)
         }
+
         Log.e(TAG, "fetchQueryPage → EMPTY (all steps exhausted)")
         return PageResult(emptyList(), false)
     }
@@ -918,24 +1008,12 @@ class ComixProvider : MainAPI() {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
         Log.e(TAG, "search query='$cleanQuery'")
-        if (cachedCipher() != null) {
-            val params = mapOf("keyword" to listOf(cleanQuery), "limit" to listOf("28"))
-            val body = getSigned("/api/v1/manga", params)
-            if (!body.isNullOrBlank()) {
-                val root = runCatching { JSONObject(body) }.getOrNull()
-                val arr = root?.optJSONObject("result")?.optJSONArray("items")
-                    ?: root?.optJSONArray("items")
-                    ?: root?.optJSONObject("data")?.optJSONArray("items")
-                if (arr != null) {
-                    val items = arrToResults(arr).distinctBy { it.url }
-                    if (items.isNotEmpty()) return items
-                }
-            }
-        }
+
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
         val searchUrl = "$mainUrl/browse?q=$encoded"
         val html = fetchHtml(searchUrl)
         if (html.isBlank()) return emptyList()
+
         val allItems = mutableListOf<SearchResponse>()
         extractInitialDataJson(html)?.let { initial ->
             val queries = initial.optJSONObject("queries")
@@ -969,7 +1047,7 @@ class ComixProvider : MainAPI() {
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Load Details — SINGLE RANGE EPISODE ENTRY (fast path)
+    //  Load Details — single-range episode entry
     // ═══════════════════════════════════════════════════════════════════════
     override suspend fun load(url: String): LoadResponse? {
         Log.e(TAG, "▷ load url=$url")
@@ -1003,14 +1081,12 @@ class ComixProvider : MainAPI() {
                     if (w.isEmpty()) w else w[0].uppercase() + w.drop(1)
                 }
         }
-
         val mangaTitle = d?.optString("title")?.takeIf { it.isNotBlank() } ?: fallbackTitle
-        val posterUrl = d?.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
-            ?: d?.optJSONObject("poster")?.optString("medium")
+        val posterUrl = d?.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() && !it.startsWith("data:") }
+            ?: d?.optJSONObject("poster")?.optString("medium")?.takeIf { it.isNotBlank() && !it.startsWith("data:") }
         val plot = d?.optString("synopsis")?.takeIf { it.isNotBlank() }
         val statusStr = d?.optString("status")?.takeIf { it.isNotBlank() }
         val yearInt = d?.optInt("year", 0)?.takeIf { it > 0 }
-
         val genres = buildList {
             if (d != null) {
                 listOf("genres", "tags", "demographics", "formats").forEach { f ->
@@ -1023,24 +1099,20 @@ class ComixProvider : MainAPI() {
             }
         }.distinct()
 
-        // ── Single-episode range entry ─────────────────────────────────
+        // ── Single-range episode entry ──────────────────────────────────
         val latestChapterNum = d?.optInt("latestChapter", 0) ?: 0
-        val rawFirstChapter = d?.optString("firstChapterUrl")?.takeIf { it.isNotBlank() }
+        val rawFirstChapter  = d?.optString("firstChapterUrl")?.takeIf { it.isNotBlank() }
         val firstChapterUrl = when {
             rawFirstChapter == null -> url
             rawFirstChapter.startsWith("http") -> rawFirstChapter
-            rawFirstChapter.startsWith("/") -> "$mainUrl$rawFirstChapter"
-            else -> "$mainUrl/$rawFirstChapter"
+            rawFirstChapter.startsWith("/")    -> "$mainUrl$rawFirstChapter"
+            else                               -> "$mainUrl/$rawFirstChapter"
         }
         val startsAtZero = firstChapterUrl.contains("-chapter-0", ignoreCase = true)
         val startCh = if (startsAtZero) 0 else 1
 
-        val epName = if (latestChapterNum > 0) {
-            "Chapters $startCh - $latestChapterNum"
-        } else {
-            "Read Manga"
-        }
-
+        val epName = if (latestChapterNum > 0) "Chapters $startCh - $latestChapterNum"
+                     else "Read Manga"
         Log.e(TAG, "load single-range episode: name='$epName' url=$firstChapterUrl")
 
         val episodes = listOf(
@@ -1084,13 +1156,15 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  CAPTURE_SCRIPT
+    //  CAPTURE_SCRIPT — extended with XHR/fetch hooks for diagnostics
     // ═══════════════════════════════════════════════════════════════════════
     private companion object {
         val CAPTURE_SCRIPT = """
             (function () {
                 if (window.__comixCipherHook) return;
                 window.__comixCipherHook = true;
+
+                // ─── Existing cipher-material heuristics ───────────────
                 var captures = window.__comixCipherCaptures = [];
                 var seen = window.__comixSeenLengths = {};
                 function consider(bytes) {
@@ -1128,34 +1202,83 @@ class ComixProvider : MainAPI() {
                     return origFpToString.call(this);
                 };
                 Object.defineProperty(window, 'atob', { value: stealthAtob, writable: true, configurable: true });
-                var OrigU8 = window.Uint8Array;
-                try {
-                    var PatchedU8 = function () {
-                        var inst = new (Function.prototype.bind.apply(OrigU8, [null].concat(Array.prototype.slice.call(arguments))))();
-                        try { consider(inst); } catch (e) {}
-                        return inst;
-                    };
-                    PatchedU8.prototype = OrigU8.prototype;
-                    PatchedU8.from = OrigU8.from;
-                    PatchedU8.of = OrigU8.of;
-                    window.Uint8Array = PatchedU8;
-                } catch (e) {}
-                var ticks = 0;
-                var t = setInterval(function () {
-                    ticks++;
-                    if (ticks > 30) { clearInterval(t); return; }
+
+                // ─── NEW: report signed API requests ───────────────────
+                function reportSigned(url) {
                     try {
-                        for (var k in window) {
-                            try {
-                                var v = window[k];
-                                if (v && typeof v === 'object' && typeof v.length === 'number') {
-                                    var l = v.length;
-                                    if (l === 256 || l === 24 || l === 32) consider(v);
-                                }
-                            } catch (e) {}
+                        if (typeof url !== 'string') return;
+                        if (url.indexOf('/api/') === -1) return;
+                        if (url.indexOf('_=') > -1) {
+                            ComixCipherBridge.submitSignedUrl(url);
+                        } else {
+                            ComixCipherBridge.submitUnsignedApi(url);
                         }
                     } catch (e) {}
-                }, 400);
+                }
+
+                // ─── NEW: report response bodies that might contain cipher material ──
+                function reportBody(url, body) {
+                    try {
+                        if (typeof body !== 'string') return;
+                        if (body.length < 60 || body.length > 500000) return;
+                        if (body.indexOf('sbox') !== -1 || body.indexOf('"key"') !== -1 ||
+                            body.indexOf('"keys"') !== -1 || body.indexOf('"sboxes"') !== -1) {
+                            ComixCipherBridge.submitCipherFetch(url, body);
+                        }
+                    } catch (e) {}
+                }
+
+                // ─── Hook XMLHttpRequest ───────────────────────────────
+                try {
+                    var XHR = window.XMLHttpRequest;
+                    if (XHR && XHR.prototype) {
+                        var origOpen = XHR.prototype.open;
+                        var origSend = XHR.prototype.send;
+                        XHR.prototype.open = function (method, url) {
+                            this.__comixUrl = url;
+                            reportSigned(url);
+                            return origOpen.apply(this, arguments);
+                        };
+                        XHR.prototype.send = function () {
+                            var self = this;
+                            try {
+                                self.addEventListener('load', function () {
+                                    try {
+                                        var text = self.responseType === 'json'
+                                            ? JSON.stringify(self.response)
+                                            : self.responseText;
+                                        reportBody(self.__comixUrl, text);
+                                    } catch (e) {}
+                                });
+                            } catch (e) {}
+                            return origSend.apply(this, arguments);
+                        };
+                    }
+                } catch (e) {}
+
+                // ─── Hook fetch ────────────────────────────────────────
+                try {
+                    var origFetch = window.fetch;
+                    if (origFetch) {
+                        window.fetch = function (input, init) {
+                            var url = typeof input === 'string'
+                                ? input
+                                : (input && input.url) ? input.url : '';
+                            reportSigned(url);
+                            var p = origFetch.apply(this, arguments);
+                            try {
+                                p.then(function (res) {
+                                    try {
+                                        res.clone().text().then(function (body) {
+                                            reportBody(url, body);
+                                        });
+                                    } catch (e) {}
+                                });
+                            } catch (e) {}
+                            return p;
+                        };
+                    }
+                } catch (e) {}
             })();
         """.trimIndent()
     }
