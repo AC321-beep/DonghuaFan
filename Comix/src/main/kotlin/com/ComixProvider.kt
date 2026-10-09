@@ -257,6 +257,12 @@ class ComixProvider : MainAPI() {
                 Log.e(TAG, "submitApiResponse error: ${t.message}")
             }
         }
+
+        // ── Diagnostic-only, receives arbitrary tagged messages from JS ──
+        @JavascriptInterface
+        fun submitDiagnostic(tag: String, message: String) {
+            Log.e(TAG, "DIAG[$tag] $message")
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -488,10 +494,6 @@ class ComixProvider : MainAPI() {
         return runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
     }
 
-    /**
-     * Synchronous fetch used from shouldInterceptRequest on the WebView's IO thread.
-     * Returns null on any failure so the WebView falls back to its own loader.
-     */
     private fun blockingFetchHtml(url: String): String? {
         return try {
             runBlocking(Dispatchers.IO) {
@@ -506,11 +508,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    /**
-     * Patches the HTML by inserting the localStorage seed script right after
-     * the opening <head> tag, so it runs before the site's own boot scripts.
-     * Returns null if the HTML doesn't contain a <head> element.
-     */
     private fun injectSeedIntoHtml(html: String): String? {
         val seed = "<script>${LOCAL_STORAGE_SEED_SCRIPT.replace("</", "<\\/")}</script>"
         val headOpenIdx = html.indexOf("<head", ignoreCase = true)
@@ -1311,7 +1308,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  Companion — caches, locks, seed script, capture script
+    //  Companion — caches, locks, diagnostic seed script, capture script
     // ══════════════════════════════════════════════════════════════════════
 
     private companion object {
@@ -1336,23 +1333,90 @@ class ComixProvider : MainAPI() {
         data class ApiKey(val tab: String, val page: Int)
 
         /**
-         * Runs at document-start (injected into <head>) to seed the SPA's
-         * persisted filter store before its boot code reads localStorage.
+         * Diagnostic build of the seed script. Seeds `list.filters.v2` with
+         * all four ratings, then proxies setItem/getItem to (a) force our
+         * value on every write and (b) log every interaction so we can see
+         * exactly what the SPA does with the filter state.
          *
-         * The site's Zustand store keys its persisted filter state at
-         * `list.filters.v2`. The SPA reads `contentRating` from it to build
-         * its signed /api/v1/manga XHR. By overwriting this key before any
-         * of the site's own scripts run, the site's own request carries all
-         * four content ratings — which is what we then capture.
+         * Also snapshots the SSR'd filter UI labels after page load to detect
+         * whether the SPA reads from the DOM instead of localStorage.
          */
         val LOCAL_STORAGE_SEED_SCRIPT = """
             (function () {
                 try {
-                    var raw = localStorage.getItem('list.filters.v2');
-                    var filters = raw ? JSON.parse(raw) : {};
-                    filters.contentRating = ['safe','suggestive','erotica','pornographic'];
-                    localStorage.setItem('list.filters.v2', JSON.stringify(filters));
-                } catch (e) {}
+                    var KEY = 'list.filters.v2';
+                    var DESIRED = ['safe','suggestive','erotica','pornographic'];
+
+                    var originalGet = localStorage.getItem.bind(localStorage);
+                    var originalSet = localStorage.setItem.bind(localStorage);
+
+                    function patch(json) {
+                        try {
+                            var parsed = JSON.parse(json);
+                            parsed.contentRating = DESIRED;
+                            return JSON.stringify(parsed);
+                        } catch (e) {
+                            return json;
+                        }
+                    }
+
+                    // Snapshot before we touch anything
+                    var initial = originalGet(KEY);
+                    ComixCipherBridge.submitDiagnostic('SEED-INITIAL',
+                        (initial || '(null)').substring(0, 300));
+
+                    // Initial seed
+                    originalSet(KEY, patch(initial || '{}'));
+                    ComixCipherBridge.submitDiagnostic('SEED-AFTER',
+                        (originalGet(KEY) || '(null)').substring(0, 300));
+
+                    // Intercept writes
+                    localStorage.setItem = function (k, v) {
+                        if (k === KEY && typeof v === 'string') {
+                            var patched = patch(v);
+                            ComixCipherBridge.submitDiagnostic('SET-ITEM',
+                                'incoming=' + v.substring(0, 200) +
+                                ' | forcing=' + patched.substring(0, 200));
+                            return originalSet(k, patched);
+                        }
+                        return originalSet(k, v);
+                    };
+
+                    // Intercept reads (log only first call)
+                    var firstGetLogged = false;
+                    localStorage.getItem = function (k) {
+                        var v = originalGet(k);
+                        if (k === KEY && typeof v === 'string') {
+                            var patched = patch(v);
+                            if (patched !== v) originalSet(k, patched);
+                            if (!firstGetLogged) {
+                                firstGetLogged = true;
+                                ComixCipherBridge.submitDiagnostic('GET-ITEM',
+                                    'returning=' + patched.substring(0, 250));
+                            }
+                            return patched;
+                        }
+                        return v;
+                    };
+
+                    // Snapshot the SSR'd filter UI labels after load
+                    setTimeout(function () {
+                        try {
+                            var labels = [];
+                            document.querySelectorAll('.fdrop').forEach(function (d) {
+                                var lbl = d.querySelector('.fdrop__label');
+                                var val = d.querySelector('.fdrop__value');
+                                if (lbl && val) {
+                                    labels.push(lbl.innerText.trim() + '=' + val.innerText.trim());
+                                }
+                            });
+                            ComixCipherBridge.submitDiagnostic('UI-FILTERS',
+                                labels.join(' | ').substring(0, 300));
+                        } catch (e) {}
+                    }, 200);
+                } catch (e) {
+                    ComixCipherBridge.submitDiagnostic('SEED-ERROR', '' + e);
+                }
             })();
         """.trimIndent()
 
