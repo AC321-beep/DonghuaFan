@@ -544,27 +544,44 @@ class ComixProvider : MainAPI() {
         }
     }
 
+    /**
+     * Produces a signed GET. Array params whose raw key ends with "[]" are
+     * emitted as `name[]=v` in both the canonical string and the query string,
+     * matching the SPA's own signing so the server-side check passes.
+     */
     private suspend fun getSigned(path: String, params: Map<String, List<String>>): String? {
         val c = cachedCipher() ?: return null
         return try {
             val canonical = params.toSortedMap().entries.joinToString("&") { (rawName, values) ->
-                val name = rawName.removeSuffix("[]")
-                if (values.size == 1 && !rawName.endsWith("[]")) "$name=${values.single().trim()}"
-                else values.mapIndexed { i, v -> "$name[$i]=${v.trim()}" }.joinToString("&")
+                if (rawName.endsWith("[]")) {
+                    val name = rawName.removeSuffix("[]")
+                    values.joinToString("&") { v -> "$name[]=${v.trim()}" }
+                } else if (values.size == 1) {
+                    "$rawName=${values.single().trim()}"
+                } else {
+                    values.mapIndexed { i, v -> "$rawName[$i]=${v.trim()}" }.joinToString("&")
+                }
             }
             val token = c.sign(path, canonical)
+
             val encoded = buildString {
                 append(mainUrl).append(path).append("?")
                 var first = true
+                fun emit(k: String, v: String) {
+                    if (!first) append("&")
+                    first = false
+                    append(URLEncoder.encode(k, "UTF-8")).append("=")
+                        .append(URLEncoder.encode(v.trim(), "UTF-8"))
+                }
                 params.toSortedMap().forEach { (rawName, values) ->
-                    val name = rawName.removeSuffix("[]")
-                    fun emit(k: String, v: String) {
-                        if (!first) append("&")
-                        first = false
-                        append(URLEncoder.encode(k, "UTF-8")).append("=").append(URLEncoder.encode(v.trim(), "UTF-8"))
+                    if (rawName.endsWith("[]")) {
+                        val name = rawName.removeSuffix("[]")
+                        values.forEach { v -> emit("$name[]", v) }
+                    } else if (values.size == 1) {
+                        emit(rawName, values.single())
+                    } else {
+                        values.forEachIndexed { i, v -> emit("$rawName[$i]", v) }
                     }
-                    if (values.size == 1 && !rawName.endsWith("[]")) emit(name, values.single())
-                    else values.forEachIndexed { i, v -> emit("$name[$i]", v) }
                 }
                 if (!first) append("&")
                 append("_=").append(URLEncoder.encode(token, "UTF-8"))
@@ -624,6 +641,9 @@ class ComixProvider : MainAPI() {
             val handler = Handler(Looper.getMainLooper())
             var pollRunnable: Runnable? = null
             var timeoutRunnable: Runnable? = null
+            // Grace window: accept the first response if the "all four ratings"
+            // variant never shows up. Avoids paying the full timeout every page.
+            var graceAt: Long = 0L
 
             val webView = WebView(activity).apply {
                 layoutParams = ViewGroup.LayoutParams(1, 1)
@@ -706,13 +726,19 @@ class ComixProvider : MainAPI() {
                     val raw = signedApiCache[key]
                     if (raw != null) {
                         val ratingCount = signedApiCacheRatingCount[key] ?: 0
-                        // Accept the wider response as soon as it arrives.
-                        if (ratingCount >= 4) {
-                            val json = runCatching { JSONObject(raw) }.getOrNull()
-                            if (json != null) {
-                                Log.e(TAG, "captureApiResponse[$tab/$page] captured len=${raw.length} ratings=$ratingCount")
-                                cleanup(json)
-                                return
+                        val json = runCatching { JSONObject(raw) }.getOrNull()
+                        if (json != null && ratingCount >= 4) {
+                            Log.e(TAG, "captureApiResponse[$tab/$page] captured (all ratings) len=${raw.length}")
+                            cleanup(json); return
+                        }
+                        // Accept the first valid response after a short grace window
+                        // so a page that (still) filtered client-side doesn't cost
+                        // the full 12 s timeout.
+                        if (json != null) {
+                            if (graceAt == 0L) graceAt = System.currentTimeMillis() + 1_500L
+                            else if (System.currentTimeMillis() >= graceAt) {
+                                Log.e(TAG, "captureApiResponse[$tab/$page] accepting first response (ratings=$ratingCount)")
+                                cleanup(json); return
                             }
                         }
                     }
@@ -720,7 +746,6 @@ class ComixProvider : MainAPI() {
                 }
             }
             timeoutRunnable = Runnable {
-                // Timeout: accept whichever response we have (likely the 2-rating one).
                 val key = ApiKey(tab, page)
                 val raw = signedApiCache[key]
                 val ratingCount = signedApiCacheRatingCount[key] ?: 0
@@ -1058,17 +1083,21 @@ class ComixProvider : MainAPI() {
         }
 
         if (cachedCipher() != null) {
+            // content_rating[] is emitted as `content_rating[]=safe&…=suggestive&…=erotica&…=pornographic`
+            // by getSigned (raw key ends with "[]"), matching the SPA's own signing.
             val params: Map<String, List<String>> = when (request.data) {
                 "hot" -> mapOf(
                     "scope" to listOf("hot"),
                     "page" to listOf(page.toString()),
                     "order[chapter_updated_at]" to listOf("desc"),
-                    "limit" to listOf("28")
+                    "limit" to listOf("28"),
+                    "content_rating[]" to CONTENT_RATINGS
                 )
                 "latest" -> mapOf(
                     "page" to listOf(page.toString()),
                     "order[created_at]" to listOf("desc"),
-                    "limit" to listOf("28")
+                    "limit" to listOf("28"),
+                    "content_rating[]" to CONTENT_RATINGS
                 )
                 else -> return null
             }
@@ -1087,8 +1116,8 @@ class ComixProvider : MainAPI() {
         }
 
         val browseUrl = when (request.data) {
-            "hot"    -> "$mainUrl/browse?scope=hot&order[chapter_updated_at]=desc&page=$page&limit=28"
-            "latest" -> "$mainUrl/browse?order[created_at]=desc&page=$page&limit=28"
+            "hot"    -> "$mainUrl/browse?scope=hot&order[chapter_updated_at]=desc&page=$page&limit=28$CONTENT_RATINGS_QUERY"
+            "latest" -> "$mainUrl/browse?order[created_at]=desc&page=$page&limit=28$CONTENT_RATINGS_QUERY"
             else     -> return null
         }
         Log.e(TAG, "fetchQueryPage captureApiResponse url=$browseUrl")
@@ -1165,7 +1194,7 @@ class ComixProvider : MainAPI() {
         }
 
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
-        val browseUrl = "$mainUrl/browse?q=$encoded"
+        val browseUrl = "$mainUrl/browse?q=$encoded$CONTENT_RATINGS_QUERY"
         Log.e(TAG, "search captureSearchApi url=$browseUrl")
 
         val apiRoot = captureSearchApi(browseUrl, cleanQuery)
@@ -1325,10 +1354,21 @@ class ComixProvider : MainAPI() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  Companion — caches, locks, seed script with UI click, capture script
+    //  Companion — caches, locks, seed script with real UI sweep, capture
     // ══════════════════════════════════════════════════════════════════════
 
     private companion object {
+
+        /** All four content ratings — the value we want the store to hold. */
+        val CONTENT_RATINGS = listOf("safe", "suggestive", "erotica", "pornographic")
+
+        /**
+         * Query suffix used on every /browse URL to hydrate the SPA's reactive
+         * store with all four ratings on mount. Emitted as
+         * `&content_rating[]=safe&content_rating[]=…`.
+         */
+        val CONTENT_RATINGS_QUERY: String =
+            CONTENT_RATINGS.joinToString("") { "&content_rating[]=$it" }
 
         val signedApiCache = ConcurrentHashMap<ApiKey, String>()
         val signedApiCacheRatingCount = ConcurrentHashMap<ApiKey, Int>()
@@ -1351,15 +1391,22 @@ class ComixProvider : MainAPI() {
         data class ApiKey(val tab: String, val page: Int)
 
         /**
-         * Runs at document-start. Seeds `list.filters.v2.contentRating` with
-         * all four ratings, then proxies setItem/getItem for that key so any
-         * subsequent SPA write is forced back to all four. Also observes the
-         * DOM to keep the CONTENT RATING dropdown label synced.
+         * Runs at document-start on /browse pages.
          *
-         * Finally, attempts a programmatic UI click on the CONTENT RATING
-         * dropdown to select "Show all". The SPA then re-issues its own signed
-         * XHR with all four ratings — and only the SPA can produce a valid
-         * signature. The response is picked up by `captureApiResponse`.
+         * 1. Seeds `list.filters.v2.contentRating` with all four ratings and
+         *    proxies setItem/getItem so any later write is forced back to the
+         *    four-rating set. This only affects the *persisted* copy.
+         *
+         * 2. Sweeps the CONTENT RATING dropdown in the real UI: opens the
+         *    popover, clicks any unchecked rating option, then closes it. This
+         *    is what actually drives the SPA's reactive store (which is what
+         *    the signer reads), so the label and payload stay in sync.
+         *
+         * Combined with `&content_rating[]=…` on the browse URL — which the
+         * SPA consumes at mount time — the store reliably ends up holding all
+         * four ratings, and the signed XHR carries all four `content_rating[]`
+         * params. No MutationObserver label-faking: the site renders "Any"
+         * itself once the store is correct.
          */
         val LOCAL_STORAGE_SEED_SCRIPT = """
             (function () {
@@ -1404,83 +1451,96 @@ class ComixProvider : MainAPI() {
                     ComixCipherBridge.submitDiagnostic('SEED-ERROR', '' + e);
                 }
 
-                try {
-                    var patchedOnce = false;
-                    var observer = new MutationObserver(function () {
+                // ── Real UI sweep on the CONTENT RATING dropdown ───────
+                // Drive the store, not the label. Once every rating option is
+                // checked, the site renders "Any" itself.
+                (function () {
+                    var state = 'idle';
+                    var deadline = Date.now() + 8000;
+                    var targetLabels = ['safe', 'suggestive', 'erotica', 'pornographic'];
+
+                    function findRatingContainer() {
                         var labels = document.querySelectorAll('.fdrop__label');
                         for (var i = 0; i < labels.length; i++) {
-                            var txt = (labels[i].textContent || '').toUpperCase();
-                            if (txt.indexOf('CONTENT RATING') !== -1) {
-                                var parent = labels[i].parentElement;
-                                if (!parent) continue;
-                                var btn = parent.querySelector('.fdrop__value');
-                                if (btn && btn.textContent !== 'Any') {
-                                    btn.textContent = 'Any';
-                                    if (!patchedOnce) {
-                                        patchedOnce = true;
-                                        ComixCipherBridge.submitDiagnostic('DOM-PATCH',
-                                            'CONTENT RATING -> Any');
-                                    }
+                            if ((labels[i].textContent || '').toUpperCase().indexOf('CONTENT RATING') !== -1) {
+                                return labels[i].parentElement;
+                            }
+                        }
+                        return null;
+                    }
+
+                    function findPopover(container) {
+                        if (!container) return null;
+                        return container.querySelector('.fdrop__pop, .fdrop__menu, .fdrop__dropdown, [role="listbox"], [role="menu"]')
+                            || container.querySelector('.fdrop__btn ~ *')
+                            || null;
+                    }
+
+                    function collectRatingItems(scope) {
+                        var out = [];
+                        var nodes = scope.querySelectorAll(
+                            'input[type="checkbox"], [role="checkbox"], [role="option"], ' +
+                            '.fdrop__opt, label, li, button'
+                        );
+                        for (var i = 0; i < nodes.length; i++) {
+                            var n = nodes[i];
+                            var t = (n.textContent || '').trim().toLowerCase();
+                            for (var j = 0; j < targetLabels.length; j++) {
+                                if (t === targetLabels[j] || t.indexOf(targetLabels[j]) === 0) {
+                                    out.push(n);
+                                    break;
                                 }
                             }
                         }
-                    });
-                    observer.observe(document.documentElement, {
-                        childList: true, subtree: true, characterData: true
-                    });
-                } catch (e) {
-                    ComixCipherBridge.submitDiagnostic('OBSERVER-ERROR', '' + e);
-                }
-
-                // ── Programmatic UI click on CONTENT RATING dropdown ────
-                (function () {
-                    var state = 'idle';
-                    var deadline = Date.now() + 6000;
+                        return out;
+                    }
 
                     function loop() {
                         if (Date.now() > deadline || state === 'done') return;
 
                         if (state === 'idle') {
-                            var labels = document.querySelectorAll('.fdrop__label');
-                            for (var i = 0; i < labels.length; i++) {
-                                if ((labels[i].textContent || '').toUpperCase().indexOf('CONTENT RATING') !== -1) {
-                                    var parent = labels[i].parentElement;
-                                    if (!parent) continue;
-                                    var btn = parent.querySelector('.fdrop__btn');
-                                    if (btn) {
-                                        try { btn.click(); } catch (e) {}
-                                        ComixCipherBridge.submitDiagnostic('UI-CLICK', 'dropdown clicked');
-                                        state = 'dropdown-clicked';
-                                        setTimeout(loop, 250);
-                                        return;
-                                    }
-                                }
-                            }
-                        } else if (state === 'dropdown-clicked') {
-                            var options = document.querySelectorAll('[role="option"], .fdrop__opt');
-                            for (var j = 0; j < options.length; j++) {
-                                var t = (options[j].textContent || '').trim();
-                                if (t === 'Show all' || t === 'Show All' || t === 'Any') {
-                                    try { options[j].click(); } catch (e) {}
-                                    ComixCipherBridge.submitDiagnostic('UI-CLICK', 'selected: ' + t);
-                                    state = 'done';
+                            var container = findRatingContainer();
+                            if (container) {
+                                var btn = container.querySelector('.fdrop__btn');
+                                if (btn) {
+                                    try { btn.click(); } catch (e) {}
+                                    ComixCipherBridge.submitDiagnostic('UI-CLICK', 'rating dropdown opened');
+                                    state = 'sweep';
+                                    setTimeout(loop, 300);
                                     return;
                                 }
                             }
-                            var btns = document.querySelectorAll('button, li');
-                            for (var k = 0; k < btns.length; k++) {
-                                var t2 = (btns[k].textContent || '').trim();
-                                if ((t2 === 'Show all' || t2 === 'Show All' || t2 === 'Any') && btns[k].children.length < 3) {
-                                    try { btns[k].click(); } catch (e) {}
-                                    ComixCipherBridge.submitDiagnostic('UI-CLICK', 'selected fallback: ' + t2);
-                                    state = 'done';
-                                    return;
+                        } else if (state === 'sweep') {
+                            var c2 = findRatingContainer();
+                            var scope = findPopover(c2) || document;
+                            var items = collectRatingItems(scope);
+                            var clicked = 0, already = 0;
+                            for (var k = 0; k < items.length; k++) {
+                                var n = items[k];
+                                var cb = (n.matches && n.matches('input[type="checkbox"]'))
+                                    ? n
+                                    : (n.querySelector ? n.querySelector('input[type="checkbox"]') : null);
+                                if (cb) {
+                                    if (!cb.checked) { try { cb.click(); } catch (e) {} clicked++; }
+                                    else already++;
+                                } else {
+                                    try { n.click(); } catch (e) {}
+                                    clicked++;
                                 }
                             }
+                            ComixCipherBridge.submitDiagnostic('UI-CLICK',
+                                'rating sweep clicked=' + clicked + ' already=' + already + ' total=' + items.length);
+                            // Close the popover so the SPA commits the change.
+                            if (c2) {
+                                var btn2 = c2.querySelector('.fdrop__btn');
+                                if (btn2) { try { btn2.click(); } catch (e) {} }
+                            }
+                            state = 'done';
+                            return;
                         }
                         setTimeout(loop, 100);
                     }
-                    setTimeout(loop, 300);
+                    setTimeout(loop, 400);
                 })();
             })();
         """.trimIndent()
