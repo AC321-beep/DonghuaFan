@@ -253,6 +253,16 @@ class ComixProvider : MainAPI() {
                 Log.e(TAG, "submitApiResponse error: ${t.message}")
             }
         }
+
+        // ── NEW: diagnostic-only, receives the localStorage dump ───────────
+        @JavascriptInterface
+        fun submitLocalStorageDump(dump: String) {
+            Log.e(TAG, "=== LOCALSTORAGE DUMP START ===")
+            dump.split("\n").forEach { line ->
+                if (line.isNotBlank()) Log.e(TAG, "  LS: $line")
+            }
+            Log.e(TAG, "=== LOCALSTORAGE DUMP END ===")
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -616,6 +626,8 @@ class ComixProvider : MainAPI() {
                     }
                     override fun onPageFinished(view: WebView?, url: String?) {
                         view?.evaluateJavascript(CAPTURE_SCRIPT, null)
+                        // ── NEW: fire the localStorage diagnostic ────────
+                        view?.evaluateJavascript(LOCAL_STORAGE_DUMP_SCRIPT, null)
                     }
                 }
             }
@@ -984,7 +996,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ── Extended content_rating params appended to the browse URL ──
         val browseUrl = when (request.data) {
             "hot"    -> "$mainUrl/browse?scope=hot&order[chapter_updated_at]=desc&page=$page&limit=28$EXTENDED_RATINGS_PARAMS"
             "latest" -> "$mainUrl/browse?order[created_at]=desc&page=$page&limit=28$EXTENDED_RATINGS_PARAMS"
@@ -1224,22 +1235,15 @@ class ComixProvider : MainAPI() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  Companion — caches, locks, extended-rating constant, capture script
+    //  Companion — caches, locks, extended-rating constant, capture scripts
     // ══════════════════════════════════════════════════════════════════════
 
     private companion object {
 
         /**
-         * Extra content_rating[] params appended to every browse URL.
-         *
-         * The site's own SPA defaults to safe+suggestive when it builds its
-         * /api/v1/manga XHR. Adding these params to the browse URL causes the
-         * site's own request to include the extended set, which is what we
-         * then capture. Includes all four levels to override the default
-         * regardless of whether the SPA merges or replaces.
-         *
-         * Remove `&content_rating[]=pornographic` below if you only want
-         * erotica (plot-driven adult) and not explicitly pornographic titles.
+         * Extended content_rating[] params. The site overwrites these on the
+         * server-side filter, but the diagnostic will show us the real
+         * localStorage field name so we can set the correct one directly.
          */
         const val EXTENDED_RATINGS_PARAMS =
             "&content_rating[]=safe" +
@@ -1265,6 +1269,39 @@ class ComixProvider : MainAPI() {
         const val HOME_CACHE_TTL_MS      = 5_000L
 
         data class ApiKey(val tab: String, val page: Int)
+
+        /**
+         * Diagnostic-only. Dumps all localStorage keys 3 times, spaced 1.5 s
+         * apart, to catch both "before settings are written" and "after
+         * settings are written" states. Runs once per WebView.
+         */
+        val LOCAL_STORAGE_DUMP_SCRIPT = """
+            (function () {
+                if (window.__comixLsDumped) return;
+                window.__comixLsDumped = true;
+                var shots = 0;
+                var iv = setInterval(function () {
+                    shots++;
+                    try {
+                        var out = [];
+                        for (var i = 0; i < localStorage.length; i++) {
+                            var k = localStorage.key(i);
+                            var v = localStorage.getItem(k) || '';
+                            if (v.length > 600) v = v.substring(0, 600) + '...';
+                            out.push(k + ' = ' + v);
+                        }
+                        ComixCipherBridge.submitLocalStorageDump(
+                            '[shot ' + shots + '] ' + out.length + ' keys\n' + out.join('\n')
+                        );
+                    } catch (e) {
+                        ComixCipherBridge.submitLocalStorageDump(
+                            '[shot ' + shots + '] error: ' + (e && e.message ? e.message : 'unknown')
+                        );
+                    }
+                    if (shots >= 3) clearInterval(iv);
+                }, 1500);
+            })();
+        """.trimIndent()
 
         val CAPTURE_SCRIPT = """
             (function () {
