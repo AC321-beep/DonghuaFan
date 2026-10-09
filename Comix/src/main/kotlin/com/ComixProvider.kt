@@ -145,7 +145,6 @@ class ComixProvider : MainAPI() {
     private val cipherGraceMs = 8_000L
     private val cipherAcquireMutex = Mutex()
 
-    /** One-time warm-up: mimics the SPA's `/api/v1/user` pre-flight call. */
     @Volatile private var userWarmed = false
 
     private val cipherCacheFile: File?
@@ -176,11 +175,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    /**
-     * Ensures a valid cipher is available before attempting the direct-signed
-     * path. If none is cached, runs the WebView acquisition flow once,
-     * respecting a 20 s cooldown so concurrent callers don't spawn WebViews.
-     */
     private suspend fun ensureCipher(): Boolean {
         if (cachedCipher() != null) return true
         return cipherAcquireMutex.withLock {
@@ -206,10 +200,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    /**
-     * Fire-and-forget pre-flight that matches the SPA's request sequence
-     * (`/api/v1/user` then `/api/v1/manga`). Runs once per session.
-     */
     private suspend fun warmUserEndpointOnce() {
         if (userWarmed) return
         runCatching {
@@ -227,10 +217,6 @@ class ComixProvider : MainAPI() {
             "User-Agent" to (CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa)
         )
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  Cloudflare resolver
-    // ══════════════════════════════════════════════════════════════════════
 
     private val CHALLENGE_TITLE_MARKERS = listOf(
         "just a moment", "attention required", "security verification",
@@ -251,9 +237,6 @@ class ComixProvider : MainAPI() {
         return !isChallengeTitle(title)
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  JS bridge
-    // ══════════════════════════════════════════════════════════════════════
     private fun makeBridge() = object {
         @JavascriptInterface
         fun submit(json: String) {
@@ -345,10 +328,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  Silent + interactive resolvers
-    // ══════════════════════════════════════════════════════════════════════
-
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun attemptSilentResolution(
         activity: android.app.Activity, waitForCipher: Boolean
@@ -438,7 +417,7 @@ class ComixProvider : MainAPI() {
             decor.addView(webView)
             webView.loadUrl(mainUrl)
             handler.postDelayed(checkRunnable!!, 700L)
-            handler.postDelayed(timeoutRunnable!!, if (waitForCipher) 20_000L else 8_000L)
+            handler.postDelayed(timeoutRunnable!!, if (waitForCipher) 25_000L else 8_000L)
         }
     }
 
@@ -526,7 +505,7 @@ class ComixProvider : MainAPI() {
             dialog.setOnDismissListener { if (!done.get()) finish(false) }
             dialog.show()
             webView.loadUrl(mainUrl)
-            handler.postDelayed({ if (!done.get()) finish(false) }, 35_000L)
+            handler.postDelayed({ if (!done.get()) finish(false) }, 40_000L)
         }
     }
 
@@ -536,10 +515,6 @@ class ComixProvider : MainAPI() {
         if (attemptSilentResolution(activity, waitForCipher)) return true
         return attemptInteractiveResolution(activity, waitForCipher)
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  HTTP helpers
-    // ══════════════════════════════════════════════════════════════════════
 
     private fun isCloudflareChallenge(html: String): Boolean {
         if (html.isBlank()) return false
@@ -673,10 +648,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  Query-param builders
-    // ══════════════════════════════════════════════════════════════════════
-
     private fun apiParamsFor(tab: String, page: Int): Map<String, List<String>>? {
         val order = when (tab) {
             "hot"      -> "chapter_updated_at" to "desc"
@@ -697,6 +668,12 @@ class ComixProvider : MainAPI() {
         )
     }
 
+    /**
+     * Browse URL — NO content_rating[] params. The logcat proved that including
+     * them makes the SPA's URL parser collapse the four values into two, which
+     * then poisons the reactive store for the entire session. Relying on the
+     * localStorage seed instead yields a clean 4-rating state on every mount.
+     */
     private fun browseUrlFor(tab: String, page: Int): String? {
         val order = when (tab) {
             "hot"      -> "chapter_updated_at" to "desc"
@@ -709,17 +686,8 @@ class ComixProvider : MainAPI() {
             "followsApi" -> "follows_total" to "desc"
             else -> return null
         }
-        return "$mainUrl/browse?order[${order.first}]=${order.second}&page=$page&limit=28$CONTENT_RATINGS_QUERY"
+        return "$mainUrl/browse?order[${order.first}]=${order.second}&page=$page&limit=28"
     }
-
-    private suspend fun trySilentCipherAcquisition(): Boolean {
-        if (cachedCipher() != null) return true
-        return ensureCipher()
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  Prefetch
-    // ══════════════════════════════════════════════════════════════════════
 
     private fun maybePrefetchPage2(request: MainPageRequest) {
         if (request.data != "hot" && request.data != "latest") return
@@ -740,13 +708,9 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  WebView capture helpers
-    // ══════════════════════════════════════════════════════════════════════
-
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun captureApiResponse(
-        browseUrl: String, tab: String, page: Int, timeoutMs: Long = 12_000L
+        browseUrl: String, tab: String, page: Int, timeoutMs: Long = 15_000L
     ): JSONObject? = withContext(Dispatchers.Main) {
         val activity = CommonActivity.activity ?: return@withContext null
         if (activity.isFinishing || activity.isDestroyed) return@withContext null
@@ -838,16 +802,14 @@ class ComixProvider : MainAPI() {
                     if (raw != null) {
                         val ratingCount = signedApiCacheRatingCount[key] ?: 0
                         val json = runCatching { JSONObject(raw) }.getOrNull()
-                        // SPA caps at 3 ratings — accept as soon as we have 3,
-                        // with a short grace window for the very first 2-rating response.
-                        if (json != null && ratingCount >= 3) {
-                            Log.e(TAG, "captureApiResponse[$tab/$page] captured (${ratingCount} ratings) len=${raw.length}")
+                        if (json != null && ratingCount >= 4) {
+                            Log.e(TAG, "captureApiResponse[$tab/$page] captured (4 ratings) len=${raw.length}")
                             cleanup(json); return
                         }
                         if (json != null) {
-                            if (graceAt == 0L) graceAt = System.currentTimeMillis() + 1_500L
+                            if (graceAt == 0L) graceAt = System.currentTimeMillis() + 2_500L
                             else if (System.currentTimeMillis() >= graceAt) {
-                                Log.e(TAG, "captureApiResponse[$tab/$page] accepting first response (ratings=$ratingCount)")
+                                Log.e(TAG, "captureApiResponse[$tab/$page] accepting (ratings=$ratingCount)")
                                 cleanup(json); return
                             }
                         }
@@ -873,7 +835,7 @@ class ComixProvider : MainAPI() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun captureSearchApi(
-        browseUrl: String, query: String, timeoutMs: Long = 14_000L
+        browseUrl: String, query: String, timeoutMs: Long = 15_000L
     ): JSONObject? = withContext(Dispatchers.Main) {
         val activity = CommonActivity.activity ?: return@withContext null
         if (activity.isFinishing || activity.isDestroyed) return@withContext null
@@ -964,14 +926,14 @@ class ComixProvider : MainAPI() {
                     if (raw != null) {
                         val ratingCount = searchApiCacheRatingCount[key] ?: 0
                         val json = runCatching { JSONObject(raw) }.getOrNull()
-                        if (json != null && ratingCount >= 3) {
-                            Log.e(TAG, "captureSearchApi['$key'] captured (${ratingCount} ratings) len=${raw.length}")
+                        if (json != null && ratingCount >= 4) {
+                            Log.e(TAG, "captureSearchApi['$key'] captured (4 ratings) len=${raw.length}")
                             cleanup(json); return
                         }
                         if (json != null) {
-                            if (graceAt == 0L) graceAt = System.currentTimeMillis() + 1_500L
+                            if (graceAt == 0L) graceAt = System.currentTimeMillis() + 2_500L
                             else if (System.currentTimeMillis() >= graceAt) {
-                                Log.e(TAG, "captureSearchApi['$key'] accepting first response (ratings=$ratingCount)")
+                                Log.e(TAG, "captureSearchApi['$key'] accepting (ratings=$ratingCount)")
                                 cleanup(json); return
                             }
                         }
@@ -991,10 +953,6 @@ class ComixProvider : MainAPI() {
             handler.postDelayed(timeoutRunnable!!, timeoutMs)
         }
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  Parsing helpers
-    // ══════════════════════════════════════════════════════════════════════
 
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
         val doc: Document = when (htmlOrDoc) {
@@ -1121,10 +1079,6 @@ class ComixProvider : MainAPI() {
         return itemCount >= 28
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  Main page
-    // ══════════════════════════════════════════════════════════════════════
-
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val mutex = tabMutexes.getOrPut(request.data) { Mutex() }
         val resp = mutex.withLock { getMainPageLocked(page, request) }
@@ -1181,7 +1135,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ── Primary path: our own signed request with all four ratings ──
         val apiParams = apiParamsFor(request.data, page)
         if (apiParams != null) {
             val hasCipher = cachedCipher() != null || ensureCipher()
@@ -1198,7 +1151,6 @@ class ComixProvider : MainAPI() {
                         Log.e(TAG, "fetchQueryPage DIRECT-SIGNED parsed empty for ${request.data}/$page")
                     }
                 } else {
-                    // Cipher was rejected — invalidate and fall through.
                     Log.e(TAG, "fetchQueryPage DIRECT-SIGNED failed, invalidating cipher")
                     cipher = null; cipherCacheFile?.delete()
                     userWarmed = false
@@ -1208,7 +1160,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ── Fallback: WebView (SPA-capped at 3 ratings) ──
         val browseUrl = browseUrlFor(request.data, page) ?: return null
         Log.e(TAG, "fetchQueryPage WebView fallback url=$browseUrl")
         val apiRoot = captureApiResponse(browseUrl, request.data, page)
@@ -1223,10 +1174,6 @@ class ComixProvider : MainAPI() {
         Log.e(TAG, "fetchQueryPage → EMPTY (all steps exhausted)")
         return PageResult(emptyList(), false)
     }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  Search
-    // ══════════════════════════════════════════════════════════════════════
 
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
@@ -1245,7 +1192,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ── Primary path: our own signed request with all four ratings ──
         val hasCipher = cachedCipher() != null || ensureCipher()
         if (hasCipher) {
             val params = mapOf(
@@ -1258,7 +1204,7 @@ class ComixProvider : MainAPI() {
             val body = getSigned(
                 "/api/v1/manga",
                 params,
-                referer = "$mainUrl/browse?q=${URLEncoder.encode(cleanQuery, "UTF-8")}"
+                referer = "$mainUrl/browse"
             )
             if (!body.isNullOrBlank()) {
                 val root = runCatching { JSONObject(body) }.getOrNull()
@@ -1280,9 +1226,9 @@ class ComixProvider : MainAPI() {
             Log.e(TAG, "search no cipher, skipping direct-signed path")
         }
 
-        // ── Fallback: WebView (SPA-capped at 3 ratings) ──
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
-        val browseUrl = "$mainUrl/browse?q=$encoded$CONTENT_RATINGS_QUERY"
+        // No content_rating[] params — same rationale as browseUrlFor.
+        val browseUrl = "$mainUrl/browse?q=$encoded"
         Log.e(TAG, "search WebView fallback url=$browseUrl")
 
         val apiRoot = captureSearchApi(browseUrl, cleanQuery)
@@ -1295,7 +1241,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // ── Last resort: SSR HTML ──
         Log.e(TAG, "search SSR fallback url=$browseUrl")
         val html = fetchHtml(browseUrl)
         if (html.isNotBlank()) {
@@ -1336,10 +1281,6 @@ class ComixProvider : MainAPI() {
     }
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  Load details
-    // ══════════════════════════════════════════════════════════════════════
 
     override suspend fun load(url: String): LoadResponse? {
         val html = fetchHtml(url)
@@ -1442,16 +1383,9 @@ class ComixProvider : MainAPI() {
         return true
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  Companion
-    // ══════════════════════════════════════════════════════════════════════
-
     private companion object {
 
         val CONTENT_RATINGS = listOf("safe", "suggestive", "erotica", "pornographic")
-
-        val CONTENT_RATINGS_QUERY: String =
-            CONTENT_RATINGS.joinToString("") { "&content_rating[]=$it" }
 
         val signedApiCache = ConcurrentHashMap<ApiKey, String>()
         val signedApiCacheRatingCount = ConcurrentHashMap<ApiKey, Int>()
@@ -1474,6 +1408,12 @@ class ComixProvider : MainAPI() {
 
         data class ApiKey(val tab: String, val page: Int)
 
+        /**
+         * localStorage seed only — no UI click sweep. The logcat proved the
+         * SPA already mounts with 4 ratings when this seed is the only source
+         * of truth. The UI click was actively harmful because it triggered a
+         * re-render that reset the store.
+         */
         val LOCAL_STORAGE_SEED_SCRIPT = """
             (function () {
                 try {
@@ -1515,95 +1455,6 @@ class ComixProvider : MainAPI() {
                 } catch (e) {
                     try { ComixCipherBridge.submitDiagnostic('SEED-ERROR', '' + e); } catch (_) {}
                 }
-
-                (function () {
-                    var state = 'idle';
-                    var deadline = Date.now() + 8000;
-                    var targetLabels = ['safe', 'suggestive', 'erotica', 'pornographic'];
-
-                    function findRatingContainer() {
-                        var labels = document.querySelectorAll('.fdrop__label');
-                        for (var i = 0; i < labels.length; i++) {
-                            if ((labels[i].textContent || '').toUpperCase().indexOf('CONTENT RATING') !== -1) {
-                                return labels[i].parentElement;
-                            }
-                        }
-                        return null;
-                    }
-                    function findPopover(c) {
-                        if (!c) return null;
-                        return c.querySelector('.fdrop__pop') || null;
-                    }
-                    function collectRatingItems(scope) {
-                        var out = [];
-                        var nodes = scope.querySelectorAll('.fdrop__item');
-                        for (var i = 0; i < nodes.length; i++) {
-                            var n = nodes[i];
-                            var t = (n.textContent || '').trim().toLowerCase();
-                            for (var j = 0; j < targetLabels.length; j++) {
-                                if (t === targetLabels[j] || t.indexOf(targetLabels[j]) === 0) {
-                                    out.push(n);
-                                    break;
-                                }
-                            }
-                        }
-                        return out;
-                    }
-                    function loop() {
-                        if (Date.now() > deadline || state === 'done') return;
-                        if (state === 'idle') {
-                            var c = findRatingContainer();
-                            if (c) {
-                                var btn = c.querySelector('.fdrop__btn');
-                                if (btn) {
-                                    try { btn.click(); } catch (e) {}
-                                    try { ComixCipherBridge.submitDiagnostic('UI-CLICK', 'rating dropdown opened'); } catch (e) {}
-                                    state = 'sweep';
-                                    setTimeout(loop, 300);
-                                    return;
-                                }
-                            }
-                        } else if (state === 'sweep') {
-                            var c2 = findRatingContainer();
-                            var scope = findPopover(c2) || document;
-                            var items = collectRatingItems(scope);
-                            var clicked = 0, already = 0;
-                            for (var k = 0; k < items.length; k++) {
-                                var n = items[k];
-                                var isOff = n.classList.contains('fdrop__item--off')
-                                         || n.getAttribute('aria-selected') === 'false';
-                                if (isOff) { try { n.click(); } catch (e) {} clicked++; }
-                                else already++;
-                            }
-                            // Report resulting label + selected count.
-                            try {
-                                var valEl = c2 && c2.querySelector('.fdrop__value');
-                                var pop = findPopover(c2);
-                                var on = 0, off = 0;
-                                if (pop) {
-                                    var list = pop.querySelectorAll('.fdrop__item');
-                                    for (var z = 0; z < list.length; z++) {
-                                        if (list[z].getAttribute('aria-selected') === 'true') on++;
-                                        else off++;
-                                    }
-                                }
-                                ComixCipherBridge.submitDiagnostic('UI-RESULT',
-                                    'label=' + (valEl ? valEl.textContent : '?') +
-                                    ' clicked=' + clicked +
-                                    ' already=' + already +
-                                    ' selected=' + on + '/' + (on + off));
-                            } catch (e) {}
-                            if (c2) {
-                                var btn2 = c2.querySelector('.fdrop__btn');
-                                if (btn2) { try { btn2.click(); } catch (e) {} }
-                            }
-                            state = 'done';
-                            return;
-                        }
-                        setTimeout(loop, 100);
-                    }
-                    setTimeout(loop, 400);
-                })();
             })();
         """.trimIndent()
 
@@ -1640,14 +1491,18 @@ class ComixProvider : MainAPI() {
         """.trimIndent()
 
         /**
-         * Cipher capture. The site produces exactly ONE sbox (length 256) and
-         * one or two keys (length 24 / 32) per session. The previous version
-         * required 3 of each before submitting — unreachable because the dedup
-         * map (`seen['L256']`, etc.) allows at most one of each length.
+         * Broader cipher capture. The previous version only hooked atob /
+         * importKey / Uint8Array.from — none of them fired on this SPA.
          *
-         * Now we submit as soon as we have at least one sbox AND at least one
-         * key, on every new unique capture. Kotlin-side validation rejects
-         * anything malformed.
+         * Added hooks:
+         *  - crypto.subtle.digest output (most likely path for KDF)
+         *  - Uint8Array constructor via Proxy (catches `new Uint8Array([...])`)
+         *  - Array.from (catches `Array.from(bufferLike)`)
+         *  - String.fromCharCode (catches char-code loop construction)
+         *  - TextDecoder.prototype.decode
+         *
+         * Content-based dedup so distinct sboxes with the same length are all
+         * retained. Submit only at 3+3 (what CipherMaterial.isValid requires).
          */
         val CAPTURE_SCRIPT = """
             (function () {
@@ -1655,23 +1510,44 @@ class ComixProvider : MainAPI() {
                 window.__comixCipherHook = true;
 
                 var captures = window.__comixCipherCaptures = [];
-                var seen = window.__comixSeenLengths = {};
+                var seenHashes = {};
+
+                function hashBytes(bytes) {
+                    var h = bytes.length + ':';
+                    var step = bytes.length <= 32 ? 1 : 8;
+                    for (var i = 0; i < bytes.length; i += step) {
+                        h += (bytes[i] & 255).toString(16) + ',';
+                    }
+                    return h;
+                }
+
                 function consider(bytes) {
                     if (!bytes) return;
                     var len = bytes.length;
                     if (len !== 256 && len !== 24 && len !== 32) return;
-                    var key = 'L' + len;
-                    if (seen[key]) return;
-                    seen[key] = true;
+                    var h = hashBytes(bytes);
+                    if (seenHashes[h]) return;
+                    seenHashes[h] = true;
+
                     var arr = new Array(len);
                     for (var i = 0; i < len; i++) arr[i] = bytes[i] & 255;
                     captures.push(arr);
-                    try { ComixCipherBridge.submitDiagnostic('CAPTURE',
-                        'new bytes len=' + len + ' total=' + captures.length); } catch (e) {}
+
                     var sboxes = captures.filter(function (x) { return x.length === 256; });
                     var keys   = captures.filter(function (x) { return x.length === 24 || x.length === 32; });
-                    if (sboxes.length >= 1 && keys.length >= 1) {
-                        try { ComixCipherBridge.submit(JSON.stringify({ sboxes: sboxes, keys: keys })); } catch (e) {}
+
+                    try {
+                        ComixCipherBridge.submitDiagnostic('CAPTURE',
+                            'len=' + len + ' sboxes=' + sboxes.length + ' keys=' + keys.length);
+                    } catch (e) {}
+
+                    if (sboxes.length >= 3 && keys.length >= 3) {
+                        try {
+                            ComixCipherBridge.submit(JSON.stringify({
+                                sboxes: sboxes.slice(0, 3),
+                                keys:   keys.slice(0, 3)
+                            }));
+                        } catch (e) {}
                     }
                 }
 
@@ -1683,6 +1559,7 @@ class ComixProvider : MainAPI() {
                     }
                 } catch (e) {}
 
+                // atob
                 try {
                     var originalAtob = window.atob;
                     var stealthAtob = function (value) {
@@ -1705,9 +1582,28 @@ class ComixProvider : MainAPI() {
                     Object.defineProperty(window, 'atob', { value: stealthAtob, writable: true, configurable: true });
                 } catch (e) {}
 
+                // crypto.subtle.digest + importKey
                 try {
                     if (window.crypto && window.crypto.subtle) {
                         var subtle = window.crypto.subtle;
+                        var origDigest = subtle.digest.bind(subtle);
+                        subtle.digest = function (algo, data) {
+                            var p = origDigest(algo, data);
+                            try {
+                                p.then(function (result) {
+                                    try {
+                                        var bytes = new Uint8Array(result);
+                                        try { ComixCipherBridge.submitDiagnostic('DIGEST-OUT',
+                                            (typeof algo === 'string' ? algo : algo.name) +
+                                            ' out=' + bytes.length); } catch (e) {}
+                                        if (bytes.length === 24 || bytes.length === 32 || bytes.length === 256) {
+                                            consider(bytes);
+                                        }
+                                    } catch (e) {}
+                                });
+                            } catch (e) {}
+                            return p;
+                        };
                         var origImport = subtle.importKey.bind(subtle);
                         subtle.importKey = function (fmt, keyData, algo, extractable, usages) {
                             try {
@@ -1721,6 +1617,26 @@ class ComixProvider : MainAPI() {
                     }
                 } catch (e) {}
 
+                // Uint8Array constructor via Proxy
+                try {
+                    var OrigU8 = window.Uint8Array;
+                    var U8Proxy = new Proxy(OrigU8, {
+                        construct: function (target, args) {
+                            var inst = Reflect.construct(target, args);
+                            try {
+                                if (inst.length === 256 || inst.length === 24 || inst.length === 32) {
+                                    consider(inst);
+                                }
+                            } catch (e) {}
+                            return inst;
+                        }
+                    });
+                    Object.defineProperty(window, 'Uint8Array', {
+                        value: U8Proxy, writable: true, configurable: true
+                    });
+                } catch (e) {}
+
+                // Uint8Array.from
                 try {
                     var origFrom = Uint8Array.from;
                     Uint8Array.from = function (iterable) {
@@ -1730,6 +1646,44 @@ class ComixProvider : MainAPI() {
                         } catch (e) {}
                         return arr;
                     };
+                } catch (e) {}
+
+                // Array.from — catches Array.from(typedArray)
+                try {
+                    var origArrayFrom = Array.from;
+                    Array.from = function (src) {
+                        var res = origArrayFrom.apply(this, arguments);
+                        try {
+                            if (Array.isArray(res) && (res.length === 256 || res.length === 24 || res.length === 32)) {
+                                // Only convert if it's array-like of numbers
+                                var isBytes = true;
+                                for (var i = 0; i < Math.min(res.length, 8); i++) {
+                                    if (typeof res[i] !== 'number') { isBytes = false; break; }
+                                }
+                                if (isBytes) consider(res);
+                            }
+                        } catch (e) {}
+                        return res;
+                    };
+                } catch (e) {}
+
+                // TextDecoder.decode
+                try {
+                    if (window.TextDecoder && TextDecoder.prototype && TextDecoder.prototype.decode) {
+                        var origDecode = TextDecoder.prototype.decode;
+                        TextDecoder.prototype.decode = function (input, options) {
+                            var out = origDecode.call(this, input, options);
+                            try {
+                                if (typeof out === 'string' &&
+                                    (out.length === 256 || out.length === 24 || out.length === 32)) {
+                                    var bytes = new Uint8Array(out.length);
+                                    for (var i = 0; i < out.length; i++) bytes[i] = out.charCodeAt(i) & 255;
+                                    consider(bytes);
+                                }
+                            } catch (e) {}
+                            return out;
+                        };
+                    }
                 } catch (e) {}
 
                 function reportSigned(url) {
