@@ -42,9 +42,6 @@ import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -127,11 +124,7 @@ class ComixProvider : MainAPI() {
     private val cfMutex = Mutex()
 
     @Volatile private var lastCipherAttemptMs: Long = 0L
-    // Lowered from 90s → 20s. A single failed attempt shouldn't lock out
-    // all subsequent pagination calls for a minute and a half.
     private val cipherRetryCooldownMs = 20_000L
-
-    // Raised from 2s → 5s to give /browse time to hydrate and build the cipher.
     private val cipherGraceMs = 5_000L
 
     private val cipherCacheFile: File?
@@ -148,9 +141,11 @@ class ComixProvider : MainAPI() {
             ComixCipher(mat)
         }.getOrNull()
     }
+
     private fun saveCachedCipher(mat: CipherMaterial) {
         runCatching { cipherCacheFile?.writeText(mat.toJson().toString()) }
     }
+
     private fun cachedCipher(): ComixCipher? {
         cipher?.let { return it }
         return loadCachedCipher()?.also { cipher = it }
@@ -165,7 +160,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Cloudflare resolver
+    //  Cloudflare resolver (UNCHANGED)
     // ═══════════════════════════════════════════════════════════════════════
 
     private val CHALLENGE_TITLE_MARKERS = listOf(
@@ -178,6 +173,7 @@ class ComixProvider : MainAPI() {
         if (t.isEmpty()) return true
         return CHALLENGE_TITLE_MARKERS.any { t.contains(it) }
     }
+
     private fun resolverSuccessConditionMet(webView: WebView?): Boolean {
         val url = webView?.url ?: return false
         if (!url.contains("comix.to", ignoreCase = true)) return false
@@ -197,9 +193,6 @@ class ComixProvider : MainAPI() {
                 var checkRunnable: Runnable? = null
                 var timeoutRunnable: Runnable? = null
                 var graceDeadline: Long = 0L
-
-                // NEW: only navigate to /browse once, so the SPA can run the
-                // signed XHR that forces cipher construction.
                 val triggeredCipher = AtomicBoolean(false)
 
                 Log.e(TAG, "attemptSilentResolution START waitForCipher=$waitForCipher")
@@ -256,19 +249,13 @@ class ComixProvider : MainAPI() {
                         override fun onPageFinished(view: WebView?, url: String?) {
                             Log.e(TAG, "silent onPageFinished url=$url title=${view?.title}")
                             view?.evaluateJavascript(CAPTURE_SCRIPT, null)
-
-                            // NEW — homepage alone never builds the cipher. Once
-                            // it's loaded, jump to /browse which DOES hydrate
-                            // client-side and DOES issue a signed API request.
                             if (waitForCipher && !triggeredCipher.get() && url != null &&
                                 url.contains("comix.to", ignoreCase = true) &&
                                 !url.contains("/browse", ignoreCase = true)
                             ) {
                                 if (triggeredCipher.compareAndSet(false, true)) {
                                     Log.e(TAG, "silent navigating to /browse to trigger cipher build")
-                                    view?.postDelayed({
-                                        view.loadUrl("$mainUrl/browse")
-                                    }, 600L)
+                                    view?.postDelayed({ view.loadUrl("$mainUrl/browse") }, 600L)
                                 }
                             }
                         }
@@ -303,9 +290,8 @@ class ComixProvider : MainAPI() {
                                 return
                             }
                             val now = System.currentTimeMillis()
-                            if (graceDeadline == 0L) {
-                                graceDeadline = now + cipherGraceMs
-                            } else if (now >= graceDeadline) {
+                            if (graceDeadline == 0L) graceDeadline = now + cipherGraceMs
+                            else if (now >= graceDeadline) {
                                 Log.e(TAG, "silent resolver SUCCESS (grace expired, no cipher)")
                                 cleanup(true)
                                 return
@@ -323,8 +309,6 @@ class ComixProvider : MainAPI() {
                 decor.addView(webView)
                 webView.loadUrl(mainUrl)
                 handler.postDelayed(checkRunnable!!, 700L)
-                // Slightly longer timeout — the /browse navigation adds a
-                // couple of seconds to the total.
                 handler.postDelayed(timeoutRunnable!!, if (waitForCipher) 15_000L else 8_000L)
             }
         }
@@ -544,7 +528,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  WebView render/scrape helper
+    //  WebView render/scrape helper — FASTER POLLING
     // ═══════════════════════════════════════════════════════════════════════
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -552,7 +536,7 @@ class ComixProvider : MainAPI() {
         url: String,
         waitForJs: String,
         label: String,
-        timeoutMs: Long = 20_000L
+        timeoutMs: Long = 15_000L
     ): List<Map<String, String>>? = withContext(Dispatchers.Main) {
         val activity = CommonActivity.activity ?: return@withContext null
         if (activity.isFinishing || activity.isDestroyed) return@withContext null
@@ -610,8 +594,9 @@ class ComixProvider : MainAPI() {
                         if (done.get()) return@evaluateJavascript
                         val json = raw?.trim()
                         if (json.isNullOrEmpty() || json == "null" || json == "\"null\"") {
-                            handler.postDelayed(this, 400L); return@evaluateJavascript
+                            handler.postDelayed(this, 200L); return@evaluateJavascript
                         }
+                        if (json == "[]") { cleanup(emptyList()); return@evaluateJavascript }
                         val parsed = runCatching {
                             val trimmed = if (json.startsWith("\"") && json.endsWith("\""))
                                 JSONObject("{\"v\":$json}").getString("v") else json
@@ -628,7 +613,7 @@ class ComixProvider : MainAPI() {
                             }
                             out
                         }.getOrNull()
-                        if (parsed.isNullOrEmpty()) { handler.postDelayed(this, 400L); return@evaluateJavascript }
+                        if (parsed == null) { handler.postDelayed(this, 200L); return@evaluateJavascript }
                         cleanup(parsed)
                     }
                 }
@@ -636,66 +621,9 @@ class ComixProvider : MainAPI() {
             timeoutRunnable = Runnable { Log.e(TAG, "renderAndScrape[$label] TIMEOUT"); cleanup(null) }
             decor.addView(webView)
             webView.loadUrl(url)
-            handler.postDelayed(checkRunnable!!, 800L)
+            handler.postDelayed(checkRunnable!!, 300L)
             handler.postDelayed(timeoutRunnable!!, timeoutMs)
         }
-    }
-
-    private suspend fun scrapeChapterLinksViaWebView(titleUrl: String): Map<String, Pair<String, String>> {
-        val js = """
-            (function() {
-                try {
-                    window.scrollTo(0, document.body.scrollHeight);
-                    var labels = ['load more', 'show more', 'view all', 'see all', 'show all', 'all chapters', 'more chapters'];
-                    var clickable = document.querySelectorAll('button, a, [role="button"]');
-                    for (var i = 0; i < clickable.length; i++) {
-                        var el = clickable[i];
-                        var t = (el.textContent || '').trim().toLowerCase();
-                        for (var j = 0; j < labels.length; j++) {
-                            if (t === labels[j] || t.indexOf(labels[j]) !== -1) {
-                                try { el.click(); } catch (e) {}
-                                break;
-                            }
-                        }
-                    }
-                    var nextBtns = document.querySelectorAll(
-                        'a[rel="next"], button[aria-label*="next" i], button[title*="next" i], .pagination .next, .pager .next'
-                    );
-                    for (var k = 0; k < nextBtns.length; k++) {
-                        try { nextBtns[k].click(); } catch (e) {}
-                    }
-                } catch (e) {}
-                var nodes = document.querySelectorAll('a[href*="-chapter-"]');
-                if (!nodes.length) return null;
-                var out = [];
-                for (var m = 0; m < nodes.length; m++) {
-                    var a = nodes[m];
-                    out.push({ h: a.href, t: (a.textContent || '').trim() });
-                }
-                return out;
-            })();
-        """.trimIndent()
-
-        var best: List<Map<String, String>> = emptyList()
-        repeat(6) { iter ->
-            val rows = renderAndScrape(titleUrl, js, label = "chapters#$iter") ?: emptyList()
-            Log.e(TAG, "chapter expand iter=$iter raw=${rows.size} best=${best.size}")
-            if (rows.size > best.size) best = rows
-            if (best.size >= 200) return@repeat
-        }
-
-        val out = linkedMapOf<String, Pair<String, String>>()
-        for (row in best) {
-            val href = row["h"] ?: continue
-            val m = Regex("""-chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: continue
-            val numStr = m.groupValues[1].toDoubleOrNull()?.let {
-                if (it % 1.0 == 0.0) it.toInt().toString() else it.toString()
-            } ?: continue
-            val name = row["t"].orEmpty().ifBlank { "Ch. $numStr" }
-            if (!out.containsKey(numStr)) out[numStr] = name to href
-        }
-        Log.e(TAG, "scrapeChapterLinksViaWebView → ${out.size} chapters (raw anchors=${best.size})")
-        return out
     }
 
     private suspend fun scrapePageCardsViaWebView(pageUrl: String): List<SearchResponse> {
@@ -930,43 +858,8 @@ class ComixProvider : MainAPI() {
                 }
             }
         }
-        val ssrCandidates = buildList {
-            add("$mainUrl/?page=$page")
-            when (request.data) {
-                "hot" -> {
-                    add("$mainUrl/browse?scope=hot&order[chapter_updated_at]=desc&page=$page&limit=28")
-                    add("$mainUrl/browse?scope=hot&page=$page")
-                }
-                "latest" -> {
-                    add("$mainUrl/browse?order[created_at]=desc&page=$page&limit=28")
-                    add("$mainUrl/browse?page=$page")
-                }
-            }
-        }.distinct()
-        Log.e(TAG, "fetchQueryPage step3 SSR candidates=$ssrCandidates")
-        for (ssrUrl in ssrCandidates) {
-            val html = runCatching { fetchHtml(ssrUrl) }.getOrNull() ?: continue
-            if (html.isBlank()) continue
-            val initial = extractInitialDataJson(html)
-            if (initial != null) {
-                val items = readQueries(initial) { k ->
-                    if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
-                    val subtype = k.optString(1)
-                    val p       = k.optJSONObject(2) ?: return@readQueries false
-                    if (p.optInt("page", 1) != page) return@readQueries false
-                    when (request.data) {
-                        "hot"    -> subtype == "list" && p.optString("scope") == "hot"
-                        "latest" -> subtype == "list" && p.optJSONObject("order")?.optString("created_at") == "desc"
-                        else     -> false
-                    }
-                }
-                if (items.isNotEmpty()) return PageResult(items, hasNext = true)
-            }
-            if (page == 1) {
-                val domItems = extractSearchResultsDom(Jsoup.parse(html))
-                if (domItems.isNotEmpty()) return PageResult(domItems, hasNext = true)
-            }
-        }
+        // Skip SSR candidates (they always return the 7 KB SPA shell) — go straight
+        // to WebView render, which is the only path that produces real cards.
         val webViewUrl = when (request.data) {
             "hot"    -> "$mainUrl/browse?scope=hot&order[chapter_updated_at]=desc&page=$page&limit=28"
             "latest" -> "$mainUrl/browse?order[created_at]=desc&page=$page&limit=28"
@@ -1039,20 +932,6 @@ class ComixProvider : MainAPI() {
                 }
             }
         }
-        if (cachedCipher() == null && trySilentCipherAcquisition()) {
-            val params = mapOf("keyword" to listOf(cleanQuery), "limit" to listOf("28"))
-            val body = getSigned("/api/v1/manga", params)
-            if (!body.isNullOrBlank()) {
-                val root = runCatching { JSONObject(body) }.getOrNull()
-                val arr = root?.optJSONObject("result")?.optJSONArray("items")
-                    ?: root?.optJSONArray("items")
-                    ?: root?.optJSONObject("data")?.optJSONArray("items")
-                if (arr != null) {
-                    val items = arrToResults(arr).distinctBy { it.url }
-                    if (items.isNotEmpty()) return items
-                }
-            }
-        }
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
         val searchUrl = "$mainUrl/browse?q=$encoded"
         val html = fetchHtml(searchUrl)
@@ -1090,11 +969,8 @@ class ComixProvider : MainAPI() {
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  Load Details
+    //  Load Details — SINGLE RANGE EPISODE ENTRY (fast path)
     // ═══════════════════════════════════════════════════════════════════════
-    private fun formatChapterNum(n: Double): String =
-        if (n % 1.0 == 0.0) n.toInt().toString() else n.toString()
-
     override suspend fun load(url: String): LoadResponse? {
         Log.e(TAG, "▷ load url=$url")
         val html = fetchHtml(url)
@@ -1104,59 +980,11 @@ class ComixProvider : MainAPI() {
         val document = Jsoup.parse(html)
         val initialData = extractInitialDataJson(document)
 
-        val chapterMap = linkedMapOf<String, Pair<String, String>>()
-        fun putChapter(numStr: String, name: String, absUrl: String) {
-            if (!chapterMap.containsKey(numStr)) chapterMap[numStr] = name to absUrl
-        }
-        fun toAbsolute(href: String): String = when {
-            href.startsWith("http", ignoreCase = true) -> href
-            href.startsWith("/") -> "$mainUrl$href"
-            else -> "$mainUrl/$href"
-        }
-        fun collectFromDoc(doc: Document) {
-            var found = 0
-            doc.select("a[href*='-chapter-']").forEach { a ->
-                val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@forEach
-                val m = Regex("""-chapter-([\d.]+)""", RegexOption.IGNORE_CASE).find(href) ?: return@forEach
-                val numStr = m.groupValues[1].toDoubleOrNull()?.let { formatChapterNum(it) } ?: return@forEach
-                val visible = a.text().trim()
-                val name = visible.ifBlank { "Ch. $numStr" }
-                putChapter(numStr, name, toAbsolute(href))
-                found++
-            }
-            Log.e(TAG, "collectFromDoc anchors=$found chapterMap.size=${chapterMap.size}")
-        }
-
-        collectFromDoc(document)
-
-        var maxPage = 1
-        document.select(".npager__num").forEach { el ->
-            val p = el.text().toIntOrNull() ?: 1
-            if (p > maxPage) maxPage = p
-        }
-        Log.e(TAG, "load maxChapterPage=$maxPage")
-        if (maxPage > 1) {
-            val pages = (2..maxPage).toList()
-            for (chunk in pages.chunked(3)) {
-                coroutineScope {
-                    chunk.map { pageNum ->
-                        async {
-                            val pUrl = if (url.contains("?")) "$url&page=$pageNum" else "$url?page=$pageNum"
-                            val response = runCatching { fetchHtml(pUrl) }.getOrNull() ?: return@async
-                            if (response.isBlank()) return@async
-                            collectFromDoc(Jsoup.parse(response))
-                        }
-                    }.awaitAll()
-                }
-            }
-        }
-
         var detail: JSONObject? = null
         initialData?.optJSONObject("queries")?.let { queries ->
             val keys = queries.keys()
             while (keys.hasNext()) {
                 val k = keys.next()
-                Log.e(TAG, "load title-page query key=${k.take(200)}")
                 val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
                 if (parsed.length() >= 2 && parsed.optString(0) == "manga" && parsed.optString(1) == "detail") {
                     detail = queries.optJSONObject(k)
@@ -1166,46 +994,6 @@ class ComixProvider : MainAPI() {
         }
         val d = detail
         Log.e(TAG, "load detail JSON present=${d != null}")
-        if (d != null) {
-            val it = d.keys()
-            val allKeys = mutableListOf<String>()
-            while (it.hasNext()) allKeys.add(it.next())
-            Log.e(TAG, "load detail keys=${allKeys}")
-        }
-
-        if (d != null) {
-            val candidateKeys = listOf("chapters", "chapter_list", "chapterList", "chapterItems", "items", "chapter_data")
-            for (key in candidateKeys) {
-                val arr = d.optJSONArray(key) ?: continue
-                Log.e(TAG, "load detail['$key'] length=${arr.length()}")
-                for (i in 0 until arr.length()) {
-                    val c = arr.optJSONObject(i) ?: continue
-                    val numStr = c.optString("number", "").takeIf { it.isNotBlank() }
-                        ?: c.optString("chapter", "").takeIf { it.isNotBlank() }
-                        ?: c.optInt("number", 0).takeIf { it != 0 }?.toString()
-                        ?: continue
-                    val href = c.optString("url").takeIf { it.isNotBlank() }
-                        ?: c.optString("href").takeIf { it.isNotBlank() }
-                        ?: c.optString("link").takeIf { it.isNotBlank() }
-                        ?: continue
-                    val name = c.optString("title").takeIf { it.isNotBlank() } ?: "Ch. $numStr"
-                    putChapter(numStr, name, toAbsolute(href))
-                }
-            }
-        }
-
-        // WebView fallback / augmentation
-        if (chapterMap.isEmpty()) {
-            Log.e(TAG, "load chapterMap empty → WebView render fallback")
-            val rendered = scrapeChapterLinksViaWebView(url)
-            Log.e(TAG, "load WebView chapter scrape → ${rendered.size} chapters")
-            rendered.forEach { (k, v) -> putChapter(k, v.first, v.second) }
-        } else {
-            Log.e(TAG, "load chapterMap populated (size=${chapterMap.size}) → augmenting via WebView")
-            val rendered = scrapeChapterLinksViaWebView(url)
-            Log.e(TAG, "load WebView augment → ${rendered.size} chapters")
-            rendered.forEach { (k, v) -> putChapter(k, v.first, v.second) }
-        }
 
         val fallbackTitle: String = run {
             val slug = url.substringAfter("/title/", "").substringAfter("-", "")
@@ -1215,12 +1003,14 @@ class ComixProvider : MainAPI() {
                     if (w.isEmpty()) w else w[0].uppercase() + w.drop(1)
                 }
         }
+
         val mangaTitle = d?.optString("title")?.takeIf { it.isNotBlank() } ?: fallbackTitle
         val posterUrl = d?.optJSONObject("poster")?.optString("large")?.takeIf { it.isNotBlank() }
             ?: d?.optJSONObject("poster")?.optString("medium")
         val plot = d?.optString("synopsis")?.takeIf { it.isNotBlank() }
         val statusStr = d?.optString("status")?.takeIf { it.isNotBlank() }
         val yearInt = d?.optInt("year", 0)?.takeIf { it > 0 }
+
         val genres = buildList {
             if (d != null) {
                 listOf("genres", "tags", "demographics", "formats").forEach { f ->
@@ -1233,58 +1023,34 @@ class ComixProvider : MainAPI() {
             }
         }.distinct()
 
+        // ── Single-episode range entry ─────────────────────────────────
         val latestChapterNum = d?.optInt("latestChapter", 0) ?: 0
-        val firstChapterUrl  = d?.optString("firstChapterUrl")?.takeIf { it.isNotBlank() }
-        val startsAtZero = firstChapterUrl?.contains("-chapter-0", ignoreCase = true) == true
-            || chapterMap.containsKey("0")
+        val rawFirstChapter = d?.optString("firstChapterUrl")?.takeIf { it.isNotBlank() }
+        val firstChapterUrl = when {
+            rawFirstChapter == null -> url
+            rawFirstChapter.startsWith("http") -> rawFirstChapter
+            rawFirstChapter.startsWith("/") -> "$mainUrl$rawFirstChapter"
+            else -> "$mainUrl/$rawFirstChapter"
+        }
+        val startsAtZero = firstChapterUrl.contains("-chapter-0", ignoreCase = true)
         val startCh = if (startsAtZero) 0 else 1
-        val baseMangaUrl = url
-            .trimEnd('/')
-            .replace(Regex("-chapter-[\\d.]+$", RegexOption.IGNORE_CASE), "")
 
-        Log.e(TAG, "load meta latestChapterNum=$latestChapterNum firstChapterUrl=$firstChapterUrl")
-        Log.e(TAG, "load meta startsAtZero=$startsAtZero startCh=$startCh baseMangaUrl=$baseMangaUrl")
-        Log.e(TAG, "load meta chapterMap.size=${chapterMap.size}")
-
-        val allChapterKeys = mutableSetOf<String>()
-        if (latestChapterNum >= startCh) {
-            for (i in startCh..latestChapterNum) allChapterKeys.add(i.toString())
+        val epName = if (latestChapterNum > 0) {
+            "Chapters $startCh - $latestChapterNum"
+        } else {
+            "Read Manga"
         }
-        chapterMap.keys.forEach { key ->
-            if (key.toDoubleOrNull()?.let { it >= 0.0 } == true) allChapterKeys.add(key)
-        }
-        if (allChapterKeys.isEmpty()) allChapterKeys.add(if (startsAtZero) "0" else "1")
 
-        val sortedKeys = allChapterKeys.toList().sortedBy { it.toDoubleOrNull() ?: 0.0 }
-        Log.e(TAG, "load allChapterKeys.size=${sortedKeys.size} first=${sortedKeys.firstOrNull()} last=${sortedKeys.lastOrNull()}")
+        Log.e(TAG, "load single-range episode: name='$epName' url=$firstChapterUrl")
 
-        var fallbackCount = 0
-        val episodes = sortedKeys.mapIndexed { index, key ->
-            val real = chapterMap[key]
-            val epUrl: String
-            if (real != null) {
-                epUrl = real.second
-            } else {
-                fallbackCount++
-                epUrl = when {
-                    key == "0" && startsAtZero  && firstChapterUrl != null -> firstChapterUrl
-                    key == "1" && !startsAtZero && firstChapterUrl != null -> firstChapterUrl
-                    else -> baseMangaUrl
-                }
-            }
-            val epName = real?.first
-                ?: if (startsAtZero && key == "0") "Ch. 0" else "Ch. $key"
-            if (index < 3 || index >= sortedKeys.size - 3) {
-                Log.e(TAG, "  episode[$index] key=$key name=$epName url=$epUrl real=${real != null}")
-            }
-            newEpisode(fixUrl(epUrl)) {
+        val episodes = listOf(
+            newEpisode(fixUrl(firstChapterUrl)) {
                 this.name = epName
                 this.season = 1
-                this.episode = index + 1
+                this.episode = 1
                 this.posterUrl = posterUrl
             }
-        }
-        Log.e(TAG, "load → episodes=${episodes.size} title='$mangaTitle' unmappedFallbacks=$fallbackCount")
+        )
 
         return newAnimeLoadResponse(mangaTitle, url, TvType.Anime) {
             this.posterUrl = posterUrl
