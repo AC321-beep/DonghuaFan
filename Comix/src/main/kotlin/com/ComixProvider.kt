@@ -667,12 +667,6 @@ class ComixProvider : MainAPI() {
         )
     }
 
-    /**
-     * NO content_rating[] in the URL. The logcat conclusively showed that
-     * including them makes the SPA's URL parser collapse the four values
-     * into two. Relying on the localStorage seed alone yields clean
-     * 4-rating signed requests from the SPA on every mount.
-     */
     private fun browseUrlFor(tab: String, page: Int): String? {
         val order = when (tab) {
             "hot"      -> "chapter_updated_at" to "desc"
@@ -685,7 +679,7 @@ class ComixProvider : MainAPI() {
             "followsApi" -> "follows_total" to "desc"
             else -> return null
         }
-        return "$mainUrl/browse?order[${order.first}]=${order.second}&page=$page&limit=28"
+        return "$mainUrl/browse?order[${order.first}]=${order.second}&page=$page&limit=28$CONTENT_RATINGS_QUERY"
     }
 
     private fun maybePrefetchPage2(request: MainPageRequest) {
@@ -801,8 +795,8 @@ class ComixProvider : MainAPI() {
                     if (raw != null) {
                         val ratingCount = signedApiCacheRatingCount[key] ?: 0
                         val json = runCatching { JSONObject(raw) }.getOrNull()
-                        if (json != null && ratingCount >= 4) {
-                            Log.e(TAG, "captureApiResponse[$tab/$page] captured (4 ratings) len=${raw.length}")
+                        if (json != null && ratingCount >= 3) {
+                            Log.e(TAG, "captureApiResponse[$tab/$page] captured (${ratingCount} ratings) len=${raw.length}")
                             cleanup(json); return
                         }
                         if (json != null) {
@@ -925,8 +919,8 @@ class ComixProvider : MainAPI() {
                     if (raw != null) {
                         val ratingCount = searchApiCacheRatingCount[key] ?: 0
                         val json = runCatching { JSONObject(raw) }.getOrNull()
-                        if (json != null && ratingCount >= 4) {
-                            Log.e(TAG, "captureSearchApi['$key'] captured (4 ratings) len=${raw.length}")
+                        if (json != null && ratingCount >= 3) {
+                            Log.e(TAG, "captureSearchApi['$key'] captured (${ratingCount} ratings) len=${raw.length}")
                             cleanup(json); return
                         }
                         if (json != null) {
@@ -1135,17 +1129,27 @@ class ComixProvider : MainAPI() {
         }
 
         val apiParams = apiParamsFor(request.data, page)
-        if (apiParams != null && cachedCipher() != null) {
-            val body = getSigned("/api/v1/manga", apiParams, referer = "$mainUrl/browse")
-            if (!body.isNullOrBlank()) {
-                val root = runCatching { JSONObject(body) }.getOrNull()
-                if (root != null) {
-                    val parsed = extractResultsFromApiJson(root)
-                    if (parsed != null && parsed.first.isNotEmpty()) {
-                        Log.e(TAG, "fetchQueryPage DIRECT-SIGNED tab=${request.data} page=$page items=${parsed.first.size}")
-                        return PageResult(parsed.first, parsed.second)
+        if (apiParams != null) {
+            val hasCipher = cachedCipher() != null || ensureCipher()
+            if (hasCipher) {
+                val body = getSigned("/api/v1/manga", apiParams, referer = "$mainUrl/browse")
+                if (!body.isNullOrBlank()) {
+                    val root = runCatching { JSONObject(body) }.getOrNull()
+                    if (root != null) {
+                        val parsed = extractResultsFromApiJson(root)
+                        if (parsed != null && parsed.first.isNotEmpty()) {
+                            Log.e(TAG, "fetchQueryPage DIRECT-SIGNED tab=${request.data} page=$page items=${parsed.first.size}")
+                            return PageResult(parsed.first, parsed.second)
+                        }
+                        Log.e(TAG, "fetchQueryPage DIRECT-SIGNED parsed empty for ${request.data}/$page")
                     }
+                } else {
+                    Log.e(TAG, "fetchQueryPage DIRECT-SIGNED failed, invalidating cipher")
+                    cipher = null; cipherCacheFile?.delete()
+                    userWarmed = false
                 }
+            } else {
+                Log.e(TAG, "fetchQueryPage no cipher, skipping direct-signed path")
             }
         }
 
@@ -1181,7 +1185,8 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        if (cachedCipher() != null) {
+        val hasCipher = cachedCipher() != null || ensureCipher()
+        if (hasCipher) {
             val params = mapOf(
                 "page" to listOf("1"),
                 "order[chapter_updated_at]" to listOf("desc"),
@@ -1189,7 +1194,11 @@ class ComixProvider : MainAPI() {
                 "content_rating[]" to CONTENT_RATINGS,
                 "keyword" to listOf(cleanQuery)
             )
-            val body = getSigned("/api/v1/manga", params, referer = "$mainUrl/browse")
+            val body = getSigned(
+                "/api/v1/manga",
+                params,
+                referer = "$mainUrl/browse"
+            )
             if (!body.isNullOrBlank()) {
                 val root = runCatching { JSONObject(body) }.getOrNull()
                 val parsed = root?.let { extractResultsFromApiJson(it) }
@@ -1200,11 +1209,18 @@ class ComixProvider : MainAPI() {
                     Log.e(TAG, "search DIRECT-SIGNED items=${items.size} (ratings=${CONTENT_RATINGS.size})")
                     return items
                 }
+                Log.e(TAG, "search DIRECT-SIGNED parsed empty")
+            } else {
+                Log.e(TAG, "search DIRECT-SIGNED failed, invalidating cipher")
+                cipher = null; cipherCacheFile?.delete()
+                userWarmed = false
             }
+        } else {
+            Log.e(TAG, "search no cipher, skipping direct-signed path")
         }
 
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
-        val browseUrl = "$mainUrl/browse?q=$encoded"
+        val browseUrl = "$mainUrl/browse?q=$encoded$CONTENT_RATINGS_QUERY"
         Log.e(TAG, "search WebView fallback url=$browseUrl")
 
         val apiRoot = captureSearchApi(browseUrl, cleanQuery)
@@ -1363,6 +1379,9 @@ class ComixProvider : MainAPI() {
 
         val CONTENT_RATINGS = listOf("safe", "suggestive", "erotica", "pornographic")
 
+        val CONTENT_RATINGS_QUERY: String =
+            CONTENT_RATINGS.joinToString("") { "&content_rating[]=$it" }
+
         val signedApiCache = ConcurrentHashMap<ApiKey, String>()
         val signedApiCacheRatingCount = ConcurrentHashMap<ApiKey, Int>()
         val searchApiCache = ConcurrentHashMap<String, String>()
@@ -1425,6 +1444,94 @@ class ComixProvider : MainAPI() {
                 } catch (e) {
                     try { ComixCipherBridge.submitDiagnostic('SEED-ERROR', '' + e); } catch (_) {}
                 }
+
+                (function () {
+                    var state = 'idle';
+                    var deadline = Date.now() + 8000;
+                    var targetLabels = ['safe', 'suggestive', 'erotica', 'pornographic'];
+
+                    function findRatingContainer() {
+                        var labels = document.querySelectorAll('.fdrop__label');
+                        for (var i = 0; i < labels.length; i++) {
+                            if ((labels[i].textContent || '').toUpperCase().indexOf('CONTENT RATING') !== -1) {
+                                return labels[i].parentElement;
+                            }
+                        }
+                        return null;
+                    }
+                    function findPopover(c) {
+                        if (!c) return null;
+                        return c.querySelector('.fdrop__pop') || null;
+                    }
+                    function collectRatingItems(scope) {
+                        var out = [];
+                        var nodes = scope.querySelectorAll('.fdrop__item');
+                        for (var i = 0; i < nodes.length; i++) {
+                            var n = nodes[i];
+                            var t = (n.textContent || '').trim().toLowerCase();
+                            for (var j = 0; j < targetLabels.length; j++) {
+                                if (t === targetLabels[j] || t.indexOf(targetLabels[j]) === 0) {
+                                    out.push(n);
+                                    break;
+                                }
+                            }
+                        }
+                        return out;
+                    }
+                    function loop() {
+                        if (Date.now() > deadline || state === 'done') return;
+                        if (state === 'idle') {
+                            var c = findRatingContainer();
+                            if (c) {
+                                var btn = c.querySelector('.fdrop__btn');
+                                if (btn) {
+                                    try { btn.click(); } catch (e) {}
+                                    try { ComixCipherBridge.submitDiagnostic('UI-CLICK', 'rating dropdown opened'); } catch (e) {}
+                                    state = 'sweep';
+                                    setTimeout(loop, 300);
+                                    return;
+                                }
+                            }
+                        } else if (state === 'sweep') {
+                            var c2 = findRatingContainer();
+                            var scope = findPopover(c2) || document;
+                            var items = collectRatingItems(scope);
+                            var clicked = 0, already = 0;
+                            for (var k = 0; k < items.length; k++) {
+                                var n = items[k];
+                                var isOff = n.classList.contains('fdrop__item--off')
+                                         || n.getAttribute('aria-selected') === 'false';
+                                if (isOff) { try { n.click(); } catch (e) {} clicked++; }
+                                else already++;
+                            }
+                            try {
+                                var valEl = c2 && c2.querySelector('.fdrop__value');
+                                var pop = findPopover(c2);
+                                var on = 0, off = 0;
+                                if (pop) {
+                                    var list = pop.querySelectorAll('.fdrop__item');
+                                    for (var z = 0; z < list.length; z++) {
+                                        if (list[z].getAttribute('aria-selected') === 'true') on++;
+                                        else off++;
+                                    }
+                                }
+                                ComixCipherBridge.submitDiagnostic('UI-RESULT',
+                                    'label=' + (valEl ? valEl.textContent : '?') +
+                                    ' clicked=' + clicked +
+                                    ' already=' + already +
+                                    ' selected=' + on + '/' + (on + off));
+                            } catch (e) {}
+                            if (c2) {
+                                var btn2 = c2.querySelector('.fdrop__btn');
+                                if (btn2) { try { btn2.click(); } catch (e) {} }
+                            }
+                            state = 'done';
+                            return;
+                        }
+                        setTimeout(loop, 100);
+                    }
+                    setTimeout(loop, 400);
+                })();
             })();
         """.trimIndent()
 
