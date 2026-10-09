@@ -143,6 +143,10 @@ class ComixProvider : MainAPI() {
     @Volatile private var lastCipherAttemptMs: Long = 0L
     private val cipherRetryCooldownMs = 20_000L
     private val cipherGraceMs = 8_000L
+    private val cipherAcquireMutex = Mutex()
+
+    /** One-time warm-up: mimics the SPA's `/api/v1/user` pre-flight call. */
+    @Volatile private var userWarmed = false
 
     private val cipherCacheFile: File?
         get() {
@@ -169,6 +173,48 @@ class ComixProvider : MainAPI() {
         return loadCachedCipher()?.also {
             cipher = it
             Log.e(TAG, "Cipher loaded from cache file")
+        }
+    }
+
+    /**
+     * Ensures a valid cipher is available before attempting the direct-signed
+     * path. If none is cached, runs the WebView acquisition flow once,
+     * respecting a 20 s cooldown so concurrent callers don't spawn WebViews.
+     */
+    private suspend fun ensureCipher(): Boolean {
+        if (cachedCipher() != null) return true
+        return cipherAcquireMutex.withLock {
+            if (cachedCipher() != null) return@withLock true
+            val activity = CommonActivity.activity ?: return@withLock false
+            if (activity.isFinishing || activity.isDestroyed) return@withLock false
+            val now = System.currentTimeMillis()
+            if (now - lastCipherAttemptMs < cipherRetryCooldownMs) {
+                Log.e(TAG, "ensureCipher: cooldown active (${now - lastCipherAttemptMs}ms)")
+                return@withLock false
+            }
+            lastCipherAttemptMs = now
+            Log.e(TAG, "ensureCipher: acquiring via WebView")
+            val ok = attemptSilentResolution(activity, waitForCipher = true)
+            if (ok && cipher != null) {
+                Log.e(TAG, "ensureCipher: cipher acquired ✓")
+                warmUserEndpointOnce()
+                true
+            } else {
+                Log.e(TAG, "ensureCipher: acquisition failed (ok=$ok cipher=${cipher != null})")
+                false
+            }
+        }
+    }
+
+    /**
+     * Fire-and-forget pre-flight that matches the SPA's request sequence
+     * (`/api/v1/user` then `/api/v1/manga`). Runs once per session.
+     */
+    private suspend fun warmUserEndpointOnce() {
+        if (userWarmed) return
+        runCatching {
+            app.get("$mainUrl/api/v1/user", interceptor = cfInterceptor).text
+            userWarmed = true
         }
     }
 
@@ -627,6 +673,10 @@ class ComixProvider : MainAPI() {
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  Query-param builders
+    // ══════════════════════════════════════════════════════════════════════
+
     private fun apiParamsFor(tab: String, page: Int): Map<String, List<String>>? {
         val order = when (tab) {
             "hot"      -> "chapter_updated_at" to "desc"
@@ -664,14 +714,12 @@ class ComixProvider : MainAPI() {
 
     private suspend fun trySilentCipherAcquisition(): Boolean {
         if (cachedCipher() != null) return true
-        val activity = CommonActivity.activity ?: return false
-        if (activity.isFinishing || activity.isDestroyed) return false
-        val now = System.currentTimeMillis()
-        if (now - lastCipherAttemptMs < cipherRetryCooldownMs) return false
-        val ok = attemptSilentResolution(activity, waitForCipher = true)
-        lastCipherAttemptMs = now
-        return ok
+        return ensureCipher()
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  Prefetch
+    // ══════════════════════════════════════════════════════════════════════
 
     private fun maybePrefetchPage2(request: MainPageRequest) {
         if (request.data != "hot" && request.data != "latest") return
@@ -790,14 +838,16 @@ class ComixProvider : MainAPI() {
                     if (raw != null) {
                         val ratingCount = signedApiCacheRatingCount[key] ?: 0
                         val json = runCatching { JSONObject(raw) }.getOrNull()
-                        if (json != null && ratingCount >= 4) {
-                            Log.e(TAG, "captureApiResponse[$tab/$page] captured (4 ratings) len=${raw.length}")
+                        // SPA caps at 3 ratings — accept as soon as we have 3,
+                        // with a short grace window for the very first 2-rating response.
+                        if (json != null && ratingCount >= 3) {
+                            Log.e(TAG, "captureApiResponse[$tab/$page] captured (${ratingCount} ratings) len=${raw.length}")
                             cleanup(json); return
                         }
                         if (json != null) {
                             if (graceAt == 0L) graceAt = System.currentTimeMillis() + 1_500L
                             else if (System.currentTimeMillis() >= graceAt) {
-                                Log.e(TAG, "captureApiResponse[$tab/$page] accepting (ratings=$ratingCount)")
+                                Log.e(TAG, "captureApiResponse[$tab/$page] accepting first response (ratings=$ratingCount)")
                                 cleanup(json); return
                             }
                         }
@@ -914,14 +964,14 @@ class ComixProvider : MainAPI() {
                     if (raw != null) {
                         val ratingCount = searchApiCacheRatingCount[key] ?: 0
                         val json = runCatching { JSONObject(raw) }.getOrNull()
-                        if (json != null && ratingCount >= 4) {
-                            Log.e(TAG, "captureSearchApi['$key'] captured (4 ratings) len=${raw.length}")
+                        if (json != null && ratingCount >= 3) {
+                            Log.e(TAG, "captureSearchApi['$key'] captured (${ratingCount} ratings) len=${raw.length}")
                             cleanup(json); return
                         }
                         if (json != null) {
                             if (graceAt == 0L) graceAt = System.currentTimeMillis() + 1_500L
                             else if (System.currentTimeMillis() >= graceAt) {
-                                Log.e(TAG, "captureSearchApi['$key'] accepting (ratings=$ratingCount)")
+                                Log.e(TAG, "captureSearchApi['$key'] accepting first response (ratings=$ratingCount)")
                                 cleanup(json); return
                             }
                         }
@@ -1131,29 +1181,41 @@ class ComixProvider : MainAPI() {
             }
         }
 
+        // ── Primary path: our own signed request with all four ratings ──
         val apiParams = apiParamsFor(request.data, page)
-        if (apiParams != null && cachedCipher() != null) {
-            val body = getSigned("/api/v1/manga", apiParams, referer = "$mainUrl/browse")
-            if (!body.isNullOrBlank()) {
-                val root = runCatching { JSONObject(body) }.getOrNull()
-                if (root != null) {
-                    val parsed = extractResultsFromApiJson(root)
-                    if (parsed != null && parsed.first.isNotEmpty()) {
-                        return PageResult(parsed.first, parsed.second)
+        if (apiParams != null) {
+            val hasCipher = cachedCipher() != null || ensureCipher()
+            if (hasCipher) {
+                val body = getSigned("/api/v1/manga", apiParams, referer = "$mainUrl/browse")
+                if (!body.isNullOrBlank()) {
+                    val root = runCatching { JSONObject(body) }.getOrNull()
+                    if (root != null) {
+                        val parsed = extractResultsFromApiJson(root)
+                        if (parsed != null && parsed.first.isNotEmpty()) {
+                            Log.e(TAG, "fetchQueryPage DIRECT-SIGNED tab=${request.data} page=$page items=${parsed.first.size}")
+                            return PageResult(parsed.first, parsed.second)
+                        }
+                        Log.e(TAG, "fetchQueryPage DIRECT-SIGNED parsed empty for ${request.data}/$page")
                     }
+                } else {
+                    // Cipher was rejected — invalidate and fall through.
+                    Log.e(TAG, "fetchQueryPage DIRECT-SIGNED failed, invalidating cipher")
+                    cipher = null; cipherCacheFile?.delete()
+                    userWarmed = false
                 }
             } else {
-                cipher = null; cipherCacheFile?.delete()
+                Log.e(TAG, "fetchQueryPage no cipher, skipping direct-signed path")
             }
         }
 
+        // ── Fallback: WebView (SPA-capped at 3 ratings) ──
         val browseUrl = browseUrlFor(request.data, page) ?: return null
-        Log.e(TAG, "fetchQueryPage captureApiResponse url=$browseUrl")
+        Log.e(TAG, "fetchQueryPage WebView fallback url=$browseUrl")
         val apiRoot = captureApiResponse(browseUrl, request.data, page)
         if (apiRoot != null) {
             val parsed = extractResultsFromApiJson(apiRoot)
             if (parsed != null && parsed.first.isNotEmpty()) {
-                Log.e(TAG, "fetchQueryPage captured items=${parsed.first.size}")
+                Log.e(TAG, "fetchQueryPage WebView captured items=${parsed.first.size}")
                 return PageResult(parsed.first, hasNext = true)
             }
         }
@@ -1183,7 +1245,9 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        if (cachedCipher() != null) {
+        // ── Primary path: our own signed request with all four ratings ──
+        val hasCipher = cachedCipher() != null || ensureCipher()
+        if (hasCipher) {
             val params = mapOf(
                 "page" to listOf("1"),
                 "order[chapter_updated_at]" to listOf("desc"),
@@ -1206,26 +1270,32 @@ class ComixProvider : MainAPI() {
                     Log.e(TAG, "search DIRECT-SIGNED items=${items.size} (ratings=${CONTENT_RATINGS.size})")
                     return items
                 }
+                Log.e(TAG, "search DIRECT-SIGNED parsed empty")
             } else {
-                Log.e(TAG, "search DIRECT-SIGNED failed, invalidating cipher; falling back to WebView")
+                Log.e(TAG, "search DIRECT-SIGNED failed, invalidating cipher")
                 cipher = null; cipherCacheFile?.delete()
+                userWarmed = false
             }
+        } else {
+            Log.e(TAG, "search no cipher, skipping direct-signed path")
         }
 
+        // ── Fallback: WebView (SPA-capped at 3 ratings) ──
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
         val browseUrl = "$mainUrl/browse?q=$encoded$CONTENT_RATINGS_QUERY"
-        Log.e(TAG, "search captureSearchApi url=$browseUrl")
+        Log.e(TAG, "search WebView fallback url=$browseUrl")
 
         val apiRoot = captureSearchApi(browseUrl, cleanQuery)
         if (apiRoot != null) {
             val parsed = extractResultsFromApiJson(apiRoot)
             if (parsed != null && parsed.first.isNotEmpty()) {
                 val items = parsed.first.distinctBy { it.url }
-                Log.e(TAG, "search captured items=${items.size}")
+                Log.e(TAG, "search WebView captured items=${items.size}")
                 return items
             }
         }
 
+        // ── Last resort: SSR HTML ──
         Log.e(TAG, "search SSR fallback url=$browseUrl")
         val html = fetchHtml(browseUrl)
         if (html.isNotBlank()) {
@@ -1373,7 +1443,7 @@ class ComixProvider : MainAPI() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  Companion — caches, locks, seed script with real UI sweep, capture
+    //  Companion
     // ══════════════════════════════════════════════════════════════════════
 
     private companion object {
@@ -1462,15 +1532,11 @@ class ComixProvider : MainAPI() {
                     }
                     function findPopover(c) {
                         if (!c) return null;
-                        return c.querySelector('.fdrop__pop, .fdrop__menu, .fdrop__dropdown, [role="listbox"], [role="menu"]')
-                            || c.querySelector('.fdrop__btn ~ *') || null;
+                        return c.querySelector('.fdrop__pop') || null;
                     }
                     function collectRatingItems(scope) {
                         var out = [];
-                        var nodes = scope.querySelectorAll(
-                            'input[type="checkbox"], [role="checkbox"], [role="option"], ' +
-                            '.fdrop__opt, label, li, button'
-                        );
+                        var nodes = scope.querySelectorAll('.fdrop__item');
                         for (var i = 0; i < nodes.length; i++) {
                             var n = nodes[i];
                             var t = (n.textContent || '').trim().toLowerCase();
@@ -1504,19 +1570,28 @@ class ComixProvider : MainAPI() {
                             var clicked = 0, already = 0;
                             for (var k = 0; k < items.length; k++) {
                                 var n = items[k];
-                                var cb = (n.matches && n.matches('input[type="checkbox"]'))
-                                    ? n : (n.querySelector ? n.querySelector('input[type="checkbox"]') : null);
-                                if (cb) {
-                                    if (!cb.checked) { try { cb.click(); } catch (e) {} clicked++; }
-                                    else already++;
-                                } else {
-                                    try { n.click(); } catch (e) {}
-                                    clicked++;
-                                }
+                                var isOff = n.classList.contains('fdrop__item--off')
+                                         || n.getAttribute('aria-selected') === 'false';
+                                if (isOff) { try { n.click(); } catch (e) {} clicked++; }
+                                else already++;
                             }
+                            // Report resulting label + selected count.
                             try {
-                                ComixCipherBridge.submitDiagnostic('UI-CLICK',
-                                    'rating sweep clicked=' + clicked + ' already=' + already + ' total=' + items.length);
+                                var valEl = c2 && c2.querySelector('.fdrop__value');
+                                var pop = findPopover(c2);
+                                var on = 0, off = 0;
+                                if (pop) {
+                                    var list = pop.querySelectorAll('.fdrop__item');
+                                    for (var z = 0; z < list.length; z++) {
+                                        if (list[z].getAttribute('aria-selected') === 'true') on++;
+                                        else off++;
+                                    }
+                                }
+                                ComixCipherBridge.submitDiagnostic('UI-RESULT',
+                                    'label=' + (valEl ? valEl.textContent : '?') +
+                                    ' clicked=' + clicked +
+                                    ' already=' + already +
+                                    ' selected=' + on + '/' + (on + off));
                             } catch (e) {}
                             if (c2) {
                                 var btn2 = c2.querySelector('.fdrop__btn');
@@ -1564,6 +1639,16 @@ class ComixProvider : MainAPI() {
             })();
         """.trimIndent()
 
+        /**
+         * Cipher capture. The site produces exactly ONE sbox (length 256) and
+         * one or two keys (length 24 / 32) per session. The previous version
+         * required 3 of each before submitting — unreachable because the dedup
+         * map (`seen['L256']`, etc.) allows at most one of each length.
+         *
+         * Now we submit as soon as we have at least one sbox AND at least one
+         * key, on every new unique capture. Kotlin-side validation rejects
+         * anything malformed.
+         */
         val CAPTURE_SCRIPT = """
             (function () {
                 if (window.__comixCipherHook) return;
@@ -1581,9 +1666,11 @@ class ComixProvider : MainAPI() {
                     var arr = new Array(len);
                     for (var i = 0; i < len; i++) arr[i] = bytes[i] & 255;
                     captures.push(arr);
-                    var sboxes = captures.filter(function (x) { return x.length === 256; }).slice(0, 3);
-                    var keys   = captures.filter(function (x) { return x.length === 24 || x.length === 32; }).slice(0, 3);
-                    if (sboxes.length === 3 && keys.length === 3) {
+                    try { ComixCipherBridge.submitDiagnostic('CAPTURE',
+                        'new bytes len=' + len + ' total=' + captures.length); } catch (e) {}
+                    var sboxes = captures.filter(function (x) { return x.length === 256; });
+                    var keys   = captures.filter(function (x) { return x.length === 24 || x.length === 32; });
+                    if (sboxes.length >= 1 && keys.length >= 1) {
                         try { ComixCipherBridge.submit(JSON.stringify({ sboxes: sboxes, keys: keys })); } catch (e) {}
                     }
                 }
