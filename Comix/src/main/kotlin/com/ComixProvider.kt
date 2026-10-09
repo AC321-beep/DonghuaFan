@@ -14,6 +14,8 @@ import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -45,10 +47,12 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Interceptor
 import okhttp3.Response
 import org.json.JSONArray
@@ -252,16 +256,6 @@ class ComixProvider : MainAPI() {
             } catch (t: Throwable) {
                 Log.e(TAG, "submitApiResponse error: ${t.message}")
             }
-        }
-
-        // ── Diagnostic-only, receives the localStorage dump ────────────────
-        @JavascriptInterface
-        fun submitLocalStorageDump(dump: String) {
-            Log.e(TAG, "=== LOCALSTORAGE DUMP START ===")
-            dump.split("\n").forEach { line ->
-                if (line.isNotBlank()) Log.e(TAG, "  LS: $line")
-            }
-            Log.e(TAG, "=== LOCALSTORAGE DUMP END ===")
         }
     }
 
@@ -494,6 +488,38 @@ class ComixProvider : MainAPI() {
         return runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
     }
 
+    /**
+     * Synchronous fetch used from shouldInterceptRequest on the WebView's IO thread.
+     * Returns null on any failure so the WebView falls back to its own loader.
+     */
+    private fun blockingFetchHtml(url: String): String? {
+        return try {
+            runBlocking(Dispatchers.IO) {
+                withTimeoutOrNull(8_000L) {
+                    runCatching {
+                        app.get(url, interceptor = cfInterceptor).text
+                    }.getOrNull()
+                }
+            }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * Patches the HTML by inserting the localStorage seed script right after
+     * the opening <head> tag, so it runs before the site's own boot scripts.
+     * Returns null if the HTML doesn't contain a <head> element.
+     */
+    private fun injectSeedIntoHtml(html: String): String? {
+        val seed = "<script>${LOCAL_STORAGE_SEED_SCRIPT.replace("</", "<\\/")}</script>"
+        val headOpenIdx = html.indexOf("<head", ignoreCase = true)
+        if (headOpenIdx < 0) return null
+        val headCloseIdx = html.indexOf('>', headOpenIdx)
+        if (headCloseIdx < 0) return null
+        return html.substring(0, headCloseIdx + 1) + seed + html.substring(headCloseIdx + 1)
+    }
+
     private suspend fun fetchHomeHtml(): String {
         val cached = homeHtml
         val at = homeHtmlAt
@@ -621,13 +647,37 @@ class ComixProvider : MainAPI() {
                 webViewClient = object : WebViewClient() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: WebView?, h: SslErrorHandler?, error: SslError?) { h?.proceed() }
+
+                    override fun shouldInterceptRequest(
+                        view: WebView?,
+                        request: WebResourceRequest?
+                    ): WebResourceResponse? {
+                        val req = request ?: return null
+                        val url = req.url?.toString() ?: return null
+                        if (!req.isForMainFrame) return null
+                        if (!url.contains("comix.to", ignoreCase = true)) return null
+                        if (!url.contains("/browse")) return null
+
+                        val html = blockingFetchHtml(url) ?: return null
+                        if (isCloudflareChallenge(html)) return null
+
+                        val patched = injectSeedIntoHtml(html) ?: return null
+                        Log.e(TAG, "shouldInterceptRequest → seeded $url")
+                        return WebResourceResponse(
+                            "text/html",
+                            "UTF-8",
+                            200,
+                            "OK",
+                            emptyMap(),
+                            patched.byteInputStream(Charsets.UTF_8)
+                        )
+                    }
+
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                         view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                     }
                     override fun onPageFinished(view: WebView?, url: String?) {
                         view?.evaluateJavascript(CAPTURE_SCRIPT, null)
-                        // Fire the localStorage diagnostic (synchronous first shot).
-                        view?.evaluateJavascript(LOCAL_STORAGE_DUMP_SCRIPT, null)
                     }
                 }
             }
@@ -712,6 +762,32 @@ class ComixProvider : MainAPI() {
                 webViewClient = object : WebViewClient() {
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(view: WebView?, h: SslErrorHandler?, error: SslError?) { h?.proceed() }
+
+                    override fun shouldInterceptRequest(
+                        view: WebView?,
+                        request: WebResourceRequest?
+                    ): WebResourceResponse? {
+                        val req = request ?: return null
+                        val url = req.url?.toString() ?: return null
+                        if (!req.isForMainFrame) return null
+                        if (!url.contains("comix.to", ignoreCase = true)) return null
+                        if (!url.contains("/browse")) return null
+
+                        val html = blockingFetchHtml(url) ?: return null
+                        if (isCloudflareChallenge(html)) return null
+
+                        val patched = injectSeedIntoHtml(html) ?: return null
+                        Log.e(TAG, "shouldInterceptRequest → seeded $url")
+                        return WebResourceResponse(
+                            "text/html",
+                            "UTF-8",
+                            200,
+                            "OK",
+                            emptyMap(),
+                            patched.byteInputStream(Charsets.UTF_8)
+                        )
+                    }
+
                     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                         view?.evaluateJavascript(CAPTURE_SCRIPT, null)
                     }
@@ -997,8 +1073,8 @@ class ComixProvider : MainAPI() {
         }
 
         val browseUrl = when (request.data) {
-            "hot"    -> "$mainUrl/browse?scope=hot&order[chapter_updated_at]=desc&page=$page&limit=28$EXTENDED_RATINGS_PARAMS"
-            "latest" -> "$mainUrl/browse?order[created_at]=desc&page=$page&limit=28$EXTENDED_RATINGS_PARAMS"
+            "hot"    -> "$mainUrl/browse?scope=hot&order[chapter_updated_at]=desc&page=$page&limit=28"
+            "latest" -> "$mainUrl/browse?order[created_at]=desc&page=$page&limit=28"
             else     -> return null
         }
         Log.e(TAG, "fetchQueryPage captureApiResponse url=$browseUrl")
@@ -1075,7 +1151,7 @@ class ComixProvider : MainAPI() {
         }
 
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
-        val browseUrl = "$mainUrl/browse?q=$encoded$EXTENDED_RATINGS_PARAMS"
+        val browseUrl = "$mainUrl/browse?q=$encoded"
         Log.e(TAG, "search captureSearchApi url=$browseUrl")
 
         val apiRoot = captureSearchApi(browseUrl, cleanQuery)
@@ -1235,21 +1311,10 @@ class ComixProvider : MainAPI() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  Companion — caches, locks, extended-rating constant, capture scripts
+    //  Companion — caches, locks, seed script, capture script
     // ══════════════════════════════════════════════════════════════════════
 
     private companion object {
-
-        /**
-         * Extended content_rating[] params. The site overwrites these on the
-         * server-side filter, but the diagnostic will show us the real
-         * localStorage field name so we can set the correct one directly.
-         */
-        const val EXTENDED_RATINGS_PARAMS =
-            "&content_rating[]=safe" +
-            "&content_rating[]=suggestive" +
-            "&content_rating[]=erotica" +
-            "&content_rating[]=pornographic"
 
         val signedApiCache = ConcurrentHashMap<ApiKey, String>()
         val searchApiCache = ConcurrentHashMap<String, String>()
@@ -1271,37 +1336,23 @@ class ComixProvider : MainAPI() {
         data class ApiKey(val tab: String, val page: Int)
 
         /**
-         * Diagnostic-only. Fires shot 1 synchronously (before the WebView is
-         * destroyed), then schedules shots 2 and 3 at 400 ms and 1000 ms —
-         * both well within the WebView's ~1 s lifespan.
+         * Runs at document-start (injected into <head>) to seed the SPA's
+         * persisted filter store before its boot code reads localStorage.
+         *
+         * The site's Zustand store keys its persisted filter state at
+         * `list.filters.v2`. The SPA reads `contentRating` from it to build
+         * its signed /api/v1/manga XHR. By overwriting this key before any
+         * of the site's own scripts run, the site's own request carries all
+         * four content ratings — which is what we then capture.
          */
-        val LOCAL_STORAGE_DUMP_SCRIPT = """
+        val LOCAL_STORAGE_SEED_SCRIPT = """
             (function () {
-                if (window.__comixLsDumped) return;
-                window.__comixLsDumped = true;
-
-                function snap(shot) {
-                    try {
-                        var out = [];
-                        for (var i = 0; i < localStorage.length; i++) {
-                            var k = localStorage.key(i);
-                            var v = localStorage.getItem(k) || '';
-                            if (v.length > 600) v = v.substring(0, 600) + '...';
-                            out.push(k + ' = ' + v);
-                        }
-                        ComixCipherBridge.submitLocalStorageDump(
-                            '[shot ' + shot + '] ' + out.length + ' keys\n' + out.join('\n')
-                        );
-                    } catch (e) {
-                        ComixCipherBridge.submitLocalStorageDump(
-                            '[shot ' + shot + '] error: ' + (e && e.message ? e.message : 'unknown')
-                        );
-                    }
-                }
-
-                snap(1);
-                setTimeout(function () { snap(2); }, 400);
-                setTimeout(function () { snap(3); }, 1000);
+                try {
+                    var raw = localStorage.getItem('list.filters.v2');
+                    var filters = raw ? JSON.parse(raw) : {};
+                    filters.contentRating = ['safe','suggestive','erotica','pornographic'];
+                    localStorage.setItem('list.filters.v2', JSON.stringify(filters));
+                } catch (e) {}
             })();
         """.trimIndent()
 
