@@ -305,11 +305,6 @@ class ComixProvider : MainAPI() {
                             cleanup(true)
                             return
                         }
-                        // Real page reached but the cipher hasn't been captured.
-                        // The S-boxes are decoded during the page's own script
-                        // execution, so a short grace window is enough. If they
-                        // don't appear, accept anyway — a real page load is the
-                        // meaningful signal.
                         val now = System.currentTimeMillis()
                         if (graceDeadline == 0L) {
                             graceDeadline = now + cipherGraceMs
@@ -403,7 +398,6 @@ class ComixProvider : MainAPI() {
                         handler.postDelayed({ finish(true) }, 700)
                         return
                     }
-                    // Same grace logic as the silent resolver.
                     val now = System.currentTimeMillis()
                     if (graceDeadline == 0L) {
                         graceDeadline = now + cipherGraceMs
@@ -491,20 +485,6 @@ class ComixProvider : MainAPI() {
 
     /**
      * Request-first, CF only when actually challenged.
-     *
-     *   1. Direct GET. Real HTML → return.
-     *   2. Blank response → likely a network-level failure. One retry, then
-     *      give up: running the resolver for a DNS error is pointless.
-     *   3. Challenge response → one more direct GET (CDN cache often serves
-     *      the real page on the second try).
-     *   4. Still challenging → run the resolver under a mutex. Inside the
-     *      mutex we probe once more in case a concurrent caller already
-     *      solved it while we were waiting for the lock.
-     *   5. Return whatever the final GET gives.
-     *
-     * This is what makes a CF state flip a non-event: the next challenge
-     * simply triggers the resolver again, and the resolver's success condition
-     * (reached real page) is valid in either state.
      */
     private suspend fun fetchHtml(url: String): String {
         val first = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
@@ -515,12 +495,10 @@ class ComixProvider : MainAPI() {
             if (retry.isBlank()) return ""
             if (!isCloudflareChallenge(retry)) return retry
         } else {
-            // first was a challenge — one more direct attempt before the resolver.
             val second = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
             if (second.isNotBlank() && !isCloudflareChallenge(second)) return second
         }
 
-        // Genuine challenge. Serialize and re-probe inside the lock.
         cfMutex.withLock {
             val probe = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
             if (probe.isNotBlank() && !isCloudflareChallenge(probe)) return probe
@@ -803,6 +781,13 @@ class ComixProvider : MainAPI() {
         }
 
         // 3. SSR fallback across several URL shapes.
+        //
+        // FIX: the matcher below now REQUIRES the query's `page` param to equal
+        // the requested page, uses optString("scope") WITHOUT a default (so
+        // a scope-less "latest" query can't masquerade as "hot"), and requires
+        // the order.created_at marker for "latest" so a "hot" query can't be
+        // served for the latest tab. This eliminates same-page/same-list
+        // duplicates that appeared when the SSR HTML still held page-1 queries.
         val ssrCandidates = buildList {
             add("$mainUrl/?page=$page")
             when (request.data) {
@@ -824,19 +809,28 @@ class ComixProvider : MainAPI() {
             val initial = extractInitialDataJson(html)
             if (initial != null) {
                 val items = readQueries(initial) { k ->
-                    if (k.length() < 2 || k.optString(0) != "manga") return@readQueries false
+                    if (k.length() < 3 || k.optString(0) != "manga") return@readQueries false
+                    val subtype = k.optString(1)
+                    val p       = k.optJSONObject(2) ?: return@readQueries false
+                    // Page must match what we asked for.
+                    if (p.optInt("page", 1) != page) return@readQueries false
                     when (request.data) {
-                        "hot" -> k.optString(1) == "list" &&
-                                 k.optJSONObject(2)?.optString("scope", "hot") == "hot"
-                        "latest" -> k.optString(1) == "list"
-                        else -> false
+                        "hot"    -> subtype == "list" && p.optString("scope") == "hot"
+                        "latest" -> subtype == "list" &&
+                                    p.optJSONObject("order")?.optString("created_at") == "desc"
+                        else     -> false
                     }
                 }
                 if (items.isNotEmpty()) return PageResult(items, hasNext = true)
             }
 
-            val domItems = extractSearchResultsDom(Jsoup.parse(html))
-            if (domItems.isNotEmpty()) return PageResult(domItems, hasNext = true)
+            // DOM fallback only for page 1 — on later pages the SSR HTML may
+            // still be page-1 content (server ignored ?page=N), which would
+            // duplicate page-1 items here.
+            if (page == 1) {
+                val domItems = extractSearchResultsDom(Jsoup.parse(html))
+                if (domItems.isNotEmpty()) return PageResult(domItems, hasNext = true)
+            }
         }
 
         return PageResult(emptyList(), false)
@@ -865,6 +859,14 @@ class ComixProvider : MainAPI() {
                 }
             }
 
+            // Page-1 fallback: prefer "list" subtype first, then any manga.
+            // This stops every main-page tab from collapsing onto the first
+            // arbitrary manga query in the JSON.
+            if (items.isEmpty() && page == 1) {
+                items = readQueries(initial) { k ->
+                    k.length() >= 2 && k.optString(0) == "manga" && k.optString(1) == "list"
+                }
+            }
             if (items.isEmpty() && page == 1) {
                 items = readQueries(initial) { k ->
                     k.length() >= 2 && k.optString(0) == "manga"
