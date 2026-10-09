@@ -565,12 +565,6 @@ class ComixProvider : MainAPI() {
         return m.groupValues[1]
     }
 
-    /**
-     * Injects ONLY the localStorage seed. The previous version also injected
-     * an initial-data patcher, but the logcat showed that patch reset the
-     * SPA's reactive store back to 2 ratings on every mount — the exact
-     * opposite of what we wanted.
-     */
     private fun injectSeedIntoHtml(html: String): String? {
         val seedBody = LOCAL_STORAGE_SEED_SCRIPT.replace("</", "<\\/")
         val seed = "<script>$seedBody</script>"
@@ -673,6 +667,12 @@ class ComixProvider : MainAPI() {
         )
     }
 
+    /**
+     * NO content_rating[] in the URL. The logcat conclusively showed that
+     * including them makes the SPA's URL parser collapse the four values
+     * into two. Relying on the localStorage seed alone yields clean
+     * 4-rating signed requests from the SPA on every mount.
+     */
     private fun browseUrlFor(tab: String, page: Int): String? {
         val order = when (tab) {
             "hot"      -> "chapter_updated_at" to "desc"
@@ -685,7 +685,7 @@ class ComixProvider : MainAPI() {
             "followsApi" -> "follows_total" to "desc"
             else -> return null
         }
-        return "$mainUrl/browse?order[${order.first}]=${order.second}&page=$page&limit=28$CONTENT_RATINGS_QUERY"
+        return "$mainUrl/browse?order[${order.first}]=${order.second}&page=$page&limit=28"
     }
 
     private fun maybePrefetchPage2(request: MainPageRequest) {
@@ -1135,27 +1135,17 @@ class ComixProvider : MainAPI() {
         }
 
         val apiParams = apiParamsFor(request.data, page)
-        if (apiParams != null) {
-            val hasCipher = cachedCipher() != null || ensureCipher()
-            if (hasCipher) {
-                val body = getSigned("/api/v1/manga", apiParams, referer = "$mainUrl/browse")
-                if (!body.isNullOrBlank()) {
-                    val root = runCatching { JSONObject(body) }.getOrNull()
-                    if (root != null) {
-                        val parsed = extractResultsFromApiJson(root)
-                        if (parsed != null && parsed.first.isNotEmpty()) {
-                            Log.e(TAG, "fetchQueryPage DIRECT-SIGNED tab=${request.data} page=$page items=${parsed.first.size}")
-                            return PageResult(parsed.first, parsed.second)
-                        }
-                        Log.e(TAG, "fetchQueryPage DIRECT-SIGNED parsed empty for ${request.data}/$page")
+        if (apiParams != null && cachedCipher() != null) {
+            val body = getSigned("/api/v1/manga", apiParams, referer = "$mainUrl/browse")
+            if (!body.isNullOrBlank()) {
+                val root = runCatching { JSONObject(body) }.getOrNull()
+                if (root != null) {
+                    val parsed = extractResultsFromApiJson(root)
+                    if (parsed != null && parsed.first.isNotEmpty()) {
+                        Log.e(TAG, "fetchQueryPage DIRECT-SIGNED tab=${request.data} page=$page items=${parsed.first.size}")
+                        return PageResult(parsed.first, parsed.second)
                     }
-                } else {
-                    Log.e(TAG, "fetchQueryPage DIRECT-SIGNED failed, invalidating cipher")
-                    cipher = null; cipherCacheFile?.delete()
-                    userWarmed = false
                 }
-            } else {
-                Log.e(TAG, "fetchQueryPage no cipher, skipping direct-signed path")
             }
         }
 
@@ -1191,8 +1181,7 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        val hasCipher = cachedCipher() != null || ensureCipher()
-        if (hasCipher) {
+        if (cachedCipher() != null) {
             val params = mapOf(
                 "page" to listOf("1"),
                 "order[chapter_updated_at]" to listOf("desc"),
@@ -1200,11 +1189,7 @@ class ComixProvider : MainAPI() {
                 "content_rating[]" to CONTENT_RATINGS,
                 "keyword" to listOf(cleanQuery)
             )
-            val body = getSigned(
-                "/api/v1/manga",
-                params,
-                referer = "$mainUrl/browse"
-            )
+            val body = getSigned("/api/v1/manga", params, referer = "$mainUrl/browse")
             if (!body.isNullOrBlank()) {
                 val root = runCatching { JSONObject(body) }.getOrNull()
                 val parsed = root?.let { extractResultsFromApiJson(it) }
@@ -1215,18 +1200,11 @@ class ComixProvider : MainAPI() {
                     Log.e(TAG, "search DIRECT-SIGNED items=${items.size} (ratings=${CONTENT_RATINGS.size})")
                     return items
                 }
-                Log.e(TAG, "search DIRECT-SIGNED parsed empty")
-            } else {
-                Log.e(TAG, "search DIRECT-SIGNED failed, invalidating cipher")
-                cipher = null; cipherCacheFile?.delete()
-                userWarmed = false
             }
-        } else {
-            Log.e(TAG, "search no cipher, skipping direct-signed path")
         }
 
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
-        val browseUrl = "$mainUrl/browse?q=$encoded$CONTENT_RATINGS_QUERY"
+        val browseUrl = "$mainUrl/browse?q=$encoded"
         Log.e(TAG, "search WebView fallback url=$browseUrl")
 
         val apiRoot = captureSearchApi(browseUrl, cleanQuery)
@@ -1385,9 +1363,6 @@ class ComixProvider : MainAPI() {
 
         val CONTENT_RATINGS = listOf("safe", "suggestive", "erotica", "pornographic")
 
-        val CONTENT_RATINGS_QUERY: String =
-            CONTENT_RATINGS.joinToString("") { "&content_rating[]=$it" }
-
         val signedApiCache = ConcurrentHashMap<ApiKey, String>()
         val signedApiCacheRatingCount = ConcurrentHashMap<ApiKey, Int>()
         val searchApiCache = ConcurrentHashMap<String, String>()
@@ -1409,12 +1384,6 @@ class ComixProvider : MainAPI() {
 
         data class ApiKey(val tab: String, val page: Int)
 
-        /**
-         * localStorage seed only — no UI click sweep, no initial-data patch.
-         * The logcat showed the initial-data patch was resetting the SPA's
-         * reactive store back to 2 ratings, and the click sweep was racing
-         * the SPA's re-render. Just seed localStorage and let the SPA read it.
-         */
         val LOCAL_STORAGE_SEED_SCRIPT = """
             (function () {
                 try {
@@ -1459,19 +1428,6 @@ class ComixProvider : MainAPI() {
             })();
         """.trimIndent()
 
-        /**
-         * Broadened cipher capture. Now hooks:
-         *  - atob
-         *  - String.fromCharCode
-         *  - ArrayBuffer constructor (via Proxy)
-         *  - crypto.subtle.digest output + importKey
-         *  - Uint8Array constructor (via Proxy) + Uint8Array.from
-         *  - Array.from
-         *  - TextDecoder.prototype.decode
-         *
-         * Content-based dedup; submit only at 3 sboxes + 3 keys (what
-         * CipherMaterial.isValid requires).
-         */
         val CAPTURE_SCRIPT = """
             (function () {
                 if (window.__comixCipherHook) return;
@@ -1527,7 +1483,6 @@ class ComixProvider : MainAPI() {
                     }
                 } catch (e) {}
 
-                // atob
                 try {
                     var originalAtob = window.atob;
                     var stealthAtob = function (value) {
@@ -1550,7 +1505,6 @@ class ComixProvider : MainAPI() {
                     Object.defineProperty(window, 'atob', { value: stealthAtob, writable: true, configurable: true });
                 } catch (e) {}
 
-                // String.fromCharCode
                 try {
                     var origFromCharCode = String.fromCharCode;
                     String.fromCharCode = function () {
@@ -1566,28 +1520,6 @@ class ComixProvider : MainAPI() {
                     };
                 } catch (e) {}
 
-                // ArrayBuffer constructor
-                try {
-                    var OrigAB = window.ArrayBuffer;
-                    var ABProxy = new Proxy(OrigAB, {
-                        construct: function (target, args) {
-                            var inst = Reflect.construct(target, args);
-                            try {
-                                if (inst.byteLength === 256 || inst.byteLength === 24 || inst.byteLength === 32) {
-                                    setTimeout(function () {
-                                        try { consider(new Uint8Array(inst)); } catch (e) {}
-                                    }, 0);
-                                }
-                            } catch (e) {}
-                            return inst;
-                        }
-                    });
-                    Object.defineProperty(window, 'ArrayBuffer', {
-                        value: ABProxy, writable: true, configurable: true
-                    });
-                } catch (e) {}
-
-                // crypto.subtle
                 try {
                     if (window.crypto && window.crypto.subtle) {
                         var subtle = window.crypto.subtle;
@@ -1622,7 +1554,6 @@ class ComixProvider : MainAPI() {
                     }
                 } catch (e) {}
 
-                // Uint8Array constructor via Proxy
                 try {
                     var OrigU8 = window.Uint8Array;
                     var U8Proxy = new Proxy(OrigU8, {
@@ -1641,7 +1572,6 @@ class ComixProvider : MainAPI() {
                     });
                 } catch (e) {}
 
-                // Uint8Array.from
                 try {
                     var origFrom = Uint8Array.from;
                     Uint8Array.from = function (iterable) {
@@ -1653,7 +1583,6 @@ class ComixProvider : MainAPI() {
                     };
                 } catch (e) {}
 
-                // Array.from
                 try {
                     var origArrayFrom = Array.from;
                     Array.from = function (src) {
@@ -1671,7 +1600,6 @@ class ComixProvider : MainAPI() {
                     };
                 } catch (e) {}
 
-                // TextDecoder
                 try {
                     if (window.TextDecoder && TextDecoder.prototype && TextDecoder.prototype.decode) {
                         var origDecode = TextDecoder.prototype.decode;
