@@ -314,7 +314,6 @@ class ComixProvider : MainAPI() {
                     val kw = URLDecoder.decode(kwMatch.groupValues[1], "UTF-8")
                         .trim().lowercase()
                     if (kw.isNotEmpty()) {
-                        // FIX: page-aware search cache key
                         val pageMatch = Regex("[?&]page=(\\d+)").find(url)
                         val pageNum = pageMatch?.groupValues?.get(1)?.toIntOrNull() ?: 1
                         val cacheKey = "$kw|$pageNum"
@@ -1293,99 +1292,116 @@ class ComixProvider : MainAPI() {
         return PageResult(emptyList(), false)
     }
 
+    // ==================================================================
+    // SEARCH — builds a fallback chain of keyword variants, probes each
+    // one, and only accepts a candidate whose results actually contain a
+    // title resembling the original query. This is required because the
+    // site's search does NOT stem tokens (Ravage ≠ Ravaged) and returns
+    // OR-matched junk sorted by update time.
+    // ==================================================================
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
         Log.e(TAG, "search query='$cleanQuery'")
 
-        val merged = LinkedHashMap<String, SearchResponse>()
-        val queryLower = cleanQuery.lowercase().trim()
-        val MAX_PAGES = 5
+        val noPunct = cleanQuery
+            .replace(Regex("[^A-Za-z0-9 ]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        val words = noPunct.split(' ').filter { it.length >= 3 }
 
-        fun collect(items: List<SearchResponse>): Boolean {
-            var exact = false
-            for (it in items) {
-                merged.putIfAbsent(it.url, it)
-                if (it.name.lowercase().trim() == queryLower) exact = true
+        // Candidate keywords, in descending order of "distinctiveness"
+        // (longer words first). We also add common suffix variants so
+        // "Ravage" produces "Ravaged" and vice versa.
+        val candidates = LinkedHashSet<String>()
+        for (w in words) {
+            val lw = w.lowercase()
+            candidates.add(w)
+            candidates.add(lw + "d")     // Ravage   → Ravaged
+            candidates.add(lw + "ed")    // dance    → danced
+            candidates.add(lw + "s")     // title    → titles
+            if (lw.endsWith("d") && lw.length > 3) candidates.add(lw.dropLast(1))
+            if (lw.endsWith("ed") && lw.length > 4) candidates.add(lw.dropLast(2))
+            if (lw.endsWith("s") && lw.length > 3) candidates.add(lw.dropLast(1))
+        }
+        val ordered = candidates.sortedByDescending { it.length }
+
+        Log.e(TAG, "search candidates: $ordered")
+
+        for (candidate in ordered) {
+            val result = searchByKeyword(candidate)
+            if (result.isEmpty()) {
+                Log.e(TAG, "search candidate='$candidate' → 0 items")
+                continue
             }
-            return exact
+            val anyMatch = result.any { titleMatchesQuery(it.name, cleanQuery) }
+            if (anyMatch) {
+                Log.e(TAG, "search candidate='$candidate' → ${result.size} items, ACCEPTED (match found)")
+                return result
+            }
+            Log.e(TAG, "search candidate='$candidate' → ${result.size} items, rejected (no matching title)")
         }
 
-        // ---- 1) Direct API: no order param → server ranks by relevance ----
+        Log.e(TAG, "search → EMPTY (no candidate produced a matching title)")
+        return emptyList()
+    }
+
+    private suspend fun searchByKeyword(keyword: String): List<SearchResponse> {
+        val merged = LinkedHashMap<String, SearchResponse>()
+        val encoded = URLEncoder.encode(keyword, "UTF-8")
+        val MAX_PAGES = 3
+
+        // Direct API first
         for (page in 1..MAX_PAGES) {
             val params = mapOf(
                 "page" to listOf(page.toString()),
                 "limit" to listOf("28"),
                 "content_rating[]" to CONTENT_RATINGS,
-                "keyword" to listOf(cleanQuery)
+                "keyword" to listOf(keyword)
             )
             val body = fetchApiDirect(params, referer = "$mainUrl/browse") ?: break
             if (body.isBlank()) break
             val root = runCatching { JSONObject(body) }.getOrNull() ?: break
             val parsed = extractResultsFromApiJson(root) ?: break
             if (parsed.first.isEmpty()) break
-            val found = collect(parsed.first)
-            Log.e(TAG, "search DIRECT page=$page items=${parsed.first.size} total=${merged.size} exact=$found")
-            if (found) break
+            for (it in parsed.first) merged.putIfAbsent(it.url, it)
+            Log.e(TAG, "searchByKeyword DIRECT '$keyword' p$page items=${parsed.first.size} total=${merged.size}")
             if (!parsed.second) break
         }
+        if (merged.isNotEmpty()) return merged.values.toList()
 
-        if (merged.isNotEmpty()) {
-            Log.e(TAG, "search DIRECT → ${merged.size} merged")
-            return merged.values.toList()
-        }
-
-        // ---- 2) WebView fallback: paginated ----
-        val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
+        // WebView fallback
         for (page in 1..MAX_PAGES) {
             val browseUrl = "$mainUrl/browse?q=$encoded$CONTENT_RATINGS_QUERY&page=$page"
-            Log.e(TAG, "search WebView page=$page url=$browseUrl")
-            val apiRoot = captureSearchApi(browseUrl, cleanQuery, page) ?: break
+            Log.e(TAG, "searchByKeyword WebView '$keyword' p$page url=$browseUrl")
+            val apiRoot = captureSearchApi(browseUrl, keyword, page) ?: break
             val parsed = extractResultsFromApiJson(apiRoot) ?: break
             if (parsed.first.isEmpty()) break
-            val found = collect(parsed.first)
-            Log.e(TAG, "search WebView page=$page items=${parsed.first.size} total=${merged.size} exact=$found")
-            if (found) break
+            for (it in parsed.first) merged.putIfAbsent(it.url, it)
+            Log.e(TAG, "searchByKeyword WebView '$keyword' p$page items=${parsed.first.size} total=${merged.size}")
             if (!parsed.second) break
         }
+        return merged.values.toList()
+    }
 
-        if (merged.isNotEmpty()) {
-            Log.e(TAG, "search WebView → ${merged.size} merged")
-            return merged.values.toList()
+    private fun titleMatchesQuery(title: String, query: String): Boolean {
+        val normalize: (String) -> String = { s ->
+            s.lowercase()
+                .replace(Regex("[^a-z0-9 ]"), " ")
+                .replace(Regex("\\s+"), " ")
+                .trim()
         }
-
-        // ---- 3) SSR fallback (single page) ----
-        Log.e(TAG, "search SSR fallback")
-        val html = fetchHtml("$mainUrl/browse?q=$encoded$CONTENT_RATINGS_QUERY")
-        if (html.isNotBlank()) {
-            val all = mutableListOf<SearchResponse>()
-            extractInitialDataJson(html)?.let { initial ->
-                val queries = initial.optJSONObject("queries")
-                if (queries != null) {
-                    val keys = queries.keys()
-                    while (keys.hasNext()) {
-                        val k = keys.next()
-                        val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
-                        if (parsed.length() >= 1 && parsed.optString(0) == "manga") {
-                            val v = queries.opt(k)
-                            val arr = when (v) {
-                                is JSONArray -> v
-                                is JSONObject -> v.optJSONArray("items")
-                                else -> null
-                            } ?: continue
-                            for (i in 0 until arr.length()) {
-                                arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> all.add(r) } }
-                            }
-                        }
-                    }
-                }
-            }
-            if (all.isEmpty()) all.addAll(extractSearchResultsDom(Jsoup.parse(html)))
-            if (all.isNotEmpty()) return all.distinctBy { it.url }
+        val t = normalize(title)
+        val tokens = normalize(query).split(' ').filter { it.length >= 3 }
+        if (tokens.isEmpty()) return false
+        var hits = 0
+        for (tok in tokens) {
+            // strip common suffix so "ravage" matches "ravaged" etc.
+            val stem = tok.dropLastWhile { it == 'd' || it == 's' || it == 'e' }
+            val stemAlt = if (stem.length >= 3) stem else tok
+            if (t.contains(tok) || t.contains(stemAlt)) hits++
         }
-
-        Log.e(TAG, "search → EMPTY")
-        return emptyList()
+        return hits >= 2
     }
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
@@ -1503,7 +1519,7 @@ class ComixProvider : MainAPI() {
         val signedApiCache = ConcurrentHashMap<ApiKey, String>()
         val signedApiCacheRatingCount = ConcurrentHashMap<ApiKey, Int>()
 
-        // Search cache is keyed by "query|page" now so multi-page search works.
+        // Search cache is keyed by "query|page" so multi-page search works.
         val searchApiCache = ConcurrentHashMap<String, String>()
         val searchApiCacheRatingCount = ConcurrentHashMap<String, Int>()
 
@@ -1535,8 +1551,6 @@ class ComixProvider : MainAPI() {
                         try {
                             var parsed = JSON.parse(json);
                             parsed.contentRating = DESIRED;
-                            // FIX: for keyword searches, blank out the recency sort
-                            // so the server ranks by relevance instead of update time.
                             if (parsed.q && String(parsed.q).trim().length > 0) {
                                 parsed.sort = '';
                             }
