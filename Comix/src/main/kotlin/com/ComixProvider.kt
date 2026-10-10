@@ -1447,10 +1447,10 @@ class ComixProvider : MainAPI() {
 
                 (function () {
                     var state = 'idle';
-                    var deadline = Date.now() + 8000;
-                    var targetLabels = ['safe', 'suggestive', 'erotica', 'pornographic'];
+                    var deadline = Date.now() + 12000;
+                    var lastHash = '';
 
-                    function findRatingContainer() {
+                    function findContainer() {
                         var labels = document.querySelectorAll('.fdrop__label');
                         for (var i = 0; i < labels.length; i++) {
                             if ((labels[i].textContent || '').toUpperCase().indexOf('CONTENT RATING') !== -1) {
@@ -1460,77 +1460,100 @@ class ComixProvider : MainAPI() {
                         return null;
                     }
                     function findPopover(c) {
-                        if (!c) return null;
-                        return c.querySelector('.fdrop__pop') || null;
+                        return c ? (c.querySelector('.fdrop__pop') || null) : null;
                     }
-                    function collectRatingItems(scope) {
-                        var out = [];
-                        var nodes = scope.querySelectorAll('.fdrop__item');
-                        for (var i = 0; i < nodes.length; i++) {
-                            var n = nodes[i];
-                            var t = (n.textContent || '').trim().toLowerCase();
-                            for (var j = 0; j < targetLabels.length; j++) {
-                                if (t === targetLabels[j] || t.indexOf(targetLabels[j]) === 0) {
-                                    out.push(n);
-                                    break;
-                                }
+                    function selectionHash(pop) {
+                        if (!pop) return '';
+                        var items = pop.querySelectorAll('.fdrop__item');
+                        var on = [];
+                        for (var i = 0; i < items.length; i++) {
+                            if (items[i].getAttribute('aria-selected') === 'true') {
+                                on.push((items[i].textContent || '').trim().toLowerCase());
                             }
                         }
-                        return out;
+                        return on.sort().join(',');
                     }
+                    function findOff(pop) {
+                        if (!pop) return null;
+                        var items = pop.querySelectorAll('.fdrop__item');
+                        for (var i = 0; i < items.length; i++) {
+                            if (items[i].getAttribute('aria-selected') === 'false' ||
+                                items[i].classList.contains('fdrop__item--off')) {
+                                return items[i];
+                            }
+                        }
+                        return null;
+                    }
+                    function labelText(c) {
+                        var v = c && c.querySelector('.fdrop__value');
+                        return v ? v.textContent : '?';
+                    }
+
                     function loop() {
-                        if (Date.now() > deadline || state === 'done') return;
+                        if (Date.now() > deadline) {
+                            try { ComixCipherBridge.submitDiagnostic('UI-SWEEP', 'deadline'); } catch(e) {}
+                            return;
+                        }
+
                         if (state === 'idle') {
-                            var c = findRatingContainer();
+                            var c = findContainer();
                             if (c) {
                                 var btn = c.querySelector('.fdrop__btn');
                                 if (btn) {
                                     try { btn.click(); } catch (e) {}
-                                    try { ComixCipherBridge.submitDiagnostic('UI-CLICK', 'rating dropdown opened'); } catch (e) {}
-                                    state = 'sweep';
-                                    setTimeout(loop, 300);
+                                    try { ComixCipherBridge.submitDiagnostic('UI-CLICK', 'opened'); } catch(e) {}
+                                    state = 'cycle';
+                                    setTimeout(loop, 400);
                                     return;
                                 }
                             }
-                        } else if (state === 'sweep') {
-                            var c2 = findRatingContainer();
-                            var scope = findPopover(c2) || document;
-                            var items = collectRatingItems(scope);
-                            var clicked = 0, already = 0;
-                            for (var k = 0; k < items.length; k++) {
-                                var n = items[k];
-                                var isOff = n.classList.contains('fdrop__item--off')
-                                         || n.getAttribute('aria-selected') === 'false';
-                                if (isOff) { try { n.click(); } catch (e) {} clicked++; }
-                                else already++;
+                            setTimeout(loop, 100);
+                            return;
+                        }
+
+                        if (state === 'cycle') {
+                            var c2 = findContainer();
+                            var pop = findPopover(c2);
+                            if (!pop) { setTimeout(loop, 150); return; }
+
+                            var hash = selectionHash(pop);
+                            var off = findOff(pop);
+
+                            if (!off) {
+                                try { ComixCipherBridge.submitDiagnostic('UI-RESULT',
+                                    'complete label=' + labelText(c2) + ' selected=' + hash); } catch(e) {}
+                                state = 'close';
+                                setTimeout(loop, 200);
+                                return;
                             }
-                            try {
-                                var valEl = c2 && c2.querySelector('.fdrop__value');
-                                var pop = findPopover(c2);
-                                var on = 0, off = 0;
-                                if (pop) {
-                                    var list = pop.querySelectorAll('.fdrop__item');
-                                    for (var z = 0; z < list.length; z++) {
-                                        if (list[z].getAttribute('aria-selected') === 'true') on++;
-                                        else off++;
-                                    }
-                                }
-                                ComixCipherBridge.submitDiagnostic('UI-RESULT',
-                                    'label=' + (valEl ? valEl.textContent : '?') +
-                                    ' clicked=' + clicked +
-                                    ' already=' + already +
-                                    ' selected=' + on + '/' + (on + off));
-                            } catch (e) {}
-                            if (c2) {
-                                var btn2 = c2.querySelector('.fdrop__btn');
-                                if (btn2) { try { btn2.click(); } catch (e) {} }
+
+                            if (hash === lastHash) {
+                                try { ComixCipherBridge.submitDiagnostic('UI-RESULT',
+                                    'stable label=' + labelText(c2) + ' selected=' + hash); } catch(e) {}
+                                state = 'close';
+                                setTimeout(loop, 200);
+                                return;
+                            }
+                            lastHash = hash;
+
+                            try { off.click(); } catch(e) {}
+                            try { ComixCipherBridge.submitDiagnostic('UI-CLICK',
+                                'clicked=' + (off.textContent || '').trim().substring(0, 20)); } catch(e) {}
+                            setTimeout(loop, 500);
+                            return;
+                        }
+
+                        if (state === 'close') {
+                            var c3 = findContainer();
+                            if (c3) {
+                                var btn3 = c3.querySelector('.fdrop__btn');
+                                if (btn3) { try { btn3.click(); } catch(e) {} }
                             }
                             state = 'done';
                             return;
                         }
-                        setTimeout(loop, 100);
                     }
-                    setTimeout(loop, 400);
+                    setTimeout(loop, 500);
                 })();
             })();
         """.trimIndent()
