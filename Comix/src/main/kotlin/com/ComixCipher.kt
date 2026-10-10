@@ -5,14 +5,17 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 data class CipherMaterial(
+    val kid: String,
     val sboxes: List<List<Int>>,
     val keys: List<List<Int>>,
 ) {
     fun isValid(): Boolean =
+        kid.isNotBlank() &&
         sboxes.size == 3 && sboxes.all { it.size == 256 } &&
         keys.size == 3 && keys.all { it.isNotEmpty() }
 
     fun toJson(): JSONObject = JSONObject().apply {
+        put("kid", kid)
         put("sboxes", JSONArray().apply { sboxes.forEach { put(JSONArray(it)) } })
         put("keys",   JSONArray().apply { keys.forEach   { put(JSONArray(it)) } })
     }
@@ -22,6 +25,7 @@ data class CipherMaterial(
             val sboxesArr = obj.getJSONArray("sboxes")
             val keysArr   = obj.getJSONArray("keys")
             CipherMaterial(
+                kid = obj.optString("kid").takeIf { it.isNotBlank() } ?: "17w",
                 sboxes = (0 until sboxesArr.length()).map { i ->
                     val inner = sboxesArr.getJSONArray(i)
                     (0 until inner.length()).map { inner.getInt(it) }
@@ -37,6 +41,7 @@ data class CipherMaterial(
 
 class ComixCipher(material: CipherMaterial) {
 
+    private val kid: String = material.kid
     private val sboxes: List<IntArray> = material.sboxes.map { it.toIntArray() }
     private val keys:   List<IntArray> = material.keys.map   { it.toIntArray() }
 
@@ -52,15 +57,17 @@ class ComixCipher(material: CipherMaterial) {
             data = substitute(data, sboxes[round], keys[round], PREVIOUS[round])
         }
 
-        return Base64.encodeToString(
+        val b64 = Base64.encodeToString(
             data,
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
         )
+        return "$kid.$b64"
     }
 
     fun decrypt(value: String): String {
+        val payload = value.substringAfter('.', value)
         var data = Base64.decode(
-            value,
+            payload,
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
         )
         for (round in 2 downTo 0) {
