@@ -1468,7 +1468,7 @@ class ComixProvider : MainAPI() {
         val signedApiCacheRatingCount = ConcurrentHashMap<ApiKey, Int>()
         val searchApiCache = ConcurrentHashMap<String, String>()
         val searchApiCacheRatingCount = ConcurrentHashMap<String, Int>()
-        val mainPageCache  = ConcurrentHashMap<String, List<SearchResponse>>()
+        val mainPageCache  = ConcurrentHashMap<String, Pair<List<SearchResponse>, Long>>()
 
         val tabMutexes = ConcurrentHashMap<String, Mutex>()
         val homeFetchMutex = Mutex()
