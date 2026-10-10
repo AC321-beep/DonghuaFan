@@ -682,21 +682,24 @@ class ComixProvider : MainAPI() {
         return "$mainUrl/browse?order[${order.first}]=${order.second}&page=$page&limit=28$CONTENT_RATINGS_QUERY"
     }
 
+    /**
+     * Prefetches pages 2..6 of hot/latest in the background after page 1 loads.
+     * With the WebView fallback now ~2s per uncached page, five pages of
+     * prefetch finishes in ~10s, warming the whole next-page pipeline.
+     */
     private fun maybePrefetchPage2(request: MainPageRequest) {
         if (request.data != "hot" && request.data != "latest") return
         if (!prefetchedTabs.add(request.data)) return
-        if (signedApiCache.containsKey(ApiKey(request.data, 2))) {
-            Log.e(TAG, "prefetch ${request.data} page=2 skipped (already cached)")
-            return
-        }
         prefetchScope.launch {
             prefetchMutex.withLock {
-                if (signedApiCache.containsKey(ApiKey(request.data, 2))) return@withLock
-                Log.e(TAG, "prefetch ${request.data} page=2 (background)")
-                val t0 = System.currentTimeMillis()
-                val ok = runCatching { fetchQueryPage(request, 2) }.getOrNull()
-                val ms = System.currentTimeMillis() - t0
-                Log.e(TAG, "prefetch ${request.data} page=2 done in ${ms}ms items=${ok?.items?.size ?: 0}")
+                for (p in 2..6) {
+                    if (signedApiCache.containsKey(ApiKey(request.data, p))) continue
+                    Log.e(TAG, "prefetch ${request.data} page=$p (background)")
+                    val t0 = System.currentTimeMillis()
+                    val ok = runCatching { fetchQueryPage(request, p) }.getOrNull()
+                    val ms = System.currentTimeMillis() - t0
+                    Log.e(TAG, "prefetch ${request.data} page=$p done in ${ms}ms items=${ok?.items?.size ?: 0}")
+                }
             }
         }
     }
@@ -795,12 +798,12 @@ class ComixProvider : MainAPI() {
                     if (raw != null) {
                         val ratingCount = signedApiCacheRatingCount[key] ?: 0
                         val json = runCatching { JSONObject(raw) }.getOrNull()
-                        if (json != null && ratingCount >= 3) {
+                        if (json != null && ratingCount >= 4) {
                             Log.e(TAG, "captureApiResponse[$tab/$page] captured (${ratingCount} ratings) len=${raw.length}")
                             cleanup(json); return
                         }
                         if (json != null) {
-                            if (graceAt == 0L) graceAt = System.currentTimeMillis() + 2_500L
+                            if (graceAt == 0L) graceAt = System.currentTimeMillis() + 800L
                             else if (System.currentTimeMillis() >= graceAt) {
                                 Log.e(TAG, "captureApiResponse[$tab/$page] accepting (ratings=$ratingCount)")
                                 cleanup(json); return
@@ -919,12 +922,12 @@ class ComixProvider : MainAPI() {
                     if (raw != null) {
                         val ratingCount = searchApiCacheRatingCount[key] ?: 0
                         val json = runCatching { JSONObject(raw) }.getOrNull()
-                        if (json != null && ratingCount >= 3) {
+                        if (json != null && ratingCount >= 4) {
                             Log.e(TAG, "captureSearchApi['$key'] captured (${ratingCount} ratings) len=${raw.length}")
                             cleanup(json); return
                         }
                         if (json != null) {
-                            if (graceAt == 0L) graceAt = System.currentTimeMillis() + 2_500L
+                            if (graceAt == 0L) graceAt = System.currentTimeMillis() + 800L
                             else if (System.currentTimeMillis() >= graceAt) {
                                 Log.e(TAG, "captureSearchApi['$key'] accepting (ratings=$ratingCount)")
                                 cleanup(json); return
@@ -1128,28 +1131,26 @@ class ComixProvider : MainAPI() {
             }
         }
 
+        // Only use a cached cipher. Never spawn a WebView to try to acquire it —
+        // the site's derivation path is not catchable by our JS hooks, and the
+        // attempt wastes ~8s on every uncached page.
         val apiParams = apiParamsFor(request.data, page)
-        if (apiParams != null) {
-            val hasCipher = cachedCipher() != null || ensureCipher()
-            if (hasCipher) {
-                val body = getSigned("/api/v1/manga", apiParams, referer = "$mainUrl/browse")
-                if (!body.isNullOrBlank()) {
-                    val root = runCatching { JSONObject(body) }.getOrNull()
-                    if (root != null) {
-                        val parsed = extractResultsFromApiJson(root)
-                        if (parsed != null && parsed.first.isNotEmpty()) {
-                            Log.e(TAG, "fetchQueryPage DIRECT-SIGNED tab=${request.data} page=$page items=${parsed.first.size}")
-                            return PageResult(parsed.first, parsed.second)
-                        }
-                        Log.e(TAG, "fetchQueryPage DIRECT-SIGNED parsed empty for ${request.data}/$page")
+        if (apiParams != null && cachedCipher() != null) {
+            val body = getSigned("/api/v1/manga", apiParams, referer = "$mainUrl/browse")
+            if (!body.isNullOrBlank()) {
+                val root = runCatching { JSONObject(body) }.getOrNull()
+                if (root != null) {
+                    val parsed = extractResultsFromApiJson(root)
+                    if (parsed != null && parsed.first.isNotEmpty()) {
+                        Log.e(TAG, "fetchQueryPage DIRECT-SIGNED tab=${request.data} page=$page items=${parsed.first.size}")
+                        return PageResult(parsed.first, parsed.second)
                     }
-                } else {
-                    Log.e(TAG, "fetchQueryPage DIRECT-SIGNED failed, invalidating cipher")
-                    cipher = null; cipherCacheFile?.delete()
-                    userWarmed = false
+                    Log.e(TAG, "fetchQueryPage DIRECT-SIGNED parsed empty for ${request.data}/$page")
                 }
             } else {
-                Log.e(TAG, "fetchQueryPage no cipher, skipping direct-signed path")
+                Log.e(TAG, "fetchQueryPage DIRECT-SIGNED failed, invalidating cipher")
+                cipher = null; cipherCacheFile?.delete()
+                userWarmed = false
             }
         }
 
@@ -1185,8 +1186,8 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        val hasCipher = cachedCipher() != null || ensureCipher()
-        if (hasCipher) {
+        // Only use a cached cipher — see note in fetchQueryPage.
+        if (cachedCipher() != null) {
             val params = mapOf(
                 "page" to listOf("1"),
                 "order[chapter_updated_at]" to listOf("desc"),
@@ -1215,8 +1216,6 @@ class ComixProvider : MainAPI() {
                 cipher = null; cipherCacheFile?.delete()
                 userWarmed = false
             }
-        } else {
-            Log.e(TAG, "search no cipher, skipping direct-signed path")
         }
 
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
