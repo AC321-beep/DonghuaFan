@@ -303,17 +303,24 @@ class ComixProvider : MainAPI() {
                 if (url.indexOf("/api/v1/manga") == -1) return
                 if (body.length < 20) return
 
+                val ratingCount = Regex("content_rating").findAll(url).count()
+
+                // ---- FIX: reject any response that isn't 4/4 ratings ----
+                if (ratingCount < 4) {
+                    Log.e(TAG, "API RESPONSE skipped (ratings=$ratingCount < 4)")
+                    return
+                }
+
                 val kwMatch = Regex("keyword=([^&]+)").find(url)
                 if (kwMatch != null) {
                     val kw = URLDecoder.decode(kwMatch.groupValues[1], "UTF-8")
                         .trim().lowercase()
                     if (kw.isNotEmpty()) {
-                        val ratingCount = Regex("content_rating").findAll(url).count()
                         val prev = searchApiCacheRatingCount[kw] ?: 0
                         if (ratingCount >= prev) {
                             searchApiCache[kw] = body
                             searchApiCacheRatingCount[kw] = ratingCount
-                            Log.e(TAG, "SEARCH RESPONSE cached keyword='$kw' len=${body.length} ratings=$ratingCount")
+                            Log.e(TAG, "SEARCH RESPONSE cached keyword='$kw' len=${body.length} ratings=$ratingCount ✓FULL")
                         }
                     }
                     return
@@ -333,13 +340,14 @@ class ComixProvider : MainAPI() {
                     else -> return
                 }
                 val key = ApiKey(tab, page)
-                signedApiCache[key] = body
-                val ratingCount = Regex("content_rating").findAll(url).count()
                 val previous = signedApiCacheRatingCount[key] ?: 0
                 if (ratingCount >= previous) {
+                    signedApiCache[key] = body
                     signedApiCacheRatingCount[key] = ratingCount
+                    Log.e(TAG, "API RESPONSE cached tab=$tab page=$page len=${body.length} ratings=$ratingCount ✓FULL")
+                } else {
+                    Log.e(TAG, "API RESPONSE ignored tab=$tab page=$page ratings=$ratingCount < prev=$previous")
                 }
-                Log.e(TAG, "API RESPONSE cached tab=$tab page=$page len=${body.length} ratings=$ratingCount")
             } catch (t: Throwable) {
                 Log.e(TAG, "submitApiResponse error: ${t.message}")
             }
@@ -620,10 +628,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    /**
-     * Idea 2: probe the API's signature requirement in one shot.
-     * Fires four requests and logs the server's verdict for each.
-     */
     private suspend fun probeApiSignatureOnce() {
         if (probeDone) return
         probeDone = true
@@ -669,11 +673,6 @@ class ComixProvider : MainAPI() {
         }
     }
 
-    /**
-     * Unsigned direct API call. Relies on WebView session cookies for auth.
-     * The CFInterceptor rewrites the URL to include all four content_rating[]
-     * params. Returns the raw body or null on exception.
-     */
     private suspend fun fetchApiDirect(
         params: Map<String, List<String>>,
         referer: String? = null
@@ -1227,12 +1226,18 @@ class ComixProvider : MainAPI() {
     private suspend fun fetchQueryPage(request: MainPageRequest, page: Int): PageResult? {
         Log.e(TAG, "▷ fetchQueryPage data=${request.data} page=$page")
 
+        // ---- FIX: cache fast-path only accepts 4-rating bodies ----
         signedApiCache[ApiKey(request.data, page)]?.let { raw ->
+            val ratings = signedApiCacheRatingCount[ApiKey(request.data, page)] ?: 0
+            if (ratings < CONTENT_RATINGS.size) {
+                Log.e(TAG, "fetchQueryPage CACHE-SKIP ratings=$ratings < ${CONTENT_RATINGS.size}")
+                return@let
+            }
             val root = runCatching { JSONObject(raw) }.getOrNull()
             if (root != null) {
                 val parsed = extractResultsFromApiJson(root)
                 if (parsed != null && parsed.first.isNotEmpty()) {
-                    Log.e(TAG, "fetchQueryPage CACHE HIT tab=${request.data} page=$page items=${parsed.first.size}")
+                    Log.e(TAG, "fetchQueryPage CACHE HIT tab=${request.data} page=$page items=${parsed.first.size} ratings=$ratings")
                     return PageResult(parsed.first, hasNext = parsed.second || parsed.first.isNotEmpty())
                 }
             }
@@ -1294,6 +1299,11 @@ class ComixProvider : MainAPI() {
         Log.e(TAG, "search query='$cleanQuery'")
 
         searchApiCache[key]?.let { raw ->
+            val ratings = searchApiCacheRatingCount[key] ?: 0
+            if (ratings < CONTENT_RATINGS.size) {
+                Log.e(TAG, "search CACHE-SKIP ratings=$ratings")
+                return@let
+            }
             val root = runCatching { JSONObject(raw) }.getOrNull()
             if (root != null) {
                 val parsed = extractResultsFromApiJson(root)
@@ -1505,8 +1515,10 @@ class ComixProvider : MainAPI() {
 
         val CONTENT_RATINGS = listOf("safe", "suggestive", "erotica", "pornographic")
 
+        // ---- FIX: SPA reads comma-separated `content_rating=safe,suggestive,...`
+        //           (array syntax `content_rating[]=` is only for the API) ----
         val CONTENT_RATINGS_QUERY: String =
-            CONTENT_RATINGS.joinToString("") { "&content_rating[]=$it" }
+            "&content_rating=" + CONTENT_RATINGS.joinToString(",")
 
         val signedApiCache = ConcurrentHashMap<ApiKey, String>()
         val signedApiCacheRatingCount = ConcurrentHashMap<ApiKey, Int>()
@@ -1724,6 +1736,7 @@ class ComixProvider : MainAPI() {
                     if (sboxes.length >= 3 && keys.length >= 3) {
                         try {
                             ComixCipherBridge.submit(JSON.stringify({
+                                kid: '17w',
                                 sboxes: sboxes.slice(0, 3),
                                 keys:   keys.slice(0, 3)
                             }));
