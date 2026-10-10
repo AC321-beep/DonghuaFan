@@ -78,8 +78,6 @@ class CFInterceptor : Interceptor {
         val original = chain.request()
         val originalUrl = original.url
 
-        // Forge /api/v1/manga URLs to always request all four content ratings.
-        // The SPA's own URL builder caps at 2 or 3 ratings; we bypass that here.
         val request = if (originalUrl.encodedPath.contains("/api/v1/manga")) {
             val b = originalUrl.newBuilder()
             val names = originalUrl.queryParameterNames.toList()
@@ -161,6 +159,7 @@ class ComixProvider : MainAPI() {
 
     @Volatile private var cipher: ComixCipher? = null
     private val cfInterceptor = CFInterceptor()
+    private val noopInterceptor = Interceptor { chain -> chain.proceed(chain.request()) }
     private val cfMutex = Mutex()
 
     @Volatile private var lastCipherAttemptMs: Long = 0L
@@ -169,6 +168,7 @@ class ComixProvider : MainAPI() {
     private val cipherAcquireMutex = Mutex()
 
     @Volatile private var userWarmed = false
+    @Volatile private var probeDone = false
 
     private val cipherCacheFile: File?
         get() {
@@ -621,11 +621,58 @@ class ComixProvider : MainAPI() {
     }
 
     /**
+     * Idea 2: probe the API's signature requirement in one shot.
+     * Fires four requests and logs the server's verdict for each.
+     */
+    private suspend fun probeApiSignatureOnce() {
+        if (probeDone) return
+        probeDone = true
+
+        val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
+        val ua = CFState.userAgent.ifBlank { "Mozilla/5.0" }
+        val headers = buildMap {
+            if (cookies.isNotEmpty()) put("Cookie", cookies)
+            put("User-Agent", ua)
+            put("Accept", "application/json, text/plain, */*")
+            put("Referer", "$mainUrl/browse")
+            put("Sec-Fetch-Site", "same-origin")
+            put("Sec-Fetch-Mode", "cors")
+            put("Sec-Fetch-Dest", "empty")
+        }
+
+        val base = "$mainUrl/api/v1/manga?order%5Bchapter_updated_at%5D=desc&page=1&limit=5"
+        val four = "$base&content_rating%5B%5D=safe&content_rating%5B%5D=suggestive" +
+                   "&content_rating%5B%5D=erotica&content_rating%5B%5D=pornographic"
+        val fourFakeSig = "$four&_=fake.abc"
+        val twoFakeSig  = "$base&content_rating%5B%5D=safe&content_rating%5B%5D=suggestive&_=fake.abc"
+
+        listOf(
+            "1-BASELINE" to base,
+            "2-FOUR-NOSIG" to four,
+            "3-FOUR-FAKESIG" to fourFakeSig,
+            "4-TWO-FAKESIG" to twoFakeSig
+        ).forEach { (label, url) ->
+            try {
+                val resp = app.get(url, interceptor = noopInterceptor, headers = headers)
+                val body = resp.text.take(400).replace(Regex("\\s+"), " ")
+                val json = runCatching { JSONObject(body) }.getOrNull()
+                val items = json?.let {
+                    (it.optJSONObject("result")?.optJSONArray("items")
+                        ?: it.optJSONArray("items"))?.length()
+                } ?: -1
+                val err = json?.optString("message")?.takeIf { it.isNotBlank() }
+                    ?: json?.optString("error")?.takeIf { it.isNotBlank() }
+                Log.e(TAG, "PROBE[$label] code=${resp.code} items=$items err=$err body=${body.take(160)}")
+            } catch (t: Throwable) {
+                Log.e(TAG, "PROBE[$label] threw ${t.message}")
+            }
+        }
+    }
+
+    /**
      * Unsigned direct API call. Relies on WebView session cookies for auth.
      * The CFInterceptor rewrites the URL to include all four content_rating[]
-     * params, bypassing the SPA's filter cap. If the server enforces the
-     * `_=` signature, this returns a non-JSON error and we fall through to
-     * the WebView path.
+     * params. Returns the raw body or null on exception.
      */
     private suspend fun fetchApiDirect(
         params: Map<String, List<String>>,
@@ -1135,6 +1182,7 @@ class ComixProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
+        if (page == 1) runCatching { probeApiSignatureOnce() }
         val mutex = tabMutexes.getOrPut(request.data) { Mutex() }
         val resp = mutex.withLock { getMainPageLocked(page, request) }
         if (page == 1 && resp != null) maybePrefetchPage2(request)
@@ -1192,7 +1240,6 @@ class ComixProvider : MainAPI() {
 
         val apiParams = apiParamsFor(request.data, page)
         if (apiParams != null) {
-            // Try unsigned direct API first — bypasses the SPA entirely.
             val directBody = fetchApiDirect(apiParams, referer = "$mainUrl/browse")
             if (!directBody.isNullOrBlank()) {
                 val root = runCatching { JSONObject(directBody) }.getOrNull()
@@ -1210,7 +1257,6 @@ class ComixProvider : MainAPI() {
                 }
             }
 
-            // Try signed if cipher is cached.
             if (cachedCipher() != null) {
                 val signedBody = getSigned("/api/v1/manga", apiParams, referer = "$mainUrl/browse")
                 if (!signedBody.isNullOrBlank()) {
@@ -1266,7 +1312,6 @@ class ComixProvider : MainAPI() {
             "keyword" to listOf(cleanQuery)
         )
 
-        // Try unsigned direct API first.
         val directBody = fetchApiDirect(searchParams, referer = "$mainUrl/browse")
         if (!directBody.isNullOrBlank()) {
             val root = runCatching { JSONObject(directBody) }.getOrNull()
@@ -1284,7 +1329,6 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // Try signed if cipher is cached.
         if (cachedCipher() != null) {
             val signedBody = getSigned("/api/v1/manga", searchParams, referer = "$mainUrl/browse")
             if (!signedBody.isNullOrBlank()) {
