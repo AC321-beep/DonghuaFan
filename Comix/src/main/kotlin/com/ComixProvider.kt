@@ -76,7 +76,30 @@ private const val TAG = "ComixDebug"
 class CFInterceptor : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
         val original = chain.request()
-        val builder = original.newBuilder()
+        val originalUrl = original.url
+
+        // Forge /api/v1/manga URLs to always request all four content ratings.
+        // The SPA's own URL builder caps at 2 or 3 ratings; we bypass that here.
+        val request = if (originalUrl.encodedPath.contains("/api/v1/manga")) {
+            val b = originalUrl.newBuilder()
+            val names = originalUrl.queryParameterNames.toList()
+            names.forEach { n ->
+                if (n == "content_rating" || n == "content_rating[]") {
+                    b.removeAllQueryParameters(n)
+                }
+            }
+            b.addQueryParameter("content_rating[]", "safe")
+            b.addQueryParameter("content_rating[]", "suggestive")
+            b.addQueryParameter("content_rating[]", "erotica")
+            b.addQueryParameter("content_rating[]", "pornographic")
+            val forged = b.build()
+            Log.e(TAG, "HTTP → FORGED ${original.method} $forged")
+            original.newBuilder().url(forged).build()
+        } else {
+            original
+        }
+
+        val builder = request.newBuilder()
 
         val defaultUa = try {
             WebSettings.getDefaultUserAgent(CommonActivity.activity)
@@ -87,30 +110,30 @@ class CFInterceptor : Interceptor {
         builder.header("User-Agent", ua)
         builder.removeHeader("X-Requested-With")
 
-        val cookies = CookieManager.getInstance().getCookie(original.url.toString())
+        val cookies = CookieManager.getInstance().getCookie(request.url.toString())
         if (!cookies.isNullOrEmpty()) builder.header("Cookie", cookies)
 
-        val isApi = original.url.encodedPath.contains("/api/")
-        if (original.header("Accept") == null)
+        val isApi = request.url.encodedPath.contains("/api/")
+        if (request.header("Accept") == null)
             builder.header(
                 "Accept",
                 if (isApi) "application/json, text/plain, */*"
                 else "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
             )
-        if (original.header("Accept-Language") == null)
+        if (request.header("Accept-Language") == null)
             builder.header("Accept-Language", "en-US,en;q=0.5")
-        if (original.header("Connection") == null)
+        if (request.header("Connection") == null)
             builder.header("Connection", "keep-alive")
-        if (original.header("Upgrade-Insecure-Requests") == null)
+        if (request.header("Upgrade-Insecure-Requests") == null)
             builder.header("Upgrade-Insecure-Requests", "1")
-        if (original.header("Sec-Fetch-Dest") == null)
+        if (request.header("Sec-Fetch-Dest") == null)
             builder.header("Sec-Fetch-Dest", if (isApi) "empty" else "document")
-        if (original.header("Sec-Fetch-Mode") == null)
+        if (request.header("Sec-Fetch-Mode") == null)
             builder.header("Sec-Fetch-Mode", if (isApi) "cors" else "navigate")
-        if (original.header("Sec-Fetch-Site") == null)
+        if (request.header("Sec-Fetch-Site") == null)
             builder.header("Sec-Fetch-Site", "same-origin")
 
-        Log.e(TAG, "HTTP → ${original.method} ${original.url}")
+        Log.e(TAG, "HTTP → ${request.method} ${request.url}")
         return chain.proceed(builder.build())
     }
 }
@@ -597,6 +620,47 @@ class ComixProvider : MainAPI() {
         }
     }
 
+    /**
+     * Unsigned direct API call. Relies on WebView session cookies for auth.
+     * The CFInterceptor rewrites the URL to include all four content_rating[]
+     * params, bypassing the SPA's filter cap. If the server enforces the
+     * `_=` signature, this returns a non-JSON error and we fall through to
+     * the WebView path.
+     */
+    private suspend fun fetchApiDirect(
+        params: Map<String, List<String>>,
+        referer: String? = null
+    ): String? {
+        return try {
+            val encoded = buildString {
+                append(mainUrl).append("/api/v1/manga").append("?")
+                var first = true
+                fun emit(k: String, v: String) {
+                    if (!first) append("&")
+                    first = false
+                    append(URLEncoder.encode(k, "UTF-8")).append("=")
+                        .append(URLEncoder.encode(v.trim(), "UTF-8"))
+                }
+                params.toSortedMap().forEach { (rawName, values) ->
+                    if (rawName.endsWith("[]")) {
+                        val name = rawName.removeSuffix("[]")
+                        values.forEach { v -> emit("$name[]", v) }
+                    } else if (values.size == 1) {
+                        emit(rawName, values.single())
+                    } else {
+                        values.forEachIndexed { i, v -> emit("$rawName[$i]", v) }
+                    }
+                }
+            }
+            Log.e(TAG, "GET-UNSIGNED $encoded")
+            val headers = referer?.let { mapOf("Referer" to it) } ?: emptyMap()
+            app.get(encoded, interceptor = cfInterceptor, headers = headers).text
+        } catch (t: Throwable) {
+            Log.e(TAG, "fetchApiDirect failed: ${t.message}")
+            null
+        }
+    }
+
     private suspend fun getSigned(
         path: String,
         params: Map<String, List<String>>,
@@ -682,11 +746,6 @@ class ComixProvider : MainAPI() {
         return "$mainUrl/browse?order[${order.first}]=${order.second}&page=$page&limit=28$CONTENT_RATINGS_QUERY"
     }
 
-    /**
-     * Prefetches pages 2..6 of hot/latest in the background after page 1 loads.
-     * With the WebView fallback now ~2s per uncached page, five pages of
-     * prefetch finishes in ~10s, warming the whole next-page pipeline.
-     */
     private fun maybePrefetchPage2(request: MainPageRequest) {
         if (request.data != "hot" && request.data != "latest") return
         if (!prefetchedTabs.add(request.data)) return
@@ -803,7 +862,7 @@ class ComixProvider : MainAPI() {
                             cleanup(json); return
                         }
                         if (json != null) {
-                            if (graceAt == 0L) graceAt = System.currentTimeMillis() + 800L
+                            if (graceAt == 0L) graceAt = System.currentTimeMillis() + 2_500L
                             else if (System.currentTimeMillis() >= graceAt) {
                                 Log.e(TAG, "captureApiResponse[$tab/$page] accepting (ratings=$ratingCount)")
                                 cleanup(json); return
@@ -927,7 +986,7 @@ class ComixProvider : MainAPI() {
                             cleanup(json); return
                         }
                         if (json != null) {
-                            if (graceAt == 0L) graceAt = System.currentTimeMillis() + 800L
+                            if (graceAt == 0L) graceAt = System.currentTimeMillis() + 2_500L
                             else if (System.currentTimeMillis() >= graceAt) {
                                 Log.e(TAG, "captureSearchApi['$key'] accepting (ratings=$ratingCount)")
                                 cleanup(json); return
@@ -1131,26 +1190,39 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // Only use a cached cipher. Never spawn a WebView to try to acquire it —
-        // the site's derivation path is not catchable by our JS hooks, and the
-        // attempt wastes ~8s on every uncached page.
         val apiParams = apiParamsFor(request.data, page)
-        if (apiParams != null && cachedCipher() != null) {
-            val body = getSigned("/api/v1/manga", apiParams, referer = "$mainUrl/browse")
-            if (!body.isNullOrBlank()) {
-                val root = runCatching { JSONObject(body) }.getOrNull()
+        if (apiParams != null) {
+            // Try unsigned direct API first — bypasses the SPA entirely.
+            val directBody = fetchApiDirect(apiParams, referer = "$mainUrl/browse")
+            if (!directBody.isNullOrBlank()) {
+                val root = runCatching { JSONObject(directBody) }.getOrNull()
                 if (root != null) {
                     val parsed = extractResultsFromApiJson(root)
                     if (parsed != null && parsed.first.isNotEmpty()) {
-                        Log.e(TAG, "fetchQueryPage DIRECT-SIGNED tab=${request.data} page=$page items=${parsed.first.size}")
+                        Log.e(TAG, "fetchQueryPage DIRECT-UNSIGNED tab=${request.data} page=$page items=${parsed.first.size}")
+                        signedApiCache[ApiKey(request.data, page)] = directBody
+                        signedApiCacheRatingCount[ApiKey(request.data, page)] = CONTENT_RATINGS.size
                         return PageResult(parsed.first, parsed.second)
                     }
-                    Log.e(TAG, "fetchQueryPage DIRECT-SIGNED parsed empty for ${request.data}/$page")
+                    Log.e(TAG, "fetchQueryPage DIRECT-UNSIGNED empty for ${request.data}/$page (body=${directBody.take(120)})")
+                } else {
+                    Log.e(TAG, "fetchQueryPage DIRECT-UNSIGNED not JSON (body=${directBody.take(120)})")
                 }
-            } else {
-                Log.e(TAG, "fetchQueryPage DIRECT-SIGNED failed, invalidating cipher")
-                cipher = null; cipherCacheFile?.delete()
-                userWarmed = false
+            }
+
+            // Try signed if cipher is cached.
+            if (cachedCipher() != null) {
+                val signedBody = getSigned("/api/v1/manga", apiParams, referer = "$mainUrl/browse")
+                if (!signedBody.isNullOrBlank()) {
+                    val root = runCatching { JSONObject(signedBody) }.getOrNull()
+                    if (root != null) {
+                        val parsed = extractResultsFromApiJson(root)
+                        if (parsed != null && parsed.first.isNotEmpty()) {
+                            Log.e(TAG, "fetchQueryPage DIRECT-SIGNED tab=${request.data} page=$page items=${parsed.first.size}")
+                            return PageResult(parsed.first, parsed.second)
+                        }
+                    }
+                }
             }
         }
 
@@ -1186,35 +1258,46 @@ class ComixProvider : MainAPI() {
             }
         }
 
-        // Only use a cached cipher — see note in fetchQueryPage.
-        if (cachedCipher() != null) {
-            val params = mapOf(
-                "page" to listOf("1"),
-                "order[chapter_updated_at]" to listOf("desc"),
-                "limit" to listOf("28"),
-                "content_rating[]" to CONTENT_RATINGS,
-                "keyword" to listOf(cleanQuery)
-            )
-            val body = getSigned(
-                "/api/v1/manga",
-                params,
-                referer = "$mainUrl/browse"
-            )
-            if (!body.isNullOrBlank()) {
-                val root = runCatching { JSONObject(body) }.getOrNull()
-                val parsed = root?.let { extractResultsFromApiJson(it) }
+        val searchParams = mapOf(
+            "page" to listOf("1"),
+            "order[chapter_updated_at]" to listOf("desc"),
+            "limit" to listOf("28"),
+            "content_rating[]" to CONTENT_RATINGS,
+            "keyword" to listOf(cleanQuery)
+        )
+
+        // Try unsigned direct API first.
+        val directBody = fetchApiDirect(searchParams, referer = "$mainUrl/browse")
+        if (!directBody.isNullOrBlank()) {
+            val root = runCatching { JSONObject(directBody) }.getOrNull()
+            if (root != null) {
+                val parsed = extractResultsFromApiJson(root)
                 if (parsed != null && parsed.first.isNotEmpty()) {
-                    searchApiCache[key] = body
+                    searchApiCache[key] = directBody
                     searchApiCacheRatingCount[key] = CONTENT_RATINGS.size
-                    val items = parsed.first.distinctBy { it.url }
-                    Log.e(TAG, "search DIRECT-SIGNED items=${items.size} (ratings=${CONTENT_RATINGS.size})")
-                    return items
+                    Log.e(TAG, "search DIRECT-UNSIGNED items=${parsed.first.size}")
+                    return parsed.first.distinctBy { it.url }
                 }
-                Log.e(TAG, "search DIRECT-SIGNED parsed empty")
+                Log.e(TAG, "search DIRECT-UNSIGNED empty (body=${directBody.take(120)})")
             } else {
-                Log.e(TAG, "search DIRECT-SIGNED failed, invalidating cipher")
-                cipher = null; cipherCacheFile?.delete()
-                userWarmed = false
+                Log.e(TAG, "search DIRECT-UNSIGNED not JSON (body=${directBody.take(120)})")
+            }
+        }
+
+        // Try signed if cipher is cached.
+        if (cachedCipher() != null) {
+            val signedBody = getSigned("/api/v1/manga", searchParams, referer = "$mainUrl/browse")
+            if (!signedBody.isNullOrBlank()) {
+                val root = runCatching { JSONObject(signedBody) }.getOrNull()
+                if (root != null) {
+                    val parsed = extractResultsFromApiJson(root)
+                    if (parsed != null && parsed.first.isNotEmpty()) {
+                        searchApiCache[key] = signedBody
+                        searchApiCacheRatingCount[key] = CONTENT_RATINGS.size
+                        Log.e(TAG, "search DIRECT-SIGNED items=${parsed.first.size}")
+                        return parsed.first.distinctBy { it.url }
+                    }
+                }
             }
         }
 
@@ -1385,7 +1468,7 @@ class ComixProvider : MainAPI() {
         val signedApiCacheRatingCount = ConcurrentHashMap<ApiKey, Int>()
         val searchApiCache = ConcurrentHashMap<String, String>()
         val searchApiCacheRatingCount = ConcurrentHashMap<String, Int>()
-        val mainPageCache  = ConcurrentHashMap<String, Pair<List<SearchResponse>, Long>>()
+        val mainPageCache  = ConcurrentHashMap<String, List<SearchResponse>>()
 
         val tabMutexes = ConcurrentHashMap<String, Mutex>()
         val homeFetchMutex = Mutex()
