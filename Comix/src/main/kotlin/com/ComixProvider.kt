@@ -304,8 +304,6 @@ class ComixProvider : MainAPI() {
                 if (body.length < 20) return
 
                 val ratingCount = Regex("content_rating").findAll(url).count()
-
-                // ---- FIX: reject any response that isn't 4/4 ratings ----
                 if (ratingCount < 4) {
                     Log.e(TAG, "API RESPONSE skipped (ratings=$ratingCount < 4)")
                     return
@@ -316,11 +314,15 @@ class ComixProvider : MainAPI() {
                     val kw = URLDecoder.decode(kwMatch.groupValues[1], "UTF-8")
                         .trim().lowercase()
                     if (kw.isNotEmpty()) {
-                        val prev = searchApiCacheRatingCount[kw] ?: 0
+                        // FIX: page-aware search cache key
+                        val pageMatch = Regex("[?&]page=(\\d+)").find(url)
+                        val pageNum = pageMatch?.groupValues?.get(1)?.toIntOrNull() ?: 1
+                        val cacheKey = "$kw|$pageNum"
+                        val prev = searchApiCacheRatingCount[cacheKey] ?: 0
                         if (ratingCount >= prev) {
-                            searchApiCache[kw] = body
-                            searchApiCacheRatingCount[kw] = ratingCount
-                            Log.e(TAG, "SEARCH RESPONSE cached keyword='$kw' len=${body.length} ratings=$ratingCount ✓FULL")
+                            searchApiCache[cacheKey] = body
+                            searchApiCacheRatingCount[cacheKey] = ratingCount
+                            Log.e(TAG, "SEARCH RESPONSE cached '$kw' p$pageNum len=${body.length} ratings=$ratingCount ✓FULL")
                         }
                     }
                     return
@@ -936,12 +938,12 @@ class ComixProvider : MainAPI() {
 
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun captureSearchApi(
-        browseUrl: String, query: String, timeoutMs: Long = 15_000L
+        browseUrl: String, query: String, page: Int = 1, timeoutMs: Long = 15_000L
     ): JSONObject? = withContext(Dispatchers.Main) {
         val activity = CommonActivity.activity ?: return@withContext null
         if (activity.isFinishing || activity.isDestroyed) return@withContext null
         val decor = activity.window?.decorView as? ViewGroup ?: return@withContext null
-        val key = query.trim().lowercase()
+        val key = "${query.trim().lowercase()}|$page"
 
         suspendCancellableCoroutine { cont ->
             val done = AtomicBoolean(false)
@@ -1028,13 +1030,13 @@ class ComixProvider : MainAPI() {
                         val ratingCount = searchApiCacheRatingCount[key] ?: 0
                         val json = runCatching { JSONObject(raw) }.getOrNull()
                         if (json != null && ratingCount >= 4) {
-                            Log.e(TAG, "captureSearchApi['$key'] captured (${ratingCount} ratings) len=${raw.length}")
+                            Log.e(TAG, "captureSearchApi['${query}'/p$page] captured (${ratingCount} ratings) len=${raw.length}")
                             cleanup(json); return
                         }
                         if (json != null) {
                             if (graceAt == 0L) graceAt = System.currentTimeMillis() + 2_500L
                             else if (System.currentTimeMillis() >= graceAt) {
-                                Log.e(TAG, "captureSearchApi['$key'] accepting (ratings=$ratingCount)")
+                                Log.e(TAG, "captureSearchApi['${query}'/p$page] accepting (ratings=$ratingCount)")
                                 cleanup(json); return
                             }
                         }
@@ -1044,7 +1046,7 @@ class ComixProvider : MainAPI() {
             }
             timeoutRunnable = Runnable {
                 val ratingCount = searchApiCacheRatingCount[key] ?: 0
-                Log.e(TAG, "captureSearchApi['$key'] TIMEOUT (ratings=$ratingCount)")
+                Log.e(TAG, "captureSearchApi['${query}'/p$page] TIMEOUT (ratings=$ratingCount)")
                 cleanup(searchApiCache[key]?.let { runCatching { JSONObject(it) }.getOrNull() })
             }
 
@@ -1226,7 +1228,6 @@ class ComixProvider : MainAPI() {
     private suspend fun fetchQueryPage(request: MainPageRequest, page: Int): PageResult? {
         Log.e(TAG, "▷ fetchQueryPage data=${request.data} page=$page")
 
-        // ---- FIX: cache fast-path only accepts 4-rating bodies ----
         signedApiCache[ApiKey(request.data, page)]?.let { raw ->
             val ratings = signedApiCacheRatingCount[ApiKey(request.data, page)] ?: 0
             if (ratings < CONTENT_RATINGS.size) {
@@ -1295,84 +1296,69 @@ class ComixProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
-        val key = cleanQuery.lowercase()
         Log.e(TAG, "search query='$cleanQuery'")
 
-        searchApiCache[key]?.let { raw ->
-            val ratings = searchApiCacheRatingCount[key] ?: 0
-            if (ratings < CONTENT_RATINGS.size) {
-                Log.e(TAG, "search CACHE-SKIP ratings=$ratings")
-                return@let
+        val merged = LinkedHashMap<String, SearchResponse>()
+        val queryLower = cleanQuery.lowercase().trim()
+        val MAX_PAGES = 5
+
+        fun collect(items: List<SearchResponse>): Boolean {
+            var exact = false
+            for (it in items) {
+                merged.putIfAbsent(it.url, it)
+                if (it.name.lowercase().trim() == queryLower) exact = true
             }
-            val root = runCatching { JSONObject(raw) }.getOrNull()
-            if (root != null) {
-                val parsed = extractResultsFromApiJson(root)
-                if (parsed != null && parsed.first.isNotEmpty()) {
-                    Log.e(TAG, "search CACHE HIT '$key' items=${parsed.first.size}")
-                    return parsed.first.distinctBy { it.url }
-                }
-            }
+            return exact
         }
 
-        val searchParams = mapOf(
-            "page" to listOf("1"),
-            "order[chapter_updated_at]" to listOf("desc"),
-            "limit" to listOf("28"),
-            "content_rating[]" to CONTENT_RATINGS,
-            "keyword" to listOf(cleanQuery)
-        )
-
-        val directBody = fetchApiDirect(searchParams, referer = "$mainUrl/browse")
-        if (!directBody.isNullOrBlank()) {
-            val root = runCatching { JSONObject(directBody) }.getOrNull()
-            if (root != null) {
-                val parsed = extractResultsFromApiJson(root)
-                if (parsed != null && parsed.first.isNotEmpty()) {
-                    searchApiCache[key] = directBody
-                    searchApiCacheRatingCount[key] = CONTENT_RATINGS.size
-                    Log.e(TAG, "search DIRECT-UNSIGNED items=${parsed.first.size}")
-                    return parsed.first.distinctBy { it.url }
-                }
-                Log.e(TAG, "search DIRECT-UNSIGNED empty (body=${directBody.take(120)})")
-            } else {
-                Log.e(TAG, "search DIRECT-UNSIGNED not JSON (body=${directBody.take(120)})")
-            }
+        // ---- 1) Direct API: no order param → server ranks by relevance ----
+        for (page in 1..MAX_PAGES) {
+            val params = mapOf(
+                "page" to listOf(page.toString()),
+                "limit" to listOf("28"),
+                "content_rating[]" to CONTENT_RATINGS,
+                "keyword" to listOf(cleanQuery)
+            )
+            val body = fetchApiDirect(params, referer = "$mainUrl/browse") ?: break
+            if (body.isBlank()) break
+            val root = runCatching { JSONObject(body) }.getOrNull() ?: break
+            val parsed = extractResultsFromApiJson(root) ?: break
+            if (parsed.first.isEmpty()) break
+            val found = collect(parsed.first)
+            Log.e(TAG, "search DIRECT page=$page items=${parsed.first.size} total=${merged.size} exact=$found")
+            if (found) break
+            if (!parsed.second) break
         }
 
-        if (cachedCipher() != null) {
-            val signedBody = getSigned("/api/v1/manga", searchParams, referer = "$mainUrl/browse")
-            if (!signedBody.isNullOrBlank()) {
-                val root = runCatching { JSONObject(signedBody) }.getOrNull()
-                if (root != null) {
-                    val parsed = extractResultsFromApiJson(root)
-                    if (parsed != null && parsed.first.isNotEmpty()) {
-                        searchApiCache[key] = signedBody
-                        searchApiCacheRatingCount[key] = CONTENT_RATINGS.size
-                        Log.e(TAG, "search DIRECT-SIGNED items=${parsed.first.size}")
-                        return parsed.first.distinctBy { it.url }
-                    }
-                }
-            }
+        if (merged.isNotEmpty()) {
+            Log.e(TAG, "search DIRECT → ${merged.size} merged")
+            return merged.values.toList()
         }
 
+        // ---- 2) WebView fallback: paginated ----
         val encoded = URLEncoder.encode(cleanQuery, "UTF-8")
-        val browseUrl = "$mainUrl/browse?q=$encoded$CONTENT_RATINGS_QUERY"
-        Log.e(TAG, "search WebView fallback url=$browseUrl")
-
-        val apiRoot = captureSearchApi(browseUrl, cleanQuery)
-        if (apiRoot != null) {
-            val parsed = extractResultsFromApiJson(apiRoot)
-            if (parsed != null && parsed.first.isNotEmpty()) {
-                val items = parsed.first.distinctBy { it.url }
-                Log.e(TAG, "search WebView captured items=${items.size}")
-                return items
-            }
+        for (page in 1..MAX_PAGES) {
+            val browseUrl = "$mainUrl/browse?q=$encoded$CONTENT_RATINGS_QUERY&page=$page"
+            Log.e(TAG, "search WebView page=$page url=$browseUrl")
+            val apiRoot = captureSearchApi(browseUrl, cleanQuery, page) ?: break
+            val parsed = extractResultsFromApiJson(apiRoot) ?: break
+            if (parsed.first.isEmpty()) break
+            val found = collect(parsed.first)
+            Log.e(TAG, "search WebView page=$page items=${parsed.first.size} total=${merged.size} exact=$found")
+            if (found) break
+            if (!parsed.second) break
         }
 
-        Log.e(TAG, "search SSR fallback url=$browseUrl")
-        val html = fetchHtml(browseUrl)
+        if (merged.isNotEmpty()) {
+            Log.e(TAG, "search WebView → ${merged.size} merged")
+            return merged.values.toList()
+        }
+
+        // ---- 3) SSR fallback (single page) ----
+        Log.e(TAG, "search SSR fallback")
+        val html = fetchHtml("$mainUrl/browse?q=$encoded$CONTENT_RATINGS_QUERY")
         if (html.isNotBlank()) {
-            val allItems = mutableListOf<SearchResponse>()
+            val all = mutableListOf<SearchResponse>()
             extractInitialDataJson(html)?.let { initial ->
                 val queries = initial.optJSONObject("queries")
                 if (queries != null) {
@@ -1381,30 +1367,24 @@ class ComixProvider : MainAPI() {
                         val k = keys.next()
                         val parsed = runCatching { JSONArray(k) }.getOrNull() ?: continue
                         if (parsed.length() >= 1 && parsed.optString(0) == "manga") {
-                            val value = queries.opt(k)
-                            val arr = when (value) {
-                                is JSONArray  -> value
-                                is JSONObject -> value.optJSONArray("items")
-                                else          -> null
+                            val v = queries.opt(k)
+                            val arr = when (v) {
+                                is JSONArray -> v
+                                is JSONObject -> v.optJSONArray("items")
+                                else -> null
                             } ?: continue
                             for (i in 0 until arr.length()) {
-                                arr.optJSONObject(i)?.let { obj ->
-                                    parseMangaFromJson(obj)?.let { r -> allItems.add(r) }
-                                }
+                                arr.optJSONObject(i)?.let { parseMangaFromJson(it)?.let { r -> all.add(r) } }
                             }
                         }
                     }
                 }
             }
-            if (allItems.isEmpty()) allItems.addAll(extractSearchResultsDom(Jsoup.parse(html)))
-            if (allItems.isNotEmpty()) {
-                val out = allItems.distinctBy { it.url }
-                Log.e(TAG, "search SSR items=${out.size}")
-                return out
-            }
+            if (all.isEmpty()) all.addAll(extractSearchResultsDom(Jsoup.parse(html)))
+            if (all.isNotEmpty()) return all.distinctBy { it.url }
         }
 
-        Log.e(TAG, "search → EMPTY (all steps exhausted)")
+        Log.e(TAG, "search → EMPTY")
         return emptyList()
     }
 
@@ -1515,15 +1495,18 @@ class ComixProvider : MainAPI() {
 
         val CONTENT_RATINGS = listOf("safe", "suggestive", "erotica", "pornographic")
 
-        // ---- FIX: SPA reads comma-separated `content_rating=safe,suggestive,...`
-        //           (array syntax `content_rating[]=` is only for the API) ----
+        // SPA reads comma-separated `content_rating=safe,suggestive,...`
+        // (array syntax `content_rating[]=` is only for the API)
         val CONTENT_RATINGS_QUERY: String =
             "&content_rating=" + CONTENT_RATINGS.joinToString(",")
 
         val signedApiCache = ConcurrentHashMap<ApiKey, String>()
         val signedApiCacheRatingCount = ConcurrentHashMap<ApiKey, Int>()
+
+        // Search cache is keyed by "query|page" now so multi-page search works.
         val searchApiCache = ConcurrentHashMap<String, String>()
         val searchApiCacheRatingCount = ConcurrentHashMap<String, Int>()
+
         val mainPageCache  = ConcurrentHashMap<String, Pair<List<SearchResponse>, Long>>()
 
         val tabMutexes = ConcurrentHashMap<String, Mutex>()
@@ -1552,6 +1535,11 @@ class ComixProvider : MainAPI() {
                         try {
                             var parsed = JSON.parse(json);
                             parsed.contentRating = DESIRED;
+                            // FIX: for keyword searches, blank out the recency sort
+                            // so the server ranks by relevance instead of update time.
+                            if (parsed.q && String(parsed.q).trim().length > 0) {
+                                parsed.sort = '';
+                            }
                             return JSON.stringify(parsed);
                         } catch (e) { return json; }
                     }
