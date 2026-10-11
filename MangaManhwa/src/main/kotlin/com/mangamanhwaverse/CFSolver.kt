@@ -75,6 +75,7 @@ class CFSolver(
             CFState.endSolve(host)
         }
     }
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun showDialog(
         activity: android.app.Activity,
@@ -105,7 +106,7 @@ class CFSolver(
             }
         }
 
-        // Hard timeout — a capture that never fires must not leak the dialog.
+        // Hard watchdog: a capture that never fires must not leak the dialog.
         mainHandler.postDelayed({
             if (resolved.compareAndSet(false, true)) {
                 if (!deferred.isCompleted) deferred.complete(false)
@@ -144,6 +145,7 @@ class CFSolver(
 
         val host = runCatching { URI(url).host }.getOrNull() ?: ""
 
+        // Local val so Kotlin can smart-cast at loadUrl().
         val webView = WebView(activity)
         web = webView
 
@@ -159,6 +161,7 @@ class CFSolver(
             useWideViewPort = true
             loadWithOverviewMode = true
             cacheMode = WebSettings.LOAD_DEFAULT
+
             allowFileAccess = false
             allowContentAccess = false
             setGeolocationEnabled(false)
@@ -248,3 +251,4 @@ class CFSolver(
         dialog.show()
         webView.loadUrl(url)
     }
+}
