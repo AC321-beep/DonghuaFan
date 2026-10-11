@@ -20,6 +20,8 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import com.lagradost.cloudstream3.CommonActivity
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -69,7 +71,10 @@ class CFSolver(
 
         val deferred = CFState.beginSolve(host)
         return try {
-            showDialog(activity, deferred)
+            // Dialog() requires a thread with a Looper. fetch() runs on IO.
+            withContext(Dispatchers.Main) {
+                showDialog(activity, deferred)
+            }
             deferred.await()
         } finally {
             CFState.endSolve(host)
@@ -145,7 +150,6 @@ class CFSolver(
 
         val host = runCatching { URI(url).host }.getOrNull() ?: ""
 
-        // Local val so Kotlin can smart-cast at loadUrl().
         val webView = WebView(activity)
         web = webView
 
