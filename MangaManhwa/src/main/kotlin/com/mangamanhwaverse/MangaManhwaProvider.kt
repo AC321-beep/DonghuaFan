@@ -43,10 +43,12 @@ abstract class MangaManhwaProvider : MainAPI() {
     override val hasQuickSearch = true
     override val hasDownloadSupport = false
 
-    // FIX A: escape the host. `.` in "comix.to" is a regex wildcard and was
-    // matching unrelated domains (comixXto, comix-to.evil.example).
     protected open val cfPattern: Regex
-        get() = Regex(".*${Regex.escape(hostOf(baseUrl))}.*")
+        get() {
+            val host = hostOf(baseUrl)
+            if (host.isBlank()) return Regex("(?!)") // never matches
+            return Regex(".*${Regex.escape(host)}.*")
+        }
 
     private val cfResolver by lazy { WebViewResolver(cfPattern) }
 
@@ -95,22 +97,23 @@ abstract class MangaManhwaProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse>? =
         runCatching { searchPage(query, 1) }.getOrNull()
 
-    override suspend fun load(url: String): LoadResponse? = runCatching {
-        // FIX (P2): if chapters() throws, still return the title page with
-        // zero episodes instead of failing the whole load.
-        val episodes = runCatching { chapters(url) }.getOrDefault(emptyList())
-
-        newAnimeLoadResponse(
-            // FIX (P2): format the slug-derived fallback into Title Case.
-            titleFromSlug(url),
-            url,
-            TvType.Anime
-        ) {
-            if (episodes.isNotEmpty()) {
-                addEpisodes(DubStatus.Subbed, episodes)
-            }
+    override suspend fun load(url: String): LoadResponse? {
+        val episodes = try {
+            chapters(url)
+        } catch (t: Throwable) {
+            logErr("chapters() failed for $url: ${t.message}", t)
+            emptyList()
         }
-    }.getOrNull()
+
+        return runCatching {
+            newAnimeLoadResponse(titleFromSlug(url), url, TvType.Anime) {
+                if (episodes.isNotEmpty()) {
+                    addEpisodes(DubStatus.Subbed, episodes)
+                }
+            }
+        }.onFailure { logErr("load() construction failed for $url", it) }
+         .getOrNull()
+    }
 
     override suspend fun loadLinks(
         data: String,
@@ -119,11 +122,12 @@ abstract class MangaManhwaProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val activity = CommonActivity.activity as? androidx.appcompat.app.AppCompatActivity
-            ?: return false
+            ?: run {
+                logErr("loadLinks: no AppCompatActivity host")
+                return false
+            }
         if (activity.isFinishing || activity.isDestroyed) return false
 
-        // FIX C: keep the nullable Double so 0.0 ("Prologue") is distinguishable
-        // from a regex miss (real "Chapter" fallback).
         val chapterNumRaw = Regex("(?:chapter|ch)[-\\s]?([\\d.]+)", RegexOption.IGNORE_CASE)
             .find(data)
             ?.groupValues?.get(1)
@@ -137,7 +141,6 @@ abstract class MangaManhwaProvider : MainAPI() {
             else -> "Ch. $chapterNumRaw"
         }
 
-        // FIX B: only report success after the dialog actually mounted.
         val mounted = CompletableDeferred<Boolean>()
         activity.runOnUiThread {
             runCatching {
@@ -156,9 +159,9 @@ abstract class MangaManhwaProvider : MainAPI() {
     }
 
     protected suspend fun fetch(url: String, referer: String? = baseUrl): Document? {
-        val absolute = if (url.startsWith("http")) url else abs(url)
+        val absolute = abs(url)
 
-        return runCatching {
+        return try {
             var doc = app.get(
                 absolute,
                 interceptor = unifiedInterceptor,
@@ -167,37 +170,55 @@ abstract class MangaManhwaProvider : MainAPI() {
             ).document
 
             if (isCfChallenge(doc)) {
-                log("CF challenge persists after silent solve — invoking dialog")
+                log("CF challenge on $absolute — invoking solver dialog")
                 val solved = CFSolver(absolute).solve()
-                if (solved) {
-                    doc = app.get(
-                        absolute,
-                        interceptor = unifiedInterceptor,
-                        referer = referer,
-                        headers = browserHeaders()
-                    ).document
+                if (!solved) {
+                    logErr("CF solver returned false for $absolute")
+                    return null
+                }
+                doc = app.get(
+                    absolute,
+                    interceptor = unifiedInterceptor,
+                    referer = referer,
+                    headers = browserHeaders()
+                ).document
+                if (isCfChallenge(doc)) {
+                    logErr("CF challenge persists after solve: $absolute")
+                    return null
                 }
             }
             doc
-        }.onFailure {
-            val msg = it.message ?: ""
+        } catch (t: Throwable) {
+            val msg = t.message ?: ""
             if (msg.contains("SSL", true) || msg.contains("TLS", true)) {
                 log("fetch skipped (TLS): $absolute")
             } else {
-                logErr("fetch failed $absolute: $msg", it)
+                logErr("fetch failed $absolute: $msg", t)
             }
-        }.getOrNull()
+            null
+        }
     }
 
-    protected fun abs(url: String) =
-        if (url.startsWith("http")) url
-        else "$baseUrl${if (url.startsWith("/")) "" else "/"}$url"
+    /**
+     * Resolve a possibly-relative URL against [baseUrl].
+     * Handles: absolute http(s), protocol-relative "//host/path",
+     * root-relative "/path", and bare "path".
+     */
+    protected fun abs(url: String): String {
+        if (url.isBlank()) return url
+        return when {
+            url.startsWith("http://") || url.startsWith("https://") -> url
+            url.startsWith("//") -> "https:$url"
+            url.startsWith("/")  -> "$baseUrl$url"
+            else                 -> "$baseUrl/$url"
+        }
+    }
 
     protected fun browserHeaders(extra: Map<String, String> = emptyMap()): Map<String, String> =
         mapOf(
             "User-Agent" to UA,
             "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language" to "en-US,en;q=0.5",
+            "Accept-Language" to "en-US,en;q=0.9",
             "Sec-Ch-Ua" to "\"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"122\", \"Chromium\";v=\"122\"",
             "Sec-Ch-Ua-Mobile" to "?0",
             "Sec-Ch-Ua-Platform" to "\"Windows\"",
@@ -225,16 +246,19 @@ abstract class MangaManhwaProvider : MainAPI() {
         android.util.Log.e("MangaManhwa/$name", msg, t)
     }
 
-    private fun hostOf(url: String) =
-        runCatching { URI(url).host }.getOrNull() ?: url
+    private fun hostOf(url: String): String =
+        runCatching { URI(url).host }.getOrNull().orEmpty()
 
-    /** "solo-leveling" / "solo-leveling-chapter-3" → "Solo Leveling Chapter 3". */
-    private fun titleFromSlug(url: String): String {
-        val raw = url.substringAfterLast("/").replace('-', ' ').trim()
+     protected fun titleFromSlug(url: String): String {
+        val cleaned = url.substringBefore("?").substringBefore("#").trimEnd('/')
+        val raw = cleaned.substringAfterLast("/")
+            .replace('-', ' ')
+            .replace('_', ' ')
+            .trim()
         if (raw.isBlank()) return "Untitled"
-        return raw.split(' ').joinToString(" ") { w ->
-            if (w.isEmpty()) w else w[0].uppercase() + w.drop(1)
-        }
+        return raw.split(' ')
+            .filter { it.isNotEmpty() }
+            .joinToString(" ") { w -> w[0].uppercase() + w.drop(1) }
     }
 
     companion object {
