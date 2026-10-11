@@ -22,8 +22,20 @@ data class ThemeConfig(
     val chapterSelector: String,
     val pageSelector: String,
     val imageSelector: String = "img",
-    /** Most themes list newest-first in the DOM. Reverse to oldest-first. */
-    val newestFirst: Boolean = true
+    /** Most themes list newest-first in the DOM; reverse to oldest-first. */
+    val newestFirst: Boolean = true,
+
+    // ── detail-page selectors ──
+    val detailTitleSelector: String   = "h1",
+    val detailPosterSelector: String  = "img",
+    val detailDescSelector: String    = "",
+    val detailGenreSelector: String   = "",
+
+    /**
+     * Appended to the manga URL to request a full, non-paginated chapter
+     * list. Madara uses "?style=list". Empty = don't refetch.
+     */
+    val chapterListSuffix: String = ""
 )
 
 open class ThemeBasedProvider(
@@ -50,6 +62,7 @@ open class ThemeBasedProvider(
             val hosts = (listOf(mainUrl) + fallbackUrls + listOfNotNull(override))
                 .mapNotNull { runCatching { URI(it).host }.getOrNull() }
                 .distinct()
+            if (hosts.isEmpty()) return Regex("(?!)")
             val pattern = hosts.joinToString("|") { Regex.escape(it) }
             return Regex(".*($pattern).*")
         }
@@ -62,28 +75,30 @@ open class ThemeBasedProvider(
         resolveLock.withLock {
             if (resolvedUrl != null) return@withLock
             for (url in listOf(mainUrl) + fallbackUrls) {
-                if (probe(url)) { resolvedUrl = url; return@withLock }
+                if (probe(url)) {
+                    log("resolved $name → $url")
+                    resolvedUrl = url
+                    return@withLock
+                }
             }
+            logErr("no reachable mirror for $name — using $mainUrl as last resort")
             resolvedUrl = mainUrl
         }
     }
 
-    /**
-     * CF-protected mirrors answer 403/503 with a challenge header while
-     * still being alive. Treat those as reachable so the fallback resolver
-     * doesn't skip every working URL of a CF-protected provider.
-     */
-    private suspend fun probe(url: String): Boolean =
-        runCatching {
-            val resp = app.get(url, headers = browserHeaders())
-            when {
-                resp.code in 200..399 -> true
-                resp.code == 403 && resp.headers["cf-mitigated"]
-                    ?.contains("challenge", true) == true -> true
-                resp.code == 503 -> true
-                else -> false
+    private suspend fun probe(url: String): Boolean = runCatching {
+        val resp = app.get(url, headers = browserHeaders())
+        val mitigated = resp.headers["cf-mitigated"]?.contains("challenge", true) == true
+        when {
+            resp.code in 200..399 -> true
+            resp.code == 403 && mitigated -> true
+            resp.code == 503 -> true
+            else -> {
+                log("probe $url → HTTP ${resp.code}")
+                false
             }
-        }.getOrDefault(false)
+        }
+    }.getOrDefault(false)
 
     override suspend fun popular(page: Int): List<SearchResponse> {
         ensureUrlResolved()
@@ -103,10 +118,7 @@ open class ThemeBasedProvider(
         return parseList(doc)
     }
 
-    /** Default mapping: hot → trending-by-views. Override per-provider if needed. */
     override suspend fun hot(page: Int): List<SearchResponse> = trending(page)
-
-    /** Default mapping: follows → popular. Override per-provider if needed. */
     override suspend fun follows(page: Int): List<SearchResponse> = popular(page)
 
     override suspend fun completed(page: Int): List<SearchResponse> {
@@ -133,7 +145,21 @@ open class ThemeBasedProvider(
     override suspend fun chapters(mangaUrl: String): List<Episode> {
         ensureUrlResolved()
         val doc = fetch(mangaUrl) ?: return emptyList()
-        return parseChapters(doc)
+        var eps = parseChapters(doc)
+
+        // For themes that paginate the chapter list (Madara),
+        // refetch the "?style=list" view and use whichever is fuller.
+        if (config.chapterListSuffix.isNotEmpty()) {
+            val sep = if (mangaUrl.contains("?")) "&" else "?"
+            val fullUrl = mangaUrl.trimEnd('/') +
+                          config.chapterListSuffix.replaceFirst("?", sep)
+            val full = runCatching { fetch(fullUrl) }.getOrNull()
+            if (full != null) {
+                val fullEps = parseChapters(full)
+                if (fullEps.size > eps.size) eps = fullEps
+            }
+        }
+        return eps
     }
 
     override suspend fun pages(chapterUrl: String): List<String> {
@@ -143,13 +169,49 @@ open class ThemeBasedProvider(
         return if (Settings.dataSaver()) raw.map(::shrink) else raw
     }
 
+    override suspend fun load(url: String): LoadResponse? {
+        ensureUrlResolved()
+        val doc = fetch(url) ?: return null
+
+        val title = doc.selectFirst(config.detailTitleSelector)
+            ?.text()?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: titleFromSlug(url)
+
+        val poster = doc.selectFirst(config.detailPosterSelector)
+            ?.let(::img)?.takeIf { it.isNotBlank() }?.let(::abs)
+
+        val plot = config.detailDescSelector
+            .takeIf { it.isNotBlank() }
+            ?.let { sel -> doc.selectFirst(sel)?.text()?.trim() }
+            ?.takeIf { !it.isNullOrBlank() }
+
+        val tags = config.detailGenreSelector
+            .takeIf { it.isNotBlank() }
+            ?.let { sel ->
+                doc.select(sel).map { it.text().trim() }
+                    .filter { it.isNotEmpty() }
+                    .distinct()
+            }
+            .orEmpty()
+
+        val episodes = runCatching { chapters(url) }.getOrDefault(emptyList())
+
+        return newAnimeLoadResponse(title, url, TvType.Anime) {
+            this.posterUrl = poster
+            this.plot      = plot
+            this.tags      = tags
+            if (episodes.isNotEmpty()) addEpisodes(DubStatus.Subbed, episodes)
+        }
+    }
+
     private fun parseList(doc: Document): List<SearchResponse> =
         doc.select(config.listSelector).mapNotNull { el ->
             val a = el.selectFirst(config.linkSelector) ?: return@mapNotNull null
             val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val title = (el.selectFirst(config.titleSelector)?.text()?.trim()
                 ?: a.text().trim()).takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val poster = el.selectFirst(config.imageSelector)?.let(::img)?.let { abs(it) }
+            val poster = el.selectFirst(config.imageSelector)?.let(::img)?.let(::abs)
             newAnimeSearchResponse(title, abs(href), TvType.Anime).apply {
                 posterUrl = poster
             }
@@ -158,13 +220,14 @@ open class ThemeBasedProvider(
     private fun parseChapters(doc: Document): List<Episode> {
         val eps = doc.select(config.chapterSelector).mapNotNull { a ->
             val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            newEpisode(abs(href)) { this.name = a.text().trim() }
+            val label = a.text().trim().ifBlank { href.substringAfterLast("/") }
+            newEpisode(abs(href)) { this.name = label }
         }.distinctBy { it.data }
         return if (config.newestFirst) eps.reversed() else eps
     }
 
     private fun parsePages(doc: Document): List<String> =
-        doc.select(config.pageSelector).mapNotNull(::img).distinct()
+        doc.select(config.pageSelector).mapNotNull(::img).map(::abs).distinct()
 
     private fun img(el: Element): String? =
         el.attr("src").takeIf { it.isNotBlank() }
@@ -197,8 +260,13 @@ object Themes {
         listSelector    = "div.c-tabs-item__content, div.page-item-detail",
         linkSelector    = "h3 a, h4 a, .post-title a",
         titleSelector   = "h3 a, h4 a, .post-title a",
-        chapterSelector = "li.wp-manga-chapter > a",
-        pageSelector    = "div.reading-content img, div.page-break img"
+        chapterSelector = ".wp-manga-chapter a, li.wp-manga-chapter > a",
+        pageSelector    = "div.reading-content img, div.page-break img",
+        detailTitleSelector  = "div.post-title h1, h1",
+        detailPosterSelector = "div.summary_image img, div.tab-summary img",
+        detailDescSelector   = "div.description-summary, div.summary__content",
+        detailGenreSelector  = "div.genres-content a",
+        chapterListSuffix    = "?style=list"
     )
 
     val MangaThemesia = ThemeConfig(
@@ -211,7 +279,12 @@ object Themes {
         listSelector    = "div.listupd div.bs",
         linkSelector    = "div.bsx > a",
         titleSelector   = "div.tt",
-        chapterSelector = "div.eplister ul li a",
-        pageSelector    = "div#readerarea img"
+        chapterSelector = "div.eplister ul li a, #chapterlist ul li a",
+        pageSelector    = "div#readerarea img",
+        detailTitleSelector  = "h1.entry-title, .ts-breadcrumb span",
+        detailPosterSelector = ".thumb img, .summary_image img",
+        detailDescSelector   = ".entry-content-single, .summary__content",
+        detailGenreSelector  = ".mgen a, .seriestugenre a",
+        chapterListSuffix    = ""
     )
 }
