@@ -75,7 +75,6 @@ class CFSolver(
             CFState.endSolve(host)
         }
     }
-
     @SuppressLint("SetJavaScriptEnabled")
     private fun showDialog(
         activity: android.app.Activity,
@@ -84,10 +83,12 @@ class CFSolver(
         val resolved = AtomicBoolean(false)
         var dialog: Dialog? = null
         var web: WebView? = null
+        val mainHandler = Handler(Looper.getMainLooper())
 
         fun disposeWebView() {
+            val bridge = capture?.bridgeName
             runCatching {
-                web?.removeJavascriptInterface(capture?.bridgeName ?: "")
+                if (!bridge.isNullOrBlank()) web?.removeJavascriptInterface(bridge)
                 web?.stopLoading()
                 web?.destroy()
             }
@@ -96,13 +97,22 @@ class CFSolver(
 
         fun finish(success: Boolean) {
             if (!resolved.compareAndSet(false, true)) return
+            mainHandler.removeCallbacksAndMessages(null)
             if (!deferred.isCompleted) deferred.complete(success)
-            // Tear down on the UI thread AFTER callers resume.
-            Handler(Looper.getMainLooper()).post {
+            mainHandler.post {
                 disposeWebView()
                 runCatching { dialog?.dismiss() }
             }
         }
+
+        // Hard timeout — a capture that never fires must not leak the dialog.
+        mainHandler.postDelayed({
+            if (resolved.compareAndSet(false, true)) {
+                if (!deferred.isCompleted) deferred.complete(false)
+                runCatching { dialog?.dismiss() }
+                disposeWebView()
+            }
+        }, 120_000L)
 
         dialog = Dialog(activity)
 
@@ -134,8 +144,6 @@ class CFSolver(
 
         val host = runCatching { URI(url).host }.getOrNull() ?: ""
 
-        // Local val so Kotlin can smart-cast at the loadUrl() call.
-        // The outer `web` var exists only so disposeWebView() can reach it.
         val webView = WebView(activity)
         web = webView
 
@@ -151,14 +159,10 @@ class CFSolver(
             useWideViewPort = true
             loadWithOverviewMode = true
             cacheMode = WebSettings.LOAD_DEFAULT
-
-            // Harden the WebView. It only ever loads the target site's
-            // CF challenge, never local files or content:// URIs.
             allowFileAccess = false
             allowContentAccess = false
             setGeolocationEnabled(false)
 
-            // Per-host UA: reuse if already captured for this domain
             val existing = CFState.userAgentFor(host)
             if (existing != null) {
                 userAgentString = existing
@@ -169,7 +173,6 @@ class CFSolver(
 
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
-        // Optional site-specific hook (Comix cipher, etc.)
         capture?.let { cap ->
             webView.addJavascriptInterface(cap.bridge(), cap.bridgeName)
         }
@@ -188,8 +191,6 @@ class CFSolver(
             ).any { title.contains(it) }
 
             if (!stillChallenging && cookies.contains("cf_clearance")) {
-                // If the provider also needs post-solve material,
-                // keep the WebView alive until it's captured.
                 if (capture != null && !capture.hasCaptured()) {
                     header.text = "Generating session keys…"
                     return
@@ -197,9 +198,7 @@ class CFSolver(
                 CookieManager.getInstance().flush()
                 header.text = "Verified. Resuming…"
                 header.setTextColor(Color.parseColor("#22C55E"))
-                Handler(Looper.getMainLooper()).postDelayed(
-                    { finish(true) }, 400
-                )
+                mainHandler.postDelayed({ finish(true) }, 400)
             }
         }
 
@@ -213,9 +212,6 @@ class CFSolver(
         }
 
         webView.webViewClient = object : WebViewClient() {
-            // Never trust an invalid certificate. CF always serves a valid
-            // chain — a failure here means MITM or a broken device clock,
-            // and proceeding would leak the clearance cookie to the attacker.
             override fun onReceivedSslError(
                 view: WebView?, handler: SslErrorHandler?, error: SslError?
             ) {
@@ -231,9 +227,7 @@ class CFSolver(
             override fun onPageFinished(view: WebView?, url: String?) {
                 capture?.injectScript?.let { view?.evaluateJavascript(it, null) }
                 checkSolved(view)
-                Handler(Looper.getMainLooper()).postDelayed(
-                    { checkSolved(view) }, 1200
-                )
+                mainHandler.postDelayed({ checkSolved(view) }, 1200)
             }
         }
 
@@ -254,4 +248,3 @@ class CFSolver(
         dialog.show()
         webView.loadUrl(url)
     }
-}
