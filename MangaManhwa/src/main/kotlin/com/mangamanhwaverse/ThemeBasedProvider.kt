@@ -4,6 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.app
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
@@ -147,6 +148,8 @@ open class ThemeBasedProvider(
         val doc = fetch(mangaUrl) ?: return emptyList()
         var eps = parseChapters(doc)
 
+        // Madara's "?style=list" forces server-side rendering of the full list.
+        // Most child themes honour this; some don't.
         if (config.chapterListSuffix.isNotEmpty()) {
             val sep = if (mangaUrl.contains("?")) "&" else "?"
             val fullUrl = mangaUrl.trimEnd('/') +
@@ -156,6 +159,21 @@ open class ThemeBasedProvider(
                 val fullEps = parseChapters(full)
                 if (fullEps.size > eps.size) eps = fullEps
             }
+        }
+
+        // Fallback: Madara sites with AJAX-loaded chapter lists serve an empty
+        // #manga-chapters-holder in the initial HTML. Fetch the list directly
+        // from admin-ajax.php.
+        if (eps.isEmpty()) {
+            eps = fetchMadaraAjaxChapters(mangaUrl, doc)
+        }
+
+        if (eps.isEmpty()) {
+            logErr(
+                "chapters($mangaUrl) → 0 episodes | title='${doc.title()}' " +
+                "chapterSelector='${config.chapterSelector}' " +
+                "hasAjaxHolder=${doc.selectFirst("#manga-chapters-holder") != null}"
+            )
         }
         return eps
     }
@@ -196,9 +214,7 @@ open class ThemeBasedProvider(
         // Parse chapters from the doc we already have — no second fetch.
         var episodes = parseChapters(doc)
 
-        // Madara only renders ~10 chapters on the default view; the
-        // "?style=list" view returns the full list. Refetch once if
-        // the theme asks for it and the first parse looks thin.
+        // Madara's ?style=list view returns the full list on most themes.
         if (config.chapterListSuffix.isNotEmpty()) {
             val sep = if (url.contains("?")) "&" else "?"
             val fullUrl = url.trimEnd('/') +
@@ -208,6 +224,11 @@ open class ThemeBasedProvider(
                 val fullEps = parseChapters(full)
                 if (fullEps.size > episodes.size) episodes = fullEps
             }
+        }
+
+        // Fallback: AJAX-loaded chapter list (Madara "show more" mode).
+        if (episodes.isEmpty()) {
+            episodes = fetchMadaraAjaxChapters(url, doc)
         }
 
         if (episodes.isEmpty()) {
@@ -257,6 +278,60 @@ open class ThemeBasedProvider(
             val label = a.text().trim().ifBlank { href.substringAfterLast("/") }
             newEpisode(abs(href)) { this.name = label }
         }.distinctBy { it.data }
+        return if (config.newestFirst) eps.reversed() else eps
+    }
+
+    /**
+     * Madara sites that use the "show more" AJAX chapter list serve an empty
+     * <div id="manga-chapters-holder" data-id="N"> in the initial HTML and load
+     * the actual list via a POST to admin-ajax.php with action=manga_get_chapters.
+     *
+     * This is the standard Madara AJAX pattern. Returns an empty list if the
+     * holder is absent (i.e. this isn't a Madara AJAX site) or the request fails.
+     */
+    private suspend fun fetchMadaraAjaxChapters(
+        mangaUrl: String,
+        doc: Document
+    ): List<Episode> {
+        val postId = doc.selectFirst("#manga-chapters-holder[data-id]")
+            ?.attr("data-id")
+            ?.takeIf { it.isNotBlank() && it != "0" }
+            ?: return emptyList()
+
+        val ajaxUrl = "$baseUrl/wp-admin/admin-ajax.php"
+        val body = runCatching {
+            app.post(
+                ajaxUrl,
+                data = mapOf(
+                    "action" to "manga_get_chapters",
+                    "manga"  to postId,
+                ),
+                interceptor = unifiedInterceptor,
+                referer = mangaUrl,
+                headers = browserHeaders(mapOf(
+                    "X-Requested-With" to "XMLHttpRequest",
+                    "Accept" to "text/html, */*; q=0.01",
+                    "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8",
+                ))
+            ).text
+        }.getOrElse {
+            logErr("Madara AJAX failed for $ajaxUrl (postId=$postId)", it)
+            return emptyList()
+        }
+
+        val ajaxDoc = Jsoup.parse(body)
+        val eps = ajaxDoc.select(config.chapterSelector).mapNotNull { a ->
+            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            newEpisode(abs(href)) { this.name = a.text().trim() }
+        }.distinctBy { it.data }
+
+        log("Madara AJAX chapters: postId=$postId → ${eps.size} episodes")
+        if (eps.isEmpty()) {
+            logErr(
+                "Madara AJAX response empty | postId=$postId | " +
+                "respLen=${body.length} | head=${body.take(200).replace(Regex("\\s+"), " ")}"
+            )
+        }
         return if (config.newestFirst) eps.reversed() else eps
     }
 
