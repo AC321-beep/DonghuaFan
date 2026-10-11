@@ -46,7 +46,7 @@ abstract class MangaManhwaProvider : MainAPI() {
     protected open val cfPattern: Regex
         get() {
             val host = hostOf(baseUrl)
-            if (host.isBlank()) return Regex("(?!)") // never matches
+            if (host.isBlank()) return Regex("(?!)")
             return Regex(".*${Regex.escape(host)}.*")
         }
 
@@ -88,14 +88,21 @@ abstract class MangaManhwaProvider : MainAPI() {
                 "new"       -> newReleases(page)
                 else        -> emptyList()
             }
+        }.onFailure {
+            logErr("getMainPage(${request.data}, p$page) threw", it)
         }.getOrDefault(emptyList())
 
-        if (items.isEmpty()) return null
+        if (items.isEmpty()) {
+            logErr("getMainPage(${request.data}, p$page) → 0 items for $name")
+            return null
+        }
         return newHomePageResponse(request.name, items)
     }
 
     override suspend fun search(query: String): List<SearchResponse>? =
-        runCatching { searchPage(query, 1) }.getOrNull()
+        runCatching { searchPage(query, 1) }
+            .onFailure { logErr("search('$query') threw", it) }
+            .getOrNull()
 
     override suspend fun load(url: String): LoadResponse? {
         val episodes = try {
@@ -249,7 +256,12 @@ abstract class MangaManhwaProvider : MainAPI() {
     private fun hostOf(url: String): String =
         runCatching { URI(url).host }.getOrNull().orEmpty()
 
-     protected fun titleFromSlug(url: String): String {
+    /**
+     * "solo-leveling"              → "Solo Leveling"
+     * "solo-leveling/"             → "Solo Leveling"
+     * "…/solo-leveling-chapter-3/" → "Solo Leveling Chapter 3"
+     */
+    protected fun titleFromSlug(url: String): String {
         val cleaned = url.substringBefore("?").substringBefore("#").trimEnd('/')
         val raw = cleaned.substringAfterLast("/")
             .replace('-', ' ')
