@@ -306,7 +306,6 @@ open class ThemeBasedProvider(
                     "action" to "manga_get_chapters",
                     "manga"  to postId,
                 ),
-                interceptor = unifiedInterceptor,
                 referer = mangaUrl,
                 headers = browserHeaders(mapOf(
                     "X-Requested-With" to "XMLHttpRequest",
