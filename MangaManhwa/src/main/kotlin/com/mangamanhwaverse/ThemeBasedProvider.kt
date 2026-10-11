@@ -147,8 +147,6 @@ open class ThemeBasedProvider(
         val doc = fetch(mangaUrl) ?: return emptyList()
         var eps = parseChapters(doc)
 
-        // For themes that paginate the chapter list (Madara),
-        // refetch the "?style=list" view and use whichever is fuller.
         if (config.chapterListSuffix.isNotEmpty()) {
             val sep = if (mangaUrl.contains("?")) "&" else "?"
             val fullUrl = mangaUrl.trimEnd('/') +
@@ -195,7 +193,29 @@ open class ThemeBasedProvider(
             }
             .orEmpty()
 
-        val episodes = runCatching { chapters(url) }.getOrDefault(emptyList())
+        // Parse chapters from the doc we already have — no second fetch.
+        var episodes = parseChapters(doc)
+
+        // Madara only renders ~10 chapters on the default view; the
+        // "?style=list" view returns the full list. Refetch once if
+        // the theme asks for it and the first parse looks thin.
+        if (config.chapterListSuffix.isNotEmpty()) {
+            val sep = if (url.contains("?")) "&" else "?"
+            val fullUrl = url.trimEnd('/') +
+                          config.chapterListSuffix.replaceFirst("?", sep)
+            val full = runCatching { fetch(fullUrl) }.getOrNull()
+            if (full != null) {
+                val fullEps = parseChapters(full)
+                if (fullEps.size > episodes.size) episodes = fullEps
+            }
+        }
+
+        if (episodes.isEmpty()) {
+            logErr(
+                "load($url) → 0 chapters | title='$title' " +
+                "chapterSelector='${config.chapterSelector}'"
+            )
+        }
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
@@ -205,8 +225,9 @@ open class ThemeBasedProvider(
         }
     }
 
-    private fun parseList(doc: Document): List<SearchResponse> =
-        doc.select(config.listSelector).mapNotNull { el ->
+    private fun parseList(doc: Document): List<SearchResponse> {
+        val nodes = doc.select(config.listSelector)
+        val results = nodes.mapNotNull { el ->
             val a = el.selectFirst(config.linkSelector) ?: return@mapNotNull null
             val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val title = (el.selectFirst(config.titleSelector)?.text()?.trim()
@@ -216,6 +237,19 @@ open class ThemeBasedProvider(
                 posterUrl = poster
             }
         }.distinctBy { it.url }
+
+        if (results.isEmpty()) {
+            val bodyHead = doc.body()?.text()
+                ?.take(200)?.replace(Regex("\\s+"), " ")
+                .orEmpty()
+            logErr(
+                "parseList 0 results | selector='${config.listSelector}' " +
+                "matched ${nodes.size} nodes | doc.title='${doc.title()}' | " +
+                "body: $bodyHead"
+            )
+        }
+        return results
+    }
 
     private fun parseChapters(doc: Document): List<Episode> {
         val eps = doc.select(config.chapterSelector).mapNotNull { a ->
@@ -229,15 +263,27 @@ open class ThemeBasedProvider(
     private fun parsePages(doc: Document): List<String> =
         doc.select(config.pageSelector).mapNotNull(::img).map(::abs).distinct()
 
-    private fun img(el: Element): String? =
-        el.attr("src").takeIf { it.isNotBlank() }
-            ?: el.attr("data-src").takeIf { it.isNotBlank() }
-            ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() }
-            ?: el.attr("data-original").takeIf { it.isNotBlank() }
-            ?: el.attr("srcset").split(",").firstOrNull()?.trim()
-                ?.substringBefore(" ")?.takeIf { it.isNotBlank() }
-            ?: el.attr("data-srcset").split(",").firstOrNull()?.trim()
-                ?.substringBefore(" ")?.takeIf { it.isNotBlank() }
+    /**
+     * Priority order matters: Madara lazy-loads images with a placeholder
+     * in `src` and the real URL in `data-src`. Data/about/blob URIs are
+     * rejected so the caller never tries to fetch a base64 gif as an image.
+     */
+    private fun img(el: Element): String? {
+        val candidates = listOf(
+            el.attr("data-src"),
+            el.attr("data-lazy-src"),
+            el.attr("data-original"),
+            el.attr("src"),
+            el.attr("srcset").split(",").firstOrNull()?.trim()?.substringBefore(" ").orEmpty(),
+            el.attr("data-srcset").split(",").firstOrNull()?.trim()?.substringBefore(" ").orEmpty()
+        )
+        return candidates.firstOrNull {
+            it.isNotBlank() &&
+                !it.startsWith("data:") &&
+                !it.startsWith("about:") &&
+                !it.startsWith("blob:")
+        }
+    }
 
     private fun shrink(url: String): String = when {
         url.contains("/large/") -> url.replace("/large/", "/small/")
