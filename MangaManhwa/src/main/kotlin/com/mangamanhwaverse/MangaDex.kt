@@ -169,12 +169,12 @@ class MangaDex : MangaManhwaProvider() {
             this.plot = desc
             this.tags = tags
             this.year = year
-            this.showStatus = when (statusStr?.lowercase()) {
-                "completed" -> ShowStatus.Completed
-                "ongoing"   -> ShowStatus.Ongoing
-                "hiatus"    -> ShowStatus.OnHiatus
-                else        -> null
-            }
+           this.showStatus = when (statusStr?.lowercase()) {
+    "completed" -> ShowStatus.Completed
+    "cancelled" -> ShowStatus.Cancelled
+    "ongoing", "hiatus" -> ShowStatus.Ongoing
+    else -> null
+}
             if (episodes.isNotEmpty()) addEpisodes(DubStatus.Subbed, episodes)
         }
     }
