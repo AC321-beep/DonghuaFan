@@ -9,6 +9,6 @@ cloudstream {
     status = 1
     tvTypes = listOf("Anime", "Others")
     language = "en"
-    version = 5
+    version = 6
     iconUrl = "https://www.google.com/s2/favicons?domain=comix.to&sz=256"
 }
