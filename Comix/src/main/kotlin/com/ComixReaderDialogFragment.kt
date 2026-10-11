@@ -83,12 +83,22 @@ class ComixReaderDialogFragment : DialogFragment() {
 
     private var toolbarVisible = true
 
+    // ─── Resume state ────────────────────────────────────────────────────────
+    private lateinit var prefs: android.content.SharedPreferences
+
+    /** Scroll Y that must be applied on the next onPageFinished (<= 0 → nothing). */
+    private var pendingScrollRestore: Float = -1f
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val a = arguments
         comicTitle = a?.getString(ARG_TITLE) ?: "Comic Reader"
         currentChapterName = a?.getString(ARG_CHAPTER_NAME) ?: "Chapter"
         currentChapterUrl = a?.getString(ARG_CHAPTER_URL) ?: ""
+
+        // Resume prefs (chapter url under slug + scroll under pos::<chapterUrl>)
+        prefs = requireContext().applicationContext
+            .getSharedPreferences("comix_resume_prefs", Context.MODE_PRIVATE)
     }
 
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
@@ -124,7 +134,19 @@ class ComixReaderDialogFragment : DialogFragment() {
         }
     }
 
+    override fun onPause() {
+        // Ask the page to push its current scroll position one last time.
+        webView?.evaluateJavascript(
+            "window.__comixPushScroll && window.__comixPushScroll();", null
+        )
+        super.onPause()
+    }
+
     override fun onDestroyView() {
+        // Final flush before the WebView is destroyed.
+        webView?.evaluateJavascript(
+            "window.__comixPushScroll && window.__comixPushScroll();", null
+        )
         webView?.apply {
             stopLoading()
             loadUrl("about:blank")
@@ -214,6 +236,11 @@ class ComixReaderDialogFragment : DialogFragment() {
                     super.doUpdateVisitedHistory(view, url, isReload)
                     if (url.isNullOrBlank() || !url.contains("comix.to")) return
 
+                    // URL changed (back / forward / SPA) → queue its saved scroll
+                    if (url != currentChapterUrl) {
+                        pendingScrollRestore = loadSavedScroll(url)
+                    }
+
                     val numStr = Regex("-chapter-([\\d.]+)").find(url)?.groupValues?.get(1)
                     if (numStr != null) {
                         currentChapterUrl = url
@@ -222,8 +249,7 @@ class ComixReaderDialogFragment : DialogFragment() {
 
                         val slug = extractSlug(url)
                         if (slug.isNotBlank()) {
-                            view.context.getSharedPreferences("comix_resume_prefs", Context.MODE_PRIVATE)
-                                .edit().putString(slug, url).apply()
+                            prefs.edit().putString(slug, url).apply()
                         }
                     }
 
@@ -235,6 +261,13 @@ class ComixReaderDialogFragment : DialogFragment() {
                     progressBar?.visibility = View.GONE
                     injectReaderOptimizations(view)
                     applyZoomAndWidth()
+
+                    // Consume any pending scroll restore
+                    val restoreY = pendingScrollRestore
+                    if (restoreY > 0f) {
+                        pendingScrollRestore = -1f
+                        view.postDelayed({ restoreScrollPosition(restoreY) }, 100L)
+                    }
                 }
             }
         }
@@ -726,6 +759,88 @@ class ComixReaderDialogFragment : DialogFragment() {
                     setTimeout(function(){ dot.remove(); }, 450);
                   } catch(e) {}
                 }
+
+                // ─── Scroll position tracking (resume) ─────────────────────────────────
+                if (!window.__comixScrollTrackerInstalled) {
+                  window.__comixScrollTrackerInstalled = true;
+
+                  var lastY = -1;
+                  var lastT = 0;
+                  var pendingTimer = null;
+
+                  function getScroller() {
+                    var el = document.querySelector('.rpage-main')
+                          || document.querySelector('.rpage-main--long-strip');
+                    if (el && el.scrollHeight > el.clientHeight + 4) return el;
+                    return null;
+                  }
+                  function currentY() {
+                    var el = getScroller();
+                    if (el) return el.scrollTop;
+                    return window.scrollY
+                        || window.pageYOffset
+                        || document.documentElement.scrollTop
+                        || 0;
+                  }
+                  function push(force) {
+                    var y = currentY();
+                    if (!force && Math.abs(y - lastY) < 6) return;
+                    lastY = y;
+                    try {
+                      if (window.AndroidComix && window.AndroidComix.onScrollPosition) {
+                        window.AndroidComix.onScrollPosition(window.location.href, y);
+                      }
+                    } catch (e) {}
+                  }
+                  function schedulePush() {
+                    var now = Date.now();
+                    if (now - lastT >= 500) { lastT = now; push(false); return; }
+                    if (pendingTimer) clearTimeout(pendingTimer);
+                    pendingTimer = setTimeout(function () {
+                      lastT = Date.now(); push(false);
+                    }, 500 - (now - lastT));
+                  }
+
+                  window.addEventListener('scroll', schedulePush, { passive: true });
+                  document.addEventListener('scroll', schedulePush, { passive: true, capture: true });
+                  window.addEventListener('pagehide',     function () { push(true); });
+                  window.addEventListener('beforeunload', function () { push(true); });
+
+                  // Exposed so Android can force a final save (onPause / onDestroyView).
+                  window.__comixPushScroll = function () { push(true); };
+                }
+
+                // ─── Restore scroll with retries (images load lazily) ──────────────────
+                if (!window.__comixRestoreScroll) {
+                  window.__comixRestoreScroll = function (targetY) {
+                    if (typeof targetY !== 'number' || targetY <= 0) return;
+
+                    var cancelled = false;
+                    function cancel() { cancelled = true; }
+                    // Programmatic scrolls don't fire these — safe to cancel on real input.
+                    window.addEventListener('touchstart', cancel, { once: true, passive: true, capture: true });
+                    window.addEventListener('wheel',      cancel, { once: true, passive: true, capture: true });
+                    window.addEventListener('keydown',    cancel, { once: true });
+
+                    function scroller() {
+                      var el = document.querySelector('.rpage-main')
+                            || document.querySelector('.rpage-main--long-strip');
+                      if (el && el.scrollHeight > el.clientHeight + 4) return el;
+                      return null;
+                    }
+                    function apply() {
+                      if (cancelled) return;
+                      try {
+                        var el = scroller();
+                        if (el) el.scrollTop = targetY;
+                        window.scrollTo(0, targetY);
+                      } catch (e) {}
+                    }
+                    // Retry while lazy images expand the document height.
+                    [0, 60, 150, 300, 500, 800, 1200, 1700, 2400, 3200, 4000]
+                      .forEach(function (d) { setTimeout(apply, d); });
+                  };
+                }
               } catch(e) {}
             })();
             """.trimIndent(), null
@@ -737,6 +852,36 @@ class ComixReaderDialogFragment : DialogFragment() {
         val slugRaw = match?.groupValues?.get(1) ?: return ""
         return slugRaw.substringBefore("-chapter-").trimEnd('-')
     }
+
+    // ─── Resume helpers ──────────────────────────────────────────────────────
+
+    /** Stable key for a chapter URL – ignore hash and trailing slash. */
+    private fun positionKey(url: String): String {
+        if (url.isBlank()) return ""
+        return "pos::" + url.substringBefore('#').trimEnd('/')
+    }
+
+    private fun loadSavedScroll(url: String): Float {
+        val k = positionKey(url)
+        if (k.isEmpty()) return -1f
+        return runCatching { prefs.getFloat(k, -1f) }.getOrDefault(-1f)
+    }
+
+    fun saveScroll(url: String, y: Float) {
+        val k = positionKey(url)
+        if (k.isEmpty() || y < 0f) return
+        runCatching { prefs.edit().putFloat(k, y).apply() }
+    }
+
+    private fun restoreScrollPosition(y: Float) {
+        if (y <= 0f) return
+        val yStr = String.format(java.util.Locale.US, "%.2f", y)
+        webView?.evaluateJavascript(
+            "window.__comixRestoreScroll && window.__comixRestoreScroll($yStr);", null
+        )
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
 
     fun loadUrlDirectly(name: String, url: String) {
         if (url.isBlank()) return
@@ -751,6 +896,9 @@ class ComixReaderDialogFragment : DialogFragment() {
         val numStr = Regex("-chapter-([\\d.]+)").find(currentChapterUrl)?.groupValues?.get(1)
         currentChapterName = if (numStr != null) "Ch. $numStr" else name
         chapterInfoTextView?.text = currentChapterName.ifBlank { "Chapter" }
+
+        // ▼ Queue the exact scroll position for this chapter
+        pendingScrollRestore = loadSavedScroll(currentChapterUrl)
 
         val headers = mapOf(
             "Referer" to "https://comix.to/",
@@ -790,6 +938,12 @@ class ComixReaderDialogFragment : DialogFragment() {
             dialog.activity?.runOnUiThread {
                 dialog.webView?.let { dialog.injectReaderOptimizations(it) }
             }
+        }
+
+        @JavascriptInterface
+        fun onScrollPosition(url: String, y: Float) {
+            // Called from the WebView's JS thread – SharedPreferences is thread-safe.
+            dialog.saveScroll(url, y)
         }
     }
 
