@@ -4,7 +4,9 @@ import android.app.Activity
 import android.app.Application
 import android.content.Context
 import android.os.Bundle
+import androidx.fragment.app.DialogFragment
 import androidx.fragment.app.Fragment
+import androidx.fragment.app.FragmentActivity
 import androidx.fragment.app.FragmentManager
 import java.util.Collections
 import java.util.WeakHashMap
@@ -47,8 +49,6 @@ object DialogSentinel {
 
     private val installed = AtomicBoolean(false)
 
-    // FMs we've already hooked, so rotation and activity re-entry don't
-    // register duplicates. WeakHashMap so dead FMs are collected.
     private val registeredFms: MutableSet<FragmentManager> =
         Collections.newSetFromMap(WeakHashMap<FragmentManager, Boolean>())
 
@@ -83,15 +83,16 @@ object DialogSentinel {
             override fun onActivityResumed(activity: Activity) {
                 if (!FilterStore.enabled) return
 
-                val fm = try { activity.supportFragmentManager } catch (_: Throwable) { null } ?: return
+                // supportFragmentManager lives on FragmentActivity, not on
+                // Activity. Cast to reach the Java getter.
+                val fm = (activity as? FragmentActivity)?.supportFragmentManager ?: return
 
                 if (registeredFms.add(fm)) {
                     try {
                         fm.registerFragmentLifecycleCallbacks(callbacks, true)
                     } catch (_: Throwable) {
-                        // Fall through to sweep; the hook may have failed.
+                        // Fall through to sweep.
                     }
-                    // One sweep catches anything attached before registration.
                     sweep(fm)
                 }
             }
@@ -123,8 +124,6 @@ object DialogSentinel {
                       CLASS_PATTERNS.any { it.containsMatchIn(cls) }
         if (matched) return true
 
-        // Diagnostic: a dialog-shaped fragment that no pattern matched.
-        // Useful for adding one regex later; harmless in release builds.
         if (cls.contains("dialog", ignoreCase = true) ||
             tag.contains("dialog", ignoreCase = true)) {
             android.util.Log.w("AdFree", "Unmatched dialog: tag=$tag class=$cls")
@@ -133,17 +132,20 @@ object DialogSentinel {
     }
 
     private fun killFragment(f: Fragment, fm: FragmentManager) {
-        // 1. Kill the window.
+        val df = f as? DialogFragment
+
+        // 1. Kill the underlying window first. dialog, dismiss, and
+        //    dismissAllowingStateLoss are DialogFragment members, not Fragment.
         try {
-            f.dialog?.let {
+            df?.dialog?.let {
                 it.dismiss()
                 it.cancel()
             }
         } catch (_: Throwable) {}
 
         // 2. Dismiss the fragment.
-        try { f.dismissAllowingStateLoss() } catch (_: Throwable) {}
-        try { f.dismiss() } catch (_: Throwable) {}
+        try { df?.dismissAllowingStateLoss() } catch (_: Throwable) {}
+        try { df?.dismiss() } catch (_: Throwable) {}
 
         // 3. Force-remove if still attached.
         if (f.isAdded) {
