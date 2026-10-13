@@ -16,6 +16,7 @@ import java.util.Collections
 import java.util.Date
 import java.util.Locale
 import java.util.WeakHashMap
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -44,8 +45,27 @@ object FilterStore {
         }
 }
 
-
+/**
+ * Popup blocker. Two mechanisms under one roof:
+ *
+ *  - Dialog hook: FragmentLifecycleCallbacks kill a popup DialogFragment
+ *    the same frame it attaches.
+ *  - Prefs gate: rewrites the extension's own SharedPreferences so its
+ *    "already shown today" check returns early, and re-pins the gate the
+ *    moment the extension writes it, via OnSharedPreferenceChangeListener.
+ *
+ * All matching is generic regex stems.Every pattern lives in [Patterns] below so a
+ * new stem is added in exactly one place and picked up by both mechanisms.
+ *
+ * Watchers are registered on demand: at plugin load, and again on each
+ * activity resume, so a prefs file created by an extension that runs for
+ * the first time after the plugin loaded is still picked up.
+ */
 object PopupBlocker {
+
+    // -----------------------------------------------------------------
+    // Shared pattern vocabulary
+    // -----------------------------------------------------------------
 
     private object Patterns {
         val tag = listOf(
@@ -142,6 +162,10 @@ object PopupBlocker {
 
             override fun onActivityResumed(activity: Activity) {
                 if (!FilterStore.enabled) return
+
+                // Pick up any prefs file created by an extension that ran
+                // for the first time since the last sanitize(). 
+
                 val fm = (activity as? FragmentActivity)?.supportFragmentManager ?: return
 
                 if (registeredFms.add(fm)) {
@@ -164,7 +188,7 @@ object PopupBlocker {
     }
 
     /**
-     * Full prefs sweep plus registration of the change listeners.
+     * Full prefs sweep plus registration of change listeners.
      * Called at plugin load and again when the user enables the blocker.
      */
     fun sanitize(context: Context): Int {
@@ -184,9 +208,8 @@ object PopupBlocker {
     }
 
     /**
-     * Called when the user disables
-     * the blocker.
-     **/
+     * Called when the user disables the blocker.
+     */
     fun clearGates(context: Context) {
         val dir = File(context.applicationInfo.dataDir, "shared_prefs")
         if (!dir.isDirectory) return
@@ -293,8 +316,14 @@ object PopupBlocker {
     // Prefs sanitizer
     // =================================================================
 
+    // Prefs objects already wired. WeakHashMap so unloaded prefs drop.
     private val watched: MutableSet<SharedPreferences> =
         Collections.newSetFromMap(WeakHashMap<SharedPreferences, Boolean>())
+
+    // Filenames already inspected. Thread-safe because onActivityResumed
+    // runs on the main thread and sanitize() may run from anywhere.
+    private val watchedNames: MutableSet<String> =
+        ConcurrentHashMap.newKeySet()
 
     @Volatile private var selfWriting = false
 
@@ -315,9 +344,15 @@ object PopupBlocker {
     private fun today(): String =
         SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
 
+    /**
+     * Registers a change listener on [file] if its name matches a popup
+     * pattern and we have not already wired it. Safe to call repeatedly:
+     * the name check is a set lookup once the file has been seen.
+     */
     private fun registerWatcher(context: Context, file: File) {
         val name = file.nameWithoutExtension
         if (!Patterns.file.any { it.containsMatchIn(name) }) return
+        if (!watchedNames.add(name)) return
 
         val prefs = try {
             context.getSharedPreferences(name, Context.MODE_PRIVATE)
@@ -328,6 +363,20 @@ object PopupBlocker {
                 prefs.registerOnSharedPreferenceChangeListener(listener)
             } catch (_: Throwable) {}
         }
+    }
+
+    /**
+     * Re-lists shared_prefs and wires any new matching file. Called on
+     * every resume so a prefs file created by a first-run extension is
+     * picked up without restarting the app.
+     */
+    private fun rescanWatchers(context: Context) {
+        if (!FilterStore.enabled) return
+        val dir = File(context.applicationInfo.dataDir, "shared_prefs")
+        if (!dir.isDirectory) return
+
+        val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".xml") } ?: return
+        for (f in files) registerWatcher(context, f)
     }
 
     private fun sanitizeFile(context: Context, file: File): Boolean {
