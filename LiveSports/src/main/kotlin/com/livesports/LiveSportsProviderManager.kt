@@ -11,7 +11,17 @@ import java.util.concurrent.TimeUnit
 object LiveSportsProviderManager {
     private const val FALLBACK_BASE_URL = "https://cfymarkscanjiostar80.top"
     private const val PACKAGE_NAME = "com.cricfy.tv"
+
+    // ─────────── CHANGE 4: self-healing cache ───────────
+    private const val CACHE_TTL_MS = 15 * 60 * 1000L   // 15 min
     private var cachedBaseUrl: String? = null
+    private var cacheTime: Long = 0L
+
+    fun invalidateBaseUrl() {
+        cachedBaseUrl = null
+        cacheTime = 0L
+    }
+    // ─────────── end CHANGE 4 ───────────
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -21,8 +31,14 @@ object LiveSportsProviderManager {
     data class RemoteConfigResponse(val entries: Map<String, String>? = null)
 
     suspend fun getBaseUrl(): String {
-        if (cachedBaseUrl != null) return cachedBaseUrl!!
-        
+        // ─────────── CHANGE 4: TTL-aware cache check ───────────
+        val now = System.currentTimeMillis()
+        val cached = cachedBaseUrl
+        if (cached != null && (now - cacheTime) < CACHE_TTL_MS) {
+            return cached
+        }
+        // ─────────── end CHANGE 4 ───────────
+
         val apiKey = try { BuildConfig.LIVESPORTS_FIREBASE_API_KEY } catch (e: Exception) { "" }
         val appId = try { BuildConfig.LIVESPORTS_FIREBASE_APP_ID } catch (e: Exception) { "" }
         val projNum = try { BuildConfig.LIVESPORTS_FIREBASE_PROJECT_NUMBER } catch (e: Exception) { "" }
@@ -55,22 +71,27 @@ object LiveSportsProviderManager {
                 }
             } catch (e: Exception) { e.printStackTrace() }
         }
-        
+
         if (cachedBaseUrl == null) cachedBaseUrl = FALLBACK_BASE_URL
+        cacheTime = now                                    // ← CHANGE 4: stamp on success
         return cachedBaseUrl!!
     }
 
     suspend fun fetchLiveEvents(): List<LiveEventData> {
         try {
             val url = "${getBaseUrl()}/categories/live-events.txt"
-            
+
             val request = Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
             val response = client.newCall(request).execute()
             if (response.isSuccessful) {
                 val decrypted = CryptoUtils.decryptData(response.body?.string() ?: "")
                 if (!decrypted.isNullOrBlank()) return parseJson(decrypted)
             }
-        } catch (e: Exception) { e.printStackTrace() }
+            invalidateBaseUrl()                            // ← CHANGE 4: reachable but bad payload
+        } catch (e: Exception) {
+            e.printStackTrace()
+            invalidateBaseUrl()                            // ← CHANGE 4: network / parse failure
+        }
         return emptyList()
     }
 }
