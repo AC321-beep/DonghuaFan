@@ -40,7 +40,7 @@ class LiveSportsEvents : MainAPI() {
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-       enum class EventState(val emoji: String) {
+    enum class EventState(val emoji: String) {
         LIVE("🔴"),
         UPCOMING("🔜"),
         ENDED("✅"),
@@ -70,7 +70,7 @@ class LiveSportsEvents : MainAPI() {
         }
     }
 
-      private fun getFormattedTime(event: LiveEventData): String {
+    private fun getFormattedTime(event: LiveEventData): String {
         val timeMs = parseEventDate(event.eventInfo?.startTime) ?: return ""
         return try {
             SimpleDateFormat("MMM dd, yyyy hh:mm a", Locale.US).format(Date(timeMs))
@@ -82,14 +82,14 @@ class LiveSportsEvents : MainAPI() {
         return if (info?.teamA != null && info.teamB != null && info.teamA != info.teamB) "${info.teamA} vs ${info.teamB}" else event.title
     }
 
-     private fun generateMatchCardUrl(event: LiveEventData): String {
+    private fun generateMatchCardUrl(event: LiveEventData): String {
         val info = event.eventInfo
         val state = getEventState(event)
         val time = getFormattedTime(event)
-        
+
         val isLive = state == EventState.LIVE
         val isEnded = state == EventState.ENDED
-        
+
         return buildString {
             append("https://sportslivecard.livesportz.workers.dev/?")
             append("title=${java.net.URLEncoder.encode(info?.eventName ?: event.title, "UTF-8")}")
@@ -98,10 +98,10 @@ class LiveSportsEvents : MainAPI() {
             info?.teamAFlag?.let { append("&teamAImg=$it") }
             info?.teamBFlag?.let { append("&teamBImg=$it") }
             info?.eventLogo?.let { append("&eventLogo=$it") }
-            
+
             append("&isLive=$isLive")
             append("&isEnded=$isEnded")
-            
+
             if (time.isNotBlank()) {
                 append("&time=${java.net.URLEncoder.encode(time, "UTF-8")}")
             }
@@ -111,17 +111,17 @@ class LiveSportsEvents : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val events = LiveSportsProviderManager.fetchLiveEvents()
         val grouped = events.groupBy { it.eventInfo?.eventCat ?: it.cat ?: "Other" }
-        
+
         val categoryOrder = listOf("football", "cricket", "boxing", "motorsport")
         val sortedCategories = grouped.keys.sortedBy { category ->
             val index = categoryOrder.indexOf(category.lowercase())
-            if (index == -1) Int.MAX_VALUE else index 
+            if (index == -1) Int.MAX_VALUE else index
         }
 
         val lists = sortedCategories.mapNotNull { category ->
             val list = grouped[category] ?: return@mapNotNull null
-            
-            val icon = when (category.lowercase()) { 
+
+            val icon = when (category.lowercase()) {
                 "cricket" -> "🏏"
                 "football" -> "⚽"
                 "motorsport" -> "🏎️"
@@ -130,51 +130,51 @@ class LiveSportsEvents : MainAPI() {
                 "tennis" -> "🎾"
                 "ice hockey" -> "🏒"
                 "baseball" -> "⚾"
-                else -> "📺" 
+                else -> "📺"
             }
-            
-            // Advanced Chronological Sorting 
+
+            // Advanced Chronological Sorting
             val sortedList = list.sortedWith(Comparator { a, b ->
                 val stateA = getEventState(a)
                 val stateB = getEventState(b)
-                
+
                 if (stateA != stateB) {
                     stateA.compareTo(stateB)
                 } else {
                     val timeA = parseEventDate(a.eventInfo?.startTime) ?: 0L
                     val timeB = parseEventDate(b.eventInfo?.startTime) ?: 0L
-                    
+
                     if (stateA == EventState.UPCOMING) {
-                        timeA.compareTo(timeB) 
+                        timeA.compareTo(timeB)
                     } else {
-                        timeB.compareTo(timeA) 
+                        timeB.compareTo(timeA)
                     }
                 }
             })
 
             val items = sortedList.map { event ->
                 val state = getEventState(event)
-                val time = getFormattedTime(event) 
+                val time = getFormattedTime(event)
                 val baseTitle = createDisplayTitle(event)
-                
+
                 val title = buildString {
                     if (state != EventState.UNKNOWN) append("${state.emoji} ")
                     append(baseTitle)
-                    
+
                     // Display time on UI only if not live and not ended
                     if (state == EventState.UPCOMING && time.isNotBlank()) {
                         append(" • $time")
                     }
                 }
-                
+
                 val loadData = LiveEventLoadData(
                     eventId = event.id, title = baseTitle,
                     poster = generateMatchCardUrl(event), slug = event.slug,
                     formats = event.formats ?: emptyList(), eventInfo = event.eventInfo
                 )
-                
-                newLiveSearchResponse(title, loadData.toJson(), TvType.Live) { 
-                    this.posterUrl = loadData.poster 
+
+                newLiveSearchResponse(title, loadData.toJson(), TvType.Live) {
+                    this.posterUrl = loadData.poster
                 }
             }
             HomePageList("$icon $category", items, isHorizontalImages = true)
@@ -182,7 +182,51 @@ class LiveSportsEvents : MainAPI() {
         return newHomePageResponse(lists, false)
     }
 
-    override suspend fun search(query: String): List<SearchResponse> { return emptyList() }
+    // ─────────── CHANGE 2: search() implementation ───────────
+    override suspend fun search(query: String): List<SearchResponse> {
+        if (query.isBlank()) return emptyList()
+
+        val events = LiveSportsProviderManager.fetchLiveEvents()
+
+        return events
+            .filter { event ->
+                val haystack = listOfNotNull(
+                    event.title,
+                    event.eventInfo?.teamA,
+                    event.eventInfo?.teamB,
+                    event.eventInfo?.eventName,
+                    event.eventInfo?.eventType,
+                    event.eventInfo?.eventCat,
+                    event.cat
+                ).joinToString(" ")
+                haystack.contains(query, ignoreCase = true)
+            }
+            .map { event ->
+                val state = getEventState(event)
+                val time = getFormattedTime(event)
+                val baseTitle = createDisplayTitle(event)
+
+                val title = buildString {
+                    if (state != EventState.UNKNOWN) append("${state.emoji} ")
+                    append(baseTitle)
+                    if (state == EventState.UPCOMING && time.isNotBlank()) {
+                        append(" • $time")
+                    }
+                }
+
+                val loadData = LiveEventLoadData(
+                    eventId = event.id, title = baseTitle,
+                    poster = generateMatchCardUrl(event), slug = event.slug,
+                    formats = event.formats ?: emptyList(),
+                    eventInfo = event.eventInfo
+                )
+
+                newLiveSearchResponse(title, loadData.toJson(), TvType.Live) {
+                    this.posterUrl = loadData.poster
+                }
+            }
+    }
+    // ─────────── end CHANGE 2 ───────────
 
     override suspend fun load(url: String): LoadResponse {
         val data = parseJson<LiveEventLoadData>(url)
@@ -201,16 +245,16 @@ class LiveSportsEvents : MainAPI() {
             }
             append("\n📡 Available Servers: ${data.formats.size}")
         }
-        return newLiveStreamLoadResponse(data.title, url, url) { 
+        return newLiveStreamLoadResponse(data.title, url, url) {
             this.posterUrl = data.poster
-            this.plot = plot 
+            this.plot = plot
         }
     }
 
     override suspend fun loadLinks(
-        data: String, 
-        isCasting: Boolean, 
-        subtitleCallback: (SubtitleFile) -> Unit, 
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val loadData = parseJson<LiveEventLoadData>(data)
@@ -223,16 +267,16 @@ class LiveSportsEvents : MainAPI() {
             val resolved = resolveEmbedUrlIfNeeded(url, headers) ?: return@forEach
 
             when (stream.type) {
-                "7" -> { 
+                "7" -> {
                     val drmParts = stream.api?.split(":") ?: return@forEach
                     if (drmParts.size == 2) {
                         val kid = drmParts[0].replace("-", "").hexToBase64UrlOrNull() ?: drmParts[0]
                         val key = drmParts[1].replace("-", "").hexToBase64UrlOrNull() ?: drmParts[1]
                         val drmHeaders = headers.toMutableMap()
-                        
+
                         drmHeaders["drm_scheme"] = "clearkey"
                         drmHeaders["drm_license_key"] = "{\"keys\":[{\"kty\":\"oct\",\"k\":\"${key}\",\"kid\":\"${kid}\"}]}"
-                        
+
                         callback.invoke(newDrmExtractorLink(name, serverName, resolved, INFER_TYPE, CLEARKEY_UUID) {
                             quality = Qualities.Unknown.value
                             if (drmHeaders.isNotEmpty()) this.headers = drmHeaders
@@ -243,7 +287,7 @@ class LiveSportsEvents : MainAPI() {
                         callback.invoke(createExtractor(resolved, ExtractorLinkType.DASH, headers, serverName))
                     }
                 }
-                else -> { 
+                else -> {
                     val type = if (resolved.contains(".mpd")) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
                     val finalHeaders = headers.toMutableMap()
                     if (type == ExtractorLinkType.M3U8 && !finalHeaders.containsKey("User-Agent")) {
@@ -279,15 +323,15 @@ class LiveSportsEvents : MainAPI() {
         if (!link.contains("|")) return link to emptyMap()
         val parts = link.split("|", limit = 2)
         val headers = mutableMapOf<String, String>()
-        
+
         parts.getOrNull(1)?.split("&")?.forEach { pair ->
             val kv = pair.split("=", limit = 2)
             if (kv.size == 2) {
-                val key = when (kv[0].lowercase()) { 
+                val key = when (kv[0].lowercase()) {
                     "user-agent" -> "User-Agent"
                     "referer" -> "Referer"
                     "origin" -> "Origin"
-                    else -> kv[0] 
+                    else -> kv[0]
                 }
                 headers[key] = kv[1]
             }
@@ -305,47 +349,124 @@ class LiveSportsEvents : MainAPI() {
         return parts[0] to headers
     }
 
+    // ─────────── CHANGE 3: broader direct-URL detection ───────────
+    private fun isDirectStreamUrl(url: String): Boolean {
+        val u = url.lowercase()
+        return u.contains(".m3u8") || u.contains(".mpd") || u.contains(".mp4") ||
+            u.contains(".ts") || u.contains(".mkv") || u.contains(".webm")
+    }
+    // ─────────── end CHANGE 3 ───────────
+
+    // ─────────── CHANGE 1 + 3: JS-bridge embed resolver ───────────
     private suspend fun resolveEmbedUrlIfNeeded(url: String, headers: Map<String, String>): String? {
-        if (url.contains(".m3u8") || url.contains(".mpd") || url.contains(".mp4") || url.contains(".ts")) return url
-        
+        if (isDirectStreamUrl(url)) return url
+
         return suspendCoroutine { cont ->
             Handler(Looper.getMainLooper()).post {
                 val ctx = context
                 if (ctx == null) { cont.resume(null); return@post }
-                
-                var urlCaptured = false
-                
+
+                var resolved = false
+                fun finish(result: String?) {
+                    if (resolved) return
+                    resolved = true
+                    try { cont.resume(result) } catch (_: Exception) {}
+                }
+
                 val webView = WebView(ctx).apply {
-                    settings.apply { 
+                    settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
-                        mediaPlaybackRequiresUserGesture = false 
-                        userAgentString = headers["User-Agent"] ?: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
+                        mediaPlaybackRequiresUserGesture = false
+                        userAgentString = headers["User-Agent"]
+                            ?: "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
                     }
-                    
+
+                    addJavascriptInterface(object {
+                        @android.webkit.JavascriptInterface
+                        fun onStreamUrlFound(u: String) {
+                            if (u.isBlank()) return
+                            Handler(Looper.getMainLooper()).post {
+                                try { destroy() } catch (_: Exception) {}
+                                finish(u)
+                            }
+                        }
+                    }, "StreamBridge")
+
                     webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                             val reqUrl = request.url.toString()
-                            if ((reqUrl.contains(".m3u8") || reqUrl.contains(".mpd")) && !urlCaptured) {
-                                urlCaptured = true
-                                Handler(Looper.getMainLooper()).post { cont.resume(reqUrl); destroy() }
+                            if ((reqUrl.contains(".m3u8") || reqUrl.contains(".mpd")) && !resolved) {
+                                Handler(Looper.getMainLooper()).post {
+                                    try { destroy() } catch (_: Exception) {}
+                                    finish(reqUrl)
+                                }
                             }
                             return super.shouldInterceptRequest(view, request)
                         }
+
+                        override fun onPageFinished(view: WebView, pageUrl: String) {
+                            super.onPageFinished(view, pageUrl)
+                            if (resolved) return
+
+                            val probe = """
+                                (function() {
+                                    function send(u) {
+                                        if (typeof u === 'string' && u.length > 4) {
+                                            window.StreamBridge.onStreamUrlFound(u);
+                                            return true;
+                                        }
+                                        return false;
+                                    }
+                                    try {
+                                        var names = ['playbackURL','videoUrl','streamUrl','m3u8Url',
+                                                     'dashUrl','source','file','url','stream'];
+                                        for (var i = 0; i < names.length; i++) {
+                                            try { if (send(window[names[i]])) return; } catch(e){}
+                                        }
+                                    } catch(e){}
+                                    try {
+                                        var v = document.querySelector('video');
+                                        if (v && send(v.currentSrc || v.src)) return;
+                                    } catch(e){}
+                                    try {
+                                        if (window.videojs && videojs.getAllPlayers) {
+                                            var p = videojs.getAllPlayers()[0];
+                                            if (p && send(p.currentSrc())) return;
+                                        }
+                                    } catch(e){}
+                                    try {
+                                        if (window.jwplayer) {
+                                            var jw = jwplayer();
+                                            if (jw && jw.getPlaylistItem) {
+                                                var item = jw.getPlaylistItem();
+                                                if (item && send(item.file)) return;
+                                            }
+                                        }
+                                    } catch(e){}
+                                })();
+                            """.trimIndent()
+
+                            Handler(Looper.getMainLooper()).postDelayed({
+                                if (!resolved) view.evaluateJavascript(probe, null)
+                            }, 600)
+                            Handler(Looper.getMainLooper()).postDelayed({
+                                if (!resolved) view.evaluateJavascript(probe, null)
+                            }, 2000)
+                        }
                     }
-                    
-                    loadUrl(url, headers) 
+
+                    loadUrl(url, headers)
                 }
-                
-                Handler(Looper.getMainLooper()).postDelayed({ 
-                    if (!urlCaptured) { 
-                        try { 
-                            cont.resume(null)
-                            webView.destroy() 
-                        } catch (e: Exception) {} 
-                    } 
+
+                Handler(Looper.getMainLooper()).postDelayed({
+                    if (!resolved) {
+                        try { webView.destroy() } catch (_: Exception) {}
+                        finish(null)
+                    }
                 }, 15000)
             }
         }
     }
+    // ─────────── end CHANGE 1 + 3 ───────────
 }
