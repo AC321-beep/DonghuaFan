@@ -24,7 +24,7 @@ class OptimizerPlugin : Plugin() {
             runSanitization(context)
         }
 
-        DialogSentinel.install(context)
+        PopupBlocker.install(context)
 
         openSettings = {
             try {
@@ -37,7 +37,7 @@ class OptimizerPlugin : Plugin() {
     fun runSanitization(context: Context) {
         if (!FilterStore.enabled) return
         try {
-            PreferenceSanitizer.sanitize(context)
+            PopupBlocker.sanitize(context)
         } catch (_: Throwable) {
         }
     }
