@@ -8,9 +8,9 @@ import com.lagradost.cloudstream3.plugins.Plugin
 class OptimizerPlugin : Plugin() {
 
     companion object {
-        @Volatile private var instance: OptimizerPlugin? = null
+        @Volatile
+        private var instance: OptimizerPlugin? = null
 
-        /** Called from SettingsDialog after the user toggles the switch. */
         fun reSanitize(context: Context) {
             instance?.runSanitization(context)
         }
@@ -20,13 +20,10 @@ class OptimizerPlugin : Plugin() {
         instance = this
         FilterStore.init(context)
 
-        // Layer 1: pin every known donation/popup gate to today so the
-        // extension's own cooldown check returns early.
-        runSanitization(context)
+        if (FilterStore.enabled) {
+            runSanitization(context)
+        }
 
-        // Layer 2: dismiss the dialog if it ever attaches anyway, and
-        // re-pin the gate on every activity resume (catches midnight rollover
-        // and any post-sweep writes by the extension).
         DialogSentinel.install(context)
 
         openSettings = {
@@ -38,6 +35,7 @@ class OptimizerPlugin : Plugin() {
     }
 
     fun runSanitization(context: Context) {
+        if (!FilterStore.enabled) return
         try {
             PreferenceSanitizer.sanitize(context)
         } catch (_: Throwable) {
