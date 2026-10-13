@@ -1,143 +1,178 @@
 package com.adfree
 
 import android.content.Context
+import android.content.SharedPreferences
 import java.io.File
 import java.text.SimpleDateFormat
+import java.util.Collections
 import java.util.Date
 import java.util.Locale
+import java.util.WeakHashMap
 
+/**
+ * Rewrites popup/donation prefs so the extension's own cooldown check
+ * returns early.
+ *
+ * Two entry points:
+ *  - sanitize(context): full sweep. Called once at plugin load.
+ *  - OnSharedPreferenceChangeListener: re-pins individual keys the moment
+ *    an extension writes them, so we never need to poll on activity resume.
+ *
+ * Matching is purely generic. No vendor, package, or prefs filename is
+ * hardcoded.
+ */
 object PreferenceSanitizer {
 
-    // ---------- Known identifiers (decompiled from com.cncverse.donation) ----------
-    private const val KNOWN_PREFS   = "cncverse_donation"
-    private const val KNOWN_GATE    = "last_shown_day"
-    private const val KNOWN_CACHE   = "cncverse_donation_cached_"
-    private const val KNOWN_ACHIEVED = "cncverse_donation_achieved_shown_month"
-
-    // ---------- Generic patterns for other extensions ----------
     private val FILE_PATTERNS = listOf(
-        Regex("donat",  RegexOption.IGNORE_CASE),
-        Regex("popup",  RegexOption.IGNORE_CASE),
-        Regex("promo",  RegexOption.IGNORE_CASE),
-        Regex("support", RegexOption.IGNORE_CASE),
-        Regex("sponsor", RegexOption.IGNORE_CASE)
-    )
-    private val KEY_PATTERNS = listOf(
         Regex("donat",   RegexOption.IGNORE_CASE),
         Regex("popup",   RegexOption.IGNORE_CASE),
         Regex("promo",   RegexOption.IGNORE_CASE),
-        Regex("sponsor", RegexOption.IGNORE_CASE),
-        Regex("last_shown", RegexOption.IGNORE_CASE),
-        Regex("last_popup", RegexOption.IGNORE_CASE),
-        Regex("next_show",  RegexOption.IGNORE_CASE),
-        Regex("cooldown",   RegexOption.IGNORE_CASE),
+        Regex("support", RegexOption.IGNORE_CASE),
+        Regex("sponsor", RegexOption.IGNORE_CASE)
+    )
+
+    private val KEY_PATTERNS = listOf(
+        Regex("donat",          RegexOption.IGNORE_CASE),
+        Regex("popup",          RegexOption.IGNORE_CASE),
+        Regex("promo",          RegexOption.IGNORE_CASE),
+        Regex("sponsor",        RegexOption.IGNORE_CASE),
+        Regex("last_shown",     RegexOption.IGNORE_CASE),
+        Regex("last_popup",     RegexOption.IGNORE_CASE),
+        Regex("next_show",      RegexOption.IGNORE_CASE),
+        Regex("cooldown",       RegexOption.IGNORE_CASE),
         Regex("achieved_shown", RegexOption.IGNORE_CASE),
-        Regex("cached_(amount|goal|percent|supporters|month|currency)",
-              RegexOption.IGNORE_CASE)
+        Regex(
+            "cached_(amount|goal|percent|supporters|month|currency)",
+            RegexOption.IGNORE_CASE
+        )
     )
 
     private val GATE_KEY_PATTERNS = listOf(
-        Regex("last_shown", RegexOption.IGNORE_CASE),
-        Regex("last_popup", RegexOption.IGNORE_CASE),
-        Regex("next_show",  RegexOption.IGNORE_CASE)
+        Regex("last_shown",  RegexOption.IGNORE_CASE),
+        Regex("last_popup",  RegexOption.IGNORE_CASE),
+        Regex("next_show",   RegexOption.IGNORE_CASE),
+        Regex("shown_day",   RegexOption.IGNORE_CASE),
+        Regex("shown_month", RegexOption.IGNORE_CASE)
     )
+
     private val CACHE_KEY_PATTERNS = listOf(
-        Regex("^cached_",  RegexOption.IGNORE_CASE),
-        Regex("_cached_",  RegexOption.IGNORE_CASE)
+        Regex("^cached_", RegexOption.IGNORE_CASE),
+        Regex("_cached_", RegexOption.IGNORE_CASE)
     )
+
     private val FLAG_KEY_PATTERNS = listOf(
         Regex("donation_enabled", RegexOption.IGNORE_CASE),
         Regex("show_donation",    RegexOption.IGNORE_CASE),
         Regex("popup_enabled",    RegexOption.IGNORE_CASE),
-        Regex("promo_enabled",    RegexOption.IGNORE_CASE)
+        Regex("promo_enabled",    RegexOption.IGNORE_CASE),
+        Regex("show_popup",       RegexOption.IGNORE_CASE)
     )
 
-    /** Same format the extension uses. Do not change. */
+    private val GATE_KEY_CANDIDATES = listOf(
+        "last_shown_day",
+        "last_shown",
+        "last_popup_day",
+        "last_popup",
+        "next_show",
+        "shown_day",
+        "shown_month"
+    )
+
+    private val COOLDOWN_REGEX = Regex("cooldown", RegexOption.IGNORE_CASE)
+
+    // Prefs files we already listen to. WeakHashMap so unloaded prefs drop.
+    private val watched: MutableSet<SharedPreferences> =
+        Collections.newSetFromMap(WeakHashMap<SharedPreferences, Boolean>())
+
+    // Guard against reacting to our own writes.
+    @Volatile private var selfWriting = false
+
+    private val listener = SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
+        if (selfWriting) return@OnSharedPreferenceChangeListener
+        if (!FilterStore.enabled) return@OnSharedPreferenceChangeListener
+        if (key == null) return@OnSharedPreferenceChangeListener
+
+        val value = try { prefs.all[key] } catch (_: Throwable) { null } ?: return
+        val editor = prefs.edit()
+        val dirty = applyRules(editor, key, value, today())
+        if (dirty) {
+            selfWriting = true
+            try { editor.apply() } finally { selfWriting = false }
+        }
+    }
+
     private fun today(): String =
         SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
 
+    // -------------------- Public API --------------------
+
+    /** Full sweep + register listeners for future writes. Idempotent. */
     fun sanitize(context: Context): Int {
-        var touched = 0
-        touched += sanitizeKnown(context)
-        touched += sanitizeGeneric(context)
-        return touched
-    }
+        if (!FilterStore.enabled) return 0
 
-    // -------------------- Known fast path --------------------
-
-    private fun sanitizeKnown(context: Context): Int {
-        val prefs = try {
-            context.getSharedPreferences(KNOWN_PREFS, Context.MODE_PRIVATE)
-        } catch (_: Throwable) {
-            return 0
-        }
-
-        val all = try { prefs.all } catch (_: Throwable) { return 0 }
-        if (all.isEmpty()) return 0
-
-        val editor = prefs.edit()
-        var dirty = false
-        val today = today()
-
-        // Gate: write today so `today == lastShown` → extension skips popup.
-        if (prefs.getString(KNOWN_GATE, null) != today) {
-            editor.putString(KNOWN_GATE, today)
-            dirty = true
-        }
-
-        // Cache: zero so the offline fallback in buildConfig() has nothing.
-        for ((k, v) in all) {
-            if (k.startsWith(KNOWN_CACHE)) {
-                when (v) {
-                    is Float  -> if (v != 0f)           { editor.putFloat(k, 0f);   dirty = true }
-                    is Int    -> if (v != -1)           { editor.putInt(k, -1);     dirty = true }
-                    is Long   -> if (v != 0L)           { editor.putLong(k, 0L);    dirty = true }
-                    is String -> if (v.isNotEmpty())    { editor.putString(k, "");  dirty = true }
-                    else -> {}
-                }
-            }
-            // Achieved-month marker: pin to a value that never equals a
-            // freshly-formatted month, so the "goal achieved" variant
-            // never re-fires either.
-            if (k == KNOWN_ACHIEVED && v is String && v != "9999") {
-                editor.putString(k, "9999")
-                dirty = true
-            }
-        }
-
-        if (dirty) editor.apply()
-        return if (dirty) 1 else 0
-    }
-
-    // -------------------- Generic fallback path --------------------
-
-    private fun sanitizeGeneric(context: Context): Int {
         val dir = File(context.applicationInfo.dataDir, "shared_prefs")
         if (!dir.isDirectory) return 0
 
-        val files = dir.listFiles { f ->
-            f.isFile && f.name.endsWith(".xml")
-        } ?: return 0
+        val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".xml") } ?: return 0
 
         var touched = 0
         for (f in files) {
             if (sanitizeFile(context, f)) touched++
+            registerWatcher(context, f)
         }
         return touched
     }
 
-    private fun sanitizeFile(context: Context, file: File): Boolean {
+    /** Remove gate keys so popups can fire again after the user disables the blocker. */
+    fun clearGates(context: Context) {
+        val dir = File(context.applicationInfo.dataDir, "shared_prefs")
+        if (!dir.isDirectory) return
+
+        val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".xml") } ?: return
+
+        for (f in files) {
+            val name = f.nameWithoutExtension
+            if (!FILE_PATTERNS.any { it.containsMatchIn(name) }) continue
+
+            try {
+                val prefs = context.getSharedPreferences(name, Context.MODE_PRIVATE)
+                val editor = prefs.edit()
+                for (k in prefs.all.keys) {
+                    if (GATE_KEY_PATTERNS.any { it.containsMatchIn(k) }) {
+                        editor.remove(k)
+                    }
+                }
+                selfWriting = true
+                try { editor.apply() } finally { selfWriting = false }
+            } catch (_: Throwable) {}
+        }
+    }
+
+    // -------------------- Internals --------------------
+
+    private fun registerWatcher(context: Context, file: File) {
         val name = file.nameWithoutExtension
-        if (name == KNOWN_PREFS) return false   // handled by fast path
+        if (!FILE_PATTERNS.any { it.containsMatchIn(name) }) return
 
         val prefs = try {
             context.getSharedPreferences(name, Context.MODE_PRIVATE)
-        } catch (_: Throwable) {
-            return false
+        } catch (_: Throwable) { return }
+
+        if (watched.add(prefs)) {
+            try {
+                prefs.registerOnSharedPreferenceChangeListener(listener)
+            } catch (_: Throwable) {}
         }
+    }
+
+    private fun sanitizeFile(context: Context, file: File): Boolean {
+        val name = file.nameWithoutExtension
+
+        val prefs = try {
+            context.getSharedPreferences(name, Context.MODE_PRIVATE)
+        } catch (_: Throwable) { return false }
 
         val all = try { prefs.all } catch (_: Throwable) { return false }
-        if (all.isEmpty()) return false
 
         val fileHit = FILE_PATTERNS.any { it.containsMatchIn(name) }
         val keyHit  = all.keys.any { k -> KEY_PATTERNS.any { it.containsMatchIn(k) } }
@@ -147,47 +182,110 @@ object PreferenceSanitizer {
         var dirty = false
         val today = today()
 
-        for ((k, v) in all) {
-            // Gate-style string keys → pin to today.
-            if (GATE_KEY_PATTERNS.any { it.containsMatchIn(k) } && v is String) {
-                if (v != today) {
-                    editor.putString(k, today)
+        // Empty or newly-created popup file: seed generic gate keys so a
+        // date-based cooldown short-circuits on the very first run.
+        if (fileHit) {
+            for (gate in GATE_KEY_CANDIDATES) {
+                val existing = all[gate]
+                if (existing !is String || existing != today) {
+                    editor.putString(gate, today)
                     dirty = true
                 }
             }
+        }
 
-            // Numeric cooldowns → push far future.
-            if (Regex("cooldown", RegexOption.IGNORE_CASE).containsMatchIn(k)) {
-                when (v) {
-                    is Long -> if (v != Long.MAX_VALUE) {
-                        editor.putLong(k, Long.MAX_VALUE); dirty = true
-                    }
-                    is Int  -> if (v != Int.MAX_VALUE) {
-                        editor.putInt(k, Int.MAX_VALUE); dirty = true
-                    }
-                    else -> {}
+        for ((k, v) in all) {
+            if (applyRules(editor, k, v, today)) dirty = true
+        }
+
+        if (dirty) {
+            selfWriting = true
+            try { editor.apply() } finally { selfWriting = false }
+        }
+        return dirty
+    }
+
+    /**
+     * Applies the per-key sanitization rules. Returns true if the editor
+     * received at least one change.
+     */
+    private fun applyRules(
+        editor: SharedPreferences.Editor,
+        k: String,
+        v: Any?,
+        today: String
+    ): Boolean {
+        var dirty = false
+
+        if (GATE_KEY_PATTERNS.any { it.containsMatchIn(k) }) {
+            when (v) {
+                is String -> if (v != today) {
+                    editor.putString(k, today); dirty = true
                 }
-            }
-
-            // Cached payloads → zero.
-            if (CACHE_KEY_PATTERNS.any { it.containsMatchIn(k) }) {
-                when (v) {
-                    is Float  -> if (v != 0f)           { editor.putFloat(k, 0f);   dirty = true }
-                    is Int    -> if (v != -1)           { editor.putInt(k, -1);     dirty = true }
-                    is Long   -> if (v != 0L)           { editor.putLong(k, 0L);    dirty = true }
-                    is String -> if (v.isNotEmpty())    { editor.putString(k, "");  dirty = true }
-                    else -> {}
+                is Long -> if (v != Long.MAX_VALUE) {
+                    editor.putLong(k, Long.MAX_VALUE); dirty = true
                 }
-            }
-
-            // Boolean feature flags → off.
-            if (FLAG_KEY_PATTERNS.any { it.containsMatchIn(k) } && v == true) {
-                editor.putBoolean(k, false)
-                dirty = true
+                is Int -> if (v != Int.MAX_VALUE) {
+                    editor.putInt(k, Int.MAX_VALUE); dirty = true
+                }
+                else -> {}
             }
         }
 
-        if (dirty) editor.apply()
+        if (COOLDOWN_REGEX.containsMatchIn(k)) {
+            when (v) {
+                is Long -> if (v != Long.MAX_VALUE) {
+                    editor.putLong(k, Long.MAX_VALUE); dirty = true
+                }
+                is Int -> if (v != Int.MAX_VALUE) {
+                    editor.putInt(k, Int.MAX_VALUE); dirty = true
+                }
+                else -> {}
+            }
+        }
+
+        if (CACHE_KEY_PATTERNS.any { it.containsMatchIn(k) }) {
+            when (v) {
+                is Float -> if (v != 0f) {
+                    editor.putFloat(k, 0f); dirty = true
+                }
+                is Int -> if (v != -1) {
+                    editor.putInt(k, -1); dirty = true
+                }
+                is Long -> if (v != 0L) {
+                    editor.putLong(k, 0L); dirty = true
+                }
+                is String -> if (v.isNotEmpty()) {
+                    editor.putString(k, ""); dirty = true
+                }
+                is Boolean -> if (v) {
+                    editor.putBoolean(k, false); dirty = true
+                }
+                is Set<*> -> if (v.isNotEmpty()) {
+                    editor.putStringSet(k, emptySet<String>()); dirty = true
+                }
+                else -> {}
+            }
+        }
+
+        if (FLAG_KEY_PATTERNS.any { it.containsMatchIn(k) }) {
+            when (v) {
+                is Boolean -> if (v) {
+                    editor.putBoolean(k, false); dirty = true
+                }
+                is Int -> if (v != 0) {
+                    editor.putInt(k, 0); dirty = true
+                }
+                is Long -> if (v != 0L) {
+                    editor.putLong(k, 0L); dirty = true
+                }
+                is String -> if (v.equals("true", ignoreCase = true)) {
+                    editor.putString(k, "false"); dirty = true
+                }
+                else -> {}
+            }
+        }
+
         return dirty
     }
 }
