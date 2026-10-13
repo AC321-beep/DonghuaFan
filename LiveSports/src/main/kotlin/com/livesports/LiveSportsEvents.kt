@@ -47,7 +47,7 @@ class LiveSportsEvents : MainAPI() {
         UNKNOWN("📺")
     }
 
-    // 2. Single robust date parser
+    // Single robust date parser
     private fun parseEventDate(dateStr: String?): Long? {
         if (dateStr.isNullOrBlank()) return null
         return try {
@@ -55,7 +55,6 @@ class LiveSportsEvents : MainAPI() {
         } catch (e: Exception) { null }
     }
 
-    // 3. Status Logic (Mirrors the working code's exact chronological checks)
     private fun getEventState(event: LiveEventData): EventState {
         val info = event.eventInfo ?: return EventState.UNKNOWN
         val startTime = parseEventDate(info.startTime)
@@ -182,7 +181,6 @@ class LiveSportsEvents : MainAPI() {
         return newHomePageResponse(lists, false)
     }
 
-    // ─────────── CHANGE 2: search() implementation ───────────
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
 
@@ -226,7 +224,6 @@ class LiveSportsEvents : MainAPI() {
                 }
             }
     }
-    // ─────────── end CHANGE 2 ───────────
 
     override suspend fun load(url: String): LoadResponse {
         val data = parseJson<LiveEventLoadData>(url)
@@ -260,8 +257,12 @@ class LiveSportsEvents : MainAPI() {
         val loadData = parseJson<LiveEventLoadData>(data)
         val streamResponse = fetchChannelStreams(loadData.slug) ?: return false
 
-        streamResponse.streamUrls?.forEach { stream ->
-            val serverName = stream.title ?: "Server"
+       streamResponse.streamUrls?.forEach { stream ->
+    val serverName = when {
+        stream.title == null -> "Server"
+        stream.title.equals("CRICFy LIVE", ignoreCase = true) -> "My Sports"
+        else -> stream.title
+    }
             val (url, headers) = parseStreamLink(stream.link ?: return@forEach)
             if (url.isBlank()) return@forEach
             val resolved = resolveEmbedUrlIfNeeded(url, headers) ?: return@forEach
@@ -349,15 +350,12 @@ class LiveSportsEvents : MainAPI() {
         return parts[0] to headers
     }
 
-    // ─────────── CHANGE 3: broader direct-URL detection ───────────
     private fun isDirectStreamUrl(url: String): Boolean {
         val u = url.lowercase()
         return u.contains(".m3u8") || u.contains(".mpd") || u.contains(".mp4") ||
             u.contains(".ts") || u.contains(".mkv") || u.contains(".webm")
     }
-    // ─────────── end CHANGE 3 ───────────
 
-    // ─────────── CHANGE 1 + 3: JS-bridge embed resolver ───────────
     private suspend fun resolveEmbedUrlIfNeeded(url: String, headers: Map<String, String>): String? {
         if (isDirectStreamUrl(url)) return url
 
@@ -468,5 +466,4 @@ class LiveSportsEvents : MainAPI() {
             }
         }
     }
-    // ─────────── end CHANGE 1 + 3 ───────────
-}
+   }
