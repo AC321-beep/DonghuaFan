@@ -257,9 +257,8 @@ class LiveSportsEvents : MainAPI() {
         val loadData = parseJson<LiveEventLoadData>(data)
         val streamResponse = fetchChannelStreams(loadData.slug) ?: return false
 
-      streamResponse.streamUrls?.forEach { stream ->
-    val serverName = stream.title ?: "Server"
-    }
+        streamResponse.streamUrls?.forEach { stream ->
+            val serverName = stream.title ?: "Server"
             val (url, headers) = parseStreamLink(stream.link ?: return@forEach)
             if (url.isBlank()) return@forEach
             val resolved = resolveEmbedUrlIfNeeded(url, headers) ?: return@forEach
@@ -463,4 +462,4 @@ class LiveSportsEvents : MainAPI() {
             }
         }
     }
-   }
+}
