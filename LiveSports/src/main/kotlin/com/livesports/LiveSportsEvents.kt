@@ -257,11 +257,8 @@ class LiveSportsEvents : MainAPI() {
         val loadData = parseJson<LiveEventLoadData>(data)
         val streamResponse = fetchChannelStreams(loadData.slug) ?: return false
 
-       streamResponse.streamUrls?.forEach { stream ->
-    val serverName = when {
-        stream.title == null -> "Server"
-        stream.title.equals("CRICFy LIVE", ignoreCase = true) -> "LIVE"
-        else -> stream.title
+      streamResponse.streamUrls?.forEach { stream ->
+    val serverName = stream.title ?: "Server"
     }
             val (url, headers) = parseStreamLink(stream.link ?: return@forEach)
             if (url.isBlank()) return@forEach
