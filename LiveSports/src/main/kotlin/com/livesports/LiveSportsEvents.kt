@@ -260,7 +260,7 @@ class LiveSportsEvents : MainAPI() {
        streamResponse.streamUrls?.forEach { stream ->
     val serverName = when {
         stream.title == null -> "Server"
-        stream.title.equals("CRICFy LIVE", ignoreCase = true) -> "My Sports"
+        stream.title.equals("CRICFy LIVE", ignoreCase = true) -> "LIVE"
         else -> stream.title
     }
             val (url, headers) = parseStreamLink(stream.link ?: return@forEach)
