@@ -56,9 +56,7 @@ class SettingsDialog(
                 if (toggle.isChecked) {
                     try { OptimizerPlugin.reSanitize(activity) } catch (_: Throwable) {}
                 } else {
-                    // Restore natural popup behavior by removing the gates
-                    // we previously wrote.
-                    try { PreferenceSanitizer.clearGates(activity) } catch (_: Throwable) {}
+                    try { PopupBlocker.clearGates(activity) } catch (_: Throwable) {}
                 }
 
                 onApply()
