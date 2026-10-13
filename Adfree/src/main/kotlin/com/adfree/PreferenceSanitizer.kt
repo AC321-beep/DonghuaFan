@@ -9,18 +9,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.WeakHashMap
 
-/**
- * Rewrites popup/donation prefs so the extension's own cooldown check
- * returns early.
- *
- * Two entry points:
- *  - sanitize(context): full sweep. Called once at plugin load.
- *  - OnSharedPreferenceChangeListener: re-pins individual keys the moment
- *    an extension writes them, so we never need to poll on activity resume.
- *
- * Matching is purely generic. No vendor, package, or prefs filename is
- * hardcoded.
- */
 object PreferenceSanitizer {
 
     private val FILE_PATTERNS = listOf(
@@ -80,33 +68,30 @@ object PreferenceSanitizer {
 
     private val COOLDOWN_REGEX = Regex("cooldown", RegexOption.IGNORE_CASE)
 
-    // Prefs files we already listen to. WeakHashMap so unloaded prefs drop.
     private val watched: MutableSet<SharedPreferences> =
         Collections.newSetFromMap(WeakHashMap<SharedPreferences, Boolean>())
 
-    // Guard against reacting to our own writes.
     @Volatile private var selfWriting = false
 
+    // Listener body written with a nested if, not a labeled return, so it
+    // compiles under all Kotlin versions this project targets.
     private val listener = SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
-        if (selfWriting) return@OnSharedPreferenceChangeListener
-        if (!FilterStore.enabled) return@OnSharedPreferenceChangeListener
-        if (key == null) return@OnSharedPreferenceChangeListener
-
-        val value = try { prefs.all[key] } catch (_: Throwable) { null } ?: return
-        val editor = prefs.edit()
-        val dirty = applyRules(editor, key, value, today())
-        if (dirty) {
-            selfWriting = true
-            try { editor.apply() } finally { selfWriting = false }
+        if (!selfWriting && FilterStore.enabled && key != null) {
+            val value = try { prefs.all[key] } catch (_: Throwable) { null }
+            if (value != null) {
+                val editor = prefs.edit()
+                val dirty = applyRules(editor, key, value, today())
+                if (dirty) {
+                    selfWriting = true
+                    try { editor.apply() } finally { selfWriting = false }
+                }
+            }
         }
     }
 
     private fun today(): String =
         SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
 
-    // -------------------- Public API --------------------
-
-    /** Full sweep + register listeners for future writes. Idempotent. */
     fun sanitize(context: Context): Int {
         if (!FilterStore.enabled) return 0
 
@@ -123,7 +108,6 @@ object PreferenceSanitizer {
         return touched
     }
 
-    /** Remove gate keys so popups can fire again after the user disables the blocker. */
     fun clearGates(context: Context) {
         val dir = File(context.applicationInfo.dataDir, "shared_prefs")
         if (!dir.isDirectory) return
@@ -147,8 +131,6 @@ object PreferenceSanitizer {
             } catch (_: Throwable) {}
         }
     }
-
-    // -------------------- Internals --------------------
 
     private fun registerWatcher(context: Context, file: File) {
         val name = file.nameWithoutExtension
@@ -182,8 +164,6 @@ object PreferenceSanitizer {
         var dirty = false
         val today = today()
 
-        // Empty or newly-created popup file: seed generic gate keys so a
-        // date-based cooldown short-circuits on the very first run.
         if (fileHit) {
             for (gate in GATE_KEY_CANDIDATES) {
                 val existing = all[gate]
@@ -205,10 +185,6 @@ object PreferenceSanitizer {
         return dirty
     }
 
-    /**
-     * Applies the per-key sanitization rules. Returns true if the editor
-     * received at least one change.
-     */
     private fun applyRules(
         editor: SharedPreferences.Editor,
         k: String,
