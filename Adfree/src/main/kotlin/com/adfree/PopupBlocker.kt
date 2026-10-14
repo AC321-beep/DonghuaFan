@@ -46,7 +46,7 @@ object PopupBlocker {
 
     private const val TEN_YEARS_MS = 10L * 365 * 24 * 60 * 60 * 1000
     // Leaves ~4.6 years of headroom before Int overflow on additions
-    private const val SAFE_MAX_INT = 2_000_000_000 
+    private const val SAFE_MAX_INT = 2_000_000_000
 
     private object Patterns {
         val tag = listOf(
@@ -310,7 +310,6 @@ object PopupBlocker {
         val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".xml") } ?: return
         for (f in files) {
             val name = f.nameWithoutExtension
-            // Only inspect and register target popup preference files
             if (Patterns.file.any { it.containsMatchIn(name) }) {
                 if (watchedNames.add(name)) {
                     registerWatcher(context, f)
