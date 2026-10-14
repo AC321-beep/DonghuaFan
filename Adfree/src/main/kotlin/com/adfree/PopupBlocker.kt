@@ -19,9 +19,6 @@ import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
-/**
- * User-facing on/off toggle for the popup blocker.
- */
 object FilterStore {
     private const val PREFS_NAME = "net_opt_config"
     private const val KEY_ENABLED = "blocker_enabled"
@@ -45,27 +42,11 @@ object FilterStore {
         }
 }
 
-/**
- * Popup blocker. Two mechanisms under one roof:
- *
- *  - Dialog hook: FragmentLifecycleCallbacks kill a popup DialogFragment
- *    the same frame it attaches.
- *  - Prefs gate: rewrites the extension's own SharedPreferences so its
- *    "already shown today" check returns early, and re-pins the gate the
- *    moment the extension writes it, via OnSharedPreferenceChangeListener.
- *
- * All matching is generic regex stems.Every pattern lives in [Patterns] below so a
- * new stem is added in exactly one place and picked up by both mechanisms.
- *
- * Watchers are registered on demand: at plugin load, and again on each
- * activity resume, so a prefs file created by an extension that runs for
- * the first time after the plugin loaded is still picked up.
- */
 object PopupBlocker {
 
-    // -----------------------------------------------------------------
-    // Shared pattern vocabulary
-    // -----------------------------------------------------------------
+    private const val TEN_YEARS_MS = 10L * 365 * 24 * 60 * 60 * 1000
+    // Leaves ~4.6 years of headroom before Int overflow on additions
+    private const val SAFE_MAX_INT = 2_000_000_000 
 
     private object Patterns {
         val tag = listOf(
@@ -73,8 +54,7 @@ object PopupBlocker {
             Regex("popup",   RegexOption.IGNORE_CASE),
             Regex("promo",   RegexOption.IGNORE_CASE),
             Regex("sponsor", RegexOption.IGNORE_CASE),
-            Regex("support", RegexOption.IGNORE_CASE),
-            Regex("dialog",  RegexOption.IGNORE_CASE)
+            Regex("support", RegexOption.IGNORE_CASE)
         )
 
         val cls = listOf(
@@ -106,10 +86,7 @@ object PopupBlocker {
             Regex("next_show",      RegexOption.IGNORE_CASE),
             Regex("cooldown",       RegexOption.IGNORE_CASE),
             Regex("achieved_shown", RegexOption.IGNORE_CASE),
-            Regex(
-                "cached_(amount|goal|percent|supporters|month|currency)",
-                RegexOption.IGNORE_CASE
-            )
+            Regex("cached_(amount|goal|percent|supporters|month|currency)", RegexOption.IGNORE_CASE)
         )
 
         val gateKey = listOf(
@@ -133,16 +110,6 @@ object PopupBlocker {
             Regex("show_popup",       RegexOption.IGNORE_CASE)
         )
 
-        val gateCandidates = listOf(
-            "last_shown_day",
-            "last_shown",
-            "last_popup_day",
-            "last_popup",
-            "next_show",
-            "shown_day",
-            "shown_month"
-        )
-
         val cooldown = Regex("cooldown", RegexOption.IGNORE_CASE)
     }
 
@@ -150,32 +117,24 @@ object PopupBlocker {
     // PUBLIC API
     // =================================================================
 
-    /**
-     * Registers the activity lifecycle hook that fires the fragment
-     * callback on every resume. Call once at plugin load.
-     */
     fun install(context: Context) {
-        if (!installed.compareAndSet(false, true)) return
         val app = context.applicationContext as? Application ?: return
+        if (!installed.compareAndSet(false, true)) return
 
         app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
-
             override fun onActivityResumed(activity: Activity) {
                 if (!FilterStore.enabled) return
-
-                // Pick up any prefs file created by an extension that ran
-                // for the first time since the last sanitize(). 
 
                 val fm = (activity as? FragmentActivity)?.supportFragmentManager ?: return
 
                 if (registeredFms.add(fm)) {
                     try {
                         fm.registerFragmentLifecycleCallbacks(callbacks, true)
-                    } catch (_: Throwable) {
-                        // Fall through to sweep.
-                    }
-                    sweep(fm)
+                    } catch (_: Throwable) {}
                 }
+
+                sweep(fm)
+                rescanWatchers(activity)
             }
 
             override fun onActivityCreated(a: Activity, b: Bundle?) {}
@@ -187,10 +146,6 @@ object PopupBlocker {
         })
     }
 
-    /**
-     * Full prefs sweep plus registration of change listeners.
-     * Called at plugin load and again when the user enables the blocker.
-     */
     fun sanitize(context: Context): Int {
         if (!FilterStore.enabled) return 0
 
@@ -207,10 +162,9 @@ object PopupBlocker {
         return touched
     }
 
-    /**
-     * Called when the user disables the blocker.
-     */
     fun clearGates(context: Context) {
+        if (FilterStore.enabled) return
+
         val dir = File(context.applicationInfo.dataDir, "shared_prefs")
         if (!dir.isDirectory) return
 
@@ -228,14 +182,13 @@ object PopupBlocker {
                         editor.remove(k)
                     }
                 }
-                selfWriting = true
-                try { editor.apply() } finally { selfWriting = false }
+                writeSelf(editor)
             } catch (_: Throwable) {}
         }
     }
 
     // =================================================================
-    // Fragment hook
+    // Fragment Lifecycle Interception
     // =================================================================
 
     private val installed = AtomicBoolean(false)
@@ -244,17 +197,12 @@ object PopupBlocker {
         Collections.newSetFromMap(WeakHashMap<FragmentManager, Boolean>())
 
     private val callbacks = object : FragmentManager.FragmentLifecycleCallbacks() {
-
-        override fun onFragmentAttached(
-            fm: FragmentManager, f: Fragment, context: Context
-        ) {
+        override fun onFragmentAttached(fm: FragmentManager, f: Fragment, context: Context) {
             if (!FilterStore.enabled) return
             if (isTarget(f)) killFragment(f, fm)
         }
 
-        override fun onFragmentCreated(
-            fm: FragmentManager, f: Fragment, savedInstanceState: Bundle?
-        ) {
+        override fun onFragmentCreated(fm: FragmentManager, f: Fragment, savedInstanceState: Bundle?) {
             if (!FilterStore.enabled) return
             if (isTarget(f)) killFragment(f, fm)
         }
@@ -271,6 +219,7 @@ object PopupBlocker {
             for (f in fm.fragments) {
                 if (f == null || !f.isAdded) continue
                 if (isTarget(f)) killFragment(f, fm)
+                sweep(f.childFragmentManager)
             }
         } catch (_: Throwable) {}
     }
@@ -291,17 +240,9 @@ object PopupBlocker {
     }
 
     private fun killFragment(f: Fragment, fm: FragmentManager) {
-        val df = f as? DialogFragment
-
         try {
-            df?.dialog?.let {
-                it.dismiss()
-                it.cancel()
-            }
+            (f as? DialogFragment)?.dismissAllowingStateLoss()
         } catch (_: Throwable) {}
-
-        try { df?.dismissAllowingStateLoss() } catch (_: Throwable) {}
-        try { df?.dismiss() } catch (_: Throwable) {}
 
         if (f.isAdded) {
             try {
@@ -313,29 +254,30 @@ object PopupBlocker {
     }
 
     // =================================================================
-    // Prefs sanitizer
+    // Preference Sanitizer
     // =================================================================
 
-    // Prefs objects already wired. WeakHashMap so unloaded prefs drop.
     private val watched: MutableSet<SharedPreferences> =
         Collections.newSetFromMap(WeakHashMap<SharedPreferences, Boolean>())
 
-    // Filenames already inspected. Thread-safe because onActivityResumed
-    // runs on the main thread and sanitize() may run from anywhere.
-    private val watchedNames: MutableSet<String> =
-        ConcurrentHashMap.newKeySet()
+    private val watchedNames: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
-    @Volatile private var selfWriting = false
+    // ThreadLocal isolates the self-write state per thread
+    private val writing = ThreadLocal.withInitial { false }
 
+    private fun writeSelf(editor: SharedPreferences.Editor) {
+        writing.set(true)
+        try { editor.apply() } finally { writing.set(false) }
+    }
+
+    // WARNING: Must remain a top-level object property to prevent GC weak reference dropping
     private val listener = SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
-        if (!selfWriting && FilterStore.enabled && key != null) {
+        if (!writing.get() && FilterStore.enabled && key != null) {
             val value = try { prefs.all[key] } catch (_: Throwable) { null }
             if (value != null) {
                 val editor = prefs.edit()
-                val dirty = applyRules(editor, key, value, today())
-                if (dirty) {
-                    selfWriting = true
-                    try { editor.apply() } finally { selfWriting = false }
+                if (applyRules(editor, key, value, today())) {
+                    writeSelf(editor)
                 }
             }
         }
@@ -344,39 +286,38 @@ object PopupBlocker {
     private fun today(): String =
         SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
 
-    /**
-     * Registers a change listener on [file] if its name matches a popup
-     * pattern and we have not already wired it. Safe to call repeatedly:
-     * the name check is a set lookup once the file has been seen.
-     */
     private fun registerWatcher(context: Context, file: File) {
         val name = file.nameWithoutExtension
         if (!Patterns.file.any { it.containsMatchIn(name) }) return
-        if (!watchedNames.add(name)) return
 
         val prefs = try {
             context.getSharedPreferences(name, Context.MODE_PRIVATE)
         } catch (_: Throwable) { return }
 
         if (watched.add(prefs)) {
+            watchedNames.add(name)
             try {
                 prefs.registerOnSharedPreferenceChangeListener(listener)
             } catch (_: Throwable) {}
         }
     }
 
-    /**
-     * Re-lists shared_prefs and wires any new matching file. Called on
-     * every resume so a prefs file created by a first-run extension is
-     * picked up without restarting the app.
-     */
     private fun rescanWatchers(context: Context) {
         if (!FilterStore.enabled) return
         val dir = File(context.applicationInfo.dataDir, "shared_prefs")
         if (!dir.isDirectory) return
 
         val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".xml") } ?: return
-        for (f in files) registerWatcher(context, f)
+        for (f in files) {
+            val name = f.nameWithoutExtension
+            // Only inspect and register target popup preference files
+            if (Patterns.file.any { it.containsMatchIn(name) }) {
+                if (watchedNames.add(name)) {
+                    registerWatcher(context, f)
+                    sanitizeFile(context, f)
+                }
+            }
+        }
     }
 
     private fun sanitizeFile(context: Context, file: File): Boolean {
@@ -396,23 +337,12 @@ object PopupBlocker {
         var dirty = false
         val today = today()
 
-        if (fileHit) {
-            for (gate in Patterns.gateCandidates) {
-                val existing = all[gate]
-                if (existing !is String || existing != today) {
-                    editor.putString(gate, today)
-                    dirty = true
-                }
-            }
-        }
-
         for ((k, v) in all) {
             if (applyRules(editor, k, v, today)) dirty = true
         }
 
         if (dirty) {
-            selfWriting = true
-            try { editor.apply() } finally { selfWriting = false }
+            writeSelf(editor)
         }
         return dirty
     }
@@ -424,17 +354,18 @@ object PopupBlocker {
         today: String
     ): Boolean {
         var dirty = false
+        val safeFutureLong = System.currentTimeMillis() + TEN_YEARS_MS
 
         if (Patterns.gateKey.any { it.containsMatchIn(k) }) {
             when (v) {
                 is String -> if (v != today) {
                     editor.putString(k, today); dirty = true
                 }
-                is Long -> if (v != Long.MAX_VALUE) {
-                    editor.putLong(k, Long.MAX_VALUE); dirty = true
+                is Long -> if (v < safeFutureLong) {
+                    editor.putLong(k, safeFutureLong); dirty = true
                 }
-                is Int -> if (v != Int.MAX_VALUE) {
-                    editor.putInt(k, Int.MAX_VALUE); dirty = true
+                is Int -> if (v < SAFE_MAX_INT) {
+                    editor.putInt(k, SAFE_MAX_INT); dirty = true
                 }
                 else -> {}
             }
@@ -442,11 +373,11 @@ object PopupBlocker {
 
         if (Patterns.cooldown.containsMatchIn(k)) {
             when (v) {
-                is Long -> if (v != Long.MAX_VALUE) {
-                    editor.putLong(k, Long.MAX_VALUE); dirty = true
+                is Long -> if (v < TEN_YEARS_MS) {
+                    editor.putLong(k, TEN_YEARS_MS); dirty = true
                 }
-                is Int -> if (v != Int.MAX_VALUE) {
-                    editor.putInt(k, Int.MAX_VALUE); dirty = true
+                is Int -> if (v < SAFE_MAX_INT) {
+                    editor.putInt(k, SAFE_MAX_INT); dirty = true
                 }
                 else -> {}
             }
