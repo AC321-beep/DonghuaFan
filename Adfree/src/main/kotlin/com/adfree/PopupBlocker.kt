@@ -17,10 +17,11 @@ import java.util.Date
 import java.util.Locale
 import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 object FilterStore {
-    private const val PREFS_NAME = "net_opt_config"
+    const val PREFS_NAME = "net_opt_config"
     private const val KEY_ENABLED = "blocker_enabled"
 
     @Volatile private var prefs: SharedPreferences? = null
@@ -45,16 +46,18 @@ object FilterStore {
 object PopupBlocker {
 
     private const val TEN_YEARS_MS = 10L * 365 * 24 * 60 * 60 * 1000
+    private const val NINE_YEARS_MS = 9L * 365 * 24 * 60 * 60 * 1000
     // Leaves ~4.6 years of headroom before Int overflow on additions
     private const val SAFE_MAX_INT = 2_000_000_000
 
+    private val ioExecutor = Executors.newSingleThreadExecutor()
+
     private object Patterns {
+        // Compound dialog/popup tags
         val tag = listOf(
-            Regex("donat",   RegexOption.IGNORE_CASE),
-            Regex("popup",   RegexOption.IGNORE_CASE),
-            Regex("promo",   RegexOption.IGNORE_CASE),
-            Regex("sponsor", RegexOption.IGNORE_CASE),
-            Regex("support", RegexOption.IGNORE_CASE)
+            Regex("donat(e|ion)?[_.-]?(popup|dialog|banner|modal|prompt)", RegexOption.IGNORE_CASE),
+            Regex("(promo|sponsor|support)[_.-]?(popup|dialog|banner|modal|prompt)", RegexOption.IGNORE_CASE),
+            Regex("(popup|dialog|banner|modal|prompt)[_.-]?(donat|promo|sponsor|support)", RegexOption.IGNORE_CASE)
         )
 
         val cls = listOf(
@@ -62,30 +65,33 @@ object PopupBlocker {
             Regex("promo.?dialog",    RegexOption.IGNORE_CASE),
             Regex("popup.?dialog",    RegexOption.IGNORE_CASE),
             Regex("support.?dialog",  RegexOption.IGNORE_CASE),
-            Regex("sponsor.?dialog",  RegexOption.IGNORE_CASE),
-            Regex("donation",         RegexOption.IGNORE_CASE),
-            Regex("promo",            RegexOption.IGNORE_CASE),
-            Regex("sponsor",          RegexOption.IGNORE_CASE)
+            Regex("sponsor.?dialog",  RegexOption.IGNORE_CASE)
         )
 
+        // Strictly enforced compound file naming (no optional trailing groups)
         val file = listOf(
-            Regex("donat",   RegexOption.IGNORE_CASE),
-            Regex("popup",   RegexOption.IGNORE_CASE),
-            Regex("promo",   RegexOption.IGNORE_CASE),
-            Regex("support", RegexOption.IGNORE_CASE),
-            Regex("sponsor", RegexOption.IGNORE_CASE)
+            Regex("donat(e|ion)[_.-](popup|dialog|prefs|config|state)", RegexOption.IGNORE_CASE),
+            Regex("(promo|sponsor|support)[_.-](popup|dialog|prefs|config|state)", RegexOption.IGNORE_CASE),
+            Regex("popup[_.-](donat|promo|sponsor|support|prefs|config|state)", RegexOption.IGNORE_CASE)
         )
 
+        // Gate keys: at least one of these must exist in the file before it is
+        // watched or sanitized. Union of all patterns applyRules() can act on,
+        // plus the flagKey shapes it neutralizes.
         val key = listOf(
-            Regex("donat",          RegexOption.IGNORE_CASE),
-            Regex("popup",          RegexOption.IGNORE_CASE),
-            Regex("promo",          RegexOption.IGNORE_CASE),
-            Regex("sponsor",        RegexOption.IGNORE_CASE),
+            // donation_* compound forms
+            Regex("donat(e|ion)[_.-](enabled|show|popup|dialog|cooldown|last)", RegexOption.IGNORE_CASE),
+            // flagKey shapes: show_donation, show_popup, popup_enabled, promo_enabled
+            Regex("(show|popup|promo|sponsor|donation)[_.-](enabled|show|popup|dialog)", RegexOption.IGNORE_CASE),
+            Regex("(enabled|show)[_.-](donat|popup|promo|sponsor)", RegexOption.IGNORE_CASE),
+            // gate keys
             Regex("last_shown",     RegexOption.IGNORE_CASE),
             Regex("last_popup",     RegexOption.IGNORE_CASE),
             Regex("next_show",      RegexOption.IGNORE_CASE),
-            Regex("cooldown",       RegexOption.IGNORE_CASE),
             Regex("achieved_shown", RegexOption.IGNORE_CASE),
+            // scoped cooldowns
+            Regex("(donat|popup|promo|sponsor).*cooldown|cooldown.*(donat|popup|promo|sponsor)", RegexOption.IGNORE_CASE),
+            // donation cache
             Regex("cached_(amount|goal|percent|supporters|month|currency)", RegexOption.IGNORE_CASE)
         )
 
@@ -98,8 +104,7 @@ object PopupBlocker {
         )
 
         val cacheKey = listOf(
-            Regex("^cached_", RegexOption.IGNORE_CASE),
-            Regex("_cached_", RegexOption.IGNORE_CASE)
+            Regex("cached_(amount|goal|percent|supporters|month|currency)", RegexOption.IGNORE_CASE)
         )
 
         val flagKey = listOf(
@@ -110,7 +115,10 @@ object PopupBlocker {
             Regex("show_popup",       RegexOption.IGNORE_CASE)
         )
 
-        val cooldown = Regex("cooldown", RegexOption.IGNORE_CASE)
+        val cooldown = Regex(
+            "(donat|popup|promo|sponsor).*cooldown|cooldown.*(donat|popup|promo|sponsor)",
+            RegexOption.IGNORE_CASE
+        )
     }
 
     // =================================================================
@@ -134,7 +142,8 @@ object PopupBlocker {
                 }
 
                 sweep(fm)
-                rescanWatchers(activity)
+                val appCtx = activity.applicationContext
+                ioExecutor.execute { rescanWatchers(appCtx) }
             }
 
             override fun onActivityCreated(a: Activity, b: Bundle?) {}
@@ -144,6 +153,11 @@ object PopupBlocker {
             override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
             override fun onActivityDestroyed(a: Activity) {}
         })
+    }
+
+    fun sanitizeAsync(context: Context) {
+        val appCtx = context.applicationContext
+        ioExecutor.execute { sanitize(appCtx) }
     }
 
     fun sanitize(context: Context): Int {
@@ -156,34 +170,42 @@ object PopupBlocker {
 
         var touched = 0
         for (f in files) {
-            if (sanitizeFile(context, f)) touched++
-            registerWatcher(context, f)
+            val name = f.nameWithoutExtension
+            if (isProtectedFile(context, name)) continue
+            if (inspectAndSanitizeFile(context, f)) touched++
         }
         return touched
     }
 
     fun clearGates(context: Context) {
         if (FilterStore.enabled) return
+        val appCtx = context.applicationContext
 
-        val dir = File(context.applicationInfo.dataDir, "shared_prefs")
-        if (!dir.isDirectory) return
+        ioExecutor.execute {
+            val dir = File(appCtx.applicationInfo.dataDir, "shared_prefs")
+            if (!dir.isDirectory) return@execute
 
-        val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".xml") } ?: return
+            val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".xml") } ?: return@execute
 
-        for (f in files) {
-            val name = f.nameWithoutExtension
-            if (!Patterns.file.any { it.containsMatchIn(name) }) continue
+            for (f in files) {
+                val name = f.nameWithoutExtension
+                if (isProtectedFile(appCtx, name)) continue
+                if (!Patterns.file.any { it.containsMatchIn(name) }) continue
 
-            try {
-                val prefs = context.getSharedPreferences(name, Context.MODE_PRIVATE)
-                val editor = prefs.edit()
-                for (k in prefs.all.keys) {
-                    if (Patterns.gateKey.any { it.containsMatchIn(k) }) {
-                        editor.remove(k)
+                try {
+                    val prefs = appCtx.getSharedPreferences(name, Context.MODE_PRIVATE)
+                    val keys = prefs.all.keys
+                    if (!keys.any { k -> Patterns.key.any { it.containsMatchIn(k) } }) continue
+
+                    val editor = prefs.edit()
+                    for (k in keys) {
+                        if (Patterns.gateKey.any { it.containsMatchIn(k) }) {
+                            editor.remove(k)
+                        }
                     }
-                }
-                writeSelf(editor)
-            } catch (_: Throwable) {}
+                    writeSelf(editor)
+                } catch (_: Throwable) {}
+            }
         }
     }
 
@@ -199,17 +221,17 @@ object PopupBlocker {
     private val callbacks = object : FragmentManager.FragmentLifecycleCallbacks() {
         override fun onFragmentAttached(fm: FragmentManager, f: Fragment, context: Context) {
             if (!FilterStore.enabled) return
-            if (isTarget(f)) killFragment(f, fm)
+            if (isTarget(f)) killFragment(f)
         }
 
         override fun onFragmentCreated(fm: FragmentManager, f: Fragment, savedInstanceState: Bundle?) {
             if (!FilterStore.enabled) return
-            if (isTarget(f)) killFragment(f, fm)
+            if (isTarget(f)) killFragment(f)
         }
 
         override fun onFragmentResumed(fm: FragmentManager, f: Fragment) {
             if (!FilterStore.enabled) return
-            if (isTarget(f)) killFragment(f, fm)
+            if (isTarget(f)) killFragment(f)
         }
     }
 
@@ -218,13 +240,15 @@ object PopupBlocker {
         try {
             for (f in fm.fragments) {
                 if (f == null || !f.isAdded) continue
-                if (isTarget(f)) killFragment(f, fm)
+                if (isTarget(f)) killFragment(f)
                 sweep(f.childFragmentManager)
             }
         } catch (_: Throwable) {}
     }
 
     private fun isTarget(f: Fragment): Boolean {
+        if (f !is DialogFragment) return false
+
         val tag = f.tag ?: ""
         val cls = f.javaClass.name
 
@@ -239,18 +263,10 @@ object PopupBlocker {
         return false
     }
 
-    private fun killFragment(f: Fragment, fm: FragmentManager) {
+    private fun killFragment(f: Fragment) {
         try {
             (f as? DialogFragment)?.dismissAllowingStateLoss()
         } catch (_: Throwable) {}
-
-        if (f.isAdded) {
-            try {
-                fm.beginTransaction()
-                    .remove(f)
-                    .commitAllowingStateLoss()
-            } catch (_: Throwable) {}
-        }
     }
 
     // =================================================================
@@ -260,25 +276,38 @@ object PopupBlocker {
     private val watched: MutableSet<SharedPreferences> =
         Collections.newSetFromMap(WeakHashMap<SharedPreferences, Boolean>())
 
-    private val watchedNames: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val inspectedNames: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
-    // ThreadLocal isolates the self-write state per thread
-    private val writing = ThreadLocal.withInitial { false }
+    private val writing = AtomicBoolean(false)
 
     private fun writeSelf(editor: SharedPreferences.Editor) {
         writing.set(true)
-        try { editor.apply() } finally { writing.set(false) }
+        try {
+            editor.apply()
+        } finally {
+            writing.set(false)
+        }
     }
 
+    private fun isTargetKey(k: String): Boolean {
+        return Patterns.gateKey.any { it.containsMatchIn(k) } ||
+               Patterns.cooldown.containsMatchIn(k) ||
+               Patterns.cacheKey.any { it.containsMatchIn(k) } ||
+               Patterns.flagKey.any { it.containsMatchIn(k) }
+    }
+
+    // Fast-path filter on key name first; offloads map read & sanitization to background thread
     // WARNING: Must remain a top-level object property to prevent GC weak reference dropping
     private val listener = SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
-        if (!writing.get() && FilterStore.enabled && key != null) {
-            val value = try { prefs.all[key] } catch (_: Throwable) { null }
-            if (value != null) {
-                val editor = prefs.edit()
-                if (applyRules(editor, key, value, today())) {
-                    writeSelf(editor)
-                }
+        if (writing.get() || !FilterStore.enabled || key == null) return@OnSharedPreferenceChangeListener
+        if (!isTargetKey(key)) return@OnSharedPreferenceChangeListener
+
+        ioExecutor.execute {
+            if (writing.get() || !FilterStore.enabled) return@execute
+            val value = try { prefs.all[key] } catch (_: Throwable) { null } ?: return@execute
+            val editor = prefs.edit()
+            if (applyRules(editor, key, value, today())) {
+                writeSelf(editor)
             }
         }
     }
@@ -286,20 +315,11 @@ object PopupBlocker {
     private fun today(): String =
         SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
 
-    private fun registerWatcher(context: Context, file: File) {
-        val name = file.nameWithoutExtension
-        if (!Patterns.file.any { it.containsMatchIn(name) }) return
-
-        val prefs = try {
-            context.getSharedPreferences(name, Context.MODE_PRIVATE)
-        } catch (_: Throwable) { return }
-
-        if (watched.add(prefs)) {
-            watchedNames.add(name)
-            try {
-                prefs.registerOnSharedPreferenceChangeListener(listener)
-            } catch (_: Throwable) {}
-        }
+    private fun isProtectedFile(context: Context, name: String): Boolean {
+        return name == "rebuild_preference" ||
+               name == FilterStore.PREFS_NAME ||
+               name == "${context.packageName}_preferences" ||
+               name.endsWith("_preferences")
     }
 
     private fun rescanWatchers(context: Context) {
@@ -310,27 +330,34 @@ object PopupBlocker {
         val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".xml") } ?: return
         for (f in files) {
             val name = f.nameWithoutExtension
-            if (Patterns.file.any { it.containsMatchIn(name) }) {
-                if (watchedNames.add(name)) {
-                    registerWatcher(context, f)
-                    sanitizeFile(context, f)
-                }
+            if (isProtectedFile(context, name)) continue
+            if (Patterns.file.any { it.containsMatchIn(name) } && inspectedNames.add(name)) {
+                inspectAndSanitizeFile(context, f)
             }
         }
     }
 
-    private fun sanitizeFile(context: Context, file: File): Boolean {
+    private fun inspectAndSanitizeFile(context: Context, file: File): Boolean {
         val name = file.nameWithoutExtension
+        if (isProtectedFile(context, name)) return false
+        if (!Patterns.file.any { it.containsMatchIn(name) }) return false
 
         val prefs = try {
             context.getSharedPreferences(name, Context.MODE_PRIVATE)
         } catch (_: Throwable) { return false }
 
         val all = try { prefs.all } catch (_: Throwable) { return false }
+        if (all.isEmpty()) return false
 
-        val fileHit = Patterns.file.any { it.containsMatchIn(name) }
-        val keyHit  = all.keys.any { k -> Patterns.key.any { it.containsMatchIn(k) } }
-        if (!fileHit && !keyHit) return false
+        val hasPopupKeys = all.keys.any { k -> Patterns.key.any { it.containsMatchIn(k) } }
+        if (!hasPopupKeys) return false
+
+        if (watched.add(prefs)) {
+            inspectedNames.add(name)
+            try {
+                prefs.registerOnSharedPreferenceChangeListener(listener)
+            } catch (_: Throwable) {}
+        }
 
         val editor = prefs.edit()
         var dirty = false
@@ -353,14 +380,16 @@ object PopupBlocker {
         today: String
     ): Boolean {
         var dirty = false
-        val safeFutureLong = System.currentTimeMillis() + TEN_YEARS_MS
+        val now = System.currentTimeMillis()
+        val safeFutureLong = now + TEN_YEARS_MS
+        val minFutureLong = now + NINE_YEARS_MS
 
         if (Patterns.gateKey.any { it.containsMatchIn(k) }) {
             when (v) {
                 is String -> if (v != today) {
                     editor.putString(k, today); dirty = true
                 }
-                is Long -> if (v < safeFutureLong) {
+                is Long -> if (v < minFutureLong) {
                     editor.putLong(k, safeFutureLong); dirty = true
                 }
                 is Int -> if (v < SAFE_MAX_INT) {
@@ -387,8 +416,8 @@ object PopupBlocker {
                 is Float -> if (v != 0f) {
                     editor.putFloat(k, 0f); dirty = true
                 }
-                is Int -> if (v != -1) {
-                    editor.putInt(k, -1); dirty = true
+                is Int -> if (v != 0) {
+                    editor.putInt(k, 0); dirty = true
                 }
                 is Long -> if (v != 0L) {
                     editor.putLong(k, 0L); dirty = true
