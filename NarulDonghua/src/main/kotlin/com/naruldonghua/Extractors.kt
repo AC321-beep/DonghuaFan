@@ -256,16 +256,9 @@ class AbyssPlayer : ExtractorApi() {
                                     "$name HLS $display"
                                 else -> link.name
                             }
-                            callback(ExtractorLink(
-                                name = link.name,
-                                source = finalName,
-                                url = link.url,
-                                referer = link.referer,
-                                quality = finalQ,
-                                type = link.type,
-                                headers = link.headers,
-                                extractorData = link.extractorData,
-                            ))
+                            // ✅ copy() — preserves referer, headers, extractorData,
+                            //    audioTracks without listing them; not deprecated.
+                            callback(link.copy(source = finalName, quality = finalQ))
                         }
                     } else {
                         val sourceName = if (display.isNotBlank()) "$name $display" else name
