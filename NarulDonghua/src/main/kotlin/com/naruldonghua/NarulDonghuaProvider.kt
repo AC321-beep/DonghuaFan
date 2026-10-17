@@ -140,10 +140,11 @@ class NarulDonghuaProvider : MainAPI() {
             .firstOrNull() ?: url
 
         // .episodelist exists on both series pages and episode pages.
-        var epNodes = doc.select(".episodelist li")
-        if (epNodes.isEmpty() && seriesUrl != url) {
-            epNodes = fetch(seriesUrl)?.select(".episodelist li").orEmpty()
-        }
+       val epNodes: List<Element> = run {
+    val first = doc.select(".episodelist li")
+    if (first.isNotEmpty() || seriesUrl == url) first
+    else fetch(seriesUrl)?.select(".episodelist li")?.toList().orEmpty()
+}
 
         val episodes = epNodes.mapNotNull { li ->
             val a = li.selectFirst("a[href]") ?: return@mapNotNull null
