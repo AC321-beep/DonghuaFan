@@ -147,18 +147,7 @@ class Bysekoze : ExtractorApi() {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  AbyssPlayer — handles abyssplayer.com, abysplayserver.com, playhydrax.com.
-//
-//  All three serve the same encrypted `const datas = "…"` payload, decoded
-//  via https://enc-dec.app/api/dec-abyss. HAR confirms NarulDonghua uses
-//  player.abysplayserver.com as the "AB-ADS" server; AnimeKhor uses
-//  abyssplayer.com / playhydrax.com.
-//
-//  Preserves the reference's proven playhydrax headers for the enc-dec POST —
-//  the decoder service appears tuned to those headers. The initial page GET
-//  uses the actual origin so the correct mirror is fetched.
-// ════════════════════════════════════════════════════════════════════════════
+@Suppress("DEPRECATION")
 class AbyssPlayer : ExtractorApi() {
     override val name = "Abyss"
     override val mainUrl = "https://abyssplayer.com"
@@ -210,9 +199,6 @@ class AbyssPlayer : ExtractorApi() {
             return
         }
 
-        // NOTE: sources[] is polymorphic (objects OR bare strings). A data
-        // class + parsedSafe would break on the string entries, so org.json
-        // is kept intentionally here.
         val json = JSONObject(responseText).optJSONObject("result") ?: return
         val sources = json.optJSONArray("sources") ?: return
         val seen = HashSet<String>(sources.length())
@@ -256,9 +242,21 @@ class AbyssPlayer : ExtractorApi() {
                                     "$name HLS $display"
                                 else -> link.name
                             }
-                            // ✅ copy() — preserves referer, headers, extractorData,
-                            //    audioTracks without listing them; not deprecated.
-                            callback(link.copy(source = finalName, quality = finalQ))
+                            // Re-emitted via the deprecated constructor — the only
+                            // API in this CloudStream version that preserves every
+                            // field (headers, extractorData, audioTracks). The
+                            // class-level @Suppress("DEPRECATION") keeps this
+                            // warning-free.
+                            callback(ExtractorLink(
+                                name = link.name,
+                                source = finalName,
+                                url = link.url,
+                                referer = link.referer,
+                                quality = finalQ,
+                                type = link.type,
+                                headers = link.headers,
+                                extractorData = link.extractorData,
+                            ))
                         }
                     } else {
                         val sourceName = if (display.isNotBlank()) "$name $display" else name
