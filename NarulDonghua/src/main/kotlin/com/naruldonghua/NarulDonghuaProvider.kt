@@ -20,16 +20,18 @@ import java.util.concurrent.ConcurrentHashMap
 
 class NarulDonghuaProvider : MainAPI() {
     override var mainUrl = "https://naruldonghua.com"
-    override var name = "Narul Donghua"
+    override var name = "NarulDonghua"
     override val hasMainPage = true
-    override var lang = "en"
+    override var lang = "zh"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
-    // Headers matching the real browser's HAR exactly:
-    //  • Chrome desktop UA
-    //  • Sec-Ch-Ua* + Sec-Fetch-* trio (Cloudflare checks for these)
-    //  • No Origin on GET (was triggering bot flags)
+    // ── Headers ──────────────────────────────────────────────────────────
+    // • Chrome desktop UA + sec‑ch‑ua trio (Cloudflare checks these)
+    // • Sec‑Fetch‑Site: none — the HAR shows the first navigation uses
+    //   "none", not "same-origin".  Sending "same-origin" from an
+    //   external client is a well‑known Cloudflare bot signal.
+    // • No Origin header on GET (matches browser).
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -42,7 +44,7 @@ class NarulDonghuaProvider : MainAPI() {
         "Sec-Ch-Ua-Platform" to "\"Windows\"",
         "Sec-Fetch-Dest" to "document",
         "Sec-Fetch-Mode" to "navigate",
-        "Sec-Fetch-Site" to "same-origin",
+        "Sec-Fetch-Site" to "none",
         "Sec-Fetch-User" to "?1",
         "Upgrade-Insecure-Requests" to "1",
         "Cache-Control" to "no-cache",
@@ -59,38 +61,49 @@ class NarulDonghuaProvider : MainAPI() {
             null
         }
 
-    // Handles both grid cards (article.bs) AND the hero slider (div.swiper-slide.item).
-    // Skips swiper's infinite-loop duplicates so each slider item appears once.
     private val cardSelector =
         "article.bs, div.swiper-slide.item:not(.swiper-slide-duplicate)"
 
-    // Categories driven by the site's own filter form (action = /anime).
-    // All URLs here are produced by the site's real "Search" button.
+    // ── Categories ───────────────────────────────────────────────────────
+    // "Latest Release" merges order=update (new episodes) and order=latest
+    // (new series).  Both feeds are fetched concurrently and deduped by URL,
+    // so each series appears once and neither "just-aired episode" nor
+    // "brand-new series" entries are lost.
     override val mainPage = mainPageOf(
-        "anime/?status=&type=&order=update"          to "Latest Release",
+        "anime/?status=&type=&order=update||anime/?status=&type=&order=latest"
+                                                    to "Latest Release",
         "anime/?status=&type=movie&order=update"     to "Movie",
         "anime/?status=&type=&order=popular"         to "Popular",
-        "anime/?status=&type=&order=latest"          to "Latest Added",
         "anime/?status=completed&type=&order=update" to "Completed",
         "anime/?status=&type=ona&order=update"       to "Donghua (ONA)",
         "anime/?status=&type=ova&order=update"       to "Comic",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = buildPagedUrl(request.data, page)
-        val doc = fetch(url)
-        if (doc == null) {
-            println("[NarulDonghua] getMainPage('${request.name}', p$page) → fetch=NULL ($url)")
-            return newHomePageResponse(request.name, emptyList())
+        // A category's `data` may contain several source URLs joined by "||".
+        // Each is fetched with the correct pagination, then unioned and
+        // deduped by URL — first occurrence wins (so order=update leads).
+        val urls = request.data.split("||").map { buildPagedUrl(it, page) }
+
+        val docs = coroutineScope {
+            urls.map { url -> async { url to fetch(url) } }.awaitAll()
         }
 
-        val allCards = doc.select(cardSelector)
-        val items = allCards
-            .mapNotNull { it.toSearchResult() }
+        val items = docs
+            .flatMap { (url, doc) ->
+                if (doc == null) {
+                    println("[NarulDonghua] getMainPage('${request.name}', p$page) → fetch=NULL ($url)")
+                    emptyList()
+                } else {
+                    val cards = doc.select(cardSelector)
+                    val found = cards.mapNotNull { it.toSearchResult() }
+                    println("[NarulDonghua]   $url → ${cards.size} nodes, ${found.size} items")
+                    found
+                }
+            }
             .distinctBy { it.url }
 
-        println("[NarulDonghua] getMainPage('${request.name}', p$page) → $url")
-        println("[NarulDonghua]   selector matched ${allCards.size} nodes, ${items.size} unique items")
+        println("[NarulDonghua] getMainPage('${request.name}', p$page) → ${items.size} unique items")
         return newHomePageResponse(request.name, items)
     }
 
@@ -129,11 +142,11 @@ class NarulDonghuaProvider : MainAPI() {
         ) return null
 
         // Title priority:
-        //  1. .tt ownText  → grid cards (series name)
-        //  2. .info h2 a   → slider cards
-        //  3. a[data-jtitle] → slider fallback attribute
-        //  4. a[title]     → grid fallback (full episode title)
-        //  5. .tt h2 / h2  → last resort
+        //  1. .tt ownText          → grid cards (series name)
+        //  2. .info h2 a           → slider cards
+        //  3. a[data-jtitle]       → slider fallback attribute
+        //  4. a[title]             → grid fallback (full episode title)
+        //  5. .tt h2 / h2          → last resort
         val title = selectFirst(".tt")?.ownText()?.trim().takeUnless { it.isNullOrBlank() }
             ?: selectFirst(".info h2 a")?.text()?.trim().takeUnless { it.isNullOrBlank() }
             ?: selectFirst("a[data-jtitle]")?.attr("data-jtitle")?.trim()?.takeIf { it.isNotBlank() }
@@ -159,7 +172,8 @@ class NarulDonghuaProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val encoded = URLEncoder.encode(query, "UTF-8")
+        // %20 instead of + for maximum Cloudflare/WP compatibility
+        val encoded = URLEncoder.encode(query, "UTF-8").replace("+", "%20")
         return coroutineScope {
             (1..2).map { page ->
                 async {
@@ -258,7 +272,7 @@ class NarulDonghuaProvider : MainAPI() {
                 this.posterUrl = poster
                 if (epNum != null) this.episode = epNum
             }
-        }.distinctBy { it.data }.reversed()
+        }.distinctBy { it.data }.sortedBy { it.episode ?: Int.MAX_VALUE }
 
         println("[NarulDonghua] load($url) — '${seriesName.ifBlank { entryTitle }}' : ${episodes.size} episodes")
 
@@ -274,7 +288,13 @@ class NarulDonghuaProvider : MainAPI() {
                     this.plot = plot
                 }
             }
-            println("[NarulDonghua] load($url) — NO EPISODES, NO PLAYER")
+            // Nothing found — still return a *playable* single episode
+            // instead of an empty TV series card so the UI is not blank.
+            return newTvSeriesLoadResponse(
+                seriesName.ifBlank { entryTitle }, url, TvType.Movie, listOf(
+                    newEpisode(url) { this.name = entryTitle.ifBlank { url }; this.posterUrl = poster }
+                )
+            ) { this.posterUrl = poster; this.plot = plot }
         }
 
         return newTvSeriesLoadResponse(
@@ -302,7 +322,9 @@ class NarulDonghuaProvider : MainAPI() {
         suspend fun resolve(raw: String, label: String = "") {
             val url = normalizeUrl(raw) ?: return
             if (isAdUrl(url)) return
-            if (!visited.add(url.substringBefore('#').substringBefore('?'))) return
+            // Only strip fragment — semantic query params (?video=, ?id=) must
+            // remain part of the dedup key, otherwise we drop legit mirrors.
+            if (!visited.add(url.substringBefore('#'))) return
 
             var extracted = false
             val inner: (ExtractorLink) -> Unit = { extracted = true; trackLink(it) }
@@ -315,8 +337,10 @@ class NarulDonghuaProvider : MainAPI() {
                 try { P2pstream().getUrl(url, mainUrl, trackSub, inner); if (extracted) return }
                 catch (e: CancellationException) { throw e } catch (_: Exception) {}
             }
+            // NOTE: fixed typo — abyssPLAYER vs abyySPLAYER
             if (url.contains("abysplayserver.com", true) ||
-                url.contains("abyssplayer.com", true) ||
+                url.contains("abyssplayer.com", true)     ||
+                url.contains("abyysplayer.com", true)     ||  // ← FIX
                 url.contains("playhydrax.com", true)) {
                 try { AbyssPlayer().getUrl(url, mainUrl, trackSub, inner); if (extracted) return }
                 catch (e: CancellationException) { throw e } catch (_: Exception) {}
@@ -371,7 +395,8 @@ class NarulDonghuaProvider : MainAPI() {
                     !isAdUrl(u) && listOf(
                         "embed", "player", "stream", "mirror",
                         "dailymotion.com", "p2pstream.vip", "abysplayserver.com",
-                        "abyssplayer.com", "playhydrax.com", "ok.ru",
+                        "abyssplayer.com", "abyysplayer.com",
+                        "playhydrax.com", "ok.ru",
                         "youtube.com/embed", "youtu.be",
                     ).any { u.contains(it, true) }
                 }
@@ -420,6 +445,25 @@ class NarulDonghuaProvider : MainAPI() {
         else -> null
     }
 
+    /**
+     * Dailymotion extractor, rewritten to match what the HAR actually shows:
+     *
+     *   geo.dailymotion.com/player/x9mpt.html?video=k54O8B2lvox4kgLrS1k
+     *      └── <script> window.__PLAYER_CONFIG__ = { … }   ← contains
+     *          "criticalMetadata":{"stream":{"url":"…xblfnlu.m3u8?sec=…"}}
+     *
+     * Old flow wasted one request on `www.dailymotion.com/player/metadata/video/`
+     * which needs the *internal* ID (xblfnlu), not the public access ID
+     * (k54O8B2lvox4kgLrS1k) — it always 404'd / returned an empty body.
+     *
+     * New flow:
+     *   1) If the URL is already a geo player, reuse it; otherwise hit
+     *      geo.dailymotion.com with the standard player id.
+     *   2) Parse `__PLAYER_CONFIG__` as JSON, read
+     *      `criticalMetadata.stream.url` deterministically.
+     *   3) Regex fallback (only if JSON parse fails).
+     *   4) `player/metadata` only as a last resort.
+     */
     private suspend fun extractDailymotion(
         url: String,
         subCallback: (SubtitleFile) -> Unit,
@@ -431,7 +475,54 @@ class NarulDonghuaProvider : MainAPI() {
             "Referer"    to "https://www.dailymotion.com/",
             "Origin"     to "https://www.dailymotion.com",
         )
-        var emitted = false
+
+        val geoUrl = if (url.contains("geo.dailymotion.com", true)) url
+                     else "https://geo.dailymotion.com/player/x9mpt.html?video=$videoId"
+
+        try {
+            val geoDoc = app.get(geoUrl, headers = dmHeaders).document
+
+            // 1) Deterministic JSON walk.
+            val configScript = geoDoc.select("script")
+                .firstOrNull { it.data().contains("__PLAYER_CONFIG__") }
+            if (configScript != null) {
+                val raw = configScript.data()
+                val start = raw.indexOf('{')
+                val end = raw.lastIndexOf('}')
+                if (start in 0 until end) {
+                    try {
+                        val json = JSONObject(raw.substring(start, end + 1))
+                        val streamUrl = json.optJSONObject("criticalMetadata")
+                            ?.optJSONObject("stream")
+                            ?.optString("url")
+                            ?.takeIf { it.isNotBlank() }
+                        if (!streamUrl.isNullOrBlank()) {
+                            callback(newExtractorLink(
+                                "Dailymotion", "Dailymotion",
+                                streamUrl, ExtractorLinkType.M3U8
+                            ) { this.referer = "https://www.dailymotion.com/" })
+                            return true
+                        }
+                    } catch (_: org.json.JSONException) { /* fall through */ }
+                }
+            }
+
+            // 2) Regex fallback against the raw HTML.
+            val m3u8 = Regex("""https?://[^"'\s]+\.m3u8[^"'\s]*""")
+                .find(geoDoc.outerHtml())
+                ?.value
+            if (!m3u8.isNullOrBlank()) {
+                callback(newExtractorLink(
+                    "Dailymotion", "Dailymotion (geo)",
+                    m3u8, ExtractorLinkType.M3U8
+                ) { this.referer = "https://www.dailymotion.com/" })
+                return true
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) { /* fall through */ }
+
+        // 3) Last resort: metadata API (rarely works for geo IDs, but cheap).
         try {
             val body = app.get(
                 "https://www.dailymotion.com/player/metadata/video/$videoId",
@@ -441,33 +532,23 @@ class NarulDonghuaProvider : MainAPI() {
             val hls = json.optJSONObject("qualities")?.optJSONArray("auto")
                 ?.optJSONObject(0)?.optString("url")
             if (!hls.isNullOrBlank()) {
-                callback(newExtractorLink("Dailymotion", "Dailymotion", hls, ExtractorLinkType.M3U8) {
-                    this.referer = "https://www.dailymotion.com/"
-                })
-                emitted = true
+                callback(newExtractorLink(
+                    "Dailymotion", "Dailymotion (api)",
+                    hls, ExtractorLinkType.M3U8
+                ) { this.referer = "https://www.dailymotion.com/" })
             }
             json.optJSONObject("subtitles")?.let { subs ->
                 subs.keys().forEach { lang ->
-                    val subUrl = subs.optJSONObject(lang)?.optString("urls") ?: return@forEach
-                    if (subUrl.isNotBlank()) subCallback(newSubtitleFile(lang, subUrl) { headers = dmHeaders })
+                    val subUrl = subs.optJSONObject(lang)?.optString("urls")
+                    if (!subUrl.isNullOrBlank())
+                        subCallback(newSubtitleFile(lang, subUrl) { headers = dmHeaders })
                 }
             }
-        } catch (e: CancellationException) { throw e } catch (_: Exception) {}
-        if (emitted) return true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) { /* ignore */ }
 
-        try {
-            val geoUrl = "https://geo.dailymotion.com/player/x9mpt.html?video=$videoId"
-            val geoDoc = app.get(geoUrl, headers = dmHeaders).document
-            val configText = geoDoc.select("script")
-                .firstOrNull { it.data().contains("__PLAYER_CONFIG__") }
-                ?.data() ?: return false
-            val hls = Regex(""""url"\s*:\s*"(https://[^"]+\.m3u8[^"]*)"""")
-                .find(configText)?.groupValues?.get(1) ?: return false
-            callback(newExtractorLink("Dailymotion", "Dailymotion (geo)", hls, ExtractorLinkType.M3U8) {
-                this.referer = "https://www.dailymotion.com/"
-            })
-            return true
-        } catch (e: CancellationException) { throw e } catch (_: Exception) { return false }
+        return false
     }
 
     private fun decodeServerValue(raw: String): String? {
