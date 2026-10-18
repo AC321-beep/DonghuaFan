@@ -167,7 +167,7 @@ private suspend fun manualJsUnpackExtraction(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  Plex  (P2pstream)
+//  Plex  (P2pstream / narulplex subdomains)
 // ════════════════════════════════════════════════════════════════════════════
 class P2pstream : ExtractorApi() {
     override val name = "Plex"
@@ -182,11 +182,13 @@ class P2pstream : ExtractorApi() {
         private val DEFAULT_ENDPOINTS = listOf(
             "/api/v1/video", "/api/video", "/api/source",
             "/api/stream",   "/api/get",   "/api/embed",
+            "/api/v1/source", "/api/v1/stream", "/api/v1/get",
         )
 
-        private val RE_API_PATH = Regex("""["'](/api/[a-zA-Z0-9_\-/]{2,60})["']""")
-        private val RE_API_URL = Regex("""["'](https?://api\.[^"']+?/[a-zA-Z0-9_\-/]{2,60})["']""")
-        private val RE_JS_BUNDLE = Regex("""src=["']([^"']*?/assets/index-[^"']+\.js)["']""")
+        private val RE_API_PATH  = Regex("""["'](/(?:api|v1|ajax|embed)/[a-zA-Z0-9_\-/]{2,80})["']""")
+        private val RE_API_URL   = Regex("""["'](https?://[^"']+?/(?:api|v1)/[a-zA-Z0-9_\-/]{2,80})["']""")
+        private val RE_SCRIPT_SRC = Regex("""<script[^>]+src=["']([^"']+\.js[^"']*)["']""", RegexOption.IGNORE_CASE)
+        private val JSON_TYPE    = "application/json; charset=utf-8".toMediaTypeOrNull()
     }
 
     override suspend fun getUrl(
@@ -200,7 +202,8 @@ class P2pstream : ExtractorApi() {
 
         val origin = originOf(url) ?: return
         val id = url.substringAfter("#", "").substringBefore("&").trim()
-        if (id.isBlank()) return
+        if (id.isBlank()) { Log.e(TAG, "id blank → abort"); return }
+        Log.e(TAG, "origin=$origin id=$id")
 
         val headers = mapOf(
             "Origin"     to origin,
@@ -208,15 +211,17 @@ class P2pstream : ExtractorApi() {
             "User-Agent" to DEFAULT_UA,
         )
 
-        // Fast path
+        // ── Fast path: cached working endpoint for this origin ────────────
         workingEndpointCache[origin]?.let { ep ->
             Log.e(TAG, "FAST-PATH: cached endpoint=$ep")
             if (probeEndpoint(origin, ep, id, headers, subtitleCallback, callback)) return
+            workingEndpointCache.remove(origin)  // stale — invalidate
         }
 
-        // Classic
+        // ── Classic /e/{id} ───────────────────────────────────────────────
         val classicUrl = "$origin/e/$id"
         val classicBody = try { app.get(classicUrl, headers = headers).text } catch (_: Exception) { null }
+        Log.e(TAG, "classicBody length=${classicBody?.length ?: 0}")
 
         if (classicBody != null) {
             if (RE_PACKED_SCRIPT.containsMatchIn(classicBody)) {
@@ -226,14 +231,24 @@ class P2pstream : ExtractorApi() {
             if (tryDirectMedia(classicBody, origin, headers, subtitleCallback, callback)) return
         }
 
-        // SPA
-        val html = classicBody ?: try { app.get("$origin/", headers = headers).text } catch (_: Exception) { null } ?: return
-        if (!looksLikeSpa(html)) return
+        // ── SPA fallback — ALWAYS try if classic failed ───────────────────
+        // (Fix #1: previously a 404 from /e/{id} would short-circuit here)
+        Log.e(TAG, "Classic failed; trying SPA")
 
-        Log.e(TAG, "SPA detected → probing API")
-        trySpaApi(origin, id, html, headers, subtitleCallback, callback)
+        val shellHtml = classicBody?.takeIf { looksLikeSpa(it) }
+            ?: try { app.get("$origin/", headers = headers).text } catch (_: Exception) { null }
+            ?: run { Log.e(TAG, "SPA shell fetch failed → abort"); return }
+
+        if (!looksLikeSpa(shellHtml)) {
+            Log.e(TAG, "Not an SPA shell → abort")
+            return
+        }
+
+        Log.e(TAG, "SPA confirmed; probing API")
+        trySpaApi(origin, id, shellHtml, headers, subtitleCallback, callback)
     }
 
+    // ──────────────────────────────────────────────────────────────────────
     private suspend fun trySpaApi(
         origin: String,
         id: String,
@@ -242,36 +257,43 @@ class P2pstream : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ) {
-        val jsUrl = RE_JS_BUNDLE.find(shellHtml)?.groupValues?.get(1)
-            ?.let {
-                if (it.startsWith("http")) it
-                else if (it.startsWith("/")) "$origin$it"
-                else "$origin/$it"
-            }
-            ?: "$origin/assets/index.js"
+        val jsUrl = findMainJsUrl(shellHtml, origin) ?: "$origin/assets/index.js"
+        Log.e(TAG, "jsUrl=$jsUrl")
 
         val js = scriptCache[origin] ?: try {
             app.get(jsUrl, headers = headers).text.also { scriptCache[origin] = it }
-        } catch (_: Exception) { null } ?: return
+        } catch (e: Exception) {
+            Log.e(TAG, "JS fetch failed: ${e.message}"); null
+        } ?: return
+
+        Log.e(TAG, "JS length=${js.length}")
 
         val fromJs = buildList<String> {
             RE_API_PATH.findAll(js).map { it.groupValues[1] }.distinct().forEach { path ->
-                if (listOf("video", "source", "stream", "get", "embed", "player").any { path.contains(it, true) }) add(path)
+                if (listOf("video", "source", "stream", "get", "embed", "player")
+                        .any { path.contains(it, true) }) add(path)
             }
             RE_API_URL.findAll(js).map { it.groupValues[1] }.distinct().forEach { fullUrl ->
-                if (listOf("video", "source", "stream", "get", "embed").any { fullUrl.contains(it, true) }) add(fullUrl)
+                if (listOf("video", "source", "stream", "get", "embed")
+                        .any { fullUrl.contains(it, true) }) add(fullUrl)
             }
         }
-        val candidates = (fromJs + DEFAULT_ENDPOINTS).distinct().take(6)
+        Log.e(TAG, "JS-discovered endpoints: $fromJs")
+
+        val candidates = (fromJs + DEFAULT_ENDPOINTS).distinct().take(8)
+        Log.e(TAG, "Probing ${candidates.size} endpoints")
 
         for (ep in candidates) {
             if (probeEndpoint(origin, ep, id, headers, subtitleCallback, callback)) {
                 workingEndpointCache[origin] = ep
+                Log.e(TAG, "✓ WORKING endpoint: $ep (cached)")
                 return
             }
         }
+        Log.e(TAG, "✗ No working endpoint found")
     }
 
+    // ──────────────────────────────────────────────────────────────────────
     private suspend fun probeEndpoint(
         origin: String,
         endpoint: String,
@@ -286,8 +308,10 @@ class P2pstream : ExtractorApi() {
             else                        -> "$origin/$endpoint"
         }
 
+        // ── Query-param style ─────────────────────────────────────────────
         for (param in listOf("id", "hash", "v", "vid")) {
             val u = if (baseUrl.contains('?')) "$baseUrl&$param=$id" else "$baseUrl?$param=$id"
+            Log.e(TAG, "  GET $u")
             try {
                 val body = app.get(u, headers = headers).text
                 if (body.isBlank()) continue
@@ -295,9 +319,66 @@ class P2pstream : ExtractorApi() {
                 if (tryJsonBody(body, origin, headers, subtitleCallback, callback)) return true
             } catch (_: Exception) { }
         }
+
+        // ── Path-param style (Fix #3) ─────────────────────────────────────
+        val pathBase = baseUrl.substringBefore('?').trimEnd('/')
+        for (suffix in listOf("/$id", "/hash/$id", "/id/$id")) {
+            val u = "$pathBase$suffix"
+            Log.e(TAG, "  GET $u")
+            try {
+                val body = app.get(u, headers = headers).text
+                if (body.isBlank()) continue
+                if (tryDirectMedia(body, origin, headers, subtitleCallback, callback)) return true
+                if (tryJsonBody(body, origin, headers, subtitleCallback, callback)) return true
+            } catch (_: Exception) { }
+        }
+
+        // ── POST JSON body style (Fix #3) ─────────────────────────────────
+        val postHeaders = headers + ("Content-Type" to "application/json; charset=utf-8")
+        for (payload in listOf(
+            """{"id":"$id"}""", """{"hash":"$id"}""", """{"v":"$id"}"""
+        )) {
+            Log.e(TAG, "  POST $baseUrl body=$payload")
+            try {
+                val reqBody = payload.toRequestBody(JSON_TYPE)
+                val body = app.post(baseUrl, headers = postHeaders, requestBody = reqBody).text
+                if (body.isBlank()) continue
+                if (tryDirectMedia(body, origin, headers, subtitleCallback, callback)) return true
+                if (tryJsonBody(body, origin, headers, subtitleCallback, callback)) return true
+            } catch (_: Exception) { }
+        }
+
         return false
     }
 
+    // ──────────────────────────────────────────────────────────────────────
+    private fun findMainJsUrl(shellHtml: String, origin: String): String? {
+        val srcs = RE_SCRIPT_SRC.findAll(shellHtml).map { it.groupValues[1] }.toList()
+        Log.e(TAG, "  script srcs: $srcs")
+
+        fun absolutize(u: String): String = when {
+            u.startsWith("http") -> u
+            u.startsWith("//")   -> "https:$u"
+            u.startsWith("/")    -> "$origin$u"
+            else                 -> "$origin/$u"
+        }
+
+        // Priority 1: Vite default  /assets/index-<hash>.js
+        srcs.firstOrNull { it.matches(Regex(".*/assets/index-[^/]+\\.js.*")) }
+            ?.let { return absolutize(it) }
+        // Priority 2: CRA-style  /static/js/main.<hash>.js
+        srcs.firstOrNull { it.matches(Regex(".*/static/js/[^/]+\\.js.*")) }
+            ?.let { return absolutize(it) }
+        // Priority 3: any /assets/*.js
+        srcs.firstOrNull { it.contains("/assets/") && it.contains(".js") }
+            ?.let { return absolutize(it) }
+        // Priority 4: any local .js
+        srcs.firstOrNull { !it.startsWith("http") && !it.startsWith("//") && it.contains(".js") }
+            ?.let { return absolutize(it) }
+        return null
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
     private suspend fun tryDirectMedia(
         text: String,
         origin: String,
@@ -308,13 +389,18 @@ class P2pstream : ExtractorApi() {
         if (text.length > 500_000) return false
         val normalized = text.replace("\\/", "/")
 
-        RE_M3U8_ATTR.find(normalized)?.groupValues?.get(1)?.let { emitHls(it, origin, headers, subtitleCallback, callback); return true }
-        RE_M3U8_ANY.find(normalized)?.groupValues?.get(1)?.let { emitHls(it, origin, headers, subtitleCallback, callback); return true }
-        RE_MP4_ATTR.find(normalized)?.groupValues?.get(1)?.let { callback(newExtractorLink(name, name, it, INFER_TYPE) { this.referer = "$origin/" }); return true }
-        RE_MP4_ANY.find(normalized)?.groupValues?.get(1)?.let { callback(newExtractorLink(name, name, it, INFER_TYPE) { this.referer = "$origin/" }); return true }
+        RE_M3U8_ATTR.find(normalized)?.groupValues?.get(1)
+            ?.let { emitHls(it, origin, headers, subtitleCallback, callback); return true }
+        RE_M3U8_ANY.find(normalized)?.groupValues?.get(1)
+            ?.let { emitHls(it, origin, headers, subtitleCallback, callback); return true }
+        RE_MP4_ATTR.find(normalized)?.groupValues?.get(1)
+            ?.let { callback(newExtractorLink(name, name, it, INFER_TYPE) { this.referer = "$origin/" }); return true }
+        RE_MP4_ANY.find(normalized)?.groupValues?.get(1)
+            ?.let { callback(newExtractorLink(name, name, it, INFER_TYPE) { this.referer = "$origin/" }); return true }
         return false
     }
 
+    // ──────────────────────────────────────────────────────────────────────
     private suspend fun tryJsonBody(
         body: String,
         origin: String,
@@ -327,9 +413,12 @@ class P2pstream : ExtractorApi() {
 
         val candidates: List<String> = listOf(
             json.optString("url"), json.optString("source"), json.optString("src"), json.optString("file"),
-            json.optString("video_url"), json.optString("videoUrl"), json.optString("stream_url"), json.optString("streamUrl"),
-            json.optJSONObject("data")?.optString("url").orEmpty(), json.optJSONObject("data")?.optString("src").orEmpty(),
-            json.optJSONObject("data")?.optString("file").orEmpty(), json.optJSONObject("result")?.optString("url").orEmpty()
+            json.optString("video_url"), json.optString("videoUrl"),
+            json.optString("stream_url"), json.optString("streamUrl"),
+            json.optJSONObject("data")?.optString("url").orEmpty(),
+            json.optJSONObject("data")?.optString("src").orEmpty(),
+            json.optJSONObject("data")?.optString("file").orEmpty(),
+            json.optJSONObject("result")?.optString("url").orEmpty()
         )
 
         val direct = candidates.firstOrNull { c -> c.isNotBlank() && (c.startsWith("http") || c.startsWith("//")) }
@@ -343,7 +432,10 @@ class P2pstream : ExtractorApi() {
             var any = false
             for (i in 0 until arr.length()) {
                 val obj = arr.optJSONObject(i) ?: continue
-                val u = obj.optString("url").ifBlank { obj.optString("file") }.ifBlank { obj.optString("src") }.ifBlank { obj.optString("link") }
+                val u = obj.optString("url")
+                    .ifBlank { obj.optString("file") }
+                    .ifBlank { obj.optString("src") }
+                    .ifBlank { obj.optString("link") }
                 if (u.isBlank()) continue
                 emitSingleUrl(normalize(u), origin, headers, subtitleCallback, callback)
                 any = true
@@ -353,25 +445,32 @@ class P2pstream : ExtractorApi() {
         return false
     }
 
-    private fun normalize(url: String): String = if (url.startsWith("//")) "https:$url" else url
+    private fun normalize(url: String): String =
+        if (url.startsWith("//")) "https:$url" else url
 
     private suspend fun emitSingleUrl(
-        url: String, origin: String, headers: Map<String, String>, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
+        url: String, origin: String, headers: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
     ) {
         if (url.contains(".m3u8")) emitHls(url, origin, headers, subtitleCallback, callback)
         else callback(newExtractorLink(name, name, url, INFER_TYPE) { this.referer = "$origin/" })
     }
 
     private suspend fun emitHls(
-        m3u8: String, origin: String, headers: Map<String, String>, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
+        m3u8: String, origin: String, headers: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
     ) {
         M3u8Helper.generateM3u8(name, m3u8, "$origin/", headers = headers).forEach(callback)
         emitSubtitlesFromM3u8(m3u8, headers, subtitleCallback)
     }
 
     private fun looksLikeSpa(html: String): Boolean =
-        html.contains("/assets/index-", ignoreCase = true) || html.contains("id=\"root\"", ignoreCase = true) ||
-            html.contains("id=\"app\"", ignoreCase = true) || html.contains("vite", ignoreCase = true)
+        html.contains("/assets/index-", ignoreCase = true) ||
+        html.contains("/static/js/", ignoreCase = true)   ||
+        html.contains("id=\"root\"", ignoreCase = true)   ||
+        html.contains("id=\"app\"", ignoreCase = true)    ||
+        html.contains("vite", ignoreCase = true)          ||
+        html.contains("<script type=\"module\"", ignoreCase = true)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
