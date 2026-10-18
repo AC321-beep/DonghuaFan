@@ -149,23 +149,16 @@ private suspend fun manualJsUnpackExtraction(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  P2pstream — handles classic packed-JS AND modern SPA (React/Vite) variants.
+//  P2pstream — classic packed-JS AND modern SPA (React/Vite) variants.
 //
-//  Classic (p2pstream.vip):
-//      https://p2pstream.vip/#{hash}       → /e/{hash}  → packed JS
+//  Classic:  https://p2pstream.vip/#{hash}         → /e/{hash}  → packed JS
+//  SPA:      https://narulplex.p2pstream.vip/#xyz  → Vite shell → REST API
 //
-//  SPA (narulplex.p2pstream.vip):
-//      https://narulplex.p2pstream.vip/#q5miiz
-//          → serves a Vite SPA shell
-//          → JS bundle calls REST API (/api/v1/video/{id}, /api/source/{id}, …)
-//          → API returns JSON with m3u8/mp4 URL
-//
-//  Detection + caching strategy:
-//    1. If we already learned a working endpoint for this origin, reuse it.
-//    2. Otherwise try classic /e/{id} (works for old subdomains).
-//    3. If we got an SPA shell back, fetch the JS bundle (cached per origin),
-//       mine it for /api/... paths, and probe them once with the video id.
-//    4. Cache whichever endpoint succeeded — no re-probing on next episode.
+//  Strategy:
+//    1. Reuse a previously-successful endpoint for this origin (fast path).
+//    2. Try classic /e/{id} (works for the original subdomains).
+//    3. If SPA shell detected, fetch the JS bundle once (cached) and probe
+//       /api/... endpoints; cache whichever endpoint worked.
 // ════════════════════════════════════════════════════════════════════════════
 class P2pstream : ExtractorApi() {
     override val name = "P2pstream"
@@ -173,28 +166,17 @@ class P2pstream : ExtractorApi() {
     override val requiresReferer = true
 
     companion object {
-        // Cache: origin → JS bundle source (fetched once).
         private val scriptCache = ConcurrentHashMap<String, String>()
-        // Cache: origin → the endpoint path we know works.
         private val workingEndpointCache = ConcurrentHashMap<String, String>()
 
-        // Endpoint paths to try, in priority order.  Cap at 6 to bound
-        // the worst-case request count when the bundle mining fails.
         private val DEFAULT_ENDPOINTS = listOf(
             "/api/v1/video", "/api/video", "/api/source",
             "/api/stream",   "/api/get",   "/api/embed",
         )
 
-        private val RE_API_PATH = Regex(
-            """["'](/api/[a-zA-Z0-9_\-/]{2,60})["']"""
-        )
-        // Full-URL APIs (some deployments use a different subdomain).
-        private val RE_API_URL = Regex(
-            """["'](https?://api\.[^"']+?/[a-zA-Z0-9_\-/]{2,60})["']"""
-        )
-        private val RE_JS_BUNDLE = Regex(
-            """src=["']([^"']*?/assets/index-[^"']+\.js)["']"""
-        )
+        private val RE_API_PATH = Regex("""["'](/api/[a-zA-Z0-9_\-/]{2,60})["']""")
+        private val RE_API_URL = Regex("""["'](https?://api\.[^"']+?/[a-zA-Z0-9_\-/]{2,60})["']""")
+        private val RE_JS_BUNDLE = Regex("""src=["']([^"']*?/assets/index-[^"']+\.js)["']""")
     }
 
     override suspend fun getUrl(
@@ -204,7 +186,6 @@ class P2pstream : ExtractorApi() {
         callback: (ExtractorLink) -> Unit,
     ) {
         val origin = originOf(url) ?: return
-        // Strip the &dl=1 flag so play/download resolve to the same video.
         val id = url.substringAfter("#", "").substringBefore("&").trim()
         if (id.isBlank()) return
 
@@ -214,12 +195,12 @@ class P2pstream : ExtractorApi() {
             "User-Agent" to DEFAULT_UA,
         )
 
-        // 1) Fast path: a previously successful endpoint for this origin.
+        // Fast path — a previously successful endpoint for this origin.
         workingEndpointCache[origin]?.let { ep ->
             if (probeEndpoint(origin, ep, id, headers, subtitleCallback, callback)) return
         }
 
-        // 2) Classic packed-JS extraction.
+        // Classic packed-JS.
         val classicUrl = "$origin/e/$id"
         val classicBody = try {
             app.get(classicUrl, headers = headers).text
@@ -231,18 +212,15 @@ class P2pstream : ExtractorApi() {
                 manualJsUnpackExtraction(classicUrl, name, headers, subtitleCallback, callback)
                 return
             }
-            // Not packed. Could still be a JSON redirect, a direct m3u8, or
-            // an SPA shell. Try direct m3u8/mp4 first — cheap.
             if (tryDirectMedia(classicBody, origin, headers, subtitleCallback, callback)) return
         }
 
-        // 3) SPA API probing.
+        // SPA.
         val html = classicBody ?: try {
             app.get("$origin/", headers = headers).text
         } catch (_: Exception) { null } ?: return
 
         if (!looksLikeSpa(html)) {
-            // Neither packed JS nor SPA — give up cleanly.
             println("[P2pstream] $origin → unknown shape, no links emitted")
             return
         }
@@ -251,7 +229,6 @@ class P2pstream : ExtractorApi() {
         trySpaApi(origin, id, html, headers, subtitleCallback, callback)
     }
 
-    // ── SPA path ───────────────────────────────────────────────────────
     private suspend fun trySpaApi(
         origin: String,
         id: String,
@@ -261,15 +238,18 @@ class P2pstream : ExtractorApi() {
         callback: (ExtractorLink) -> Unit,
     ) {
         val jsUrl = RE_JS_BUNDLE.find(shellHtml)?.groupValues?.get(1)
-            ?.let { if (it.startsWith("http")) it else "$origin${if (it.startsWith("/")) "" else "/"}$it" }
+            ?.let {
+                if (it.startsWith("http")) it
+                else if (it.startsWith("/")) "$origin$it"
+                else "$origin/$it"
+            }
             ?: "$origin/assets/index.js"
 
         val js = scriptCache[origin] ?: try {
             app.get(jsUrl, headers = headers).text.also { scriptCache[origin] = it }
         } catch (_: Exception) { null } ?: return
 
-        // Build the endpoint candidate list: JS-derived first, then defaults.
-        val fromJs = buildList {
+        val fromJs = buildList<String> {
             RE_API_PATH.findAll(js).map { it.groupValues[1] }.distinct().forEach { path ->
                 if (listOf("video", "source", "stream", "get", "embed", "player")
                         .any { path.contains(it, true) }) {
@@ -295,7 +275,6 @@ class P2pstream : ExtractorApi() {
         println("[P2pstream] $origin → all endpoints failed")
     }
 
-    /** Probe a single endpoint with 4 common param names. Returns true on success. */
     private suspend fun probeEndpoint(
         origin: String,
         endpoint: String,
@@ -304,10 +283,11 @@ class P2pstream : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        // Absolute URL (from JS mining) vs. relative path.
-        val baseUrl = if (endpoint.startsWith("http")) endpoint
-                      else if (endpoint.startsWith("/")) "$origin$endpoint"
-                      else "$origin/$endpoint"
+        val baseUrl = when {
+            endpoint.startsWith("http") -> endpoint
+            endpoint.startsWith("/")    -> "$origin$endpoint"
+            else                        -> "$origin/$endpoint"
+        }
 
         for (param in listOf("id", "hash", "v", "vid")) {
             val u = if (baseUrl.contains('?')) "$baseUrl&$param=$id"
@@ -322,7 +302,6 @@ class P2pstream : ExtractorApi() {
         return false
     }
 
-    // ── Parsers ────────────────────────────────────────────────────────
     private suspend fun tryDirectMedia(
         text: String,
         origin: String,
@@ -330,7 +309,6 @@ class P2pstream : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        // Skip huge SPA shells early — no point scanning megabytes.
         if (text.length > 500_000) return false
         val normalized = text.replace("\\/", "/")
 
@@ -357,6 +335,14 @@ class P2pstream : ExtractorApi() {
         return false
     }
 
+    /**
+     * Parse a JSON body for a video URL.
+     *
+     * The candidate list is built with `.orEmpty()` on every nullable
+     * expression so the list is statically `List<String>` — this avoids
+     * the "only safe calls on String?" smart-cast error inside the
+     * `firstOrNull {}` predicate.
+     */
     private suspend fun tryJsonBody(
         body: String,
         origin: String,
@@ -367,8 +353,7 @@ class P2pstream : ExtractorApi() {
         if (!body.trimStart().startsWith("{")) return false
         val json = try { JSONObject(body) } catch (_: Exception) { return false }
 
-        // Direct string fields.
-        val direct = sequenceOf(
+        val candidates: List<String> = listOf(
             json.optString("url"),
             json.optString("source"),
             json.optString("src"),
@@ -377,18 +362,21 @@ class P2pstream : ExtractorApi() {
             json.optString("videoUrl"),
             json.optString("stream_url"),
             json.optString("streamUrl"),
-            json.optJSONObject("data")?.optString("url"),
-            json.optJSONObject("data")?.optString("src"),
-            json.optJSONObject("data")?.optString("file"),
-            json.optJSONObject("result")?.optString("url"),
-        ).firstOrNull { it.isNotBlank() && (it.startsWith("http") || it.startsWith("//")) }
+            json.optJSONObject("data")?.optString("url").orEmpty(),
+            json.optJSONObject("data")?.optString("src").orEmpty(),
+            json.optJSONObject("data")?.optString("file").orEmpty(),
+            json.optJSONObject("result")?.optString("url").orEmpty(),
+        )
+
+        val direct: String? = candidates.firstOrNull { c ->
+            c.isNotBlank() && (c.startsWith("http") || c.startsWith("//"))
+        }
 
         if (!direct.isNullOrBlank()) {
             emitSingleUrl(normalize(direct), origin, headers, subtitleCallback, callback)
             return true
         }
 
-        // Array shapes.
         for (key in listOf("streams", "sources", "links", "videos", "mirrors")) {
             val arr = json.optJSONArray(key) ?: continue
             var any = false
@@ -407,10 +395,7 @@ class P2pstream : ExtractorApi() {
     }
 
     private fun normalize(url: String): String =
-        when {
-            url.startsWith("//") -> "https:$url"
-            else                 -> url
-        }
+        if (url.startsWith("//")) "https:$url" else url
 
     private suspend fun emitSingleUrl(
         url: String,
