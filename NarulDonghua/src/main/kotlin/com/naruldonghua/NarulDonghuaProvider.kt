@@ -70,10 +70,6 @@ class NarulDonghuaProvider : MainAPI() {
         "article.bs, div.swiper-slide.item:not(.swiper-slide-duplicate)"
 
     // ── Categories ───────────────────────────────────────────────────────
-    // "Latest Release" merges order=update (new episodes) and order=latest
-    // (new series). Merged only on page 1 to prevent cross-page duplicates;
-    // pages 2+ use the primary sort (order=update) so every page is strictly
-    // monotonic.
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update||anime/?status=&type=&order=latest"
                                                     to "Latest Release",
@@ -86,11 +82,6 @@ class NarulDonghuaProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val sources = request.data.split("||")
-
-        // Merge feeds ONLY on page 1. Beyond page 1 the two sorts diverge,
-        // so page N of order=latest frequently re-surfaces items that
-        // order=update already showed at page N-1. Pages 2+ use the
-        // primary sort.
         val effectiveSources = if (page == 1) sources else sources.take(1)
         val bustCache = effectiveSources.size > 1
         val urls = effectiveSources.map { buildPagedUrl(it, page, bustCache) }
@@ -113,9 +104,6 @@ class NarulDonghuaProvider : MainAPI() {
             }
             .distinctBy { it.url }
 
-        // Trust the theme's own "Next" link (<a class="r">Next</a> inside
-        // .hpage) — rendered only when a further page actually exists.
-        // Falls back to "items non-empty" if the theme markup ever changes.
         val hasNext = docs.any { (_, doc) ->
             doc?.selectFirst(".hpage a.r") != null
         } || items.isNotEmpty()
@@ -124,42 +112,22 @@ class NarulDonghuaProvider : MainAPI() {
         return newHomePageResponse(request.name, items, hasNext = hasNext)
     }
 
-    /**
-     * Build a paginated URL.
-     *
-     * Two pagination schemes are in play on this site:
-     *   • Unfiltered archives (/anime/page/N/) — the theme's archive template
-     *     reads `paged` from the pretty path.
-     *   • Filtered views (/anime/?status=&type=&order=…) — the theme serves
-     *     these from a static page template (page-anime.php), which does
-     *     NOT process the pretty `/page/N/` segment and silently returns
-     *     page 1 forever.
-     *
-     * For filtered URLs we therefore send `?paged=N&page=N` as query vars.
-     * WordPress's WP_Query populates `paged` from the query string for
-     * both archive templates and static page templates, so this works
-     * uniformly across all categories.
-     */
     private fun buildPagedUrl(data: String, page: Int, bustCache: Boolean = false): String {
         val q = data.indexOf('?')
         val rawPath = if (q == -1) data else data.substring(0, q)
         val path = rawPath.trim('/')
         val query = if (q == -1) "" else data.substring(q + 1)
-
         val useQueryPagination = query.isNotEmpty()
 
         return buildString {
             append(mainUrl).append('/')
             if (path.isNotEmpty()) append(path).append('/')
-
-            // Only use the pretty path form when there's no filter query.
             if (!useQueryPagination && page > 1) append("page/$page/")
-
             val qs = buildList {
                 if (query.isNotEmpty()) add(query)
                 if (useQueryPagination && page > 1) {
                     add("paged=$page")
-                    add("page=$page")   // static page templates read this one
+                    add("page=$page")
                 }
                 if (bustCache) add("_=${System.currentTimeMillis()}")
             }.joinToString("&")
@@ -214,8 +182,6 @@ class NarulDonghuaProvider : MainAPI() {
         return coroutineScope {
             (1..2).map { page ->
                 async {
-                    // Search pages also use query-var pagination on this
-                    // theme (page/2/?s=… fails identically to the archive).
                     val url = if (page == 1) "$mainUrl/?s=$encoded"
                               else "$mainUrl/?s=$encoded&paged=$page&page=$page"
                     fetch(url)?.select(cardSelector)
@@ -227,9 +193,6 @@ class NarulDonghuaProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        // Bust LiteSpeed cache — per-episode pages can lag behind the
-        // published episode list by minutes; fresh fetch guarantees the
-        // sidebar includes the latest episode (e.g. 215).
         val doc = fetch(withCacheBust(url)) ?: fetch(url)
         if (doc == null) {
             println("[NarulDonghua] load($url) — fetch=NULL (header/Cloudflare block?)")
@@ -272,7 +235,6 @@ class NarulDonghuaProvider : MainAPI() {
             }
         }
 
-        // Fallback: fetch the canonical series page (fresh).
         if (epNodes.isEmpty() && seriesUrl != url) {
             val seriesDoc = fetch(withCacheBust(seriesUrl)) ?: fetch(seriesUrl)
             if (seriesDoc != null) {
@@ -300,8 +262,6 @@ class NarulDonghuaProvider : MainAPI() {
                 ?: href.substringAfterLast('/', "").replace("-", " ")
                     .split(" ").joinToString(" ") { w -> w.replaceFirstChar { it.uppercase() } }
 
-            // Number priority: URL slug first (site has mislabeled spans like
-            // "Eps 112" on Ep 113), then the .playinfo span.
             val epNum = Regex("""episode-(\d+)-""", RegexOption.IGNORE_CASE)
                 .find(href)?.groupValues?.getOrNull(1)?.toIntOrNull()
                 ?: Regex("""(?:Eps?|Episode)\s*(\d+)""", RegexOption.IGNORE_CASE)
@@ -315,8 +275,6 @@ class NarulDonghuaProvider : MainAPI() {
             }
         }
             .distinctBy { it.data }
-            // Descending — newest (215) at the top, matching the site's own
-            // display order and what users expect for an ongoing series.
             .sortedByDescending { it.episode ?: 0 }
 
         println("[NarulDonghua] load($url) — '${seriesName.ifBlank { entryTitle }}' : ${episodes.size} episodes")
@@ -333,7 +291,6 @@ class NarulDonghuaProvider : MainAPI() {
                     this.plot = plot
                 }
             }
-            // Single playable episode rather than an empty TV card.
             return newTvSeriesLoadResponse(
                 seriesName.ifBlank { entryTitle }, url, TvType.Movie, listOf(
                     newEpisode(url) { this.name = entryTitle.ifBlank { url }; this.posterUrl = poster }
@@ -455,9 +412,11 @@ class NarulDonghuaProvider : MainAPI() {
                     if (raw.isBlank()) null else Pair(raw, option.text().trim())
                 }
 
+            // Unescape slashes BEFORE regex — some URLs are stored as `https:\/\/…`
+            val htmlUnescaped = doc.html().replace("\\/", "/")
             val rawEmbeds = Regex("""(?:https?:)?//[^"'\s<>]+""")
-                .findAll(doc.html())
-                .map { it.value.replace("\\/", "/") }
+                .findAll(htmlUnescaped)
+                .map { it.value }
                 .filter { u ->
                     !isAdUrl(u) && listOf(
                         "embed", "player", "stream", "mirror",
@@ -481,16 +440,13 @@ class NarulDonghuaProvider : MainAPI() {
             rawEmbeds.map { url -> async { resolve(url, "Raw") } }.awaitAll()
         }
 
+        // Download links from .soraurlx — route through resolve() so the
+        // correct extractor (Byse, Plex, …) handles them instead of trying
+        // to play the wrapper URL as a video.
         doc.select(".soradl .soraurlx a[href], .mctnx .soraurlx a[href]")
             .map { it.attr("href").trim() to it.text().trim() }
             .filter { (href, _) -> href.startsWith("http") && !isAdUrl(href) }
-            .forEach { (href, label) ->
-                if (emittedLinks.add(href)) {
-                    callback(newExtractorLink(
-                        "Download", "Download ($label)", href, ExtractorLinkType.VIDEO
-                    ) { this.referer = mainUrl })
-                }
-            }
+            .forEach { (href, label) -> resolve(href, "DL-$label") }
 
         Log.e("Narul/Prov", "=== loadLinks END total links=${emittedLinks.size}")
         return emittedLinks.isNotEmpty()
@@ -611,7 +567,6 @@ class NarulDonghuaProvider : MainAPI() {
             return false
         }
 
-        // ── 3. Single "Dailymotion" entry — no (geo)/(api) suffix ──────────
         Log.e("Narul/DM", "EMITTING single 'Dailymotion' m3u8=$m3u8Url")
         callback(newExtractorLink(
             "Dailymotion", "Dailymotion",
@@ -657,7 +612,13 @@ class NarulDonghuaProvider : MainAPI() {
     ).any { url.contains(it, true) }
 
     private fun normalizeUrl(raw: String): String? {
-        val s = raw.trim().replace("\\/", "/")
+        var s = raw.trim().replace("\\/", "/")
+        if (s.startsWith("\"") && s.endsWith("\"") && s.length > 1) {
+            s = s.substring(1, s.length - 1)
+        }
+        if (s.startsWith("'") && s.endsWith("'") && s.length > 1) {
+            s = s.substring(1, s.length - 1)
+        }
         if (s.isBlank()) return null
         return when {
             s.startsWith("//")   -> "https:$s"
