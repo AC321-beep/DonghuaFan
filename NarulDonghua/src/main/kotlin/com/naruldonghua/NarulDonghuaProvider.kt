@@ -20,7 +20,7 @@ import java.util.concurrent.ConcurrentHashMap
 
 class NarulDonghuaProvider : MainAPI() {
     override var mainUrl = "https://naruldonghua.com"
-    override var name = "Narul Donghua"
+    override var name = "NarulDonghua"
     override val hasMainPage = true
     override var lang = "en"
     override val hasDownloadSupport = true
