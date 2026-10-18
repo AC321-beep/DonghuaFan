@@ -26,8 +26,10 @@ class NarulDonghuaProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
-    // ✅ FIX: match the HAR exactly — desktop Chrome UA, no Origin on GET,
-    // add Sec-Ch-Ua/Sec-Fetch headers (Cloudflare checks for these).
+    // Headers matching the real browser's HAR exactly:
+    //  • Chrome desktop UA
+    //  • Sec-Ch-Ua* + Sec-Fetch-* trio (Cloudflare checks for these)
+    //  • No Origin on GET (was triggering bot flags)
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -46,36 +48,53 @@ class NarulDonghuaProvider : MainAPI() {
         "Cache-Control" to "no-cache",
         "Pragma" to "no-cache",
         "Referer" to "$mainUrl/",
-        // ✅ Removed "Origin" — was triggering Cloudflare bot flags on GET
     )
 
     private suspend fun fetch(url: String, timeoutMs: Long = 15_000L): Document? =
         try {
             withTimeoutOrNull(timeoutMs) { app.get(url, headers = defaultHeaders).document }
-        } catch (e: CancellationException) { throw e }
-        catch (_: Exception) { null }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
 
+    // Handles both grid cards (article.bs) AND the hero slider (div.swiper-slide.item).
+    // Skips swiper's infinite-loop duplicates so each slider item appears once.
     private val cardSelector =
-        "div.listupd article.bs, div.listupd .bsx, div.bsx, article.bs, .excstf > article"
+        "article.bs, div.swiper-slide.item:not(.swiper-slide-duplicate)"
 
+    // Categories driven by the site's own filter form (action = /anime).
+    // All URLs here are produced by the site's real "Search" button.
     override val mainPage = mainPageOf(
-        "" to "Home",
-        "ongoing/" to "Ongoing",
-        "completed/" to "Completed",
-        "upcoming/" to "Upcoming",
-        "comic-series/" to "Comic Series",
+        "anime/?status=&type=&order=update"          to "Latest Release",
+        "anime/?status=&type=movie&order=update"     to "Movie",
+        "anime/?status=&type=&order=popular"         to "Popular",
+        "anime/?status=&type=&order=latest"          to "Latest Added",
+        "anime/?status=completed&type=&order=update" to "Completed",
+        "anime/?status=&type=ona&order=update"       to "Donghua (ONA)",
+        "anime/?status=&type=ova&order=update"       to "Comic",
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val doc = fetch(buildPagedUrl(request.data, page))
-            ?: return newHomePageResponse(request.name, emptyList())
-        val items = doc.select(cardSelector)
+        val url = buildPagedUrl(request.data, page)
+        val doc = fetch(url)
+        if (doc == null) {
+            println("[NarulDonghua] getMainPage('${request.name}', p$page) → fetch=NULL ($url)")
+            return newHomePageResponse(request.name, emptyList())
+        }
+
+        val allCards = doc.select(cardSelector)
+        val items = allCards
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
-        println("[NarulDonghua] main '${request.name}' p$page : ${items.size} items")
+
+        println("[NarulDonghua] getMainPage('${request.name}', p$page) → $url")
+        println("[NarulDonghua]   selector matched ${allCards.size} nodes, ${items.size} unique items")
         return newHomePageResponse(request.name, items)
     }
 
+    // WordPress path-style pagination: /anime/page/N/?query (page BEFORE query).
     private fun buildPagedUrl(data: String, page: Int): String {
         val q = data.indexOf('?')
         val rawPath = if (q == -1) data else data.substring(0, q)
@@ -92,16 +111,50 @@ class NarulDonghuaProvider : MainAPI() {
     private fun Element.toSearchResult(): SearchResponse? {
         val link = selectFirst("a[href]") ?: return null
         val href = fixUrlNull(link.attr("href")) ?: return null
-        if (href == mainUrl || href.contains("/genres/")) return null
+
+        // Skip all non-content link paths.
+        if (href == mainUrl ||
+            href.contains("/genres/") ||
+            href.contains("/anime/?") ||
+            href.contains("/network/") ||
+            href.contains("/studio/") ||
+            href.contains("/season/") ||
+            href.contains("/country/") ||
+            href.contains("/author/") ||
+            href.contains("/page/") ||
+            href.contains("/a-z/") ||
+            href.contains("/feed/") ||
+            href.contains("/wp-") ||
+            href.contains("?p=")
+        ) return null
+
+        // Title priority:
+        //  1. .tt ownText  → grid cards (series name)
+        //  2. .info h2 a   → slider cards
+        //  3. a[data-jtitle] → slider fallback attribute
+        //  4. a[title]     → grid fallback (full episode title)
+        //  5. .tt h2 / h2  → last resort
         val title = selectFirst(".tt")?.ownText()?.trim().takeUnless { it.isNullOrBlank() }
+            ?: selectFirst(".info h2 a")?.text()?.trim().takeUnless { it.isNullOrBlank() }
+            ?: selectFirst("a[data-jtitle]")?.attr("data-jtitle")?.trim()?.takeIf { it.isNotBlank() }
             ?: link.attr("title").trim().takeIf { it.isNotBlank() }
+            ?: selectFirst(".tt h2, h2")?.text()?.trim().takeUnless { it.isNullOrBlank() }
             ?: return null
+
+        // Poster: grid uses <img data-src>; slider uses .backdrop inline style.
         val poster = selectFirst("img")?.let { img ->
             sequenceOf("data-src", "data-lazy-src", "src")
                 .map { img.attr(it) }
                 .firstOrNull { it.isNotBlank() && !it.startsWith("data:") }
                 ?.let { fixUrlNull(it) }
+        } ?: selectFirst(".backdrop[style]")?.let { div ->
+            Regex("""url\(['"]?(.*?)['"]?\)""")
+                .find(div.attr("style"))
+                ?.groupValues?.get(1)
+                ?.takeIf { it.isNotBlank() }
+                ?.let { fixUrlNull(it) }
         }
+
         return newMovieSearchResponse(title, href, TvType.Movie) { posterUrl = poster }
     }
 
@@ -120,9 +173,6 @@ class NarulDonghuaProvider : MainAPI() {
         }
     }
 
-    // ✅ FIX: multi-selector episode discovery — handles both
-    //    • Episode pages (`.episodelist li`)   ← verified in current HTML
-    //    • Series pages  (`.eplister li`)       ← used by /shrouding-the-heavens/ etc.
     override suspend fun load(url: String): LoadResponse {
         val doc = fetch(url)
         if (doc == null) {
@@ -149,12 +199,13 @@ class NarulDonghuaProvider : MainAPI() {
         ).mapNotNull { it?.takeIf { s -> s.isNotBlank() }?.let { fixUrlNull(it) } }
             .firstOrNull() ?: url
 
-        // ✅ Multi-selector: first non-empty wins
+        // Multi-selector discovery — handles both episode pages (.episodelist)
+        // AND series pages (.eplister / .listupd article.bs).
         val selectors = listOf(
-            ".episodelist li",              // episode-page list — verified in your HTML
-            ".eplister li",                 // series-page list — used by Popular cards
-            ".bixbox .listupd article.bs",  // series-page grid variant
-            ".listupd article.bs",          // generic card grid
+            ".episodelist li",
+            ".eplister li",
+            ".bixbox .listupd article.bs",
+            ".listupd article.bs",
         )
 
         var epNodes: List<Element> = emptyList()
@@ -168,7 +219,7 @@ class NarulDonghuaProvider : MainAPI() {
         }
 
         // If we're on an episode page and its list is empty, retry with the
-        // canonical series URL (which may have the actual episode grid).
+        // canonical series URL (which has the actual episode grid).
         if (epNodes.isEmpty() && seriesUrl != url) {
             val seriesDoc = fetch(seriesUrl)
             if (seriesDoc != null) {
@@ -183,11 +234,9 @@ class NarulDonghuaProvider : MainAPI() {
             }
         }
 
-        // Parse each li/article into an Episode
         val episodes = epNodes.mapNotNull { node ->
             val a = node.selectFirst("a[href]") ?: return@mapNotNull null
             val href = fixUrlNull(a.attr("href")) ?: return@mapNotNull null
-            // Skip nav/menu links picked up by loose selectors
             if (href == mainUrl || href.contains("/genres/") || href.contains("/anime/?"))
                 return@mapNotNull null
 
@@ -214,7 +263,6 @@ class NarulDonghuaProvider : MainAPI() {
         println("[NarulDonghua] load($url) — '${seriesName.ifBlank { entryTitle }}' : ${episodes.size} episodes")
 
         if (episodes.isEmpty()) {
-            // Fallback: if page has a player but no list, treat as single video
             val hasPlayer = doc.selectFirst(
                 "#embed_holder iframe, .video-content iframe, .player-embed iframe"
             ) != null
@@ -226,7 +274,7 @@ class NarulDonghuaProvider : MainAPI() {
                     this.plot = plot
                 }
             }
-            println("[NarulDonghua] load($url) — NO EPISODES, NO PLAYER (page may be empty)")
+            println("[NarulDonghua] load($url) — NO EPISODES, NO PLAYER")
         }
 
         return newTvSeriesLoadResponse(
@@ -237,7 +285,6 @@ class NarulDonghuaProvider : MainAPI() {
         }
     }
 
-    // ─── loadLinks: unchanged except for one extra guard on empty doc ──────
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -354,7 +401,7 @@ class NarulDonghuaProvider : MainAPI() {
         return emittedLinks.isNotEmpty()
     }
 
-    // ─── Dailymotion (unchanged, verified via HAR) ─────────────────────────
+    // ─── Dailymotion ──────────────────────────────────────────────────────
     private fun isDailymotionUrl(url: String) =
         url.contains("dailymotion.com", true) || url.contains("dai.ly", true)
 
