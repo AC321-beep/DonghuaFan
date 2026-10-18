@@ -1,5 +1,6 @@
 package com.naruldonghua
 
+import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
@@ -244,7 +245,7 @@ private suspend fun manualJsUnpackExtraction(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  Plex  (P2pstream / narulplex) — SPA-aware
+//  Plex  (P2pstream / narulplex) — SPA + encrypted payload
 // ════════════════════════════════════════════════════════════════════════════
 class P2pstream : ExtractorApi() {
     override val name = "Plex"
@@ -257,77 +258,53 @@ class P2pstream : ExtractorApi() {
         private val workingEndpointCache = ConcurrentHashMap<String, String>()
         private val workingEntryCache = ConcurrentHashMap<String, String>()
 
-        // Proven entry first (from your log: ?v= returns the real SPA shell)
-        private val ENTRY_TEMPLATES = listOf(
-            "/?v={id}",
-            "/?id={id}",
-            "/?hash={id}",
-            "/?video={id}",
-            "/?h={id}",
-            "/{id}",
-            "/embed/{id}",
-            "/e/{id}",
+        // Priority 1 — proven in logcat: /api/v1/video?id=f1u519 → 200 + encrypted payload
+        private val KNOWN_ENDPOINTS = listOf(
+            "/api/v1/video?id={id}",
+            "/api/v1/video?hash={id}",
+            "/api/video?id={id}",
+            "/api/v1/source?id={id}",
+            "/api/source?id={id}",
         )
 
-        // Endpoint templates — {id} substituted
-        private val ENDPOINT_TEMPLATES = listOf(
-            // Query style
-            "/api/v1/sources?id={id}",
-            "/api/v1/source?id={id}",
-            "/api/v1/video?id={id}",
-            "/api/v1/sources?hash={id}",
-            "/api/v1/source?hash={id}",
-            "/api/v1/video?hash={id}",
-            "/api/sources?id={id}",
-            "/api/source?id={id}",
-            "/api/video?id={id}",
-            "/api/sources?hash={id}",
-            "/api/source?hash={id}",
-            "/api/video?hash={id}",
-            "/api/resolve?id={id}",
-            "/api/fetch?id={id}",
-            "/api/embed?id={id}",
-            // Path style
-            "/api/v1/sources/{id}",
-            "/api/v1/source/{id}",
-            "/api/v1/video/{id}",
-            "/api/sources/{id}",
-            "/api/source/{id}",
-            "/api/video/{id}",
-            "/api/embed/{id}",
-            "/source/{id}",
-            "/v1/source/{id}",
-            "/v1/video/{id}",
-            "/embed2/{id}",
-            "/play/{id}",
+        private val ENTRY_TEMPLATES = listOf(
+            "/?v={id}", "/?id={id}", "/{id}",
+        )
+
+        // enc-dec.app decoder endpoints — try all, skip 404s silently
+        private val DECODERS = listOf(
+            "dec-vidsrc", "dec-streamtape", "dec-vidlink", "dec-rapid",
+            "dec-vidstack", "dec-abyss", "dec-mega", "dec-voe",
+            "dec-p2pstream", "dec-plex",
         )
 
         private val RE_SCRIPT_SRC = Regex(
             """<script[^>]+src=["']([^"']+\.js[^"']*)["']""",
             RegexOption.IGNORE_CASE
         )
-        // ✓ FIXED: allow backticks AND trailing `${` in minified Vite bundles
         private val RE_API_PATH = Regex(
-            """["'`](/(?:api|v1|v2|ajax|embed|source|video|link|stream|resolve|fetch|play)/[a-zA-Z0-9_\-/.]{2,100})["'`$]""",
+            """["'`](/(?:api|v1|v2|ajax|embed|source|video|link|stream|resolve|fetch|play)/[a-zA-Z0-9_\-/.]{2,100})["'`]""",
             RegexOption.IGNORE_CASE
         )
-        // Template-literal prefixes: /api/video/${hash} → capture "/api/video"
         private val RE_TEMPLATE_PATH = Regex(
             """["'`](/[a-zA-Z0-9_\-./]{2,80}?)/?\$\{[^}]+\}"""
         )
-        private val RE_FULL_URL = Regex(
-            """["'`](https?://[a-zA-Z0-9_\-./:]{5,200})["'`]"""
-        )
         private val JSON_TYPE = "application/json; charset=utf-8".toMediaTypeOrNull()
+
+        private val RE_HEX    = Regex("^[0-9a-fA-F]{100,}$")
+        private val RE_BASE64 = Regex("^[A-Za-z0-9+/=_-]{200,}$")
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    private enum class ProbeResult { FOUND, PAYLOAD_UNKNOWN, NOT_FOUND, RATE_LIMITED, ERROR }
 
     // ────────────────────────────────────────────────────────────────────
     private fun looksLikeSpa(html: String): Boolean {
         if (html.length < 300) return false
         if (isErrorPage(html)) return false
 
-        val hasRoot  = html.contains("id=\"root\"") || html.contains("id=\"app\"")
-        val hasVite  = html.contains("/assets/index-") || html.contains("/assets/main-")
+        val hasRoot = html.contains("id=\"root\"") || html.contains("id=\"app\"")
+        val hasVite = html.contains("/assets/index-") || html.contains("/assets/main-")
         val hasBundle = RE_SCRIPT_SRC.findAll(html).any { m ->
             val s = m.groupValues[1]
             s.endsWith(".js", true) &&
@@ -362,192 +339,89 @@ class P2pstream : ExtractorApi() {
             "Accept-Language" to "en-US,en;q=0.9",
         )
 
-        // Fast path
-        workingEndpointCache[origin]?.let { ep ->
-            Log.e(TAG, "FAST-PATH template=$ep")
-            if (probeEndpoint(origin, ep, id, headers, subtitleCallback, callback)) return
-            workingEndpointCache.remove(origin)
+        // ── Fast path: cached endpoint ───────────────────────────────
+        workingEndpointCache[origin]?.let { cached ->
+            Log.e(TAG, "FAST-PATH $cached")
+            when (probeEndpoint(origin, cached, id, headers, subtitleCallback, callback)) {
+                ProbeResult.FOUND, ProbeResult.PAYLOAD_UNKNOWN -> return
+                ProbeResult.RATE_LIMITED -> { Log.e(TAG, "⚠ rate-limited on fast path"); return }
+                else -> workingEndpointCache.remove(origin)
+            }
         }
 
-        // ── Find working SPA shell ─────────────────────────────────────
+        // ── Priority 1: known working endpoints ──────────────────────
+        for (template in KNOWN_ENDPOINTS) {
+            when (probeEndpoint(origin, template, id, headers, subtitleCallback, callback)) {
+                ProbeResult.FOUND -> { workingEndpointCache[origin] = template; return }
+                ProbeResult.PAYLOAD_UNKNOWN -> { workingEndpointCache[origin] = template; return }
+                ProbeResult.RATE_LIMITED -> { Log.e(TAG, "⚠ rate-limited — aborting"); return }
+                else -> { /* next */ }
+            }
+        }
+
+        // ── Priority 2: SPA shell discovery ──────────────────────────
+        Log.e(TAG, "Known endpoints exhausted; fetching SPA shell")
         val cachedEntry = workingEntryCache[origin]
-        val entries = if (cachedEntry != null) listOf(cachedEntry) + ENTRY_TEMPLATES
-                      else ENTRY_TEMPLATES
+        val entries = if (cachedEntry != null) listOf(cachedEntry) + ENTRY_TEMPLATES else ENTRY_TEMPLATES
 
         var shell: String? = null
-        var shellUrl: String? = null
-
         for (tmpl in entries.distinct()) {
             val path = tmpl.replace("{id}", id)
             val fullUrl = "$origin$path"
-            Log.e(TAG, "→ try $fullUrl")
+            Log.e(TAG, "→ shell try $fullUrl")
 
             val resp = try { app.get(fullUrl, headers = headers) } catch (e: Exception) {
                 Log.e(TAG, "  fail: ${e.message}"); continue
             }
-            val body = resp.text
-            Log.e(TAG, "  status=${resp.code} len=${body.length}")
+            if (resp.code == 429) { Log.e(TAG, "  ⚠ rate-limited"); return }
+            if (resp.code != 200) { Log.e(TAG, "  skip HTTP ${resp.code}"); continue }
+            if (isErrorPage(resp.text)) { Log.e(TAG, "  skip error"); continue }
+            if (!looksLikeSpa(resp.text)) { Log.e(TAG, "  not SPA"); continue }
 
-            if (resp.code != 200) { Log.e(TAG, "  skip: HTTP ${resp.code}"); continue }
-            if (isErrorPage(body)) { Log.e(TAG, "  skip: error page"); continue }
-
-            if (RE_PACKED_SCRIPT.containsMatchIn(body)) {
-                Log.e(TAG, "  packed JS → extract")
-                if (manualJsUnpackExtraction(fullUrl, name, headers, subtitleCallback, callback)) return
-            }
-            if (tryDirectMedia(body, origin, headers, subtitleCallback, callback)) return
-
-            if (looksLikeSpa(body)) {
-                shell = body
-                shellUrl = fullUrl
-                workingEntryCache[origin] = tmpl
-                Log.e(TAG, "  ✓ SPA shell (cached entry=$tmpl)")
-                break
-            }
+            shell = resp.text
+            workingEntryCache[origin] = tmpl
+            Log.e(TAG, "  ✓ SPA shell ($fullUrl)")
+            break
         }
 
         if (shell == null) {
-            Log.e(TAG, "✗ No working SPA shell")
+            Log.e(TAG, "✗ No SPA shell — site unreachable or blocked")
             return
         }
 
-        Log.e(TAG, "Probing API (shell=$shellUrl)")
-        trySpaApi(origin, id, shell, headers, subtitleCallback, callback)
-    }
-
-    // ────────────────────────────────────────────────────────────────────
-    private suspend fun trySpaApi(
-        origin: String,
-        id: String,
-        shellHtml: String,
-        headers: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-    ) {
-        val jsUrl = findMainJsUrl(shellHtml, origin)
+        // ── Discover extra endpoints from JS bundle ──────────────────
+        val jsUrl = findMainJsUrl(shell, origin)
         Log.e(TAG, "jsUrl=$jsUrl")
 
-        val js = if (jsUrl != null) {
-            scriptCache[origin] ?: try {
+        val fromJs = if (jsUrl != null) {
+            val js = scriptCache[origin] ?: try {
                 val r = app.get(jsUrl, headers = headers)
                 if (r.code == 200 && !isErrorPage(r.text)) r.text.also { scriptCache[origin] = it }
                 else null
             } catch (_: Exception) { null }
-        } else null
 
-        if (js != null) {
-            Log.e(TAG, "JS length=${js.length}")
-            dumpInterestingJs(js)
-        } else {
-            Log.e(TAG, "no JS bundle → default endpoints only")
-        }
+            if (js != null) {
+                Log.e(TAG, "JS length=${js.length}")
+                dumpInterestingJs(js)
+                discoverEndpointsFromJs(js)
+            } else emptyList()
+        } else emptyList()
 
-        val fromJs = if (js != null) discoverEndpointsFromJs(js) else emptyList()
-        Log.e(TAG, "JS endpoints (${fromJs.size}): $fromJs")
+        Log.e(TAG, "JS-discovered endpoints (${fromJs.size}): $fromJs")
 
-        val candidates = (fromJs + ENDPOINT_TEMPLATES).distinct()
+        val candidates = (fromJs + KNOWN_ENDPOINTS).distinct().take(10)
         Log.e(TAG, "Probing ${candidates.size} templates")
 
-        for (tmpl in candidates) {
-            if (probeEndpoint(origin, tmpl, id, headers, subtitleCallback, callback)) {
-                workingEndpointCache[origin] = tmpl
-                Log.e(TAG, "✓ WORKING template: $tmpl")
-                return
+        for (template in candidates) {
+            when (probeEndpoint(origin, template, id, headers, subtitleCallback, callback)) {
+                ProbeResult.FOUND -> { workingEndpointCache[origin] = template; return }
+                ProbeResult.PAYLOAD_UNKNOWN -> { workingEndpointCache[origin] = template; return }
+                ProbeResult.RATE_LIMITED -> { Log.e(TAG, "⚠ rate-limited — stopping"); return }
+                else -> { /* next */ }
             }
         }
 
-        // Alt API hosts
-        val host = origin.substringAfter("//")
-        val rootHost = host.split(".").takeLast(2).joinToString(".")
-        val altHosts = listOf(
-            "https://$rootHost",
-            "https://api.$rootHost",
-            "https://api.$host",
-        ).filter { it != origin }.distinct()
-
-        for (altHost in altHosts) {
-            Log.e(TAG, "→ alt host $altHost")
-            for (tmpl in ENDPOINT_TEMPLATES.take(14)) {
-                if (probeEndpoint(altHost, tmpl, id, headers, subtitleCallback, callback)) {
-                    workingEndpointCache[origin] = tmpl
-                    Log.e(TAG, "✓ WORKING via $altHost → $tmpl")
-                    return
-                }
-            }
-        }
-
-        Log.e(TAG, "✗ No working endpoint found (all paths + alt hosts exhausted)")
-    }
-
-    // ────────────────────────────────────────────────────────────────────
-    private fun dumpInterestingJs(js: String) {
-        val lines = js.lines().filter { line ->
-            line.length in 10..1500 &&
-            listOf(
-                "api/", "fetch(", "axios", ".get(", ".post(",
-                "/source", "/video", "/embed", "/stream", "/resolve",
-                "m3u8", "p2pstream",
-            ).any { line.contains(it, true) }
-        }.distinct()
-
-        Log.e(TAG, "── Interesting JS lines (${lines.size}) ──")
-        lines.take(100).forEachIndexed { i, line ->
-            Log.e(TAG, "  [$i] ${line.trim().take(300)}")
-        }
-
-        val fullUrls = RE_FULL_URL.findAll(js)
-            .map { it.groupValues[1] }
-            .filter {
-                !it.contains("cloudflare") && !it.contains("google") &&
-                !it.contains("yandex") && !it.contains("vitejs") &&
-                !it.contains("w3.org") && !it.contains("github") &&
-                !it.contains("npmjs") && !it.contains("jsdelivr")
-            }
-            .distinct().take(40).toList()
-        Log.e(TAG, "── JS full URLs (${fullUrls.size}) ──")
-        fullUrls.forEach { Log.e(TAG, "  $it") }
-
-        val tmpl = RE_TEMPLATE_PATH.findAll(js)
-            .map { it.groupValues[1] }
-            .distinct().take(40).toList()
-        Log.e(TAG, "── JS template prefixes (${tmpl.size}) ──")
-        tmpl.forEach { Log.e(TAG, "  $it/\${...}") }
-    }
-
-    // ────────────────────────────────────────────────────────────────────
-    private fun discoverEndpointsFromJs(js: String): List<String> {
-        val found = mutableListOf<String>()
-
-        RE_API_PATH.findAll(js)
-            .map { it.groupValues[1] }
-            .filter { path ->
-                listOf("video","source","stream","embed","resolve","fetch","link","play")
-                    .any { path.contains(it, true) } &&
-                !path.contains("/assets/") && !path.contains("/static/")
-            }
-            .distinct()
-            .forEach { p ->
-                found.add("$p?id={id}")
-                found.add("$p?hash={id}")
-                found.add("$p/{id}")
-            }
-
-        RE_TEMPLATE_PATH.findAll(js)
-            .map { it.groupValues[1] }
-            .filter { p ->
-                p.length > 3 &&
-                listOf("video","source","stream","embed","resolve","fetch","link","play","api")
-                    .any { p.contains(it, true) } &&
-                !p.contains("/assets/") && !p.contains("/static/")
-            }
-            .distinct()
-            .forEach { p ->
-                val clean = p.trimEnd('/')
-                found.add("$clean/{id}")
-                found.add("$clean?id={id}")
-            }
-
-        return found.distinct().take(60)
+        Log.e(TAG, "✗ All attempts exhausted")
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -558,7 +432,7 @@ class P2pstream : ExtractorApi() {
         headers: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
-    ): Boolean {
+    ): ProbeResult {
         val path = template.replace("{id}", id)
         val url = when {
             path.startsWith("http") -> path
@@ -566,40 +440,187 @@ class P2pstream : ExtractorApi() {
             else                    -> "$origin/$path"
         }
 
-        // GET
-        try {
-            val resp = app.get(url, headers = headers + ("Accept" to "application/json, */*"))
-            val body = resp.text
-            val preview = body.take(250).replace("\n", "\\n")
-            Log.e(TAG, "  GET $url → ${resp.code} len=${body.length} preview=$preview")
+        Log.e(TAG, "→ GET $url")
 
-            if (resp.code in 200..299 && body.isNotBlank() && !isErrorPage(body)) {
-                if (tryDirectMedia(body, origin, headers, subtitleCallback, callback)) return true
-                if (tryJsonBody(body, origin, headers, subtitleCallback, callback)) return true
-            }
+        val resp = try {
+            app.get(url, headers = headers + ("Accept" to "application/json, */*"))
         } catch (e: Exception) {
-            Log.e(TAG, "  GET fail: ${e.message}")
+            Log.e(TAG, "  fail: ${e.message}")
+            return ProbeResult.ERROR
         }
 
-        // POST with {"id":...} and {"hash":...}
-        for (payload in listOf("""{"id":"$id"}""", """{"hash":"$id"}""")) {
-            try {
-                val resp = app.post(
-                    url,
-                    headers = headers + ("Content-Type" to "application/json; charset=utf-8"),
-                    requestBody = payload.toRequestBody(JSON_TYPE),
-                )
-                val body = resp.text
-                val preview = body.take(250).replace("\n", "\\n")
-                Log.e(TAG, "  POST $url body=$payload → ${resp.code} len=${body.length} preview=$preview")
+        val body = resp.text
+        val preview = body.take(200).replace("\n", "\\n")
+        Log.e(TAG, "  ${resp.code} len=${body.length} preview=$preview")
 
-                if (resp.code in 200..299 && body.isNotBlank() && !isErrorPage(body)) {
-                    if (tryDirectMedia(body, origin, headers, subtitleCallback, callback)) return true
-                    if (tryJsonBody(body, origin, headers, subtitleCallback, callback)) return true
+        when (resp.code) {
+            429 -> { Log.e(TAG, "  ⚠ rate limited"); return ProbeResult.RATE_LIMITED }
+            404, 403, 410 -> { Log.e(TAG, "  not found"); return ProbeResult.NOT_FOUND }
+        }
+        if (resp.code !in 200..299) return ProbeResult.NOT_FOUND
+        if (isErrorPage(body)) return ProbeResult.NOT_FOUND
+
+        // 1. Direct media URL anywhere in body
+        if (tryDirectMedia(body, origin, headers, subtitleCallback, callback)) {
+            Log.e(TAG, "  ✓ direct media")
+            return ProbeResult.FOUND
+        }
+
+        // 2. JSON (nested or flat)
+        if (tryJsonBody(body, origin, headers, subtitleCallback, callback)) {
+            Log.e(TAG, "  ✓ JSON media")
+            return ProbeResult.FOUND
+        }
+
+        // 3. Iframe wrapper
+        if (body.contains("<iframe", ignoreCase = true)) {
+            val iframeSrc = Jsoup.parse(body)
+                .selectFirst("iframe[src], iframe[data-src], iframe[data-litespeed-src]")
+                ?.let { it.attr("data-litespeed-src").ifEmpty { it.attr("data-src") }.ifEmpty { it.attr("src") } }
+                ?.takeIf { it.isNotBlank() }
+            if (iframeSrc != null) {
+                Log.e(TAG, "  iframe wrapper: $iframeSrc")
+                val fixed = resolveUrl(iframeSrc, url, origin)
+                if (manualJsUnpackExtraction(fixed, name, headers, subtitleCallback, callback)) {
+                    return ProbeResult.FOUND
                 }
-            } catch (_: Exception) { }
+            }
         }
 
+        // 4. Hex / base64 / encrypted payload
+        val trimmed = body.trim()
+        val isHex    = RE_HEX.matches(trimmed)
+        val isBase64 = !isHex && RE_BASE64.matches(trimmed)
+
+        if (isHex || isBase64) {
+            Log.e(TAG, "  ⚠ encrypted payload (hex=$isHex base64=$isBase64 len=${trimmed.length})")
+
+            // 4a. Simple hex → bytes → UTF8 (unencrypted hex-encoded JSON/URL)
+            if (isHex) {
+                val decoded = try { hexToUtf8(trimmed) } catch (_: Exception) { null }
+                if (decoded != null && decoded.isNotBlank()) {
+                    Log.e(TAG, "  hex-decoded preview: ${decoded.take(300).replace("\n", "\\n")}")
+                    if (tryDirectMedia(decoded, origin, headers, subtitleCallback, callback)) {
+                        Log.e(TAG, "  ✓ hex-decoded → media")
+                        return ProbeResult.FOUND
+                    }
+                    if (tryJsonBody(decoded, origin, headers, subtitleCallback, callback)) {
+                        Log.e(TAG, "  ✓ hex-decoded → JSON")
+                        return ProbeResult.FOUND
+                    }
+                }
+            }
+
+            // 4b. Simple base64 → UTF8
+            if (isBase64) {
+                val decoded = try {
+                    String(Base64.decode(trimmed, Base64.DEFAULT), Charsets.UTF_8)
+                } catch (_: Exception) { null }
+                if (decoded != null && decoded.isNotBlank()) {
+                    Log.e(TAG, "  b64-decoded preview: ${decoded.take(300).replace("\n", "\\n")}")
+                    if (tryDirectMedia(decoded, origin, headers, subtitleCallback, callback)) {
+                        Log.e(TAG, "  ✓ b64-decoded → media")
+                        return ProbeResult.FOUND
+                    }
+                    if (tryJsonBody(decoded, origin, headers, subtitleCallback, callback)) {
+                        Log.e(TAG, "  ✓ b64-decoded → JSON")
+                        return ProbeResult.FOUND
+                    }
+                }
+            }
+
+            // 4c. enc-dec.app decoders
+            if (tryEncDecPayload(trimmed, origin, subtitleCallback, callback)) {
+                Log.e(TAG, "  ✓ decoded via enc-dec.app")
+                return ProbeResult.FOUND
+            }
+
+            // 4d. Log full payload for offline analysis
+            Log.e(TAG, "══════ UNKNOWN ENCRYPTED PAYLOAD ══════")
+            Log.e(TAG, "url=$url")
+            Log.e(TAG, "length=${body.length} hex=$isHex base64=$isBase64")
+            Log.e(TAG, "full_body=${body.take(6000)}")
+            Log.e(TAG, "═════════════════════════════════════")
+            return ProbeResult.PAYLOAD_UNKNOWN
+        }
+
+        // 5. Ad-redirect page
+        if (body.contains("http-equiv=\"refresh\"", ignoreCase = true) ||
+            body.contains("location.href", ignoreCase = true)) {
+            Log.e(TAG, "  ⚠ ad-redirect page")
+            val redirectUrl =
+                Regex("""content=["']\s*\d+\s*;\s*url=([^"']+)["']""", RegexOption.IGNORE_CASE)
+                    .find(body)?.groupValues?.getOrNull(1)?.trim()
+                ?: Regex("""location\.href\s*=\s*["']([^"']+)["']""")
+                    .find(body)?.groupValues?.getOrNull(1)
+            if (!redirectUrl.isNullOrBlank()) {
+                val fixed = resolveUrl(redirectUrl, url, origin)
+                Log.e(TAG, "  following redirect → $fixed")
+                // Follow once — avoid infinite loop by treating as NOT_FOUND if the redirect loops
+                val nextResp = try { app.get(fixed, headers = headers) } catch (_: Exception) { null }
+                if (nextResp != null && nextResp.code in 200..299) {
+                    if (tryDirectMedia(nextResp.text, origin, headers, subtitleCallback, callback)) return ProbeResult.FOUND
+                    if (tryJsonBody(nextResp.text, origin, headers, subtitleCallback, callback)) return ProbeResult.FOUND
+                }
+            }
+        }
+
+        Log.e(TAG, "  200 OK but no media / unrecognised payload")
+        return ProbeResult.NOT_FOUND
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    private fun hexToUtf8(hex: String): String? {
+        if (hex.length % 2 != 0) return null
+        val bytes = ByteArray(hex.length / 2)
+        for (i in bytes.indices) {
+            val hi = Character.digit(hex[i * 2], 16)
+            val lo = Character.digit(hex[i * 2 + 1], 16)
+            if (hi < 0 || lo < 0) return null
+            bytes[i] = ((hi shl 4) or lo).toByte()
+        }
+        return String(bytes, Charsets.UTF_8)
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    private suspend fun tryEncDecPayload(
+        payload: String,
+        origin: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val reqBody = """{"text":"$payload"}""".toRequestBody(JSON_TYPE)
+        val decHeaders = mapOf(
+            "User-Agent"   to DEFAULT_UA,
+            "Origin"       to "https://enc-dec.app",
+            "Referer"      to "https://enc-dec.app/",
+            "Content-Type" to "application/json",
+        )
+
+        for (decoder in DECODERS) {
+            val endpoint = "https://enc-dec.app/api/$decoder"
+            Log.e(TAG, "    try $endpoint")
+            try {
+                val resp = app.post(endpoint, headers = decHeaders, requestBody = reqBody)
+                val text = resp.text
+                Log.e(TAG, "    $decoder → ${resp.code} len=${text.length}")
+
+                if (resp.code != 200) continue
+                if (!text.contains(".m3u8") && !text.contains(".mp4") &&
+                    !text.contains("\"sources\"") && !text.contains("\"url\"")) continue
+
+                try {
+                    val json = JSONObject(text)
+                    val result = json.optJSONObject("result") ?: json
+                    if (tryJsonBody(result.toString(), origin, emptyMap(), subtitleCallback, callback)) return true
+                    if (tryDirectMedia(result.toString(), origin, emptyMap(), subtitleCallback, callback)) return true
+                } catch (_: Exception) {
+                    if (tryDirectMedia(text, origin, emptyMap(), subtitleCallback, callback)) return true
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "    $decoder fail: ${e.message}")
+            }
+        }
         return false
     }
 
@@ -621,12 +642,67 @@ class P2pstream : ExtractorApi() {
             !it.contains("google-analytics", ignoreCase = true) &&
             !it.contains("yandex", ignoreCase = true)
         }
-
         good.firstOrNull { it.matches(Regex(".*/assets/(index|main)-[^/]+\\.js.*")) }?.let { return absolutize(it) }
         good.firstOrNull { it.matches(Regex(".*/static/js/[^/]+\\.js.*")) }?.let { return absolutize(it) }
         good.firstOrNull { it.contains("/assets/") && it.contains(".js") }?.let { return absolutize(it) }
-        good.firstOrNull { !it.startsWith("http") && !it.startsWith("//") && it.contains(".js") }?.let { return absolutize(it) }
         return null
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    private fun dumpInterestingJs(js: String) {
+        // Handle minified single-line bundles: check substrings, not lines
+        val keywords = listOf(
+            "api/", "/api", "fetch(", "axios", ".get(", ".post(",
+            "/source", "/video", "/embed", "/stream", "/resolve",
+            "m3u8", "p2pstream", "rate-limit", "error",
+        )
+        val matches = mutableListOf<String>()
+        for (kw in keywords) {
+            var idx = 0
+            while (idx < js.length && matches.size < 30) {
+                val found = js.indexOf(kw, idx)
+                if (found < 0) break
+                val start = maxOf(0, found - 60)
+                val end = minOf(js.length, found + 140)
+                matches.add(js.substring(start, end).replace("\n", " "))
+                idx = found + kw.length
+            }
+        }
+        Log.e(TAG, "── Interesting JS snippets (${matches.size}) ──")
+        matches.distinct().take(30).forEachIndexed { i, s ->
+            Log.e(TAG, "  [$i] $s")
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    private fun discoverEndpointsFromJs(js: String): List<String> {
+        val found = mutableListOf<String>()
+
+        RE_API_PATH.findAll(js)
+            .map { it.groupValues[1] }
+            .filter { path ->
+                listOf("video","source","stream","embed","resolve","fetch","link","play")
+                    .any { path.contains(it, true) } &&
+                !path.contains("/assets/") && !path.contains("/static/")
+            }
+            .distinct()
+            .forEach { p ->
+                found.add("$p?id={id}")
+                found.add("$p?hash={id}")
+            }
+
+        RE_TEMPLATE_PATH.findAll(js)
+            .map { it.groupValues[1] }
+            .filter { p ->
+                p.length > 3 &&
+                listOf("video","source","stream","embed","resolve","fetch","link","play","api")
+                    .any { p.contains(it, true) } &&
+                !p.contains("/assets/") && !p.contains("/static/")
+            }
+            .distinct()
+            .forEach { p -> found.add("${p.trimEnd('/')}/{id}") }
+
+        return found.distinct().take(8)
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -659,7 +735,6 @@ class P2pstream : ExtractorApi() {
         if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return false
         val json = try { JSONObject(body) } catch (_: Exception) { return false }
 
-        // ── Deep recursive URL walk (catches {"data":{"stream":{"sources":[…]}}}) ─
         val deepUrls = extractUrlsFromJson(json)
         if (deepUrls.isNotEmpty()) {
             Log.e(TAG, "    deep-json urls: ${deepUrls.take(3)}")
@@ -667,15 +742,12 @@ class P2pstream : ExtractorApi() {
             return true
         }
 
-        // ── Flat key scan (fallback for simple APIs) ──────────────────
-        val candidates = listOf(
+        val direct = listOf(
             json.optString("url"), json.optString("source"), json.optString("src"), json.optString("file"),
             json.optString("video_url"), json.optString("videoUrl"),
             json.optString("stream_url"), json.optString("streamUrl"),
-        )
-        val direct = candidates.firstOrNull { c ->
-            c.isNotBlank() && (c.startsWith("http") || c.startsWith("//"))
-        }
+        ).firstOrNull { it.isNotBlank() && (it.startsWith("http") || it.startsWith("//")) }
+
         if (!direct.isNullOrBlank()) {
             emitSingleUrl(normalize(direct), origin, headers, subtitleCallback, callback)
             return true
