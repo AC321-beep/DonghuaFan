@@ -23,7 +23,7 @@ class NarulDonghuaProvider : MainAPI() {
     override var mainUrl = "https://naruldonghua.com"
     override var name = "NarulDonghua"
     override val hasMainPage = true
-    override var lang = "en"
+    override var lang = "zh"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
