@@ -28,9 +28,6 @@ class NarulDonghuaProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.Anime)
 
     // ── Headers ──────────────────────────────────────────────────────────
-    // Sec-Fetch-Site: none — matches what the browser sends on a cold
-    // navigation; "same-origin" from an external client is a Cloudflare
-    // bot signal.
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
@@ -60,8 +57,6 @@ class NarulDonghuaProvider : MainAPI() {
             null
         }
 
-    /** Append a `_=<timestamp>` cache-buster. LiteSpeed treats this as a
-     *  cache miss and re-renders from WordPress. */
     private fun withCacheBust(url: String): String =
         if (url.contains("?")) "$url&_=${System.currentTimeMillis()}"
         else                   "$url?_=${System.currentTimeMillis()}"
