@@ -1,6 +1,7 @@
 package com.naruldonghua
 
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -354,7 +355,12 @@ class NarulDonghuaProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val doc = fetch(data) ?: return false
+        Log.e("Narul/Prov", "════════════════════════════════════")
+        Log.e("Narul/Prov", "=== loadLinks START data=$data")
+        val doc = fetch(data) ?: run {
+            Log.e("Narul/Prov", "loadLinks page fetch FAILED")
+            return false
+        }
 
         val emittedLinks = ConcurrentHashMap.newKeySet<String>()
         val emittedSubs = ConcurrentHashMap.newKeySet<String>()
@@ -364,42 +370,53 @@ class NarulDonghuaProvider : MainAPI() {
 
         suspend fun resolve(raw: String, label: String = "") {
             val url = normalizeUrl(raw) ?: return
-            if (isAdUrl(url)) return
-            // Only strip fragment — semantic query params (?video=, ?id=) must
-            // remain part of the dedup key, otherwise we drop legit mirrors.
-            if (!visited.add(url.substringBefore('#'))) return
+            if (isAdUrl(url)) {
+                Log.e("Narul/Prov", "skip ad: $url")
+                return
+            }
+            if (!visited.add(url.substringBefore('#'))) {
+                Log.e("Narul/Prov", "skip dup: $url")
+                return
+            }
+
+            Log.e("Narul/Prov", "── resolve[$label] $url")
 
             var extracted = false
             val inner: (ExtractorLink) -> Unit = { extracted = true; trackLink(it) }
 
             if (isDailymotionUrl(url)) {
-                try { if (extractDailymotion(url, trackSub, inner)) return }
-                catch (e: CancellationException) { throw e } catch (_: Exception) {}
+                Log.e("Narul/Prov", "   try Dailymotion")
+                try { if (extractDailymotion(url, trackSub, inner)) { Log.e("Narul/Prov", "   ✓ DM OK"); return } }
+                catch (e: CancellationException) { throw e } catch (e: Exception) { Log.e("Narul/Prov", "   ✗ DM: ${e.message}") }
             }
             if (url.contains("p2pstream.vip", true)) {
-                try { P2pstream().getUrl(url, mainUrl, trackSub, inner); if (extracted) return }
-                catch (e: CancellationException) { throw e } catch (_: Exception) {}
+                Log.e("Narul/Prov", "   try Plex")
+                try { P2pstream().getUrl(url, mainUrl, trackSub, inner) }
+                catch (e: CancellationException) { throw e } catch (e: Exception) { Log.e("Narul/Prov", "   ✗ Plex: ${e.message}") }
+                if (extracted) { Log.e("Narul/Prov", "   ✓ Plex OK"); return } else Log.e("Narul/Prov", "   ✗ Plex no links")
             }
-            // Fixed: abyssplayer.com (one y) vs abyyplayer.com (two y's).
             if (url.contains("abysplayserver.com", true) ||
                 url.contains("abyssplayer.com", true)     ||
-                url.contains("abyysplayer.com", true)     ||   // ← the real mirror
+                url.contains("abyysplayer.com", true)     ||
                 url.contains("playhydrax.com", true)) {
-                try { AbyssPlayer().getUrl(url, mainUrl, trackSub, inner); if (extracted) return }
-                catch (e: CancellationException) { throw e } catch (_: Exception) {}
+                Log.e("Narul/Prov", "   try Abyss")
+                try { AbyssPlayer().getUrl(url, mainUrl, trackSub, inner) }
+                catch (e: CancellationException) { throw e } catch (e: Exception) { Log.e("Narul/Prov", "   ✗ Abyss: ${e.message}") }
+                if (extracted) { Log.e("Narul/Prov", "   ✓ Abyss OK"); return } else Log.e("Narul/Prov", "   ✗ Abyss no links")
             }
             if (url.contains("bysekoze.com", true) || url.contains("bysejikuar.com", true)) {
-                try { Bysekoze().getUrl(url, mainUrl, trackSub, inner); if (extracted) return }
-                catch (e: CancellationException) { throw e } catch (_: Exception) {}
+                Log.e("Narul/Prov", "   try Byse")
+                try { Bysekoze().getUrl(url, mainUrl, trackSub, inner) }
+                catch (e: CancellationException) { throw e } catch (e: Exception) { Log.e("Narul/Prov", "   ✗ Byse: ${e.message}") }
+                if (extracted) { Log.e("Narul/Prov", "   ✓ Byse OK"); return } else Log.e("Narul/Prov", "   ✗ Byse no links")
             }
 
-            // General fallback — handles YouTube (built-in YoutubeExtractor),
-            // Vimeo, ok.ru, Streamtape, etc.  No custom YouTube class needed.
+            Log.e("Narul/Prov", "   try loadExtractor (generic)")
             try { loadExtractor(url, referer = mainUrl, trackSub, inner) }
-            catch (e: CancellationException) { throw e } catch (_: Exception) {}
-            if (extracted) return
+            catch (e: CancellationException) { throw e } catch (e: Exception) { Log.e("Narul/Prov", "   ✗ generic: ${e.message}") }
+            if (extracted) { Log.e("Narul/Prov", "   ✓ generic OK"); return }
 
-            // Last resort: page-nesting (iframe inside iframe).
+            Log.e("Narul/Prov", "   try nested-iframe fallback")
             val nested = fetch(url)?.let { page ->
                 page.selectFirst("iframe[data-litespeed-src]")?.attr("data-litespeed-src")
                     ?: page.selectFirst("iframe[data-src]")?.attr("data-src")
@@ -410,7 +427,10 @@ class NarulDonghuaProvider : MainAPI() {
                         ?.attr("content")?.substringAfter("url=", "")?.trim()
             }
             if (!nested.isNullOrBlank() && !isAdUrl(nested)) {
+                Log.e("Narul/Prov", "   nested=$nested → recurse")
                 resolve(nested, label)
+            } else {
+                Log.e("Narul/Prov", "   no nested iframe")
             }
         }
 
@@ -449,6 +469,8 @@ class NarulDonghuaProvider : MainAPI() {
                 }
                 .toList()
 
+            Log.e("Narul/Prov", "directIframes=${directIframes.size} serverValues=${serverValues.size} rawEmbeds=${rawEmbeds.size}")
+
             directIframes.map { url -> async { resolve(url, "Direct") } }.awaitAll()
             serverValues.map { (raw, label) ->
                 async {
@@ -470,6 +492,7 @@ class NarulDonghuaProvider : MainAPI() {
                 }
             }
 
+        Log.e("Narul/Prov", "=== loadLinks END total links=${emittedLinks.size}")
         return emittedLinks.isNotEmpty()
     }
 
@@ -497,86 +520,104 @@ class NarulDonghuaProvider : MainAPI() {
         subCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val videoId = extractDailymotionVideoId(url) ?: return false
+        Log.e("Narul/DM", "=== extractDailymotion ===")
+        Log.e("Narul/DM", "url=$url")
+
+        val videoId = extractDailymotionVideoId(url) ?: run {
+            Log.e("Narul/DM", "videoId=null → abort")
+            return false
+        }
+        Log.e("Narul/DM", "videoId=$videoId")
+
         val dmHeaders = mapOf(
             "User-Agent" to defaultHeaders["User-Agent"]!!,
             "Referer"    to "https://www.dailymotion.com/",
             "Origin"     to "https://www.dailymotion.com",
         )
-
         val geoUrl = if (url.contains("geo.dailymotion.com", true)) url
                      else "https://geo.dailymotion.com/player/x9mpt.html?video=$videoId"
+        Log.e("Narul/DM", "geoUrl=$geoUrl")
 
+        var m3u8Url: String? = null
+
+        // ── 1. geo player page (JSON walk, then regex) ─────────────────────
         try {
             val geoDoc = app.get(geoUrl, headers = dmHeaders).document
+            Log.e("Narul/DM", "geoDoc fetched: ${geoDoc.select("script").size} scripts")
 
-            // Deterministic JSON walk — read criticalMetadata.stream.url.
             val configScript = geoDoc.select("script")
                 .firstOrNull { it.data().contains("__PLAYER_CONFIG__") }
             if (configScript != null) {
                 val raw = configScript.data()
                 val start = raw.indexOf('{')
                 val end = raw.lastIndexOf('}')
+                Log.e("Narul/DM", "configScript found, span=$start..$end")
                 if (start in 0 until end) {
                     try {
                         val json = JSONObject(raw.substring(start, end + 1))
-                        val streamUrl = json.optJSONObject("criticalMetadata")
+                        m3u8Url = json.optJSONObject("criticalMetadata")
                             ?.optJSONObject("stream")
                             ?.optString("url")
                             ?.takeIf { it.isNotBlank() }
-                        if (!streamUrl.isNullOrBlank()) {
-                            callback(newExtractorLink(
-                                "Dailymotion", "Dailymotion",
-                                streamUrl, ExtractorLinkType.M3U8
-                            ) { this.referer = "https://www.dailymotion.com/" })
-                            return true
+                        Log.e("Narul/DM", "JSON walk → m3u8=$m3u8Url")
+                    } catch (e: org.json.JSONException) {
+                        Log.e("Narul/DM", "JSON parse failed: ${e.message}")
+                    }
+                }
+            } else Log.e("Narul/DM", "no __PLAYER_CONFIG__ script")
+
+            if (m3u8Url == null) {
+                m3u8Url = Regex("""https?://[^"'\s]+\.m3u8[^"'\s]*""")
+                    .find(geoDoc.outerHtml())?.value
+                Log.e("Narul/DM", "regex fallback → m3u8=$m3u8Url")
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("Narul/DM", "geo fetch failed: ${e.message}")
+        }
+
+        // ── 2. metadata API fallback ───────────────────────────────────────
+        if (m3u8Url.isNullOrBlank()) {
+            try {
+                val body = app.get(
+                    "https://www.dailymotion.com/player/metadata/video/$videoId",
+                    headers = dmHeaders,
+                ).text
+                Log.e("Narul/DM", "metadata body length=${body.length}")
+                val json = JSONObject(body)
+                m3u8Url = json.optJSONObject("qualities")?.optJSONArray("auto")
+                    ?.optJSONObject(0)?.optString("url")?.takeIf { it.isNotBlank() }
+                Log.e("Narul/DM", "metadata → m3u8=$m3u8Url")
+
+                json.optJSONObject("subtitles")?.let { subs ->
+                    subs.keys().forEach { lang ->
+                        val subUrl = subs.optJSONObject(lang)?.optString("urls")
+                        if (!subUrl.isNullOrBlank()) {
+                            Log.e("Narul/DM", "subtitle [$lang]=$subUrl")
+                            subCallback(newSubtitleFile(lang, subUrl) { headers = dmHeaders })
                         }
-                    } catch (_: org.json.JSONException) { /* fall through */ }
+                    }
                 }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e("Narul/DM", "metadata API failed: ${e.message}")
             }
+        }
 
-            // Regex fallback against the raw HTML.
-            val m3u8 = Regex("""https?://[^"'\s]+\.m3u8[^"'\s]*""")
-                .find(geoDoc.outerHtml())
-                ?.value
-            if (!m3u8.isNullOrBlank()) {
-                callback(newExtractorLink(
-                    "Dailymotion", "Dailymotion (geo)",
-                    m3u8, ExtractorLinkType.M3U8
-                ) { this.referer = "https://www.dailymotion.com/" })
-                return true
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) { /* fall through */ }
+        if (m3u8Url.isNullOrBlank()) {
+            Log.e("Narul/DM", "no m3u8 found → abort")
+            return false
+        }
 
-        // Last resort: metadata API (rarely works for geo IDs, but cheap).
-        try {
-            val body = app.get(
-                "https://www.dailymotion.com/player/metadata/video/$videoId",
-                headers = dmHeaders,
-            ).text
-            val json = JSONObject(body)
-            val hls = json.optJSONObject("qualities")?.optJSONArray("auto")
-                ?.optJSONObject(0)?.optString("url")
-            if (!hls.isNullOrBlank()) {
-                callback(newExtractorLink(
-                    "Dailymotion", "Dailymotion (api)",
-                    hls, ExtractorLinkType.M3U8
-                ) { this.referer = "https://www.dailymotion.com/" })
-            }
-            json.optJSONObject("subtitles")?.let { subs ->
-                subs.keys().forEach { lang ->
-                    val subUrl = subs.optJSONObject(lang)?.optString("urls")
-                    if (!subUrl.isNullOrBlank())
-                        subCallback(newSubtitleFile(lang, subUrl) { headers = dmHeaders })
-                }
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) { /* ignore */ }
-
-        return false
+        // ── 3. Single "Dailymotion" entry — no (geo)/(api) suffix ──────────
+        Log.e("Narul/DM", "EMITTING single 'Dailymotion' m3u8=$m3u8Url")
+        callback(newExtractorLink(
+            "Dailymotion", "Dailymotion",
+            m3u8Url, ExtractorLinkType.M3U8
+        ) { this.referer = "https://www.dailymotion.com/" })
+        return true
     }
 
     private fun decodeServerValue(raw: String): String? {
