@@ -3,6 +3,28 @@ package com.mangamanhwaverse
 import android.content.Context
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
+import com.mangamanhwaverse.providers.*
+
+object AppContext {
+    var ctx: Context? = null
+}
+
+object ProviderRegistry {
+    val providers = listOf(
+        // ThemeSites
+        Manhuanext(), Toonily(), MangaTX(), FlameComics(), LuminousScans(), 
+        CosmicScans(), Disasterscans(), VyvyManga(), MangaBob(), HiveScans(), 
+        AsuraScans(), IgnisComic(), MangaKakalot(), MangaBat(), MangaReader(), 
+        MangaPanda(), MangaFox(), ManhwaWorld(), NyxScans(),
+        
+        // API / Custom
+        MangaDex(), 
+        OmegaScans(), 
+        ComixProvider()
+    )
+
+    val names: List<String> get() = providers.map { it.name }
+}
 
 @CloudstreamPlugin
 class MangaManhwaPlugin : Plugin() {
@@ -10,7 +32,6 @@ class MangaManhwaPlugin : Plugin() {
         AppContext.ctx = context
         Settings.init(context)
 
-        // First-run: initialize the per-provider set from the master toggle
         if (!Settings.hasInitializedProviderSet()) {
             Settings.setEnabledProviderNames(
                 if (Settings.allProvidersEnabled()) ProviderRegistry.names.toSet()
@@ -18,7 +39,6 @@ class MangaManhwaPlugin : Plugin() {
             )
         }
 
-        // Register only enabled providers
         ProviderRegistry.providers
             .filter { Settings.isProviderEnabled(it.name) }
             .forEach { registerMainAPI(it) }
