@@ -2,11 +2,6 @@ package com.mangamanhwaverse.providers
 
 import com.mangamanhwaverse.core.MangaManhwaProvider
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.newExtractorLink
-import org.json.JSONArray
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
@@ -44,7 +39,19 @@ class OmegaScans : MangaManhwaProvider() {
         return eps
     }
 
-    override suspend fun pages(chapterUrl: String): List<String> = emptyList()
+    // ✅ FIX: Implemented native pages() for Cloudstream manga reader. 
+    // (Removed the deprecated PACKED / isManga ExtractorLink logic)
+    override suspend fun pages(chapterUrl: String): List<String> {
+        val doc = fetch(chapterUrl) ?: return emptyList()
+        val images = mutableListOf<String>()
+        doc.select("img").forEach { img ->
+            val src = extractImage(img) ?: return@forEach
+            if (!src.contains("media.omegascans.org")) return@forEach
+            if (images.contains(src)) return@forEach
+            images.add(src)
+        }
+        return images
+    }
 
     override suspend fun load(url: String): LoadResponse? {
         val doc = fetch(url) ?: return null
@@ -58,21 +65,8 @@ class OmegaScans : MangaManhwaProvider() {
         }
     }
 
-    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        val doc = fetch(data) ?: return false
-        val images = mutableListOf<String>()
-        doc.select("img").forEach { img ->
-            val src = extractImage(img) ?: return@forEach
-            if (!src.contains("media.omegascans.org")) return@forEach
-            if (images.contains(src)) return@forEach
-            images.add(src)
-        }
-        if (images.isEmpty()) return false
-        callback.invoke(newExtractorLink(name, name, JSONArray(images).toString(), ExtractorLinkType.PACKED) {
-            this.referer = mainUrl; this.isManga = true; this.quality = Qualities.Unknown.value
-        })
-        return true
-    }
+    // Notice: loadLinks() is omitted here, so it will automatically fallback 
+    // to the MangaManhwaProvider.loadLinks() which opens the custom ReaderDialog!
 
     private fun parseSeriesGrid(doc: Document): List<SearchResponse> = doc.select("a[href]").mapNotNull { a ->
         val href = a.attr("href").trim()
