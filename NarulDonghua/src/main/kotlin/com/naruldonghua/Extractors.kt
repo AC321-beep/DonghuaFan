@@ -169,13 +169,12 @@ private fun evpKDF(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PATCH #3 — obfuscation-aware secret extraction (single-bundle sites)
+//  Obfuscation-aware secret extraction
 // ════════════════════════════════════════════════════════════════════════════
 private fun extractObfuscatedSecrets(js: String): Pair<List<ByteArray>, List<String>> {
     val keys = mutableListOf<ByteArray>()
     val passwords = mutableListOf<String>()
 
-    // 1) String.fromCharCode(107,105,101,109,...)
     Regex("""String\.fromCharCode\(\s*([\d,\s]{20,})\s*\)""").findAll(js).take(300).forEach { m ->
         try {
             val codes = m.groupValues[1].split(",").mapNotNull { it.trim().toIntOrNull() }
@@ -190,7 +189,6 @@ private fun extractObfuscatedSecrets(js: String): Pair<List<ByteArray>, List<Str
         } catch (_: Exception) {}
     }
 
-    // 2) "abc" + "def"  (adjacent string concatenation)
     Regex("""["'`]([A-Za-z0-9!@#$%^&*_+\-=./]{4,32})["'`]\s*\+\s*["'`]([A-Za-z0-9!@#$%^&*_+\-=./]{4,32})["'`]""")
         .findAll(js).take(300).forEach { m ->
             val combined = m.groupValues[1] + m.groupValues[2]
@@ -199,7 +197,6 @@ private fun extractObfuscatedSecrets(js: String): Pair<List<ByteArray>, List<Str
             if (b.size in listOf(16, 24, 32)) keys.add(b)
         }
 
-    // 3) atob("...")  →  string OR 16/24/32 raw bytes
     Regex("""atob\(\s*["'`]([A-Za-z0-9+/=]{16,256})["'`]\s*\)""").findAll(js).take(300).forEach { m ->
         try {
             val raw = Base64.decode(m.groupValues[1], Base64.DEFAULT)
@@ -209,7 +206,6 @@ private fun extractObfuscatedSecrets(js: String): Pair<List<ByteArray>, List<Str
         } catch (_: Exception) {}
     }
 
-    // 4) [0x61, 0x62, ...]  or  Uint8Array([0x61, 0x62, ...])
     Regex("""\[\s*(0x[0-9a-fA-F]{2}(?:\s*,\s*0x[0-9a-fA-F]{2}){7,63})\s*\]""")
         .findAll(js).take(200).forEach { m ->
             try {
@@ -220,7 +216,6 @@ private fun extractObfuscatedSecrets(js: String): Pair<List<ByteArray>, List<Str
             } catch (_: Exception) {}
         }
 
-    // 5) rawKey/secretKey/aesKey/decryptKey = "..."
     Regex("""(?:rawKey|secretKey|cryptoKey|aesKey|decryptKey)\s*[:=]\s*["'`]([A-Za-z0-9!@#$%^&*_+\-=./]{8,64})["'`]""",
         RegexOption.IGNORE_CASE).findAll(js).take(200).forEach { m ->
         val s = m.groupValues[1]
@@ -231,6 +226,39 @@ private fun extractObfuscatedSecrets(js: String): Pair<List<ByteArray>, List<Str
 
     Log.e("Narul/SecretX", "extractObfuscatedSecrets: +${keys.size} keys, +${passwords.size} passwords")
     return Pair(keys, passwords)
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  PATCH C — targeted extraction near app markers (skips Shaka vendor noise)
+// ════════════════════════════════════════════════════════════════════════════
+private fun extractNearAppMarkers(js: String): List<String> {
+    val found = mutableListOf<String>()
+    val markers = listOf(
+        "p2pstream", "narulplex", "naruldonghua",
+        "api/v1/info", "api/v1/player", "api/v1/",
+        "decrypt", "encrypt", "cipher", "crypto",
+        "secret", "passphrase", "aeskey",
+    )
+    for (marker in markers) {
+        // String literal near the marker
+        val re = Regex(
+            """${Regex.escape(marker)}[^\n]{0,120}?["'`]([A-Za-z0-9!@#$%^&*()_+\-=./:?]{8,80})["'`]""",
+            RegexOption.IGNORE_CASE
+        )
+        re.findAll(js).take(40).forEach { found.add(it.groupValues[1]) }
+
+        // String literal that CONTAINS the marker
+        val re2 = Regex(
+            """["'`]([^"'`\s]{0,120}${Regex.escape(marker)}[^"'`\s]{0,120})["'`]""",
+            RegexOption.IGNORE_CASE
+        )
+        re2.findAll(js).take(20).forEach {
+            val s = it.groupValues[1]
+            if (s.length in 8..200) found.add(s)
+        }
+    }
+    Log.e("Narul/Markers", "extractNearAppMarkers: +${found.size} candidates")
+    return found.distinct()
 }
 
 private fun likelyPlain(s: String): Boolean =
@@ -392,7 +420,6 @@ class P2pstream : ExtractorApi() {
             "/api/v1/video?id={id}",
         )
         private val ENTRY_TEMPLATES = listOf("/?v={id}", "/?id={id}", "/{id}")
-        private val DECODERS = listOf("dec-rapid", "dec-abyss", "dec-mega")
 
         private val RE_SCRIPT_SRC = Regex("""<script[^>]+src=["']([^"']+\.js[^"']*)["']""", RegexOption.IGNORE_CASE)
         private val RE_HEX    = Regex("^[0-9a-fA-F]{100,}$")
@@ -428,37 +455,65 @@ class P2pstream : ExtractorApi() {
         return hasRoot || hasVite || hasBundle
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    //  PATCH B — fetch ALL scripts + inline scripts
+    //  (previous version only fetched the first script tag → Shaka Player)
+    // ════════════════════════════════════════════════════════════════════════
     private suspend fun ensureJsCached(origin: String, id: String, headers: Map<String, String>) {
         if (scriptCache[origin] != null) return
-        Log.e(TAG, "Pre-fetching JS + Vite chunks")
+        Log.e(TAG, "Pre-fetching JS + inline + all scripts")
         for (tmpl in ENTRY_TEMPLATES) {
             val shellUrl = "$origin${tmpl.replace("{id}", id)}"
             try {
                 val resp = app.get(shellUrl, headers = headers)
                 if (resp.code != 200 || isErrorPage(resp.text) || !looksLikeSpa(resp.text)) continue
-                val jsUrl = findMainJsUrl(resp.text, origin) ?: continue
-                val jsResp = app.get(jsUrl, headers = headers)
-                if (jsResp.code != 200 || isErrorPage(jsResp.text)) continue
-                val mainJs = jsResp.text
-                Log.e(TAG, "  main js len=${mainJs.length} via $tmpl")
+                val html = resp.text
 
-                val chunks = extractAllChunkUrls(mainJs)
-                Log.e(TAG, "  vite chunks via mapFallback: ${chunks.size} → ${chunks.take(15)}")
+                // Extract ALL external script srcs on the page
+                val scriptSrcs = RE_SCRIPT_SRC.findAll(html).map { it.groupValues[1] }
+                    .filter { !it.contains("cloudflareinsights", true) && !it.contains("googletagmanager", true) &&
+                        !it.contains("google-analytics", true) && !it.contains("yandex", true) }
+                    .distinct()
+                    .map { u -> when {
+                        u.startsWith("http") -> u
+                        u.startsWith("//")   -> "https:$u"
+                        u.startsWith("/")    -> "$origin$u"
+                        else                 -> "$origin/$u"
+                    }}
+                Log.e(TAG, "  found ${scriptSrcs.size} script tags:")
+                scriptSrcs.take(8).forEach { Log.e(TAG, "    • ${it.takeLast(70)}") }
 
-                val sb = StringBuilder(mainJs)
-                for (chunk in chunks.take(60)) {
-                    val chunkUrl = if (chunk.startsWith("http")) chunk else "$origin/$chunk"
-                    if (isTemplatePlaceholder(chunkUrl)) continue
+                // Inline <script> blocks — where app init/decrypt helpers commonly live
+                val inlineScripts = Jsoup.parse(html).select("script:not([src])")
+                    .joinToString("\n") { it.data() }
+                Log.e(TAG, "  inline scripts len=${inlineScripts.length}")
+
+                val sb = StringBuilder()
+                if (inlineScripts.isNotBlank()) sb.append(inlineScripts)
+
+                for (scriptUrl in scriptSrcs.take(10)) {
                     try {
-                        val cr = app.get(chunkUrl, headers = headers)
-                        if (cr.code == 200 && !isErrorPage(cr.text) && cr.text.length > 500) {
-                            Log.e(TAG, "  +chunk ${chunk.takeLast(40)} len=${cr.text.length}")
-                            sb.append("\n").append(cr.text)
+                        val sr = app.get(scriptUrl, headers = headers)
+                        if (sr.code == 200 && !isErrorPage(sr.text) && sr.text.length > 500) {
+                            Log.e(TAG, "  +script ${scriptUrl.takeLast(60)} len=${sr.text.length}")
+                            sb.append("\n").append(sr.text)
+                            for (chunk in extractAllChunkUrls(sr.text).take(40)) {
+                                val chunkUrl = if (chunk.startsWith("http")) chunk else "$origin/$chunk"
+                                if (isTemplatePlaceholder(chunkUrl)) continue
+                                try {
+                                    val cr = app.get(chunkUrl, headers = headers)
+                                    if (cr.code == 200 && !isErrorPage(cr.text) && cr.text.length > 500) {
+                                        Log.e(TAG, "  +chunk ${chunk.takeLast(40)} len=${cr.text.length}")
+                                        sb.append("\n").append(cr.text)
+                                    }
+                                } catch (_: Exception) {}
+                            }
                         }
                     } catch (_: Exception) {}
                 }
+
                 scriptCache[origin] = sb.toString()
-                Log.e(TAG, "  ✓ JS cached total len=${sb.length} (main=${mainJs.length}, chunks=${sb.length - mainJs.length})")
+                Log.e(TAG, "  ✓ JS cached total len=${sb.length}")
                 return
             } catch (e: Exception) { Log.e(TAG, "  prefetch fail $tmpl: ${e.message}") }
         }
@@ -556,7 +611,6 @@ class P2pstream : ExtractorApi() {
             if (tryKnownPlexDecrypt(trimmed, origin, subtitleCallback, callback)) return ProbeResult.FOUND
 
             val js = scriptCache[origin]
-            // PATCH #2 — pass real `id` into the extractor
             if (js != null && tryDecryptWithExtractedKeys(trimmed, js, origin, id, subtitleCallback, callback)) return ProbeResult.FOUND
 
             Log.e(TAG, "══════ UNKNOWN PAYLOAD ══════")
@@ -668,8 +722,7 @@ class P2pstream : ExtractorApi() {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    //  PATCH #2 + #3 + #4 — id-derived keys now execute; obfuscated extraction;
-    //                      diagnostic logs for top keys/passwords
+    //  PATCH C wired in — app-marker extraction added after obfuscation pass
     // ════════════════════════════════════════════════════════════════════════
     private suspend fun tryDecryptWithExtractedKeys(
         payloadHex: String, js: String, origin: String, id: String,
@@ -681,28 +734,22 @@ class P2pstream : ExtractorApi() {
         val passwords = mutableListOf<String>()
         rawKeys.add(plexKey())
 
-        // Hex raw keys
         Regex("""["'`]([0-9a-fA-F]{32})["'`]""").findAll(js).forEach { hexToBytes(it.groupValues[1])?.let(rawKeys::add) }
         Regex("""["'`]([0-9a-fA-F]{64})["'`]""").findAll(js).forEach { hexToBytes(it.groupValues[1])?.let(rawKeys::add) }
 
-        // Generic 16/32-char passwords
         Regex("""["'`]([A-Za-z0-9!@#$%^&*()_+\-=./]{16})["'`]""").findAll(js).take(300).forEach { passwords.add(it.groupValues[1]) }
         Regex("""["'`]([A-Za-z0-9!@#$%^&*()_+\-=./]{32})["'`]""").findAll(js).take(300).forEach { passwords.add(it.groupValues[1]) }
 
-        // Contextual: strings near decrypt/key/secret/cipher/aes tokens
         Regex("""(?:key|secret|pass(?:word|phrase)?|decrypt|aes|cipher|iv)[^\w]{0,20}["'`]([^"'`\s]{8,64})["'`]""",
             RegexOption.IGNORE_CASE).findAll(js).take(120).forEach { passwords.add(it.groupValues[1]) }
 
-        // Near CryptoJS.AES.decrypt
         Regex("""CryptoJS\.AES\.decrypt\([^)]{0,400}?["'`]([^"'`\s]{4,64})["'`]""")
             .findAll(js).take(60).forEach { passwords.add(it.groupValues[1]) }
 
-        // Reversed-string obfuscation
         Regex("""["'`]([A-Za-z0-9!@#$%^&*_+\-=./]{16})["'`]""").findAll(js).take(200).forEach {
             passwords.add(it.groupValues[1].reversed())
         }
 
-        // Base64 strings that decode to 16/24/32 bytes → usable as AES key
         Regex("""["'`]([A-Za-z0-9+/]{22,}==?)["'`]""").findAll(js).take(200).forEach { m ->
             try {
                 val dec = Base64.decode(m.groupValues[1], Base64.DEFAULT)
@@ -710,7 +757,6 @@ class P2pstream : ExtractorApi() {
             } catch (_: Exception) {}
         }
 
-        // Payload-derived keys
         val payloadLower = payloadHex.lowercase()
         val payloadUpper = payloadHex.uppercase()
         rawKeys.add(md5Bytes(payloadLower))
@@ -722,7 +768,6 @@ class P2pstream : ExtractorApi() {
         if (ct.size > 16) passwords.add(bytesToHex(ct.copyOf(16)))
         if (ct.size > 32) passwords.add(bytesToHex(ct.copyOf(32)))
 
-        // Host derivation
         val hostname = hostOf(origin) ?: ""
         if (hostname.isNotBlank()) {
             rawKeys.add(md5Bytes(hostname))
@@ -731,9 +776,6 @@ class P2pstream : ExtractorApi() {
             passwords.add(hostname)
         }
 
-        // ═══════════════════════════════════════════════════════════════════
-        //  PATCH #2 — ID-derived keys (previously dead code: id was "")
-        // ═══════════════════════════════════════════════════════════════════
         if (id.isNotBlank()) {
             rawKeys.add(md5Bytes(id))
             rawKeys.add(sha1Bytes(id).copyOf(16))
@@ -744,14 +786,15 @@ class P2pstream : ExtractorApi() {
             Log.e(TAG, "    ↪ added ID-derived keys (id='$id')")
         }
 
-        // ═══════════════════════════════════════════════════════════════════
-        //  PATCH #3 — obfuscation extraction (String.fromCharCode, atob, +concat, hex arrays)
-        // ═══════════════════════════════════════════════════════════════════
         val (obfKeys, obfPasswords) = extractObfuscatedSecrets(js)
         rawKeys.addAll(obfKeys)
         passwords.addAll(obfPasswords)
 
-        // Fold passwords into raw-key list (backward-compat)
+        // PATCH C — narrow to app-adjacent strings (bypasses Shaka noise)
+        val appStrings = extractNearAppMarkers(js)
+        passwords.addAll(appStrings)
+        Log.e(TAG, "    ↪ app-marker candidates: ${appStrings.take(10).map { it.take(30) }}")
+
         passwords.forEach { pw ->
             val b = pw.toByteArray(Charsets.UTF_8)
             if (b.size in listOf(16, 24, 32)) rawKeys.add(b)
@@ -759,10 +802,6 @@ class P2pstream : ExtractorApi() {
 
         val uniqueKeys = rawKeys.distinctBy { bytesToHex(it) }
         Log.e(TAG, "    ${uniqueKeys.size} raw-key candidates, ${passwords.distinct().size} password candidates")
-
-        // ═══════════════════════════════════════════════════════════════════
-        //  PATCH #4 — diagnostic dumps
-        // ═══════════════════════════════════════════════════════════════════
         Log.e(TAG, "    ── top 10 keys: ${uniqueKeys.take(10).map { bytesToHex(it).take(16) + "…" }}")
         Log.e(TAG, "    ── top 15 passwords: ${passwords.distinct().take(15).map { it.take(24) }}")
 
@@ -778,7 +817,6 @@ class P2pstream : ExtractorApi() {
         val zeroIv = ByteArray(16)
         val ivs = listOf("known-hash" to plexIvWithHash(), "known-nohash" to plexIvNoHash(), "zero" to zeroIv)
 
-        // 1) Raw key + fixed/zero IVs
         for (key in uniqueKeys) {
             for ((ivLabel, iv) in ivs) {
                 tryAesCbc(ct, key, iv)?.let { p -> if (tryPlain(String(p, Charsets.UTF_8), "cbc($ivLabel) key=${bytesToHex(key).take(20)}…")) return true }
@@ -786,7 +824,6 @@ class P2pstream : ExtractorApi() {
             tryAesEcb(ct, key)?.let { p -> if (tryPlain(String(p, Charsets.UTF_8), "ecb key=${bytesToHex(key).take(20)}…")) return true }
         }
 
-        // 2) Prefixed-IV CBC (IV = first 16 bytes)
         if (ct.size > 32) {
             val prefixedIv = ct.copyOf(16)
             val strippedCt = ct.copyOfRange(16, ct.size)
@@ -802,7 +839,6 @@ class P2pstream : ExtractorApi() {
             Log.e(TAG, "    ↪ prefixed-IV CBC tried ${uniqueKeys.size} keys (${prefixedHits} hits)")
         }
 
-        // 3) EvpKDF (password-derived)
         for (password in passwords.distinct().take(150)) {
             val pw = password.toByteArray(Charsets.UTF_8)
             for (salt in listOf(ByteArray(0), ByteArray(8))) {
@@ -815,7 +851,6 @@ class P2pstream : ExtractorApi() {
             }
         }
 
-        // 4) GCM (nonce = first 12/16 bytes)
         for (nonceLen in listOf(12, 16)) {
             if (ct.size <= nonceLen + 16) continue
             val nonce = ct.copyOf(nonceLen)
@@ -829,54 +864,77 @@ class P2pstream : ExtractorApi() {
         return false
     }
 
-    // PATCH #4 — decoder error body captured
+    // ════════════════════════════════════════════════════════════════════════
+    //  PATCH A — send `agent` field (CONFIRMED required by dec-rapid / dec-mega)
+    // ════════════════════════════════════════════════════════════════════════
     private suspend fun tryEncDecPayload(
         payload: String, origin: String,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val bodies = listOf(
-            """{"text":"$payload"}""" to JSON_TYPE,
-            """{"data":"$payload"}""" to JSON_TYPE,
-            """{"hex":"$payload"}""" to JSON_TYPE,
-            payload to "text/plain".toMediaTypeOrNull(),
-        )
         val decHeaders = mapOf(
             "User-Agent" to DEFAULT_UA, "Origin" to "https://enc-dec.app",
             "Referer" to "https://enc-dec.app/", "Content-Type" to "application/json",
         )
-        for (decoder in DECODERS) {
-            for ((reqBody, mediaType) in bodies) {
+
+        // Candidate agent strings — "naruldonghua.com" appears in the p2pstream
+        // player URL as `&r=`, so it's the strongest candidate.
+        val agentCandidates = listOf(
+            hostOf(origin) ?: "",
+            "naruldonghua.com",
+            "narulplex",
+            "p2pstream",
+            DEFAULT_UA,
+            "Mozilla/5.0",
+            "Chrome",
+        ).filter { it.isNotBlank() }.distinct()
+
+        // A1) decoders requiring { text, agent }
+        for (decoder in listOf("dec-rapid", "dec-mega")) {
+            for (agent in agentCandidates) {
                 try {
-                    val resp = app.post("https://enc-dec.app/api/$decoder", headers = decHeaders, requestBody = reqBody.toRequestBody(mediaType))
+                    val reqBody = JSONObject().apply {
+                        put("text", payload)
+                        put("agent", agent)
+                    }.toString().toRequestBody(JSON_TYPE)
+                    val resp = app.post("https://enc-dec.app/api/$decoder", headers = decHeaders, requestBody = reqBody)
                     val text = resp.text
-                    Log.e(TAG, "    $decoder → ${resp.code} len=${text.length} body=${text.take(180).replace("\n", "\\n")}")
-                    if (resp.code != 200) continue
-                    if (!text.contains(".m3u8") && !text.contains(".mp4") && !text.contains("\"sources\"") && !text.contains("\"url\"") && !text.contains("\"token\"")) continue
-                    try {
-                        val json = JSONObject(text)
-                        val result = json.optJSONObject("result") ?: json
-                        if (tryJsonBody(result.toString(), origin, emptyMap(), subtitleCallback, callback)) return true
-                        if (tryDirectMedia(result.toString(), origin, emptyMap(), subtitleCallback, callback)) return true
-                        if (tryExtractTokenAndProbe(result.toString(), origin, "", emptyMap(), subtitleCallback, callback)) return true
-                    } catch (_: Exception) {
-                        if (tryDirectMedia(text, origin, emptyMap(), subtitleCallback, callback)) return true
-                    }
+                    Log.e(TAG, "    $decoder(agent='${agent.take(30)}…') → ${resp.code} len=${text.length} body=${text.take(180).replace("\n", "\\n")}")
+                    if (resp.code == 200 && tryDecodedResult(text, origin, subtitleCallback, callback)) return true
                 } catch (_: Exception) {}
             }
         }
+
+        // A2) decoders requiring { text } only
+        for (decoder in listOf("dec-abyss")) {
+            try {
+                val reqBody = """{"text":"$payload"}""".toRequestBody(JSON_TYPE)
+                val resp = app.post("https://enc-dec.app/api/$decoder", headers = decHeaders, requestBody = reqBody)
+                val text = resp.text
+                Log.e(TAG, "    $decoder(text-only) → ${resp.code} len=${text.length} body=${text.take(180).replace("\n", "\\n")}")
+                if (resp.code == 200 && tryDecodedResult(text, origin, subtitleCallback, callback)) return true
+            } catch (_: Exception) {}
+        }
+
         return false
     }
 
-    private fun findMainJsUrl(shell: String, origin: String): String? {
-        fun abs(u: String) = when {
-            u.startsWith("http") -> u; u.startsWith("//") -> "https:$u"; u.startsWith("/") -> "$origin$u"; else -> "$origin/$u"
+    // Helper — parse a successful decoder response
+    private suspend fun tryDecodedResult(
+        text: String, origin: String,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        if (!text.contains(".m3u8") && !text.contains(".mp4") &&
+            !text.contains("\"sources\"") && !text.contains("\"url\"") && !text.contains("\"token\"")) return false
+        try {
+            val json = JSONObject(text)
+            val result = json.optJSONObject("result") ?: json
+            if (tryJsonBody(result.toString(), origin, emptyMap(), subtitleCallback, callback)) return true
+            if (tryDirectMedia(result.toString(), origin, emptyMap(), subtitleCallback, callback)) return true
+            if (tryExtractTokenAndProbe(result.toString(), origin, "", emptyMap(), subtitleCallback, callback)) return true
+        } catch (_: Exception) {
+            if (tryDirectMedia(text, origin, emptyMap(), subtitleCallback, callback)) return true
         }
-        val srcs = RE_SCRIPT_SRC.findAll(shell).map { it.groupValues[1] }
-            .filter { !it.contains("cloudflareinsights", true) && !it.contains("googletagmanager", true) &&
-                !it.contains("google-analytics", true) && !it.contains("yandex", true) }
-        srcs.firstOrNull { it.matches(Regex(".*/assets/(index|main)-[^/]+\\.js.*")) }?.let { return abs(it) }
-        srcs.firstOrNull { it.contains("/assets/") && it.contains(".js") }?.let { return abs(it) }
-        return null
+        return false
     }
 
     private fun discoverEndpointsFromJs(js: String): List<String> {
@@ -934,7 +992,7 @@ class P2pstream : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  BYSE — PATCH #1: removed premium.api.byse.to alternate (6.2s timeout)
+//  BYSE — unchanged (CDN is DNS-dead; extractor already fails cleanly)
 // ════════════════════════════════════════════════════════════════════════════
 class Bysekoze : ExtractorApi() {
     override val name = "Byse"
@@ -1010,12 +1068,9 @@ class Bysekoze : ExtractorApi() {
         for (m3u8 in allM3u8.distinct().take(3)) {
             Log.e(TAG, "── try m3u8: ${m3u8.take(90)}")
             val alternates = mutableListOf<String>()
-            alternates += m3u8 // Original first
+            alternates += m3u8
             if (m3u8.contains("premium.api.byse.sx", true)) {
                 alternates += m3u8.replace("premium.api.byse.sx", "bysejikuar.com", true)
-                // NOTE: premium.api.byse.{to,io,cc} all return UnknownHostException as of
-                // 2026-10-19 and cost 6s+ per attempt. bysejikuar.com resolves but returns
-                // HTML (not #EXTM3U). Byse CDN is effectively dead — nothing to fix here.
             }
 
             for (alt in alternates.distinct()) {
@@ -1039,7 +1094,6 @@ class Bysekoze : ExtractorApi() {
                 }
             }
 
-            // Validate before emit — never emit garbage
             for (alt in alternates.distinct()) {
                 val host = hostOf(alt) ?: continue
                 Log.e(TAG, "    ↪ raw-validate $host")
