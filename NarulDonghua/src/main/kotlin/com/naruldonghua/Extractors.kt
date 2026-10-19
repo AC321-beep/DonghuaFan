@@ -41,7 +41,6 @@ private val RE_M3U8_ANY  = Regex("""(https?://[^"'\s\\]+\.m3u8[^"'\s\\]*)""")
 private val RE_MP4_ATTR  = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.(?:mp4|mkv)[^"']*)["']""", RegexOption.IGNORE_CASE)
 private val RE_MP4_ANY   = Regex("""(https?://[^"'\s\\]+\.(?:mp4|mkv)[^"'\s\\]*)""")
 private val RE_SUB_URL   = Regex("""(https?://[^"'\s\\<>]+\.(?:vtt|srt|ass|ssa)(?:\?[^"'\s\\<>]*)?)""", RegexOption.IGNORE_CASE)
-// NEW – match HLS manifests that don't end in ".m3u8"
 private val RE_HLS_HINT  = Regex("""(https?://[^"'\s\\]+/(?:manifest|hls|playlist|master)(?:/[^"'\s\\]*)?)""", RegexOption.IGNORE_CASE)
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -101,11 +100,27 @@ private fun hexToBytes(hex: String): ByteArray? {
 }
 private fun bytesToHex(b: ByteArray): String = b.joinToString("") { "%02x".format(it) }
 
+private fun md5Bytes(s: String): ByteArray =
+    MessageDigest.getInstance("MD5").digest(s.toByteArray(Charsets.UTF_8))
+private fun sha1Bytes(s: String): ByteArray =
+    MessageDigest.getInstance("SHA-1").digest(s.toByteArray(Charsets.UTF_8))
+private fun sha256Bytes(s: String): ByteArray =
+    MessageDigest.getInstance("SHA-256").digest(s.toByteArray(Charsets.UTF_8))
+
 private fun tryAesCbc(ct: ByteArray, key: ByteArray, iv: ByteArray): ByteArray? {
     if (ct.isEmpty() || ct.size % 16 != 0) return null
     if (key.size !in listOf(16, 24, 32) || iv.size != 16) return null
     return try {
         val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+        c.doFinal(ct)
+    } catch (_: Exception) { null }
+}
+private fun tryAesCbcNoPad(ct: ByteArray, key: ByteArray, iv: ByteArray): ByteArray? {
+    if (ct.isEmpty() || ct.size % 16 != 0) return null
+    if (key.size !in listOf(16, 24, 32) || iv.size != 16) return null
+    return try {
+        val c = Cipher.getInstance("AES/CBC/NoPadding")
         c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
         c.doFinal(ct)
     } catch (_: Exception) { null }
@@ -119,19 +134,18 @@ private fun tryAesEcb(ct: ByteArray, key: ByteArray): ByteArray? {
         c.doFinal(ct)
     } catch (_: Exception) { null }
 }
-private fun tryAesGcm(ct: ByteArray, key: ByteArray, nonce: ByteArray): ByteArray? {
-    if (ct.isEmpty() || key.size !in listOf(16, 24, 32) || nonce.size !in listOf(12, 16)) return null
+private fun tryAesGcm(ctAndTag: ByteArray, key: ByteArray, nonce: ByteArray): ByteArray? {
+    if (ctAndTag.size < 16 || key.size !in listOf(16, 24, 32)) return null
+    if (nonce.size !in listOf(12, 16)) return null
     return try {
         val c = Cipher.getInstance("AES/GCM/NoPadding")
         c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
-        c.doFinal(ct)
+        c.doFinal(ctAndTag)
     } catch (_: Exception) { null }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  NEW – CryptoJS-compatible EvpKDF (OpenSSL key derivation)
-//  Derives {key, iv} from {password, salt} using iterative MD5.
-//  Matches CryptoJS.AES.encrypt(plaintext, passphrase).toString() output.
+//  CryptoJS/OpenSSL EvpKDF (MD5, 1 iteration)
 // ════════════════════════════════════════════════════════════════════════════
 private fun evpKDF(
     password: ByteArray,
@@ -152,7 +166,6 @@ private fun evpKDF(
         if (salt.isNotEmpty()) md5.update(salt)
         block = md5.digest()
         md5.reset()
-
         for (i in 1 until iterations) {
             block = md5.digest(block!!)
             md5.reset()
@@ -167,6 +180,15 @@ private fun evpKDF(
 private fun likelyPlain(s: String): Boolean =
     s.isNotBlank() && s.length > 8 && !s.contains('\u0000') &&
     s.count { it.code in 32..126 || it.code == 9 || it.code == 10 } / s.length.toFloat() > 0.55f
+
+// ════════════════════════════════════════════════════════════════════════════
+//  NEW – Validate that a URL actually serves an M3U8 manifest
+// ════════════════════════════════════════════════════════════════════════════
+private suspend fun isValidM3u8(url: String, headers: Map<String, String>): Boolean =
+    try {
+        val resp = app.get(url, headers = headers, timeout = 8L)
+        resp.code == 200 && resp.text.trimStart().startsWith("#EXTM3U")
+    } catch (_: Exception) { false }
 
 private suspend fun emitSubtitlesFromText(text: String, subtitleCallback: (SubtitleFile) -> Unit) {
     if (text.isEmpty()) return
@@ -300,24 +322,22 @@ class P2pstream : ExtractorApi() {
         private val workingEndpointCache = ConcurrentHashMap<String, String>()
 
         private val KNOWN_ENDPOINTS = listOf(
-            "/api/v1/info?id={id}",            // ← now tried FIRST (returns token payload)
+            "/api/v1/info?id={id}",
             "/api/v1/player?t={id}&w=1920&h=1080&r={ref}",
             "/api/v1/player?t={id}&w=1920&h=1080",
             "/api/v1/player?t={id}",
             "/api/v1/video?id={id}",
         )
         private val ENTRY_TEMPLATES = listOf("/?v={id}", "/?id={id}", "/{id}")
-        private val DECODERS = listOf(
-            "dec-vidsrc", "dec-streamtape", "dec-vidlink", "dec-rapid",
-            "dec-vidstack", "dec-abyss", "dec-mega", "dec-voe",
-            "dec-p2pstream", "dec-plex", "dec-decrypt", "dec-aes",
-        )
+
+        // Only decoders that actually exist (non-404 per latest log)
+        private val DECODERS = listOf("dec-rapid", "dec-abyss", "dec-mega")
+
         private val RE_SCRIPT_SRC = Regex("""<script[^>]+src=["']([^"']+\.js[^"']*)["']""", RegexOption.IGNORE_CASE)
         private val RE_HEX    = Regex("^[0-9a-fA-F]{100,}$")
         private val RE_BASE64 = Regex("^[A-Za-z0-9+/=_-]{200,}$")
         private val JSON_TYPE = "application/json; charset=utf-8".toMediaTypeOrNull()
 
-        // ── FIX #1: correct no-hash IV (was 0x00 in place of 'i' 0x69) ───────
         private fun plexKey(): ByteArray = "kiemtienmua911c#".toByteArray(Charsets.UTF_8)
         private fun plexIvWithHash(): ByteArray = "1234567890oiuytr".toByteArray(Charsets.UTF_8)
         private fun plexIvNoHash(): ByteArray = "1234567890oiuytr".toByteArray(Charsets.UTF_8)
@@ -325,15 +345,9 @@ class P2pstream : ExtractorApi() {
         private fun base64KeyCandidate(): ByteArray? =
             try { Base64.decode("ITWMv7t88JGzI0xPwW8I0+LveiXX9SWbfdmt0ArUSyc=", Base64.DEFAULT) } catch (_: Exception) { null }
 
-        // ── NEW: candidate passwords derived from known template families ───
         private fun candidatePasswords(): List<String> = listOf(
-            "kiemtienmua911c#",
-            "kiemtienmua911c",
-            "kiemtienmua911c\$",
-            "kiemtienmua911c@",
-            "kiemtienmua911c!",
-            "kiemtien",
-            "kiemtienmua911",
+            "kiemtienmua911c#", "kiemtienmua911c", "kiemtienmua911c\$",
+            "kiemtienmua911c@", "kiemtienmua911c!", "kiemtien", "kiemtienmua911",
         )
     }
 
@@ -398,7 +412,6 @@ class P2pstream : ExtractorApi() {
             "Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "same-origin",
         )
 
-        // Cache fast-path
         workingEndpointCache[origin]?.let { cached ->
             when (probeEndpoint(origin, cached, id, apiHeaders, subtitleCallback, callback)) {
                 ProbeResult.FOUND, ProbeResult.PAYLOAD_UNKNOWN, ProbeResult.RATE_LIMITED -> return
@@ -406,7 +419,6 @@ class P2pstream : ExtractorApi() {
             }
         }
 
-        // Always fetch JS first – we need it for EvpKDF password discovery
         ensureJsCached(origin, id, headers)
 
         for (tmpl in KNOWN_ENDPOINTS) {
@@ -463,7 +475,6 @@ class P2pstream : ExtractorApi() {
         if (isHex || isBase64) {
             Log.e(TAG, "  ⚠ encrypted payload (hex=$isHex b64=$isBase64 len=${trimmed.length})")
 
-            // (a) plain-text attempt (some payloads just get hex-encoded JSON)
             if (isHex) {
                 val dec = hexToBytes(trimmed)?.let { String(it, Charsets.UTF_8) }
                 if (dec != null && likelyPlain(dec)) {
@@ -473,13 +484,9 @@ class P2pstream : ExtractorApi() {
                 }
             }
 
-            // (b) enc-dec.app decoders (FIX #5 – three payload shapes)
             if (tryEncDecPayload(trimmed, origin, subtitleCallback, callback)) return ProbeResult.FOUND
-
-            // (c) known hard-coded key, now also via EvpKDF (FIX #2)
             if (tryKnownPlexDecrypt(trimmed, origin, subtitleCallback, callback)) return ProbeResult.FOUND
 
-            // (d) keys AND EvpKDF-passwords extracted from JS (FIX #3)
             val js = scriptCache[origin]
             if (js != null && tryDecryptWithExtractedKeys(trimmed, js, origin, subtitleCallback, callback)) return ProbeResult.FOUND
 
@@ -492,7 +499,6 @@ class P2pstream : ExtractorApi() {
         return ProbeResult.NOT_FOUND
     }
 
-    // ── NEW (FIX #4): if decrypted JSON carries a token, probe /player with it ──
     private suspend fun tryExtractTokenAndProbe(
         plaintext: String, origin: String, originalId: String,
         apiHeaders: Map<String, String>,
@@ -523,7 +529,26 @@ class P2pstream : ExtractorApi() {
         val key = plexKey()
         Log.e(TAG, "    ★ known key=${bytesToHex(key)} len=${key.size} ct=${ct.size}")
 
-        // Attempt 1 – raw key with the two known IVs (existing behaviour, IV bug fixed)
+        // ── OpenSSL `Salted__` format (first 8 bytes = "Salted__") ──────────
+        if (payloadHex.startsWith("53616c7465645f5f", true) && payloadHex.length > 32) {
+            Log.e(TAG, "    ↪ OpenSSL Salted__ format detected")
+            val salt = hexToBytes(payloadHex.substring(16, 32)) ?: return false
+            val realCt = hexToBytes(payloadHex.substring(32)) ?: return false
+            for (pw in candidatePasswords()) {
+                val (k, iv) = evpKDF(pw.toByteArray(), salt, 32, 16)
+                tryAesCbc(realCt, k, iv)?.let { p ->
+                    val s = String(p, Charsets.UTF_8)
+                    if (likelyPlain(s)) {
+                        Log.e(TAG, "    ✓✓ Salted__ pass='$pw' → ${s.take(400)}")
+                        if (tryDirectMedia(s, origin, emptyMap(), subtitleCallback, callback)) return true
+                        if (tryJsonBody(s, origin, emptyMap(), subtitleCallback, callback)) return true
+                        if (tryExtractTokenAndProbe(s, origin, "", emptyMap(), subtitleCallback, callback)) return true
+                    }
+                }
+            }
+        }
+
+        // ── Raw key + 2 known IVs ──────────────────────────────────────────
         for ((label, iv) in listOf("iv-hash" to plexIvWithHash(), "iv-no-hash" to plexIvNoHash())) {
             val plain = tryAesCbc(ct, key, iv)
             if (plain == null) { Log.e(TAG, "    ✗ $label: BadPadding"); continue }
@@ -535,7 +560,7 @@ class P2pstream : ExtractorApi() {
             if (tryExtractTokenAndProbe(s, origin, "", emptyMap(), subtitleCallback, callback)) return true
         }
 
-        // Attempt 2 – base64 key candidate (existing)
+        // ── base64 key candidate ───────────────────────────────────────────
         base64KeyCandidate()?.let { b64Key ->
             for ((label, iv) in listOf("iv-hash" to plexIvWithHash(), "iv-no-hash" to plexIvNoHash())) {
                 val plain = tryAesCbc(ct, b64Key, iv) ?: continue
@@ -549,19 +574,41 @@ class P2pstream : ExtractorApi() {
             }
         }
 
-        // Attempt 3 – NEW: CryptoJS EvpKDF with template passwords (FIX #2)
+        // ── EvpKDF (zero salt + 8-zero salt) with logging ──────────────────
         for (password in candidatePasswords()) {
             val pwBytes = password.toByteArray(Charsets.UTF_8)
             for (salt in listOf(ByteArray(0), ByteArray(8))) {
-                for (keySize in listOf(32, 16)) {  // try AES-256 then AES-128
+                for (keySize in listOf(32, 16)) {
                     val (k, iv) = evpKDF(pwBytes, salt, keySize, 16)
-                    val plain = tryAesCbc(ct, k, iv) ?: continue
-                    val s = String(plain, Charsets.UTF_8)
-                    if (!likelyPlain(s)) continue
-                    Log.e(TAG, "    ✓✓ EVPKDF pass='$password' saltLen=${salt.size} keySize=$keySize → ${s.take(400)}")
-                    if (tryDirectMedia(s, origin, emptyMap(), subtitleCallback, callback)) return true
-                    if (tryJsonBody(s, origin, emptyMap(), subtitleCallback, callback)) return true
-                    if (tryExtractTokenAndProbe(s, origin, "", emptyMap(), subtitleCallback, callback)) return true
+                    tryAesCbc(ct, k, iv)?.let { p ->
+                        val s = String(p, Charsets.UTF_8)
+                        if (likelyPlain(s)) {
+                            Log.e(TAG, "    ✓✓ EVPKDF pass='$password' salt=${salt.size} ks=$keySize → ${s.take(400)}")
+                            if (tryDirectMedia(s, origin, emptyMap(), subtitleCallback, callback)) return true
+                            if (tryJsonBody(s, origin, emptyMap(), subtitleCallback, callback)) return true
+                            if (tryExtractTokenAndProbe(s, origin, "", emptyMap(), subtitleCallback, callback)) return true
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── GCM: nonce = first 12/16 bytes, tag = last 16 bytes ───────────
+        Log.e(TAG, "    ↪ GCM attempts (nonce=12/16)")
+        for (nonceLen in listOf(12, 16)) {
+            if (ct.size <= nonceLen + 16) continue
+            val nonce = ct.copyOf(nonceLen)
+            val ctAndTag = ct.copyOfRange(nonceLen, ct.size)
+            for (key2 in listOf(key, base64KeyCandidate())) {
+                if (key2 == null) continue
+                tryAesGcm(ctAndTag, key2, nonce)?.let { p ->
+                    val s = String(p, Charsets.UTF_8)
+                    if (likelyPlain(s)) {
+                        Log.e(TAG, "    ✓✓ GCM nonce=$nonceLen → ${s.take(400)}")
+                        if (tryDirectMedia(s, origin, emptyMap(), subtitleCallback, callback)) return true
+                        if (tryJsonBody(s, origin, emptyMap(), subtitleCallback, callback)) return true
+                        if (tryExtractTokenAndProbe(s, origin, "", emptyMap(), subtitleCallback, callback)) return true
+                    }
                 }
             }
         }
@@ -574,17 +621,59 @@ class P2pstream : ExtractorApi() {
     ): Boolean {
         val ct = hexToBytes(payloadHex) ?: return false
 
-        // Collect raw key candidates (unchanged) + string password candidates (NEW)
         val rawKeys = mutableListOf<ByteArray>()
         val passwords = mutableListOf<String>()
         rawKeys.add(plexKey())
 
+        // Hex raw keys
         Regex("""["'`]([0-9a-fA-F]{32})["'`]""").findAll(js).forEach { hexToBytes(it.groupValues[1])?.let(rawKeys::add) }
         Regex("""["'`]([0-9a-fA-F]{64})["'`]""").findAll(js).forEach { hexToBytes(it.groupValues[1])?.let(rawKeys::add) }
+
+        // Generic 16/32-char passwords
         Regex("""["'`]([A-Za-z0-9!@#$%^&*()_+\-=./]{16})["'`]""").findAll(js).take(300).forEach { passwords.add(it.groupValues[1]) }
         Regex("""["'`]([A-Za-z0-9!@#$%^&*()_+\-=./]{32})["'`]""").findAll(js).take(300).forEach { passwords.add(it.groupValues[1]) }
-        // Also fold passwords into raw-key tries (backward-compat)
-        passwords.forEach { rawKeys.add(it.toByteArray(Charsets.UTF_8)) }
+
+        // NEW – contextual: strings near decrypt/key/secret/cipher/aes tokens
+        Regex("""(?:key|secret|pass(?:word|phrase)?|decrypt|aes|cipher|iv)[^\w]{0,20}["'`]([^"'`\s]{8,64})["'`]""",
+            RegexOption.IGNORE_CASE).findAll(js).take(120).forEach { passwords.add(it.groupValues[1]) }
+
+        // NEW – strings NEAR CryptoJS.AES.decrypt (whole-call context window)
+        Regex("""CryptoJS\.AES\.decrypt\([^)]{0,400}?["'`]([^"'`\s]{4,64})["'`]""")
+            .findAll(js).take(60).forEach { passwords.add(it.groupValues[1]) }
+
+        // NEW – reverse-string obfuscation candidates
+        Regex("""["'`]([A-Za-z0-9!@#$%^&*_+\-=./]{16})["'`]""").findAll(js).take(200).forEach {
+            passwords.add(it.groupValues[1].reversed())
+        }
+
+        // NEW – base64 that decodes to 16/24/32 bytes → usable as AES key
+        Regex("""["'`]([A-Za-z0-9+/]{22,}==?)["'`]""").findAll(js).take(200).forEach { m ->
+            try {
+                val dec = Base64.decode(m.groupValues[1], Base64.DEFAULT)
+                if (dec.size in listOf(16, 24, 32)) rawKeys.add(dec)
+            } catch (_: Exception) {}
+        }
+
+        // NEW – MD5 / SHA1 / SHA256 of the raw id (payload-specific derivation)
+        val id = ""
+        if (id.isNotBlank()) {
+            rawKeys.add(md5Bytes(id))
+            rawKeys.add(sha256Bytes(id))
+            passwords.add(id)
+        }
+        val hostname = hostOf(origin) ?: ""
+        if (hostname.isNotBlank()) {
+            rawKeys.add(md5Bytes(hostname))
+            rawKeys.add(sha1Bytes(hostname))
+            rawKeys.add(sha256Bytes(hostname))
+            passwords.add(hostname)
+        }
+
+        // Fold passwords into raw-key list (backward-compat)
+        passwords.forEach { pw ->
+            val b = pw.toByteArray(Charsets.UTF_8)
+            if (b.size in listOf(16, 24, 32)) rawKeys.add(b)
+        }
 
         val uniqueKeys = rawKeys.distinctBy { bytesToHex(it) }
         Log.e(TAG, "    ${uniqueKeys.size} raw-key candidates, ${passwords.distinct().size} password candidates")
@@ -617,8 +706,8 @@ class P2pstream : ExtractorApi() {
             }
         }
 
-        // ── EvpKDF attempts (NEW – FIX #3) ───────────────────────────────────
-        for (password in passwords.distinct().take(120)) {
+        // ── EvpKDF attempts (0 salt + 8-zero salt) ───────────────────────────
+        for (password in passwords.distinct().take(150)) {
             val pw = password.toByteArray(Charsets.UTF_8)
             for (salt in listOf(ByteArray(0), ByteArray(8))) {
                 for (keySize in listOf(32, 16)) {
@@ -635,10 +724,28 @@ class P2pstream : ExtractorApi() {
                 }
             }
         }
+
+        // ── GCM attempts (nonce = first 12/16 bytes) ─────────────────────────
+        for (nonceLen in listOf(12, 16)) {
+            if (ct.size <= nonceLen + 16) continue
+            val nonce = ct.copyOf(nonceLen)
+            val ctAndTag = ct.copyOfRange(nonceLen, ct.size)
+            for (key in uniqueKeys) {
+                tryAesGcm(ctAndTag, key, nonce)?.let { p ->
+                    val s = String(p, Charsets.UTF_8)
+                    if (likelyPlain(s)) {
+                        Log.e(TAG, "    ✓ gcm(nonce=$nonceLen) key=${bytesToHex(key).take(20)}… → ${s.take(200)}")
+                        if (tryDirectMedia(s, origin, emptyMap(), subtitleCallback, callback)) return true
+                        if (tryJsonBody(s, origin, emptyMap(), subtitleCallback, callback)) return true
+                        if (tryExtractTokenAndProbe(s, origin, "", emptyMap(), subtitleCallback, callback)) return true
+                    }
+                }
+            }
+        }
         return false
     }
 
-    // FIX #5 – three payload shapes attempted
+    // FIX #5 – extra payload shapes + only existing decoders
     private suspend fun tryEncDecPayload(
         payload: String, origin: String,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
@@ -646,6 +753,7 @@ class P2pstream : ExtractorApi() {
         val bodies = listOf(
             """{"text":"$payload"}""" to JSON_TYPE,
             """{"data":"$payload"}""" to JSON_TYPE,
+            """{"hex":"$payload"}""" to JSON_TYPE,
             payload to "text/plain".toMediaTypeOrNull(),
         )
         val decHeaders = mapOf(
@@ -696,7 +804,6 @@ class P2pstream : ExtractorApi() {
         return found.distinct().take(8)
     }
 
-    // FIX #9 – also try HLS-hint URLs (no ".m3u8" suffix)
     private suspend fun tryDirectMedia(text: String, origin: String, headers: Map<String, String>, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         if (text.length > 800_000) return false
         val n = text.replace("\\/", "/")
@@ -704,7 +811,6 @@ class P2pstream : ExtractorApi() {
         RE_M3U8_ANY.find(n)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { emitHls(it, origin, headers, subtitleCallback, callback); return true }
         RE_MP4_ATTR.find(n)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { callback(newExtractorLink(name, name, it, INFER_TYPE) { this.referer = "$origin/" }); return true }
         RE_MP4_ANY.find(n)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { callback(newExtractorLink(name, name, it, INFER_TYPE) { this.referer = "$origin/" }); return true }
-        // NEW – HLS-style manifest without .m3u8 extension
         RE_HLS_HINT.find(n)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { emitHls(it, origin, headers, subtitleCallback, callback); return true }
         return false
     }
@@ -744,7 +850,7 @@ class P2pstream : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  BYSE
+//  BYSE — original-first, validate-before-emit, never emit garbage
 // ════════════════════════════════════════════════════════════════════════════
 class Bysekoze : ExtractorApi() {
     override val name = "Byse"
@@ -794,7 +900,6 @@ class Bysekoze : ExtractorApi() {
         }
         Log.e(TAG, "vite chunks (${chunks.size}): ${chunks.take(10)}")
 
-        // FIX #7 – fetch each chunk ONCE and reuse for both m3u8 and API-path search
         val allM3u8 = mutableListOf<String>()
         val allApiPaths = mutableListOf<String>()
         for (chunk in chunks.take(40)) {
@@ -816,23 +921,18 @@ class Bysekoze : ExtractorApi() {
 
         Log.e(TAG, "── collected m3u8 (${allM3u8.distinct().size}): ${allM3u8.distinct().map { it.take(60) }}")
 
-        // FIX #6/#8 – try ONLY the original m3u8 first, then known alternates.
-        // Referer is derived from the m3u8 host so CDN auth headers line up.
+        val m3u8Headers = headers + mapOf("Referer" to "$origin/", "Origin" to origin)
+
+        // ─── PASS 1: original URL first, then alternates, all through M3u8Helper ─
         for (m3u8 in allM3u8.distinct().take(3)) {
             Log.e(TAG, "── try m3u8: ${m3u8.take(90)}")
-            val m3u8Host = hostOf(m3u8) ?: continue
-            val m3u8Headers = headers + mapOf(
-                "Referer" to "$origin/",
-                "Origin"  to origin,
-            )
             val alternates = mutableListOf<String>()
-            // Only include alternates whose host was previously resolvable in this session
+            alternates += m3u8 // ✅ original FIRST (was last before → caused the 0-variant short-circuit bug)
             if (m3u8.contains("premium.api.byse.sx", true)) {
                 alternates += m3u8.replace("premium.api.byse.sx", "bysejikuar.com", true)
+                alternates += m3u8.replace("premium.api.byse.sx", "premium.api.byse.to", true)
             }
-            alternates += m3u8 // original LAST so working host isn't shadowed
 
-            var emitted = false
             for (alt in alternates.distinct()) {
                 val host = hostOf(alt) ?: continue
                 val startMs = System.currentTimeMillis()
@@ -849,23 +949,31 @@ class Bysekoze : ExtractorApi() {
                         Log.e(TAG, "    ✓ emitted from $host")
                         return
                     }
-                    // FIX #6 – M3u8Helper returned empty but domain responded. Emit raw m3u8.
-                    Log.w(TAG, "    M3u8Helper 0 variants on $host – emitting raw m3u8 fallback")
+                } catch (e: Exception) {
+                    Log.e(TAG, "    FAIL $host in ${System.currentTimeMillis()-startMs}ms: ${e.javaClass.simpleName}: ${e.message?.take(80)}")
+                }
+            }
+
+            // ─── PASS 2: no M3u8Helper variant worked → validate raw URL first ─
+            for (alt in alternates.distinct()) {
+                val host = hostOf(alt) ?: continue
+                Log.e(TAG, "    ↪ raw-validate $host")
+                if (isValidM3u8(alt, m3u8Headers)) {
+                    Log.e(TAG, "    ✓ raw-validate OK on $host → emitting as M3U8")
                     callback(newExtractorLink(name, name, alt, INFER_TYPE) {
                         this.referer = "$origin/"
                         this.headers = m3u8Headers
                     })
                     emitSubtitlesFromM3u8(alt, m3u8Headers, subtitleCallback)
-                    emitted = true
-                    break
-                } catch (e: Exception) {
-                    Log.e(TAG, "    FAIL $host in ${System.currentTimeMillis()-startMs}ms: ${e.javaClass.simpleName}: ${e.message?.take(80)}")
+                    return
+                } else {
+                    Log.e(TAG, "    ✗ raw-validate FAILED on $host (not a valid #EXTM3U)")
                 }
             }
-            if (emitted) return
+            // ⛔ Do NOT emit garbage here — the old code emitted `exampleurl.com` and crashed the player.
         }
 
-        // FIX #7 – reuse allApiPaths collected above
+        // ─── PASS 3: API path probing ─────────────────────────────────────────
         for (path in allApiPaths.distinct().take(10)) {
             val tryUrl = "$origin$path"
                 .replace("{hash}", hash).replace(":hash", hash)
@@ -878,26 +986,29 @@ class Bysekoze : ExtractorApi() {
                 if (r.code == 200 && !isErrorPage(r.text)) {
                     RE_M3U8_ANY.find(r.text)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { m3u8 ->
                         val startMs = System.currentTimeMillis()
-                        val links = withTimeoutOrNull(8_000L) { M3u8Helper.generateM3u8(name, m3u8, "$origin/", headers = headers) }
+                        val links = withTimeoutOrNull(8_000L) { M3u8Helper.generateM3u8(name, m3u8, "$origin/", headers = m3u8Headers) }
                         Log.e(TAG, "    api m3u8 → ${links?.size ?: 0} in ${System.currentTimeMillis()-startMs}ms")
                         if (!links.isNullOrEmpty()) {
                             links.forEach(callback)
-                            emitSubtitlesFromM3u8(m3u8, headers, subtitleCallback)
+                            emitSubtitlesFromM3u8(m3u8, m3u8Headers, subtitleCallback)
                             return
                         }
-                        // same raw-emit fallback for API-derived m3u8
-                        callback(newExtractorLink(name, name, m3u8, INFER_TYPE) {
-                            this.referer = "$origin/"
-                            this.headers = headers
-                        })
-                        emitSubtitlesFromM3u8(m3u8, headers, subtitleCallback)
-                        return
+                        // validate before emit
+                        if (isValidM3u8(m3u8, m3u8Headers)) {
+                            callback(newExtractorLink(name, name, m3u8, INFER_TYPE) {
+                                this.referer = "$origin/"
+                                this.headers = m3u8Headers
+                            })
+                            emitSubtitlesFromM3u8(m3u8, m3u8Headers, subtitleCallback)
+                            return
+                        }
+                        Log.e(TAG, "    ✗ api m3u8 not valid #EXTM3U → skipping")
                     }
                 }
             } catch (e: Exception) { Log.e(TAG, "    API fail: ${e.message?.take(80)}") }
         }
 
-        Log.e(TAG, "✗ Byse exhausted")
+        Log.e(TAG, "✗ Byse exhausted (no valid stream found)")
     }
 
     private suspend fun fetchText(url: String, headers: Map<String, String>): String? =
@@ -914,7 +1025,7 @@ class Bysekoze : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  ABYSS — unchanged (it works in the logcat)
+//  ABYSS — unchanged (verified working in logcat)
 // ════════════════════════════════════════════════════════════════════════════
 @Suppress("DEPRECATION")
 class AbyssPlayer : ExtractorApi() {
