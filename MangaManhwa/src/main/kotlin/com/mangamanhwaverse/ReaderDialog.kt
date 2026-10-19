@@ -30,6 +30,8 @@ import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.fragment.app.DialogFragment
+import com.mangamanhwaverse.core.CFState
+import com.mangamanhwaverse.core.MangaManhwaProvider
 import java.net.URI
 
 class ReaderDialog : DialogFragment() {
@@ -42,14 +44,7 @@ class ReaderDialog : DialogFragment() {
         private const val ARG_TARGET = "target"
         private const val ARG_REFERER = "referer"
 
-        fun show(
-            activity: AppCompatActivity,
-            title: String,
-            chapterName: String,
-            chapterUrl: String,
-            referer: String,
-            targetChapter: Int = 0
-        ) {
+        fun show(activity: AppCompatActivity, title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int = 0) {
             if (activity.isFinishing || activity.isDestroyed) return
             val fm = activity.supportFragmentManager
             if (fm.isDestroyed) return
@@ -58,17 +53,12 @@ class ReaderDialog : DialogFragment() {
                 if (existing?.isAdded == true) {
                     existing.loadUrl(chapterName, chapterUrl, targetChapter)
                 } else {
-                    fm.beginTransaction()
-                        .add(newInstance(title, chapterName, chapterUrl, referer, targetChapter), TAG)
-                        .commitAllowingStateLoss()
+                    fm.beginTransaction().add(newInstance(title, chapterName, chapterUrl, referer, targetChapter), TAG).commitAllowingStateLoss()
                 }
             }
         }
 
-        fun newInstance(
-            title: String, chapterName: String, chapterUrl: String,
-            referer: String, targetChapter: Int
-        ) = ReaderDialog().apply {
+        fun newInstance(title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int) = ReaderDialog().apply {
             arguments = Bundle().apply {
                 putString(ARG_TITLE, title)
                 putString(ARG_CHAPTER, chapterName)
@@ -114,12 +104,9 @@ class ReaderDialog : DialogFragment() {
             addFlags(128)
         }
         d.setOnKeyListener { _, keyCode, event ->
-            if (keyCode != KeyEvent.KEYCODE_BACK || event.action != KeyEvent.ACTION_UP) {
-                return@setOnKeyListener false
-            }
+            if (keyCode != KeyEvent.KEYCODE_BACK || event.action != KeyEvent.ACTION_UP) return@setOnKeyListener false
             val wv = webView
-            if (wv?.canGoBack() == true) { wv.goBack(); true }
-            else { dismissAllowingStateLoss(); true }
+            if (wv?.canGoBack() == true) { wv.goBack(); true } else { dismissAllowingStateLoss(); true }
         }
         return d
     }
@@ -145,9 +132,7 @@ class ReaderDialog : DialogFragment() {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    override fun onCreateView(
-        inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?
-    ): View {
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
         val ctx = requireContext()
         val density = resources.displayMetrics.density
         fun dp(v: Int) = (v * density).toInt()
@@ -187,7 +172,9 @@ class ReaderDialog : DialogFragment() {
                 setSupportZoom(false)
                 cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
                 mediaPlaybackRequiresUserGesture = false
-                userAgentString = MangaManhwaProvider.UA
+
+                userAgentString = runCatching { URI(currentChapterUrl).host }.getOrNull()
+                    ?.let { CFState.userAgentFor(it) } ?: MangaManhwaProvider.UA
             }
 
             addJavascriptInterface(JsBridge(this@ReaderDialog), "MMReader")
@@ -202,55 +189,24 @@ class ReaderDialog : DialogFragment() {
             }
 
             webViewClient = object : WebViewClient() {
-
-                // Allow site-internal navigation; block ad/external hosts
-                override fun shouldOverrideUrlLoading(
-                    view: WebView, request: WebResourceRequest
-                ): Boolean {
+                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                     val u = request.url?.toString() ?: return false
                     if (!u.startsWith("http")) return false
-
-                    val blocklist = listOf(
-                        "doubleclick", "googlesyndication", "googleadservices",
-                        "facebook.com/tr", "analytics", "scorecardresearch",
-                        "adservice", "adsystem"
-                    )
+                    val blocklist = listOf("doubleclick", "googlesyndication", "googleadservices", "facebook.com/tr", "analytics", "scorecardresearch", "adservice", "adsystem")
                     if (blocklist.any { u.contains(it, ignoreCase = true) }) return true
-
                     return false
                 }
 
-                // Accept broken certs (common on smaller hosts)
-                override fun onReceivedSslError(
-                    view: WebView?,
-                    handler: android.webkit.SslErrorHandler?,
-                    error: android.net.http.SslError?
-                ) {
+                override fun onReceivedSslError(view: WebView?, handler: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) {
                     handler?.proceed()
                 }
 
-                // Show a friendly error page on main-frame failures
-                override fun onReceivedError(
-                    view: WebView,
-                    request: WebResourceRequest,
-                    error: WebResourceError
-                ) {
+                override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
                     if (!request.isForMainFrame) return
                     progressBar?.visibility = View.GONE
-                    val desc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        error.description.toString()
-                    } else "Network error"
+                    val desc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) error.description.toString() else "Network error"
                     view.loadData(
-                        """
-                        <html><body style="background:#07080C;color:#94A3B8;
-                          font-family:sans-serif;padding:40px;text-align:center">
-                          <h3 style="color:#E2E8F0">Couldn't load chapter</h3>
-                          <p>$desc</p>
-                          <p style="font-size:12px;margin-top:24px;word-break:break-all">
-                            ${request.url}
-                          </p>
-                        </body></html>
-                        """.trimIndent(),
+                        "<html><body style=\"background:#07080C;color:#94A3B8;font-family:sans-serif;padding:40px;text-align:center\"><h3 style=\"color:#E2E8F0\">Couldn't load chapter</h3><p>$desc</p><p style=\"font-size:12px;margin-top:24px;word-break:break-all\">${request.url}</p></body></html>",
                         "text/html", "UTF-8"
                     )
                 }
@@ -283,15 +239,11 @@ class ReaderDialog : DialogFragment() {
         }
 
         bar.addView(btn(ctx, density, "✕", "#281417", "#F87171") { dismissAllowingStateLoss() })
-        bar.addView(btn(ctx, density, "◀", null, "#CBD5E1") { jsNext(-1) }.apply {
-            (layoutParams as? LinearLayout.LayoutParams)?.leftMargin = dp(6)
-        })
+        bar.addView(btn(ctx, density, "◀", null, "#CBD5E1") { jsNext(-1) }.apply { (layoutParams as? LinearLayout.LayoutParams)?.leftMargin = dp(6) })
 
         val scroll = HorizontalScrollView(ctx).apply {
             isHorizontalScrollBarEnabled = false
-            layoutParams = LinearLayout.LayoutParams(0, -1, 1f).apply {
-                leftMargin = dp(6); rightMargin = dp(6)
-            }
+            layoutParams = LinearLayout.LayoutParams(0, -1, 1f).apply { leftMargin = dp(6); rightMargin = dp(6) }
         }
         val middle = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -322,10 +274,7 @@ class ReaderDialog : DialogFragment() {
         return bar
     }
 
-    private fun btn(
-        ctx: Context, density: Float, label: String,
-        bg: String?, fg: String?, onClick: () -> Unit
-    ): TextView {
+    private fun btn(ctx: Context, density: Float, label: String, bg: String?, fg: String?, onClick: () -> Unit): TextView {
         fun dp(v: Int) = (v * density).toInt()
         return TextView(ctx).apply {
             text = label
@@ -355,9 +304,8 @@ class ReaderDialog : DialogFragment() {
     private fun haptic() {
         runCatching {
             val v = requireContext().getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                v.vibrate(VibrationEffect.createOneShot(15, VibrationEffect.DEFAULT_AMPLITUDE))
-            } else @Suppress("DEPRECATION") v.vibrate(15)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) v.vibrate(VibrationEffect.createOneShot(15, VibrationEffect.DEFAULT_AMPLITUDE))
+            else @Suppress("DEPRECATION") v.vibrate(15)
         }
     }
 
@@ -368,6 +316,7 @@ class ReaderDialog : DialogFragment() {
         zoomBtn?.text = "$currentZoom%"
         webView?.let { applyZoom(it, currentZoom) }
     }
+
     private fun resetZoom() {
         currentZoom = 100
         zoomBtn?.text = "100%"
@@ -410,9 +359,6 @@ class ReaderDialog : DialogFragment() {
         webView?.evaluateJavascript(js, null)
     }
 
-    // ═══════════════════════════════════════════════════════════════
-    //  Jump-to-chapter — waterfall of selectors for all provider types
-    // ═══════════════════════════════════════════════════════════════
     private fun checkAndJumpToTargetChapter(view: WebView) {
         if (targetChapter <= 0) return
         val target = targetChapter
@@ -420,92 +366,44 @@ class ReaderDialog : DialogFragment() {
             (function() {
               var targetCh = $target;
               var ticks = 0, opened = false, searched = false;
-
               var initialMatch = /(?:chapter|ch)[-/\s]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
               if (initialMatch && parseFloat(initialMatch[1]) === targetCh) {
                 if (window.MMReader) window.MMReader.onTargetReached(targetCh);
                 return;
               }
-
               var timer = setInterval(function() {
                 ticks++;
-                if (ticks > 80) {
-                  clearInterval(timer);
-                  if (window.MMReader) window.MMReader.onTargetReached(0);
-                  return;
-                }
-
+                if (ticks > 80) { clearInterval(timer); if (window.MMReader) window.MMReader.onTargetReached(0); return; }
                 var m = /(?:chapter|ch)[-/\s]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
-                if (m && parseFloat(m[1]) === targetCh) {
-                  clearInterval(timer);
-                  if (window.MMReader) window.MMReader.onTargetReached(targetCh);
-                  return;
-                }
-
-                var modal = document.querySelector(
-                  '.rpage-modal--chaplist,' +
-                  '.chapter-list, .chapter-list-container, .eplister,' +
-                  '#chapterlist, #chapters, .listing-chapters_wrap,' +
-                  '.wp-manga-chapter, .version-chap, .manga-chapters'
-                );
-
+                if (m && parseFloat(m[1]) === targetCh) { clearInterval(timer); if (window.MMReader) window.MMReader.onTargetReached(targetCh); return; }
+                var modal = document.querySelector('.rpage-modal--chaplist,.chapter-list, .chapter-list-container, .eplister,#chapterlist, #chapters, .listing-chapters_wrap,.wp-manga-chapter, .version-chap, .manga-chapters');
                 if (!modal) {
                   if (!opened) {
-                    var trigger = document.querySelector(
-                      '.rpage-floatctl__chap,' +
-                      'button[aria-label*="chapter" i],' +
-                      '[title*="chapter" i],' +
-                      '.chapter-list-btn, .btn-chapter-list, .toggle-chapters'
-                    );
+                    var trigger = document.querySelector('.rpage-floatctl__chap,button[aria-label*="chapter" i],[title*="chapter" i],.chapter-list-btn, .btn-chapter-list, .toggle-chapters');
                     if (trigger) { trigger.click(); opened = true; }
                   }
                   return;
                 }
-
-                var items = modal.querySelectorAll(
-                  '.rpage-chaplist__item, a[href*="chapter"], li > a, .chapter-item a, ' +
-                  '.wp-manga-chapter a, .eplister a'
-                );
-
+                var items = modal.querySelectorAll('.rpage-chaplist__item, a[href*="chapter"], li > a, .chapter-item a, .wp-manga-chapter a, .eplister a');
                 for (var i = 0; i < items.length; i++) {
                   var btn = items[i];
                   var href = btn.getAttribute('href') || '';
                   var linkMatch = /(?:chapter|ch)[-/\s]?(\d+(?:\.\d+)?)/i.exec(href);
-                  if (linkMatch && parseFloat(linkMatch[1]) === targetCh) {
-                    clearInterval(timer);
-                    if (window.MMReader) window.MMReader.onTargetReached(targetCh);
-                    btn.click();
-                    return;
-                  }
+                  if (linkMatch && parseFloat(linkMatch[1]) === targetCh) { clearInterval(timer); if (window.MMReader) window.MMReader.onTargetReached(targetCh); btn.click(); return; }
                   var txt = (btn.innerText || '').trim();
                   var textMatch = /(?:chapter|ch\.?)\s*(\d+(?:\.\d+)?)/i.exec(txt);
-                  if (textMatch && parseFloat(textMatch[1]) === targetCh) {
-                    clearInterval(timer);
-                    if (window.MMReader) window.MMReader.onTargetReached(targetCh);
-                    btn.click();
-                    return;
-                  }
+                  if (textMatch && parseFloat(textMatch[1]) === targetCh) { clearInterval(timer); if (window.MMReader) window.MMReader.onTargetReached(targetCh); btn.click(); return; }
                 }
-
                 if (!searched) {
-                  var input = modal.querySelector(
-                    '.rpage-chaplist__search input,' +
-                    'input[type="search"], input[placeholder*="search" i], ' +
-                    'input[placeholder*="chapter" i]'
-                  );
+                  var input = modal.querySelector('.rpage-chaplist__search input,input[type="search"], input[placeholder*="search" i], input[placeholder*="chapter" i]');
                   if (input) {
                     searched = true;
                     try {
-                      var setter = Object.getOwnPropertyDescriptor(
-                        window.HTMLInputElement.prototype, "value"
-                      ).set;
+                      var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
                       setter.call(input, String(targetCh));
                       input.dispatchEvent(new Event('input', { bubbles: true }));
                       input.dispatchEvent(new Event('change', { bubbles: true }));
-                    } catch (e) {
-                      input.value = String(targetCh);
-                      input.dispatchEvent(new Event('input', { bubbles: true }));
-                    }
+                    } catch (e) { input.value = String(targetCh); input.dispatchEvent(new Event('input', { bubbles: true })); }
                   }
                 }
               }, 100);
@@ -517,8 +415,7 @@ class ReaderDialog : DialogFragment() {
     private fun promptJump() {
         val ctx = context ?: return
         val input = EditText(ctx).apply {
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER or
-                        android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
             hint = "Chapter number"
         }
         AlertDialog.Builder(ctx)
@@ -544,133 +441,45 @@ class ReaderDialog : DialogFragment() {
                 if (!document.getElementById('mm-css')) {
                   var s = document.createElement('style');
                   s.id = 'mm-css';
-                  s.innerHTML =
-                    'body{background:#07080C !important;margin:0 !important;padding:0 !important;}' +
-                    'header,footer,.header,.navbar,.site-header,[class*="ad-"],[id*="ad-"],' +
-                    'iframe[src*="ads"],iframe[src*="pop"],.google-anno,.cookie-notice,' +
-                    '.share-block,.social-share,#comments,.comment-section,' +
-                    '.related-posts,.recommendations,.mpage__recs' +
-                    '{display:none !important;}';
+                  s.innerHTML = 'body{background:#07080C !important;margin:0 !important;padding:0 !important;}header,footer,.header,.navbar,.site-header,[class*="ad-"],[id*="ad-"],iframe[src*="ads"],iframe[src*="pop"],.google-anno,.cookie-notice,.share-block,.social-share,#comments,.comment-section,.related-posts,.recommendations,.mpage__recs{display:none !important;}';
                   document.head.appendChild(s);
                 }
-
                 if (!window.__mmTapInstalled) {
                   window.__mmTapInstalled = true;
                   var MAX_MOVE = 14, MAX_TIME = 350, DEBOUNCE = 180;
                   var sx = 0, sy = 0, st = 0, last = 0, moved = false;
-
-                  function ignored(el) {
-                    if (!el || !el.closest) return false;
-                    return !!el.closest('a,button,input,textarea,select,' +
-                      '[role="dialog"],.modal,.popup,.settings,.chapter-list');
-                  }
-
+                  function ignored(el) { if (!el || !el.closest) return false; return !!el.closest('a,button,input,textarea,select,[role="dialog"],.modal,.popup,.settings,.chapter-list'); }
                   function scroller() {
-                    var all = document.querySelectorAll('div,main,section');
-                    var best = null, bestH = 0;
-                    for (var i=0;i<all.length;i++){
-                      var e = all[i];
-                      if (e.scrollHeight > e.clientHeight + 100) {
-                        var diff = e.scrollHeight - e.clientHeight;
-                        if (diff > bestH) { bestH = diff; best = e; }
-                      }
-                    }
+                    var all = document.querySelectorAll('div,main,section'); var best = null, bestH = 0;
+                    for (var i=0;i<all.length;i++){ var e = all[i]; if (e.scrollHeight > e.clientHeight + 100) { var diff = e.scrollHeight - e.clientHeight; if (diff > bestH) { bestH = diff; best = e; } } }
                     return best || document.scrollingElement;
                   }
-
-                  function atBottom() {
-                    var el = scroller();
-                    return ((el.scrollHeight - el.clientHeight) - (el.scrollTop || 0)) < 150;
-                  }
-
-                  function scrollByPage(frac) {
-                    var el = scroller();
-                    var h = window.innerHeight;
-                    try { el.scrollBy({ top: h*frac, behavior: 'smooth' }); }
-                    catch(e) { el.scrollTop = (el.scrollTop||0) + h*frac; }
-                  }
-
+                  function atBottom() { var el = scroller(); return ((el.scrollHeight - el.clientHeight) - (el.scrollTop || 0)) < 150; }
+                  function scrollByPage(frac) { var el = scroller(); var h = window.innerHeight; try { el.scrollBy({ top: h*frac, behavior: 'smooth' }); } catch(e) { el.scrollTop = (el.scrollTop||0) + h*frac; } }
                   function handleTap(x, y) {
-                    var now = Date.now();
-                    if (now - last < DEBOUNCE) return;
-                    last = now;
+                    var now = Date.now(); if (now - last < DEBOUNCE) return; last = now;
                     var w = window.innerWidth, h = window.innerHeight;
-
                     if (x < w * 0.25) { scrollByPage(-0.8); flash(x, y); }
-                    else if (x > w * 0.75) {
-                      if (atBottom()) { flash(x, y); if (window.MMReader) window.MMReader.onNext(); }
-                      else { scrollByPage(0.8); flash(x, y); }
-                    } else {
-                      if (atBottom() && y > h * 0.75) {
-                        flash(x, y); if (window.MMReader) window.MMReader.onNext();
-                      } else {
-                        flash(x, y);
-                        if (window.MMReader) window.MMReader.onCenterTap();
-                      }
-                    }
+                    else if (x > w * 0.75) { if (atBottom()) { flash(x, y); if (window.MMReader) window.MMReader.onNext(); } else { scrollByPage(0.8); flash(x, y); } }
+                    else { if (atBottom() && y > h * 0.75) { flash(x, y); if (window.MMReader) window.MMReader.onNext(); } else { flash(x, y); if (window.MMReader) window.MMReader.onCenterTap(); } }
                   }
-
-                  document.addEventListener('touchstart', function(e){
-                    if (e.touches.length !== 1) return;
-                    var t = e.touches[0];
-                    sx = t.clientX; sy = t.clientY; st = Date.now(); moved = false;
-                  }, { passive: true, capture: true });
-
-                  document.addEventListener('touchmove', function(e){
-                    if (e.touches.length !== 1) return;
-                    var t = e.touches[0];
-                    if (Math.abs(t.clientX - sx) > MAX_MOVE ||
-                        Math.abs(t.clientY - sy) > MAX_MOVE) moved = true;
-                  }, { passive: true, capture: true });
-
-                  document.addEventListener('touchend', function(e){
-                    if (moved) return;
-                    var t = e.changedTouches[0];
-                    if (Math.abs(t.clientX - sx) > MAX_MOVE) return;
-                    if (Math.abs(t.clientY - sy) > MAX_MOVE) return;
-                    if (Date.now() - st > MAX_TIME) return;
-                    if (ignored(t.target || e.target)) return;
-                    handleTap(t.clientX, t.clientY);
-                  }, { passive: true, capture: true });
-
-                  document.addEventListener('touchcancel', function(){ moved = true; },
-                    { passive: true, capture: true });
-
-                  document.addEventListener('click', function(e){
-                    if ('ontouchstart' in window) return;
-                    if (ignored(e.target)) return;
-                    handleTap(e.clientX, e.clientY);
-                  }, false);
+                  document.addEventListener('touchstart', function(e){ if (e.touches.length !== 1) return; var t = e.touches[0]; sx = t.clientX; sy = t.clientY; st = Date.now(); moved = false; }, { passive: true, capture: true });
+                  document.addEventListener('touchmove', function(e){ if (e.touches.length !== 1) return; var t = e.touches[0]; if (Math.abs(t.clientX - sx) > MAX_MOVE || Math.abs(t.clientY - sy) > MAX_MOVE) moved = true; }, { passive: true, capture: true });
+                  document.addEventListener('touchend', function(e){ if (moved) return; var t = e.changedTouches[0]; if (Math.abs(t.clientX - sx) > MAX_MOVE) return; if (Math.abs(t.clientY - sy) > MAX_MOVE) return; if (Date.now() - st > MAX_TIME) return; if (ignored(t.target || e.target)) return; handleTap(t.clientX, t.clientY); }, { passive: true, capture: true });
+                  document.addEventListener('touchcancel', function(){ moved = true; }, { passive: true, capture: true });
+                  document.addEventListener('click', function(e){ if ('ontouchstart' in window) return; if (ignored(e.target)) return; handleTap(e.clientX, e.clientY); }, false);
                 }
-
                 if (!window.__mmSoftNav) {
                   window.__mmSoftNav = true;
-                  var relist = function(){
-                    setTimeout(function(){
-                      try { if (window.MMReader) window.MMReader.onReinject(); } catch(e){}
-                    }, 150);
-                  };
-                  ['popstate','turbo:load','turbo:render','pjax:end',
-                   'swup:contentReplaced','inertia:navigate'].forEach(function(ev){
-                    window.addEventListener(ev, relist);
-                  });
+                  var relist = function(){ setTimeout(function(){ try { if (window.MMReader) window.MMReader.onReinject(); } catch(e){} }, 150); };
+                  ['popstate','turbo:load','turbo:render','pjax:end','swup:contentReplaced','inertia:navigate'].forEach(function(ev){ window.addEventListener(ev, relist); });
                 }
-
                 function flash(x, y) {
                   try {
                     var d = document.createElement('div');
-                    d.style.cssText =
-                      'position:fixed;pointer-events:none;width:56px;height:56px;' +
-                      'border-radius:50%;background:rgba(99,102,241,0.28);' +
-                      'z-index:2147483647;transform:translate(-50%,-50%);' +
-                      'transition:opacity .35s,transform .35s;opacity:1';
-                    d.style.left = x + 'px';
-                    d.style.top  = y + 'px';
-                    document.body.appendChild(d);
-                    requestAnimationFrame(function(){
-                      d.style.opacity = '0';
-                      d.style.transform = 'translate(-50%,-50%) scale(1.4)';
-                    });
+                    d.style.cssText = 'position:fixed;pointer-events:none;width:56px;height:56px;border-radius:50%;background:rgba(99,102,241,0.28);z-index:2147483647;transform:translate(-50%,-50%);transition:opacity .35s,transform .35s;opacity:1';
+                    d.style.left = x + 'px'; d.style.top  = y + 'px'; document.body.appendChild(d);
+                    requestAnimationFrame(function(){ d.style.opacity = '0'; d.style.transform = 'translate(-50%,-50%) scale(1.4)'; });
                     setTimeout(function(){ d.remove(); }, 450);
                   } catch(e){}
                 }
@@ -687,38 +496,14 @@ class ReaderDialog : DialogFragment() {
         targetChapter = target
         if (target > 0) currentChapterName = "Ch. $target"
         chapterInfo?.text = currentChapterName.ifBlank { "Chapter" }
-        webView?.loadUrl(url, mapOf(
-            "Referer" to referer,
-            "User-Agent" to (webView?.settings?.userAgentString ?: MangaManhwaProvider.UA)
-        ))
+        webView?.loadUrl(url, mapOf("Referer" to referer, "User-Agent" to (webView?.settings?.userAgentString ?: MangaManhwaProvider.UA)))
     }
 
     class JsBridge(private val dialog: ReaderDialog) {
-        @JavascriptInterface
-        fun onCenterTap() {
-            dialog.activity?.runOnUiThread {
-                dialog.toggleToolbar()
-                dialog.haptic()
-            }
-        }
-
-        @JavascriptInterface
-        fun onNext() {
-            dialog.activity?.runOnUiThread {
-                dialog.haptic()
-                dialog.jsNext(1)
-            }
-        }
-
-        @JavascriptInterface
-        fun onReinject() {
-            dialog.activity?.runOnUiThread {
-                dialog.webView?.let { dialog.injectReaderJs(it) }
-            }
-        }
-
-        @JavascriptInterface
-        fun onTargetReached(chapterNum: Int) {
+        @JavascriptInterface fun onCenterTap() { dialog.activity?.runOnUiThread { dialog.toggleToolbar(); dialog.haptic() } }
+        @JavascriptInterface fun onNext() { dialog.activity?.runOnUiThread { dialog.haptic(); dialog.jsNext(1) } }
+        @JavascriptInterface fun onReinject() { dialog.activity?.runOnUiThread { dialog.webView?.let { dialog.injectReaderJs(it) } } }
+        @JavascriptInterface fun onTargetReached(chapterNum: Int) {
             dialog.activity?.runOnUiThread {
                 if (chapterNum > 0) {
                     dialog.targetChapter = 0
