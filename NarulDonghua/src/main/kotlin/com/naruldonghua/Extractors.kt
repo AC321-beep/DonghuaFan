@@ -834,27 +834,27 @@ class P2pstream : ExtractorApi() {
         return false
     }
 
-    private suspend fun tryJsonBody(body: String, origin: String, headers: Map<String, String>, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        val t = body.trimStart()
-        if (!t.startsWith("{") && !t.startsWith("[")) return false
-        val json = try { JSONObject(body) } catch (_: Exception) { return false }
-        val deep = extractUrlsFromJson(json).filter { !isPlaceholderUrl(it) }
-        if (deep.isNotEmpty()) { deep.distinct().forEach { emitSingleUrl(it, origin, headers, subtitleCallback, callback) }; return true }
-        val direct = listOf(json.optString("url"), json.optString("source"), json.optString("src"), json.optString("file"))
-            .firstOrNull { it.isNotBlank() && (it.startsWith("http") || it.startsWith("//")) && !isPlaceholderUrl(it) }
-        if (!direct.isNullOrBlank()) { emitSingleUrl(direct, origin, headers, subtitleCallback, callback); return true }
-        for (k in listOf("streams", "sources", "links", "videos", "mirrors", "data", "result")) {
-            val arr = json.optJSONArray(k) ?: continue
-            var any = false
-            for (i in 0 until arr.length()) {
-                val o = arr.optJSONObject(i) ?: continue
-                val u = o.optString("url").ifBlank { o.optString("file") }.optString("src")
-                if (u.isNotBlank() && !isPlaceholderUrl(u)) { emitSingleUrl(u, origin, headers, subtitleCallback, callback); any = true }
-            }
-            if (any) return true
+   private suspend fun tryJsonBody(body: String, origin: String, headers: Map<String, String>, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+    val t = body.trimStart()
+    if (!t.startsWith("{") && !t.startsWith("[")) return false
+    val json = try { JSONObject(body) } catch (_: Exception) { return false }
+    val deep = extractUrlsFromJson(json).filter { !isPlaceholderUrl(it) }
+    if (deep.isNotEmpty()) { deep.distinct().forEach { emitSingleUrl(it, origin, headers, subtitleCallback, callback) }; return true }
+    val direct = listOf(json.optString("url"), json.optString("source"), json.optString("src"), json.optString("file"))
+        .firstOrNull { it.isNotBlank() && (it.startsWith("http") || it.startsWith("//")) && !isPlaceholderUrl(it) }
+    if (!direct.isNullOrBlank()) { emitSingleUrl(direct, origin, headers, subtitleCallback, callback); return true }
+    for (k in listOf("streams", "sources", "links", "videos", "mirrors", "data", "result")) {
+        val arr = json.optJSONArray(k) ?: continue
+        var any = false
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val u = o.optString("url").ifBlank { o.optString("file") }.ifBlank { o.optString("src") }  // ✅ fixed
+            if (u.isNotBlank() && !isPlaceholderUrl(u)) { emitSingleUrl(u, origin, headers, subtitleCallback, callback); any = true }
         }
-        return false
+        if (any) return true
     }
+    return false
+}
 
     private suspend fun emitSingleUrl(url: String, origin: String, headers: Map<String, String>, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val u = if (url.startsWith("//")) "https:$url" else url
