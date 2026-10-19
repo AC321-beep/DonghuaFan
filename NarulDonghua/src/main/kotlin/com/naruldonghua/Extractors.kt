@@ -240,14 +240,12 @@ private fun extractNearAppMarkers(js: String): List<String> {
         "secret", "passphrase", "aeskey",
     )
     for (marker in markers) {
-        // String literal near the marker
         val re = Regex(
             """${Regex.escape(marker)}[^\n]{0,120}?["'`]([A-Za-z0-9!@#$%^&*()_+\-=./:?]{8,80})["'`]""",
             RegexOption.IGNORE_CASE
         )
         re.findAll(js).take(40).forEach { found.add(it.groupValues[1]) }
 
-        // String literal that CONTAINS the marker
         val re2 = Regex(
             """["'`]([^"'`\s]{0,120}${Regex.escape(marker)}[^"'`\s]{0,120})["'`]""",
             RegexOption.IGNORE_CASE
@@ -455,10 +453,6 @@ class P2pstream : ExtractorApi() {
         return hasRoot || hasVite || hasBundle
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    //  PATCH B — fetch ALL scripts + inline scripts
-    //  (previous version only fetched the first script tag → Shaka Player)
-    // ════════════════════════════════════════════════════════════════════════
     private suspend fun ensureJsCached(origin: String, id: String, headers: Map<String, String>) {
         if (scriptCache[origin] != null) return
         Log.e(TAG, "Pre-fetching JS + inline + all scripts")
@@ -480,10 +474,10 @@ class P2pstream : ExtractorApi() {
                         u.startsWith("/")    -> "$origin$u"
                         else                 -> "$origin/$u"
                     }}
+                    .toList()   // ✅ Sequence → List, so .size works
                 Log.e(TAG, "  found ${scriptSrcs.size} script tags:")
                 scriptSrcs.take(8).forEach { Log.e(TAG, "    • ${it.takeLast(70)}") }
 
-                // Inline <script> blocks — where app init/decrypt helpers commonly live
                 val inlineScripts = Jsoup.parse(html).select("script:not([src])")
                     .joinToString("\n") { it.data() }
                 Log.e(TAG, "  inline scripts len=${inlineScripts.length}")
@@ -721,9 +715,6 @@ class P2pstream : ExtractorApi() {
         return false
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    //  PATCH C wired in — app-marker extraction added after obfuscation pass
-    // ════════════════════════════════════════════════════════════════════════
     private suspend fun tryDecryptWithExtractedKeys(
         payloadHex: String, js: String, origin: String, id: String,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
@@ -790,7 +781,6 @@ class P2pstream : ExtractorApi() {
         rawKeys.addAll(obfKeys)
         passwords.addAll(obfPasswords)
 
-        // PATCH C — narrow to app-adjacent strings (bypasses Shaka noise)
         val appStrings = extractNearAppMarkers(js)
         passwords.addAll(appStrings)
         Log.e(TAG, "    ↪ app-marker candidates: ${appStrings.take(10).map { it.take(30) }}")
@@ -864,9 +854,6 @@ class P2pstream : ExtractorApi() {
         return false
     }
 
-    // ════════════════════════════════════════════════════════════════════════
-    //  PATCH A — send `agent` field (CONFIRMED required by dec-rapid / dec-mega)
-    // ════════════════════════════════════════════════════════════════════════
     private suspend fun tryEncDecPayload(
         payload: String, origin: String,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
@@ -876,8 +863,6 @@ class P2pstream : ExtractorApi() {
             "Referer" to "https://enc-dec.app/", "Content-Type" to "application/json",
         )
 
-        // Candidate agent strings — "naruldonghua.com" appears in the p2pstream
-        // player URL as `&r=`, so it's the strongest candidate.
         val agentCandidates = listOf(
             hostOf(origin) ?: "",
             "naruldonghua.com",
@@ -888,7 +873,6 @@ class P2pstream : ExtractorApi() {
             "Chrome",
         ).filter { it.isNotBlank() }.distinct()
 
-        // A1) decoders requiring { text, agent }
         for (decoder in listOf("dec-rapid", "dec-mega")) {
             for (agent in agentCandidates) {
                 try {
@@ -904,7 +888,6 @@ class P2pstream : ExtractorApi() {
             }
         }
 
-        // A2) decoders requiring { text } only
         for (decoder in listOf("dec-abyss")) {
             try {
                 val reqBody = """{"text":"$payload"}""".toRequestBody(JSON_TYPE)
@@ -918,7 +901,6 @@ class P2pstream : ExtractorApi() {
         return false
     }
 
-    // Helper — parse a successful decoder response
     private suspend fun tryDecodedResult(
         text: String, origin: String,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
