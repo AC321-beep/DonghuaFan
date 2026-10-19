@@ -42,12 +42,13 @@ abstract class MangaManhwaProvider : MainAPI() {
     override val hasQuickSearch = true
     override val hasDownloadSupport = false
 
+    protected open val requiresCf: Boolean = false
     protected open val cfPattern: Regex
         get() = Regex(".*${Regex.escape(hostOf(baseUrl))}.*")
 
-    private val cfResolver by lazy { WebViewResolver(cfPattern) }
+    private val builtInResolver by lazy { WebViewResolver(cfPattern) }
 
-    private val unifiedInterceptor: Interceptor by lazy {
+    protected val unifiedInterceptor: Interceptor by lazy {
         Interceptor { chain ->
             val original = chain.request()
             val modified = original.newBuilder().apply {
@@ -56,7 +57,10 @@ abstract class MangaManhwaProvider : MainAPI() {
                 val cookies = CookieManager.getInstance().getCookie(original.url.toString())
                 if (!cookies.isNullOrEmpty()) header("Cookie", cookies)
             }.build()
-            cfResolver.intercept(object : Interceptor.Chain by chain { override fun request(): Request = modified })
+
+            builtInResolver.intercept(object : Interceptor.Chain by chain {
+                override fun request(): Request = modified
+            })
         }
     }
 
@@ -70,7 +74,12 @@ abstract class MangaManhwaProvider : MainAPI() {
         }.getOrDefault(emptyList())
 
         if (items.isEmpty()) return null
-        return newHomePageResponse(listOf(newHomePageList(request.name, items.distinctBy { it.url })), hasNext = items.size >= 20)
+        
+        // ✅ FIX: Updated to use HomePageList instead of the deprecated newHomePageList
+        return newHomePageResponse(
+            list = listOf(HomePageList(request.name, items.distinctBy { it.url })),
+            hasNext = items.size >= 20
+        )
     }
 
     override suspend fun search(query: String): List<SearchResponse>? = runCatching { searchPage(query, 1) }.getOrNull()
@@ -108,8 +117,9 @@ abstract class MangaManhwaProvider : MainAPI() {
         val absolute = if (url.startsWith("http")) url else abs(url)
         return runCatching {
             var doc = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders()).document
-            if (isCfChallenge(doc)) {
-                log("CF challenge persists after silent solve — invoking dialog")
+            
+            if (requiresCf && isCfChallenge(doc)) {
+                log("Built-in CF solver failed. Invoking custom CFSolver dialog...")
                 if (CFSolver(absolute).solve()) {
                     doc = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders()).document
                 }
@@ -154,6 +164,10 @@ abstract class MangaManhwaProvider : MainAPI() {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// Theme Engine
+// ═══════════════════════════════════════════════════════════════
+
 data class ThemeConfig(
     val popularPath: String, val latestPath: String, val trendingPath: String,
     val completedPath: String, val newPath: String, val searchPath: String,
@@ -167,6 +181,8 @@ open class ThemeBasedProvider(
     private val config: ThemeConfig, override var name: String, override var mainUrl: String,
     override var lang: String = "en", private val fallbackUrls: List<String> = emptyList()
 ) : MangaManhwaProvider() {
+
+    override val requiresCf = true
 
     @Volatile private var resolvedUrl: String? = null
     private val resolveLock = Mutex()
