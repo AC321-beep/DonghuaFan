@@ -18,28 +18,31 @@ object Settings {
         prefs = context.getSharedPreferences("mangamanhwaverse", Context.MODE_PRIVATE)
     }
 
+    // ── Core preferences ──
     fun dataSaver(): Boolean = prefs.getBoolean("data_saver", false)
-    fun setDataSaver(v: Boolean) { prefs.edit().putBoolean("data_saver", v).apply() }
+    fun setDataSaver(v: Boolean) { prefs.edit().putBoolean("data_saver", v).commit() } // FIX: commit
 
     fun preloadNext(): Boolean = prefs.getBoolean("preload_next", true)
-    fun setPreloadNext(v: Boolean) { prefs.edit().putBoolean("preload_next", v).apply() }
+    fun setPreloadNext(v: Boolean) { prefs.edit().putBoolean("preload_next", v).commit() } // FIX: commit
 
     fun verboseLog(): Boolean = prefs.getBoolean("verbose_log", false)
-    fun setVerboseLog(v: Boolean) { prefs.edit().putBoolean("verbose_log", v).apply() }
+    fun setVerboseLog(v: Boolean) { prefs.edit().putBoolean("verbose_log", v).commit() } // FIX: commit
 
+    // ── Master toggle ──
     fun allProvidersEnabled(): Boolean = prefs.getBoolean("all_providers_enabled", true)
 
     fun setAllProvidersEnabled(v: Boolean) {
-        prefs.edit().putBoolean("all_providers_enabled", v).apply()
+        prefs.edit().putBoolean("all_providers_enabled", v).commit() // FIX: commit
         if (v) setEnabledProviderNames(ProviderRegistry.names.toSet())
         else setEnabledProviderNames(emptySet())
     }
 
+    // ── Per-provider selection ──
     fun enabledProviderNames(): Set<String> =
         prefs.getStringSet("enabled_providers", emptySet()) ?: emptySet()
 
     fun setEnabledProviderNames(s: Set<String>) {
-        prefs.edit().putStringSet("enabled_providers", s).apply()
+        prefs.edit().putStringSet("enabled_providers", s).commit() // FIX: commit
     }
 
     fun isProviderEnabled(name: String): Boolean {
@@ -49,13 +52,17 @@ object Settings {
 
     fun hasInitializedProviderSet(): Boolean = prefs.contains("enabled_providers")
 
+    // ── Per-provider URL override ──
     fun providerUrlOverride(name: String): String =
         prefs.getString("url_override_$name", "") ?: ""
 
     fun setProviderUrlOverride(name: String, url: String) {
-        prefs.edit().putString("url_override_$name", url.trim()).apply()
+        prefs.edit().putString("url_override_$name", url.trim()).apply() // apply() is fine here
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    //  Main dialog
+    // ═══════════════════════════════════════════════════════════════
     fun show(context: Context) {
         if (!::prefs.isInitialized) init(context)
 
@@ -194,7 +201,7 @@ object Settings {
             .setPositiveButton("Apply") { _, _ ->
                 val picked = boxes.filterValues { it.isChecked }.keys
                 setEnabledProviderNames(picked)
-                prefs.edit().putBoolean("all_providers_enabled", picked.size == names.size).apply()
+                prefs.edit().putBoolean("all_providers_enabled", picked.size == names.size).commit()
                 Toast.makeText(context, "${picked.size} of ${names.size} enabled — Save & Restart to apply", Toast.LENGTH_LONG).show()
             }
             .setNegativeButton("Cancel", null)
@@ -264,8 +271,13 @@ object Settings {
             intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK)
             context.startActivity(intent)
         }
-        android.os.Process.killProcess(android.os.Process.myPid())
-        @Suppress("UNREACHABLE_CODE")
-        Runtime.getRuntime().exit(0)
+        
+        // FIX: Delay the kill by 300ms to allow the OS to schedule the new activity
+        // and ensure all disk writes (commit) are fully flushed.
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            android.os.Process.killProcess(android.os.Process.myPid())
+            @Suppress("UNREACHABLE_CODE")
+            Runtime.getRuntime().exit(0)
+        }, 300)
     }
 }
