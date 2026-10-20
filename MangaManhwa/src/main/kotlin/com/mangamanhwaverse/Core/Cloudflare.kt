@@ -29,7 +29,14 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
+package com.mangamanhwaverse.core
+
+// ... imports ...
+
 object CFState {
+    // ✅ ADDED: Global User-Agent for the entire session
+    var userAgent: String = ""
+    
     private val userAgents = ConcurrentHashMap<String, String>()
     private val solving = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
 
@@ -47,6 +54,8 @@ object CFState {
         solving.remove(host, deferred)
     }
 }
+
+// ... CFSolver class remains exactly the same ...
 
 class CFSolver(private val url: String) {
 
