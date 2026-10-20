@@ -38,12 +38,10 @@ class OmegaScans : MangaManhwaProvider() {
         return fetch("$baseUrl/series?site_query=$enc")?.let(::parseSeriesGrid) ?: emptyList()
     }
 
-    // ✅ NEW: We now fetch chapters using a WebView to capture the API response directly.
     override suspend fun chapters(mangaUrl: String): List<Episode> {
         val eps = mutableListOf<Episode>()
         val base = mangaUrl.trimEnd('/')
         
-        // First try normal HTML parsing
         val doc = fetch(mangaUrl)
         if (doc != null) {
             doc.select("a[href*='/chapter-']").forEach { a ->
@@ -57,7 +55,6 @@ class OmegaScans : MangaManhwaProvider() {
             }
         }
         
-        // If HTML fails (Next.js App Router), use WebView to capture the API response
         if (eps.isEmpty()) {
             log("⚠️ HTML parsing failed. Booting WebView to capture API response...")
             val jsonResponse = captureChapterJson(mangaUrl)
@@ -93,7 +90,6 @@ class OmegaScans : MangaManhwaProvider() {
         return eps
     }
 
-    // ✅ ADOPTED FROM COMIX: Hook window.fetch to intercept the JSON
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun captureChapterJson(mangaUrl: String): String? = withContext(Dispatchers.Main) {
         val activity = CommonActivity.activity ?: return@withContext null
@@ -117,7 +113,6 @@ class OmegaScans : MangaManhwaProvider() {
                     fun onApiData(json: String) {
                         if (!done.get()) {
                             capturedJson = json
-                            // Wait a tiny bit more in case there are multiple chunked responses
                             handler.postDelayed({
                                 if (done.compareAndSet(false, true)) {
                                     runCatching { destroy() }
@@ -130,7 +125,6 @@ class OmegaScans : MangaManhwaProvider() {
 
                 webViewClient = object : WebViewClient() {
                     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                        // Hook the fetch API to capture the chapters JSON
                         val js = """
                             (function() {
                                 const origFetch = window.fetch;
@@ -156,7 +150,6 @@ class OmegaScans : MangaManhwaProvider() {
             }
 
             cont.invokeOnCancellation { runCatching { webView.destroy() } }
-            // Fail-safe timeout: 10 seconds
             handler.postDelayed({
                 if (done.compareAndSet(false, true)) {
                     runCatching { webView.destroy() }
