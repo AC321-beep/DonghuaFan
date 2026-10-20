@@ -83,9 +83,9 @@ class ReaderDialog : DialogFragment() {
     private var toolbar: View? = null
     private var toolbarVisible = true
 
-    private fun log(msg: String) {
-        if (Settings.verboseLog()) android.util.Log.d("MangaManhwa/ReaderDialog", msg)
-    }
+  private fun log(msg: String) { 
+    if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/ReaderDialog", msg) 
+}
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
