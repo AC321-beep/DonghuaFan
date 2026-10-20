@@ -43,7 +43,6 @@ class OmegaScans : MangaManhwaProvider() {
 
     override val requiresCf = true
 
-    // Define the categories here
     override val mainPage = mainPageOf(
         "latest" to "Latest Updates",
         "trending_daily" to "Daily Trending",
@@ -71,15 +70,20 @@ class OmegaScans : MangaManhwaProvider() {
             else -> fetchLatest(page)
         }
 
-        return newHomePageResponse(items)
+        // Fixed return type by wrapping in HomePageList
+        return newHomePageResponse(HomePageList(request.name, items))
     }
 
     // ======================================================================
-    // Search
+    // Required Base Class Overrides
     // ======================================================================
-    override suspend fun search(query: String): List<SearchResponse> {
+    override suspend fun popular(page: Int): List<SearchResponse> {
+        return fetchTrending("weekly") // Map popular to Weekly Trending
+    }
+
+    override suspend fun searchPage(query: String, page: Int): List<SearchResponse> {
         val enc = java.net.URLEncoder.encode(query, "UTF-8")
-        val url = "$baseUrl/series?site_query=$enc"
+        val url = "$baseUrl/series?site_query=$enc&page=$page"
         val doc = runCatching { app.get(url, headers = browserHeaders()).text }.getOrNull() ?: return emptyList()
         return parseSeriesGrid(Jsoup.parse(doc, baseUrl))
     }
@@ -124,10 +128,9 @@ class OmegaScans : MangaManhwaProvider() {
     }
 
     // ======================================================================
-    // HTML Fetcher for Latest Updates (Fallback)
+    // HTML Fetcher for Latest Updates
     // ======================================================================
     private suspend fun fetchLatest(page: Int): List<SearchResponse> {
-        // The homepage doesn't truly paginate, but we try the /comics route if page > 1
         val targetUrl = if (page == 1) baseUrl else "$baseUrl/comics"
         
         val rawHtml = runCatching {
