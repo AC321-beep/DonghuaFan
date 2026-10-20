@@ -83,9 +83,9 @@ class ReaderDialog : DialogFragment() {
     private var toolbar: View? = null
     private var toolbarVisible = true
 
-  private fun log(msg: String) { 
-    if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/ReaderDialog", msg) 
-}
+    private fun log(msg: String) {
+        if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/ReaderDialog", msg)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -124,7 +124,6 @@ class ReaderDialog : DialogFragment() {
     }
 
     override fun onDestroyView() {
-        log("onDestroyView: Tearing down WebView")
         webView?.apply {
             stopLoading()
             loadUrl("about:blank")
@@ -178,8 +177,8 @@ class ReaderDialog : DialogFragment() {
                 cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
                 mediaPlaybackRequiresUserGesture = false
 
-                userAgentString = runCatching { URI(currentChapterUrl).host }.getOrNull()
-                    ?.let { CFState.userAgentFor(it) } ?: MangaManhwaProvider.UA
+                // ✅ SIMPLIFIED: Just use the exact User-Agent that solved CF.
+                userAgentString = CFState.userAgent.takeIf { it.isNotBlank() } ?: MangaManhwaProvider.UA
             }
 
             addJavascriptInterface(JsBridge(this@ReaderDialog), "MMReader")
