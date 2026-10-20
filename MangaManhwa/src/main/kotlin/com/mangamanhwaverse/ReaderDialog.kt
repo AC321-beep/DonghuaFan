@@ -50,7 +50,7 @@ class ReaderDialog : DialogFragment() {
         private const val ARG_TARGET = "target"
         private const val ARG_REFERER = "referer"
 
-        // Unambiguous ad/tracker hosts only
+        // Added culinar9sync.com (the domain from the HTML) and other common ad hosts
         private val BLOCKED_HOSTS: Set<String> = setOf(
             "doubleclick.net", "googlesyndication.com", "googleadservices.com",
             "adservice.google.com", "adservice.google.co.uk", "amazon-adsystem.com",
@@ -61,11 +61,12 @@ class ReaderDialog : DialogFragment() {
             "onclickads.net", "onclkds.com", "exoclick.com", "juicyads.com",
             "trafficjunky.net", "trafficfactory.biz", "adsterra.com",
             "hilltopads.net", "clickadu.com", "vidoomy.com", "adspyglass.com",
-            "scorecardresearch.com", "quantserve.com"
+            "scorecardresearch.com", "quantserve.com", "culinar9sync.com"
         )
 
         private val BLOCKED_URL_FRAGMENTS: List<String> = listOf(
-            "paypal.com/xoplatform/logger"
+            "paypal.com/xoplatform/logger",
+            "culinar9sync.com" // Just in case it tries to load a pixel
         )
 
         fun show(activity: AppCompatActivity, title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int = 0) {
@@ -277,7 +278,10 @@ class ReaderDialog : DialogFragment() {
                         if (u.startsWith("intent://") || u.startsWith("market://") || u.startsWith("whatsapp://") || u.startsWith("tg://")) return true
                         return false
                     }
-                    if (isBlockedUrl(u)) return true
+                    if (isBlockedUrl(u)) {
+                        log("🚫 Blocked navigation: $u")
+                        return true
+                    }
                     return false
                 }
 
@@ -586,7 +590,7 @@ class ReaderDialog : DialogFragment() {
             (function(){
               try {
                 // =====================================================
-                // 1) CSS — aggressive on iframes/videos, safe on text
+                // 1) CSS — Targeted and Safe
                 // =====================================================
                 if (!document.getElementById('mm-css')) {
                   var s = document.createElement('style');
@@ -594,18 +598,24 @@ class ReaderDialog : DialogFragment() {
                   s.innerHTML = `
                     body { background: #07080C !important; margin: 0 !important; padding: 0 !important; }
 
-                    /* Hide all videos, ad iframes, and generic banners */
-                    video, iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
-                    iframe[src*="adservice"], iframe[src*="adsystem"], iframe[src*="taboola"],
-                    iframe[src*="outbrain"], iframe[src*="criteo"], iframe[src*="exoclick"],
-                    iframe[src*="adsterra"], iframe[src*="propellerads"],
-                    [class*="banner"], [id*="banner"],
-                    [class*="video-ad"], [id*="video-ad"],
-                    .adsbygoogle { display: none !important; visibility: hidden !important; height: 0 !important; width: 0 !important; }
+                    /* Target the exact ad block from your HTML */
+                    .ai-top-bar, [class^="ai-top-bar"] { display: none !important; visibility: hidden !important; height: 0 !important; }
 
-                    /* Specific ad data attributes */
+                    /* Hide video players (manga uses images, not video) */
+                    video { display: none !important; visibility: hidden !important; height: 0 !important; }
+
+                    /* Hide ad iframes based on src */
+                    iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
+                    iframe[src*="adservice"], iframe[src*="adsystem"],
+                    iframe[src*="taboola"], iframe[src*="outbrain"],
+                    iframe[src*="criteo"], iframe[src*="exoclick"],
+                    iframe[src*="adsterra"], iframe[src*="propellerads"],
+                    iframe[src*="culinar9sync"] { display: none !important; visibility: hidden !important; height: 0 !important; width: 0 !important; }
+
+                    /* Specific data attributes */
                     [data-ad], [data-ad-slot], [data-ads] { display: none !important; height: 0 !important; width: 0 !important; }
 
+                    /* Standard ad classes */
                     [class*="advert"], [id*="advert"], [class*="popup-ad"], [class*="interstitial"],
                     .ad-container, .ad-wrapper, .ad-slot, .ad-unit { display: none !important; height: 0 !important; width: 0 !important; }
 
@@ -621,20 +631,23 @@ class ReaderDialog : DialogFragment() {
                 }
 
                 // =====================================================
-                // 2) MutationObserver — debounced, targeted ad stripping
+                // 2) MutationObserver — Continuous removal
                 // =====================================================
                 if (!window.__mmAdObserver) {
                   window.__mmAdObserver = true;
 
                   var AD_SELECTOR = [
+                    '.ai-top-bar', // The new one!
                     '.adsbygoogle', '[data-ad]', '[data-ad-slot]', '[data-ads]',
                     '[class*="advert"]', '[id*="advert"]',
                     '.ad-banner', '.ad-container', '.ad-wrapper', '.ad-slot', '.ad-unit',
                     '[class*="popup-ad"]', '[class*="interstitial"]',
+                    'video',
                     'iframe[src*="doubleclick"]', 'iframe[src*="googlesyndication"]',
                     'iframe[src*="adservice"]', 'iframe[src*="adsystem"]',
                     'iframe[src*="taboola"]', 'iframe[src*="outbrain"]', 'iframe[src*="criteo"]',
                     'iframe[src*="exoclick"]', 'iframe[src*="adsterra"]', 'iframe[src*="propellerads"]',
+                    'iframe[src*="culinar9sync"]',
                     '[class*="banner"]', '[id*="banner"]', '[class*="video-ad"]'
                   ].join(',');
 
@@ -651,7 +664,7 @@ class ReaderDialog : DialogFragment() {
                             el.querySelector('.reading-content') ||
                             el.querySelector('.chapter-content'))) continue;
 
-                        // Nuke video and iframe tags immediately (manga has no legit iframes)
+                        // Nuke video and iframe tags
                         if (el.tagName === 'IFRAME' || el.tagName === 'VIDEO') {
                              el.style.display = 'none';
                              el.style.pointerEvents = 'none';
@@ -690,9 +703,9 @@ class ReaderDialog : DialogFragment() {
                 // =====================================================
                 if (!window.__mmHiddenSections) {
                   window.__mmHiddenSections = true;
-                  var keywords = ["you might also like", "recommended for you", "more like this", "related manga", "similar manga"];
+                  var keywords = ["you might also like", "recommended for you", "more like this", "related manga", "similar manga", "free ai porn"];
                   function hideDynamicSections() {
-                    var elements = document.querySelectorAll('h2, h3, h4, h5, section');
+                    var elements = document.querySelectorAll('h2, h3, h4, h5, section, div, span');
                     for (var i = 0; i < elements.length; i++) {
                       var el = elements[i];
                       if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.style.display === 'none') continue;
@@ -731,10 +744,11 @@ class ReaderDialog : DialogFragment() {
                     for (var i = 0; i < 4 && cur; i++) {
                       var cls = (cur.className && cur.className.toString()) || '';
                       var id = (cur.id || '');
+                      if (cls.indexOf('ai-top-bar') > -1) return true;
                       if (cls.indexOf('adsbygoogle') > -1 || id.indexOf('adsbygoogle') > -1) return true;
                       if (cls.indexOf('advert') > -1 || id.indexOf('advert') > -1) return true;
                       if (cls.indexOf('banner') > -1 || id.indexOf('banner') > -1) return true;
-                      if (cur.tagName === 'IFRAME' || cur.tagName === 'VIDEO') return true; // Ads are mostly iframes
+                      if (cur.tagName === 'IFRAME' || cur.tagName === 'VIDEO') return true; 
                       cur = cur.parentElement;
                     }
                     return false;
