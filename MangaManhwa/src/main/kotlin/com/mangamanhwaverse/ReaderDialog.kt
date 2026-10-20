@@ -50,65 +50,22 @@ class ReaderDialog : DialogFragment() {
         private const val ARG_TARGET = "target"
         private const val ARG_REFERER = "referer"
 
-        /**
-         * Ad / tracker hosts. Any request whose host ends with one of these
-         * (or equals it) is blocked. Contains ONLY hosts that are unambiguous
-         * ad-serving infrastructure — no legitimate site serves manga images
-         * or content from any of these domains.
-         */
+        // Unambiguous ad/tracker hosts only
         private val BLOCKED_HOSTS: Set<String> = setOf(
-            // Google ad network
-            "doubleclick.net",
-            "googlesyndication.com",
-            "googleadservices.com",
-            "adservice.google.com",
-            "adservice.google.co.uk",
-            // Amazon / Microsoft / other exchanges
-            "amazon-adsystem.com",
-            "adnxs.com",            // AppNexus
-            "adsrvr.org",           // TheTradeDesk
-            "pubmatic.com",
-            "rubiconproject.com",
-            "yieldmo.com",
-            "smartadserver.com",
-            "adform.net",
-            "moatads.com",
-            // Content-recommendation ads
-            "taboola.com",
-            "outbrain.com",
-            "revcontent.com",
-            // Retargeting
-            "criteo.com",
-            "criteo.net",
-            // Popunder / redirect networks
-            "popads.net",
-            "popcash.net",
-            "propellerads.com",
-            "onclickads.net",
-            "onclkds.com",
-            // Adult ad networks (also serve SFW sites)
-            "exoclick.com",
-            "juicyads.com",
-            "trafficjunky.net",
-            "trafficfactory.biz",
-            // Malware-adjacent ad networks
-            "adsterra.com",
-            "hilltopads.net",
-            "clickadu.com",
-            "vidoomy.com",
-            "adspyglass.com",
-            // Ad measurement / fraud
-            "scorecardresearch.com",
-            "quantserve.com"
+            "doubleclick.net", "googlesyndication.com", "googleadservices.com",
+            "adservice.google.com", "adservice.google.co.uk", "amazon-adsystem.com",
+            "adnxs.com", "adsrvr.org", "pubmatic.com", "rubiconproject.com",
+            "yieldmo.com", "smartadserver.com", "adform.net", "moatads.com",
+            "taboola.com", "outbrain.com", "revcontent.com", "criteo.com",
+            "criteo.net", "popads.net", "popcash.net", "propellerads.com",
+            "onclickads.net", "onclkds.com", "exoclick.com", "juicyads.com",
+            "trafficjunky.net", "trafficfactory.biz", "adsterra.com",
+            "hilltopads.net", "clickadu.com", "vidoomy.com", "adspyglass.com",
+            "scorecardresearch.com", "quantserve.com"
         )
 
-        /**
-         * Specific path-only blocks. Kept extremely narrow — only URLs on
-         * otherwise-legitimate domains that we KNOW are pure tracking pixels.
-         * Never add generic paths like "/ads/" or "/banner/" here.
-         */
         private val BLOCKED_URL_FRAGMENTS: List<String> = listOf(
-            "paypal.com/xoplatform/logger"     // PayPal tracking pixel (seen on omegascans)
+            "paypal.com/xoplatform/logger"
         )
 
         fun show(activity: AppCompatActivity, title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int = 0) {
@@ -157,20 +114,14 @@ class ReaderDialog : DialogFragment() {
         if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/ReaderDialog", msg)
     }
 
-    /**
-     * Extract the host from a URL and check against the ad blocklist.
-     * Never blocks the site the reader is currently on, or its subdomains.
-     */
     private fun isBlockedUrl(url: String): Boolean {
         if (url.isBlank() || !url.startsWith("http")) return false
 
-        // Never block the current site or its subdomains
         val currentHost = runCatching { URI(currentChapterUrl).host?.lowercase(Locale.US) }.getOrNull()
         val requestHost = runCatching { URI(url).host?.lowercase(Locale.US) }.getOrNull() ?: return false
         if (currentHost != null) {
             if (requestHost == currentHost) return false
             if (requestHost.endsWith(".$currentHost")) return false
-            // Also allow the parent domain (e.g. media.omegascans.org for omegascans.org)
             val parts = currentHost.split(".")
             if (parts.size >= 2) {
                 val root = parts.takeLast(2).joinToString(".")
@@ -178,12 +129,10 @@ class ReaderDialog : DialogFragment() {
             }
         }
 
-        // Host-based block (exact or subdomain match)
         for (blocked in BLOCKED_HOSTS) {
             if (requestHost == blocked || requestHost.endsWith(".$blocked")) return true
         }
 
-        // Very narrow path-based blocks
         val lower = url.lowercase(Locale.US)
         for (frag in BLOCKED_URL_FRAGMENTS) {
             if (lower.contains(frag)) return true
@@ -287,13 +236,9 @@ class ReaderDialog : DialogFragment() {
                 displayZoomControls = false
                 setSupportZoom(false)
                 cacheMode = WebSettings.LOAD_DEFAULT
-                // Autoplay video is almost always ad content on manga sites.
-                // No legitimate manga chapter requires autoplay.
                 mediaPlaybackRequiresUserGesture = true
-                // Popups require a real user gesture AND pass onCreateWindow
-                // (which we veto) — no legitimate manga reader popup exists.
                 javaScriptCanOpenWindowsAutomatically = false
-                setSupportMultipleWindows(true)   // required for onCreateWindow to fire
+                setSupportMultipleWindows(true)
 
                 val defaultUa = try { WebSettings.getDefaultUserAgent(ctx) } catch (e: Exception) { MangaManhwaProvider.UA }
                 userAgentString = CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa
@@ -309,15 +254,7 @@ class ReaderDialog : DialogFragment() {
                     }
                 }
 
-                // Return false = block. No legitimate manga reader opens a popup.
-                // For sites that DO legitimately popup (e.g. share dialogs), the
-                // user still has the toolbar ✕/◀/▶ to navigate — nothing lost.
-                override fun onCreateWindow(
-                    view: WebView,
-                    isDialog: Boolean,
-                    isUserGesture: Boolean,
-                    resultMsg: Message
-                ): Boolean {
+                override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message): Boolean {
                     log("🚫 Blocked window.open popup")
                     return false
                 }
@@ -325,17 +262,11 @@ class ReaderDialog : DialogFragment() {
 
             webViewClient = object : WebViewClient() {
 
-                // ★ Ad subresource blocking — the main workhorse.
-                // Only fires for URLs whose host is in BLOCKED_HOSTS.
-                // Clean sites: no matching URLs, zero effect.
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val u = request.url?.toString() ?: return null
                     if (isBlockedUrl(u)) {
                         log("🚫 Blocked subresource: $u")
-                        return WebResourceResponse(
-                            "text/plain", "utf-8", 200, "OK",
-                            emptyMap(), ByteArrayInputStream(ByteArray(0))
-                        )
+                        return WebResourceResponse("text/plain", "utf-8", 200, "OK", emptyMap(), ByteArrayInputStream(ByteArray(0)))
                     }
                     return null
                 }
@@ -343,16 +274,10 @@ class ReaderDialog : DialogFragment() {
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                     val u = request.url?.toString() ?: return false
                     if (!u.startsWith("http")) {
-                        // Block non-http schemes that ads abuse
-                        if (u.startsWith("intent://") || u.startsWith("market://") ||
-                            u.startsWith("whatsapp://") || u.startsWith("tg://") ||
-                            u.startsWith("mailto:") && u.contains("unsubscribe")) return true
+                        if (u.startsWith("intent://") || u.startsWith("market://") || u.startsWith("whatsapp://") || u.startsWith("tg://")) return true
                         return false
                     }
-                    if (isBlockedUrl(u)) {
-                        log("🚫 Blocked navigation: $u")
-                        return true
-                    }
+                    if (isBlockedUrl(u)) return true
                     return false
                 }
 
@@ -370,35 +295,21 @@ class ReaderDialog : DialogFragment() {
                     val desc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) error.description.toString() else "Network error"
                     log("❌ WebView Load Error: $desc | URL: $url")
 
-                    view.loadData(
-                        "<html><body style=\"background:#07080C;color:#94A3B8;font-family:sans-serif;padding:40px;text-align:center\"><h3 style=\"color:#E2E8F0\">Couldn't load chapter</h3><p>$desc</p><p style=\"font-size:12px;margin-top:24px;word-break:break-all\">$url</p></body></html>",
-                        "text/html", "UTF-8"
-                    )
+                    view.loadData("<html><body style=\"background:#07080C;color:#94A3B8;font-family:sans-serif;padding:40px;text-align:center\"><h3 style=\"color:#E2E8F0\">Couldn't load chapter</h3><p>$desc</p><p style=\"font-size:12px;margin-top:24px;word-break:break-all\">$url</p></body></html>", "text/html", "UTF-8")
                 }
 
-                // ★ Inject popup blocker before page scripts run
                 override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                     super.onPageStarted(view, url, favicon)
-                    view.evaluateJavascript(
-                        """
+                    view.evaluateJavascript("""
                         (function(){
                             try {
-                                // Only override window.open — do NOT touch alert/confirm/prompt.
-                                // Site alert() is annoying but harmless. confirm() returns
-                                // boolean and some sites use it for real UX (delete bookmark,
-                                // mark as read). Never break those.
                                 window.open = function(u){
-                                    try {
-                                        if (window.MMReader && window.MMReader.onBlockedPopup) {
-                                            window.MMReader.onBlockedPopup(String(u||''));
-                                        }
-                                    } catch(e){}
+                                    try { if (window.MMReader && window.MMReader.onBlockedPopup) window.MMReader.onBlockedPopup(String(u||'')); } catch(e){}
                                     return null;
                                 };
                             } catch(e){}
                         })();
-                        """.trimIndent(), null
-                    )
+                    """.trimIndent(), null)
                 }
 
                 override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
@@ -675,10 +586,7 @@ class ReaderDialog : DialogFragment() {
             (function(){
               try {
                 // =====================================================
-                // 1) CSS — specific, safe selectors only.
-                //    Never uses [class*="ad-"] (would match upload-, download-,
-                //    thread-, spread-, advance-, gradient…)
-                //    Only uses unambiguous ad indicators.
+                // 1) CSS — aggressive on iframes/videos, safe on text
                 // =====================================================
                 if (!document.getElementById('mm-css')) {
                   var s = document.createElement('style');
@@ -686,41 +594,24 @@ class ReaderDialog : DialogFragment() {
                   s.innerHTML = `
                     body { background: #07080C !important; margin: 0 !important; padding: 0 !important; }
 
-                    /* Google AdSense — always exactly this class */
-                    .adsbygoogle { display: none !important; }
+                    /* Hide all videos, ad iframes, and generic banners */
+                    video, iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
+                    iframe[src*="adservice"], iframe[src*="adsystem"], iframe[src*="taboola"],
+                    iframe[src*="outbrain"], iframe[src*="criteo"], iframe[src*="exoclick"],
+                    iframe[src*="adsterra"], iframe[src*="propellerads"],
+                    [class*="banner"], [id*="banner"],
+                    [class*="video-ad"], [id*="video-ad"],
+                    .adsbygoogle { display: none !important; visibility: hidden !important; height: 0 !important; width: 0 !important; }
 
-                    /* Standard data-ad attributes used by ad libs */
-                    [data-ad], [data-ad-slot], [data-ads] {
-                      display: none !important; visibility: hidden !important;
-                      height: 0 !important; width: 0 !important;
-                    }
+                    /* Specific ad data attributes */
+                    [data-ad], [data-ad-slot], [data-ads] { display: none !important; height: 0 !important; width: 0 !important; }
 
-                    /* "advert" is a rare word outside ads — safe substring */
-                    [class*="advert"], [id*="advert"] { display: none !important; visibility: hidden !important; height: 0 !important; width: 0 !important; }
+                    [class*="advert"], [id*="advert"], [class*="popup-ad"], [class*="interstitial"],
+                    .ad-container, .ad-wrapper, .ad-slot, .ad-unit { display: none !important; height: 0 !important; width: 0 !important; }
 
-                    /* Specific ad class names (full token match, not substring) */
-                    .ad-banner, .ad-container, .ad-wrapper, .ad-slot, .ad-unit,
-                    .advert-banner, .advert-container,
-                    [class*="popup-ad"], [class*="interstitial"],
-                    [class*="ad-sticky"], [class*="ad-floating"] {
-                      display: none !important; visibility: hidden !important; height: 0 !important; width: 0 !important;
-                    }
-
-                    /* Ad iframes — matched by src domain, only ad networks */
-                    iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
-                    iframe[src*="adservice.google"], iframe[src*="adsystem"],
-                    iframe[src*="taboola"], iframe[src*="outbrain"],
-                    iframe[src*="criteo"], iframe[src*="exoclick"],
-                    iframe[src*="adsterra"], iframe[src*="propellerads"] {
-                      display: none !important; visibility: hidden !important; height: 0 !important; width: 0 !important;
-                    }
-
-                    /* Reader-specific clutter — safe on any site because these
-                       are OmegaScans/Comix-specific class names */
+                    /* Reader-specific clutter */
                     .rpage-strip-comments, .cm-widget, .rpage-floatctl__col,
-                    .rpage-bottombar, .rpage-hoverzone, .rpage-dir2 {
-                      display: none !important;
-                    }
+                    .rpage-bottombar, .rpage-hoverzone, .rpage-dir2 { display: none !important; }
 
                     .rpage-chap-ending { padding-bottom: 8px !important; margin-bottom: 0 !important; }
                     .rpage-chap-ending__nav { margin-bottom: 8px !important; }
@@ -730,25 +621,21 @@ class ReaderDialog : DialogFragment() {
                 }
 
                 // =====================================================
-                // 2) MutationObserver — debounced, only strips ad nodes.
-                //    Safe to install on any site: on ad-free pages it just
-                //    runs one empty querySelectorAll per 300ms batch.
+                // 2) MutationObserver — debounced, targeted ad stripping
                 // =====================================================
                 if (!window.__mmAdObserver) {
                   window.__mmAdObserver = true;
 
                   var AD_SELECTOR = [
-                    '.adsbygoogle',
-                    '[data-ad]','[data-ad-slot]','[data-ads]',
-                    '[class*="advert"]','[id*="advert"]',
-                    '.ad-banner','.ad-container','.ad-wrapper','.ad-slot','.ad-unit',
-                    '[class*="popup-ad"]','[class*="interstitial"]',
-                    '[class*="ad-sticky"]','[class*="ad-floating"]',
-                    'iframe[src*="doubleclick"]','iframe[src*="googlesyndication"]',
-                    'iframe[src*="adservice.google"]','iframe[src*="adsystem"]',
-                    'iframe[src*="taboola"]','iframe[src*="outbrain"]',
-                    'iframe[src*="criteo"]','iframe[src*="exoclick"]',
-                    'iframe[src*="adsterra"]','iframe[src*="propellerads"]'
+                    '.adsbygoogle', '[data-ad]', '[data-ad-slot]', '[data-ads]',
+                    '[class*="advert"]', '[id*="advert"]',
+                    '.ad-banner', '.ad-container', '.ad-wrapper', '.ad-slot', '.ad-unit',
+                    '[class*="popup-ad"]', '[class*="interstitial"]',
+                    'iframe[src*="doubleclick"]', 'iframe[src*="googlesyndication"]',
+                    'iframe[src*="adservice"]', 'iframe[src*="adsystem"]',
+                    'iframe[src*="taboola"]', 'iframe[src*="outbrain"]', 'iframe[src*="criteo"]',
+                    'iframe[src*="exoclick"]', 'iframe[src*="adsterra"]', 'iframe[src*="propellerads"]',
+                    '[class*="banner"]', '[id*="banner"]', '[class*="video-ad"]'
                   ].join(',');
 
                   function stripAds() {
@@ -757,12 +644,21 @@ class ReaderDialog : DialogFragment() {
                       for (var i = 0; i < ads.length; i++) {
                         var el = ads[i];
                         if (!el) continue;
-                        // Never hide an ancestor of the reader or the page content
+                        // Safety: never hide a container holding our actual comic images
                         if (el.querySelector && (
+                            el.querySelector('.rpage-page__img') ||
                             el.querySelector('#readerarea') ||
-                            el.querySelector('.rpage-main') ||
                             el.querySelector('.reading-content') ||
                             el.querySelector('.chapter-content'))) continue;
+
+                        // Nuke video and iframe tags immediately (manga has no legit iframes)
+                        if (el.tagName === 'IFRAME' || el.tagName === 'VIDEO') {
+                             el.style.display = 'none';
+                             el.style.pointerEvents = 'none';
+                             if (el.parentElement) el.parentElement.style.display = 'none';
+                             continue;
+                        }
+
                         el.style.display = 'none';
                         el.style.visibility = 'hidden';
                         el.style.height = '0';
@@ -772,42 +668,29 @@ class ReaderDialog : DialogFragment() {
                     } catch(e) {}
                   }
 
-                  // Initial sweep + a couple of delayed passes (ads often
-                  // appear 1–3s after initial paint).
                   stripAds();
-                  setTimeout(stripAds, 500);
-                  setTimeout(stripAds, 1500);
-                  setTimeout(stripAds, 3000);
+                  setTimeout(stripAds, 300);
+                  setTimeout(stripAds, 1000);
+                  setTimeout(stripAds, 2500);
+                  setTimeout(stripAds, 5000);
 
-                  // Debounced observer — at most 1 scan per 300ms.
                   try {
                     var pendingScan = false;
                     var observer = new MutationObserver(function(){
                       if (pendingScan) return;
                       pendingScan = true;
-                      setTimeout(function(){ pendingScan = false; stripAds(); }, 300);
+                      setTimeout(function(){ pendingScan = false; stripAds(); }, 250);
                     });
                     observer.observe(document.body, { childList: true, subtree: true });
                   } catch(e) {}
                 }
 
                 // =====================================================
-                // 3) Keyword-based section hiding — kept narrow to avoid
-                //    hiding legitimate "Related chapters" navigation.
-                //    Uses full phrases ("related manga" etc) rather than
-                //    bare "related" which could match content headings.
+                // 3) Keyword-based section hiding
                 // =====================================================
                 if (!window.__mmHiddenSections) {
                   window.__mmHiddenSections = true;
-                  var keywords = [
-                    "you might also like",
-                    "recommended for you",
-                    "more like this",
-                    "related manga",
-                    "related series",
-                    "similar manga",
-                    "other manga you may like"
-                  ];
+                  var keywords = ["you might also like", "recommended for you", "more like this", "related manga", "similar manga"];
                   function hideDynamicSections() {
                     var elements = document.querySelectorAll('h2, h3, h4, h5, section');
                     for (var i = 0; i < elements.length; i++) {
@@ -818,12 +701,7 @@ class ReaderDialog : DialogFragment() {
                         for (var k = 0; k < keywords.length; k++) {
                           if (text.includes(keywords[k])) {
                             var target = el.parentElement || el;
-                            // Safety: never hide the reader, and never hide
-                            // a block containing images (could be legit).
-                            if (target && !target.querySelector('img') &&
-                                !target.querySelector('.rpage-main') &&
-                                !target.querySelector('#readerarea') &&
-                                !target.querySelector('.reading-content')) {
+                            if (target && !target.querySelector('img') && !target.querySelector('.rpage-main') && !target.querySelector('#readerarea')) {
                               target.style.display = 'none';
                             }
                             break;
@@ -838,7 +716,7 @@ class ReaderDialog : DialogFragment() {
                 }
 
                 // =====================================================
-                // 4) Tap zones (existing, with refined isLikelyAd)
+                // 4) Tap zones
                 // =====================================================
                 if (!window.__mmTapInstalled) {
                   window.__mmTapInstalled = true;
@@ -847,9 +725,6 @@ class ReaderDialog : DialogFragment() {
 
                   function ignored(el) { if (!el || !el.closest) return false; return !!el.closest('a,button,input,textarea,select,[role="dialog"],.modal,.popup,.settings,.chapter-list'); }
 
-                  // Only return true for elements that are almost certainly ads.
-                  // Checking iframe.src against the SAME ad domains we block at
-                  // network level — no false positives on legit embedded content.
                   function isLikelyAd(el) {
                     if (!el) return false;
                     var cur = el;
@@ -858,12 +733,8 @@ class ReaderDialog : DialogFragment() {
                       var id = (cur.id || '');
                       if (cls.indexOf('adsbygoogle') > -1 || id.indexOf('adsbygoogle') > -1) return true;
                       if (cls.indexOf('advert') > -1 || id.indexOf('advert') > -1) return true;
-                      if (cls.indexOf('popup-ad') > -1 || id.indexOf('popup-ad') > -1) return true;
-                      if (cur.hasAttribute && (cur.hasAttribute('data-ad') || cur.hasAttribute('data-ad-slot'))) return true;
-                      if (cur.tagName === 'IFRAME') {
-                        var src = (cur.src || cur.getAttribute('data-src') || '').toLowerCase();
-                        if (/doubleclick|googlesyndication|adservice\.google|adsystem|taboola|outbrain|criteo|exoclick|adsterra|propellerads/.test(src)) return true;
-                      }
+                      if (cls.indexOf('banner') > -1 || id.indexOf('banner') > -1) return true;
+                      if (cur.tagName === 'IFRAME' || cur.tagName === 'VIDEO') return true; // Ads are mostly iframes
                       cur = cur.parentElement;
                     }
                     return false;
@@ -949,7 +820,7 @@ class ReaderDialog : DialogFragment() {
                 }
 
                 // =====================================================
-                // 5) Scroll tracking (unchanged)
+                // 5) Scroll tracking
                 // =====================================================
                 if (!window.__mmScrollTrackerInstalled) {
                   window.__mmScrollTrackerInstalled = true;
@@ -975,7 +846,7 @@ class ReaderDialog : DialogFragment() {
                 }
 
                 // =====================================================
-                // 6) Scroll restore (unchanged)
+                // 6) Scroll restore
                 // =====================================================
                 if (!window.__mmRestoreScroll) {
                   window.__mmRestoreScroll = function (targetY) {
