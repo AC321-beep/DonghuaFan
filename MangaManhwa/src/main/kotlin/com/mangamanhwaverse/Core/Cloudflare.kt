@@ -21,6 +21,8 @@ import android.widget.TextView
 import com.lagradost.cloudstream3.CommonActivity
 import com.mangamanhwaverse.Settings
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -53,9 +55,17 @@ interface CFSessionCapture {
 
 class CFSolver(private val url: String, private val capture: CFSessionCapture? = null) {
 
-    private fun log(msg: String) {if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/CFSolver", msg)}
+    private fun log(msg: String) { if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/CFSolver", msg) }
+
     suspend fun solve(): Boolean {
         val activity = CommonActivity.activity ?: return false
+        
+        // ✅ FIX: Ensure activity is still valid
+        if (activity.isFinishing || activity.isDestroyed) {
+            log("❌ Activity is finishing/destroyed. Skipping CF solve.")
+            return false
+        }
+
         val host = runCatching { URI(url).host }.getOrNull() ?: return false
 
         val (deferred, isOwner) = CFState.beginSolve(host)
@@ -66,8 +76,14 @@ class CFSolver(private val url: String, private val capture: CFSessionCapture? =
 
         log("🛡️ Starting CF solve for $host")
         return try {
-            showDialog(activity, deferred)
+            // ✅ FIX: Force execution on the Main Thread
+            withContext(Dispatchers.Main.immediate) {
+                showDialog(activity, deferred)
+            }
             deferred.await()
+        } catch (e: Exception) {
+            log("❌ CF Solver failed: ${e.message}")
+            false
         } finally {
             CFState.endSolve(host, deferred)
         }
@@ -98,10 +114,54 @@ class CFSolver(private val url: String, private val capture: CFSessionCapture? =
             }
         }
 
+        // ✅ FIX: This is now guaranteed to run on the Main Thread
         dialog = Dialog(activity)
-        // ... (Keep the UI layout code exactly the same as before)
-        
-        // Ensure you add the log calls inside checkSolved()
+        val density = activity.resources.displayMetrics.density
+        fun dp(v: Int) = (v * density).toInt()
+
+        val layout = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#0A0C12"))
+        }
+
+        val header = TextView(activity).apply {
+            text = "Verifying you are human…"
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            setPadding(dp(20), dp(20), dp(20), dp(12))
+        }
+        layout.addView(header)
+
+        val progress = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(6))
+            max = 100
+        }
+        layout.addView(progress)
+
+        val host = runCatching { URI(url).host }.getOrNull() ?: ""
+        val webView = WebView(activity)
+        web = webView
+        webView.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+
+        webView.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            useWideViewPort = true
+            loadWithOverviewMode = true
+            cacheMode = WebSettings.LOAD_DEFAULT
+            allowFileAccess = false
+            allowContentAccess = false
+            setGeolocationEnabled(false)
+
+            val existing = CFState.userAgentFor(host)
+            if (existing != null) userAgentString = existing
+            else CFState.setUserAgent(host, userAgentString)
+        }
+
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+        capture?.let { webView.addJavascriptInterface(it.bridge(), it.bridgeName) }
+
         fun checkSolved(view: WebView?) {
             if (resolved.get()) return
             val u = view?.url ?: return
@@ -116,10 +176,39 @@ class CFSolver(private val url: String, private val capture: CFSessionCapture? =
                     return
                 }
                 CookieManager.getInstance().flush()
+                header.text = "Verified. Resuming…"
+                header.setTextColor(Color.parseColor("#22C55E"))
                 Handler(Looper.getMainLooper()).postDelayed({ finish(true) }, 400)
             }
         }
-        
-        // ... (Keep the rest of the webview setup exactly the same)
+
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                progress.progress = newProgress
+                progress.visibility = if (newProgress in 1..99) View.VISIBLE else View.GONE
+                if (newProgress >= 99) checkSolved(view)
+            }
+        }
+
+        webView.webViewClient = object : WebViewClient() {
+            override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) { handler?.cancel() }
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) { capture?.injectScript?.let { view?.evaluateJavascript(it, null) } }
+            override fun onPageFinished(view: WebView?, url: String?) {
+                capture?.injectScript?.let { view?.evaluateJavascript(it, null) }
+                checkSolved(view)
+                Handler(Looper.getMainLooper()).postDelayed({ checkSolved(view) }, 1200)
+            }
+        }
+
+        layout.addView(webView)
+        dialog.setContentView(layout)
+        dialog.setCancelable(true)
+        dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        dialog.setOnDismissListener {
+            if (resolved.compareAndSet(false, true)) { if (!deferred.isCompleted) deferred.complete(false) }
+            disposeWebView()
+        }
+        dialog.show()
+        webView.loadUrl(url)
     }
 }
