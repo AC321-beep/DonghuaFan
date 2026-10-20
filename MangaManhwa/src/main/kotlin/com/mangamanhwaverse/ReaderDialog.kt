@@ -232,12 +232,10 @@ class ReaderDialog : DialogFragment() {
                     )
                 }
 
-                // ✅ ADOPTED: SPA Navigation Handling
                 override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
                     super.doUpdateVisitedHistory(view, url, isReload)
                     if (url.isNullOrBlank() || !url.startsWith("http")) return
 
-                    // If the URL changes via SPA routing (Next.js), queue the scroll restore
                     if (url != currentChapterUrl) {
                         pendingScrollRestore = loadSavedScroll(url)
                     }
@@ -249,7 +247,6 @@ class ReaderDialog : DialogFragment() {
                         chapterInfo?.text = currentChapterName
                     }
                     
-                    // Re-inject CSS/JS because the DOM rebuilt
                     view.postDelayed({ injectReaderJs(view) }, 250L)
                 }
 
@@ -269,7 +266,6 @@ class ReaderDialog : DialogFragment() {
                     injectReaderJs(view)
                     applyZoom(view, currentZoom)
                     
-                    // ✅ ADOPTED: Consume Scroll Restore
                     val restoreY = pendingScrollRestore
                     if (restoreY > 0f) {
                         pendingScrollRestore = -1f
@@ -404,7 +400,6 @@ class ReaderDialog : DialogFragment() {
         )
     }
 
-    // ✅ ADOPTED: Comix specific syncData parsing for Next Chapter
     private fun jsNext(dir: Int) {
         val js = if (dir > 0) """
             (function(){
@@ -505,7 +500,6 @@ class ReaderDialog : DialogFragment() {
             .show()
     }
 
-    // ✅ ADOPTED: Scroll Saving & Restoring & Advanced Tap Zones
     private fun injectReaderJs(view: WebView) {
         view.evaluateJavascript(
             """
@@ -537,7 +531,7 @@ class ReaderDialog : DialogFragment() {
                   document.head.appendChild(s);
                 }
 
-                // Dynamic Keyword-based hiding
+                // ✅ FIXED: Safer Dynamic Keyword-based hiding
                 if (!window.__mmHiddenSections) {
                   window.__mmHiddenSections = true;
                   var keywords = ["comments", "you might also like", "recommended", "related", "more like this"];
@@ -553,12 +547,14 @@ class ReaderDialog : DialogFragment() {
                         for (var k = 0; k < keywords.length; k++) {
                           if (text.includes(keywords[k])) {
                             var target = el;
-                            for (var depth = 0; depth < 3; depth++) {
+                            // Walk up 2 levels max
+                            for (var depth = 0; depth < 2; depth++) {
                               if (target.parentElement && target.parentElement.tagName !== 'BODY' && target.parentElement.tagName !== 'HTML') {
                                 target = target.parentElement;
                               }
                             }
-                            if (target && !target.querySelector('img[src*="chapter"], .rpage-main, #readerarea')) {
+                            // ✅ SAFETY CHECK: Do not hide if it contains any images or the reader container
+                            if (target && !target.querySelector('img') && !target.querySelector('.rpage-main') && !target.querySelector('#readerarea')) {
                               target.style.display = 'none';
                             }
                             break;
@@ -571,31 +567,56 @@ class ReaderDialog : DialogFragment() {
                   setTimeout(hideDynamicSections, 1500);
                 }
 
-                // ✅ ADOPTED: Advanced Tap Zones (Left/Right scroll, Center toggle)
+                // ✅ FIXED: Tap Zones & Right Tap Logic
                 if (!window.__mmTapInstalled) {
                   window.__mmTapInstalled = true;
                   var MAX_MOVE = 14, MAX_TIME = 350, DEBOUNCE = 180;
                   var sx = 0, sy = 0, st = 0, last = 0, moved = false;
                   
                   function ignored(el) { if (!el || !el.closest) return false; return !!el.closest('a,button,input,textarea,select,[role="dialog"],.modal,.popup,.settings,.chapter-list'); }
+                  
+                  // ✅ FIXED: Exhaustive scroller search
                   function scroller() {
                     var el = document.querySelector('.rpage-main') || document.querySelector('.rpage-main--long-strip');
                     if (el && el.scrollHeight > el.clientHeight + 4) return el;
-                    return document.scrollingElement;
+                    var all = document.querySelectorAll('div,main,section');
+                    var best = null, bestH = 0;
+                    for (var i=0;i<all.length;i++){ var e = all[i]; if (e.scrollHeight > e.clientHeight + 100) { var diff = e.scrollHeight - e.clientHeight; if (diff > bestH) { bestH = diff; best = e; } } }
+                    return best || document.scrollingElement;
                   }
-                  function atBottom() { var el = scroller(); return ((el.scrollHeight - el.clientHeight) - (el.scrollTop || 0)) < 150; }
-                  function scrollByPage(frac) { var el = scroller(); var h = window.innerHeight; try { el.scrollBy({ top: h*frac, behavior: 'smooth' }); } catch(e) { el.scrollTop = (el.scrollTop||0) + h*frac; } }
+                  
+                  // ✅ FIXED: atBottom only true if page is actually scrollable
+                  function atBottom() { 
+                    var el = scroller(); 
+                    if (!el) return false;
+                    var scrollable = el.scrollHeight - el.clientHeight;
+                    if (scrollable < 150) return false; 
+                    return (scrollable - (el.scrollTop || 0)) < 150; 
+                  }
+                  
+                  function scrollByPage(frac) { var el = scroller(); if (!el) return; var h = window.innerHeight; try { el.scrollBy({ top: h*frac, behavior: 'smooth' }); } catch(e) { el.scrollTop = (el.scrollTop||0) + h*frac; } }
                   
                   function handleTap(x, y) {
                     var now = Date.now(); if (now - last < DEBOUNCE) return; last = now;
                     var w = window.innerWidth, h = window.innerHeight;
-                    if (x < w * 0.25) { scrollByPage(-0.8); flash(x, y); }
-                    else if (x > w * 0.75) { 
-                      if (atBottom()) { flash(x, y); if (window.MMReader) window.MMReader.onNext(); } 
-                      else { scrollByPage(0.8); flash(x, y); } 
+                    
+                    if (x < w * 0.25) { 
+                      scrollByPage(-0.8); flash(x, y); 
+                    } else if (x > w * 0.75) { 
+                      // ✅ FIXED: Right side tap logic
+                      if (atBottom()) {
+                        flash(x, y); if (window.MMReader) window.MMReader.onNext(); 
+                      } else if (y > h * 0.75) {
+                        flash(x, y); if (window.MMReader) window.MMReader.onNext(); 
+                      } else {
+                        scrollByPage(0.8); flash(x, y);
+                      }
                     } else { 
-                      if (atBottom() && y > h * 0.75) { flash(x, y); if (window.MMReader) window.MMReader.onNext(); } 
-                      else { flash(x, y); if (window.MMReader) window.MMReader.onCenterTap(); } 
+                      if (atBottom() && y > h * 0.75) { 
+                        flash(x, y); if (window.MMReader) window.MMReader.onNext(); 
+                      } else { 
+                        flash(x, y); if (window.MMReader) window.MMReader.onCenterTap(); 
+                      } 
                     }
                   }
                   document.addEventListener('touchstart', function(e){ if (e.touches.length !== 1) return; var t = e.touches[0]; sx = t.clientX; sy = t.clientY; st = Date.now(); moved = false; }, { passive: true, capture: true });
@@ -648,7 +669,7 @@ class ReaderDialog : DialogFragment() {
                   window.__mmPushScroll = function () { push(true); };
                 }
 
-                // ✅ ADOPTED: Scroll Restore with retries for lazy-loaded images
+                // ✅ ADOPTED: Scroll Restore with retries
                 if (!window.__mmRestoreScroll) {
                   window.__mmRestoreScroll = function (targetY) {
                     if (typeof targetY !== 'number' || targetY <= 0) return;
@@ -675,7 +696,6 @@ class ReaderDialog : DialogFragment() {
         )
     }
 
-    // ✅ ADOPTED: Persistence helpers
     private fun extractSlug(url: String): String {
         val match = Regex("/(?:comic|title|series)/([^/?#]+)").find(url)
         val slugRaw = match?.groupValues?.get(1) ?: return ""
