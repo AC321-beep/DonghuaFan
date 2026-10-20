@@ -57,22 +57,21 @@ abstract class MangaManhwaProvider : MainAPI() {
                 val cookies = CookieManager.getInstance().getCookie(original.url.toString())
                 if (!cookies.isNullOrEmpty()) header("Cookie", cookies)
             }.build()
-
-            builtInResolver.intercept(object : Interceptor.Chain by chain {
-                override fun request(): Request = modified
-            })
+            builtInResolver.intercept(object : Interceptor.Chain by chain { override fun request(): Request = modified })
         }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
+        log("⬇️ getMainPage: ${request.name} | Page $page")
         val items = runCatching {
             when (request.data) {
                 "popular" -> popular(page); "latest" -> latest(page); "trending" -> trending(page)
                 "hot" -> hot(page); "follows" -> follows(page); "completed" -> completed(page); "new" -> newReleases(page)
                 else -> emptyList()
             }
-        }.getOrDefault(emptyList())
+        }.onFailure { logErr("❌ getMainPage failed", it) }.getOrDefault(emptyList())
 
+        log("✅ getMainPage: Found ${items.size} items for ${request.name}")
         if (items.isEmpty()) return null
         
         return newHomePageResponse(
@@ -81,19 +80,29 @@ abstract class MangaManhwaProvider : MainAPI() {
         )
     }
 
-    override suspend fun search(query: String): List<SearchResponse>? = runCatching { searchPage(query, 1) }.getOrNull()
+    override suspend fun search(query: String): List<SearchResponse>? {
+        log("⬇️ Search: '$query'")
+        val results = runCatching { searchPage(query, 1) }.onFailure { logErr("❌ Search failed", it) }.getOrNull()
+        log("✅ Search: Found ${results?.size ?: 0} results for '$query'")
+        return results
+    }
 
-    override suspend fun load(url: String): LoadResponse? = runCatching {
-        val episodes = runCatching { chapters(url) }.getOrDefault(emptyList())
-        newAnimeLoadResponse(titleFromSlug(url), url, TvType.Anime) {
-            if (episodes.isNotEmpty()) addEpisodes(DubStatus.Subbed, episodes)
-        }
-    }.getOrNull()
+    override suspend fun load(url: String): LoadResponse? {
+        log("⬇️ Load: $url")
+        return runCatching {
+            val episodes = runCatching { chapters(url) }.getOrDefault(emptyList())
+            log("✅ Load: Found ${episodes.size} chapters")
+            newAnimeLoadResponse(titleFromSlug(url), url, TvType.Anime) {
+                if (episodes.isNotEmpty()) addEpisodes(DubStatus.Subbed, episodes)
+            }
+        }.onFailure { logErr("❌ Load failed", it) }.getOrNull()
+    }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val activity = CommonActivity.activity as? androidx.appcompat.app.AppCompatActivity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
+        log("⬇️ loadLinks: $data")
         val chapterNumRaw = Regex("(?:chapter|ch)[-\\s]?([\\d.]+)", RegexOption.IGNORE_CASE).find(data)?.groupValues?.get(1)?.toDoubleOrNull()
         val chapterNum = chapterNumRaw?.toInt() ?: 0
         val chapterName = when {
@@ -107,25 +116,21 @@ abstract class MangaManhwaProvider : MainAPI() {
         activity.runOnUiThread {
             runCatching {
                 ReaderDialog.show(activity, name, chapterName, data, baseUrl, chapterNum)
-            }.onSuccess { mounted.complete(true) }.onFailure { mounted.complete(false) }
+            }.onSuccess { mounted.complete(true) }.onFailure { mounted.complete(false); logErr("❌ ReaderDialog failed to mount", it) }
         }
         return mounted.await()
     }
 
     protected suspend fun fetch(url: String, referer: String? = baseUrl): Document? {
         val absolute = if (url.startsWith("http")) url else abs(url)
-        
-        // ✅ ADDED LOGGING
-        log("Fetching URL: $absolute")
+        log("⬇️ Fetching HTML: $absolute")
         
         return runCatching {
             var doc = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders()).document
-            
-            // ✅ ADDED LOGGING
-            log("Fetched Successfully: $absolute")
+            log("✅ Fetched HTML: $absolute")
             
             if (requiresCf && isCfChallenge(doc)) {
-                log("Built-in CF solver failed. Invoking custom CFSolver dialog...")
+                log("🛡️ Built-in CF solver failed. Invoking custom CFSolver dialog...")
                 if (CFSolver(absolute).solve()) {
                     doc = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders()).document
                 }
@@ -133,8 +138,8 @@ abstract class MangaManhwaProvider : MainAPI() {
             doc
         }.onFailure {
             val msg = it.message ?: ""
-            if (msg.contains("SSL", true) || msg.contains("TLS", true)) log("fetch skipped (TLS): $absolute")
-            else logErr("fetch failed $absolute: $msg", it)
+            if (msg.contains("SSL", true) || msg.contains("TLS", true)) log("❌ fetch skipped (TLS): $absolute")
+            else logErr("❌ fetch failed $absolute: $msg", it)
         }.getOrNull()
     }
 
@@ -165,9 +170,7 @@ abstract class MangaManhwaProvider : MainAPI() {
         return raw.split(' ').joinToString(" ") { w -> if (w.isEmpty()) w else w[0].uppercase() + w.drop(1) }
     }
 
-    companion object {
-        const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    }
+    companion object { const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36" }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -189,12 +192,10 @@ open class ThemeBasedProvider(
 ) : MangaManhwaProvider() {
 
     override val requiresCf = true
-
     @Volatile private var resolvedUrl: String? = null
     private val resolveLock = Mutex()
 
-    override val baseUrl: String
-        get() = Settings.providerUrlOverride(name).takeIf { it.isNotBlank() } ?: (resolvedUrl ?: mainUrl)
+    override val baseUrl: String get() = Settings.providerUrlOverride(name).takeIf { it.isNotBlank() } ?: (resolvedUrl ?: mainUrl)
 
     override val cfPattern: Regex
         get() {
@@ -208,8 +209,12 @@ open class ThemeBasedProvider(
         if (fallbackUrls.isEmpty()) { resolvedUrl = mainUrl; return }
         resolveLock.withLock {
             if (resolvedUrl != null) return@withLock
-            for (url in listOf(mainUrl) + fallbackUrls) { if (probe(url)) { resolvedUrl = url; return@withLock } }
+            for (url in listOf(mainUrl) + fallbackUrls) { 
+                log("🔍 Probing URL: $url")
+                if (probe(url)) { resolvedUrl = url; log("✅ Resolved URL: $url"); return@withLock } 
+            }
             resolvedUrl = mainUrl
+            log("⚠️ All fallbacks failed, using mainUrl: $mainUrl")
         }
     }
 
@@ -237,41 +242,54 @@ open class ThemeBasedProvider(
         return fetch(path)?.let(::parseList) ?: emptyList()
     }
 
-    override suspend fun chapters(mangaUrl: String): List<Episode> = fetch(mangaUrl)?.let(::parseChapters) ?: emptyList()
+    override suspend fun chapters(mangaUrl: String): List<Episode> {
+        val doc = fetch(mangaUrl) ?: return emptyList()
+        return parseChapters(doc)
+    }
 
     override suspend fun pages(chapterUrl: String): List<String> {
         ensureUrlResolved()
         val doc = fetch(chapterUrl) ?: return emptyList()
         val raw = doc.select(config.pageSelector).mapNotNull(::img).distinct()
+        log("✅ pages: Found ${raw.size} images")
         return if (Settings.dataSaver()) raw.map(::shrink) else raw
     }
 
     override suspend fun load(url: String): LoadResponse? {
         ensureUrlResolved()
-        val doc = fetch(url)
-        val episodes = doc?.let(::parseChapters) ?: emptyList()
-        val title = doc?.selectFirst("h1, .post-title h1, .entry-title")?.text()?.trim() ?: titleFromSlug(url)
-        val poster = doc?.selectFirst(config.posterSelector)?.let(::img)?.let(::abs)
-        val plot = config.plotSelector.split(",").asSequence().mapNotNull { sel -> doc?.selectFirst(sel.trim())?.text()?.trim() }.firstOrNull { it.isNotBlank() }
+        val doc = fetch(url) ?: return null
+        val episodes = parseChapters(doc)
+        val title = doc.selectFirst("h1, .post-title h1, .entry-title")?.text()?.trim() ?: titleFromSlug(url)
+        val poster = doc.selectFirst(config.posterSelector)?.let(::img)?.let(::abs)
+        val plot = config.plotSelector.split(",").asSequence().mapNotNull { sel -> doc.selectFirst(sel.trim())?.text()?.trim() }.firstOrNull { it.isNotBlank() }
+        
+        log("✅ Load: Title='$title' | Chapters=${episodes.size}")
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster; this.plot = plot
             if (episodes.isNotEmpty()) addEpisodes(DubStatus.Subbed, episodes)
         }
     }
 
-    private fun parseList(doc: Document): List<SearchResponse> = doc.select(config.listSelector).mapNotNull { el ->
-        val a = el.selectFirst(config.linkSelector) ?: return@mapNotNull null
-        val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-        val title = (el.selectFirst(config.titleSelector)?.text()?.trim() ?: a.text().trim()).takeIf { it.isNotBlank() } ?: return@mapNotNull null
-        val poster = el.selectFirst(config.imageSelector)?.let(::img)?.let(::abs)
-        newAnimeSearchResponse(title, abs(href), TvType.Anime).apply { posterUrl = poster }
-    }.distinctBy { it.url }
+    private fun parseList(doc: Document): List<SearchResponse> {
+        val items = doc.select(config.listSelector).mapNotNull { el ->
+            val a = el.selectFirst(config.linkSelector) ?: return@mapNotNull null
+            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val title = (el.selectFirst(config.titleSelector)?.text()?.trim() ?: a.text().trim()).takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val poster = el.selectFirst(config.imageSelector)?.let(::img)?.let(::abs)
+            newAnimeSearchResponse(title, abs(href), TvType.Anime).apply { posterUrl = poster }
+        }.distinctBy { it.url }
+        
+        if (items.isEmpty()) log("⚠️ parseList: Found 0 items. HTML selector might be broken!")
+        return items
+    }
 
     private fun parseChapters(doc: Document): List<Episode> {
         val eps = doc.select(config.chapterSelector).mapNotNull { a ->
             val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
             newEpisode(abs(href)) { this.name = a.text().trim() }
         }.distinctBy { it.data }
+        
+        if (eps.isEmpty()) log("⚠️ parseChapters: Found 0 chapters. HTML selector might be broken!")
         return if (config.newestFirst) eps.reversed() else eps
     }
 
