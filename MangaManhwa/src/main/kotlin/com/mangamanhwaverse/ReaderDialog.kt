@@ -33,6 +33,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.fragment.app.DialogFragment
 import com.mangamanhwaverse.core.CFState
 import com.mangamanhwaverse.core.MangaManhwaProvider
+import java.util.Locale
 
 class ReaderDialog : DialogFragment() {
 
@@ -83,6 +84,9 @@ class ReaderDialog : DialogFragment() {
     private var toolbar: View? = null
     private var toolbarVisible = true
 
+    private lateinit var prefs: android.content.SharedPreferences
+    private var pendingScrollRestore: Float = -1f
+
     private fun log(msg: String) {
         if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/ReaderDialog", msg)
     }
@@ -96,6 +100,7 @@ class ReaderDialog : DialogFragment() {
             referer = it.getString(ARG_REFERER) ?: ""
             targetChapter = it.getInt(ARG_TARGET, 0)
         }
+        prefs = requireContext().applicationContext.getSharedPreferences("mm_resume_prefs", Context.MODE_PRIVATE)
     }
 
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
@@ -123,7 +128,13 @@ class ReaderDialog : DialogFragment() {
         }
     }
 
+    override fun onPause() {
+        webView?.evaluateJavascript("window.__mmPushScroll && window.__mmPushScroll();", null)
+        super.onPause()
+    }
+
     override fun onDestroyView() {
+        webView?.evaluateJavascript("window.__mmPushScroll && window.__mmPushScroll();", null)
         webView?.apply {
             stopLoading()
             loadUrl("about:blank")
@@ -196,7 +207,7 @@ class ReaderDialog : DialogFragment() {
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                     val u = request.url?.toString() ?: return false
                     if (!u.startsWith("http")) return false
-                    val blocklist = listOf("doubleclick", "googlesyndication", "googleadservices", "facebook.com/tr", "analytics", "scorecardresearch", "adservice", "adsystem")
+                    val blocklist = listOf("doubleclick", "googlesyndication", "googleadservices", "facebook.com/tr", "analytics", "scorecardresearch", "adservice", "adsystem", "araplhn")
                     if (blocklist.any { u.contains(it, ignoreCase = true) }) return true
                     return false
                 }
@@ -207,14 +218,39 @@ class ReaderDialog : DialogFragment() {
 
                 override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
                     if (!request.isForMainFrame) return
+                    val url = request.url?.toString() ?: ""
+                    val isMainSite = url.contains("comix.to", true) || url.contains("omegascans.org", true) || url.contains(baseUrl(), true)
+                    if (!isMainSite) return
+                    
                     progressBar?.visibility = View.GONE
                     val desc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) error.description.toString() else "Network error"
-                    log("❌ WebView Load Error: $desc | URL: ${request.url}")
+                    log("❌ WebView Load Error: $desc | URL: $url")
                     
                     view.loadData(
-                        "<html><body style=\"background:#07080C;color:#94A3B8;font-family:sans-serif;padding:40px;text-align:center\"><h3 style=\"color:#E2E8F0\">Couldn't load chapter</h3><p>$desc</p><p style=\"font-size:12px;margin-top:24px;word-break:break-all\">${request.url}</p></body></html>",
+                        "<html><body style=\"background:#07080C;color:#94A3B8;font-family:sans-serif;padding:40px;text-align:center\"><h3 style=\"color:#E2E8F0\">Couldn't load chapter</h3><p>$desc</p><p style=\"font-size:12px;margin-top:24px;word-break:break-all\">$url</p></body></html>",
                         "text/html", "UTF-8"
                     )
+                }
+
+                // ✅ ADOPTED: SPA Navigation Handling
+                override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+                    super.doUpdateVisitedHistory(view, url, isReload)
+                    if (url.isNullOrBlank() || !url.startsWith("http")) return
+
+                    // If the URL changes via SPA routing (Next.js), queue the scroll restore
+                    if (url != currentChapterUrl) {
+                        pendingScrollRestore = loadSavedScroll(url)
+                    }
+
+                    val numStr = Regex("(?:chapter|ch)[-/]([\\d.]+)").find(url)?.groupValues?.get(1)
+                    if (numStr != null) {
+                        currentChapterUrl = url
+                        currentChapterName = "Ch. $numStr"
+                        chapterInfo?.text = currentChapterName
+                    }
+                    
+                    // Re-inject CSS/JS because the DOM rebuilt
+                    view.postDelayed({ injectReaderJs(view) }, 250L)
                 }
 
                 override fun onPageFinished(view: WebView, url: String?) {
@@ -226,13 +262,21 @@ class ReaderDialog : DialogFragment() {
 
                     if (isChallenge) {
                         log("🛡️ Cloudflare Turnstile detected in Reader. Please solve it manually.")
-                        return
+                        return 
                     }
 
                     log("✅ WebView Page Finished: $url")
                     injectReaderJs(view)
                     applyZoom(view, currentZoom)
-                    checkAndJumpToTargetChapter(view)
+                    
+                    // ✅ ADOPTED: Consume Scroll Restore
+                    val restoreY = pendingScrollRestore
+                    if (restoreY > 0f) {
+                        pendingScrollRestore = -1f
+                        view.postDelayed({ restoreScrollPosition(restoreY) }, 100L)
+                    } else {
+                        checkAndJumpToTargetChapter(view)
+                    }
                 }
             }
         }
@@ -242,6 +286,10 @@ class ReaderDialog : DialogFragment() {
 
         loadUrl(currentChapterName, currentChapterUrl, targetChapter)
         return root
+    }
+
+    private fun baseUrl(): String {
+        return runCatching { java.net.URI(currentChapterUrl).host }.getOrNull() ?: ""
     }
 
     private fun buildToolbar(ctx: Context, density: Float): View {
@@ -356,17 +404,25 @@ class ReaderDialog : DialogFragment() {
         )
     }
 
+    // ✅ ADOPTED: Comix specific syncData parsing for Next Chapter
     private fun jsNext(dir: Int) {
         val js = if (dir > 0) """
             (function(){
-              var btns = document.querySelectorAll('a[rel="next"], button.next, .btn-next, .next_page, [aria-label*="next" i], [title*="next" i]');
+              try {
+                var s = document.getElementById('syncData');
+                if (s && s.textContent) {
+                  var d = JSON.parse(s.textContent);
+                  if (d && d.next_chapter_url) { window.location.href = d.next_chapter_url; return true; }
+                }
+              } catch(e) {}
+              var btns = document.querySelectorAll('a[rel="next"], button.next, .btn-next, .next_page, [aria-label*="next" i], [title*="next" i], .rpage-floatctl__row button:last-of-type, .rpage-chap-ending__nav-btn:last-of-type, .rpage-dir2__btn:last-of-type');
               for (var i=0;i<btns.length;i++){ var b=btns[i]; if(!b.disabled){ b.click(); return true; } }
               window.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowRight',keyCode:39,bubbles:true}));
               return false;
             })();
         """.trimIndent() else """
             (function(){
-              var btns = document.querySelectorAll('a[rel="prev"], button.prev, .btn-prev, .prev_page, [aria-label*="prev" i], [title*="prev" i]');
+              var btns = document.querySelectorAll('a[rel="prev"], button.prev, .btn-prev, .prev_page, [aria-label*="prev" i], [title*="prev" i], .rpage-floatctl__row button:first-of-type, .rpage-chap-ending__nav-btn:first-of-type, .rpage-dir2__btn:first-of-type');
               for (var i=0;i<btns.length;i++){ var b=btns[i]; if(!b.disabled){ b.click(); return true; } }
               window.dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowLeft',keyCode:37,bubbles:true}));
               return false;
@@ -449,6 +505,7 @@ class ReaderDialog : DialogFragment() {
             .show()
     }
 
+    // ✅ ADOPTED: Scroll Saving & Restoring & Advanced Tap Zones
     private fun injectReaderJs(view: WebView) {
         view.evaluateJavascript(
             """
@@ -464,12 +521,18 @@ class ReaderDialog : DialogFragment() {
                     [class*="ad-"], [id*="ad-"], iframe[src*="ads"], iframe[src*="pop"], .google-anno, .cookie-notice
                     { display: none !important; }
                     
-                    /* Static Comment & Recommendation Selectors (Madara, Themesia, etc.) */
+                    /* Static Comment & Recommendation Selectors */
                     #comments, .comments, .comment-section, #disqus_thread, .fb-comments, 
                     .related-posts, .recommendations, .mpage__recs, .wp-manga-related, 
                     .chapter-widget, .related-manga, .suggestions, .also-like, .more-like-this,
-                    .share-block, .social-share
+                    .share-block, .social-share,
+                    /* Comix Specific */
+                    .rpage-strip-comments, .cm-widget, .rpage-floatctl__col, .rpage-bottombar, .rpage-hoverzone, .rpage-dir2
                     { display: none !important; }
+                    
+                    .rpage-chap-ending { padding-bottom: 8px !important; margin-bottom: 0 !important; }
+                    .rpage-chap-ending__nav { margin-bottom: 8px !important; }
+                    .rpage-main, .rpage-main--long-strip, .rpage-main__inner { padding-bottom: 0 !important; margin-bottom: 0 !important; }
                   `;
                   document.head.appendChild(s);
                 }
@@ -483,22 +546,18 @@ class ReaderDialog : DialogFragment() {
                     var elements = document.querySelectorAll('h2, h3, h4, h5, div, section, span');
                     for (var i = 0; i < elements.length; i++) {
                       var el = elements[i];
-                      // Skip if already hidden or if it's a script/style
                       if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.style.display === 'none') continue;
                       
                       var text = (el.innerText || '').trim().toLowerCase();
-                      // Only look at small text blocks that likely represent headers
                       if (text.length > 0 && text.length < 50) {
                         for (var k = 0; k < keywords.length; k++) {
                           if (text.includes(keywords[k])) {
-                            // Walk up the DOM to find the container to hide (max 3 levels up)
                             var target = el;
                             for (var depth = 0; depth < 3; depth++) {
                               if (target.parentElement && target.parentElement.tagName !== 'BODY' && target.parentElement.tagName !== 'HTML') {
                                 target = target.parentElement;
                               }
                             }
-                            // Ensure we don't hide the actual reading area
                             if (target && !target.querySelector('img[src*="chapter"], .rpage-main, #readerarea')) {
                               target.style.display = 'none';
                             }
@@ -508,31 +567,36 @@ class ReaderDialog : DialogFragment() {
                       }
                     }
                   }
-                  
-                  // Run immediately
                   hideDynamicSections();
-                  // Run again after a slight delay for dynamic content
                   setTimeout(hideDynamicSections, 1500);
                 }
 
+                // ✅ ADOPTED: Advanced Tap Zones (Left/Right scroll, Center toggle)
                 if (!window.__mmTapInstalled) {
                   window.__mmTapInstalled = true;
                   var MAX_MOVE = 14, MAX_TIME = 350, DEBOUNCE = 180;
                   var sx = 0, sy = 0, st = 0, last = 0, moved = false;
+                  
                   function ignored(el) { if (!el || !el.closest) return false; return !!el.closest('a,button,input,textarea,select,[role="dialog"],.modal,.popup,.settings,.chapter-list'); }
                   function scroller() {
-                    var all = document.querySelectorAll('div,main,section'); var best = null, bestH = 0;
-                    for (var i=0;i<all.length;i++){ var e = all[i]; if (e.scrollHeight > e.clientHeight + 100) { var diff = e.scrollHeight - e.clientHeight; if (diff > bestH) { bestH = diff; best = e; } } }
-                    return best || document.scrollingElement;
+                    var el = document.querySelector('.rpage-main') || document.querySelector('.rpage-main--long-strip');
+                    if (el && el.scrollHeight > el.clientHeight + 4) return el;
+                    return document.scrollingElement;
                   }
                   function atBottom() { var el = scroller(); return ((el.scrollHeight - el.clientHeight) - (el.scrollTop || 0)) < 150; }
                   function scrollByPage(frac) { var el = scroller(); var h = window.innerHeight; try { el.scrollBy({ top: h*frac, behavior: 'smooth' }); } catch(e) { el.scrollTop = (el.scrollTop||0) + h*frac; } }
+                  
                   function handleTap(x, y) {
                     var now = Date.now(); if (now - last < DEBOUNCE) return; last = now;
                     var w = window.innerWidth, h = window.innerHeight;
                     if (x < w * 0.25) { scrollByPage(-0.8); flash(x, y); }
-                    else if (x > w * 0.75) { if (atBottom()) { flash(x, y); if (window.MMReader) window.MMReader.onNext(); } else { scrollByPage(0.8); flash(x, y); } }
-                    else { if (atBottom() && y > h * 0.75) { flash(x, y); if (window.MMReader) window.MMReader.onNext(); } else { flash(x, y); if (window.MMReader) window.MMReader.onCenterTap(); } }
+                    else if (x > w * 0.75) { 
+                      if (atBottom()) { flash(x, y); if (window.MMReader) window.MMReader.onNext(); } 
+                      else { scrollByPage(0.8); flash(x, y); } 
+                    } else { 
+                      if (atBottom() && y > h * 0.75) { flash(x, y); if (window.MMReader) window.MMReader.onNext(); } 
+                      else { flash(x, y); if (window.MMReader) window.MMReader.onCenterTap(); } 
+                    }
                   }
                   document.addEventListener('touchstart', function(e){ if (e.touches.length !== 1) return; var t = e.touches[0]; sx = t.clientX; sy = t.clientY; st = Date.now(); moved = false; }, { passive: true, capture: true });
                   document.addEventListener('touchmove', function(e){ if (e.touches.length !== 1) return; var t = e.touches[0]; if (Math.abs(t.clientX - sx) > MAX_MOVE || Math.abs(t.clientY - sy) > MAX_MOVE) moved = true; }, { passive: true, capture: true });
@@ -540,11 +604,13 @@ class ReaderDialog : DialogFragment() {
                   document.addEventListener('touchcancel', function(){ moved = true; }, { passive: true, capture: true });
                   document.addEventListener('click', function(e){ if ('ontouchstart' in window) return; if (ignored(e.target)) return; handleTap(e.clientX, e.clientY); }, false);
                 }
+                
                 if (!window.__mmSoftNav) {
                   window.__mmSoftNav = true;
                   var relist = function(){ setTimeout(function(){ try { if (window.MMReader) window.MMReader.onReinject(); } catch(e){} }, 150); };
                   ['popstate','turbo:load','turbo:render','pjax:end','swup:contentReplaced','inertia:navigate'].forEach(function(ev){ window.addEventListener(ev, relist); });
                 }
+                
                 function flash(x, y) {
                   try {
                     var d = document.createElement('div');
@@ -554,27 +620,114 @@ class ReaderDialog : DialogFragment() {
                     setTimeout(function(){ d.remove(); }, 450);
                   } catch(e){}
                 }
+
+                // ✅ ADOPTED: Scroll Position Tracking
+                if (!window.__mmScrollTrackerInstalled) {
+                  window.__mmScrollTrackerInstalled = true;
+                  var lastY = -1;
+                  var lastT = 0;
+                  var pendingTimer = null;
+                  
+                  function push(force) {
+                    var el = scroller();
+                    var y = el ? el.scrollTop : (window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0);
+                    if (!force && Math.abs(y - lastY) < 6) return;
+                    lastY = y;
+                    try { if (window.MMReader && window.MMReader.onScrollPosition) window.MMReader.onScrollPosition(window.location.href, y); } catch (e) {}
+                  }
+                  function schedulePush() {
+                    var now = Date.now();
+                    if (now - lastT >= 500) { lastT = now; push(false); return; }
+                    if (pendingTimer) clearTimeout(pendingTimer);
+                    pendingTimer = setTimeout(function () { lastT = Date.now(); push(false); }, 500 - (now - lastT));
+                  }
+                  window.addEventListener('scroll', schedulePush, { passive: true });
+                  document.addEventListener('scroll', schedulePush, { passive: true, capture: true });
+                  window.addEventListener('pagehide',     function () { push(true); });
+                  window.addEventListener('beforeunload', function () { push(true); });
+                  window.__mmPushScroll = function () { push(true); };
+                }
+
+                // ✅ ADOPTED: Scroll Restore with retries for lazy-loaded images
+                if (!window.__mmRestoreScroll) {
+                  window.__mmRestoreScroll = function (targetY) {
+                    if (typeof targetY !== 'number' || targetY <= 0) return;
+                    var cancelled = false;
+                    function cancel() { cancelled = true; }
+                    window.addEventListener('touchstart', cancel, { once: true, passive: true, capture: true });
+                    window.addEventListener('wheel',      cancel, { once: true, passive: true, capture: true });
+                    window.addEventListener('keydown',    cancel, { once: true });
+                    
+                    function apply() {
+                      if (cancelled) return;
+                      try {
+                        var el = scroller();
+                        if (el) el.scrollTop = targetY;
+                        window.scrollTo(0, targetY);
+                      } catch (e) {}
+                    }
+                    [0, 60, 150, 300, 500, 800, 1200, 1700, 2400, 3200, 4000].forEach(function (d) { setTimeout(apply, d); });
+                  };
+                }
               } catch(e){}
             })();
             """.trimIndent(), null
         )
     }
 
+    // ✅ ADOPTED: Persistence helpers
+    private fun extractSlug(url: String): String {
+        val match = Regex("/(?:comic|title|series)/([^/?#]+)").find(url)
+        val slugRaw = match?.groupValues?.get(1) ?: return ""
+        return slugRaw.substringBefore("-chapter-").trimEnd('-')
+    }
+
+    private fun positionKey(url: String): String {
+        if (url.isBlank()) return ""
+        return "pos::" + url.substringBefore('#').trimEnd('/')
+    }
+
+    private fun loadSavedScroll(url: String): Float {
+        val k = positionKey(url)
+        if (k.isEmpty()) return -1f
+        return runCatching { prefs.getFloat(k, -1f) }.getOrDefault(-1f)
+    }
+
+    fun saveScroll(url: String, y: Float) {
+        val k = positionKey(url)
+        if (k.isEmpty() || y < 0f) return
+        runCatching { prefs.edit().putFloat(k, y).apply() }
+    }
+
+    private fun restoreScrollPosition(y: Float) {
+        if (y <= 0f) return
+        val yStr = String.format(Locale.US, "%.2f", y)
+        webView?.evaluateJavascript("window.__mmRestoreScroll && window.__mmRestoreScroll($yStr);", null)
+    }
+
     fun loadUrl(name: String, url: String, target: Int) {
         if (url.isBlank()) return
         log("📖 Opening Reader: '$name' at $url")
+        
+        val slug = extractSlug(url)
+        val savedUrl = if (slug.isNotBlank()) prefs.getString(slug, null) else null
+
+        currentChapterUrl = savedUrl ?: url
         currentChapterName = name
-        currentChapterUrl = url
         targetChapter = target
         if (target > 0) currentChapterName = "Ch. $target"
         chapterInfo?.text = currentChapterName.ifBlank { "Chapter" }
-        webView?.loadUrl(url, mapOf("Referer" to referer, "User-Agent" to (webView?.settings?.userAgentString ?: MangaManhwaProvider.UA)))
+
+        pendingScrollRestore = loadSavedScroll(currentChapterUrl)
+
+        webView?.loadUrl(currentChapterUrl, mapOf("Referer" to referer, "User-Agent" to (webView?.settings?.userAgentString ?: MangaManhwaProvider.UA)))
     }
 
     class JsBridge(private val dialog: ReaderDialog) {
         @JavascriptInterface fun onCenterTap() { dialog.activity?.runOnUiThread { dialog.toggleToolbar(); dialog.haptic() } }
         @JavascriptInterface fun onNext() { dialog.activity?.runOnUiThread { dialog.haptic(); dialog.jsNext(1) } }
         @JavascriptInterface fun onReinject() { dialog.activity?.runOnUiThread { dialog.webView?.let { dialog.injectReaderJs(it) } } }
+        @JavascriptInterface fun onScrollPosition(url: String, y: Float) { dialog.saveScroll(url, y) }
         @JavascriptInterface fun onTargetReached(chapterNum: Int) {
             dialog.activity?.runOnUiThread {
                 if (chapterNum > 0) {
