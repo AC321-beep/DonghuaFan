@@ -260,7 +260,6 @@ class ReaderDialog : DialogFragment() {
                     return false
                 }
 
-                // Added to catch JS errors
                 override fun onConsoleMessage(m: ConsoleMessage): Boolean {
                     log("WV console: ${m.message()}")
                     return true
@@ -479,7 +478,7 @@ class ReaderDialog : DialogFragment() {
             (function(){
               var z = $zoom;
               var s = document.getElementById('mm-zoom');
-              if (!s) { s = document.createElement('style'); s.id = 'mm-zoom'; document.documentElement.appendChild(s); }
+              if (!s) { s = document.createElement('style'); s.id = 'mm-zoom'; document.head.appendChild(s); }
               s.innerHTML =
                 'img, .rpage-page__img, canvas { max-width:' + z + '% !important; width:' + z + '% !important; height:auto !important; display:block !important; margin:0 auto !important; }' +
                 '.rpage-main__inner, .reading-content, #readerarea, .container, ' +
@@ -631,44 +630,42 @@ class ReaderDialog : DialogFragment() {
         view.evaluateJavascript(
             """
             (function(){
-              console.log("MM-Reader: JS Injected");
               try {
-                // 1. Initial CSS
+                // 1. Wait for document to be ready to avoid null appendChild error
+                var head = document.head || document.getElementsByTagName('head')[0] || document.documentElement;
+                if (!head) {
+                   setTimeout(arguments.callee, 100);
+                   return;
+                }
+
+                // 2. Initial CSS - safe and direct
                 if (!document.getElementById('mm-css')) {
                   var s = document.createElement('style');
                   s.id = 'mm-css';
                   s.innerHTML = 
-                    "body { background: #07080C !important; margin: 0 !important; padding: 0 !important; }" +
-                    ".ai-top-bar, [class^='ai-top-bar'] { display: none !important; }" +
-                    "video { display: none !important; }" +
-                    "footer, #comments, .comment-section, .related-posts, " +
-                    ".recommendations, .mpage__recs, .wp-manga-related, .chapter-widget, " +
-                    ".related-manga, .suggestions, .also-like, .more-like-this, .share-block, " +
-                    ".social-share, .rpage-strip-comments, .cm-widget, .rpage-floatctl__col, " +
-                    ".rpage-bottombar, .rpage-hoverzone, .rpage-dir2 { display: none !important; }" +
-                    ".rpage-chap-ending { padding-bottom: 0 !important; margin-bottom: 0 !important; }" +
-                    ".rpage-main, .rpage-main--long-strip, .rpage-main__inner { padding-bottom: 0 !important; margin-bottom: 0 !important; }";
-                  document.documentElement.appendChild(s);
+                    "body { background: #07080C !important; padding-top: 0 !important; margin: 0 !important; }" +
+                    ".ai-top-bar { position: absolute !important; top: -9999px !important; left: -9999px !important; width: 1px !important; height: 1px !important; opacity: 0 !important; pointer-events: none !important; }" +
+                    "footer, #comments, .comment-section, .related-posts, .recommendations { display: none !important; }";
+                  head.appendChild(s);
                 }
 
-                // 2. NUCLEAR AD NEUTRALIZER (Fights the site's re-injection)
+                // 3. AGGRESSIVE AD KILLER (Fights React re-renders)
                 if (!window.__mmAdInterval) {
                   window.__mmAdInterval = setInterval(function() {
                     try {
-                      // Move the top bar OFF SCREEN but keep it in the DOM
-                      var ads = document.querySelectorAll('.ai-top-bar, [class^="ai-top-bar"], video, iframe');
+                      // Find the top bar by class or by generic position
+                      var ads = document.querySelectorAll('.ai-top-bar, [class^="ai-top-bar"], video');
                       for (var i = 0; i < ads.length; i++) {
                           var el = ads[i];
-                          if (el.querySelector && (el.querySelector('.rpage-page__img') || el.querySelector('#readerarea'))) continue;
-                          
                           el.style.setProperty('position', 'absolute', 'important');
                           el.style.setProperty('top', '-9999px', 'important');
                           el.style.setProperty('left', '-9999px', 'important');
-                          el.style.setProperty('z-index', '-9999', 'important');
+                          el.style.setProperty('opacity', '0', 'important');
                           el.style.setProperty('pointer-events', 'none', 'important');
+                          el.style.setProperty('z-index', '-9999', 'important');
                       }
                       
-                      // Reclaim the space left by the ad
+                      // Force the body padding to 0 to close the gap
                       document.body.style.setProperty('padding-top', '0', 'important');
                       var reader = document.querySelector('.rpage-main, #readerarea, .reading-content');
                       if (reader) {
@@ -676,10 +673,10 @@ class ReaderDialog : DialogFragment() {
                           reader.style.setProperty('margin-top', '0', 'important');
                       }
                     } catch(e) {}
-                  }, 500); 
+                  }, 250); // Run 4 times a second to catch re-renders
                 }
 
-                // 3. Reader features (Tap zones, scrolling)
+                // 4. Reader features (Tap zones)
                 if (!window.__mmTapInstalled) {
                   window.__mmTapInstalled = true;
                   var MAX_MOVE = 14, MAX_TIME = 350, DEBOUNCE = 180;
