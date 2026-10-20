@@ -22,10 +22,12 @@ import com.lagradost.cloudstream3.CommonActivity
 import com.mangamanhwaverse.Settings
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
 
 object CFState {
     private val userAgents = ConcurrentHashMap<String, String>()
@@ -89,11 +91,10 @@ class CFSolver(private val url: String) {
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun attemptSilentResolution(activity: android.app.Activity): Boolean = withContext(Dispatchers.Main) {
         val decor = activity.window?.decorView as? ViewGroup ?: return@withContext false
-        kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+        suspendCancellableCoroutine<Boolean> { cont ->
             val done = AtomicBoolean(false)
             val handler = Handler(Looper.getMainLooper())
             var timeoutRunnable: Runnable? = null
-            var checkRunnable: Runnable? = null
 
             val webView = WebView(activity).apply {
                 layoutParams = ViewGroup.LayoutParams(1, 1) // Invisible size
@@ -110,7 +111,6 @@ class CFSolver(private val url: String) {
             fun cleanup(success: Boolean) {
                 if (!done.compareAndSet(false, true)) return
                 timeoutRunnable?.let { handler.removeCallbacks(it) }
-                checkRunnable?.let { handler.removeCallbacks(it) }
                 runCatching {
                     decor.removeView(webView)
                     webView.stopLoading(); webView.loadUrl("about:blank"); webView.destroy()
@@ -124,7 +124,6 @@ class CFSolver(private val url: String) {
                     val title = view?.title?.lowercase() ?: ""
                     val isChallenge = title.contains("just a moment") || title.contains("attention required") || title.contains("checking your browser")
                     if (!isChallenge) {
-                        // Give it 1 second for cf_clearance cookie to set
                         handler.postDelayed({ cleanup(true) }, 1000)
                     }
                 }
