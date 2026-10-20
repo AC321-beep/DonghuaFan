@@ -3,6 +3,7 @@ package com.mangamanhwaverse.providers
 import android.annotation.SuppressLint
 import android.os.Handler
 import android.os.Looper
+import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.CommonActivity
@@ -56,7 +57,7 @@ class OmegaScans : MangaManhwaProvider() {
         }
         
         if (eps.isEmpty() && doc != null) {
-            log("⚠️ HTML parsing failed. Extracting series_id and using API...")
+            log("⚠️ HTML parsing failed. Extracting series_id and using WebView fetch...")
             val html = doc.html()
             val seriesIdMatch = Regex("""["']?series_id["']?\s*:\s*(\d+)""").find(html)
             val seriesId = seriesIdMatch?.groupValues?.get(1)
@@ -65,22 +66,10 @@ class OmegaScans : MangaManhwaProvider() {
                 log("✅ Found series_id: $seriesId")
                 val apiUrl = "$baseUrl/query?page=1&perPage=10000&series_id=$seriesId"
                 
-                // ✅ First try OkHttp. It's faster and usually works if Cloudflare is passed.
-                val apiResponse = try {
-                    app.get(apiUrl, headers = browserHeaders(mapOf(
-                        "Accept" to "application/json, text/plain, */*",
-                        "X-Requested-With" to "XMLHttpRequest",
-                        "Referer" to mangaUrl
-                    ))).text
-                } catch (e: Exception) { "" }
+                // ✅ Use WebView with JavascriptInterface to capture the Promise
+                val finalJson = fetchApiViaWebView(mangaUrl, apiUrl)
 
-                var finalJson = apiResponse
-                if (!finalJson.trim().startsWith("{")) {
-                    log("⚠️ OkHttp API failed (CF block?). Using WebView...")
-                    finalJson = fetchApiViaWebView(mangaUrl, apiUrl) ?: ""
-                }
-
-                if (finalJson.trim().startsWith("{")) {
+                if (!finalJson.isNullOrBlank() && finalJson.trim().startsWith("{")) {
                     try {
                         val root = JSONObject(finalJson)
                         val dataArray = root.optJSONArray("data")
@@ -120,12 +109,29 @@ class OmegaScans : MangaManhwaProvider() {
             val web = WebView(activity)
             val done = AtomicBoolean(false)
             val handler = Handler(Looper.getMainLooper())
+            var result: String? = null
             
             web.settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
-                userAgentString = CFState.userAgentFor("omegascans.org") ?: UA
+                userAgentString = CFState.userAgentFor("omegascans.org") ?: CFState.userAgent.ifBlank { UA }
             }
+            
+            // ✅ FIX: Use JavascriptInterface to receive the async response
+            web.addJavascriptInterface(object {
+                @JavascriptInterface
+                fun onApiData(json: String) {
+                    if (!done.get()) {
+                        result = json
+                        handler.postDelayed({
+                            if (done.compareAndSet(false, true)) {
+                                runCatching { web.destroy() }
+                                if (cont.isActive) cont.resume(result)
+                            }
+                        }, 1000)
+                    }
+                }
+            }, "OmegaBridge")
             
             web.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
@@ -140,24 +146,26 @@ class OmegaScans : MangaManhwaProvider() {
                                             'X-Requested-With': 'XMLHttpRequest'
                                         }
                                     });
-                                    return await res.text();
+                                    const text = await res.text();
+                                    window.OmegaBridge.onApiData(text);
                                 } catch(e) {
-                                    return 'ERROR: ' + e.message;
+                                    window.OmegaBridge.onApiData('ERROR: ' + e.message);
                                 }
                             })();
                         """.trimIndent()
-                        
-                        view?.evaluateJavascript(js) { result ->
-                            if (!done.compareAndSet(false, true)) return@evaluateJavascript
-                            val unescaped = result?.replace("\\u003C", "<")?.replace("\\u003E", ">")?.replace("\\\"", "\"")?.removeSurrounding("\"")
-                            runCatching { web.destroy() }
-                            if (cont.isActive) cont.resume(unescaped)
-                        }
+                        view?.evaluateJavascript(js, null)
                     }, 1500)
                 }
             }
             
             cont.invokeOnCancellation { runCatching { web.destroy() } }
+            handler.postDelayed({
+                if (done.compareAndSet(false, true)) {
+                    runCatching { web.destroy() }
+                    if (cont.isActive) cont.resume(null)
+                }
+            }, 15000L)
+            
             web.loadUrl(mangaUrl)
         }
     }
