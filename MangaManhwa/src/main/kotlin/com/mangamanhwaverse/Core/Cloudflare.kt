@@ -46,25 +46,13 @@ object CFState {
     }
 }
 
-interface CFSessionCapture {
-    val bridgeName: String
-    val injectScript: String
-    fun bridge(): Any
-    fun hasCaptured(): Boolean
-}
-
-class CFSolver(private val url: String, private val capture: CFSessionCapture? = null) {
+class CFSolver(private val url: String) {
 
     private fun log(msg: String) { if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/CFSolver", msg) }
 
     suspend fun solve(): Boolean {
         val activity = CommonActivity.activity ?: return false
-        
-        // ✅ FIX: Ensure activity is still valid
-        if (activity.isFinishing || activity.isDestroyed) {
-            log("❌ Activity is finishing/destroyed. Skipping CF solve.")
-            return false
-        }
+        if (activity.isFinishing || activity.isDestroyed) return false
 
         val host = runCatching { URI(url).host }.getOrNull() ?: return false
 
@@ -76,9 +64,18 @@ class CFSolver(private val url: String, private val capture: CFSessionCapture? =
 
         log("🛡️ Starting CF solve for $host")
         return try {
-            // ✅ FIX: Force execution on the Main Thread
             withContext(Dispatchers.Main.immediate) {
-                showDialog(activity, deferred)
+                // 1. Try Silent Resolution (Invisible WebView)
+                val silentSuccess = attemptSilentResolution(activity)
+                
+                // 2. If silent fails, show Interactive Dialog
+                if (silentSuccess) {
+                    log("✅ Silent CF solve success!")
+                    deferred.complete(true)
+                } else {
+                    log("❌ Silent solve failed. Opening interactive dialog.")
+                    showDialog(activity, deferred)
+                }
             }
             deferred.await()
         } catch (e: Exception) {
@@ -90,6 +87,58 @@ class CFSolver(private val url: String, private val capture: CFSessionCapture? =
     }
 
     @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun attemptSilentResolution(activity: android.app.Activity): Boolean = withContext(Dispatchers.Main) {
+        val decor = activity.window?.decorView as? ViewGroup ?: return@withContext false
+        kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+            val done = AtomicBoolean(false)
+            val handler = Handler(Looper.getMainLooper())
+            var timeoutRunnable: Runnable? = null
+            var checkRunnable: Runnable? = null
+
+            val webView = WebView(activity).apply {
+                layoutParams = ViewGroup.LayoutParams(1, 1) // Invisible size
+                translationX = 20000f // Move off-screen
+                alpha = 0f
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    userAgentString = CFState.userAgentFor(URI(url).host ?: "") ?: MangaManhwaProvider.UA
+                }
+            }
+
+            fun cleanup(success: Boolean) {
+                if (!done.compareAndSet(false, true)) return
+                timeoutRunnable?.let { handler.removeCallbacks(it) }
+                checkRunnable?.let { handler.removeCallbacks(it) }
+                runCatching {
+                    decor.removeView(webView)
+                    webView.stopLoading(); webView.loadUrl("about:blank"); webView.destroy()
+                }
+                if (success) CookieManager.getInstance().flush()
+                if (cont.isActive) cont.resume(success)
+            }
+
+            webView.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    val title = view?.title?.lowercase() ?: ""
+                    val isChallenge = title.contains("just a moment") || title.contains("attention required") || title.contains("checking your browser")
+                    if (!isChallenge) {
+                        // Give it 1 second for cf_clearance cookie to set
+                        handler.postDelayed({ cleanup(true) }, 1000)
+                    }
+                }
+            }
+
+            cont.invokeOnCancellation { cleanup(false) }
+            timeoutRunnable = Runnable { cleanup(false) }.also { handler.postDelayed(it, 12000L) }
+            
+            decor.addView(webView)
+            webView.loadUrl(url)
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
     private fun showDialog(activity: android.app.Activity, deferred: CompletableDeferred<Boolean>) {
         val resolved = AtomicBoolean(false)
         var dialog: Dialog? = null
@@ -97,7 +146,6 @@ class CFSolver(private val url: String, private val capture: CFSessionCapture? =
 
         fun disposeWebView() {
             runCatching {
-                web?.removeJavascriptInterface(capture?.bridgeName ?: "")
                 web?.stopLoading()
                 web?.destroy()
             }
@@ -106,7 +154,7 @@ class CFSolver(private val url: String, private val capture: CFSessionCapture? =
 
         fun finish(success: Boolean) {
             if (!resolved.compareAndSet(false, true)) return
-            log(if (success) "✅ CF solve success!" else "❌ CF solve failed or dismissed.")
+            log(if (success) "✅ Interactive CF solve success!" else "❌ Interactive CF solve failed.")
             if (!deferred.isCompleted) deferred.complete(success)
             Handler(Looper.getMainLooper()).post {
                 disposeWebView()
@@ -114,11 +162,7 @@ class CFSolver(private val url: String, private val capture: CFSessionCapture? =
             }
         }
 
-        // ✅ FIX: This is now guaranteed to run on the Main Thread
         dialog = Dialog(activity)
-        val density = activity.resources.displayMetrics.density
-        fun dp(v: Int) = (v * density).toInt()
-
         val layout = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#0A0C12"))
@@ -128,86 +172,32 @@ class CFSolver(private val url: String, private val capture: CFSessionCapture? =
             text = "Verifying you are human…"
             setTextColor(Color.WHITE)
             textSize = 15f
-            setPadding(dp(20), dp(20), dp(20), dp(12))
+            setPadding(50, 50, 50, 50)
         }
         layout.addView(header)
 
-        val progress = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
-            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(6))
-            max = 100
-        }
-        layout.addView(progress)
-
-        val host = runCatching { URI(url).host }.getOrNull() ?: ""
         val webView = WebView(activity)
         web = webView
-        webView.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
-            useWideViewPort = true
-            loadWithOverviewMode = true
-            cacheMode = WebSettings.LOAD_DEFAULT
-            allowFileAccess = false
-            allowContentAccess = false
-            setGeolocationEnabled(false)
-
-            val existing = CFState.userAgentFor(host)
-            if (existing != null) userAgentString = existing
-            else CFState.setUserAgent(host, userAgentString)
-        }
-
-        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
-        capture?.let { webView.addJavascriptInterface(it.bridge(), it.bridgeName) }
-
-        fun checkSolved(view: WebView?) {
-            if (resolved.get()) return
-            val u = view?.url ?: return
-            val title = view.title?.lowercase() ?: ""
-            val cookies = CookieManager.getInstance().getCookie(u) ?: ""
-
-            val stillChallenging = listOf("just a moment", "attention required", "security verification", "checking your browser").any { title.contains(it) }
-
-            if (!stillChallenging && cookies.contains("cf_clearance")) {
-                if (capture != null && !capture.hasCaptured()) {
-                    log("⏳ CF solved, waiting for JS payload capture...")
-                    return
-                }
-                CookieManager.getInstance().flush()
-                header.text = "Verified. Resuming…"
-                header.setTextColor(Color.parseColor("#22C55E"))
-                Handler(Looper.getMainLooper()).postDelayed({ finish(true) }, 400)
-            }
-        }
-
-        webView.webChromeClient = object : WebChromeClient() {
-            override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                progress.progress = newProgress
-                progress.visibility = if (newProgress in 1..99) View.VISIBLE else View.GONE
-                if (newProgress >= 99) checkSolved(view)
-            }
+            userAgentString = CFState.userAgentFor(URI(url).host ?: "") ?: MangaManhwaProvider.UA
         }
 
         webView.webViewClient = object : WebViewClient() {
-            override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) { handler?.cancel() }
-            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) { capture?.injectScript?.let { view?.evaluateJavascript(it, null) } }
             override fun onPageFinished(view: WebView?, url: String?) {
-                capture?.injectScript?.let { view?.evaluateJavascript(it, null) }
-                checkSolved(view)
-                Handler(Looper.getMainLooper()).postDelayed({ checkSolved(view) }, 1200)
+                val title = view?.title?.lowercase() ?: ""
+                val isChallenge = title.contains("just a moment") || title.contains("attention required")
+                if (!isChallenge) {
+                    Handler(Looper.getMainLooper()).postDelayed({ finish(true) }, 500)
+                }
             }
         }
 
         layout.addView(webView)
         dialog.setContentView(layout)
-        dialog.setCancelable(true)
-        dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-        dialog.setOnDismissListener {
-            if (resolved.compareAndSet(false, true)) { if (!deferred.isCompleted) deferred.complete(false) }
-            disposeWebView()
-        }
+        dialog.setOnDismissListener { finish(false) }
         dialog.show()
         webView.loadUrl(url)
     }
