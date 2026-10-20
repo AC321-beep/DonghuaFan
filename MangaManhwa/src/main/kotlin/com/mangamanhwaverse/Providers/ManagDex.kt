@@ -21,7 +21,14 @@ class MangaDex : MangaManhwaProvider() {
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true; coerceInputValues = true }
 
-    private suspend fun getText(url: String): String? = runCatching { app.get(url, headers = browserHeaders()).text }.getOrNull()
+    private suspend fun getText(url: String): String? {
+        // ✅ ADDED LOGGING
+        log("Fetching API URL: $url")
+        
+        return runCatching { app.get(url, headers = browserHeaders()).text }
+            .onFailure { logErr("API fetch failed: ${it.message}") }
+            .getOrNull()
+    }
 
     private suspend fun list(url: String): List<SearchResponse> {
         val raw = getText(url) ?: return emptyList()
