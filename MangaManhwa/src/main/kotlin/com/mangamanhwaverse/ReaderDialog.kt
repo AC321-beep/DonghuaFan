@@ -32,7 +32,6 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.fragment.app.DialogFragment
 import com.mangamanhwaverse.core.CFState
 import com.mangamanhwaverse.core.MangaManhwaProvider
-import java.net.URI
 
 class ReaderDialog : DialogFragment() {
 
@@ -177,7 +176,7 @@ class ReaderDialog : DialogFragment() {
                 cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
                 mediaPlaybackRequiresUserGesture = false
 
-                // ✅ FIX: Use the global CFState.userAgent
+                // ✅ SIMPLIFIED: Just use the exact User-Agent that solved CF.
                 userAgentString = CFState.userAgent.takeIf { it.isNotBlank() } ?: MangaManhwaProvider.UA
             }
 
