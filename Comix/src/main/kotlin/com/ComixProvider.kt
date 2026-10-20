@@ -561,31 +561,24 @@ class ComixProvider : MainAPI() {
                (lower.contains("attention required") && lower.contains("cloudflare"))
     }
 
-       private suspend fun fetchHtml(url: String): String {
-        log("Fetching HTML: $url")
-        
-        var resp = try {
-            app.get(url, interceptor = comixInterceptor, headers = comixHeaders())
-        } catch (e: Exception) {
-            logErr("❌ Fetch failed: ${e.message}")
-            return ""
+    private suspend fun fetchHtml(url: String): String {
+        val first = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
+        if (first.isNotBlank() && !isCloudflareChallenge(first)) return first
+        if (first.isBlank()) {
+            val retry = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
+            if (retry.isBlank()) return ""
+            if (!isCloudflareChallenge(retry)) return retry
+        } else {
+            val second = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
+            if (second.isNotBlank() && !isCloudflareChallenge(second)) return second
         }
-        
-        if (isCfChallenge(resp.document)) {
-            log("Comix CF challenge detected. Invoking CFSolver...")
-            if (CFSolver(url).solve()) {
-                resp = try {
-                    app.get(url, interceptor = comixInterceptor, headers = comixHeaders())
-                } catch (e: Exception) {
-                    logErr("❌ Second fetch failed: ${e.message}")
-                    return ""
-                }
-            } else {
-                log("❌ CFSolver failed or returned false")
-                return ""
-            }
+        cfMutex.withLock {
+            val probe = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
+            if (probe.isNotBlank() && !isCloudflareChallenge(probe)) return probe
+            resolveCloudflareAndCipher(waitForCipher = false)
+            CookieManager.getInstance().flush()
         }
-        return resp.text
+        return runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
     }
 
     private fun blockingFetchHtml(url: String): String? {
