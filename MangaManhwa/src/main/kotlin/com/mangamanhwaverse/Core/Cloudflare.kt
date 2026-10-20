@@ -29,10 +29,6 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
-package com.mangamanhwaverse.core
-
-// ... imports ...
-
 object CFState {
     // ✅ ADDED: Global User-Agent for the entire session
     var userAgent: String = ""
@@ -54,8 +50,6 @@ object CFState {
         solving.remove(host, deferred)
     }
 }
-
-// ... CFSolver class remains exactly the same ...
 
 class CFSolver(private val url: String) {
 
@@ -100,7 +94,7 @@ class CFSolver(private val url: String) {
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun attemptSilentResolution(activity: android.app.Activity): Boolean = withContext(Dispatchers.Main) {
         val decor = activity.window?.decorView as? ViewGroup ?: return@withContext false
-        suspendCancellableCoroutine<Boolean> { cont ->
+        suspendCancellableCoroutine { cont ->
             val done = AtomicBoolean(false)
             val handler = Handler(Looper.getMainLooper())
             var timeoutRunnable: Runnable? = null
