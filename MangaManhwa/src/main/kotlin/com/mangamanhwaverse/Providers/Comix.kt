@@ -60,8 +60,7 @@ class CFInterceptor : Interceptor {
             b.addQueryParameter("content_rating[]", "suggestive")
             b.addQueryParameter("content_rating[]", "erotica")
             b.addQueryParameter("content_rating[]", "pornographic")
-            val forged = b.build()
-            original.newBuilder().url(forged).build()
+            original.newBuilder().url(b.build()).build()
         } else {
             original
         }
@@ -474,7 +473,6 @@ class ComixProvider : MangaManhwaProvider() {
         val activity = CommonActivity.activity ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
         if (attemptSilentResolution(activity, waitForCipher)) return true
-        // Fallback if silent fails
         return attemptSilentResolution(activity, waitForCipher)
     }
 
@@ -509,6 +507,19 @@ class ComixProvider : MangaManhwaProvider() {
             CookieManager.getInstance().flush()
         }
         return runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
+    }
+    
+    // ✅ New Helper: Fetch JSON safely, handling CF if it appears
+    private suspend fun fetchJson(url: String): String? {
+        val first = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
+        if (first.isNotBlank() && !isCloudflareChallenge(first)) return first
+        
+        cfMutex.withLock {
+            resolveCloudflareAndCipher(waitForCipher = false)
+            CookieManager.getInstance().flush()
+        }
+        val second = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
+        return if (second.isNotBlank() && !isCloudflareChallenge(second)) second else null
     }
 
     private fun blockingFetchHtml(url: String): String? {
@@ -630,8 +641,8 @@ class ComixProvider : MangaManhwaProvider() {
                 }
             }
             Log.e(TAG, "GET-UNSIGNED $encoded")
-            val headers = referer?.let { mapOf("Referer" to it) } ?: emptyMap()
-            app.get(encoded, interceptor = cfInterceptor, headers = headers).text
+            // ✅ Use fetchJson to handle Cloudflare
+            fetchJson(encoded)
         } catch (t: Throwable) {
             Log.e(TAG, "fetchApiDirect failed: ${t.message}")
             null
@@ -680,8 +691,8 @@ class ComixProvider : MangaManhwaProvider() {
                 append("_=").append(URLEncoder.encode(token, "UTF-8"))
             }
             Log.e(TAG, "GET-SIGNED $encoded")
-            val headers = referer?.let { mapOf("Referer" to it) } ?: emptyMap()
-            app.get(encoded, interceptor = cfInterceptor, headers = headers).text
+            // ✅ Use fetchJson to handle Cloudflare
+            fetchJson(encoded)
         } catch (t: Throwable) {
             Log.e(TAG, "getSigned failed: ${t.message}")
             null
@@ -1123,6 +1134,12 @@ class ComixProvider : MangaManhwaProvider() {
         page: Int, request: MainPageRequest
     ): HomePageResponse? {
         Log.e(TAG, "───── getMainPage page=$page request.data=${request.data} ─────")
+
+        // ✅ FIX: Ensure we have cookies before making API requests
+        val home = fetchHtml(mainUrl)
+        if (isCloudflareChallenge(home)) {
+            resolveCloudflareAndCipher(waitForCipher = false)
+        }
 
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
