@@ -13,11 +13,9 @@ class OmegaScans : MangaManhwaProvider() {
     override val baseUrl = "https://omegascans.org"
     override var lang = "en"
 
-    // ✅ FIX 1: Enable Cloudflare fallback. 
-    // If CF blocks the request, the chapters are 0, causing "Coming Soon". 
-    // This forces the CF solver to run and get the real HTML.
+    // ✅ Enable Cloudflare fallback. OmegaScans is heavily protected by CF.
     override val requiresCf = true
-
+    
     override val mainPage = mainPageOf("hot" to "Latest Updates")
 
     override suspend fun hot(page: Int): List<SearchResponse> = fetch("$baseUrl/")?.let(::parseSeriesGrid) ?: emptyList()
@@ -31,24 +29,41 @@ class OmegaScans : MangaManhwaProvider() {
 
     override suspend fun chapters(mangaUrl: String): List<Episode> {
         val doc = fetch(mangaUrl) ?: return emptyList()
-        return parseChapters(doc)
+        return parseChapters(doc, mangaUrl)
     }
 
-    private fun parseChapters(doc: Document): List<Episode> {
+    private fun parseChapters(doc: Document, mangaUrl: String): List<Episode> {
         val eps = mutableListOf<Episode>()
+        val base = mangaUrl.trimEnd('/')
         
-        // ✅ CROSS-CHECKED WITH download (1).txt: 
-        // Links are exactly <a href="/series/.../chapter-11">
+        // 1. Try standard DOM parsing first
         doc.select("a[href*='/chapter-']").forEach { a ->
             val href = a.attr("href").trim()
             if (href.isBlank()) return@forEach
-            
-            // ✅ CROSS-CHECKED: Title is inside <span class="m-0 text-sm...">Chapter 11</span>
             val chapterName = a.selectFirst("span")?.text()?.trim() ?: href.substringAfterLast("/")
             val fullUrl = abs(href)
-            
             if (eps.none { it.data == fullUrl }) {
                 eps.add(newEpisode(fullUrl) { this.name = chapterName })
+            }
+        }
+        
+        // 2. Fallback: Regex JSON extraction (Next.js App Router)
+        // Next.js often renders chapters inside a massive Javascript string rather than DOM elements.
+        if (eps.isEmpty()) {
+            log("⚠️ DOM parsing failed. Trying JSON payload extraction...")
+            val html = doc.html()
+            
+            // Look for chapter_slug\":\"chapter-11 or similar
+            val slugRegex = Regex("""chapter_slug\\*"\\s*:\\s*\\*"(chapter-[^"\\]+)""")
+            val slugs = slugRegex.findAll(html).map { it.groupValues[1] }.toSet()
+            
+            for (slug in slugs) {
+                val fullUrl = "$base/$slug"
+                if (eps.none { it.data == fullUrl }) {
+                    // Format "chapter-11" to "Chapter 11"
+                    val chapterName = slug.replace("-", " ").replaceFirstChar { it.uppercase() }
+                    eps.add(newEpisode(fullUrl) { this.name = chapterName })
+                }
             }
         }
         
@@ -57,6 +72,10 @@ class OmegaScans : MangaManhwaProvider() {
         eps.sortByDescending { ep -> 
             num.find(ep.name ?: "")?.value?.replace('-', '.')?.toFloatOrNull() ?: 0f 
         }
+        
+        if (eps.isEmpty()) log("⚠️ parseChapters: Found 0 chapters. HTML/JSON selector might be broken!")
+        else log("✅ parseChapters: Found ${eps.size} chapters")
+        
         return eps
     }
 
@@ -66,42 +85,38 @@ class OmegaScans : MangaManhwaProvider() {
         
         doc.select("img").forEach { img ->
             val src = extractImage(img) ?: return@forEach
-            
-            // ✅ CROSS-CHECKED WITH download (2).txt:
-            // All real chapter images have "/uploads/series/" in their URL. 
-            // This ignores avatars, ads, and "You Might Also Like" covers.
+            // ✅ STRICT FILTER: Only take actual chapter images from the uploads folder.
+            // This ignores the site logo, user avatars, and recommendation covers.
             if (!src.contains("/uploads/series/")) return@forEach
             if (images.contains(src)) return@forEach
             images.add(src)
         }
+        
+        log("✅ pages: Found ${images.size} images")
         return images
     }
 
     override suspend fun load(url: String): LoadResponse? {
         val doc = fetch(url) ?: return null
         
-        // ✅ CROSS-CHECKED WITH download (1).txt:
-        // Title is <h1 class="...">As Written In The Lewd Notebook</h1>
+        // 1. Title
         val title = doc.selectFirst("h1")?.text()?.trim() ?: titleFromSlug(url)
         
-        // ✅ CROSS-CHECKED WITH download (1).txt:
-        // Plot is <div class="text-muted-foreground"><div>One day, I found...</div></div>
+        // 2. Plot
         val plot = doc.selectFirst("div.text-muted-foreground > div")?.text()?.trim()
             ?: doc.selectFirst("p")?.text()?.trim()
         
-        // ✅ CROSS-CHECKED WITH download (1).txt:
-        // The safest poster is the Open Graph Meta tag: 
-        // <meta property="og:image" content="https://media.omegascans.org/file/.../ar7yh4fm9dv9fe5yvqjbly6o.webp">
+        // 3. Poster (Open Graph Meta is the most reliable)
         val poster = doc.selectFirst("meta[property='og:image']")?.attr("content")?.takeIf { it.isNotBlank() }
             ?: doc.selectFirst("img[srcset*='media.omegascans.org']")?.let(::extractImage)?.let(::abs)
         
-        // ✅ CROSS-CHECKED WITH download (1).txt:
-        // Status is <span class="... uppercase">Ongoing</span>
+        // 4. Status
         val statusStr = doc.select("span.uppercase").firstOrNull { 
             it.text() == "Ongoing" || it.text() == "Completed" || it.text() == "Dropped" || it.text() == "Coming Soon"
         }?.text()
 
-        val episodes = parseChapters(doc)
+        // 5. Chapters
+        val episodes = parseChapters(doc, url)
         
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
