@@ -262,7 +262,6 @@ class ReaderDialog : DialogFragment() {
 
             webViewClient = object : WebViewClient() {
 
-                // Network-level blocking (Fast and undetectable by anti-adblock scripts)
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val u = request.url?.toString() ?: return null
                     if (isBlockedUrl(u)) {
@@ -484,7 +483,6 @@ class ReaderDialog : DialogFragment() {
         )
     }
 
-    // ★ UNIVERSAL NEXT/PREV: No URL guessing. Only standard DOM interaction.
     private fun jsNext(dir: Int) {
         val js = if (dir > 0) """
             (function(){
@@ -562,14 +560,6 @@ class ReaderDialog : DialogFragment() {
         val js = """
             (function() {
               var targetCh = $target;
-              
-              // Check if we are already on the target chapter
-              var initialMatch = /(?:chapter|ch)[-/\s]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
-              if (initialMatch && parseFloat(initialMatch[1]) === targetCh) {
-                if (window.MMReader) window.MMReader.onTargetReached(targetCh);
-                return;
-              }
-
               var ticks = 0;
               var timer = setInterval(function() {
                 ticks++;
@@ -635,41 +625,13 @@ class ReaderDialog : DialogFragment() {
             """
             (function(){
               try {
+                // 1. Initial CSS - Safe hiding
                 if (!document.getElementById('mm-css')) {
                   var s = document.createElement('style');
                   s.id = 'mm-css';
                   s.innerHTML = `
-                    /* Force the page to start at the very top */
                     body { background: #07080C !important; margin: 0 !important; padding: 0 !important; }
                     
-                    /* Hide the specific injected Top Ad */
-                    .ai-top-bar, [class^="ai-top-bar"] { display: none !important; }
-
-                    /* 
-                     * Safe Ad Hiding: Anti-adblock scripts look for display: none. 
-                     * We use visibility: hidden and move them off-screen so the layout 
-                     * doesn't break and the site doesn't blank out the reader. 
-                     */
-                    .adsbygoogle, [data-ad], [data-ad-slot], [id*="google_ads"], 
-                    [class*="advert"], [class*="popup-ad"], [class*="interstitial"] { 
-                        visibility: hidden !important; 
-                        position: absolute !important; 
-                        top: -9999px !important; 
-                        left: -9999px !important; 
-                        height: 1px !important; 
-                        width: 1px !important;
-                    }
-
-                    /* Remove video players and known ad iframes */
-                    video, 
-                    iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
-                    iframe[src*="adservice"], iframe[src*="adsystem"],
-                    iframe[src*="taboola"], iframe[src*="outbrain"],
-                    iframe[src*="criteo"], iframe[src*="exoclick"],
-                    iframe[src*="adsterra"], iframe[src*="propellerads"],
-                    iframe[src*="culinar9sync"] { display: none !important; }
-
-                    /* Hide ONLY junk at bottom, PRESERVE navigation buttons */
                     footer, #comments, .comment-section, .related-posts, 
                     .recommendations, .mpage__recs, .wp-manga-related, .chapter-widget, 
                     .related-manga, .suggestions, .also-like, .more-like-this, .share-block, 
@@ -682,6 +644,50 @@ class ReaderDialog : DialogFragment() {
                   document.head.appendChild(s);
                 }
 
+                // 2. SAFE MUTATION OBSERVER (Soft-hide ads, never remove)
+                if (!window.__mmAdObserver) {
+                  window.__mmAdObserver = true;
+                  
+                  var AD_SELECTOR = [
+                    '.ai-top-bar', '[class^="ai-top-bar"]', 'video',
+                    'iframe[src*="doubleclick"]', 'iframe[src*="googlesyndication"]',
+                    'iframe[src*="adservice"]', 'iframe[src*="adsystem"]',
+                    'iframe[src*="taboola"]', 'iframe[src*="outbrain"]', 'iframe[src*="criteo"]',
+                    'iframe[src*="exoclick"]', 'iframe[src*="adsterra"]', 'iframe[src*="propellerads"]',
+                    'iframe[src*="culinar9sync"]'
+                  ].join(',');
+
+                  function neutralizeAds() {
+                    try {
+                      var ads = document.querySelectorAll(AD_SELECTOR);
+                      for (var i = 0; i < ads.length; i++) {
+                        var el = ads[i];
+                        if (!el) continue;
+                        if (el.querySelector && (el.querySelector('.rpage-page__img') || el.querySelector('#readerarea') || el.querySelector('.reading-content'))) continue;
+                        
+                        el.style.setProperty('opacity', '0', 'important');
+                        el.style.setProperty('pointer-events', 'none', 'important');
+                        el.style.setProperty('z-index', '-9999', 'important');
+                        
+                        var computed = window.getComputedStyle(el);
+                        if (computed.position === 'fixed' || computed.position === 'sticky') {
+                            el.style.setProperty('position', 'absolute', 'important');
+                            el.style.setProperty('top', '0', 'important');
+                            el.style.setProperty('left', '0', 'important');
+                        }
+                      }
+                    } catch(e) {}
+                  }
+                  
+                  neutralizeAds();
+                  
+                  try {
+                    var observer = new MutationObserver(neutralizeAds);
+                    observer.observe(document.body, { childList: true, subtree: true });
+                  } catch(e) {}
+                }
+
+                // 3. Reader features (Tap zones, scrolling)
                 if (!window.__mmTapInstalled) {
                   window.__mmTapInstalled = true;
                   var MAX_MOVE = 14, MAX_TIME = 350, DEBOUNCE = 180;
@@ -701,12 +707,21 @@ class ReaderDialog : DialogFragment() {
                     return false;
                   }
                   
+                  // ★ UPDATED: Strict 20px threshold for "Absolute Bottom"
                   function atBottom() {
-                    var scrollable = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
-                    var scrollTop = window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0;
-                    var clientHeight = window.innerHeight || document.documentElement.clientHeight;
-                    if (scrollable < 300) return false;
-                    return (scrollTop + clientHeight) >= (scrollable - 150);
+                    var el = document.querySelector('.rpage-main') || document.querySelector('.rpage-main--long-strip') || document.scrollingElement || document.documentElement;
+                    
+                    if (el === document.documentElement || el === document.body) {
+                        var scrollable = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
+                        var scrollTop = window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0;
+                        var clientHeight = window.innerHeight || document.documentElement.clientHeight;
+                        return (scrollTop + clientHeight) >= (scrollable - 20);
+                    } else {
+                        var scrollable = el.scrollHeight;
+                        var scrollTop = el.scrollTop;
+                        var clientHeight = el.clientHeight;
+                        return (scrollTop + clientHeight) >= (scrollable - 20);
+                    }
                   }
                   
                   function scroller() {
@@ -725,21 +740,23 @@ class ReaderDialog : DialogFragment() {
                     }
                   }
 
+                  // ★ UPDATED: Tapping right side only triggers next if at absolute bottom. Otherwise, it scrolls.
                   function handleTap(x, y) {
                     var now = Date.now(); if (now - last < DEBOUNCE) return; last = now;
                     var w = window.innerWidth, h = window.innerHeight;
 
                     if (x < w * 0.25) {
+                      // Left zone: Scroll up
                       scrollByPage(-0.8); flash(x, y);
                     } else if (x > w * 0.75) {
+                      // Right zone: Next chapter only if at bottom, otherwise scroll down
                       if (atBottom()) {
-                        flash(x, y); if (window.MMReader) window.MMReader.onNext();
-                      } else if (y > h * 0.75) {
                         flash(x, y); if (window.MMReader) window.MMReader.onNext();
                       } else {
                         scrollByPage(0.8); flash(x, y);
                       }
                     } else {
+                      // Center zone
                       if (atBottom() && y > h * 0.75) {
                         flash(x, y); if (window.MMReader) window.MMReader.onNext();
                       } else {
