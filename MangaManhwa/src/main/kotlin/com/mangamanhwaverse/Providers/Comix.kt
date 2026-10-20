@@ -14,6 +14,7 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.mangamanhwaverse.ReaderDialog
 import com.mangamanhwaverse.core.CFSolver
+import com.mangamanhwaverse.core.CFState
 import com.mangamanhwaverse.core.MangaManhwaProvider
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -188,11 +189,19 @@ class ComixProvider : MangaManhwaProvider() {
         }
     }
 
+    // ✅ FIX: Use the exact User-Agent that the CFSolver captured!
     private fun comixHeaders(extra: Map<String, String> = emptyMap()) = mapOf(
-        "User-Agent" to UA, "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language" to "en-US,en;q=0.5", "Sec-Ch-Ua" to "\"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"121\", \"Chromium\";v=\"121\"",
-        "Sec-Ch-Ua-Mobile" to "?0", "Sec-Ch-Ua-Platform" to "\"Windows\"", "Sec-Fetch-Dest" to "document",
-        "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Site" to "none", "Sec-Fetch-User" to "?1", "Upgrade-Insecure-Requests" to "1"
+        "User-Agent" to (CFState.userAgentFor("comix.to") ?: UA), 
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language" to "en-US,en;q=0.5", 
+        "Sec-Ch-Ua" to "\"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"121\", \"Chromium\";v=\"121\"",
+        "Sec-Ch-Ua-Mobile" to "?0", 
+        "Sec-Ch-Ua-Platform" to "\"Windows\"", 
+        "Sec-Fetch-Dest" to "document",
+        "Sec-Fetch-Mode" to "navigate", 
+        "Sec-Fetch-Site" to "none", 
+        "Sec-Fetch-User" to "?1", 
+        "Upgrade-Insecure-Requests" to "1"
     ) + extra
 
     private val comixInterceptor = Interceptor { chain ->
@@ -209,7 +218,7 @@ class ComixProvider : MangaManhwaProvider() {
         })
     }
 
-      private suspend fun fetchHtml(url: String): String {
+    private suspend fun fetchHtml(url: String): String {
         log("Fetching HTML: $url")
         
         var resp = try {
@@ -238,8 +247,6 @@ class ComixProvider : MangaManhwaProvider() {
 
     private suspend fun getSigned(path: String, params: Map<String, List<String>>): String? {
         val c = cachedCipher() ?: return null
-        
-        // ✅ ADDED LOGGING
         log("Fetching Signed API: $path")
         
         return try {
