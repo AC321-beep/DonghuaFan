@@ -2,6 +2,8 @@ package com.mangamanhwaverse.providers
 
 import com.mangamanhwaverse.core.MangaManhwaProvider
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.app
+import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
@@ -13,7 +15,7 @@ class OmegaScans : MangaManhwaProvider() {
     override val baseUrl = "https://omegascans.org"
     override var lang = "en"
 
-    // ✅ Enable Cloudflare fallback. OmegaScans is heavily protected by CF.
+    // ✅ Enable Cloudflare fallback. OmegaScans uses it heavily.
     override val requiresCf = true
     
     override val mainPage = mainPageOf("hot" to "Latest Updates")
@@ -32,11 +34,11 @@ class OmegaScans : MangaManhwaProvider() {
         return parseChapters(doc, mangaUrl)
     }
 
-    private fun parseChapters(doc: Document, mangaUrl: String): List<Episode> {
+    private suspend fun parseChapters(doc: Document, mangaUrl: String): List<Episode> {
         val eps = mutableListOf<Episode>()
         val base = mangaUrl.trimEnd('/')
         
-        // 1. Try standard DOM parsing first
+        // 1. Try standard DOM parsing first (just in case they change it back)
         doc.select("a[href*='/chapter-']").forEach { a ->
             val href = a.attr("href").trim()
             if (href.isBlank()) return@forEach
@@ -47,23 +49,60 @@ class OmegaScans : MangaManhwaProvider() {
             }
         }
         
-        // 2. Fallback: Regex JSON extraction (Next.js App Router)
-        // Next.js often renders chapters inside a massive Javascript string rather than DOM elements.
+        // 2. Fallback: Query the API using the hidden series_id
         if (eps.isEmpty()) {
-            log("⚠️ DOM parsing failed. Trying JSON payload extraction...")
+            log("⚠️ DOM parsing failed. Extracting series_id and querying API...")
             val html = doc.html()
             
-            // Look for chapter_slug\":\"chapter-11 or similar
-            val slugRegex = Regex("""chapter_slug\\*"\\s*:\\s*\\*"(chapter-[^"\\]+)""")
-            val slugs = slugRegex.findAll(html).map { it.groupValues[1] }.toSet()
+            // Find series_id in the Next.js payload (e.g., "series_id":689)
+            val seriesIdMatch = Regex("""series_id\\*"?\s*:\s*(\d+)""").find(html)
+            val seriesId = seriesIdMatch?.groupValues?.get(1)
             
-            for (slug in slugs) {
-                val fullUrl = "$base/$slug"
-                if (eps.none { it.data == fullUrl }) {
-                    // Format "chapter-11" to "Chapter 11"
-                    val chapterName = slug.replace("-", " ").replaceFirstChar { it.uppercase() }
-                    eps.add(newEpisode(fullUrl) { this.name = chapterName })
+            if (seriesId != null) {
+                log("✅ Found series_id: $seriesId")
+                
+                // ✅ EXACT API URL FROM DEVTOOLS
+                val apiUrl = "$baseUrl/api/query?page=1&perPage=10000&series_id=$seriesId"
+                log("⬇️ Fetching API: $apiUrl")
+                
+                val apiResponse = try {
+                    app.get(apiUrl, interceptor = unifiedInterceptor, headers = browserHeaders()).text
+                } catch (e: Exception) {
+                    logErr("❌ API fetch failed", e)
+                    ""
                 }
+                
+                if (apiResponse.isNotBlank()) {
+                    try {
+                        // ✅ PARSE THE JSON EXACTLY AS SHOWN IN YOUR FILE
+                        val root = JSONObject(apiResponse)
+                        val dataArray = root.optJSONArray("data")
+                        
+                        if (dataArray != null) {
+                            for (i in 0 until dataArray.length()) {
+                                val chapterObj = dataArray.optJSONObject(i) ?: continue
+                                val slug = chapterObj.optString("chapter_slug") // e.g. "chapter-125-5"
+                                val name = chapterObj.optString("chapter_name") // e.g. "Chapter 125.5"
+                                
+                                if (slug.isNotBlank()) {
+                                    val fullUrl = "$base/$slug"
+                                    if (eps.none { it.data == fullUrl }) {
+                                        eps.add(newEpisode(fullUrl) { 
+                                            this.name = name.ifBlank { slug.replace("-", " ").replaceFirstChar { it.uppercase() } } 
+                                        })
+                                    }
+                                }
+                            }
+                            log("✅ Found ${eps.size} chapters from API")
+                        }
+                    } catch (e: Exception) {
+                        logErr("❌ JSON parsing failed", e)
+                    }
+                } else {
+                    log("❌ API response was empty")
+                }
+            } else {
+                log("❌ Could not find series_id in HTML")
             }
         }
         
@@ -73,9 +112,7 @@ class OmegaScans : MangaManhwaProvider() {
             num.find(ep.name ?: "")?.value?.replace('-', '.')?.toFloatOrNull() ?: 0f 
         }
         
-        if (eps.isEmpty()) log("⚠️ parseChapters: Found 0 chapters. HTML/JSON selector might be broken!")
-        else log("✅ parseChapters: Found ${eps.size} chapters")
-        
+        log("✅ parseChapters: Total ${eps.size} chapters")
         return eps
     }
 
@@ -85,8 +122,6 @@ class OmegaScans : MangaManhwaProvider() {
         
         doc.select("img").forEach { img ->
             val src = extractImage(img) ?: return@forEach
-            // ✅ STRICT FILTER: Only take actual chapter images from the uploads folder.
-            // This ignores the site logo, user avatars, and recommendation covers.
             if (!src.contains("/uploads/series/")) return@forEach
             if (images.contains(src)) return@forEach
             images.add(src)
@@ -99,23 +134,15 @@ class OmegaScans : MangaManhwaProvider() {
     override suspend fun load(url: String): LoadResponse? {
         val doc = fetch(url) ?: return null
         
-        // 1. Title
         val title = doc.selectFirst("h1")?.text()?.trim() ?: titleFromSlug(url)
-        
-        // 2. Plot
-        val plot = doc.selectFirst("div.text-muted-foreground > div")?.text()?.trim()
-            ?: doc.selectFirst("p")?.text()?.trim()
-        
-        // 3. Poster (Open Graph Meta is the most reliable)
+        val plot = doc.selectFirst("div.text-muted-foreground > div")?.text()?.trim() ?: doc.selectFirst("p")?.text()?.trim()
         val poster = doc.selectFirst("meta[property='og:image']")?.attr("content")?.takeIf { it.isNotBlank() }
             ?: doc.selectFirst("img[srcset*='media.omegascans.org']")?.let(::extractImage)?.let(::abs)
         
-        // 4. Status
         val statusStr = doc.select("span.uppercase").firstOrNull { 
             it.text() == "Ongoing" || it.text() == "Completed" || it.text() == "Dropped" || it.text() == "Coming Soon"
         }?.text()
 
-        // 5. Chapters
         val episodes = parseChapters(doc, url)
         
         return newAnimeLoadResponse(title, url, TvType.Anime) {
@@ -136,14 +163,10 @@ class OmegaScans : MangaManhwaProvider() {
 
     private fun parseSeriesGrid(doc: Document): List<SearchResponse> = doc.select("a[href]").mapNotNull { a ->
         val href = a.attr("href").trim()
-        
-        // Ensure it's a series link, not a chapter link
         if (!href.contains("/series/") || href.contains("/chapter-")) return@mapNotNull null
-        
         val title = a.selectFirst("h5")?.text()?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
         val img = a.selectFirst("img") ?: a.parent()?.selectFirst("img") ?: a.parent()?.parent()?.selectFirst("img") ?: return@mapNotNull null
         val poster = extractImage(img) ?: return@mapNotNull null
-        
         newAnimeSearchResponse(title, abs(href), TvType.Anime) { this.posterUrl = poster }
     }.distinctBy { it.url }
 
