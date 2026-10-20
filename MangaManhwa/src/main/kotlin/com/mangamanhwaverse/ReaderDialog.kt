@@ -8,6 +8,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Message
@@ -38,7 +39,6 @@ import androidx.fragment.app.DialogFragment
 import com.mangamanhwaverse.core.CFState
 import com.mangamanhwaverse.core.MangaManhwaProvider
 import java.io.ByteArrayInputStream
-import java.net.URI
 import java.util.Locale
 
 class ReaderDialog : DialogFragment() {
@@ -61,12 +61,32 @@ class ReaderDialog : DialogFragment() {
             "onclickads.net", "onclkds.com", "exoclick.com", "juicyads.com",
             "trafficjunky.net", "trafficfactory.biz", "adsterra.com",
             "hilltopads.net", "clickadu.com", "vidoomy.com", "adspyglass.com",
-            "scorecardresearch.com", "quantserve.com", "culinar9sync.com"
+            "scorecardresearch.com", "quantserve.com", "culinar9sync.com",
+            "a-ads.com", "adskeeper.com", "adskeeper.co.uk", "mgid.com",
+            "tsyndicate.com", "trafficstars.com", "galaksion.com", "bidgear.com",
+            "adinplay.com", "nitropay.com", "venatusmedia.com", "playwire.com",
+            "pubfuture.com", "valueimpression.com", "monetag.com", "richads.com",
+            "evadav.com", "rollerads.com", "admaven.com", "bidvertiser.com",
+            "acscdn.com", "twinrdsyn.com", "usrpubtrk.com", "clarity.ms",
+            "hotjar.com", "yandex.ru", "histats.com"
         )
 
         private val BLOCKED_URL_FRAGMENTS: List<String> = listOf(
             "paypal.com/xoplatform/logger",
-            "culinar9sync.com"
+            "culinar9sync.com",
+            "/ads/",
+            "/adserver",
+            "/adframe",
+            "/popunder",
+            "pagead2.googlesyndication",
+            "adsbygoogle",
+            "aclib.js"
+        )
+
+        private val CORS_HEADERS = mapOf(
+            "Access-Control-Allow-Origin" to "*",
+            "Access-Control-Allow-Methods" to "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers" to "*"
         )
 
         fun show(activity: AppCompatActivity, title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int = 0) {
@@ -118,25 +138,26 @@ class ReaderDialog : DialogFragment() {
     private fun isBlockedUrl(url: String): Boolean {
         if (url.isBlank() || !url.startsWith("http")) return false
 
-        val currentHost = runCatching { URI(currentChapterUrl).host?.lowercase(Locale.US) }.getOrNull()
-        val requestHost = runCatching { URI(url).host?.lowercase(Locale.US) }.getOrNull() ?: return false
-        if (currentHost != null) {
-            if (requestHost == currentHost) return false
-            if (requestHost.endsWith(".$currentHost")) return false
-            val parts = currentHost.split(".")
-            if (parts.size >= 2) {
-                val root = parts.takeLast(2).joinToString(".")
-                if (requestHost == root || requestHost.endsWith(".$root")) return false
-            }
+        val lower = url.lowercase(Locale.US)
+        for (frag in BLOCKED_URL_FRAGMENTS) {
+            if (lower.contains(frag)) return true
         }
+
+        val requestHost = runCatching { Uri.parse(url).host?.lowercase(Locale.US) }.getOrNull() ?: return false
+        if (requestHost.contains("cloudflare.com") || requestHost.contains("hcaptcha.com") || requestHost.contains("recaptcha.net")) return false
 
         for (blocked in BLOCKED_HOSTS) {
             if (requestHost == blocked || requestHost.endsWith(".$blocked")) return true
         }
 
-        val lower = url.lowercase(Locale.US)
-        for (frag in BLOCKED_URL_FRAGMENTS) {
-            if (lower.contains(frag)) return true
+        val currentHost = runCatching { Uri.parse(currentChapterUrl).host?.lowercase(Locale.US) }.getOrNull()
+        if (currentHost != null) {
+            if (requestHost == currentHost || requestHost.endsWith(".$currentHost")) return false
+            val parts = currentHost.split(".")
+            if (parts.size >= 2) {
+                val root = parts.takeLast(2).joinToString(".")
+                if (requestHost == root || requestHost.endsWith(".$root")) return false
+            }
         }
 
         return false
@@ -253,6 +274,9 @@ class ReaderDialog : DialogFragment() {
                         progress = newProgress
                         visibility = if (newProgress in 1..99) View.VISIBLE else View.GONE
                     }
+                    if (newProgress in 20..80) {
+                        injectReaderJs(view)
+                    }
                 }
 
                 override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message): Boolean {
@@ -272,7 +296,14 @@ class ReaderDialog : DialogFragment() {
                     val u = request.url?.toString() ?: return null
                     if (isBlockedUrl(u)) {
                         log("🚫 Blocked subresource: $u")
-                        return WebResourceResponse("text/plain", "utf-8", 200, "OK", emptyMap(), ByteArrayInputStream(ByteArray(0)))
+                        return WebResourceResponse(
+                            "text/plain",
+                            "utf-8",
+                            204,
+                            "No Content",
+                            CORS_HEADERS,
+                            ByteArrayInputStream(ByteArray(0))
+                        )
                     }
                     return null
                 }
@@ -285,6 +316,16 @@ class ReaderDialog : DialogFragment() {
                     }
                     if (isBlockedUrl(u)) {
                         log("🚫 Blocked navigation: $u")
+                        return true
+                    }
+                    val currentHost = baseUrl().lowercase(Locale.US)
+                    val targetHost = runCatching { Uri.parse(u).host?.lowercase(Locale.US) }.getOrNull() ?: ""
+                    if (currentHost.isNotBlank() && targetHost.isNotBlank() &&
+                        !targetHost.endsWith(currentHost) &&
+                        !currentHost.endsWith(targetHost) &&
+                        !targetHost.contains("cloudflare.com")
+                    ) {
+                        log("🚫 Blocked external redirect: $u")
                         return true
                     }
                     return false
@@ -319,6 +360,7 @@ class ReaderDialog : DialogFragment() {
                             } catch(e){}
                         })();
                     """.trimIndent(), null)
+                    injectReaderJs(view)
                 }
 
                 override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
@@ -336,7 +378,7 @@ class ReaderDialog : DialogFragment() {
                         chapterInfo?.text = currentChapterName
                     }
 
-                    view.postDelayed({ injectReaderJs(view) }, 250L)
+                    view.postDelayed({ injectReaderJs(view) }, 150L)
                 }
 
                 override fun onPageFinished(view: WebView, url: String?) {
@@ -374,7 +416,7 @@ class ReaderDialog : DialogFragment() {
     }
 
     private fun baseUrl(): String {
-        return runCatching { URI(currentChapterUrl).host }.getOrNull() ?: ""
+        return runCatching { Uri.parse(currentChapterUrl).host }.getOrNull() ?: ""
     }
 
     private fun buildToolbar(ctx: Context, density: Float): View {
@@ -472,15 +514,16 @@ class ReaderDialog : DialogFragment() {
         webView?.let { applyZoom(it, 100) }
     }
 
+    // ★ FIXED: applyZoom now ignores all elements tagged with data-mm-ad="1"
     private fun applyZoom(view: WebView, zoom: Int) {
         view.evaluateJavascript(
             """
             (function(){
               var z = $zoom;
               var s = document.getElementById('mm-zoom');
-              if (!s) { s = document.createElement('style'); s.id = 'mm-zoom'; document.head.appendChild(s); }
+              if (!s) { s = document.createElement('style'); s.id = 'mm-zoom'; (document.head || document.documentElement).appendChild(s); }
               s.innerHTML =
-                'img, .rpage-page__img, canvas { max-width:' + z + '% !important; width:' + z + '% !important; height:auto !important; display:block !important; margin:0 auto !important; }' +
+                'img:not([data-mm-ad="1"]), .rpage-page__img, canvas:not([data-mm-ad="1"]) { max-width:' + z + '% !important; width:' + z + '% !important; height:auto !important; display:block !important; margin:0 auto !important; }' +
                 '.rpage-main__inner, .reading-content, #readerarea, .container, ' +
                 '.viewer, .chapter-content, .manga-reading, #chapter-content, main' +
                 ' { width:' + z + '% !important; max-width:' + z + '% !important; margin:0 auto !important; }';
@@ -631,52 +674,98 @@ class ReaderDialog : DialogFragment() {
             """
             (function(){
               try {
-                // 1. Wait for document to be ready to avoid null appendChild error
-                var head = document.head || document.getElementsByTagName('head')[0] || document.documentElement;
-                if (!head) {
-                   setTimeout(arguments.callee, 100);
-                   return;
-                }
+                var t = (document.title || '').toLowerCase();
+                if (t.indexOf('just a moment') > -1 || t.indexOf('attention required') > -1 || t.indexOf('checking your browser') > -1) return;
 
-                // 2. Initial CSS - safe and direct
+                var root = document.head || document.documentElement;
+                if (!root) return;
+
+                // 1. React-safe CSS suppression
                 if (!document.getElementById('mm-css')) {
                   var s = document.createElement('style');
                   s.id = 'mm-css';
                   s.innerHTML = 
                     "body { background: #07080C !important; padding-top: 0 !important; margin: 0 !important; }" +
-                    ".ai-top-bar { position: absolute !important; top: -9999px !important; left: -9999px !important; width: 1px !important; height: 1px !important; opacity: 0 !important; pointer-events: none !important; }" +
-                    "footer, #comments, .comment-section, .related-posts, .recommendations { display: none !important; }";
-                  head.appendChild(s);
+                    "[data-mm-ad='1'], .ai-top-bar, [class*='ai-top-bar'], ins, .adsbygoogle, " +
+                    "[id^='google_ads'], [id*='ad-container'], [class*='ad-container'], [class*='ad-banner'], " +
+                    "[class*='ads-box'], [class*='FloatingAd'], [class*='sticky-ad'], " +
+                    "iframe:not([src*='cloudflare']):not([src*='hcaptcha']):not([src*='recaptcha']), video { " +
+                    "  display: none !important; max-height: 0 !important; height: 0 !important; width: 0 !important; " +
+                    "  opacity: 0 !important; pointer-events: none !important; visibility: hidden !important; " +
+                    "  overflow: hidden !important; margin: 0 !important; padding: 0 !important; border: 0 !important; " +
+                    "  position: absolute !important; top: -9999px !important; left: -9999px !important; z-index: -9999 !important; " +
+                    "}" +
+                    "footer, #comments, .comment-section, .related-posts, .recommendations, #disqus_thread { display: none !important; }";
+                  root.appendChild(s);
                 }
 
-                // 3. AGGRESSIVE AD KILLER (Fights React re-renders)
-                if (!window.__mmAdInterval) {
-                  window.__mmAdInterval = setInterval(function() {
-                    try {
-                      // Find the top bar by class or by generic position
-                      var ads = document.querySelectorAll('.ai-top-bar, [class^="ai-top-bar"], video');
-                      for (var i = 0; i < ads.length; i++) {
-                          var el = ads[i];
-                          el.style.setProperty('position', 'absolute', 'important');
-                          el.style.setProperty('top', '-9999px', 'important');
-                          el.style.setProperty('left', '-9999px', 'important');
-                          el.style.setProperty('opacity', '0', 'important');
-                          el.style.setProperty('pointer-events', 'none', 'important');
-                          el.style.setProperty('z-index', '-9999', 'important');
+                // 2. React-safe DOM scrubber
+                function scrubAds() {
+                  try {
+                    var host = window.location.hostname;
+                    
+                    // ★ FIXED: Also target <ins> tags and external <a> tags with images
+                    var selectors = [
+                      '.ai-top-bar', '[class*="ai-top-bar"]', 'video', 'ins', '.adsbygoogle',
+                      'iframe:not([src*="cloudflare"]):not([src*="hcaptcha"]):not([src*="recaptcha"])',
+                      '[id*="ad-"]', '[class*="ad-banner"]', '[class*="ad-slot"]', '[class*="ad-wrapper"]',
+                      'a[target="_blank"]'
+                    ];
+                    var nodes = document.querySelectorAll(selectors.join(','));
+                    for (var i = 0; i < nodes.length; i++) {
+                      var el = nodes[i];
+                      if (el.tagName === 'A') {
+                        var href = (el.getAttribute('href') || '').toLowerCase();
+                        // Keep internal navigation links, hide external promo/ad banners
+                        if (!href || href.indexOf(host) > -1 || href.charAt(0) === '/') continue;
                       }
-                      
-                      // Force the body padding to 0 to close the gap
+                      el.setAttribute('data-mm-ad', '1');
+                      var imgs = el.querySelectorAll ? el.querySelectorAll('img, canvas') : [];
+                      for (var j = 0; j < imgs.length; j++) {
+                        imgs[j].setAttribute('data-mm-ad', '1');
+                      }
+                    }
+
+                    // Collapse fixed/sticky overlay bars that aren't the reader container
+                    var allDivs = document.querySelectorAll('div, aside, section');
+                    for (var k = 0; k < allDivs.length; k++) {
+                      var d = allDivs[k];
+                      if (d.getAttribute('data-mm-ad') === '1') continue;
+                      var st = window.getComputedStyle(d);
+                      if ((st.position === 'fixed' || st.position === 'sticky') && d.clientHeight > 0 && d.clientHeight < 220) {
+                        if (d.querySelector('iframe, video, ins, a[target="_blank"], img[src*="banner"], img[src*="ad"]')) {
+                          d.setAttribute('data-mm-ad', '1');
+                        }
+                      }
+                    }
+
+                    if (document.body) {
                       document.body.style.setProperty('padding-top', '0', 'important');
-                      var reader = document.querySelector('.rpage-main, #readerarea, .reading-content');
-                      if (reader) {
-                          reader.style.setProperty('padding-top', '0', 'important');
-                          reader.style.setProperty('margin-top', '0', 'important');
-                      }
-                    } catch(e) {}
-                  }, 250); // Run 4 times a second to catch re-renders
+                    }
+                    var reader = document.querySelector('.rpage-main, #readerarea, .reading-content, main');
+                    if (reader) {
+                      reader.style.setProperty('padding-top', '0', 'important');
+                      reader.style.setProperty('margin-top', '0', 'important');
+                    }
+                  } catch(e) {}
                 }
 
-                // 4. Reader features (Tap zones)
+                scrubAds();
+
+                // ★ FIXED: Observe documentElement (safe during onPageStarted) and only set flag after success
+                if (!window.__mmAdObserver) {
+                  try {
+                    window.__mmAdObserver = new MutationObserver(function() { scrubAds(); });
+                    window.__mmAdObserver.observe(document.documentElement, { childList: true, subtree: true });
+                  } catch(e) {
+                    window.__mmAdObserver = null;
+                  }
+                }
+                if (!window.__mmAdInterval) {
+                  window.__mmAdInterval = setInterval(scrubAds, 300);
+                }
+
+                // 3. Reader features (Tap zones)
                 if (!window.__mmTapInstalled) {
                   window.__mmTapInstalled = true;
                   var MAX_MOVE = 14, MAX_TIME = 350, DEBOUNCE = 180;
@@ -687,18 +776,19 @@ class ReaderDialog : DialogFragment() {
                   function isLikelyAd(el) {
                     if (!el) return false;
                     var cur = el;
-                    for (var i = 0; i < 4 && cur; i++) {
+                    for (var i = 0; i < 5 && cur; i++) {
+                      if (cur.getAttribute && cur.getAttribute('data-mm-ad') === '1') return true;
                       var cls = (cur.className && cur.className.toString()) || '';
                       if (cls.indexOf('ai-top-bar') > -1) return true;
-                      if (cur.tagName === 'IFRAME' || cur.tagName === 'VIDEO') return true; 
+                      if (cur.tagName === 'IFRAME' || cur.tagName === 'VIDEO' || cur.tagName === 'INS') return true; 
                       cur = cur.parentElement;
                     }
                     return false;
                   }
                   
                   function atBottom() {
-                    var scrollable = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
-                    var scrollTop = window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0;
+                    var scrollable = Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0);
+                    var scrollTop = window.pageYOffset || document.documentElement.scrollTop || (document.body ? document.body.scrollTop : 0) || 0;
                     var clientHeight = window.innerHeight || document.documentElement.clientHeight;
                     if (scrollable <= clientHeight) return false;
                     return (scrollTop + clientHeight) >= (scrollable - 20);
@@ -755,11 +845,11 @@ class ReaderDialog : DialogFragment() {
                   }, { passive: true, capture: true });
                   document.addEventListener('touchcancel', function(){ moved = true; }, { passive: true, capture: true });
                   document.addEventListener('click', function(e){
-                    if ('ontouchstart' in window) return;
                     if (isLikelyAd(e.target)) { e.preventDefault(); e.stopPropagation(); return; }
+                    if ('ontouchstart' in window) return;
                     if (ignored(e.target)) return;
                     handleTap(e.clientX, e.clientY);
-                  }, false);
+                  }, true);
                 }
 
                 if (!window.__mmSoftNav) {
