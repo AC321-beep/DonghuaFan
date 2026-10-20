@@ -3,12 +3,14 @@ package com.mangamanhwaverse
 import android.annotation.SuppressLint
 import android.app.Dialog
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.Message
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.view.KeyEvent
@@ -19,6 +21,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -33,6 +36,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.fragment.app.DialogFragment
 import com.mangamanhwaverse.core.CFState
 import com.mangamanhwaverse.core.MangaManhwaProvider
+import java.io.ByteArrayInputStream
+import java.net.URI
 import java.util.Locale
 
 class ReaderDialog : DialogFragment() {
@@ -44,6 +49,67 @@ class ReaderDialog : DialogFragment() {
         private const val ARG_URL = "url"
         private const val ARG_TARGET = "target"
         private const val ARG_REFERER = "referer"
+
+        /**
+         * Ad / tracker hosts. Any request whose host ends with one of these
+         * (or equals it) is blocked. Contains ONLY hosts that are unambiguous
+         * ad-serving infrastructure — no legitimate site serves manga images
+         * or content from any of these domains.
+         */
+        private val BLOCKED_HOSTS: Set<String> = setOf(
+            // Google ad network
+            "doubleclick.net",
+            "googlesyndication.com",
+            "googleadservices.com",
+            "adservice.google.com",
+            "adservice.google.co.uk",
+            // Amazon / Microsoft / other exchanges
+            "amazon-adsystem.com",
+            "adnxs.com",            // AppNexus
+            "adsrvr.org",           // TheTradeDesk
+            "pubmatic.com",
+            "rubiconproject.com",
+            "yieldmo.com",
+            "smartadserver.com",
+            "adform.net",
+            "moatads.com",
+            // Content-recommendation ads
+            "taboola.com",
+            "outbrain.com",
+            "revcontent.com",
+            // Retargeting
+            "criteo.com",
+            "criteo.net",
+            // Popunder / redirect networks
+            "popads.net",
+            "popcash.net",
+            "propellerads.com",
+            "onclickads.net",
+            "onclkds.com",
+            // Adult ad networks (also serve SFW sites)
+            "exoclick.com",
+            "juicyads.com",
+            "trafficjunky.net",
+            "trafficfactory.biz",
+            // Malware-adjacent ad networks
+            "adsterra.com",
+            "hilltopads.net",
+            "clickadu.com",
+            "vidoomy.com",
+            "adspyglass.com",
+            // Ad measurement / fraud
+            "scorecardresearch.com",
+            "quantserve.com"
+        )
+
+        /**
+         * Specific path-only blocks. Kept extremely narrow — only URLs on
+         * otherwise-legitimate domains that we KNOW are pure tracking pixels.
+         * Never add generic paths like "/ads/" or "/banner/" here.
+         */
+        private val BLOCKED_URL_FRAGMENTS: List<String> = listOf(
+            "paypal.com/xoplatform/logger"     // PayPal tracking pixel (seen on omegascans)
+        )
 
         fun show(activity: AppCompatActivity, title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int = 0) {
             if (activity.isFinishing || activity.isDestroyed) return
@@ -89,6 +155,41 @@ class ReaderDialog : DialogFragment() {
 
     private fun log(msg: String) {
         if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/ReaderDialog", msg)
+    }
+
+    /**
+     * Extract the host from a URL and check against the ad blocklist.
+     * Never blocks the site the reader is currently on, or its subdomains.
+     */
+    private fun isBlockedUrl(url: String): Boolean {
+        if (url.isBlank() || !url.startsWith("http")) return false
+
+        // Never block the current site or its subdomains
+        val currentHost = runCatching { URI(currentChapterUrl).host?.lowercase(Locale.US) }.getOrNull()
+        val requestHost = runCatching { URI(url).host?.lowercase(Locale.US) }.getOrNull() ?: return false
+        if (currentHost != null) {
+            if (requestHost == currentHost) return false
+            if (requestHost.endsWith(".$currentHost")) return false
+            // Also allow the parent domain (e.g. media.omegascans.org for omegascans.org)
+            val parts = currentHost.split(".")
+            if (parts.size >= 2) {
+                val root = parts.takeLast(2).joinToString(".")
+                if (requestHost == root || requestHost.endsWith(".$root")) return false
+            }
+        }
+
+        // Host-based block (exact or subdomain match)
+        for (blocked in BLOCKED_HOSTS) {
+            if (requestHost == blocked || requestHost.endsWith(".$blocked")) return true
+        }
+
+        // Very narrow path-based blocks
+        val lower = url.lowercase(Locale.US)
+        for (frag in BLOCKED_URL_FRAGMENTS) {
+            if (lower.contains(frag)) return true
+        }
+
+        return false
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -186,7 +287,13 @@ class ReaderDialog : DialogFragment() {
                 displayZoomControls = false
                 setSupportZoom(false)
                 cacheMode = WebSettings.LOAD_DEFAULT
-                mediaPlaybackRequiresUserGesture = false
+                // Autoplay video is almost always ad content on manga sites.
+                // No legitimate manga chapter requires autoplay.
+                mediaPlaybackRequiresUserGesture = true
+                // Popups require a real user gesture AND pass onCreateWindow
+                // (which we veto) — no legitimate manga reader popup exists.
+                javaScriptCanOpenWindowsAutomatically = false
+                setSupportMultipleWindows(true)   // required for onCreateWindow to fire
 
                 val defaultUa = try { WebSettings.getDefaultUserAgent(ctx) } catch (e: Exception) { MangaManhwaProvider.UA }
                 userAgentString = CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa
@@ -201,14 +308,51 @@ class ReaderDialog : DialogFragment() {
                         visibility = if (newProgress in 1..99) View.VISIBLE else View.GONE
                     }
                 }
+
+                // Return false = block. No legitimate manga reader opens a popup.
+                // For sites that DO legitimately popup (e.g. share dialogs), the
+                // user still has the toolbar ✕/◀/▶ to navigate — nothing lost.
+                override fun onCreateWindow(
+                    view: WebView,
+                    isDialog: Boolean,
+                    isUserGesture: Boolean,
+                    resultMsg: Message
+                ): Boolean {
+                    log("🚫 Blocked window.open popup")
+                    return false
+                }
             }
 
             webViewClient = object : WebViewClient() {
+
+                // ★ Ad subresource blocking — the main workhorse.
+                // Only fires for URLs whose host is in BLOCKED_HOSTS.
+                // Clean sites: no matching URLs, zero effect.
+                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                    val u = request.url?.toString() ?: return null
+                    if (isBlockedUrl(u)) {
+                        log("🚫 Blocked subresource: $u")
+                        return WebResourceResponse(
+                            "text/plain", "utf-8", 200, "OK",
+                            emptyMap(), ByteArrayInputStream(ByteArray(0))
+                        )
+                    }
+                    return null
+                }
+
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                     val u = request.url?.toString() ?: return false
-                    if (!u.startsWith("http")) return false
-                    val blocklist = listOf("doubleclick", "googlesyndication", "googleadservices", "facebook.com/tr", "analytics", "scorecardresearch", "adservice", "adsystem", "araplhn")
-                    if (blocklist.any { u.contains(it, ignoreCase = true) }) return true
+                    if (!u.startsWith("http")) {
+                        // Block non-http schemes that ads abuse
+                        if (u.startsWith("intent://") || u.startsWith("market://") ||
+                            u.startsWith("whatsapp://") || u.startsWith("tg://") ||
+                            u.startsWith("mailto:") && u.contains("unsubscribe")) return true
+                        return false
+                    }
+                    if (isBlockedUrl(u)) {
+                        log("🚫 Blocked navigation: $u")
+                        return true
+                    }
                     return false
                 }
 
@@ -219,16 +363,41 @@ class ReaderDialog : DialogFragment() {
                 override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
                     if (!request.isForMainFrame) return
                     val url = request.url?.toString() ?: ""
-                    val isMainSite = url.contains("comix.to", true) || url.contains("omegascans.org", true) || url.contains(baseUrl(), true)
+                    val isMainSite = url.contains("omegascans.org", true) || url.contains(baseUrl(), true)
                     if (!isMainSite) return
-                    
+
                     progressBar?.visibility = View.GONE
                     val desc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) error.description.toString() else "Network error"
                     log("❌ WebView Load Error: $desc | URL: $url")
-                    
+
                     view.loadData(
                         "<html><body style=\"background:#07080C;color:#94A3B8;font-family:sans-serif;padding:40px;text-align:center\"><h3 style=\"color:#E2E8F0\">Couldn't load chapter</h3><p>$desc</p><p style=\"font-size:12px;margin-top:24px;word-break:break-all\">$url</p></body></html>",
                         "text/html", "UTF-8"
+                    )
+                }
+
+                // ★ Inject popup blocker before page scripts run
+                override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+                    super.onPageStarted(view, url, favicon)
+                    view.evaluateJavascript(
+                        """
+                        (function(){
+                            try {
+                                // Only override window.open — do NOT touch alert/confirm/prompt.
+                                // Site alert() is annoying but harmless. confirm() returns
+                                // boolean and some sites use it for real UX (delete bookmark,
+                                // mark as read). Never break those.
+                                window.open = function(u){
+                                    try {
+                                        if (window.MMReader && window.MMReader.onBlockedPopup) {
+                                            window.MMReader.onBlockedPopup(String(u||''));
+                                        }
+                                    } catch(e){}
+                                    return null;
+                                };
+                            } catch(e){}
+                        })();
+                        """.trimIndent(), null
                     )
                 }
 
@@ -246,26 +415,26 @@ class ReaderDialog : DialogFragment() {
                         currentChapterName = "Ch. $numStr"
                         chapterInfo?.text = currentChapterName
                     }
-                    
+
                     view.postDelayed({ injectReaderJs(view) }, 250L)
                 }
 
                 override fun onPageFinished(view: WebView, url: String?) {
                     super.onPageFinished(view, url)
                     progressBar?.visibility = View.GONE
-                    
+
                     val title = view.title?.lowercase() ?: ""
                     val isChallenge = title.contains("just a moment") || title.contains("attention required") || title.contains("checking your browser")
 
                     if (isChallenge) {
                         log("🛡️ Cloudflare Turnstile detected in Reader. Please solve it manually.")
-                        return 
+                        return
                     }
 
                     log("✅ WebView Page Finished: $url")
                     injectReaderJs(view)
                     applyZoom(view, currentZoom)
-                    
+
                     val restoreY = pendingScrollRestore
                     if (restoreY > 0f) {
                         pendingScrollRestore = -1f
@@ -285,7 +454,7 @@ class ReaderDialog : DialogFragment() {
     }
 
     private fun baseUrl(): String {
-        return runCatching { java.net.URI(currentChapterUrl).host }.getOrNull() ?: ""
+        return runCatching { URI(currentChapterUrl).host }.getOrNull() ?: ""
     }
 
     private fun buildToolbar(ctx: Context, density: Float): View {
@@ -505,25 +674,54 @@ class ReaderDialog : DialogFragment() {
             """
             (function(){
               try {
+                // =====================================================
+                // 1) CSS — specific, safe selectors only.
+                //    Never uses [class*="ad-"] (would match upload-, download-,
+                //    thread-, spread-, advance-, gradient…)
+                //    Only uses unambiguous ad indicators.
+                // =====================================================
                 if (!document.getElementById('mm-css')) {
                   var s = document.createElement('style');
                   s.id = 'mm-css';
                   s.innerHTML = `
                     body { background: #07080C !important; margin: 0 !important; padding: 0 !important; }
-                    
-                    /* Standard Ads */
-                    [class*="ad-"], [id*="ad-"], iframe[src*="ads"], iframe[src*="pop"], .google-anno, .cookie-notice
-                    { display: none !important; }
-                    
-                    /* Static Comment & Recommendation Selectors */
-                    #comments, .comments, .comment-section, #disqus_thread, .fb-comments, 
-                    .related-posts, .recommendations, .mpage__recs, .wp-manga-related, 
-                    .chapter-widget, .related-manga, .suggestions, .also-like, .more-like-this,
-                    .share-block, .social-share,
-                    /* Comix Specific */
-                    .rpage-strip-comments, .cm-widget, .rpage-floatctl__col, .rpage-bottombar, .rpage-hoverzone, .rpage-dir2
-                    { display: none !important; }
-                    
+
+                    /* Google AdSense — always exactly this class */
+                    .adsbygoogle { display: none !important; }
+
+                    /* Standard data-ad attributes used by ad libs */
+                    [data-ad], [data-ad-slot], [data-ads] {
+                      display: none !important; visibility: hidden !important;
+                      height: 0 !important; width: 0 !important;
+                    }
+
+                    /* "advert" is a rare word outside ads — safe substring */
+                    [class*="advert"], [id*="advert"] { display: none !important; visibility: hidden !important; height: 0 !important; width: 0 !important; }
+
+                    /* Specific ad class names (full token match, not substring) */
+                    .ad-banner, .ad-container, .ad-wrapper, .ad-slot, .ad-unit,
+                    .advert-banner, .advert-container,
+                    [class*="popup-ad"], [class*="interstitial"],
+                    [class*="ad-sticky"], [class*="ad-floating"] {
+                      display: none !important; visibility: hidden !important; height: 0 !important; width: 0 !important;
+                    }
+
+                    /* Ad iframes — matched by src domain, only ad networks */
+                    iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
+                    iframe[src*="adservice.google"], iframe[src*="adsystem"],
+                    iframe[src*="taboola"], iframe[src*="outbrain"],
+                    iframe[src*="criteo"], iframe[src*="exoclick"],
+                    iframe[src*="adsterra"], iframe[src*="propellerads"] {
+                      display: none !important; visibility: hidden !important; height: 0 !important; width: 0 !important;
+                    }
+
+                    /* Reader-specific clutter — safe on any site because these
+                       are OmegaScans/Comix-specific class names */
+                    .rpage-strip-comments, .cm-widget, .rpage-floatctl__col,
+                    .rpage-bottombar, .rpage-hoverzone, .rpage-dir2 {
+                      display: none !important;
+                    }
+
                     .rpage-chap-ending { padding-bottom: 8px !important; margin-bottom: 0 !important; }
                     .rpage-chap-ending__nav { margin-bottom: 8px !important; }
                     .rpage-main, .rpage-main--long-strip, .rpage-main__inner { padding-bottom: 0 !important; margin-bottom: 0 !important; }
@@ -531,30 +729,101 @@ class ReaderDialog : DialogFragment() {
                   document.head.appendChild(s);
                 }
 
-                // ✅ FIXED: Safer Dynamic Keyword-based hiding
+                // =====================================================
+                // 2) MutationObserver — debounced, only strips ad nodes.
+                //    Safe to install on any site: on ad-free pages it just
+                //    runs one empty querySelectorAll per 300ms batch.
+                // =====================================================
+                if (!window.__mmAdObserver) {
+                  window.__mmAdObserver = true;
+
+                  var AD_SELECTOR = [
+                    '.adsbygoogle',
+                    '[data-ad]','[data-ad-slot]','[data-ads]',
+                    '[class*="advert"]','[id*="advert"]',
+                    '.ad-banner','.ad-container','.ad-wrapper','.ad-slot','.ad-unit',
+                    '[class*="popup-ad"]','[class*="interstitial"]',
+                    '[class*="ad-sticky"]','[class*="ad-floating"]',
+                    'iframe[src*="doubleclick"]','iframe[src*="googlesyndication"]',
+                    'iframe[src*="adservice.google"]','iframe[src*="adsystem"]',
+                    'iframe[src*="taboola"]','iframe[src*="outbrain"]',
+                    'iframe[src*="criteo"]','iframe[src*="exoclick"]',
+                    'iframe[src*="adsterra"]','iframe[src*="propellerads"]'
+                  ].join(',');
+
+                  function stripAds() {
+                    try {
+                      var ads = document.querySelectorAll(AD_SELECTOR);
+                      for (var i = 0; i < ads.length; i++) {
+                        var el = ads[i];
+                        if (!el) continue;
+                        // Never hide an ancestor of the reader or the page content
+                        if (el.querySelector && (
+                            el.querySelector('#readerarea') ||
+                            el.querySelector('.rpage-main') ||
+                            el.querySelector('.reading-content') ||
+                            el.querySelector('.chapter-content'))) continue;
+                        el.style.display = 'none';
+                        el.style.visibility = 'hidden';
+                        el.style.height = '0';
+                        el.style.width = '0';
+                        el.style.pointerEvents = 'none';
+                      }
+                    } catch(e) {}
+                  }
+
+                  // Initial sweep + a couple of delayed passes (ads often
+                  // appear 1–3s after initial paint).
+                  stripAds();
+                  setTimeout(stripAds, 500);
+                  setTimeout(stripAds, 1500);
+                  setTimeout(stripAds, 3000);
+
+                  // Debounced observer — at most 1 scan per 300ms.
+                  try {
+                    var pendingScan = false;
+                    var observer = new MutationObserver(function(){
+                      if (pendingScan) return;
+                      pendingScan = true;
+                      setTimeout(function(){ pendingScan = false; stripAds(); }, 300);
+                    });
+                    observer.observe(document.body, { childList: true, subtree: true });
+                  } catch(e) {}
+                }
+
+                // =====================================================
+                // 3) Keyword-based section hiding — kept narrow to avoid
+                //    hiding legitimate "Related chapters" navigation.
+                //    Uses full phrases ("related manga" etc) rather than
+                //    bare "related" which could match content headings.
+                // =====================================================
                 if (!window.__mmHiddenSections) {
                   window.__mmHiddenSections = true;
-                  var keywords = ["comments", "you might also like", "recommended", "related", "more like this"];
-                  
+                  var keywords = [
+                    "you might also like",
+                    "recommended for you",
+                    "more like this",
+                    "related manga",
+                    "related series",
+                    "similar manga",
+                    "other manga you may like"
+                  ];
                   function hideDynamicSections() {
-                    var elements = document.querySelectorAll('h2, h3, h4, h5, div, section, span');
+                    var elements = document.querySelectorAll('h2, h3, h4, h5, section');
                     for (var i = 0; i < elements.length; i++) {
                       var el = elements[i];
                       if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.style.display === 'none') continue;
-                      
                       var text = (el.innerText || '').trim().toLowerCase();
-                      if (text.length > 0 && text.length < 50) {
+                      if (text.length > 0 && text.length < 60) {
                         for (var k = 0; k < keywords.length; k++) {
                           if (text.includes(keywords[k])) {
-                            var target = el;
-                            // Walk up 2 levels max
-                            for (var depth = 0; depth < 2; depth++) {
-                              if (target.parentElement && target.parentElement.tagName !== 'BODY' && target.parentElement.tagName !== 'HTML') {
-                                target = target.parentElement;
-                              }
-                            }
-                            // ✅ SAFETY CHECK: Do not hide if it contains any images or the reader container
-                            if (target && !target.querySelector('img') && !target.querySelector('.rpage-main') && !target.querySelector('#readerarea')) {
+                            var target = el.parentElement || el;
+                            // Safety: never hide the reader, and never hide
+                            // a block containing images (could be legit).
+                            if (target && !target.querySelector('img') &&
+                                !target.querySelector('.rpage-main') &&
+                                !target.querySelector('#readerarea') &&
+                                !target.querySelector('.reading-content')) {
                               target.style.display = 'none';
                             }
                             break;
@@ -565,17 +834,41 @@ class ReaderDialog : DialogFragment() {
                   }
                   hideDynamicSections();
                   setTimeout(hideDynamicSections, 1500);
+                  setTimeout(hideDynamicSections, 3500);
                 }
 
-                // ✅ FIXED: Tap Zones & Right Tap Logic
+                // =====================================================
+                // 4) Tap zones (existing, with refined isLikelyAd)
+                // =====================================================
                 if (!window.__mmTapInstalled) {
                   window.__mmTapInstalled = true;
                   var MAX_MOVE = 14, MAX_TIME = 350, DEBOUNCE = 180;
                   var sx = 0, sy = 0, st = 0, last = 0, moved = false;
-                  
+
                   function ignored(el) { if (!el || !el.closest) return false; return !!el.closest('a,button,input,textarea,select,[role="dialog"],.modal,.popup,.settings,.chapter-list'); }
-                  
-                  // ✅ FIXED: Exhaustive scroller search
+
+                  // Only return true for elements that are almost certainly ads.
+                  // Checking iframe.src against the SAME ad domains we block at
+                  // network level — no false positives on legit embedded content.
+                  function isLikelyAd(el) {
+                    if (!el) return false;
+                    var cur = el;
+                    for (var i = 0; i < 4 && cur; i++) {
+                      var cls = (cur.className && cur.className.toString()) || '';
+                      var id = (cur.id || '');
+                      if (cls.indexOf('adsbygoogle') > -1 || id.indexOf('adsbygoogle') > -1) return true;
+                      if (cls.indexOf('advert') > -1 || id.indexOf('advert') > -1) return true;
+                      if (cls.indexOf('popup-ad') > -1 || id.indexOf('popup-ad') > -1) return true;
+                      if (cur.hasAttribute && (cur.hasAttribute('data-ad') || cur.hasAttribute('data-ad-slot'))) return true;
+                      if (cur.tagName === 'IFRAME') {
+                        var src = (cur.src || cur.getAttribute('data-src') || '').toLowerCase();
+                        if (/doubleclick|googlesyndication|adservice\.google|adsystem|taboola|outbrain|criteo|exoclick|adsterra|propellerads/.test(src)) return true;
+                      }
+                      cur = cur.parentElement;
+                    }
+                    return false;
+                  }
+
                   function scroller() {
                     var el = document.querySelector('.rpage-main') || document.querySelector('.rpage-main--long-strip');
                     if (el && el.scrollHeight > el.clientHeight + 4) return el;
@@ -584,54 +877,67 @@ class ReaderDialog : DialogFragment() {
                     for (var i=0;i<all.length;i++){ var e = all[i]; if (e.scrollHeight > e.clientHeight + 100) { var diff = e.scrollHeight - e.clientHeight; if (diff > bestH) { bestH = diff; best = e; } } }
                     return best || document.scrollingElement;
                   }
-                  
-                  // ✅ FIXED: atBottom only true if page is actually scrollable
-                  function atBottom() { 
-                    var el = scroller(); 
+
+                  function atBottom() {
+                    var el = scroller();
                     if (!el) return false;
                     var scrollable = el.scrollHeight - el.clientHeight;
-                    if (scrollable < 150) return false; 
-                    return (scrollable - (el.scrollTop || 0)) < 150; 
+                    if (scrollable < 150) return false;
+                    return (scrollable - (el.scrollTop || 0)) < 150;
                   }
-                  
+
                   function scrollByPage(frac) { var el = scroller(); if (!el) return; var h = window.innerHeight; try { el.scrollBy({ top: h*frac, behavior: 'smooth' }); } catch(e) { el.scrollTop = (el.scrollTop||0) + h*frac; } }
-                  
+
                   function handleTap(x, y) {
                     var now = Date.now(); if (now - last < DEBOUNCE) return; last = now;
                     var w = window.innerWidth, h = window.innerHeight;
-                    
-                    if (x < w * 0.25) { 
-                      scrollByPage(-0.8); flash(x, y); 
-                    } else if (x > w * 0.75) { 
-                      // ✅ FIXED: Right side tap logic
+
+                    if (x < w * 0.25) {
+                      scrollByPage(-0.8); flash(x, y);
+                    } else if (x > w * 0.75) {
                       if (atBottom()) {
-                        flash(x, y); if (window.MMReader) window.MMReader.onNext(); 
+                        flash(x, y); if (window.MMReader) window.MMReader.onNext();
                       } else if (y > h * 0.75) {
-                        flash(x, y); if (window.MMReader) window.MMReader.onNext(); 
+                        flash(x, y); if (window.MMReader) window.MMReader.onNext();
                       } else {
                         scrollByPage(0.8); flash(x, y);
                       }
-                    } else { 
-                      if (atBottom() && y > h * 0.75) { 
-                        flash(x, y); if (window.MMReader) window.MMReader.onNext(); 
-                      } else { 
-                        flash(x, y); if (window.MMReader) window.MMReader.onCenterTap(); 
-                      } 
+                    } else {
+                      if (atBottom() && y > h * 0.75) {
+                        flash(x, y); if (window.MMReader) window.MMReader.onNext();
+                      } else {
+                        flash(x, y); if (window.MMReader) window.MMReader.onCenterTap();
+                      }
                     }
                   }
+
                   document.addEventListener('touchstart', function(e){ if (e.touches.length !== 1) return; var t = e.touches[0]; sx = t.clientX; sy = t.clientY; st = Date.now(); moved = false; }, { passive: true, capture: true });
                   document.addEventListener('touchmove', function(e){ if (e.touches.length !== 1) return; var t = e.touches[0]; if (Math.abs(t.clientX - sx) > MAX_MOVE || Math.abs(t.clientY - sy) > MAX_MOVE) moved = true; }, { passive: true, capture: true });
-                  document.addEventListener('touchend', function(e){ if (moved) return; var t = e.changedTouches[0]; if (Math.abs(t.clientX - sx) > MAX_MOVE) return; if (Math.abs(t.clientY - sy) > MAX_MOVE) return; if (Date.now() - st > MAX_TIME) return; if (ignored(t.target || e.target)) return; handleTap(t.clientX, t.clientY); }, { passive: true, capture: true });
+                  document.addEventListener('touchend', function(e){
+                    if (moved) return;
+                    var t = e.changedTouches[0];
+                    if (Math.abs(t.clientX - sx) > MAX_MOVE) return;
+                    if (Math.abs(t.clientY - sy) > MAX_MOVE) return;
+                    if (Date.now() - st > MAX_TIME) return;
+                    if (isLikelyAd(t.target)) { e.preventDefault(); e.stopPropagation(); return; }
+                    if (ignored(t.target || e.target)) return;
+                    handleTap(t.clientX, t.clientY);
+                  }, { passive: true, capture: true });
                   document.addEventListener('touchcancel', function(){ moved = true; }, { passive: true, capture: true });
-                  document.addEventListener('click', function(e){ if ('ontouchstart' in window) return; if (ignored(e.target)) return; handleTap(e.clientX, e.clientY); }, false);
+                  document.addEventListener('click', function(e){
+                    if ('ontouchstart' in window) return;
+                    if (isLikelyAd(e.target)) { e.preventDefault(); e.stopPropagation(); return; }
+                    if (ignored(e.target)) return;
+                    handleTap(e.clientX, e.clientY);
+                  }, false);
                 }
-                
+
                 if (!window.__mmSoftNav) {
                   window.__mmSoftNav = true;
                   var relist = function(){ setTimeout(function(){ try { if (window.MMReader) window.MMReader.onReinject(); } catch(e){} }, 150); };
                   ['popstate','turbo:load','turbo:render','pjax:end','swup:contentReplaced','inertia:navigate'].forEach(function(ev){ window.addEventListener(ev, relist); });
                 }
-                
+
                 function flash(x, y) {
                   try {
                     var d = document.createElement('div');
@@ -642,13 +948,12 @@ class ReaderDialog : DialogFragment() {
                   } catch(e){}
                 }
 
-                // ✅ ADOPTED: Scroll Position Tracking
+                // =====================================================
+                // 5) Scroll tracking (unchanged)
+                // =====================================================
                 if (!window.__mmScrollTrackerInstalled) {
                   window.__mmScrollTrackerInstalled = true;
-                  var lastY = -1;
-                  var lastT = 0;
-                  var pendingTimer = null;
-                  
+                  var lastY = -1, lastT = 0, pendingTimer = null;
                   function push(force) {
                     var el = scroller();
                     var y = el ? el.scrollTop : (window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0);
@@ -669,7 +974,9 @@ class ReaderDialog : DialogFragment() {
                   window.__mmPushScroll = function () { push(true); };
                 }
 
-                // ✅ ADOPTED: Scroll Restore with retries
+                // =====================================================
+                // 6) Scroll restore (unchanged)
+                // =====================================================
                 if (!window.__mmRestoreScroll) {
                   window.__mmRestoreScroll = function (targetY) {
                     if (typeof targetY !== 'number' || targetY <= 0) return;
@@ -678,7 +985,6 @@ class ReaderDialog : DialogFragment() {
                     window.addEventListener('touchstart', cancel, { once: true, passive: true, capture: true });
                     window.addEventListener('wheel',      cancel, { once: true, passive: true, capture: true });
                     window.addEventListener('keydown',    cancel, { once: true });
-                    
                     function apply() {
                       if (cancelled) return;
                       try {
@@ -728,7 +1034,7 @@ class ReaderDialog : DialogFragment() {
     fun loadUrl(name: String, url: String, target: Int) {
         if (url.isBlank()) return
         log("📖 Opening Reader: '$name' at $url")
-        
+
         val slug = extractSlug(url)
         val savedUrl = if (slug.isNotBlank()) prefs.getString(slug, null) else null
 
@@ -748,6 +1054,9 @@ class ReaderDialog : DialogFragment() {
         @JavascriptInterface fun onNext() { dialog.activity?.runOnUiThread { dialog.haptic(); dialog.jsNext(1) } }
         @JavascriptInterface fun onReinject() { dialog.activity?.runOnUiThread { dialog.webView?.let { dialog.injectReaderJs(it) } } }
         @JavascriptInterface fun onScrollPosition(url: String, y: Float) { dialog.saveScroll(url, y) }
+        @JavascriptInterface fun onBlockedPopup(url: String) {
+            if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/ReaderDialog", "🚫 Popup blocked: $url")
+        }
         @JavascriptInterface fun onTargetReached(chapterNum: Int) {
             dialog.activity?.runOnUiThread {
                 if (chapterNum > 0) {
