@@ -53,8 +53,7 @@ interface CFSessionCapture {
 
 class CFSolver(private val url: String, private val capture: CFSessionCapture? = null) {
 
-    private fun log(msg: String) { if (Settings.verboseLog()) android.util.Log.d("MangaManhwa/CFSolver", msg) }
-
+    private fun log(msg: String) {if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/CFSolver", msg)}
     suspend fun solve(): Boolean {
         val activity = CommonActivity.activity ?: return false
         val host = runCatching { URI(url).host }.getOrNull() ?: return false
