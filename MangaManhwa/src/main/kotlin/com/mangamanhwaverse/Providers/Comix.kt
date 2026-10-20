@@ -13,7 +13,7 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.mangamanhwaverse.ReaderDialog
-import com.mangamanhwaverse.core.CFState
+import com.mangamanhwaverse.core.CFSolver
 import com.mangamanhwaverse.core.MangaManhwaProvider
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -27,6 +27,8 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.Interceptor
+import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -102,11 +104,14 @@ class ComixProvider : MangaManhwaProvider() {
 
     override val mainPage = mainPageOf("popular" to "Popular", "hot" to "Hot Updates", "latest" to "Latest Releases", "trending" to "Trending Today", "follows" to "Most Followed", "completed" to "Completed")
 
+    override val requiresCf = true
+    override val cfPattern = Regex(".*comix\\.to.*")
+    private val builtInResolver by lazy { WebViewResolver(cfPattern) }
+
     @Volatile private var cipher: ComixCipher? = null
     @Volatile private var prewarmStarted = false
     private val captureLock = Mutex()
     private val bgScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val cfInterceptor = WebViewResolver(Regex(".*comix\\.to.*"))
 
     private val cipherCacheFile: File? get() = com.mangamanhwaverse.AppContext.ctx?.let { File(it.cacheDir, "comix_cipher.json") }
 
@@ -190,10 +195,41 @@ class ComixProvider : MangaManhwaProvider() {
         "Sec-Fetch-Mode" to "navigate", "Sec-Fetch-Site" to "none", "Sec-Fetch-User" to "?1", "Upgrade-Insecure-Requests" to "1"
     ) + extra
 
-    private suspend fun fetchHtml(url: String): String = app.get(url, interceptor = cfInterceptor, headers = comixHeaders()).text
+    private val comixInterceptor = Interceptor { chain ->
+        val original = chain.request()
+        val modified = original.newBuilder().apply {
+            removeHeader("X-Requested-With")
+            comixHeaders().forEach { (k, v) -> header(k, v) }
+            val cookies = android.webkit.CookieManager.getInstance().getCookie(original.url.toString())
+            if (!cookies.isNullOrEmpty()) header("Cookie", cookies)
+        }.build()
+
+        builtInResolver.intercept(object : Interceptor.Chain by chain {
+            override fun request(): Request = modified
+        })
+    }
+
+    private suspend fun fetchHtml(url: String): String {
+        // ✅ ADDED LOGGING
+        log("Fetching HTML: $url")
+        
+        var resp = app.get(url, interceptor = comixInterceptor, headers = comixHeaders())
+        
+        if (isCfChallenge(resp.document)) {
+            log("Comix CF challenge detected. Invoking CFSolver...")
+            if (CFSolver(url).solve()) {
+                resp = app.get(url, interceptor = comixInterceptor, headers = comixHeaders())
+            }
+        }
+        return resp.text
+    }
 
     private suspend fun getSigned(path: String, params: Map<String, List<String>>): String? {
         val c = cachedCipher() ?: return null
+        
+        // ✅ ADDED LOGGING
+        log("Fetching Signed API: $path")
+        
         return try {
             val canonical = params.toSortedMap().entries.joinToString("&") { (rawName, values) ->
                 val key = rawName.removeSuffix("[]")
@@ -212,10 +248,22 @@ class ComixProvider : MangaManhwaProvider() {
                 if (!first) append("&")
                 append("_=").append(URLEncoder.encode(token, "UTF-8"))
             }
-            val raw = app.get(encoded, interceptor = cfInterceptor, headers = comixHeaders(mapOf(
+            
+            var resp = app.get(encoded, interceptor = comixInterceptor, headers = comixHeaders(mapOf(
                 "Accept" to "application/json, text/plain, */*", "X-Requested-With" to "XMLHttpRequest", "Referer" to "$mainUrl/",
                 "Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "same-origin"
-            ))).text
+            )))
+            
+            if (isCfChallenge(resp.document)) {
+                if (CFSolver("$mainUrl$path").solve()) {
+                    resp = app.get(encoded, interceptor = comixInterceptor, headers = comixHeaders(mapOf(
+                        "Accept" to "application/json, text/plain, */*", "X-Requested-With" to "XMLHttpRequest", "Referer" to "$mainUrl/",
+                        "Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "same-origin"
+                    )))
+                }
+            }
+
+            val raw = resp.text
             val root = runCatching { JSONObject(raw) }.getOrNull() ?: return null
             if (root.has("e")) {
                 val decrypted = runCatching { c.decrypt(root.optString("e")) }.getOrNull()
@@ -223,7 +271,10 @@ class ComixProvider : MangaManhwaProvider() {
                 return decrypted
             }
             raw
-        } catch (_: Throwable) { null }
+        } catch (e: Throwable) { 
+            logErr("Signed API failed: ${e.message}")
+            null 
+        }
     }
 
     private fun extractInitialDataJson(htmlOrDoc: Any): JSONObject? {
