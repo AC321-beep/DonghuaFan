@@ -93,10 +93,9 @@ class OmegaScans : MangaManhwaProvider() {
             this.posterUrl = poster
             this.plot = plot
             
-                      this.showStatus = when (statusStr?.lowercase()) {
-                "completed" -> ShowStatus.Completed
-                "ongoing", "releasing" -> ShowStatus.Ongoing
-                "coming soon" -> ShowStatus.OnHold 
+                this.showStatus = when (statusStr?.lowercase()) {
+                "completed", "finished" -> ShowStatus.Completed
+                "ongoing", "releasing", "coming soon" -> ShowStatus.Ongoing
                 else -> null
             }
             
