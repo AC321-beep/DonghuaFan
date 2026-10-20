@@ -19,6 +19,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
@@ -173,11 +174,11 @@ class ReaderDialog : DialogFragment() {
                 builtInZoomControls = false
                 displayZoomControls = false
                 setSupportZoom(false)
-                cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
+                cacheMode = WebSettings.LOAD_DEFAULT
                 mediaPlaybackRequiresUserGesture = false
 
-                // ✅ SIMPLIFIED: Just use the exact User-Agent that solved CF.
-                userAgentString = CFState.userAgent.takeIf { it.isNotBlank() } ?: MangaManhwaProvider.UA
+                val defaultUa = try { WebSettings.getDefaultUserAgent(ctx) } catch (e: Exception) { MangaManhwaProvider.UA }
+                userAgentString = CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa
             }
 
             addJavascriptInterface(JsBridge(this@ReaderDialog), "MMReader")
@@ -219,6 +220,15 @@ class ReaderDialog : DialogFragment() {
                 override fun onPageFinished(view: WebView, url: String?) {
                     super.onPageFinished(view, url)
                     progressBar?.visibility = View.GONE
+                    
+                    val title = view.title?.lowercase() ?: ""
+                    val isChallenge = title.contains("just a moment") || title.contains("attention required") || title.contains("checking your browser")
+
+                    if (isChallenge) {
+                        log("🛡️ Cloudflare Turnstile detected in Reader. Please solve it manually.")
+                        return
+                    }
+
                     log("✅ WebView Page Finished: $url")
                     injectReaderJs(view)
                     applyZoom(view, currentZoom)
@@ -447,9 +457,64 @@ class ReaderDialog : DialogFragment() {
                 if (!document.getElementById('mm-css')) {
                   var s = document.createElement('style');
                   s.id = 'mm-css';
-                  s.innerHTML = 'body{background:#07080C !important;margin:0 !important;padding:0 !important;}header,footer,.header,.navbar,.site-header,[class*="ad-"],[id*="ad-"],iframe[src*="ads"],iframe[src*="pop"],.google-anno,.cookie-notice,.share-block,.social-share,#comments,.comment-section,.related-posts,.recommendations,.mpage__recs{display:none !important;}';
+                  s.innerHTML = `
+                    body { background: #07080C !important; margin: 0 !important; padding: 0 !important; }
+                    
+                    /* Standard Ads */
+                    [class*="ad-"], [id*="ad-"], iframe[src*="ads"], iframe[src*="pop"], .google-anno, .cookie-notice
+                    { display: none !important; }
+                    
+                    /* Static Comment & Recommendation Selectors (Madara, Themesia, etc.) */
+                    #comments, .comments, .comment-section, #disqus_thread, .fb-comments, 
+                    .related-posts, .recommendations, .mpage__recs, .wp-manga-related, 
+                    .chapter-widget, .related-manga, .suggestions, .also-like, .more-like-this,
+                    .share-block, .social-share
+                    { display: none !important; }
+                  `;
                   document.head.appendChild(s);
                 }
+
+                // Dynamic Keyword-based hiding
+                if (!window.__mmHiddenSections) {
+                  window.__mmHiddenSections = true;
+                  var keywords = ["comments", "you might also like", "recommended", "related", "more like this"];
+                  
+                  function hideDynamicSections() {
+                    var elements = document.querySelectorAll('h2, h3, h4, h5, div, section, span');
+                    for (var i = 0; i < elements.length; i++) {
+                      var el = elements[i];
+                      // Skip if already hidden or if it's a script/style
+                      if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.style.display === 'none') continue;
+                      
+                      var text = (el.innerText || '').trim().toLowerCase();
+                      // Only look at small text blocks that likely represent headers
+                      if (text.length > 0 && text.length < 50) {
+                        for (var k = 0; k < keywords.length; k++) {
+                          if (text.includes(keywords[k])) {
+                            // Walk up the DOM to find the container to hide (max 3 levels up)
+                            var target = el;
+                            for (var depth = 0; depth < 3; depth++) {
+                              if (target.parentElement && target.parentElement.tagName !== 'BODY' && target.parentElement.tagName !== 'HTML') {
+                                target = target.parentElement;
+                              }
+                            }
+                            // Ensure we don't hide the actual reading area
+                            if (target && !target.querySelector('img[src*="chapter"], .rpage-main, #readerarea')) {
+                              target.style.display = 'none';
+                            }
+                            break;
+                          }
+                        }
+                      }
+                    }
+                  }
+                  
+                  // Run immediately
+                  hideDynamicSections();
+                  // Run again after a slight delay for dynamic content
+                  setTimeout(hideDynamicSections, 1500);
+                }
+
                 if (!window.__mmTapInstalled) {
                   window.__mmTapInstalled = true;
                   var MAX_MOVE = 14, MAX_TIME = 350, DEBOUNCE = 180;
