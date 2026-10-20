@@ -175,16 +175,12 @@ class ComixProvider : MangaManhwaProvider() {
 
     @Volatile private var cipher: ComixCipher? = null
     private val cfInterceptor = CFInterceptor()
-    private val noopInterceptor = Interceptor { chain -> chain.proceed(chain.request()) }
     private val cfMutex = Mutex()
 
     @Volatile private var lastCipherAttemptMs: Long = 0L
     private val cipherRetryCooldownMs = 20_000L
     private val cipherGraceMs = 8_000L
     private val cipherAcquireMutex = Mutex()
-
-    @Volatile private var userWarmed = false
-    @Volatile private var probeDone = false
 
     private val cipherCacheFile: File?
         get() {
@@ -211,39 +207,6 @@ class ComixProvider : MangaManhwaProvider() {
         return loadCachedCipher()?.also {
             cipher = it
             Log.e(TAG, "Cipher loaded from cache file")
-        }
-    }
-
-    private suspend fun ensureCipher(): Boolean {
-        if (cachedCipher() != null) return true
-        return cipherAcquireMutex.withLock {
-            if (cachedCipher() != null) return@withLock true
-            val activity = CommonActivity.activity ?: return@withLock false
-            if (activity.isFinishing || activity.isDestroyed) return@withLock false
-            val now = System.currentTimeMillis()
-            if (now - lastCipherAttemptMs < cipherRetryCooldownMs) {
-                Log.e(TAG, "ensureCipher: cooldown active (${now - lastCipherAttemptMs}ms)")
-                return@withLock false
-            }
-            lastCipherAttemptMs = now
-            Log.e(TAG, "ensureCipher: acquiring via WebView")
-            val ok = attemptSilentResolution(activity, waitForCipher = true)
-            if (ok && cipher != null) {
-                Log.e(TAG, "ensureCipher: cipher acquired ✓")
-                warmUserEndpointOnce()
-                true
-            } else {
-                Log.e(TAG, "ensureCipher: acquisition failed (ok=$ok cipher=${cipher != null})")
-                false
-            }
-        }
-    }
-
-    private suspend fun warmUserEndpointOnce() {
-        if (userWarmed) return
-        runCatching {
-            app.get("$mainUrl/api/v1/user", interceptor = cfInterceptor).text
-            userWarmed = true
         }
     }
 
@@ -508,19 +471,6 @@ class ComixProvider : MangaManhwaProvider() {
         }
         return runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
     }
-    
-    // ✅ New Helper: Fetch JSON safely, handling CF if it appears
-    private suspend fun fetchJson(url: String): String? {
-        val first = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
-        if (first.isNotBlank() && !isCloudflareChallenge(first)) return first
-        
-        cfMutex.withLock {
-            resolveCloudflareAndCipher(waitForCipher = false)
-            CookieManager.getInstance().flush()
-        }
-        val second = runCatching { app.get(url, interceptor = cfInterceptor).text }.getOrDefault("")
-        return if (second.isNotBlank() && !isCloudflareChallenge(second)) second else null
-    }
 
     private fun blockingFetchHtml(url: String): String? {
         return try {
@@ -570,85 +520,6 @@ class ComixProvider : MangaManhwaProvider() {
         }
     }
 
-    private suspend fun probeApiSignatureOnce() {
-        if (probeDone) return
-        probeDone = true
-
-        val cookies = CookieManager.getInstance().getCookie(mainUrl) ?: ""
-        val ua = CFState.userAgent.ifBlank { "Mozilla/5.0" }
-        val headers = buildMap {
-            if (cookies.isNotEmpty()) put("Cookie", cookies)
-            put("User-Agent", ua)
-            put("Accept", "application/json, text/plain, */*")
-            put("Referer", "$mainUrl/browse")
-            put("Sec-Fetch-Site", "same-origin")
-            put("Sec-Fetch-Mode", "cors")
-            put("Sec-Fetch-Dest", "empty")
-        }
-
-        val base = "$mainUrl/api/v1/manga?order%5Bchapter_updated_at%5D=desc&page=1&limit=5"
-        val four = "$base&content_rating%5B%5D=safe&content_rating%5B%5D=suggestive" +
-                   "&content_rating%5B%5D=erotica&content_rating%5B%5D=pornographic"
-        val fourFakeSig = "$four&_=fake.abc"
-        val twoFakeSig  = "$base&content_rating%5B%5D=safe&content_rating%5B%5D=suggestive&_=fake.abc"
-
-        listOf(
-            "1-BASELINE" to base,
-            "2-FOUR-NOSIG" to four,
-            "3-FOUR-FAKESIG" to fourFakeSig,
-            "4-TWO-FAKESIG" to twoFakeSig
-        ).forEach { (label, url) ->
-            try {
-                val resp = app.get(url, interceptor = noopInterceptor, headers = headers)
-                val body = resp.text.take(400).replace(Regex("\\s+"), " ")
-                val json = runCatching { JSONObject(body) }.getOrNull()
-                val items = json?.let {
-                    (it.optJSONObject("result")?.optJSONArray("items")
-                        ?: it.optJSONArray("items"))?.length()
-                } ?: -1
-                val err = json?.optString("message")?.takeIf { it.isNotBlank() }
-                    ?: json?.optString("error")?.takeIf { it.isNotBlank() }
-                Log.e(TAG, "PROBE[$label] code=${resp.code} items=$items err=$err body=${body.take(160)}")
-            } catch (t: Throwable) {
-                Log.e(TAG, "PROBE[$label] threw ${t.message}")
-            }
-        }
-    }
-
-    private suspend fun fetchApiDirect(
-        params: Map<String, List<String>>,
-        referer: String? = null
-    ): String? {
-        return try {
-            val encoded = buildString {
-                append(mainUrl).append("/api/v1/manga").append("?")
-                var first = true
-                fun emit(k: String, v: String) {
-                    if (!first) append("&")
-                    first = false
-                    append(URLEncoder.encode(k, "UTF-8")).append("=")
-                        .append(URLEncoder.encode(v.trim(), "UTF-8"))
-                }
-                params.toSortedMap().forEach { (rawName, values) ->
-                    if (rawName.endsWith("[]")) {
-                        val name = rawName.removeSuffix("[]")
-                        values.forEach { v -> emit("$name[]", v) }
-                    } else if (values.size == 1) {
-                        emit(rawName, values.single())
-                    } else {
-                        values.forEachIndexed { i, v -> emit("$rawName[$i]", v) }
-                    }
-                }
-            }
-            Log.e(TAG, "GET-UNSIGNED $encoded")
-            // ✅ Use fetchJson to handle Cloudflare
-            fetchJson(encoded)
-        } catch (t: Throwable) {
-            Log.e(TAG, "fetchApiDirect failed: ${t.message}")
-            null
-        }
-    }
-
     private suspend fun getSigned(
         path: String,
         params: Map<String, List<String>>,
@@ -691,8 +562,8 @@ class ComixProvider : MangaManhwaProvider() {
                 append("_=").append(URLEncoder.encode(token, "UTF-8"))
             }
             Log.e(TAG, "GET-SIGNED $encoded")
-            // ✅ Use fetchJson to handle Cloudflare
-            fetchJson(encoded)
+            val headers = referer?.let { mapOf("Referer" to it) } ?: emptyMap()
+            app.get(encoded, interceptor = cfInterceptor, headers = headers).text
         } catch (t: Throwable) {
             Log.e(TAG, "getSigned failed: ${t.message}")
             null
@@ -1123,7 +994,7 @@ class ComixProvider : MangaManhwaProvider() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        if (page == 1) runCatching { probeApiSignatureOnce() }
+        // Removed probeApiSignatureOnce() as it's dead code
         val mutex = tabMutexes.getOrPut(request.data) { Mutex() }
         val resp = mutex.withLock { getMainPageLocked(page, request) }
         if (page == 1 && resp != null) maybePrefetchPage2(request)
@@ -1134,12 +1005,6 @@ class ComixProvider : MangaManhwaProvider() {
         page: Int, request: MainPageRequest
     ): HomePageResponse? {
         Log.e(TAG, "───── getMainPage page=$page request.data=${request.data} ─────")
-
-        // ✅ FIX: Ensure we have cookies before making API requests
-        val home = fetchHtml(mainUrl)
-        if (isCloudflareChallenge(home)) {
-            resolveCloudflareAndCipher(waitForCipher = false)
-        }
 
         if (request.data == "trending" || request.data == "follows") {
             if (page > 1) return null
@@ -1174,6 +1039,7 @@ class ComixProvider : MangaManhwaProvider() {
     private suspend fun fetchQueryPage(request: MainPageRequest, page: Int): PageResult? {
         Log.e(TAG, "▷ fetchQueryPage data=${request.data} page=$page")
 
+        // 1. Check Cache
         signedApiCache[ApiKey(request.data, page)]?.let { raw ->
             val ratings = signedApiCacheRatingCount[ApiKey(request.data, page)] ?: 0
             if (ratings < CONTENT_RATINGS.size) {
@@ -1190,40 +1056,23 @@ class ComixProvider : MangaManhwaProvider() {
             }
         }
 
+        // 2. Try Signed API (if cipher is ready)
         val apiParams = apiParamsFor(request.data, page)
-        if (apiParams != null) {
-            val directBody = fetchApiDirect(apiParams, referer = "$mainUrl/browse")
-            if (!directBody.isNullOrBlank()) {
-                val root = runCatching { JSONObject(directBody) }.getOrNull()
+        if (apiParams != null && cachedCipher() != null) {
+            val signedBody = getSigned("/api/v1/manga", apiParams, referer = "$mainUrl/browse")
+            if (!signedBody.isNullOrBlank()) {
+                val root = runCatching { JSONObject(signedBody) }.getOrNull()
                 if (root != null) {
                     val parsed = extractResultsFromApiJson(root)
                     if (parsed != null && parsed.first.isNotEmpty()) {
-                        Log.e(TAG, "fetchQueryPage DIRECT-UNSIGNED tab=${request.data} page=$page items=${parsed.first.size}")
-                        signedApiCache[ApiKey(request.data, page)] = directBody
-                        signedApiCacheRatingCount[ApiKey(request.data, page)] = CONTENT_RATINGS.size
+                        Log.e(TAG, "fetchQueryPage DIRECT-SIGNED tab=${request.data} page=$page items=${parsed.first.size}")
                         return PageResult(parsed.first, parsed.second)
-                    }
-                    Log.e(TAG, "fetchQueryPage DIRECT-UNSIGNED empty for ${request.data}/$page (body=${directBody.take(120)})")
-                } else {
-                    Log.e(TAG, "fetchQueryPage DIRECT-UNSIGNED not JSON (body=${directBody.take(120)})")
-                }
-            }
-
-            if (cachedCipher() != null) {
-                val signedBody = getSigned("/api/v1/manga", apiParams, referer = "$mainUrl/browse")
-                if (!signedBody.isNullOrBlank()) {
-                    val root = runCatching { JSONObject(signedBody) }.getOrNull()
-                    if (root != null) {
-                        val parsed = extractResultsFromApiJson(root)
-                        if (parsed != null && parsed.first.isNotEmpty()) {
-                            Log.e(TAG, "fetchQueryPage DIRECT-SIGNED tab=${request.data} page=$page items=${parsed.first.size}")
-                            return PageResult(parsed.first, parsed.second)
-                        }
                     }
                 }
             }
         }
 
+        // 3. WebView Fallback
         val browseUrl = browseUrlFor(request.data, page) ?: return null
         Log.e(TAG, "fetchQueryPage WebView fallback url=$browseUrl")
         val apiRoot = captureApiResponse(browseUrl, request.data, page)
@@ -1288,24 +1137,7 @@ class ComixProvider : MangaManhwaProvider() {
         val encoded = URLEncoder.encode(keyword, "UTF-8")
         val MAX_PAGES = 3
 
-        for (page in 1..MAX_PAGES) {
-            val params = mapOf(
-                "page" to listOf(page.toString()),
-                "limit" to listOf("28"),
-                "content_rating[]" to CONTENT_RATINGS,
-                "keyword" to listOf(keyword)
-            )
-            val body = fetchApiDirect(params, referer = "$mainUrl/browse") ?: break
-            if (body.isBlank()) break
-            val root = runCatching { JSONObject(body) }.getOrNull() ?: break
-            val parsed = extractResultsFromApiJson(root) ?: break
-            if (parsed.first.isEmpty()) break
-            for (it in parsed.first) merged.putIfAbsent(it.url, it)
-            Log.e(TAG, "searchByKeyword DIRECT '$keyword' p$page items=${parsed.first.size} total=${merged.size}")
-            if (!parsed.second) break
-        }
-        if (merged.isNotEmpty()) return merged.values.toList()
-
+        // Dead code removed: fetchApiDirect fails with missing token. Go straight to WebView.
         for (page in 1..MAX_PAGES) {
             val browseUrl = "$mainUrl/browse?q=$encoded$CONTENT_RATINGS_QUERY&page=$page"
             Log.e(TAG, "searchByKeyword WebView '$keyword' p$page url=$browseUrl")
