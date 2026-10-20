@@ -17,6 +17,7 @@ import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -258,6 +259,12 @@ class ReaderDialog : DialogFragment() {
                     log("🚫 Blocked window.open popup")
                     return false
                 }
+
+                // Added to catch JS errors
+                override fun onConsoleMessage(m: ConsoleMessage): Boolean {
+                    log("WV console: ${m.message()}")
+                    return true
+                }
             }
 
             webViewClient = object : WebViewClient() {
@@ -472,7 +479,7 @@ class ReaderDialog : DialogFragment() {
             (function(){
               var z = $zoom;
               var s = document.getElementById('mm-zoom');
-              if (!s) { s = document.createElement('style'); s.id = 'mm-zoom'; document.head.appendChild(s); }
+              if (!s) { s = document.createElement('style'); s.id = 'mm-zoom'; document.documentElement.appendChild(s); }
               s.innerHTML =
                 'img, .rpage-page__img, canvas { max-width:' + z + '% !important; width:' + z + '% !important; height:auto !important; display:block !important; margin:0 auto !important; }' +
                 '.rpage-main__inner, .reading-content, #readerarea, .container, ' +
@@ -624,77 +631,52 @@ class ReaderDialog : DialogFragment() {
         view.evaluateJavascript(
             """
             (function(){
+              console.log("MM-Reader: JS Injected");
               try {
-                // 1. Initial CSS - Using clip-path to physically hide ads without triggering anti-adblock
+                // 1. Initial CSS
                 if (!document.getElementById('mm-css')) {
                   var s = document.createElement('style');
                   s.id = 'mm-css';
-                  s.innerHTML = `
-                    body { background: #07080C !important; margin: 0 !important; padding: 0 !important; }
-                    html { padding-top: 0 !important; margin-top: 0 !important; }
-                    
-                    /* Hide known top ad bars */
-                    .ai-top-bar, [class^="ai-top-bar"] { clip-path: inset(100%) !important; opacity: 0 !important; pointer-events: none !important; }
-                    
-                    footer, #comments, .comment-section, .related-posts, 
-                    .recommendations, .mpage__recs, .wp-manga-related, .chapter-widget, 
-                    .related-manga, .suggestions, .also-like, .more-like-this, .share-block, 
-                    .social-share, .rpage-strip-comments, .cm-widget, .rpage-floatctl__col, 
-                    .rpage-bottombar, .rpage-hoverzone, .rpage-dir2 { display: none !important; }
-
-                    .rpage-chap-ending { padding-bottom: 0 !important; margin-bottom: 0 !important; }
-                    .rpage-main, .rpage-main--long-strip, .rpage-main__inner { padding-bottom: 0 !important; margin-bottom: 0 !important; }
-                  `;
-                  document.head.appendChild(s);
+                  s.innerHTML = 
+                    "body { background: #07080C !important; margin: 0 !important; padding: 0 !important; }" +
+                    ".ai-top-bar, [class^='ai-top-bar'] { display: none !important; }" +
+                    "video { display: none !important; }" +
+                    "footer, #comments, .comment-section, .related-posts, " +
+                    ".recommendations, .mpage__recs, .wp-manga-related, .chapter-widget, " +
+                    ".related-manga, .suggestions, .also-like, .more-like-this, .share-block, " +
+                    ".social-share, .rpage-strip-comments, .cm-widget, .rpage-floatctl__col, " +
+                    ".rpage-bottombar, .rpage-hoverzone, .rpage-dir2 { display: none !important; }" +
+                    ".rpage-chap-ending { padding-bottom: 0 !important; margin-bottom: 0 !important; }" +
+                    ".rpage-main, .rpage-main--long-strip, .rpage-main__inner { padding-bottom: 0 !important; margin-bottom: 0 !important; }";
+                  document.documentElement.appendChild(s);
                 }
 
-                // 2. EXTREME AD NEUTRALIZER (Bypasses anti-adblock scripts)
-                if (!window.__mmAdObserver) {
-                  window.__mmAdObserver = true;
-                  
-                  function neutralizeAds() {
+                // 2. NUCLEAR AD NEUTRALIZER (Fights the site's re-injection)
+                if (!window.__mmAdInterval) {
+                  window.__mmAdInterval = setInterval(function() {
                     try {
-                      // Kill any top-fixed banners (like ai-top-bar) and floating videos
-                      document.querySelectorAll('div, header, nav').forEach(el => {
-                        var style = window.getComputedStyle(el);
-                        if (style.position === 'fixed' || style.position === 'sticky') {
-                          var rect = el.getBoundingClientRect();
-                          // If it's at the top of the screen and wider than 80% of the viewport, it's an ad/navbar
-                          if (rect.top === 0 && rect.width > window.innerWidth * 0.8) {
-                             el.style.setProperty('clip-path', 'inset(100%)', 'important');
-                             el.style.setProperty('pointer-events', 'none', 'important');
-                             el.style.setProperty('z-index', '-9999', 'important');
-                          }
-                        }
-                      });
+                      // Move the top bar OFF SCREEN but keep it in the DOM
+                      var ads = document.querySelectorAll('.ai-top-bar, [class^="ai-top-bar"], video, iframe');
+                      for (var i = 0; i < ads.length; i++) {
+                          var el = ads[i];
+                          if (el.querySelector && (el.querySelector('.rpage-page__img') || el.querySelector('#readerarea'))) continue;
+                          
+                          el.style.setProperty('position', 'absolute', 'important');
+                          el.style.setProperty('top', '-9999px', 'important');
+                          el.style.setProperty('left', '-9999px', 'important');
+                          el.style.setProperty('z-index', '-9999', 'important');
+                          el.style.setProperty('pointer-events', 'none', 'important');
+                      }
                       
-                      // Kill video ads completely
-                      document.querySelectorAll('video').forEach(el => {
-                         el.style.setProperty('clip-path', 'inset(100%)', 'important');
-                         el.style.setProperty('pointer-events', 'none', 'important');
-                      });
-
-                      // Kill specific iframes by URL
-                      document.querySelectorAll('iframe').forEach(el => {
-                         var src = (el.src || '').toLowerCase();
-                         if (src.includes('doubleclick') || src.includes('googlesyndication') || src.includes('adsystem') || src.includes('adsterra') || src.includes('exoclick')) {
-                             el.style.setProperty('clip-path', 'inset(100%)', 'important');
-                             el.style.setProperty('pointer-events', 'none', 'important');
-                         }
-                      });
-                      
-                      // Force body padding to 0 to reclaim space from top bar
+                      // Reclaim the space left by the ad
                       document.body.style.setProperty('padding-top', '0', 'important');
+                      var reader = document.querySelector('.rpage-main, #readerarea, .reading-content');
+                      if (reader) {
+                          reader.style.setProperty('padding-top', '0', 'important');
+                          reader.style.setProperty('margin-top', '0', 'important');
+                      }
                     } catch(e) {}
-                  }
-                  
-                  neutralizeAds();
-                  setInterval(neutralizeAds, 1000);
-                  
-                  try {
-                    var observer = new MutationObserver(neutralizeAds);
-                    observer.observe(document.body, { childList: true, subtree: true });
-                  } catch(e) {}
+                  }, 500); 
                 }
 
                 // 3. Reader features (Tap zones, scrolling)
@@ -717,17 +699,11 @@ class ReaderDialog : DialogFragment() {
                     return false;
                   }
                   
-                  // ★ STRICT 20px THRESHOLD for "Absolute Bottom"
                   function atBottom() {
-                    var scrollable = Math.max(
-                        document.documentElement.scrollHeight, document.body.scrollHeight,
-                        document.documentElement.offsetHeight, document.body.offsetHeight
-                    );
+                    var scrollable = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
                     var scrollTop = window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0;
-                    var clientHeight = window.innerHeight || document.documentElement.clientHeight || document.body.clientHeight;
-                    
+                    var clientHeight = window.innerHeight || document.documentElement.clientHeight;
                     if (scrollable <= clientHeight) return false;
-                    
                     return (scrollTop + clientHeight) >= (scrollable - 20);
                   }
                   
@@ -747,7 +723,6 @@ class ReaderDialog : DialogFragment() {
                     }
                   }
 
-                  // ★ UPDATED: Tapping right side only triggers next if at absolute bottom.
                   function handleTap(x, y) {
                     var now = Date.now(); if (now - last < DEBOUNCE) return; last = now;
                     var w = window.innerWidth, h = window.innerHeight;
@@ -848,7 +823,7 @@ class ReaderDialog : DialogFragment() {
                     [0, 60, 150, 300, 500, 800, 1200, 1700, 2400, 3200, 4000].forEach(function (d) { setTimeout(apply, d); });
                   };
                 }
-              } catch(e){}
+              } catch(e){ console.log("MM-Reader Error: " + e); }
             })();
             """.trimIndent(), null
         )
