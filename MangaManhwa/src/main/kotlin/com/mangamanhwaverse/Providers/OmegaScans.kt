@@ -26,27 +26,41 @@ class OmegaScans : MangaManhwaProvider() {
 
     override suspend fun chapters(mangaUrl: String): List<Episode> {
         val doc = fetch(mangaUrl) ?: return emptyList()
+        return parseChapters(doc)
+    }
+
+    // Helper to extract chapters from a Document (avoids double fetching)
+    private fun parseChapters(doc: Document): List<Episode> {
         val eps = mutableListOf<Episode>()
         doc.select("a[href]").forEach { a ->
             val href = a.attr("href").trim()
+            // Match /series/{slug}/chapter-{num}
             if (!href.matches(Regex("^/series/[^/]+/[^/]+$"))) return@forEach
+            
             val chapterName = a.selectFirst("span")?.text()?.trim() ?: href.substringAfterLast("/")
             val fullUrl = abs(href)
-            if (eps.none { it.data == fullUrl }) eps.add(newEpisode(fullUrl) { this.name = chapterName })
+            if (eps.none { it.data == fullUrl }) {
+                eps.add(newEpisode(fullUrl) { this.name = chapterName })
+            }
         }
+        
+        // Sort newest first (handles chapter-57-5 as 57.5)
         val num = Regex("""(\d+(?:[.\-]\d+)?)""")
-        eps.sortByDescending { ep -> num.find(ep.name ?: "")?.value?.replace('-', '.')?.toFloatOrNull() ?: 0f }
+        eps.sortByDescending { ep -> 
+            num.find(ep.name ?: "")?.value?.replace('-', '.')?.toFloatOrNull() ?: 0f 
+        }
         return eps
     }
 
-    // ✅ FIX: Implemented native pages() for Cloudstream manga reader. 
-    // (Removed the deprecated PACKED / isManga ExtractorLink logic)
     override suspend fun pages(chapterUrl: String): List<String> {
         val doc = fetch(chapterUrl) ?: return emptyList()
         val images = mutableListOf<String>()
+        
         doc.select("img").forEach { img ->
             val src = extractImage(img) ?: return@forEach
-            if (!src.contains("media.omegascans.org")) return@forEach
+            // STRICT FILTER: Only take actual chapter images from the uploads folder.
+            // This ignores the site logo, user avatars, and recommendation covers.
+            if (!src.contains("/uploads/series/")) return@forEach
             if (images.contains(src)) return@forEach
             images.add(src)
         }
@@ -55,18 +69,42 @@ class OmegaScans : MangaManhwaProvider() {
 
     override suspend fun load(url: String): LoadResponse? {
         val doc = fetch(url) ?: return null
+        
+        // 1. Extract Title
         val title = doc.selectFirst("h1")?.text()?.trim() ?: titleFromSlug(url)
-        val plot = doc.selectFirst("p")?.text()?.trim()
-        val poster = doc.selectFirst("main img[src*='media.omegascans.org']")?.let(::extractImage)?.let(::abs)
-        val episodes = chapters(url)
+        
+        // 2. Extract Plot
+        val plot = doc.selectFirst("div.text-muted-foreground > div")?.text()?.trim()
+            ?: doc.selectFirst("p")?.text()?.trim()
+        
+        // 3. Extract Cover Image (looks for the actual poster, not the blurred background)
+        val poster = doc.selectFirst("img[srcset*='media.omegascans.org'], img[src*='media.omegascans.org']")
+            ?.let(::extractImage)?.let(::abs)
+        
+        // 4. Extract Status
+        val statusStr = doc.select("span.uppercase").firstOrNull { 
+            it.text() == "Ongoing" || it.text() == "Completed" || it.text() == "Dropped" || it.text() == "Coming Soon"
+        }?.text()
+
+        // 5. Parse Chapters directly from the fetched page (avoids 2nd fetch failure)
+        val episodes = parseChapters(doc)
+        
         return newAnimeLoadResponse(title, url, TvType.Anime) {
-            this.posterUrl = poster; this.plot = plot
-            if (episodes.isNotEmpty()) addEpisodes(DubStatus.Subbed, episodes)
+            this.posterUrl = poster
+            this.plot = plot
+            
+            this.showStatus = when (statusStr?.lowercase()) {
+                "completed" -> ShowStatus.Completed
+                "ongoing", "releasing" -> ShowStatus.Ongoing
+                "coming soon" -> ShowStatus.ComingSoon
+                else -> null
+            }
+            
+            if (episodes.isNotEmpty()) {
+                addEpisodes(DubStatus.Subbed, episodes)
+            }
         }
     }
-
-    // Notice: loadLinks() is omitted here, so it will automatically fallback 
-    // to the MangaManhwaProvider.loadLinks() which opens the custom ReaderDialog!
 
     private fun parseSeriesGrid(doc: Document): List<SearchResponse> = doc.select("a[href]").mapNotNull { a ->
         val href = a.attr("href").trim()
@@ -81,9 +119,12 @@ class OmegaScans : MangaManhwaProvider() {
         img ?: return null
         val src = img.attr("src").ifBlank { img.attr("data-src") }
         if (src.isBlank()) return null
+        
         if (src.contains("/_next/image")) {
             return src.substringAfter("?", "").split("&").firstOrNull { it.startsWith("url=") }
-                ?.substringAfter("url=")?.let { URLDecoder.decode(it.replace("&amp;", "&"), "UTF-8") }?.takeIf { it.isNotBlank() }
+                ?.substringAfter("url=")
+                ?.let { URLDecoder.decode(it.replace("&amp;", "&"), "UTF-8") }
+                ?.takeIf { it.isNotBlank() }
         }
         return if (src.startsWith("http")) src else abs(src)
     }
