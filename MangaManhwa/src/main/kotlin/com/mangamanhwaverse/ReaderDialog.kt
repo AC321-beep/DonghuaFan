@@ -625,12 +625,16 @@ class ReaderDialog : DialogFragment() {
             """
             (function(){
               try {
-                // 1. Initial CSS - Safe hiding
+                // 1. Initial CSS - Using clip-path to physically hide ads without triggering anti-adblock
                 if (!document.getElementById('mm-css')) {
                   var s = document.createElement('style');
                   s.id = 'mm-css';
                   s.innerHTML = `
                     body { background: #07080C !important; margin: 0 !important; padding: 0 !important; }
+                    html { padding-top: 0 !important; margin-top: 0 !important; }
+                    
+                    /* Hide known top ad bars */
+                    .ai-top-bar, [class^="ai-top-bar"] { clip-path: inset(100%) !important; opacity: 0 !important; pointer-events: none !important; }
                     
                     footer, #comments, .comment-section, .related-posts, 
                     .recommendations, .mpage__recs, .wp-manga-related, .chapter-widget, 
@@ -644,42 +648,48 @@ class ReaderDialog : DialogFragment() {
                   document.head.appendChild(s);
                 }
 
-                // 2. SAFE MUTATION OBSERVER (Soft-hide ads, never remove)
+                // 2. EXTREME AD NEUTRALIZER (Bypasses anti-adblock scripts)
                 if (!window.__mmAdObserver) {
                   window.__mmAdObserver = true;
                   
-                  var AD_SELECTOR = [
-                    '.ai-top-bar', '[class^="ai-top-bar"]', 'video',
-                    'iframe[src*="doubleclick"]', 'iframe[src*="googlesyndication"]',
-                    'iframe[src*="adservice"]', 'iframe[src*="adsystem"]',
-                    'iframe[src*="taboola"]', 'iframe[src*="outbrain"]', 'iframe[src*="criteo"]',
-                    'iframe[src*="exoclick"]', 'iframe[src*="adsterra"]', 'iframe[src*="propellerads"]',
-                    'iframe[src*="culinar9sync"]'
-                  ].join(',');
-
                   function neutralizeAds() {
                     try {
-                      var ads = document.querySelectorAll(AD_SELECTOR);
-                      for (var i = 0; i < ads.length; i++) {
-                        var el = ads[i];
-                        if (!el) continue;
-                        if (el.querySelector && (el.querySelector('.rpage-page__img') || el.querySelector('#readerarea') || el.querySelector('.reading-content'))) continue;
-                        
-                        el.style.setProperty('opacity', '0', 'important');
-                        el.style.setProperty('pointer-events', 'none', 'important');
-                        el.style.setProperty('z-index', '-9999', 'important');
-                        
-                        var computed = window.getComputedStyle(el);
-                        if (computed.position === 'fixed' || computed.position === 'sticky') {
-                            el.style.setProperty('position', 'absolute', 'important');
-                            el.style.setProperty('top', '0', 'important');
-                            el.style.setProperty('left', '0', 'important');
+                      // Kill any top-fixed banners (like ai-top-bar) and floating videos
+                      document.querySelectorAll('div, header, nav').forEach(el => {
+                        var style = window.getComputedStyle(el);
+                        if (style.position === 'fixed' || style.position === 'sticky') {
+                          var rect = el.getBoundingClientRect();
+                          // If it's at the top of the screen and wider than 80% of the viewport, it's an ad/navbar
+                          if (rect.top === 0 && rect.width > window.innerWidth * 0.8) {
+                             el.style.setProperty('clip-path', 'inset(100%)', 'important');
+                             el.style.setProperty('pointer-events', 'none', 'important');
+                             el.style.setProperty('z-index', '-9999', 'important');
+                          }
                         }
-                      }
+                      });
+                      
+                      // Kill video ads completely
+                      document.querySelectorAll('video').forEach(el => {
+                         el.style.setProperty('clip-path', 'inset(100%)', 'important');
+                         el.style.setProperty('pointer-events', 'none', 'important');
+                      });
+
+                      // Kill specific iframes by URL
+                      document.querySelectorAll('iframe').forEach(el => {
+                         var src = (el.src || '').toLowerCase();
+                         if (src.includes('doubleclick') || src.includes('googlesyndication') || src.includes('adsystem') || src.includes('adsterra') || src.includes('exoclick')) {
+                             el.style.setProperty('clip-path', 'inset(100%)', 'important');
+                             el.style.setProperty('pointer-events', 'none', 'important');
+                         }
+                      });
+                      
+                      // Force body padding to 0 to reclaim space from top bar
+                      document.body.style.setProperty('padding-top', '0', 'important');
                     } catch(e) {}
                   }
                   
                   neutralizeAds();
+                  setInterval(neutralizeAds, 1000);
                   
                   try {
                     var observer = new MutationObserver(neutralizeAds);
@@ -707,21 +717,18 @@ class ReaderDialog : DialogFragment() {
                     return false;
                   }
                   
-                  // ★ UPDATED: Strict 20px threshold for "Absolute Bottom"
+                  // ★ STRICT 20px THRESHOLD for "Absolute Bottom"
                   function atBottom() {
-                    var el = document.querySelector('.rpage-main') || document.querySelector('.rpage-main--long-strip') || document.scrollingElement || document.documentElement;
+                    var scrollable = Math.max(
+                        document.documentElement.scrollHeight, document.body.scrollHeight,
+                        document.documentElement.offsetHeight, document.body.offsetHeight
+                    );
+                    var scrollTop = window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0;
+                    var clientHeight = window.innerHeight || document.documentElement.clientHeight || document.body.clientHeight;
                     
-                    if (el === document.documentElement || el === document.body) {
-                        var scrollable = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
-                        var scrollTop = window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0;
-                        var clientHeight = window.innerHeight || document.documentElement.clientHeight;
-                        return (scrollTop + clientHeight) >= (scrollable - 20);
-                    } else {
-                        var scrollable = el.scrollHeight;
-                        var scrollTop = el.scrollTop;
-                        var clientHeight = el.clientHeight;
-                        return (scrollTop + clientHeight) >= (scrollable - 20);
-                    }
+                    if (scrollable <= clientHeight) return false;
+                    
+                    return (scrollTop + clientHeight) >= (scrollable - 20);
                   }
                   
                   function scroller() {
@@ -740,23 +747,20 @@ class ReaderDialog : DialogFragment() {
                     }
                   }
 
-                  // ★ UPDATED: Tapping right side only triggers next if at absolute bottom. Otherwise, it scrolls.
+                  // ★ UPDATED: Tapping right side only triggers next if at absolute bottom.
                   function handleTap(x, y) {
                     var now = Date.now(); if (now - last < DEBOUNCE) return; last = now;
                     var w = window.innerWidth, h = window.innerHeight;
 
                     if (x < w * 0.25) {
-                      // Left zone: Scroll up
                       scrollByPage(-0.8); flash(x, y);
                     } else if (x > w * 0.75) {
-                      // Right zone: Next chapter only if at bottom, otherwise scroll down
                       if (atBottom()) {
                         flash(x, y); if (window.MMReader) window.MMReader.onNext();
                       } else {
                         scrollByPage(0.8); flash(x, y);
                       }
                     } else {
-                      // Center zone
                       if (atBottom() && y > h * 0.75) {
                         flash(x, y); if (window.MMReader) window.MMReader.onNext();
                       } else {
