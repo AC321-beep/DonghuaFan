@@ -15,9 +15,7 @@ class OmegaScans : MangaManhwaProvider() {
     override val baseUrl = "https://omegascans.org"
     override var lang = "en"
 
-    // ✅ Enable Cloudflare fallback. OmegaScans uses it heavily.
     override val requiresCf = true
-    
     override val mainPage = mainPageOf("hot" to "Latest Updates")
 
     override suspend fun hot(page: Int): List<SearchResponse> = fetch("$baseUrl/")?.let(::parseSeriesGrid) ?: emptyList()
@@ -38,7 +36,7 @@ class OmegaScans : MangaManhwaProvider() {
         val eps = mutableListOf<Episode>()
         val base = mangaUrl.trimEnd('/')
         
-        // 1. Try standard DOM parsing first (just in case they change it back)
+        // 1. Try standard DOM parsing first
         doc.select("a[href*='/chapter-']").forEach { a ->
             val href = a.attr("href").trim()
             if (href.isBlank()) return@forEach
@@ -49,40 +47,60 @@ class OmegaScans : MangaManhwaProvider() {
             }
         }
         
-        // 2. Fallback: Query the API using the hidden series_id
+        // 2. Fallback: Query the API
         if (eps.isEmpty()) {
             log("⚠️ DOM parsing failed. Extracting series_id and querying API...")
             val html = doc.html()
             
-            // Find series_id in the Next.js payload (e.g., "series_id":689)
             val seriesIdMatch = Regex("""series_id\\*"?\s*:\s*(\d+)""").find(html)
             val seriesId = seriesIdMatch?.groupValues?.get(1)
             
             if (seriesId != null) {
                 log("✅ Found series_id: $seriesId")
                 
-                // ✅ EXACT API URL FROM DEVTOOLS
-                val apiUrl = "$baseUrl/api/query?page=1&perPage=10000&series_id=$seriesId"
-                log("⬇️ Fetching API: $apiUrl")
-                
-                val apiResponse = try {
-                    app.get(apiUrl, interceptor = unifiedInterceptor, headers = browserHeaders()).text
-                } catch (e: Exception) {
-                    logErr("❌ API fetch failed", e)
-                    ""
+                // ✅ Try multiple API endpoints just in case
+                val apiCandidates = listOf(
+                    "$baseUrl/api/query?page=1&perPage=10000&series_id=$seriesId",
+                    "$baseUrl/api/v1/query?page=1&perPage=10000&series_id=$seriesId",
+                    "$baseUrl/api/series/query?page=1&perPage=10000&series_id=$seriesId",
+                    "$baseUrl/query?page=1&perPage=10000&series_id=$seriesId"
+                )
+
+                // ✅ XHR Headers from DevTools
+                val apiHeaders = browserHeaders(mapOf(
+                    "Accept" to "application/json, text/plain, */*",
+                    "Referer" to mangaUrl,
+                    "Origin" to baseUrl,
+                    "X-Requested-With" to "XMLHttpRequest"
+                ))
+
+                var apiResponse = ""
+                for (candidate in apiCandidates) {
+                    log("⬇️ Trying API: $candidate")
+                    try {
+                        val resp = app.get(candidate, interceptor = unifiedInterceptor, headers = apiHeaders).text
+                        if (resp.trim().startsWith("{")) {
+                            apiResponse = resp
+                            log("✅ Found valid JSON from API")
+                            break
+                        } else {
+                            log("❌ Endpoint returned HTML (skipping)")
+                        }
+                    } catch (e: Exception) {
+                        logErr("❌ API fetch failed", e)
+                    }
                 }
-                
+
                 if (apiResponse.isNotBlank()) {
                     try {
-                        // ✅ PARSE THE JSON EXACTLY AS SHOWN IN YOUR FILE
                         val root = JSONObject(apiResponse)
                         val dataArray = root.optJSONArray("data")
                         
                         if (dataArray != null) {
                             for (i in 0 until dataArray.length()) {
                                 val chapterObj = dataArray.optJSONObject(i) ?: continue
-                                val slug = chapterObj.optString("chapter_slug") // e.g. "chapter-125-5"
-                                val name = chapterObj.optString("chapter_name") // e.g. "Chapter 125.5"
+                                val slug = chapterObj.optString("chapter_slug")
+                                val name = chapterObj.optString("chapter_name")
                                 
                                 if (slug.isNotBlank()) {
                                     val fullUrl = "$base/$slug"
@@ -99,14 +117,14 @@ class OmegaScans : MangaManhwaProvider() {
                         logErr("❌ JSON parsing failed", e)
                     }
                 } else {
-                    log("❌ API response was empty")
+                    log("❌ All API endpoints failed to return JSON")
                 }
             } else {
                 log("❌ Could not find series_id in HTML")
             }
         }
         
-        // Sort newest first (handles chapter-57-5 as 57.5)
+        // Sort newest first
         val num = Regex("""(\d+(?:[.\-]\d+)?)""")
         eps.sortByDescending { ep -> 
             num.find(ep.name ?: "")?.value?.replace('-', '.')?.toFloatOrNull() ?: 0f 
