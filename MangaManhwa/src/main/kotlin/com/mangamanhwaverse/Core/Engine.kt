@@ -159,7 +159,7 @@ abstract class MangaManhwaProvider : MainAPI() {
                doc.selectFirst("form#challenge-form") != null || doc.html().contains("cf-chl-")
     }
 
-    protected fun log(msg: String) { if (Settings.verboseLog()) android.util.Log.d("MangaManhwa/$name", msg) }
+    protected fun log(msg: String) {  if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/$name", msg)}
     protected fun logErr(msg: String, t: Throwable? = null) { android.util.Log.e("MangaManhwa/$name", msg, t) }
 
     private fun hostOf(url: String) = runCatching { URI(url).host }.getOrNull() ?: url
