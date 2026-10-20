@@ -75,7 +75,6 @@ abstract class MangaManhwaProvider : MainAPI() {
 
         if (items.isEmpty()) return null
         
-        // ✅ FIX: Updated to use HomePageList instead of the deprecated newHomePageList
         return newHomePageResponse(
             list = listOf(HomePageList(request.name, items.distinctBy { it.url })),
             hasNext = items.size >= 20
@@ -115,8 +114,15 @@ abstract class MangaManhwaProvider : MainAPI() {
 
     protected suspend fun fetch(url: String, referer: String? = baseUrl): Document? {
         val absolute = if (url.startsWith("http")) url else abs(url)
+        
+        // ✅ ADDED LOGGING
+        log("Fetching URL: $absolute")
+        
         return runCatching {
             var doc = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders()).document
+            
+            // ✅ ADDED LOGGING
+            log("Fetched Successfully: $absolute")
             
             if (requiresCf && isCfChallenge(doc)) {
                 log("Built-in CF solver failed. Invoking custom CFSolver dialog...")
