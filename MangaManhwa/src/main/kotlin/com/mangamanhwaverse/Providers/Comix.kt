@@ -13,7 +13,6 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.mangamanhwaverse.ReaderDialog
-import com.mangamanhwaverse.core.CFSolver
 import com.mangamanhwaverse.core.CFState
 import com.mangamanhwaverse.core.MangaManhwaProvider
 import kotlinx.coroutines.CompletableDeferred
@@ -107,7 +106,6 @@ class ComixProvider : MangaManhwaProvider() {
 
     override val requiresCf = true
     override val cfPattern = Regex(".*comix\\.to.*")
-    private val builtInResolver by lazy { WebViewResolver(cfPattern) }
 
     @Volatile private var cipher: ComixCipher? = null
     @Volatile private var prewarmStarted = false
@@ -189,7 +187,6 @@ class ComixProvider : MangaManhwaProvider() {
         }
     }
 
-    // ✅ FIX: Use the exact User-Agent that the CFSolver captured!
     private fun comixHeaders(extra: Map<String, String> = emptyMap()) = mapOf(
         "User-Agent" to (CFState.userAgentFor("comix.to") ?: UA), 
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -204,43 +201,20 @@ class ComixProvider : MangaManhwaProvider() {
         "Upgrade-Insecure-Requests" to "1"
     ) + extra
 
-    private val comixInterceptor = Interceptor { chain ->
-        val original = chain.request()
-        val modified = original.newBuilder().apply {
-            removeHeader("X-Requested-With")
-            comixHeaders().forEach { (k, v) -> header(k, v) }
-            val cookies = android.webkit.CookieManager.getInstance().getCookie(original.url.toString())
-            if (!cookies.isNullOrEmpty()) header("Cookie", cookies)
-        }.build()
-
-        builtInResolver.intercept(object : Interceptor.Chain by chain {
-            override fun request(): Request = modified
-        })
-    }
-
     private suspend fun fetchHtml(url: String): String {
         log("Fetching HTML: $url")
         
+        // ✅ FIX: Use unifiedInterceptor (Cloudstream's built-in WebViewResolver). It solves CF silently.
         var resp = try {
-            app.get(url, interceptor = comixInterceptor, headers = comixHeaders())
+            app.get(url, interceptor = unifiedInterceptor, headers = comixHeaders())
         } catch (e: Exception) {
             logErr("❌ Fetch failed: ${e.message}")
             return ""
         }
         
         if (isCfChallenge(resp.document)) {
-            log("Comix CF challenge detected. Invoking CFSolver...")
-            if (CFSolver(url).solve()) {
-                resp = try {
-                    app.get(url, interceptor = comixInterceptor, headers = comixHeaders())
-                } catch (e: Exception) {
-                    logErr("❌ Second fetch failed: ${e.message}")
-                    return ""
-                }
-            } else {
-                log("❌ CFSolver failed or returned false")
-                return ""
-            }
+            log("❌ Cloudstream's built-in solver failed. Cannot load page.")
+            return ""
         }
         return resp.text
     }
@@ -268,20 +242,11 @@ class ComixProvider : MangaManhwaProvider() {
                 append("_=").append(URLEncoder.encode(token, "UTF-8"))
             }
             
-            var resp = app.get(encoded, interceptor = comixInterceptor, headers = comixHeaders(mapOf(
+            var resp = app.get(encoded, interceptor = unifiedInterceptor, headers = comixHeaders(mapOf(
                 "Accept" to "application/json, text/plain, */*", "X-Requested-With" to "XMLHttpRequest", "Referer" to "$mainUrl/",
                 "Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "same-origin"
             )))
             
-            if (isCfChallenge(resp.document)) {
-                if (CFSolver("$mainUrl$path").solve()) {
-                    resp = app.get(encoded, interceptor = comixInterceptor, headers = comixHeaders(mapOf(
-                        "Accept" to "application/json, text/plain, */*", "X-Requested-With" to "XMLHttpRequest", "Referer" to "$mainUrl/",
-                        "Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "same-origin"
-                    )))
-                }
-            }
-
             val raw = resp.text
             val root = runCatching { JSONObject(raw) }.getOrNull() ?: return null
             if (root.has("e")) {
