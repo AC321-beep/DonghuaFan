@@ -41,23 +41,15 @@ class OmegaScans : MangaManhwaProvider() {
     override val baseUrl = "https://omegascans.org"
     override var lang = "en"
 
+    // CF is handled by the framework (CFSolver) — we only read the UA it cached.
     override val requiresCf = true
     override val mainPage = mainPageOf("hot" to "Latest Updates")
 
     private val webViewMutex = Mutex()
 
-    // Tight markers — only present in actual CF challenge pages, never in normal ones
-    private val cfMarkers = listOf(
-        "/cdn-cgi/challenge-platform/",
-        "cf-browser-verification",
-        "cf_chl_opt",
-        "<title>Just a moment"
-    )
-
     // ======================================================================
-    // Main page — DOM → RSC, no early CF gate
+    // Homepage — DOM → RSC → diagnostic. CF is never a gate.
     // ======================================================================
-
     override suspend fun hot(page: Int): List<SearchResponse> {
         val rawHtml = runCatching {
             app.get("$baseUrl/", headers = browserHeaders()).text
@@ -74,21 +66,20 @@ class OmegaScans : MangaManhwaProvider() {
         log("⚠️ Homepage DOM: 0 items — trying RSC")
 
         // 2) RSC
-        val rsc = decodeRscStream(rawHtml)
-        if (rsc != null) {
+        decodeRscStream(rawHtml)?.let { rsc ->
             val rscItems = parseSeriesFromRsc(rsc)
             if (rscItems.isNotEmpty()) {
                 log("✅ Homepage RSC: ${rscItems.size} items")
                 return rscItems
             }
             log("⚠️ Homepage RSC: 0 items")
-        } else {
-            log("⚠️ Homepage RSC decode returned null")
-        }
+        } ?: log("⚠️ Homepage RSC decode returned null")
 
-        // 3) Diagnostics only — never early-returns
-        cfMarkers.firstOrNull { rawHtml.contains(it, ignoreCase = true) }?.let {
-            log("🚫 CF marker present: $it")
+        // 3) Diagnostics only — the CF solver is a framework concern, not ours.
+        //    A real CF challenge page is tiny (<20 KB). A 198 KB page is a real page
+        //    whose parser we've simply failed on — log enough to diagnose it.
+        if (rawHtml.length < 20_000) {
+            log("🚫 Small page (${rawHtml.length}B) — possibly a CF interstitial; framework CF path should retry")
         }
         log("📄 Preview: ${rawHtml.take(500).replace('\n', ' ')}")
         return emptyList()
@@ -103,9 +94,8 @@ class OmegaScans : MangaManhwaProvider() {
     }
 
     // ======================================================================
-    // chapters — direct API first
+    // chapters — DOM → direct chapter/query API → _next/data → RSC → WebView
     // ======================================================================
-
     override suspend fun chapters(mangaUrl: String): List<Episode> {
         val eps = mutableListOf<Episode>()
         val seriesSlug = mangaUrl.trimEnd('/').substringAfterLast('/')
@@ -115,7 +105,7 @@ class OmegaScans : MangaManhwaProvider() {
             app.get(mangaUrl, headers = browserHeaders()).text
         }.getOrNull()
 
-        // ---------- Stage 1: DOM ----------
+        // ---- Stage 1: DOM ----
         if (rawHtml != null) {
             Jsoup.parse(rawHtml, mangaUrl).select("a[href*='/chapter-']").forEach { a ->
                 val href = a.attr("href").trim()
@@ -127,14 +117,11 @@ class OmegaScans : MangaManhwaProvider() {
                     }
                 }
             }
-            if (eps.isNotEmpty()) {
-                log("✅ DOM: ${eps.size} chapters")
-                return sortChapters(eps)
-            }
+            if (eps.isNotEmpty()) { log("✅ DOM: ${eps.size} chapters"); return sortChapters(eps) }
             log("⚠️ DOM: 0 chapters")
         }
 
-        // ---------- Stage 2: Direct chapter/query API ----------
+        // ---- Stage 2: direct chapter/query API (confirmed endpoint from logcat) ----
         val seriesId = rawHtml?.let { extractSeriesId(it, seriesSlug) }
         if (seriesId != null) {
             log("🎯 series_id=$seriesId — direct API")
@@ -144,10 +131,7 @@ class OmegaScans : MangaManhwaProvider() {
                 log("⬇️ chapter/query response: ${json.length} bytes")
                 runCatching { parseChapterQueryResponse(json, seriesSlug, eps) }
                     .onFailure { logErr("chapter/query parse failed", it) }
-                if (eps.isNotEmpty()) {
-                    log("✅ Direct API: ${eps.size} chapters")
-                    return sortChapters(eps)
-                }
+                if (eps.isNotEmpty()) { log("✅ Direct API: ${eps.size} chapters"); return sortChapters(eps) }
                 log("⚠️ Direct API: 0 chapters — preview: ${json.take(200)}")
             } else {
                 log("⚠️ chapter/query fetch null")
@@ -156,7 +140,7 @@ class OmegaScans : MangaManhwaProvider() {
             log("⚠️ No series_id in HTML")
         }
 
-        // ---------- Stage 3: _next/data ----------
+        // ---- Stage 3: _next/data ----
         val buildId = rawHtml?.let { Regex("\"buildId\":\"([^\"]+)\"").find(it)?.groupValues?.get(1) }
         if (buildId != null) {
             val dataUrl = "$baseUrl/_next/data/$buildId/series/$seriesSlug.json"
@@ -165,30 +149,23 @@ class OmegaScans : MangaManhwaProvider() {
             if (json != null) {
                 runCatching { addFromJson(JSONObject(json), seriesSlug, eps) }
                     .onFailure { addFromRsc(json, seriesSlug, eps) }
-                if (eps.isNotEmpty()) {
-                    log("✅ _next/data: ${eps.size} chapters")
-                    return sortChapters(eps)
-                }
+                if (eps.isNotEmpty()) { log("✅ _next/data: ${eps.size} chapters"); return sortChapters(eps) }
             }
         }
 
-        // ---------- Stage 4: RSC ----------
+        // ---- Stage 4: RSC embedded in HTML ----
         if (rawHtml != null) {
             decodeRscStream(rawHtml)?.let { rsc ->
                 addFromRsc(rsc, seriesSlug, eps)
-                if (eps.isNotEmpty()) {
-                    log("✅ RSC: ${eps.size} chapters")
-                    return sortChapters(eps)
-                }
+                if (eps.isNotEmpty()) { log("✅ RSC: ${eps.size} chapters"); return sortChapters(eps) }
             }
         }
 
-        // ---------- Stage 5: WebView ----------
+        // ---- Stage 5: WebView (last resort) ----
         log("⚠️ Falling back to WebView")
-        val wvResult = captureChapterJson(mangaUrl, seriesSlug)
-        if (wvResult != null) {
+        captureChapterJson(mangaUrl, seriesSlug)?.let { wv ->
             runCatching {
-                val t = wvResult.trim()
+                val t = wv.trim()
                 when {
                     t.startsWith("[") && t.contains("\"href\"") -> parseDomChapterJson(t, eps)
                     t.startsWith("[") -> addFromJsonArray(JSONArray(t), seriesSlug, eps)
@@ -201,16 +178,43 @@ class OmegaScans : MangaManhwaProvider() {
         return sortChapters(eps)
     }
 
+    // ======================================================================
+    // series_id extraction — walks the RSC stream for { series_slug=slug, id=N }
+    // ======================================================================
     private fun extractSeriesId(html: String, slug: String): String? {
-        for (marker in listOf("\"series_slug\":\"$slug\"", "\\\"series_slug\\\":\\\"$slug\\\"")) {
-            val idx = html.indexOf(marker)
-            if (idx < 0) continue
-            val chunk = html.substring(maxOf(0, idx - 500), idx)
-            val matches = Regex("""\\?"id\\?"\s*:\s*(\d+)""").findAll(chunk).toList()
-            if (matches.isNotEmpty()) return matches.last().groupValues[1]
+        val decoded = decodeRscStream(html) ?: return null
+        val marker = "\"series_slug\":\"$slug\""
+        val stack = ArrayDeque<Int>()
+        var inStr = false
+        var esc = false
+        for (i in decoded.indices) {
+            val c = decoded[i]
+            if (inStr) {
+                if (esc) esc = false
+                else if (c == '\\') esc = true
+                else if (c == '"') inStr = false
+                continue
+            }
+            when (c) {
+                '"' -> inStr = true
+                '{' -> stack.push(i)
+                '}' -> {
+                    if (stack.isEmpty()) continue
+                    val start = stack.pop()
+                    val end = i + 1
+                    val found = decoded.indexOf(marker, start)
+                    if (found < 0 || found >= end) continue
+                    val chunk = decoded.substring(start, end)
+                    runCatching {
+                        val obj = JSONObject(chunk)
+                        val s = obj.optString("id")
+                        if (s.isNotBlank()) return s
+                        val n = obj.optInt("id", -1)
+                        if (n > 0) return n.toString()
+                    }
+                }
+            }
         }
-        Regex("""\\?"(?:series_id|seriesId)\\?"\s*:\s*(\d+)""").find(html)?.let { return it.groupValues[1] }
-        Regex("""/series/(\d+)/""").find(html)?.let { return it.groupValues[1] }
         return null
     }
 
@@ -228,14 +232,15 @@ class OmegaScans : MangaManhwaProvider() {
 
     private fun sortChapters(eps: MutableList<Episode>): List<Episode> {
         val num = Regex("""(\d+(?:[.\-]\d+)?)""")
-        eps.sortByDescending { ep -> num.find(ep.name ?: "")?.value?.replace('-', '.')?.toFloatOrNull() ?: 0f }
+        eps.sortByDescending { ep ->
+            num.find(ep.name ?: "")?.value?.replace('-', '.')?.toFloatOrNull() ?: 0f
+        }
         return eps
     }
 
     // ======================================================================
-    // JSON extraction
+    // JSON extractors
     // ======================================================================
-
     private fun addFromJsonArray(arr: JSONArray, seriesSlug: String, out: MutableList<Episode>) {
         for (i in 0 until arr.length()) arr.optJSONObject(i)?.let { addChapterObject(it, seriesSlug, out) }
     }
@@ -243,7 +248,6 @@ class OmegaScans : MangaManhwaProvider() {
     private fun addFromJson(root: JSONObject, seriesSlug: String, out: MutableList<Episode>) {
         val visited = Collections.newSetFromMap(IdentityHashMap<JSONObject, Boolean>())
         val chapterKeys = setOf("free_chapters", "paid_chapters", "chapters", "data", "results", "items")
-
         fun walk(obj: JSONObject) {
             if (!visited.add(obj)) return
             val keys = obj.keys()
@@ -251,8 +255,10 @@ class OmegaScans : MangaManhwaProvider() {
                 val k = keys.next()
                 when (val v = obj.opt(k)) {
                     is JSONArray -> {
-                        if (k in chapterKeys) for (i in 0 until v.length()) v.optJSONObject(i)?.let { addChapterObject(it, seriesSlug, out) }
-                        else for (i in 0 until v.length()) (v.opt(i) as? JSONObject)?.let { walk(it) }
+                        if (k in chapterKeys) for (i in 0 until v.length())
+                            v.optJSONObject(i)?.let { addChapterObject(it, seriesSlug, out) }
+                        else for (i in 0 until v.length())
+                            (v.opt(i) as? JSONObject)?.let { walk(it) }
                     }
                     is JSONObject -> walk(v)
                     is String -> {
@@ -263,7 +269,8 @@ class OmegaScans : MangaManhwaProvider() {
                                 else addFromJson(JSONObject(t), seriesSlug, out)
                             }
                         }
-                        if (t.contains("free_chapters") || t.contains("paid_chapters")) addFromRsc(t, seriesSlug, out)
+                        if (t.contains("free_chapters") || t.contains("paid_chapters"))
+                            addFromRsc(t, seriesSlug, out)
                     }
                 }
             }
@@ -288,7 +295,9 @@ class OmegaScans : MangaManhwaProvider() {
             val href = o.optString("href")
             if (href.isBlank()) continue
             if (out.none { it.data == href }) {
-                out.add(newEpisode(href) { this.name = o.optString("name").ifBlank { href.substringAfterLast('/').replace('-', ' ') } })
+                out.add(newEpisode(href) {
+                    this.name = o.optString("name").ifBlank { href.substringAfterLast('/').replace('-', ' ') }
+                })
             }
         }
     }
@@ -296,7 +305,6 @@ class OmegaScans : MangaManhwaProvider() {
     // ======================================================================
     // RSC helpers
     // ======================================================================
-
     private fun decodeRscStream(html: String): String? {
         val sb = StringBuilder()
         Regex("""self\.__next_f\.push\(\[1,\s*"((?:[^"\\]|\\.)*)"\]\)""")
@@ -388,9 +396,8 @@ class OmegaScans : MangaManhwaProvider() {
     } catch (t: Throwable) { null }
 
     // ======================================================================
-    // WebView fallback
+    // WebView fallback — UA comes from CFState; never triggers CF itself
     // ======================================================================
-
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun captureChapterJson(mangaUrl: String, seriesSlug: String): String? =
         webViewMutex.withLock {
@@ -414,7 +421,8 @@ class OmegaScans : MangaManhwaProvider() {
 
                     val webView = WebView(activity).apply {
                         layoutParams = ViewGroup.LayoutParams(1, 1)
-                        translationX = 20000f; alpha = 0.01f
+                        translationX = 20000f
+                        alpha = 0.01f
                         settings.apply {
                             javaScriptEnabled = true
                             domStorageEnabled = true
@@ -454,23 +462,34 @@ class OmegaScans : MangaManhwaProvider() {
 
                         webViewClient = object : WebViewClient() {
                             @SuppressLint("WebViewClientOnReceivedSslError")
-                            override fun onReceivedSslError(view: WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
+                            override fun onReceivedSslError(
+                                view: WebView?,
+                                h: android.webkit.SslErrorHandler?,
+                                error: android.net.http.SslError?
+                            ) { h?.proceed() }
 
-                            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                            override fun shouldInterceptRequest(
+                                view: WebView?,
+                                request: WebResourceRequest?
+                            ): WebResourceResponse? {
                                 val req = request ?: return null
                                 val url = req.url?.toString() ?: return null
                                 if (!req.isForMainFrame || !url.contains("omegascans.org/series/")) return null
                                 val html = blockingFetchHtml(url) ?: return null
-                                // Only bail if it's a REAL challenge page
-                                if (cfMarkers.any { html.contains(it, ignoreCase = true) }) {
-                                    log("WV: blockingFetchHtml is real CF challenge — native load")
+                                // If the fetch returned a tiny page, assume a CF interstitial
+                                // and let the WebView load natively (framework CF path will handle).
+                                if (html.length < 20_000) {
+                                    log("WV: blockingFetchHtml is small (${html.length}B) — native load")
                                     return null
                                 }
                                 val script = buildInjectionScript()
                                 val patched = if (html.contains("<head>"))
                                     html.replaceFirst("<head>", "<head>$script")
                                 else script + html
-                                return WebResourceResponse("text/html", "UTF-8", 200, "OK", emptyMap(), patched.byteInputStream(Charsets.UTF_8))
+                                return WebResourceResponse(
+                                    "text/html", "UTF-8", 200, "OK", emptyMap(),
+                                    patched.byteInputStream(Charsets.UTF_8)
+                                )
                             }
 
                             override fun onPageFinished(view: WebView, url: String) {
@@ -545,13 +564,16 @@ class OmegaScans : MangaManhwaProvider() {
     """.trimIndent()
 
     private fun blockingFetchHtml(url: String): String? = try {
-        runBlocking(Dispatchers.IO) { withTimeoutOrNull(8000L) { runCatching { app.get(url, headers = browserHeaders()).text }.getOrNull() } }
+        runBlocking(Dispatchers.IO) {
+            withTimeoutOrNull(8000L) {
+                runCatching { app.get(url, headers = browserHeaders()).text }.getOrNull()
+            }
+        }
     } catch (t: Throwable) { null }
 
     // ======================================================================
-    // pages / load / parsers
+    // pages / load / list parsers
     // ======================================================================
-
     override suspend fun pages(chapterUrl: String): List<String> {
         val doc = fetch(chapterUrl) ?: return emptyList()
         val images = mutableListOf<String>()
@@ -567,13 +589,17 @@ class OmegaScans : MangaManhwaProvider() {
     override suspend fun load(url: String): LoadResponse? {
         val doc = fetch(url) ?: return null
         val title = doc.selectFirst("h1")?.text()?.trim() ?: titleFromSlug(url)
-        val plot = doc.selectFirst("div.text-muted-foreground > div")?.text()?.trim() ?: doc.selectFirst("p")?.text()?.trim()
-        val poster = doc.selectFirst("meta[property='og:image']")?.attr("content")?.takeIf { it.isNotBlank() }
+        val plot = doc.selectFirst("div.text-muted-foreground > div")?.text()?.trim()
+            ?: doc.selectFirst("p")?.text()?.trim()
+        val poster = doc.selectFirst("meta[property='og:image']")?.attr("content")
+            ?.takeIf { it.isNotBlank() }
             ?: doc.selectFirst("img[srcset*='media.omegascans.org']")?.let(::extractImage)?.let(::abs)
-        val statusStr = doc.select("span.uppercase").firstOrNull { it.text() == "Ongoing" || it.text() == "Completed" }?.text()
+        val statusStr = doc.select("span.uppercase")
+            .firstOrNull { it.text() == "Ongoing" || it.text() == "Completed" }?.text()
         val episodes = chapters(url)
         return newAnimeLoadResponse(title, url, TvType.Anime) {
-            this.posterUrl = poster; this.plot = plot
+            this.posterUrl = poster
+            this.plot = plot
             this.showStatus = when (statusStr?.lowercase()) {
                 "completed", "finished" -> ShowStatus.Completed
                 "ongoing", "releasing", "coming soon" -> ShowStatus.Ongoing
@@ -587,7 +613,8 @@ class OmegaScans : MangaManhwaProvider() {
         val href = a.attr("href").trim()
         if (!href.contains("/series/") || href.contains("/chapter-")) return@mapNotNull null
         val title = a.selectFirst("h5")?.text()?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-        val img = a.selectFirst("img") ?: a.parent()?.selectFirst("img") ?: a.parent()?.parent()?.selectFirst("img") ?: return@mapNotNull null
+        val img = a.selectFirst("img") ?: a.parent()?.selectFirst("img")
+            ?: a.parent()?.parent()?.selectFirst("img") ?: return@mapNotNull null
         val poster = extractImage(img) ?: return@mapNotNull null
         newAnimeSearchResponse(title, abs(href), TvType.Anime) { this.posterUrl = poster }
     }.distinctBy { it.url }
@@ -598,7 +625,8 @@ class OmegaScans : MangaManhwaProvider() {
         if (src.isBlank()) return null
         if (src.contains("/_next/image")) {
             return src.substringAfter("?", "").split("&").firstOrNull { it.startsWith("url=") }
-                ?.substringAfter("url=")?.let { URLDecoder.decode(it.replace("&amp;", "&"), "UTF-8") }
+                ?.substringAfter("url=")
+                ?.let { URLDecoder.decode(it.replace("&amp;", "&"), "UTF-8") }
                 ?.takeIf { it.isNotBlank() }
         }
         return if (src.startsWith("http")) src else abs(src)
