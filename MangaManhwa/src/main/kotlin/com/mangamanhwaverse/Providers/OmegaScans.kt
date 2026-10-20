@@ -9,6 +9,7 @@ import com.lagradost.cloudstream3.CommonActivity
 import com.mangamanhwaverse.core.CFState
 import com.mangamanhwaverse.core.MangaManhwaProvider
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.app
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -54,20 +55,34 @@ class OmegaScans : MangaManhwaProvider() {
             }
         }
         
-        if (eps.isEmpty()) {
-            log("⚠️ HTML parsing failed. Extracting series_id and using WebView fetch...")
-            val html = doc?.html() ?: ""
+        if (eps.isEmpty() && doc != null) {
+            log("⚠️ HTML parsing failed. Extracting series_id and using API...")
+            val html = doc.html()
             val seriesIdMatch = Regex("""["']?series_id["']?\s*:\s*(\d+)""").find(html)
             val seriesId = seriesIdMatch?.groupValues?.get(1)
             
             if (seriesId != null) {
                 log("✅ Found series_id: $seriesId")
                 val apiUrl = "$baseUrl/query?page=1&perPage=10000&series_id=$seriesId"
-                val jsonResponse = fetchApiViaWebView(mangaUrl, apiUrl)
                 
-                if (!jsonResponse.isNullOrBlank()) {
+                // ✅ First try OkHttp. It's faster and usually works if Cloudflare is passed.
+                val apiResponse = try {
+                    app.get(apiUrl, headers = browserHeaders(mapOf(
+                        "Accept" to "application/json, text/plain, */*",
+                        "X-Requested-With" to "XMLHttpRequest",
+                        "Referer" to mangaUrl
+                    ))).text
+                } catch (e: Exception) { "" }
+
+                var finalJson = apiResponse
+                if (!finalJson.trim().startsWith("{")) {
+                    log("⚠️ OkHttp API failed (CF block?). Using WebView...")
+                    finalJson = fetchApiViaWebView(mangaUrl, apiUrl) ?: ""
+                }
+
+                if (finalJson.trim().startsWith("{")) {
                     try {
-                        val root = JSONObject(jsonResponse)
+                        val root = JSONObject(finalJson)
                         val dataArray = root.optJSONArray("data")
                         if (dataArray != null) {
                             for (i in 0 until dataArray.length()) {
@@ -114,11 +129,8 @@ class OmegaScans : MangaManhwaProvider() {
             
             web.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
-                    // Wait 2 seconds for the page to fully load and acquire cookies
                     handler.postDelayed({
                         if (done.get()) return@postDelayed
-                        
-                        // ✅ Execute the fetch API call exactly like the browser does
                         val js = """
                             (async function() {
                                 try {
@@ -128,8 +140,7 @@ class OmegaScans : MangaManhwaProvider() {
                                             'X-Requested-With': 'XMLHttpRequest'
                                         }
                                     });
-                                    const text = await res.text();
-                                    return text;
+                                    return await res.text();
                                 } catch(e) {
                                     return 'ERROR: ' + e.message;
                                 }
@@ -142,7 +153,7 @@ class OmegaScans : MangaManhwaProvider() {
                             runCatching { web.destroy() }
                             if (cont.isActive) cont.resume(unescaped)
                         }
-                    }, 2000)
+                    }, 1500)
                 }
             }
             
