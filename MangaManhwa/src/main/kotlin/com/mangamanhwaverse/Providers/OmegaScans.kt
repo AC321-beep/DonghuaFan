@@ -10,7 +10,6 @@ import com.lagradost.cloudstream3.CommonActivity
 import com.mangamanhwaverse.core.CFState
 import com.mangamanhwaverse.core.MangaManhwaProvider
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.app
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -56,41 +55,30 @@ class OmegaScans : MangaManhwaProvider() {
             }
         }
         
-        if (eps.isEmpty() && doc != null) {
-            log("⚠️ HTML parsing failed. Extracting series_id and using WebView fetch...")
-            val html = doc.html()
-            val seriesIdMatch = Regex("""["']?series_id["']?\s*:\s*(\d+)""").find(html)
-            val seriesId = seriesIdMatch?.groupValues?.get(1)
-            
-            if (seriesId != null) {
-                log("✅ Found series_id: $seriesId")
-                val apiUrl = "$baseUrl/query?page=1&perPage=10000&series_id=$seriesId"
-                
-                // ✅ Use WebView with JavascriptInterface to capture the Promise
-                val finalJson = fetchApiViaWebView(mangaUrl, apiUrl)
-
-                if (!finalJson.isNullOrBlank() && finalJson.trim().startsWith("{")) {
-                    try {
-                        val root = JSONObject(finalJson)
-                        val dataArray = root.optJSONArray("data")
-                        if (dataArray != null) {
-                            for (i in 0 until dataArray.length()) {
-                                val chapterObj = dataArray.optJSONObject(i) ?: continue
-                                val slug = chapterObj.optString("chapter_slug")
-                                val name = chapterObj.optString("chapter_name")
-                                if (slug.isNotBlank()) {
-                                    val fullUrl = "$base/$slug"
-                                    if (eps.none { it.data == fullUrl }) {
-                                        eps.add(newEpisode(fullUrl) { 
-                                            this.name = name.ifBlank { slug.replace("-", " ").replaceFirstChar { it.uppercase() } } 
-                                        })
-                                    }
+        if (eps.isEmpty()) {
+            log("⚠️ HTML parsing failed. Booting WebView to intercept fetch()...")
+            val jsonResponse = captureChapterJson(mangaUrl)
+            if (jsonResponse != null) {
+                try {
+                    val root = JSONObject(jsonResponse)
+                    val dataArray = root.optJSONArray("data")
+                    if (dataArray != null) {
+                        for (i in 0 until dataArray.length()) {
+                            val chapterObj = dataArray.optJSONObject(i) ?: continue
+                            val slug = chapterObj.optString("chapter_slug")
+                            val name = chapterObj.optString("chapter_name")
+                            if (slug.isNotBlank()) {
+                                val fullUrl = "$base/$slug"
+                                if (eps.none { it.data == fullUrl }) {
+                                    eps.add(newEpisode(fullUrl) { 
+                                        this.name = name.ifBlank { slug.replace("-", " ").replaceFirstChar { it.uppercase() } } 
+                                    })
                                 }
                             }
                         }
-                    } catch (e: Exception) {
-                        logErr("❌ JSON parsing failed", e)
                     }
+                } catch (e: Exception) {
+                    logErr("❌ JSON parsing failed", e)
                 }
             }
         }
@@ -103,70 +91,74 @@ class OmegaScans : MangaManhwaProvider() {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun fetchApiViaWebView(mangaUrl: String, apiUrl: String): String? = withContext(Dispatchers.Main) {
+    private suspend fun captureChapterJson(mangaUrl: String): String? = withContext(Dispatchers.Main) {
         val activity = CommonActivity.activity ?: return@withContext null
         suspendCancellableCoroutine { cont ->
-            val web = WebView(activity)
             val done = AtomicBoolean(false)
             val handler = Handler(Looper.getMainLooper())
-            var result: String? = null
-            
-            web.settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                userAgentString = CFState.userAgentFor("omegascans.org") ?: CFState.userAgent.ifBlank { UA }
-            }
-            
-            // ✅ FIX: Use JavascriptInterface to receive the async response
-            web.addJavascriptInterface(object {
-                @JavascriptInterface
-                fun onApiData(json: String) {
-                    if (!done.get()) {
-                        result = json
-                        handler.postDelayed({
-                            if (done.compareAndSet(false, true)) {
-                                runCatching { web.destroy() }
-                                if (cont.isActive) cont.resume(result)
-                            }
-                        }, 1000)
-                    }
+            var capturedJson: String? = null
+
+            val webView = WebView(activity).apply {
+                layoutParams = android.view.ViewGroup.LayoutParams(1, 1)
+                translationX = 20000f
+                alpha = 0f
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    userAgentString = CFState.userAgentFor("omegascans.org") ?: UA
                 }
-            }, "OmegaBridge")
-            
-            web.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    handler.postDelayed({
-                        if (done.get()) return@postDelayed
-                        val js = """
-                            (async function() {
-                                try {
-                                    const res = await fetch('$apiUrl', {
-                                        headers: {
-                                            'Accept': 'application/json, text/plain, */*',
-                                            'X-Requested-With': 'XMLHttpRequest'
-                                        }
-                                    });
-                                    const text = await res.text();
-                                    window.OmegaBridge.onApiData(text);
-                                } catch(e) {
-                                    window.OmegaBridge.onApiData('ERROR: ' + e.message);
+
+                addJavascriptInterface(object {
+                    @JavascriptInterface
+                    fun onApiData(json: String) {
+                        if (!done.get()) {
+                            capturedJson = json
+                            handler.postDelayed({
+                                if (done.compareAndSet(false, true)) {
+                                    runCatching { destroy() }
+                                    if (cont.isActive) cont.resume(capturedJson)
                                 }
+                            }, 1000)
+                        }
+                    }
+                }, "OmegaBridge")
+
+                webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                        // Hook the fetch API to capture the chapters JSON
+                        val js = """
+                            (function() {
+                                const origFetch = window.fetch;
+                                window.fetch = async function(...args) {
+                                    const response = await origFetch.apply(this, args);
+                                    try {
+                                        const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+                                        if (url.includes('/query?') && url.includes('series_id=')) {
+                                            const clone = response.clone();
+                                            const text = await clone.text();
+                                            if (text.trim().startsWith('{')) {
+                                                window.OmegaBridge.onApiData(text);
+                                            }
+                                        }
+                                    } catch(e) {}
+                                    return response;
+                                };
                             })();
                         """.trimIndent()
                         view?.evaluateJavascript(js, null)
-                    }, 1500)
+                    }
                 }
             }
-            
-            cont.invokeOnCancellation { runCatching { web.destroy() } }
+
+            cont.invokeOnCancellation { runCatching { webView.destroy() } }
             handler.postDelayed({
                 if (done.compareAndSet(false, true)) {
-                    runCatching { web.destroy() }
-                    if (cont.isActive) cont.resume(null)
+                    runCatching { webView.destroy() }
+                    if (cont.isActive) cont.resume(capturedJson)
                 }
             }, 15000L)
-            
-            web.loadUrl(mangaUrl)
+
+            webView.loadUrl(mangaUrl)
         }
     }
 
