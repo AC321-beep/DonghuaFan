@@ -52,21 +52,20 @@ class OmegaScans : MangaManhwaProvider() {
             log("⚠️ DOM parsing failed. Extracting series_id and querying API...")
             val html = doc.html()
             
-            val seriesIdMatch = Regex("""series_id\\*"?\s*:\s*(\d+)""").find(html)
+            val seriesIdMatch = Regex("""["']?series_id["']?\s*:\s*(\d+)""").find(html)
             val seriesId = seriesIdMatch?.groupValues?.get(1)
             
             if (seriesId != null) {
                 log("✅ Found series_id: $seriesId")
                 
-                // ✅ Try multiple API endpoints just in case
+                // ✅ Try multiple API endpoints
                 val apiCandidates = listOf(
+                    "$baseUrl/query?page=1&perPage=10000&series_id=$seriesId",
                     "$baseUrl/api/query?page=1&perPage=10000&series_id=$seriesId",
                     "$baseUrl/api/v1/query?page=1&perPage=10000&series_id=$seriesId",
-                    "$baseUrl/api/series/query?page=1&perPage=10000&series_id=$seriesId",
-                    "$baseUrl/query?page=1&perPage=10000&series_id=$seriesId"
+                    "https://api.omegascans.org/query?page=1&perPage=10000&series_id=$seriesId"
                 )
 
-                // ✅ XHR Headers from DevTools
                 val apiHeaders = browserHeaders(mapOf(
                     "Accept" to "application/json, text/plain, */*",
                     "Referer" to mangaUrl,
@@ -84,7 +83,7 @@ class OmegaScans : MangaManhwaProvider() {
                             log("✅ Found valid JSON from API")
                             break
                         } else {
-                            log("❌ Endpoint returned HTML (skipping)")
+                            log("❌ Endpoint returned HTML (skipping). Starts with: ${resp.take(50)}")
                         }
                     } catch (e: Exception) {
                         logErr("❌ API fetch failed", e)
