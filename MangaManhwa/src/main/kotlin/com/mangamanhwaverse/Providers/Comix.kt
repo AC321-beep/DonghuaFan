@@ -209,16 +209,28 @@ class ComixProvider : MangaManhwaProvider() {
         })
     }
 
-    private suspend fun fetchHtml(url: String): String {
-        // ✅ ADDED LOGGING
+      private suspend fun fetchHtml(url: String): String {
         log("Fetching HTML: $url")
         
-        var resp = app.get(url, interceptor = comixInterceptor, headers = comixHeaders())
+        var resp = try {
+            app.get(url, interceptor = comixInterceptor, headers = comixHeaders())
+        } catch (e: Exception) {
+            logErr("❌ Fetch failed: ${e.message}")
+            return ""
+        }
         
         if (isCfChallenge(resp.document)) {
             log("Comix CF challenge detected. Invoking CFSolver...")
             if (CFSolver(url).solve()) {
-                resp = app.get(url, interceptor = comixInterceptor, headers = comixHeaders())
+                resp = try {
+                    app.get(url, interceptor = comixInterceptor, headers = comixHeaders())
+                } catch (e: Exception) {
+                    logErr("❌ Second fetch failed: ${e.message}")
+                    return ""
+                }
+            } else {
+                log("❌ CFSolver failed or returned false")
+                return ""
             }
         }
         return resp.text
