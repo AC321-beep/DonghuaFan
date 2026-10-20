@@ -50,7 +50,6 @@ class ReaderDialog : DialogFragment() {
         private const val ARG_TARGET = "target"
         private const val ARG_REFERER = "referer"
 
-        // Strictly universal ad network blocklist
         private val BLOCKED_HOSTS: Set<String> = setOf(
             "doubleclick.net", "googlesyndication.com", "googleadservices.com",
             "adservice.google.com", "adservice.google.co.uk", "amazon-adsystem.com",
@@ -263,6 +262,7 @@ class ReaderDialog : DialogFragment() {
 
             webViewClient = object : WebViewClient() {
 
+                // Network-level blocking (Fast and undetectable by anti-adblock scripts)
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val u = request.url?.toString() ?: return null
                     if (isBlockedUrl(u)) {
@@ -292,7 +292,7 @@ class ReaderDialog : DialogFragment() {
                 override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
                     if (!request.isForMainFrame) return
                     val url = request.url?.toString() ?: ""
-                    val isMainSite = url.contains("omegascans.org", true) || url.contains(baseUrl(), true)
+                    val isMainSite = url.contains("omegascans.org", true) || url.contains("comix.to", true) || url.contains(baseUrl(), true)
                     if (!isMainSite) return
 
                     progressBar?.visibility = View.GONE
@@ -383,8 +383,6 @@ class ReaderDialog : DialogFragment() {
         }
 
         bar.addView(btn(ctx, density, "✕", "#281417", "#F87171") { dismissAllowingStateLoss() })
-        
-        // ★ ADDED TEXT: "◀ Prev"
         bar.addView(btn(ctx, density, "◀ Prev", null, "#CBD5E1") { jsNext(-1) }.apply { (layoutParams as? LinearLayout.LayoutParams)?.leftMargin = dp(6) })
 
         val scroll = HorizontalScrollView(ctx).apply {
@@ -415,7 +413,6 @@ class ReaderDialog : DialogFragment() {
         scroll.addView(middle)
         bar.addView(scroll)
 
-        // ★ ADDED TEXT: "Next ▶"
         bar.addView(btn(ctx, density, "Next ▶", "#4F46E5", "#FFFFFF") { jsNext(1) })
         toolbar = bar
         return bar
@@ -487,15 +484,13 @@ class ReaderDialog : DialogFragment() {
         )
     }
 
-    // ★ UNIVERSAL NEXT/PREV: Multi-step fallback without site-specific regex
+    // ★ UNIVERSAL NEXT/PREV: No URL guessing. Only standard DOM interaction.
     private fun jsNext(dir: Int) {
         val js = if (dir > 0) """
             (function(){
-              // 1. Check for standard rel="next"
               var relNext = document.querySelector('a[rel="next"]');
               if (relNext && relNext.href) { window.location.href = relNext.href; return true; }
 
-              // 2. Scan DOM for text matching "next"
               var links = document.querySelectorAll('a');
               for (var i=0; i<links.length; i++) {
                   var text = (links[i].innerText || links[i].textContent || '').trim().toLowerCase();
@@ -507,7 +502,6 @@ class ReaderDialog : DialogFragment() {
                   }
               }
               
-              // 3. Check generic buttons
               var btns = document.querySelectorAll('button, .btn-next, .next_page, [class*="next"]');
               for (var k=0;k<btns.length;k++){ 
                   var b = btns[k]; 
@@ -515,7 +509,6 @@ class ReaderDialog : DialogFragment() {
                   if (!b.disabled && (txt.includes('next') || b.className.includes('next'))) { b.click(); return true; } 
               }
 
-              // 4. Next.js / Nuxt Data (if present)
               try {
                 var nextData = document.getElementById('__NEXT_DATA__');
                 if (nextData) {
@@ -524,26 +517,13 @@ class ReaderDialog : DialogFragment() {
                 }
               } catch(e){}
 
-              // 5. Brute force URL increment (Last Resort)
-              try {
-                  var currentMatch = window.location.href.match(/chapter[-/]([\d.]+)/i);
-                  if (currentMatch) {
-                      var currentCh = parseFloat(currentMatch[1]);
-                      var baseUrl = window.location.href.replace(/chapter[-/][\d.]+.*$/, '');
-                      window.location.href = baseUrl + 'chapter-' + (currentCh + 1);
-                      return true;
-                  }
-              } catch(e){}
-
               return false;
             })();
         """.trimIndent() else """
             (function(){
-              // 1. Check for standard rel="prev"
               var relPrev = document.querySelector('a[rel="prev"]');
               if (relPrev && relPrev.href) { window.location.href = relPrev.href; return true; }
 
-              // 2. Scan DOM for text matching "prev"
               var links = document.querySelectorAll('a');
               for (var i=0; i<links.length; i++) {
                   var text = (links[i].innerText || links[i].textContent || '').trim().toLowerCase();
@@ -555,7 +535,6 @@ class ReaderDialog : DialogFragment() {
                   }
               }
               
-              // 3. Check generic buttons
               var btns = document.querySelectorAll('button, .btn-prev, .prev_page, [class*="prev"]');
               for (var k=0;k<btns.length;k++){ 
                   var b = btns[k]; 
@@ -563,7 +542,6 @@ class ReaderDialog : DialogFragment() {
                   if (!b.disabled && (txt.includes('prev') || b.className.includes('prev'))) { b.click(); return true; } 
               }
 
-              // 4. Next.js / Nuxt Data (if present)
               try {
                 var nextData = document.getElementById('__NEXT_DATA__');
                 if (nextData) {
@@ -572,26 +550,12 @@ class ReaderDialog : DialogFragment() {
                 }
               } catch(e){}
 
-              // 5. Brute force URL decrement (Last Resort)
-              try {
-                  var currentMatch = window.location.href.match(/chapter[-/]([\d.]+)/i);
-                  if (currentMatch) {
-                      var currentCh = parseFloat(currentMatch[1]);
-                      if (currentCh > 1) {
-                          var baseUrl = window.location.href.replace(/chapter[-/][\d.]+.*$/, '');
-                          window.location.href = baseUrl + 'chapter-' + (currentCh - 1);
-                          return true;
-                      }
-                  }
-              } catch(e){}
-
               return false;
             })();
         """.trimIndent()
         webView?.evaluateJavascript(js, null)
     }
 
-    // ★ UNIVERSAL JUMP: Searches DOM, Dropdowns, or List modals
     private fun checkAndJumpToTargetChapter(view: WebView) {
         if (targetChapter <= 0) return
         val target = targetChapter
@@ -599,35 +563,35 @@ class ReaderDialog : DialogFragment() {
             (function() {
               var targetCh = $target;
               
+              // Check if we are already on the target chapter
+              var initialMatch = /(?:chapter|ch)[-/\s]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
+              if (initialMatch && parseFloat(initialMatch[1]) === targetCh) {
+                if (window.MMReader) window.MMReader.onTargetReached(targetCh);
+                return;
+              }
+
               var ticks = 0;
               var timer = setInterval(function() {
                 ticks++;
-                if (ticks > 40) { clearInterval(timer); return; } // 4 sec max
+                if (ticks > 40) { clearInterval(timer); return; }
 
-                // 1. Try to open a chapter list modal if it exists
                 if (ticks === 1) {
                     var triggers = document.querySelectorAll('.chapter-list-btn, .btn-chapter-list, .toggle-chapters, [aria-label*="chapter" i], [title*="chapter" i]');
                     if (triggers.length > 0) triggers[0].click();
                 }
                 
-                // 2. Scan links for the exact chapter number
                 var links = document.querySelectorAll('a');
                 for (var i = 0; i < links.length; i++) {
                     var href = links[i].getAttribute('href') || '';
                     var text = (links[i].innerText || links[i].textContent || '').trim().toLowerCase();
                     
-                    // Match "chapter 15", "ch 15", "ch. 15", or href ending in "chapter-15"
-                    if (text === 'chapter ' + targetCh || 
-                        text === 'ch ' + targetCh || 
-                        text === 'ch. ' + targetCh ||
-                        href.match(new RegExp('chapter[-/]' + targetCh + '($|[^0-9])'))) {
+                    if (text === 'chapter ' + targetCh || text === 'ch ' + targetCh || text === 'ch. ' + targetCh || href.match(new RegExp('chapter[-/]' + targetCh + '($|[^0-9])'))) {
                         window.location.href = links[i].href;
                         clearInterval(timer);
                         return;
                     }
                 }
 
-                // 3. Try finding a <select> dropdown
                 var select = document.querySelector('select');
                 if (select) {
                     for (var j = 0; j < select.options.length; j++) {
@@ -675,18 +639,38 @@ class ReaderDialog : DialogFragment() {
                   var s = document.createElement('style');
                   s.id = 'mm-css';
                   s.innerHTML = `
+                    /* Force the page to start at the very top */
                     body { background: #07080C !important; margin: 0 !important; padding: 0 !important; }
                     
-                    /* ★ UNIVERSAL CROP: Remove fixed/sticky top banners without class names */
-                    div[style*="position: fixed"][style*="top: 0"], 
-                    div[style*="position: sticky"][style*="top: 0"],
-                    .ai-top-bar { display: none !important; visibility: hidden !important; height: 0 !important; }
+                    /* Hide the specific injected Top Ad */
+                    .ai-top-bar, [class^="ai-top-bar"] { display: none !important; }
 
-                    /* Reset padding/margin caused by top ad injection */
-                    body, main, #app, #__next, .container { padding-top: 0 !important; margin-top: 0 !important; }
+                    /* 
+                     * Safe Ad Hiding: Anti-adblock scripts look for display: none. 
+                     * We use visibility: hidden and move them off-screen so the layout 
+                     * doesn't break and the site doesn't blank out the reader. 
+                     */
+                    .adsbygoogle, [data-ad], [data-ad-slot], [id*="google_ads"], 
+                    [class*="advert"], [class*="popup-ad"], [class*="interstitial"] { 
+                        visibility: hidden !important; 
+                        position: absolute !important; 
+                        top: -9999px !important; 
+                        left: -9999px !important; 
+                        height: 1px !important; 
+                        width: 1px !important;
+                    }
+
+                    /* Remove video players and known ad iframes */
+                    video, 
+                    iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
+                    iframe[src*="adservice"], iframe[src*="adsystem"],
+                    iframe[src*="taboola"], iframe[src*="outbrain"],
+                    iframe[src*="criteo"], iframe[src*="exoclick"],
+                    iframe[src*="adsterra"], iframe[src*="propellerads"],
+                    iframe[src*="culinar9sync"] { display: none !important; }
 
                     /* Hide ONLY junk at bottom, PRESERVE navigation buttons */
-                    footer, #comments, .comments, .comment-section, .related-posts, 
+                    footer, #comments, .comment-section, .related-posts, 
                     .recommendations, .mpage__recs, .wp-manga-related, .chapter-widget, 
                     .related-manga, .suggestions, .also-like, .more-like-this, .share-block, 
                     .social-share, .rpage-strip-comments, .cm-widget, .rpage-floatctl__col, 
@@ -694,65 +678,8 @@ class ReaderDialog : DialogFragment() {
 
                     .rpage-chap-ending { padding-bottom: 0 !important; margin-bottom: 0 !important; }
                     .rpage-main, .rpage-main--long-strip, .rpage-main__inner { padding-bottom: 0 !important; margin-bottom: 0 !important; }
-
-                    video { display: none !important; visibility: hidden !important; height: 0 !important; }
-                    iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
-                    iframe[src*="adservice"], iframe[src*="adsystem"],
-                    iframe[src*="taboola"], iframe[src*="outbrain"],
-                    iframe[src*="criteo"], iframe[src*="exoclick"],
-                    iframe[src*="adsterra"], iframe[src*="propellerads"],
-                    iframe[src*="culinar9sync"] { display: none !important; visibility: hidden !important; height: 0 !important; width: 0 !important; }
-
-                    [data-ad], [data-ad-slot], [data-ads] { display: none !important; height: 0 !important; width: 0 !important; }
-                    [class*="advert"], [id*="advert"], [class*="popup-ad"], [class*="interstitial"],
-                    .ad-container, .ad-wrapper, .ad-slot, .ad-unit { display: none !important; height: 0 !important; width: 0 !important; }
                   `;
                   document.head.appendChild(s);
-                }
-
-                if (!window.__mmAdObserver) {
-                  window.__mmAdObserver = true;
-                  var AD_SELECTOR = [
-                    '.ai-top-bar', '.adsbygoogle', '[data-ad]', '[data-ad-slot]', '[data-ads]',
-                    '[class*="advert"]', '[id*="advert"]',
-                    '.ad-banner', '.ad-container', '.ad-wrapper', '.ad-slot', '.ad-unit',
-                    '[class*="popup-ad"]', '[class*="interstitial"]',
-                    'video', 'footer',
-                    'iframe[src*="doubleclick"]', 'iframe[src*="googlesyndication"]',
-                    'iframe[src*="adservice"]', 'iframe[src*="adsystem"]',
-                    'iframe[src*="taboola"]', 'iframe[src*="outbrain"]', 'iframe[src*="criteo"]',
-                    'iframe[src*="exoclick"]', 'iframe[src*="adsterra"]', 'iframe[src*="propellerads"]',
-                    'iframe[src*="culinar9sync"]',
-                    '[class*="banner"]', '[id*="banner"]', '[class*="video-ad"]'
-                  ].join(',');
-
-                  function stripAds() {
-                    try {
-                      var ads = document.querySelectorAll(AD_SELECTOR);
-                      for (var i = 0; i < ads.length; i++) {
-                        var el = ads[i];
-                        if (!el) continue;
-                        if (el.querySelector && (el.querySelector('.rpage-page__img') || el.querySelector('#readerarea') || el.querySelector('.reading-content') || el.querySelector('.chapter-content'))) continue;
-                        if (el.tagName === 'IFRAME' || el.tagName === 'VIDEO' || el.tagName === 'FOOTER') {
-                             el.style.display = 'none'; el.style.pointerEvents = 'none';
-                             if (el.parentElement) el.parentElement.style.display = 'none';
-                             continue;
-                        }
-                        el.style.display = 'none'; el.style.visibility = 'hidden'; el.style.height = '0'; el.style.width = '0'; el.style.pointerEvents = 'none';
-                      }
-                    } catch(e) {}
-                  }
-                  stripAds();
-                  setTimeout(stripAds, 300); setTimeout(stripAds, 1000); setTimeout(stripAds, 2500); setTimeout(stripAds, 5000);
-                  try {
-                    var pendingScan = false;
-                    var observer = new MutationObserver(function(){
-                      if (pendingScan) return;
-                      pendingScan = true;
-                      setTimeout(function(){ pendingScan = false; stripAds(); }, 250);
-                    });
-                    observer.observe(document.body, { childList: true, subtree: true });
-                  } catch(e) {}
                 }
 
                 if (!window.__mmTapInstalled) {
@@ -761,14 +688,14 @@ class ReaderDialog : DialogFragment() {
                   var sx = 0, sy = 0, st = 0, last = 0, moved = false;
 
                   function ignored(el) { if (!el || !el.closest) return false; return !!el.closest('a,button,input,textarea,select,[role="dialog"],.modal,.popup,.settings,.chapter-list'); }
+                  
                   function isLikelyAd(el) {
                     if (!el) return false;
                     var cur = el;
                     for (var i = 0; i < 4 && cur; i++) {
                       var cls = (cur.className && cur.className.toString()) || '';
-                      var id = (cur.id || '');
-                      if (cls.indexOf('ai-top-bar') > -1 || cls.indexOf('adsbygoogle') > -1 || cls.indexOf('advert') > -1 || cls.indexOf('banner') > -1) return true;
-                      if (cur.tagName === 'IFRAME' || cur.tagName === 'VIDEO' || cur.tagName === 'FOOTER') return true; 
+                      if (cls.indexOf('ai-top-bar') > -1) return true;
+                      if (cur.tagName === 'IFRAME' || cur.tagName === 'VIDEO') return true; 
                       cur = cur.parentElement;
                     }
                     return false;
