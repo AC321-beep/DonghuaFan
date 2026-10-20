@@ -177,7 +177,7 @@ class ReaderDialog : DialogFragment() {
                 cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
                 mediaPlaybackRequiresUserGesture = false
 
-                // ✅ SIMPLIFIED: Just use the exact User-Agent that solved CF.
+                // ✅ FIX: Use the global CFState.userAgent
                 userAgentString = CFState.userAgent.takeIf { it.isNotBlank() } ?: MangaManhwaProvider.UA
             }
 
