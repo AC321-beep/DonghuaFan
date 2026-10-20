@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
 object CFState {
-    // ✅ ADDED: Global User-Agent for the entire session
+    // ✅ Global User-Agent for the entire session
     var userAgent: String = ""
     
     private val userAgents = ConcurrentHashMap<String, String>()
