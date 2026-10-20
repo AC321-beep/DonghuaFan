@@ -4,15 +4,20 @@ import android.annotation.SuppressLint
 import android.os.Handler
 import android.os.Looper
 import android.webkit.JavascriptInterface
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.CommonActivity
 import com.mangamanhwaverse.core.CFState
 import com.mangamanhwaverse.core.MangaManhwaProvider
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.app
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -124,28 +129,45 @@ class OmegaScans : MangaManhwaProvider() {
                 }, "OmegaBridge")
 
                 webViewClient = object : WebViewClient() {
-                    override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                        // Hook the fetch API to capture the chapters JSON
-                        val js = """
-                            (function() {
-                                const origFetch = window.fetch;
-                                window.fetch = async function(...args) {
-                                    const response = await origFetch.apply(this, args);
-                                    try {
-                                        const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
-                                        if (url.includes('/query?') && url.includes('series_id=')) {
-                                            const clone = response.clone();
-                                            const text = await clone.text();
-                                            if (text.trim().startsWith('{')) {
-                                                window.OmegaBridge.onApiData(text);
+                    @SuppressLint("WebViewClientOnReceivedSslError")
+                    override fun onReceivedSslError(view: WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
+
+                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                        val req = request ?: return null
+                        val url = req.url?.toString() ?: return null
+                        if (!req.isForMainFrame) return null
+                        
+                        // Inject the fetch hook into the HTML
+                        if (url.contains("omegascans.org/series/")) {
+                            val html = blockingFetchHtml(url) ?: return null
+                            val script = """
+                                <script>
+                                (function() {
+                                    const origFetch = window.fetch;
+                                    window.fetch = async function(...args) {
+                                        const response = await origFetch.apply(this, args);
+                                        try {
+                                            const url = typeof args[0] === 'string' ? args[0] : args[0]?.url || '';
+                                            if (url.includes('/query?') && url.includes('series_id=')) {
+                                                const clone = response.clone();
+                                                const text = await clone.text();
+                                                if (text.trim().startsWith('{')) {
+                                                    window.OmegaBridge.onApiData(text);
+                                                }
                                             }
-                                        }
-                                    } catch(e) {}
-                                    return response;
-                                };
-                            })();
-                        """.trimIndent()
-                        view?.evaluateJavascript(js, null)
+                                        } catch(e) {}
+                                        return response;
+                                    };
+                                })();
+                                </script>
+                            """.trimIndent()
+                            val patched = html.replace("</head>", "$script</head>")
+                            return WebResourceResponse(
+                                "text/html", "UTF-8", 200, "OK", emptyMap(),
+                                patched.byteInputStream(Charsets.UTF_8)
+                            )
+                        }
+                        return null
                     }
                 }
             }
@@ -160,6 +182,16 @@ class OmegaScans : MangaManhwaProvider() {
 
             webView.loadUrl(mangaUrl)
         }
+    }
+
+    private fun blockingFetchHtml(url: String): String? {
+        return try {
+            runBlocking(Dispatchers.IO) {
+                withTimeoutOrNull(8000L) {
+                    runCatching { app.get(url, headers = browserHeaders()).text }.getOrNull()
+                }
+            }
+        } catch (t: Throwable) { null }
     }
 
     override suspend fun pages(chapterUrl: String): List<String> {
