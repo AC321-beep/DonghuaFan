@@ -81,15 +81,7 @@ class ReaderDialog : DialogFragment() {
             "media.net", "mgid.com", "zergnet.com", "adroll.com", "gumgum.com",
             "33across.com", "teads.tv", "adsafeprotected.com",
             "serving-sys.com", "sizmek.com", "innovid.com",
-            "spotxchange.com", "tremorhub.com",
-            "whos.amung.us", "amung.us", "sharethis.com", "cloudflareinsights.com",
-            "google-analytics.com", "googletagmanager.com", "analytics.google.com",
-            "monetag.com", "admaven.com", "ad-maven.com", "galaksion.com",
-            "clickaine.com", "clickadilla.com", "adskeeper.com", "adskeeper.co.uk",
-            "adsco.re", "rtmark.net", "rollerads.com", "notix.io", "richads.com",
-            "evadav.com", "kadam.net", "acint.net", "bidgear.com", "vlitag.com",
-            "venatusmedia.com", "nitropay.com", "snigelweb.com", "freestar.com",
-            "playwire.com", "ezoic.net", "ezojs.com", "optad360.io"
+            "spotxchange.com", "tremorhub.com"
         )
 
         private val BLOCKED_URL_FRAGMENTS: List<String> = listOf(
@@ -97,27 +89,18 @@ class ReaderDialog : DialogFragment() {
             "culinar9sync.com",
             "smartfloralab.com",
             "exacdn.com",
-            "popunder",
-            "ad-provider",
-            "adprovider",
+            "popunder1000.js",
+            "ad-provider.js",
             "600x300_compr",
             "_compr.gif",
             "google.com/g/collect",
-            "google-analytics.com/g/collect",
-            "cloudflareinsights.com/beacon",
-            "whos.amung.us",
-            "count-server.sharethis.com"
+            "google-analytics.com/g/collect"
         )
 
-        // Matches rotating DGA ad domains on Comix: e.g. 497.everydayessentialsco.site, 447.blogofnicole.site
-        private val DGA_AD_HOST_REGEX = Regex(
-            """^\d+\.[a-z0-9-]+\.(?:site|online|shop|store|xyz|top|icu|cyou|club|live|fun|space|website|tech|blog|click|link|work)$""",
+        // Matches Comix's extensionless image CDN shards so isDiagnosticWorthy doesn't spam Logcat
+        private val COMIX_IMAGE_CDN_REGEX = Regex(
+            """^https?://\d+\.[a-z0-9-]+\.site/hi/[A-Za-z0-9_-]+""",
             RegexOption.IGNORE_CASE
-        )
-
-        // Matches DGA ad path tokens: e.g. /hi/bEqPbYfoOT0GmlHla2KfoApMwrkFbvai3R0VorLI6y4AiVMhaGDNl
-        private val DGA_AD_PATH_REGEX = Regex(
-            """/(?:hi|pop|ad|ads|clk)/[A-Za-z0-9_-]{20,}"""
         )
 
         fun show(activity: AppCompatActivity, title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int = 0) {
@@ -184,21 +167,21 @@ class ReaderDialog : DialogFragment() {
     private fun isBlockedUrl(url: String): Boolean {
         if (url.isBlank() || !url.startsWith("http")) return false
 
+        // Never block Comix's manga page image CDN shards
+        if (COMIX_IMAGE_CDN_REGEX.containsMatchIn(url)) return false
+
         val lower = url.lowercase(Locale.US)
-        // Check fragments BEFORE same-host whitelist so self-hosted ad assets (e.g. omegascans.org/600x300_compr.gif) are blocked
+        // Check fragments BEFORE same-host whitelist so OmegaScans self-hosted ad banners (600x300_compr.gif) are blocked
         for (frag in BLOCKED_URL_FRAGMENTS) {
             if (lower.contains(frag)) return true
         }
-        if (DGA_AD_PATH_REGEX.containsMatchIn(url)) return true
 
         val requestHost = runCatching { URI(url).host?.lowercase(Locale.US) }.getOrNull() ?: return false
-        if (DGA_AD_HOST_REGEX.matches(requestHost)) return true
+        if (isSameSiteHost(requestHost)) return false
 
         for (blocked in BLOCKED_HOSTS) {
             if (requestHost == blocked || requestHost.endsWith(".$blocked")) return true
         }
-
-        if (isSameSiteHost(requestHost)) return false
 
         return false
     }
@@ -235,6 +218,8 @@ class ReaderDialog : DialogFragment() {
     }
 
     private fun isDiagnosticWorthy(url: String): Boolean {
+        if (COMIX_IMAGE_CDN_REGEX.containsMatchIn(url)) return false
+
         val lower = url.lowercase(Locale.US)
 
         if (lower.matches(Regex(".*\\.(jpg|jpeg|png|gif|webp|avif|svg|ico|css|woff2?|ttf|otf|mp4|webm|m3u8|ts)(\\?.*)?$"))) return false
@@ -247,7 +232,8 @@ class ReaderDialog : DialogFragment() {
             lower.contains("cloudflareinsights.com") ||
             lower.contains("google-analytics.com") || lower.contains("googletagmanager.com") ||
             lower.contains("fonts.gstatic.com") || lower.contains("fonts.googleapis.com") ||
-            lower.contains("fonts.cdnfonts.com") || lower.contains("onlinewebfonts.com")) return false
+            lower.contains("fonts.cdnfonts.com") || lower.contains("onlinewebfonts.com") ||
+            lower.contains("whos.amung.us") || lower.contains("sharethis.com")) return false
 
         runCatching {
             val reqHost = URI(url).host?.lowercase(Locale.US)
@@ -413,8 +399,8 @@ class ReaderDialog : DialogFragment() {
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                     val u = request.url?.toString() ?: return false
                     if (!u.startsWith("http://") && !u.startsWith("https://")) {
-                        log("🚫 Blocked non-http scheme: $u")
-                        return true
+                        if (u.startsWith("intent://") || u.startsWith("market://") || u.startsWith("whatsapp://") || u.startsWith("tg://")) return true
+                        return false
                     }
                     if (isBlockedUrl(u)) {
                         log("🚫 Blocked navigation: $u")
@@ -443,14 +429,25 @@ class ReaderDialog : DialogFragment() {
 
                     progressBar?.visibility = View.GONE
                     val desc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) error.description.toString() else "Network error"
-                    log("❌ WebView Load Error: $desc | URL: $url")
+                    log("❌ WebView Load Error: $desc | URL:$url")
 
                     view.loadData("<html><body style=\"background:#07080C;color:#94A3B8;font-family:sans-serif;padding:40px;text-align:center\"><h3 style=\"color:#E2E8F0\">Couldn't load chapter</h3><p>$desc</p><p style=\"font-size:12px;margin-top:24px;word-break:break-all\">$url</p></body></html>", "text/html", "UTF-8")
                 }
 
                 override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                     super.onPageStarted(view, url, favicon)
-                    injectEarlyLockdownJs(view)
+                    view.evaluateJavascript(
+                        """
+                        (function(){
+                            try {
+                                window.open = function(u){
+                                    try { if (window.MMReader && window.MMReader.onBlockedPopup) window.MMReader.onBlockedPopup(String(u||'')); } catch(e){}
+                                    return null;
+                                };
+                            } catch(e){}
+                        })();
+                        """.trimIndent(), null
+                    )
                 }
 
                 override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
@@ -491,7 +488,6 @@ class ReaderDialog : DialogFragment() {
 
                     log("✅ WebView Page Finished: $url")
                     if (!url.isNullOrBlank()) recordDiscoveredChapterUrl(url)
-                    injectEarlyLockdownJs(view)
                     injectReaderJs(view)
                     applyZoom(view, currentZoom)
 
@@ -724,9 +720,8 @@ class ReaderDialog : DialogFragment() {
     private fun checkAndJumpToTargetChapter(view: WebView) {
         if (targetChapter <= 0) return
         val target = targetChapter
-        targetChapter = 0 // Reset immediately so the destination page's onPageFinished doesn't re-trigger
+        targetChapter = 0
 
-        // Fast-path: check if we already harvested the exact URL for this chapter
         val slug = extractSlug(currentChapterUrl)
         val cachedDirect = if (slug.isNotBlank()) ComixProvider.getCachedChapterUrl(context, slug, target.toString()) else null
         if (!cachedDirect.isNullOrBlank() && cachedDirect != currentChapterUrl) {
@@ -835,127 +830,6 @@ class ReaderDialog : DialogFragment() {
             .show()
     }
 
-    private fun injectEarlyLockdownJs(view: WebView) {
-        view.evaluateJavascript(
-            """
-            (function(){
-              if (window.__mmLockdownInstalled) return;
-              window.__mmLockdownInstalled = true;
-
-              function isBadUrl(u) {
-                if (!u) return false;
-                var s = String(u);
-                if (/popunder|ad-provider|adprovider|smartfloralab|exacdn\.com|exoclick|600x300_compr|paypal\.com\/xoplatform\/logger|google\.com\/g\/collect/i.test(s)) return true;
-                if (/https?:\/\/\d+\.[a-z0-9-]+\.(?:site|online|shop|store|xyz|top|icu|cyou|club|live|fun|space|website|tech|blog|click|link|work)\b/i.test(s)) return true;
-                if (/\/(?:hi|pop|ad|ads|clk)\/[A-Za-z0-9_-]{20,}/.test(s)) return true;
-                return false;
-              }
-
-              window.__mmIsBadUrl = isBadUrl;
-
-              try {
-                var noopOpen = function(u) {
-                  try { if (window.MMReader && window.MMReader.onBlockedPopup) window.MMReader.onBlockedPopup(String(u || '')); } catch(e){}
-                  return null;
-                };
-                Object.defineProperty(window, 'open', {
-                  value: noopOpen,
-                  writable: false,
-                  configurable: false
-                });
-              } catch(e) {
-                window.open = function() { return null; };
-              }
-
-              try {
-                var origFetch = window.fetch;
-                if (origFetch) {
-                  window.fetch = function(input, init) {
-                    try {
-                      var url = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
-                      if (isBadUrl(url)) {
-                        return Promise.resolve(new Response('', { status: 200, headers: { 'Content-Type': 'text/plain' } }));
-                      }
-                    } catch(e) {}
-                    return origFetch.apply(this, arguments);
-                  };
-                }
-              } catch(e) {}
-
-              try {
-                var origXhrOpen = XMLHttpRequest.prototype.open;
-                var origXhrSend = XMLHttpRequest.prototype.send;
-                XMLHttpRequest.prototype.open = function(method, url) {
-                  this.__mmBlocked = isBadUrl(url);
-                  if (this.__mmBlocked) {
-                    return origXhrOpen.call(this, method, 'data:text/plain,');
-                  }
-                  return origXhrOpen.apply(this, arguments);
-                };
-                XMLHttpRequest.prototype.send = function() {
-                  if (this.__mmBlocked) return;
-                  return origXhrSend.apply(this, arguments);
-                };
-              } catch(e) {}
-
-              try {
-                var origAnchorClick = HTMLAnchorElement.prototype.click;
-                HTMLAnchorElement.prototype.click = function() {
-                  try {
-                    var href = this.href || this.getAttribute('href') || '';
-                    var tgt = (this.getAttribute('target') || '').toLowerCase();
-                    var isBodyDirect = (this.parentElement === document.body || this.parentElement === document.documentElement);
-                    var isExternal = href.indexOf('http') === 0 && this.hostname && this.hostname !== window.location.hostname;
-                    if (isBodyDirect || tgt === '_blank' || isExternal || isBadUrl(href)) {
-                      if (window.MMReader && window.MMReader.onBlockedPopup) window.MMReader.onBlockedPopup(href);
-                      return;
-                    }
-                  } catch(e) {}
-                  return origAnchorClick.apply(this, arguments);
-                };
-              } catch(e) {}
-
-              function shouldDropNode(node) {
-                if (!node || node.nodeType !== 1) return false;
-                var tag = node.tagName;
-                if (tag === 'SCRIPT' || tag === 'IFRAME') {
-                  var src = node.src || node.getAttribute('src') || '';
-                  if (isBadUrl(src)) return true;
-                }
-                if (tag === 'A' && (this === document.body || this === document.documentElement)) {
-                  var txt = (node.innerText || node.textContent || '').trim();
-                  var hasImg = node.querySelector && node.querySelector('img, canvas');
-                  if (!hasImg && txt.length === 0) return true;
-                  if ((node.getAttribute('target') || '').toLowerCase() === '_blank') return true;
-                }
-                return false;
-              }
-
-              try {
-                var origAppend = Element.prototype.appendChild;
-                Element.prototype.appendChild = function(child) {
-                  try {
-                    if (shouldDropNode.call(this, child)) {
-                      return child;
-                    }
-                  } catch(e) {}
-                  return origAppend.apply(this, arguments);
-                };
-                var origInsert = Element.prototype.insertBefore;
-                Element.prototype.insertBefore = function(child, ref) {
-                  try {
-                    if (shouldDropNode.call(this, child)) {
-                      return child;
-                    }
-                  } catch(e) {}
-                  return origInsert.apply(this, arguments);
-                };
-              } catch(e) {}
-            })();
-            """.trimIndent(), null
-        )
-    }
-
     private fun injectReaderJs(view: WebView) {
         val diag = if (Settings.verboseLog()) "true" else "false"
         view.evaluateJavascript(
@@ -971,6 +845,8 @@ class ReaderDialog : DialogFragment() {
                     return;
                   }
 
+                  var isOmega = window.location.hostname.indexOf('omegascans') !== -1;
+
                   if (!document.getElementById('mm-css')) {
                     var s = document.createElement('style');
                     s.id = 'mm-css';
@@ -980,10 +856,6 @@ class ReaderDialog : DialogFragment() {
                         margin: 0 !important;
                         padding: 0 !important;
                       }
-                      body.rpage-body > a,
-                      body > a[target="_blank"],
-                      body > a:empty,
-                      html > a,
                       [data-mm-ad="1"] {
                         display: none !important;
                         pointer-events: none !important;
@@ -995,16 +867,12 @@ class ReaderDialog : DialogFragment() {
                       }
                       aside,
                       aside.fixed,
-                      [class*="z-[2147483647]"],
                       img[src*="600x300"],
                       img[src*="compr.gif"],
-                      img[class*="max-w-[600px]"],
                       a:has(> img[src*="600x300"]),
                       a:has(> img[src*="compr.gif"]),
-                      a:has(> img[class*="max-w-[600px]"]),
                       div:has(> a > img[src*="600x300"]),
-                      div:has(> a > img[src*="compr.gif"]),
-                      div:has(> a > img[class*="max-w-[600px]"]) {
+                      div:has(> a > img[src*="compr.gif"]) {
                         display: none !important;
                         pointer-events: none !important;
                         height: 0 !important;
@@ -1178,8 +1046,11 @@ class ReaderDialog : DialogFragment() {
                   function isBannerAdImage(img) {
                     if (!img || img.tagName !== 'IMG') return false;
                     var src = (img.currentSrc || img.src || img.getAttribute('data-src') || '').toLowerCase();
-                    var cls = (img.className && img.className.toString ? img.className.toString() : '').toLowerCase();
-                    if (src.indexOf('600x300') >= 0 || src.indexOf('compr.gif') >= 0 || cls.indexOf('max-w-[600px]') >= 0) return true;
+                    if (src.indexOf('600x300') >= 0 || src.indexOf('compr.gif') >= 0) return true;
+                    if (isOmega) {
+                      var cls = (img.className && img.className.toString ? img.className.toString() : '').toLowerCase();
+                      if (cls.indexOf('max-w-[600px]') >= 0) return true;
+                    }
                     return false;
                   }
 
@@ -1193,7 +1064,7 @@ class ReaderDialog : DialogFragment() {
                     var src = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') ||
                               img.getAttribute('data-original') || img.getAttribute('data-cfsrc') ||
                               img.getAttribute('src') || '';
-                    return /\/chapter|\/page|\/pages\/|\/\d{2,4}\.(jpg|jpeg|png|webp|avif)/i.test(src);
+                    return /\/chapter|\/page|\/pages\/|\/hi\/|\/\d{2,4}\.(jpg|jpeg|png|webp|avif)/i.test(src);
                   }
 
                   function isPageWrapper(el) {
@@ -1292,17 +1163,9 @@ class ReaderDialog : DialogFragment() {
                     } catch(e) {}
                   }
 
-                  function killOverlaysAndBanners() {
+                  function killOmegaScansBanners() {
+                    if (!isOmega) return;
                     try {
-                      var vw = window.innerWidth || 360;
-                      var vh = window.innerHeight || 640;
-
-                      var directLinks = document.querySelectorAll('body > a, html > a');
-                      for (var i = 0; i < directLinks.length; i++) {
-                        nukeEl(directLinks[i]);
-                        try { directLinks[i].remove(); } catch(e) {}
-                      }
-
                       var asides = document.querySelectorAll('aside, [class*="z-[2147483647]"]');
                       for (var a = 0; a < asides.length; a++) {
                         if (asides[a].id === 'mm-tap-flash') continue;
@@ -1324,27 +1187,8 @@ class ReaderDialog : DialogFragment() {
                           }
                         }
                       }
-
-                      var bodyChildren = document.body ? document.body.children : [];
-                      for (var c = 0; c < bodyChildren.length; c++) {
-                        var ch = bodyChildren[c];
-                        if (!ch || ch.id === 'mm-tap-flash') continue;
-                        if (ch.tagName === 'SCRIPT' || ch.tagName === 'STYLE' || ch.tagName === 'LINK') continue;
-                        if (isEssentialNavOrModal(ch) || findReaderContainer(ch) || ch.querySelector('.rpage-page, .rpage-main')) continue;
-                        var cs = getComputedStyle(ch);
-                        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-                        var r = ch.getBoundingClientRect();
-                        var z = parseInt(cs.zIndex, 10) || 0;
-                        if (ch.tagName === 'A' || ch.tagName === 'IFRAME' || ch.tagName === 'ASIDE' ||
-                            (z >= 999999 && !ch.querySelector('img, canvas')) ||
-                            ((cs.position === 'fixed' || cs.position === 'absolute') && r.width >= vw * 0.8 && r.height >= vh * 0.8 && !ch.querySelector('img, canvas'))) {
-                          nukeEl(ch);
-                        }
-                      }
                     } catch(e) {}
                   }
-
-                  window.__mmKillOverlays = killOverlaysAndBanners;
 
                   function hideEl(el) {
                     if (!el || !el.style) return;
@@ -1374,7 +1218,7 @@ class ReaderDialog : DialogFragment() {
 
                   window.__mmTruncateBottom = function() {
                     try {
-                      killOverlaysAndBanners();
+                      killOmegaScansBanners();
                       cacheNavLinks();
                       var last = findLastContentPage();
                       if (!last) return;
@@ -1422,18 +1266,18 @@ class ReaderDialog : DialogFragment() {
 
                   if (!window.__mmTruncObserversInstalled) {
                     window.__mmTruncObserversInstalled = true;
-                    [100, 250, 600, 1200, 2500, 5000].forEach(function(d) {
+                    [250, 600, 1200, 2500, 5000].forEach(function(d) {
                       setTimeout(function() { try { window.__mmTruncateBottom(); } catch(e) {} }, d);
                     });
                     if (window.MutationObserver) {
                       var moTimer = null;
                       var mo = new MutationObserver(function() {
-                        killOverlaysAndBanners();
+                        if (isOmega) killOmegaScansBanners();
                         if (moTimer) clearTimeout(moTimer);
                         moTimer = setTimeout(function() {
                           moTimer = null;
                           try { window.__mmTruncateBottom(); } catch(e) {}
-                        }, 300);
+                        }, 400);
                       });
                       mo.observe(document.body || document.documentElement, { childList: true, subtree: true });
                     }
@@ -1444,7 +1288,7 @@ class ReaderDialog : DialogFragment() {
                         loadTimer = setTimeout(function() {
                           loadTimer = null;
                           try { window.__mmTruncateBottom(); } catch(err) {}
-                        }, 250);
+                        }, 300);
                       }
                     }, true);
                   }
@@ -1452,7 +1296,7 @@ class ReaderDialog : DialogFragment() {
                   if (!window.__mmAdInterval) {
                     window.__mmAdInterval = setInterval(function() {
                       try {
-                        killOverlaysAndBanners();
+                        killOmegaScansBanners();
                         var ads = document.querySelectorAll(
                           '.ai-top-bar, [class^="ai-top-bar"], ' +
                           'iframe[src*="smartfloralab"], iframe[src*="doubleclick"], ' +
@@ -1478,7 +1322,7 @@ class ReaderDialog : DialogFragment() {
                           document.body.style.setProperty('padding-top', '0', 'important');
                         }
                       } catch(e) {}
-                    }, 300);
+                    }, 350);
                   }
 
                   if (!window.__mmTapInstalled) {
@@ -1486,39 +1330,26 @@ class ReaderDialog : DialogFragment() {
                     var MAX_MOVE = 14, MAX_TIME = 350, DEBOUNCE = 180;
                     var sx = 0, sy = 0, st = 0, last = 0, moved = false;
 
-                    function isAdLinkOrOverlay(el) {
-                      if (!el) return null;
-                      var cur = el;
-                      var vw = window.innerWidth || 360;
-                      var vh = window.innerHeight || 640;
-                      for (var i = 0; i < 5 && cur && cur !== document.documentElement; i++) {
-                        if (cur.getAttribute && cur.getAttribute('data-mm-ad') === '1') return cur;
-                        var cls = (cur.className && cur.className.toString) ? cur.className.toString() : '';
-                        if (cls.indexOf('ai-top-bar') > -1 || cls.indexOf('z-[2147483647]') > -1) return cur;
-                        if (cur.tagName === 'IFRAME' || cur.tagName === 'VIDEO' || cur.tagName === 'ASIDE') return cur;
-                        if (cur.tagName === 'IMG' && isBannerAdImage(cur)) return cur.closest('a') || cur;
-                        if (cur.tagName === 'A') {
-                          if (cur.parentElement === document.body || cur.parentElement === document.documentElement) return cur;
-                          var tgt = (cur.getAttribute('target') || '').toLowerCase();
-                          var href = cur.href || '';
-                          var ext = href.indexOf('http') === 0 && cur.hostname && cur.hostname !== window.location.hostname;
-                          var r = cur.getBoundingClientRect();
-                          var bigOverlay = (r.width >= vw * 0.35 && r.height >= vh * 0.25);
-                          if (bigOverlay || tgt === '_blank' || ext) return cur;
-                        }
-                        cur = cur.parentElement;
-                      }
-                      return null;
-                    }
-
                     function ignored(el) {
                       if (!el || !el.closest) return false;
-                      if (isAdLinkOrOverlay(el)) return false;
                       return !!el.closest(
                         'a, button, input, textarea, select, [role="dialog"], ' +
                         '.modal, .popup, .settings, .chapter-list, ' +
-                        '.rpage-modal, .rpage-chaplist, .rpage-settings, .rpage-chappanel, .rpage-cmpanel'
+                        '.rpage-modal, .rpage-chaplist, .rpage-settings, .rpage-chappanel, .rpage-cmpanel, .rpage-page__loader'
                       );
+                    }
+
+                    function isLikelyAd(el) {
+                      if (!el) return false;
+                      var cur = el;
+                      for (var i = 0; i < 4 && cur; i++) {
+                        var cls = (cur.className && cur.className.toString()) || '';
+                        if (cls.indexOf('ai-top-bar') > -1) return true;
+                        if (cur.tagName === 'IFRAME' || cur.tagName === 'VIDEO' || cur.tagName === 'ASIDE') return true;
+                        if (cur.tagName === 'IMG' && isBannerAdImage(cur)) return true;
+                        cur = cur.parentElement;
+                      }
+                      return false;
                     }
 
                     function atBottom() {
@@ -1567,15 +1398,9 @@ class ReaderDialog : DialogFragment() {
                     }
 
                     document.addEventListener('touchstart', function(e){
-                      killOverlaysAndBanners();
                       if (e.touches.length !== 1) return;
                       var t = e.touches[0];
                       sx = t.clientX; sy = t.clientY; st = Date.now(); moved = false;
-                      var adNode = isAdLinkOrOverlay(t.target || e.target);
-                      if (adNode) {
-                        nukeEl(adNode);
-                        try { adNode.remove(); } catch(err) {}
-                      }
                     }, { passive: true, capture: true });
 
                     document.addEventListener('touchmove', function(e){
@@ -1591,38 +1416,19 @@ class ReaderDialog : DialogFragment() {
                       if (Math.abs(t.clientX - sx) > MAX_MOVE) return;
                       if (Math.abs(t.clientY - sy) > MAX_MOVE) return;
                       if (Date.now() - st > MAX_TIME) return;
-                      var targetEl = t.target || e.target;
-                      var adNode = isAdLinkOrOverlay(targetEl);
-                      if (adNode) {
-                        nukeEl(adNode);
-                        try { adNode.remove(); } catch(err) {}
-                        if (e.cancelable) e.preventDefault();
-                        e.stopPropagation();
-                        e.stopImmediatePropagation();
-                        handleTap(t.clientX, t.clientY);
-                        return;
-                      }
-                      if (ignored(targetEl)) return;
+                      if (isLikelyAd(t.target)) { e.preventDefault(); e.stopPropagation(); return; }
+                      if (ignored(t.target || e.target)) return;
                       handleTap(t.clientX, t.clientY);
-                    }, { passive: false, capture: true });
+                    }, { passive: true, capture: true });
 
                     document.addEventListener('touchcancel', function(){ moved = true; }, { passive: true, capture: true });
 
                     document.addEventListener('click', function(e){
-                      var adNode = isAdLinkOrOverlay(e.target);
-                      if (adNode) {
-                        nukeEl(adNode);
-                        try { adNode.remove(); } catch(err) {}
-                        if (e.cancelable) e.preventDefault();
-                        e.stopPropagation();
-                        e.stopImmediatePropagation();
-                        if (!('ontouchstart' in window)) handleTap(e.clientX, e.clientY);
-                        return;
-                      }
                       if ('ontouchstart' in window) return;
+                      if (isLikelyAd(e.target)) { e.preventDefault(); e.stopPropagation(); return; }
                       if (ignored(e.target)) return;
                       handleTap(e.clientX, e.clientY);
-                    }, { passive: false, capture: true });
+                    }, false);
                   }
 
                   if (!window.__mmSoftNav) {
@@ -1718,7 +1524,6 @@ class ReaderDialog : DialogFragment() {
                           var matched = adRegex.test(idCls) ||
                                         el.tagName === 'ASIDE' ||
                                         el.tagName === 'IFRAME' ||
-                                        (el.tagName === 'A' && (el.parentElement === document.body || el.parentElement === document.documentElement)) ||
                                         isBannerAdImage(el) ||
                                         el.hasAttribute('data-ad') ||
                                         el.hasAttribute('data-ad-slot') ||
