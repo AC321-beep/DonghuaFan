@@ -75,29 +75,29 @@ class ReaderDialog : DialogFragment() {
             "culinar9sync.com",
             "smartfloralab.com"
         )
-    }
 
-    fun show(activity: AppCompatActivity, title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int = 0) {
-        if (activity.isFinishing || activity.isDestroyed) return
-        val fm = activity.supportFragmentManager
-        if (fm.isDestroyed) return
-        activity.runOnUiThread {
-            val existing = fm.findFragmentByTag(TAG) as? ReaderDialog
-            if (existing?.isAdded == true) {
-                existing.loadUrl(chapterName, chapterUrl, targetChapter)
-            } else {
-                fm.beginTransaction().add(newInstance(title, chapterName, chapterUrl, referer, targetChapter), TAG).commitAllowingStateLoss()
+        fun show(activity: AppCompatActivity, title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int = 0) {
+            if (activity.isFinishing || activity.isDestroyed) return
+            val fm = activity.supportFragmentManager
+            if (fm.isDestroyed) return
+            activity.runOnUiThread {
+                val existing = fm.findFragmentByTag(TAG) as? ReaderDialog
+                if (existing?.isAdded == true) {
+                    existing.loadUrl(chapterName, chapterUrl, targetChapter)
+                } else {
+                    fm.beginTransaction().add(newInstance(title, chapterName, chapterUrl, referer, targetChapter), TAG).commitAllowingStateLoss()
+                }
             }
         }
-    }
 
-    fun newInstance(title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int) = ReaderDialog().apply {
-        arguments = Bundle().apply {
-            putString(ARG_TITLE, title)
-            putString(ARG_CHAPTER, chapterName)
-            putString(ARG_URL, chapterUrl)
-            putString(ARG_REFERER, referer)
-            putInt(ARG_TARGET, targetChapter)
+        fun newInstance(title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int) = ReaderDialog().apply {
+            arguments = Bundle().apply {
+                putString(ARG_TITLE, title)
+                putString(ARG_CHAPTER, chapterName)
+                putString(ARG_URL, chapterUrl)
+                putString(ARG_REFERER, referer)
+                putInt(ARG_TARGET, targetChapter)
+            }
         }
     }
 
@@ -149,28 +149,19 @@ class ReaderDialog : DialogFragment() {
         return false
     }
 
-    /**
-     * Layer 2 diagnostic — returns true for requests worth logging to logcat.
-     * Filters out common noise (static assets, framework chunks) so real
-     * ad hosts stand out. Called only when Settings.verboseLog() is on.
-     */
     private fun isDiagnosticWorthy(url: String): Boolean {
         val lower = url.lowercase(Locale.US)
 
-        // Skip static media / stylesheet / font URLs
         if (lower.matches(Regex(".*\\.(jpg|jpeg|png|gif|webp|avif|svg|ico|css|woff2?|ttf|otf|mp4|webm|m3u8|ts)(\\?.*)?$"))) return false
 
-        // Skip JS framework chunks
         if (lower.contains("/_next/static/") || lower.contains("/_nuxt/") ||
             lower.contains("/static/js/") || lower.contains("/assets/chunks/") ||
             lower.contains("/webpack-runtime.") || lower.contains("/framework-")) return false
 
-        // Skip already-handled / noise domains
         if (lower.contains("paypal.com") || lower.contains("cloudflare.com") ||
             lower.contains("google-analytics.com") || lower.contains("googletagmanager.com") ||
             lower.contains("fonts.gstatic.com") || lower.contains("fonts.googleapis.com")) return false
 
-        // Skip the reading site itself (same host as current chapter)
         runCatching {
             val curHost = URI(currentChapterUrl).host?.lowercase(Locale.US)
             val reqHost = URI(url).host?.lowercase(Locale.US)
@@ -319,7 +310,6 @@ class ReaderDialog : DialogFragment() {
                         log("🚫 Blocked: $u")
                         return WebResourceResponse("text/plain", "utf-8", 200, "OK", emptyMap(), ByteArrayInputStream(ByteArray(0)))
                     }
-                    // Layer 2 — log non-noise, non-blocked requests for ad-host discovery
                     if (Settings.verboseLog() && isDiagnosticWorthy(u)) {
                         log("📡 NET: $u")
                     }
@@ -1296,10 +1286,6 @@ class ReaderDialog : DialogFragment() {
                     };
                   }
 
-                  // === Layer 3 — DIAGNOSTICS ===
-                  // Only runs once per page load, only when verboseLog is on.
-                  // Sends results to JsBridge.onAdAudit() → logcat tag "MangaManhwa/AdAudit"
-
                   if (window.__mmDiag && !window.__mmAuditScheduled) {
                     window.__mmAuditScheduled = true;
 
@@ -1482,10 +1468,6 @@ class ReaderDialog : DialogFragment() {
             if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/ReaderDialog", "🚫 Popup blocked: $url")
         }
 
-        /**
-         * Layer 3 — DOM audit / pixel scan output from JS.
-         * Chunks long JSON so logcat (4 KB/line limit) doesn't drop payload.
-         */
         @JavascriptInterface fun onAdAudit(payload: String) {
             if (!Settings.verboseLog()) return
             val tag = "MangaManhwa/AdAudit"
