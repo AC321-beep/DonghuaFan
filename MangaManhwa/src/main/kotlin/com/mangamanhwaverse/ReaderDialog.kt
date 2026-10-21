@@ -494,6 +494,7 @@ class ReaderDialog : DialogFragment() {
                 var s = document.getElementById('mm-zoom');
                 if (!s) { s = document.createElement('style'); s.id = 'mm-zoom'; document.head.appendChild(s); }
                 s.innerHTML =
+                  ':root { --rpage-max-w: ' + z + '% !important; }' +
                   '.rpage-main, .rpage-main--long-strip { overflow-x: auto !important; }' +
                   'img, .rpage-page__img, canvas.rpage-page__img, canvas { max-width: 100% !important; width: 100% !important; height: auto !important; display: block !important; margin: 0 auto !important; }' +
                   ':is(.rpage-main__inner, .rpage-view, .rpage-view--pages, .reading-content, #readerarea, ' +
@@ -546,12 +547,12 @@ class ReaderDialog : DialogFragment() {
                       return true;
                   }
               }
-              
+
               var btns = document.querySelectorAll('button, .btn-next, .next_page, [class*="next"]');
-              for (var k=0; k<btns.length; k++){ 
-                  var b = btns[k]; 
+              for (var k=0; k<btns.length; k++){
+                  var b = btns[k];
                   var txt = (b.innerText || b.textContent || '').toLowerCase();
-                  if (!b.disabled && (txt.includes('next') || b.className.includes('next'))) { b.click(); return true; } 
+                  if (!b.disabled && (txt.includes('next') || b.className.includes('next'))) { b.click(); return true; }
               }
 
               try {
@@ -601,12 +602,12 @@ class ReaderDialog : DialogFragment() {
                       return true;
                   }
               }
-              
+
               var btns = document.querySelectorAll('button, .btn-prev, .prev_page, [class*="prev"]');
-              for (var k=0; k<btns.length; k++){ 
-                  var b = btns[k]; 
+              for (var k=0; k<btns.length; k++){
+                  var b = btns[k];
                   var txt = (b.innerText || b.textContent || '').toLowerCase();
-                  if (!b.disabled && (txt.includes('prev') || b.className.includes('prev'))) { b.click(); return true; } 
+                  if (!b.disabled && (txt.includes('prev') || b.className.includes('prev'))) { b.click(); return true; }
               }
 
               try {
@@ -642,12 +643,12 @@ class ReaderDialog : DialogFragment() {
                     var triggers = document.querySelectorAll('.rpage-floatctl__chap, .chapter-list-btn, .btn-chapter-list, .toggle-chapters, [aria-label*="chapter" i], [title*="chapter" i]');
                     if (triggers.length > 0) triggers[0].click();
                 }
-                
+
                 var links = document.querySelectorAll('a');
                 for (var i = 0; i < links.length; i++) {
                     var href = links[i].getAttribute('href') || '';
                     var text = (links[i].innerText || links[i].textContent || '').trim().toLowerCase();
-                    
+
                     if (text === 'chapter ' + targetCh || text === 'ch ' + targetCh || text === 'ch. ' + targetCh || href.match(new RegExp('chapter[-/]' + targetCh + '($|[^0-9])'))) {
                         window.location.href = links[i].href;
                         clearInterval(timer);
@@ -706,7 +707,6 @@ class ReaderDialog : DialogFragment() {
                     return;
                   }
 
-                  // 1. Static CSS — aggressive but word-boundary-safe ad patterns
                   if (!document.getElementById('mm-css')) {
                     var s = document.createElement('style');
                     s.id = 'mm-css';
@@ -720,14 +720,12 @@ class ReaderDialog : DialogFragment() {
                         position: absolute !important; top: -9999px !important; left: -9999px !important;
                         width: 1px !important; height: 1px !important; opacity: 0 !important; pointer-events: none !important;
                       }
-                      /* Ad-network resources */
                       [src*="doubleclick.net"], [src*="googlesyndication.com"], [src*="adservice.google"],
                       [src*="amazon-adsystem"], [src*="taboola"], [src*="outbrain"],
                       [src*="criteo"], [src*="popads"], [src*="propellerads"],
                       [src*="exoclick"], [src*="adsterra"], [src*="hilltopads"],
                       [src*="clickadu"], [src*="smartfloralab"] { display: none !important; }
 
-                      /* Ad class patterns — word-boundary safe (do NOT clobber reader/download/thread classes) */
                       [class^="ad-"], [class*=" ad-"], [class*="-ad-"], [class$="-ad"], [class~="ad"],
                       [id^="ad-"], [id*=" ad-"], [id*="-ad-"], [id$="-ad"], [id~="ad"],
                       [class^="ads-"], [class*=" ads-"], [class*="-ads-"], [class~="ads"],
@@ -739,10 +737,8 @@ class ReaderDialog : DialogFragment() {
                       iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
                       iframe[src*="smartfloralab"] { display: none !important; }
 
-                      /* Site chrome */
                       header, footer, .header, .footer, .site-header, .site-footer, #header, #footer, .navbar,
                       .google-anno, .cookie-notice, [class*="cookie-"], [id*="cookie-"],
-                      /* Comix reader chrome */
                       .rpage-floatctl__col, .rpage-bottombar, .rpage-hoverzone, .rpage-dir2,
                       .rpage-strip-comments, .cm-widget, .share-block, .social-share, .sharedaddy,
                       .mpage__recs, #comments, #disqus_thread, [id*="disqus"],
@@ -769,7 +765,6 @@ class ReaderDialog : DialogFragment() {
                     head.appendChild(s);
                   }
 
-                  // 2. Detect active inner scroll container
                   function getScroller() {
                     var candidates = [
                       '.rpage-main', '.rpage-main--long-strip',
@@ -788,7 +783,21 @@ class ReaderDialog : DialogFragment() {
                     return null;
                   }
 
-                  // 3. Score-prioritized next/prev URL caching
+                  function findReaderContainer(start) {
+                    var sels = '.rpage-main, .rpage-main--long-strip, .rpage-main__inner, ' +
+                               '#readerarea, .reading-content, .chapter-content, ' +
+                               '.manga-reading, #chapter-content, .viewer, ' +
+                               '.rpage-view, .rpage-view--pages';
+                    var cur = start;
+                    while (cur && cur !== document.body && cur !== document.documentElement) {
+                      try {
+                        if (cur.matches && cur.matches(sels)) return cur;
+                      } catch(e) {}
+                      cur = cur.parentElement;
+                    }
+                    return null;
+                  }
+
                   function cacheNavLinks() {
                     try {
                       var bestNextUrl = null, bestNextScore = 0;
@@ -829,7 +838,6 @@ class ReaderDialog : DialogFragment() {
                     } catch(e) {}
                   }
 
-                  // 4. Universal dynamic bottom truncation
                   var CHROME_SEL = 'header, nav, footer, aside, #comments, #disqus_thread, ' +
                                    '.rpage-strip-comments, .cm-widget, .mpage__recs, .related-posts, ' +
                                    '.recommendations, .comment-section, [role="banner"], [role="navigation"], [role="contentinfo"]';
@@ -869,11 +877,22 @@ class ReaderDialog : DialogFragment() {
                     return /\/chapter|\/page|\/pages\/|\/\d{2,4}\.(jpg|jpeg|png|webp|avif)/i.test(src);
                   }
 
+                  function isPageWrapper(el) {
+                    if (!el || el.nodeType !== 1) return false;
+                    try {
+                      if (el.matches && el.matches(
+                        '.rpage-page, .page-break, .chapter-item, canvas.rpage-page__img, .rpage-page__img'
+                      )) return true;
+                    } catch(e) {}
+                    return false;
+                  }
+
                   function isOrContainsUnloadedPage(el) {
                     if (!el || el.nodeType !== 1 || isInChrome(el)) return false;
+                    if (isPageWrapper(el)) return true;
+                    if (el.tagName === 'IMG' && isPotentialPageImage(el)) return true;
                     try {
-                      if (el.tagName === 'IMG' && isPotentialPageImage(el)) return true;
-                      var wrappers = el.querySelectorAll('.rpage-page, .page-break, .chapter-item, canvas.rpage-page__img');
+                      var wrappers = el.querySelectorAll('.rpage-page, .page-break, .chapter-item, canvas.rpage-page__img, .rpage-page__img');
                       for (var i = 0; i < wrappers.length; i++) {
                         if (!isInChrome(wrappers[i])) return true;
                       }
@@ -988,22 +1007,31 @@ class ReaderDialog : DialogFragment() {
                       var last = findLastContentPage();
                       if (!last) return;
 
-                      var cur = last, guard = 0;
-                      while (cur && cur.parentElement && guard++ < 15) {
+                      var reader = findReaderContainer(last) || getScroller();
+
+                      var start;
+                      if (reader) {
+                        start = reader;
+                      } else {
+                        var p1 = last.parentElement;
+                        var p2 = p1 ? p1.parentElement : null;
+                        start = p2 || p1 || last;
+                      }
+
+                      var cur = start, guard = 0;
+                      while (cur && cur.parentElement && cur !== document.body && cur !== document.documentElement && guard++ < 15) {
                         var sib = cur.nextElementSibling;
                         while (sib) {
                           if (!sib.contains(last)) hideEl(sib);
                           sib = sib.nextElementSibling;
                         }
-                        var parent = cur.parentElement;
-                        if (!parent || parent === document.body || parent === document.documentElement) break;
-                        cur = parent;
+                        cur = cur.parentElement;
                       }
-                      if (last.parentElement) collapseBottomSpacing(last.parentElement);
+
+                      if (start && start.parentElement) collapseBottomSpacing(start.parentElement);
                     } catch(e) {}
                   };
 
-                  // 5. Chapter title auto-detection
                   function reportChapter() {
                     try {
                       var chText = '';
@@ -1054,7 +1082,6 @@ class ReaderDialog : DialogFragment() {
                     }, true);
                   }
 
-                  // 6. Ad killer interval — targeted, no <video> clobbering
                   if (!window.__mmAdInterval) {
                     window.__mmAdInterval = setInterval(function() {
                       try {
@@ -1086,7 +1113,6 @@ class ReaderDialog : DialogFragment() {
                     }, 350);
                   }
 
-                  // 7. Tap zones — exclusive scroll, 150px bottom threshold
                   if (!window.__mmTapInstalled) {
                     window.__mmTapInstalled = true;
                     var MAX_MOVE = 14, MAX_TIME = 350, DEBOUNCE = 180;
@@ -1100,19 +1126,19 @@ class ReaderDialog : DialogFragment() {
                         '.rpage-modal, .rpage-chaplist, .rpage-settings, .rpage-chappanel, .rpage-cmpanel'
                       );
                     }
-                    
+
                     function isLikelyAd(el) {
                       if (!el) return false;
                       var cur = el;
                       for (var i = 0; i < 4 && cur; i++) {
                         var cls = (cur.className && cur.className.toString()) || '';
                         if (cls.indexOf('ai-top-bar') > -1) return true;
-                        if (cur.tagName === 'IFRAME' || cur.tagName === 'VIDEO') return true; 
+                        if (cur.tagName === 'IFRAME' || cur.tagName === 'VIDEO') return true;
                         cur = cur.parentElement;
                       }
                       return false;
                     }
-                    
+
                     function atBottom() {
                       try {
                         var sc = getScroller();
@@ -1124,9 +1150,7 @@ class ReaderDialog : DialogFragment() {
                         var docHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
                         if (docHeight <= h) return false;
                         return (scrollPos + h) >= (docHeight - 150);
-                      } catch(e) {
-                        return false;
-                      }
+                      } catch(e) { return false; }
                     }
 
                     function scrollByPage(frac) {
@@ -1162,4 +1186,191 @@ class ReaderDialog : DialogFragment() {
                     }
 
                     document.addEventListener('touchstart', function(e){ if (e.touches.length !== 1) return; var t = e.touches[0]; sx = t.clientX; sy = t.clientY; st = Date.now(); moved = false; }, { passive: true, capture: true });
-                    document.addEventListener('touchmove', function(e){ if (e.touches
+                    document.addEventListener('touchmove', function(e){ if (e.touches.length !== 1) return; var t = e.touches[0]; if (Math.abs(t.clientX - sx) > MAX_MOVE || Math.abs(t.clientY - sy) > MAX_MOVE) moved = true; }, { passive: true, capture: true });
+                    document.addEventListener('touchend', function(e){
+                      if (e.changedTouches.length !== 1) return;
+                      if (moved) return;
+                      var t = e.changedTouches[0];
+                      if (Math.abs(t.clientX - sx) > MAX_MOVE) return;
+                      if (Math.abs(t.clientY - sy) > MAX_MOVE) return;
+                      if (Date.now() - st > MAX_TIME) return;
+                      if (isLikelyAd(t.target)) { e.preventDefault(); e.stopPropagation(); return; }
+                      if (ignored(t.target || e.target)) return;
+                      handleTap(t.clientX, t.clientY);
+                    }, { passive: true, capture: true });
+                    document.addEventListener('touchcancel', function(){ moved = true; }, { passive: true, capture: true });
+                    document.addEventListener('click', function(e){
+                      if ('ontouchstart' in window) return;
+                      if (isLikelyAd(e.target)) { e.preventDefault(); e.stopPropagation(); return; }
+                      if (ignored(e.target)) return;
+                      handleTap(e.clientX, e.clientY);
+                    }, false);
+                  }
+
+                  if (!window.__mmSoftNav) {
+                    window.__mmSoftNav = true;
+                    var relist = function(){
+                      setTimeout(function(){
+                        try {
+                          window.__mmCachedNextUrl = null;
+                          window.__mmCachedPrevUrl = null;
+                          reportChapter();
+                          if (window.__mmTruncateBottom) window.__mmTruncateBottom();
+                          if (window.MMReader) window.MMReader.onReinject();
+                        } catch(e){}
+                      }, 150);
+                    };
+                    [
+                      'popstate', 'turbo:load', 'turbo:render', 'turbo:initial-updated',
+                      'turbo:request-completed', 'pjax:end', 'swup:contentReplaced', 'inertia:navigate'
+                    ].forEach(function(ev){ window.addEventListener(ev, relist); });
+                  }
+
+                  function flash(x, y) {
+                    try {
+                      var d = document.createElement('div');
+                      d.style.cssText = 'position:fixed;pointer-events:none;width:56px;height:56px;border-radius:50%;background:rgba(99,102,241,0.28);z-index:2147483647;transform:translate(-50%,-50%);transition:opacity .35s,transform .35s;opacity:1';
+                      d.style.left = x + 'px'; d.style.top  = y + 'px'; document.body.appendChild(d);
+                      requestAnimationFrame(function(){ d.style.opacity = '0'; d.style.transform = 'translate(-50%,-50%) scale(1.4)'; });
+                      setTimeout(function(){ d.remove(); }, 450);
+                    } catch(e){}
+                  }
+
+                  if (!window.__mmScrollTrackerInstalled) {
+                    window.__mmScrollTrackerInstalled = true;
+                    var lastY = -1, lastT = 0, pendingTimer = null;
+                    function currentY() {
+                      var sc = getScroller();
+                      if (sc) return sc.scrollTop;
+                      return window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
+                    }
+                    function push(force) {
+                      var y = currentY();
+                      if (!force && Math.abs(y - lastY) < 6) return;
+                      lastY = y;
+                      try { if (window.MMReader && window.MMReader.onScrollPosition) window.MMReader.onScrollPosition(window.location.href, y); } catch (e) {}
+                    }
+                    function schedulePush() {
+                      var now = Date.now();
+                      if (now - lastT >= 500) { lastT = now; push(false); return; }
+                      if (pendingTimer) clearTimeout(pendingTimer);
+                      pendingTimer = setTimeout(function () { lastT = Date.now(); push(false); }, 500 - (now - lastT));
+                    }
+                    window.addEventListener('scroll', schedulePush, { passive: true });
+                    document.addEventListener('scroll', schedulePush, { passive: true, capture: true });
+                    window.addEventListener('pagehide', function () { push(true); });
+                    window.addEventListener('beforeunload', function () { push(true); });
+                    window.__mmPushScroll = function () { push(true); };
+                  }
+
+                  if (!window.__mmRestoreScroll) {
+                    window.__mmRestoreScroll = function (targetY) {
+                      if (typeof targetY !== 'number' || targetY <= 0) return;
+                      var cancelled = false;
+                      function cancel() { cancelled = true; }
+                      window.addEventListener('touchstart', cancel, { once: true, passive: true, capture: true });
+                      window.addEventListener('wheel',      cancel, { once: true, passive: true, capture: true });
+                      window.addEventListener('keydown',    cancel, { once: true });
+                      function apply() {
+                        if (cancelled) return;
+                        try {
+                          var sc = getScroller();
+                          if (sc) { sc.scrollTop = targetY; return; }
+                          window.scrollTo(0, targetY);
+                        } catch (e) {}
+                      }
+                      [0, 60, 150, 300, 500, 800, 1200, 1700, 2400, 3200, 4000].forEach(function (d) { setTimeout(apply, d); });
+                    };
+                  }
+                } catch(e){ console.log("MM-Reader Error: " + e); }
+              }
+              mmInject(0);
+            })();
+            """.trimIndent(), null
+        )
+    }
+
+    private fun extractSlug(url: String): String {
+        val match = Regex("/(?:comic|title|series|manga)/([^/?#]+)").find(url)
+        val slugRaw = match?.groupValues?.get(1) ?: return ""
+        return slugRaw.substringBefore("-chapter-").trimEnd('-')
+    }
+
+    private fun positionKey(url: String): String {
+        if (url.isBlank()) return ""
+        return "pos::" + url.substringBefore('#').trimEnd('/')
+    }
+
+    private fun loadSavedScroll(url: String): Float {
+        val k = positionKey(url)
+        if (k.isEmpty()) return -1f
+        return runCatching { prefs.getFloat(k, -1f) }.getOrDefault(-1f)
+    }
+
+    fun saveScroll(url: String, y: Float) {
+        val k = positionKey(url)
+        if (k.isEmpty() || y < 0f) return
+        runCatching { prefs.edit().putFloat(k, y).apply() }
+    }
+
+    private fun restoreScrollPosition(y: Float) {
+        if (y <= 0f) return
+        val yStr = String.format(Locale.US, "%.2f", y)
+        webView?.evaluateJavascript("window.__mmRestoreScroll && window.__mmRestoreScroll($yStr);", null)
+    }
+
+    fun loadUrl(name: String, url: String, target: Int) {
+        if (url.isBlank()) return
+        log("📖 Opening Reader: '$name' at $url")
+
+        val slug = extractSlug(url)
+        val savedUrl = if (slug.isNotBlank()) prefs.getString(slug, null) else null
+
+        currentChapterUrl = savedUrl ?: url
+        currentChapterName = name
+        targetChapter = target
+        if (target > 0) currentChapterName = "Ch. $target"
+        chapterInfo?.text = currentChapterName.ifBlank { "Chapter" }
+
+        pendingScrollRestore = loadSavedScroll(currentChapterUrl)
+
+        webView?.loadUrl(currentChapterUrl, mapOf("Referer" to referer, "User-Agent" to (webView?.settings?.userAgentString ?: MangaManhwaProvider.UA)))
+    }
+
+    fun updateChapterTitle(detectedTitle: String, detectedUrl: String) {
+        if (detectedUrl.isNotBlank()) currentChapterUrl = detectedUrl
+
+        val m = Regex("(?:chapter|ch)[-/]?(\\d+(\\.\\d+)?)", RegexOption.IGNORE_CASE).find(detectedUrl)
+        if (m != null) {
+            val num = m.groupValues[1]
+            if (num != "0") {
+                currentChapterName = "Ch. $num"
+                chapterInfo?.text = currentChapterName
+                return
+            }
+        }
+        if (detectedTitle.isBlank() ||
+            detectedTitle.contains("Comix", ignoreCase = true) ||
+            detectedTitle.equals("Ch. 0", ignoreCase = true) ||
+            detectedTitle.equals("Chapter 0", ignoreCase = true)
+        ) return
+
+        val clean = detectedTitle.substringBefore(" - ").substringBefore(" · ").trim()
+        if (clean.isBlank() || clean == "Ch. 0" || clean == "Chapter 0") return
+        currentChapterName = clean
+        chapterInfo?.text = clean
+    }
+
+    class JsBridge(private val dialog: ReaderDialog) {
+        @JavascriptInterface fun onCenterTap() { dialog.activity?.runOnUiThread { dialog.toggleToolbar(); dialog.haptic() } }
+        @JavascriptInterface fun onNext() { dialog.activity?.runOnUiThread { dialog.haptic(); dialog.jsNext(1) } }
+        @JavascriptInterface fun onReinject() { dialog.activity?.runOnUiThread { dialog.webView?.let { dialog.injectReaderJs(it) } } }
+        @JavascriptInterface fun onScrollPosition(url: String, y: Float) { dialog.saveScroll(url, y) }
+        @JavascriptInterface fun onChapterDetected(detectedTitle: String, detectedUrl: String) {
+            dialog.activity?.runOnUiThread { dialog.updateChapterTitle(detectedTitle, detectedUrl) }
+        }
+        @JavascriptInterface fun onBlockedPopup(url: String) {
+            if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/ReaderDialog", "🚫 Popup blocked: $url")
+        }
+    }
+}
