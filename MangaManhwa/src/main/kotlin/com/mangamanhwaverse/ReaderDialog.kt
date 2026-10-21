@@ -62,7 +62,12 @@ class ReaderDialog : DialogFragment() {
             "trafficjunky.net", "trafficfactory.biz", "adsterra.com",
             "hilltopads.net", "clickadu.com", "vidoomy.com", "adspyglass.com",
             "scorecardresearch.com", "quantserve.com", "culinar9sync.com",
-            "smartfloralab.com"
+            "smartfloralab.com",
+            "openx.net", "openx.com", "sharethrough.com", "media.net",
+            "mgid.com", "zergnet.com", "adroll.com", "gumgum.com",
+            "33across.com", "teads.tv", "adsafeprotected.com",
+            "serving-sys.com", "sizmek.com", "innovid.com",
+            "spotxchange.com", "tremorhub.com"
         )
 
         private val BLOCKED_URL_FRAGMENTS: List<String> = listOf(
@@ -70,29 +75,29 @@ class ReaderDialog : DialogFragment() {
             "culinar9sync.com",
             "smartfloralab.com"
         )
+    }
 
-        fun show(activity: AppCompatActivity, title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int = 0) {
-            if (activity.isFinishing || activity.isDestroyed) return
-            val fm = activity.supportFragmentManager
-            if (fm.isDestroyed) return
-            activity.runOnUiThread {
-                val existing = fm.findFragmentByTag(TAG) as? ReaderDialog
-                if (existing?.isAdded == true) {
-                    existing.loadUrl(chapterName, chapterUrl, targetChapter)
-                } else {
-                    fm.beginTransaction().add(newInstance(title, chapterName, chapterUrl, referer, targetChapter), TAG).commitAllowingStateLoss()
-                }
+    fun show(activity: AppCompatActivity, title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int = 0) {
+        if (activity.isFinishing || activity.isDestroyed) return
+        val fm = activity.supportFragmentManager
+        if (fm.isDestroyed) return
+        activity.runOnUiThread {
+            val existing = fm.findFragmentByTag(TAG) as? ReaderDialog
+            if (existing?.isAdded == true) {
+                existing.loadUrl(chapterName, chapterUrl, targetChapter)
+            } else {
+                fm.beginTransaction().add(newInstance(title, chapterName, chapterUrl, referer, targetChapter), TAG).commitAllowingStateLoss()
             }
         }
+    }
 
-        fun newInstance(title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int) = ReaderDialog().apply {
-            arguments = Bundle().apply {
-                putString(ARG_TITLE, title)
-                putString(ARG_CHAPTER, chapterName)
-                putString(ARG_URL, chapterUrl)
-                putString(ARG_REFERER, referer)
-                putInt(ARG_TARGET, targetChapter)
-            }
+    fun newInstance(title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int) = ReaderDialog().apply {
+        arguments = Bundle().apply {
+            putString(ARG_TITLE, title)
+            putString(ARG_CHAPTER, chapterName)
+            putString(ARG_URL, chapterUrl)
+            putString(ARG_REFERER, referer)
+            putInt(ARG_TARGET, targetChapter)
         }
     }
 
@@ -142,6 +147,44 @@ class ReaderDialog : DialogFragment() {
         }
 
         return false
+    }
+
+    /**
+     * Layer 2 diagnostic — returns true for requests worth logging to logcat.
+     * Filters out common noise (static assets, framework chunks) so real
+     * ad hosts stand out. Called only when Settings.verboseLog() is on.
+     */
+    private fun isDiagnosticWorthy(url: String): Boolean {
+        val lower = url.lowercase(Locale.US)
+
+        // Skip static media / stylesheet / font URLs
+        if (lower.matches(Regex(".*\\.(jpg|jpeg|png|gif|webp|avif|svg|ico|css|woff2?|ttf|otf|mp4|webm|m3u8|ts)(\\?.*)?$"))) return false
+
+        // Skip JS framework chunks
+        if (lower.contains("/_next/static/") || lower.contains("/_nuxt/") ||
+            lower.contains("/static/js/") || lower.contains("/assets/chunks/") ||
+            lower.contains("/webpack-runtime.") || lower.contains("/framework-")) return false
+
+        // Skip already-handled / noise domains
+        if (lower.contains("paypal.com") || lower.contains("cloudflare.com") ||
+            lower.contains("google-analytics.com") || lower.contains("googletagmanager.com") ||
+            lower.contains("fonts.gstatic.com") || lower.contains("fonts.googleapis.com")) return false
+
+        // Skip the reading site itself (same host as current chapter)
+        runCatching {
+            val curHost = URI(currentChapterUrl).host?.lowercase(Locale.US)
+            val reqHost = URI(url).host?.lowercase(Locale.US)
+            if (curHost != null && reqHost != null) {
+                if (reqHost == curHost || reqHost.endsWith(".$curHost")) return false
+                val parts = curHost.split(".")
+                if (parts.size >= 2) {
+                    val root = parts.takeLast(2).joinToString(".")
+                    if (reqHost == root || reqHost.endsWith(".$root")) return false
+                }
+            }
+        }
+
+        return true
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -273,8 +316,12 @@ class ReaderDialog : DialogFragment() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val u = request.url?.toString() ?: return null
                     if (isBlockedUrl(u)) {
-                        log("🚫 Blocked subresource: $u")
+                        log("🚫 Blocked: $u")
                         return WebResourceResponse("text/plain", "utf-8", 200, "OK", emptyMap(), ByteArrayInputStream(ByteArray(0)))
+                    }
+                    // Layer 2 — log non-noise, non-blocked requests for ad-host discovery
+                    if (Settings.verboseLog() && isDiagnosticWorthy(u)) {
+                        log("📡 NET: $u")
                     }
                     return null
                 }
@@ -514,114 +561,71 @@ class ReaderDialog : DialogFragment() {
     }
 
     private fun jsNext(dir: Int) {
-        val js = if (dir > 0) """
+        val isNext = dir > 0
+        val js = """
             (function(){
-              try {
-                var sync = document.getElementById('syncData');
-                if (sync && sync.textContent) {
-                  var d = JSON.parse(sync.textContent);
-                  if (d && d.next_chapter_url) { window.location.href = d.next_chapter_url; return true; }
+              var isNext = $isNext;
+              var curNum = null;
+              var curMatch = /(?:chapter|ch)[-/]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
+              if (curMatch) curNum = parseFloat(curMatch[1]);
+
+              var candidates = [];
+              var relLink = document.querySelector(isNext ? 'a[rel="next"]' : 'a[rel="prev"]');
+              if (relLink && relLink.href) candidates.push(relLink.href);
+              if (isNext && window.__mmCachedNextUrl) candidates.push(window.__mmCachedNextUrl);
+              if (!isNext && window.__mmCachedPrevUrl) candidates.push(window.__mmCachedPrevUrl);
+
+              for (var i = 0; i < candidates.length; i++) {
+                var cUrl = candidates[i];
+                var cMatch = /(?:chapter|ch)[-/]?(\d+(?:\.\d+)?)/i.exec(cUrl);
+                if (!cMatch) continue;
+                var cNum = parseFloat(cMatch[1]);
+                if (curNum !== null) {
+                  if (isNext && cNum <= curNum) continue;
+                  if (!isNext && cNum >= curNum) continue;
                 }
-              } catch(e){}
-
-              var relNext = document.querySelector('a[rel="next"]');
-              if (relNext && relNext.href) { window.location.href = relNext.href; return true; }
-
-              if (window.__mmCachedNextUrl) { window.location.href = window.__mmCachedNextUrl; return true; }
-
-              var comixBtn = document.querySelector(
-                'button[aria-label="Next chapter"], button[title="Next chapter"], ' +
-                '.rpage-floatctl__row button:last-of-type, ' +
-                '.rpage-chap-ending__nav-btn:last-of-type, ' +
-                '.rpage-dir2__btn:last-of-type'
-              );
-              if (comixBtn && !comixBtn.disabled) { comixBtn.click(); return true; }
-
-              var links = document.querySelectorAll('a');
-              for (var i=0; i<links.length; i++) {
-                  var text = (links[i].innerText || links[i].textContent || '').trim().toLowerCase();
-                  var title = (links[i].getAttribute('title') || '').toLowerCase();
-                  var aria = (links[i].getAttribute('aria-label') || '').toLowerCase();
-                  if ((text === 'next' || text.includes('next chapter') || title.includes('next chapter') || aria.includes('next chapter')) && links[i].href) {
-                      window.location.href = links[i].href;
-                      return true;
-                  }
+                window.location.href = cUrl;
+                return true;
               }
 
-              var btns = document.querySelectorAll('button, .btn-next, .next_page, [class*="next"]');
-              for (var k=0; k<btns.length; k++){
-                  var b = btns[k];
-                  var txt = (b.innerText || b.textContent || '').toLowerCase();
-                  if (!b.disabled && (txt.includes('next') || b.className.includes('next'))) { b.click(); return true; }
-              }
-
-              try {
-                var nextData = document.getElementById('__NEXT_DATA__');
-                if (nextData) {
-                  var props = JSON.parse(nextData.textContent).props.pageProps;
-                  if (props && props.chapter && props.chapter.nextChapter) {
-                    window.location.href = props.chapter.nextChapter.url || ('/series/' + props.chapter.series_slug + '/' + props.chapter.nextChapter.chapter_slug);
+              if (curNum !== null) {
+                var wantNum = isNext ? curNum + 1 : curNum - 1;
+                var anchors = document.querySelectorAll('a[href]');
+                for (var j = 0; j < anchors.length; j++) {
+                  var aMatch = /(?:chapter|ch)[-/]?(\d+(?:\.\d+)?)/i.exec(anchors[j].href);
+                  if (aMatch && parseFloat(aMatch[1]) === wantNum) {
+                    window.location.href = anchors[j].href;
                     return true;
                   }
                 }
-              } catch(e){}
+              }
 
-              window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', keyCode: 39, code: 'ArrowRight', bubbles: true }));
-              return false;
-            })();
-        """.trimIndent() else """
-            (function(){
+              var btnSel = isNext
+                ? 'button[aria-label*="ext chapter" i], button[title*="ext chapter" i], a[aria-label*="ext chapter" i], a[title*="ext chapter" i]'
+                : 'button[aria-label*="rev chapter" i], button[title*="rev chapter" i], a[aria-label*="rev chapter" i], a[title*="rev chapter" i]';
+              var btn = document.querySelector(btnSel);
+              if (btn && !btn.disabled) { btn.click(); return true; }
+
               try {
-                var sync = document.getElementById('syncData');
-                if (sync && sync.textContent) {
-                  var d = JSON.parse(sync.textContent);
-                  if (d && d.prev_chapter_url) { window.location.href = d.prev_chapter_url; return true; }
-                }
-              } catch(e){}
-
-              var relPrev = document.querySelector('a[rel="prev"]');
-              if (relPrev && relPrev.href) { window.location.href = relPrev.href; return true; }
-
-              if (window.__mmCachedPrevUrl) { window.location.href = window.__mmCachedPrevUrl; return true; }
-
-              var comixBtn = document.querySelector(
-                'button[aria-label="Previous chapter"], button[title="Previous chapter"], ' +
-                '.rpage-floatctl__row button:first-of-type, ' +
-                '.rpage-chap-ending__nav-btn:first-of-type, ' +
-                '.rpage-dir2__btn:first-of-type'
-              );
-              if (comixBtn && !comixBtn.disabled) { comixBtn.click(); return true; }
-
-              var links = document.querySelectorAll('a');
-              for (var i=0; i<links.length; i++) {
-                  var text = (links[i].innerText || links[i].textContent || '').trim().toLowerCase();
-                  var title = (links[i].getAttribute('title') || '').toLowerCase();
-                  var aria = (links[i].getAttribute('aria-label') || '').toLowerCase();
-                  if ((text === 'prev' || text.includes('prev chapter') || text.includes('previous chapter') || title.includes('prev chapter') || aria.includes('prev chapter')) && links[i].href) {
-                      window.location.href = links[i].href;
+                var nd = document.getElementById('__NEXT_DATA__');
+                if (nd) {
+                  var props = JSON.parse(nd.textContent).props.pageProps;
+                  if (props && props.chapter) {
+                    var tgt = isNext ? props.chapter.nextChapter : props.chapter.prevChapter;
+                    if (tgt) {
+                      window.location.href = tgt.url || tgt.path;
                       return true;
-                  }
-              }
-
-              var btns = document.querySelectorAll('button, .btn-prev, .prev_page, [class*="prev"]');
-              for (var k=0; k<btns.length; k++){
-                  var b = btns[k];
-                  var txt = (b.innerText || b.textContent || '').toLowerCase();
-                  if (!b.disabled && (txt.includes('prev') || b.className.includes('prev'))) { b.click(); return true; }
-              }
-
-              try {
-                var nextData = document.getElementById('__NEXT_DATA__');
-                if (nextData) {
-                  var props = JSON.parse(nextData.textContent).props.pageProps;
-                  if (props && props.chapter && props.chapter.prevChapter) {
-                    window.location.href = props.chapter.prevChapter.url || ('/series/' + props.chapter.series_slug + '/' + props.chapter.prevChapter.chapter_slug);
-                    return true;
+                    }
                   }
                 }
               } catch(e){}
 
-              window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', keyCode: 37, code: 'ArrowLeft', bubbles: true }));
+              window.dispatchEvent(new KeyboardEvent('keydown', {
+                key: isNext ? 'ArrowRight' : 'ArrowLeft',
+                keyCode: isNext ? 39 : 37,
+                code: isNext ? 'ArrowRight' : 'ArrowLeft',
+                bubbles: true
+              }));
               return false;
             })();
         """.trimIndent()
@@ -640,17 +644,29 @@ class ReaderDialog : DialogFragment() {
                 if (ticks > 40) { clearInterval(timer); return; }
 
                 if (ticks === 1) {
-                    var triggers = document.querySelectorAll('.rpage-floatctl__chap, .chapter-list-btn, .btn-chapter-list, .toggle-chapters, [aria-label*="chapter" i], [title*="chapter" i]');
+                    var triggers = document.querySelectorAll('.rpage-floatctl__chap, .chapter-list-btn, .btn-chapter-list, .toggle-chapters');
+                    if (triggers.length === 0) {
+                        triggers = document.querySelectorAll('[aria-label*="chapter list" i], [aria-label*="chapter menu" i], [title*="chapter list" i]');
+                    }
                     if (triggers.length > 0) triggers[0].click();
                 }
 
-                var links = document.querySelectorAll('a');
-                for (var i = 0; i < links.length; i++) {
-                    var href = links[i].getAttribute('href') || '';
-                    var text = (links[i].innerText || links[i].textContent || '').trim().toLowerCase();
+                var anchors = document.querySelectorAll('a[href]');
+                for (var i = 0; i < anchors.length; i++) {
+                    var aHref = anchors[i].href || '';
+                    var hm = /(?:chapter|ch)[-/]?(\d+(?:\.\d+)?)/i.exec(aHref);
+                    if (hm && parseFloat(hm[1]) === parseFloat(targetCh)) {
+                        window.location.href = aHref;
+                        clearInterval(timer);
+                        return;
+                    }
+                }
 
-                    if (text === 'chapter ' + targetCh || text === 'ch ' + targetCh || text === 'ch. ' + targetCh || href.match(new RegExp('chapter[-/]' + targetCh + '($|[^0-9])'))) {
-                        window.location.href = links[i].href;
+                for (var k = 0; k < anchors.length; k++) {
+                    var txt = (anchors[k].innerText || anchors[k].textContent || '').trim().toLowerCase();
+                    if ((txt === 'chapter ' + targetCh || txt === 'ch ' + targetCh || txt === 'ch. ' + targetCh)
+                        && !/(?:chapter|ch)[-/]?(\d+)/i.test(anchors[k].href || '')) {
+                        window.location.href = anchors[k].href;
                         clearInterval(timer);
                         return;
                     }
@@ -695,9 +711,11 @@ class ReaderDialog : DialogFragment() {
     }
 
     private fun injectReaderJs(view: WebView) {
+        val diag = if (Settings.verboseLog()) "true" else "false"
         view.evaluateJavascript(
             """
             (function(){
+              window.__mmDiag = $diag;
               function mmInject(retries) {
                 if (retries === undefined) retries = 0;
                 try {
@@ -724,7 +742,9 @@ class ReaderDialog : DialogFragment() {
                       [src*="amazon-adsystem"], [src*="taboola"], [src*="outbrain"],
                       [src*="criteo"], [src*="popads"], [src*="propellerads"],
                       [src*="exoclick"], [src*="adsterra"], [src*="hilltopads"],
-                      [src*="clickadu"], [src*="smartfloralab"] { display: none !important; }
+                      [src*="clickadu"], [src*="smartfloralab"], [src*="openx"],
+                      [src*="sharethrough"], [src*="media.net"], [src*="mgid"],
+                      [src*="zergnet"], [src*="gumgum"], [src*="teads"] { display: none !important; }
 
                       [class^="ad-"], [class*=" ad-"], [class*="-ad-"], [class$="-ad"], [class~="ad"],
                       [id^="ad-"], [id*=" ad-"], [id*="-ad-"], [id$="-ad"], [id~="ad"],
@@ -733,9 +753,14 @@ class ReaderDialog : DialogFragment() {
                       [class*="advert"], [id*="advert"],
                       [class*="sponsor"], [id*="sponsor"],
                       [class^="promo-"], [class*=" promo-"], [class*="-promo-"], [class$="-promo"], [class~="promo"],
+                      [class*="adsense"], [class*="adsbygoogle"], [id*="google_ads"],
+                      [id*="div-gpt-ad"], [id*="div-gpt"], [id*="aswift"],
+                      ins.adsbygoogle, ins[data-ad-slot], ins[data-ad-client],
+                      [data-google-query-id], [data-ad-slot], [data-ad-client],
                       iframe[src*="ads"], iframe[src*="pop"],
                       iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
-                      iframe[src*="smartfloralab"] { display: none !important; }
+                      iframe[src*="smartfloralab"], iframe[src*="openx"],
+                      [class*="video-ad"], [class*="video-slider-ad"] { display: none !important; }
 
                       header, footer, .header, .footer, .site-header, .site-footer, #header, #footer, .navbar,
                       .google-anno, .cookie-notice, [class*="cookie-"], [id*="cookie-"],
@@ -807,7 +832,6 @@ class ReaderDialog : DialogFragment() {
                         var a = links[i];
                         var href = a.href;
                         if (!href || href.indexOf('javascript:') === 0 || href.slice(-1) === '#') continue;
-
                         var rel   = (a.getAttribute('rel') || '').toLowerCase();
                         var txt   = (a.innerText || a.textContent || '').trim().toLowerCase();
                         var title = (a.getAttribute('title') || '').toLowerCase();
@@ -817,21 +841,13 @@ class ReaderDialog : DialogFragment() {
                         if (rel === 'next') nScore = 3;
                         else if (txt.includes('next chapter') || title.includes('next chapter') || aria.includes('next chapter')) nScore = 2;
                         else if (txt === 'next' && a.offsetParent !== null) nScore = 1;
-
-                        if (nScore > bestNextScore) {
-                          bestNextScore = nScore;
-                          bestNextUrl = href;
-                        }
+                        if (nScore > bestNextScore) { bestNextScore = nScore; bestNextUrl = href; }
 
                         var pScore = 0;
                         if (rel === 'prev' || rel === 'previous') pScore = 3;
                         else if (txt.includes('prev chapter') || txt.includes('previous chapter') || title.includes('prev chapter') || aria.includes('prev chapter')) pScore = 2;
                         else if ((txt === 'prev' || txt === 'previous') && a.offsetParent !== null) pScore = 1;
-
-                        if (pScore > bestPrevScore) {
-                          bestPrevScore = pScore;
-                          bestPrevUrl = href;
-                        }
+                        if (pScore > bestPrevScore) { bestPrevScore = pScore; bestPrevUrl = href; }
                       }
                       if (bestNextUrl) window.__mmCachedNextUrl = bestNextUrl;
                       if (bestPrevUrl) window.__mmCachedPrevUrl = bestPrevUrl;
@@ -848,6 +864,7 @@ class ReaderDialog : DialogFragment() {
                                '[class*="advert"], [id*="advert"], ' +
                                '[class*="sponsor"], [id*="sponsor"], ' +
                                '[class^="promo-"], [class*=" promo-"], [class*="-promo-"], [class$="-promo"], [class~="promo"], ' +
+                               '[class*="adsense"], [class*="adsbygoogle"], [id*="google_ads"], ' +
                                '.ai-top-bar, [class^="ai-top-bar"]';
 
                   function isInChrome(el) {
@@ -880,9 +897,7 @@ class ReaderDialog : DialogFragment() {
                   function isPageWrapper(el) {
                     if (!el || el.nodeType !== 1) return false;
                     try {
-                      if (el.matches && el.matches(
-                        '.rpage-page, .page-break, .chapter-item, canvas.rpage-page__img, .rpage-page__img'
-                      )) return true;
+                      if (el.matches && el.matches('.rpage-page, .page-break, .chapter-item, canvas.rpage-page__img, .rpage-page__img')) return true;
                     } catch(e) {}
                     return false;
                   }
@@ -907,7 +922,6 @@ class ReaderDialog : DialogFragment() {
                   function isContentPage(el) {
                     if (!el || (el.tagName !== 'IMG' && el.tagName !== 'CANVAS')) return false;
                     if (!document.documentElement.contains(el) || isInChrome(el)) return false;
-
                     var cs;
                     try { cs = getComputedStyle(el); } catch(e) { cs = null; }
                     if (cs) {
@@ -915,19 +929,16 @@ class ReaderDialog : DialogFragment() {
                       var op = parseFloat(cs.opacity);
                       if (!isNaN(op) && op < 0.1) return false;
                     }
-
                     var rect;
                     try { rect = el.getBoundingClientRect(); } catch(e) { rect = null; }
                     var nw = el.naturalWidth || el.width || 0;
                     var nh = el.naturalHeight || el.height || 0;
                     var w = Math.max(rect ? rect.width : 0, nw);
                     var h = Math.max(rect ? rect.height : 0, nh);
-
                     if (w < 200 || h < 220) return false;
                     var vw = window.innerWidth || document.documentElement.clientWidth || 360;
                     if (w < vw * 0.4) return false;
                     if (h > 0 && w / h > 4) return false;
-
                     return true;
                   }
 
@@ -942,7 +953,6 @@ class ReaderDialog : DialogFragment() {
                       }
                     }
                     if (candidates.length < 2) return null;
-
                     var buckets = {};
                     for (var j = 0; j < candidates.length; j++) {
                       var b = Math.round(candidates[j].w / 50);
@@ -951,18 +961,13 @@ class ReaderDialog : DialogFragment() {
                     var bestBucket = -1, bestCount = 0;
                     for (var k in buckets) {
                       if (Object.prototype.hasOwnProperty.call(buckets, k)) {
-                        if (buckets[k] > bestCount) {
-                          bestCount = buckets[k];
-                          bestBucket = parseInt(k, 10);
-                        }
+                        if (buckets[k] > bestCount) { bestCount = buckets[k]; bestBucket = parseInt(k, 10); }
                       }
                     }
                     if (bestBucket < 0 || bestCount < 2) return null;
-
                     var targetW = bestBucket * 50;
                     var vw = window.innerWidth || document.documentElement.clientWidth || 360;
                     if (targetW < vw * 0.5) return null;
-
                     var result = null;
                     for (var m = 0; m < candidates.length; m++) {
                       if (Math.abs(candidates[m].w - targetW) <= 35) result = candidates[m].el;
@@ -974,14 +979,10 @@ class ReaderDialog : DialogFragment() {
                     if (!el || !el.style) return;
                     if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.tagName === 'LINK') return;
                     if (isEssentialNavOrModal(el) || isOrContainsUnloadedPage(el)) return;
-
                     var cs;
                     try { cs = getComputedStyle(el); } catch(e) { cs = null; }
                     if (cs && (cs.position === 'fixed' || cs.position === 'sticky')) return;
-
-                    try {
-                      el.style.setProperty('display', 'none', 'important');
-                    } catch(e) {}
+                    try { el.style.setProperty('display', 'none', 'important'); } catch(e) {}
                   }
 
                   function collapseBottomSpacing(startEl) {
@@ -1003,12 +1004,9 @@ class ReaderDialog : DialogFragment() {
                   window.__mmTruncateBottom = function() {
                     try {
                       cacheNavLinks();
-
                       var last = findLastContentPage();
                       if (!last) return;
-
                       var reader = findReaderContainer(last) || getScroller();
-
                       var start;
                       if (reader) {
                         start = reader;
@@ -1017,7 +1015,6 @@ class ReaderDialog : DialogFragment() {
                         var p2 = p1 ? p1.parentElement : null;
                         start = p2 || p1 || last;
                       }
-
                       var cur = start, guard = 0;
                       while (cur && cur.parentElement && cur !== document.body && cur !== document.documentElement && guard++ < 15) {
                         var sib = cur.nextElementSibling;
@@ -1027,7 +1024,6 @@ class ReaderDialog : DialogFragment() {
                         }
                         cur = cur.parentElement;
                       }
-
                       if (start && start.parentElement) collapseBottomSpacing(start.parentElement);
                     } catch(e) {}
                   };
@@ -1057,7 +1053,6 @@ class ReaderDialog : DialogFragment() {
                     [250, 600, 1200, 2500, 5000].forEach(function(d) {
                       setTimeout(function() { try { window.__mmTruncateBottom(); } catch(e) {} }, d);
                     });
-
                     if (window.MutationObserver) {
                       var moTimer = null;
                       var mo = new MutationObserver(function() {
@@ -1069,7 +1064,6 @@ class ReaderDialog : DialogFragment() {
                       });
                       mo.observe(document.body || document.documentElement, { childList: true, subtree: true });
                     }
-
                     var loadTimer = null;
                     document.addEventListener('load', function(e) {
                       if (e.target && (e.target.tagName === 'IMG' || e.target.tagName === 'CANVAS')) {
@@ -1091,6 +1085,15 @@ class ReaderDialog : DialogFragment() {
                           'iframe[src*="googlesyndication"], iframe[src*="adservice.google"], ' +
                           'iframe[src*="amazon-adsystem"], iframe[src*="taboola"], ' +
                           'iframe[src*="outbrain"], iframe[src*="criteo"], ' +
+                          'iframe[src*="openx"], iframe[src*="sharethrough"], ' +
+                          'iframe[src*="media.net"], iframe[src*="mgid"], ' +
+                          'iframe[src*="zergnet"], iframe[src*="gumgum"], ' +
+                          '[class*="ad-slot"], [class*="ad-slot "], [class$="ad-slot"], ' +
+                          '[class*="ad-container"], [class*="ad-wrapper"], ' +
+                          '[class^="adsense"], [class*=" adsense"], [class*="adsbygoogle"], ' +
+                          'ins.adsbygoogle, ins[data-ad-slot], ' +
+                          '[data-google-query-id], [data-ad-slot], [data-ad-client], ' +
+                          '[id*="google_ads"], [id*="div-gpt"], [id*="aswift"], ' +
                           '[class^="ad-banner"], [class*=" ad-banner"], ' +
                           '[class*="video-ad"], [class*="video-slider-ad"]'
                         );
@@ -1105,6 +1108,17 @@ class ReaderDialog : DialogFragment() {
                           el.style.setProperty('opacity', '0', 'important');
                           el.style.setProperty('pointer-events', 'none', 'important');
                           el.style.setProperty('z-index', '-9999', 'important');
+                        }
+                        var emptyAds = document.querySelectorAll(
+                          '[class^="ad-"]:empty, [class*=" ad-"]:empty, [class*="-ad-"]:empty, ' +
+                          '[class*="adsense"]:empty, [class*="adsbygoogle"]:empty, ' +
+                          '[id^="google_ads"]:empty, [data-ad-slot]:empty, [data-google-query-id]:empty'
+                        );
+                        for (var k = 0; k < emptyAds.length; k++) {
+                          var em = emptyAds[k];
+                          if (em.offsetHeight > 5) {
+                            em.style.setProperty('display', 'none', 'important');
+                          }
                         }
                         if (document.body) {
                           document.body.style.setProperty('padding-top', '0', 'important');
@@ -1167,7 +1181,6 @@ class ReaderDialog : DialogFragment() {
                     function handleTap(x, y) {
                       var now = Date.now(); if (now - last < DEBOUNCE) return; last = now;
                       var w = window.innerWidth, h = window.innerHeight;
-
                       if (x < w * 0.25) {
                         scrollByPage(-0.8); flash(x, y);
                       } else if (x > w * 0.75) {
@@ -1282,6 +1295,102 @@ class ReaderDialog : DialogFragment() {
                       [0, 60, 150, 300, 500, 800, 1200, 1700, 2400, 3200, 4000].forEach(function (d) { setTimeout(apply, d); });
                     };
                   }
+
+                  // === Layer 3 — DIAGNOSTICS ===
+                  // Only runs once per page load, only when verboseLog is on.
+                  // Sends results to JsBridge.onAdAudit() → logcat tag "MangaManhwa/AdAudit"
+
+                  if (window.__mmDiag && !window.__mmAuditScheduled) {
+                    window.__mmAuditScheduled = true;
+
+                    function runDomAudit(tag) {
+                      try {
+                        var suspects = [];
+                        var seen = new Set();
+                        var adWords = ['ad', 'ads', 'advert', 'banner', 'sponsor', 'promo',
+                                       'popup', 'overlay', 'cookie', 'subscribe', 'newsletter'];
+                        var all = document.querySelectorAll('*');
+                        for (var i = 0; i < all.length; i++) {
+                          var el = all[i];
+                          if (seen.has(el)) continue;
+                          var idCls = ((el.id || '') + ' ' + (el.className && el.className.toString ? el.className.toString() : '')).toLowerCase();
+                          var matched = false;
+                          for (var w = 0; w < adWords.length; w++) {
+                            if (idCls.indexOf(adWords[w]) >= 0) { matched = true; break; }
+                          }
+                          if (!matched &&
+                              !el.hasAttribute('data-ad') &&
+                              !el.hasAttribute('data-ad-slot') &&
+                              !el.hasAttribute('data-google-query-id')) continue;
+                          var r = el.getBoundingClientRect();
+                          if (r.width < 20 || r.height < 20) continue;
+                          var cs = getComputedStyle(el);
+                          if (cs.display === 'none' || cs.visibility === 'hidden' ||
+                              parseFloat(cs.opacity) < 0.1) continue;
+                          seen.add(el);
+                          suspects.push({
+                            tag: el.tagName,
+                            id: el.id || '',
+                            cls: (el.className && el.className.toString ? el.className.toString() : '').slice(0, 80),
+                            w: Math.round(r.width),
+                            h: Math.round(r.height),
+                            x: Math.round(r.x),
+                            y: Math.round(r.y),
+                            pos: cs.position,
+                            z: cs.zIndex,
+                            src: el.src || el.getAttribute('data-src') || el.getAttribute('data-lazy-src') || ''
+                          });
+                        }
+                        if (window.MMReader && window.MMReader.onAdAudit) {
+                          window.MMReader.onAdAudit('DOM[' + tag + ']:' + JSON.stringify(suspects));
+                        }
+                      } catch(e) {
+                        if (window.MMReader && window.MMReader.onAdAudit) {
+                          window.MMReader.onAdAudit('DOMERR:' + tag + ':' + e);
+                        }
+                      }
+                    }
+
+                    function runPixelScan(tag) {
+                      try {
+                        var out = [];
+                        var w = window.innerWidth, h = window.innerHeight;
+                        var ys = [Math.round(h * 0.05), Math.round(h * 0.2), Math.round(h * 0.4), Math.round(h * 0.6), Math.round(h * 0.8), Math.round(h * 0.95)];
+                        var xs = [Math.round(w * 0.15), Math.round(w * 0.5), Math.round(w * 0.85)];
+                        for (var yi = 0; yi < ys.length; yi++) {
+                          for (var xi = 0; xi < xs.length; xi++) {
+                            var x = xs[xi], y = ys[yi];
+                            var el = document.elementFromPoint(x, y);
+                            if (!el) continue;
+                            var path = [];
+                            var cur = el;
+                            for (var d = 0; d < 4 && cur; d++) {
+                              var seg = cur.tagName;
+                              if (cur.id) seg += '#' + cur.id;
+                              if (cur.className && cur.className.toString && cur.className.toString().trim().length > 0) {
+                                seg += '.' + cur.className.toString().trim().replace(/\s+/g, '.');
+                              }
+                              path.push(seg);
+                              cur = cur.parentElement;
+                            }
+                            out.push(x + ',' + y + ' → ' + path.join(' < '));
+                          }
+                        }
+                        if (window.MMReader && window.MMReader.onAdAudit) {
+                          window.MMReader.onAdAudit('PIXELS[' + tag + ']:' + out.join(' | '));
+                        }
+                      } catch(e) {
+                        if (window.MMReader && window.MMReader.onAdAudit) {
+                          window.MMReader.onAdAudit('PIXERR:' + tag + ':' + e);
+                        }
+                      }
+                    }
+
+                    setTimeout(function(){ runDomAudit('3s'); }, 3000);
+                    setTimeout(function(){ runPixelScan('4s'); }, 4000);
+                    setTimeout(function(){ runDomAudit('8s'); }, 8000);
+                    setTimeout(function(){ runPixelScan('9s'); }, 9000);
+                  }
                 } catch(e){ console.log("MM-Reader Error: " + e); }
               }
               mmInject(0);
@@ -1371,6 +1480,28 @@ class ReaderDialog : DialogFragment() {
         }
         @JavascriptInterface fun onBlockedPopup(url: String) {
             if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/ReaderDialog", "🚫 Popup blocked: $url")
+        }
+
+        /**
+         * Layer 3 — DOM audit / pixel scan output from JS.
+         * Chunks long JSON so logcat (4 KB/line limit) doesn't drop payload.
+         */
+        @JavascriptInterface fun onAdAudit(payload: String) {
+            if (!Settings.verboseLog()) return
+            val tag = "MangaManhwa/AdAudit"
+            val chunkSize = 3500
+            if (payload.length <= chunkSize) {
+                android.util.Log.e(tag, payload)
+            } else {
+                var i = 0
+                var part = 0
+                while (i < payload.length) {
+                    val end = minOf(i + chunkSize, payload.length)
+                    android.util.Log.e(tag, "[$part] " + payload.substring(i, end))
+                    i = end
+                    part++
+                }
+            }
         }
     }
 }
