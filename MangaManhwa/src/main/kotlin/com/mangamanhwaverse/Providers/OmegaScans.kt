@@ -35,6 +35,7 @@ import java.net.URLEncoder
 import java.util.ArrayDeque
 import java.util.Collections
 import java.util.IdentityHashMap
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
@@ -53,6 +54,7 @@ class OmegaScans : MangaManhwaProvider() {
     )
 
     private val webViewMutex = Mutex()
+    private val seriesIdCache = ConcurrentHashMap<String, String>()
 
     private val cfMarkers = listOf(
         "/cdn-cgi/challenge-platform/",
@@ -77,21 +79,21 @@ class OmegaScans : MangaManhwaProvider() {
         val isTrending = request.data == "trending_daily" || request.data == "trending_weekly"
         if (isTrending && page > 1) return null
 
-        val items = when (request.data) {
-            "trending_daily" -> fetchTrending("daily")
-            "trending_weekly" -> fetchTrending("weekly")
-            else -> fetchLatest(page)
+        return if (isTrending) {
+            val type = if (request.data == "trending_daily") "daily" else "weekly"
+            val items = fetchTrending(type)
+            newHomePageResponse(HomePageList(request.name, items), hasNext = false)
+        } else {
+            val (items, hasNext) = fetchLatestPage(page)
+            newHomePageResponse(HomePageList(request.name, items), hasNext = hasNext)
         }
-
-        val hasNext = !isTrending && items.isNotEmpty()
-        return newHomePageResponse(HomePageList(request.name, items), hasNext = hasNext)
     }
 
     // ======================================================================
     // Required Base Class Overrides
     // ======================================================================
     override suspend fun popular(page: Int): List<SearchResponse> {
-        return if (page == 1) fetchTrending("weekly") else fetchLatest(page)
+        return if (page == 1) fetchTrending("weekly") else fetchLatestPage(page).first
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -103,24 +105,32 @@ class OmegaScans : MangaManhwaProvider() {
         if (cleanQuery.isEmpty()) return emptyList()
         val enc = URLEncoder.encode(cleanQuery, "UTF-8")
 
-        // Stage 1: Direct OmegaScans Query API
-        val apiUrl = "https://api.omegascans.org/series/query?page=$page&perPage=30&query_string=$enc"
-        val apiJson = runCatching { app.get(apiUrl, headers = apiHeaders()).text }.getOrNull()
-        if (!apiJson.isNullOrBlank()) {
-            val apiResults = parseSeriesApiJson(apiJson)
-            if (apiResults.isNotEmpty()) {
-                log("✅ Search API ($cleanQuery, p$page): ${apiResults.size} items")
-                return apiResults
+        // Stage 1: HeanCMS /query endpoint on api.omegascans.org
+        val apiUrls = listOf(
+            "https://api.omegascans.org/query?query_string=$enc&series_type=Comic&perPage=30&page=$page&orderBy=total_views&order=desc&adult=true&status=All&tags_ids=%5B%5D",
+            "https://api.omegascans.org/query?query_string=$enc&series_type=Comic&perPage=30&page=$page& adult=true"
+        )
+        for (apiUrl in apiUrls) {
+            val apiJson = runCatching { app.get(apiUrl.replace(" ", ""), headers = apiHeaders()).text }.getOrNull()
+            if (!apiJson.isNullOrBlank()) {
+                val (apiResults, _) = parseSeriesApiJson(apiJson, page)
+                if (apiResults.isNotEmpty()) {
+                    log("✅ Search API ($cleanQuery, p$page): ${apiResults.size} items")
+                    return apiResults
+                }
             }
         }
 
-        // Stage 2: HTML Fallback
-        val url = "$baseUrl/series?site_query=$enc&page=$page"
-        val rawHtml = runCatching { app.get(url, headers = browserHeaders()).text }.getOrNull() ?: return emptyList()
-        val domResults = parseSeriesGrid(Jsoup.parse(rawHtml, baseUrl))
-        if (domResults.isNotEmpty()) return domResults
+        // Stage 2: HTML Fallback (page 1 only)
+        if (page == 1) {
+            val url = "$baseUrl/series?site_query=$enc"
+            val rawHtml = runCatching { app.get(url, headers = browserHeaders()).text }.getOrNull() ?: return emptyList()
+            val domResults = parseSeriesGrid(Jsoup.parse(rawHtml, baseUrl))
+            if (domResults.isNotEmpty()) return domResults
+            return decodeRscStream(rawHtml)?.let { parseSeriesFromRsc(it) } ?: emptyList()
+        }
 
-        return decodeRscStream(rawHtml)?.let { parseSeriesFromRsc(it) } ?: emptyList()
+        return emptyList()
     }
 
     // ======================================================================
@@ -135,7 +145,7 @@ class OmegaScans : MangaManhwaProvider() {
         }
 
         return try {
-            val results = parseSeriesApiJson(response)
+            val (results, _) = parseSeriesApiJson(response, 1)
             log("✅ Trending ($type): ${results.size} items")
             results
         } catch (e: Exception) {
@@ -144,28 +154,49 @@ class OmegaScans : MangaManhwaProvider() {
         }
     }
 
-    private fun parseSeriesApiJson(json: String): List<SearchResponse> {
+    private fun parseSeriesApiJson(json: String, requestedPage: Int): Pair<List<SearchResponse>, Boolean> {
         val trimmed = json.trim()
+        var hasNext = false
         val arr: JSONArray = when {
             trimmed.startsWith("[") -> JSONArray(trimmed)
             trimmed.startsWith("{") -> {
                 val root = JSONObject(trimmed)
+                val meta = root.optJSONObject("meta")
+                if (meta != null) {
+                    val lastPage = meta.optInt("last_page", meta.optInt("lastPage", -1))
+                    val nextUrl = meta.optString("next_page_url", "")
+                    hasNext = if (lastPage > 0) {
+                        requestedPage < lastPage
+                    } else {
+                        nextUrl.isNotBlank() && nextUrl != "null"
+                    }
+                }
                 root.optJSONArray("data")
                     ?: root.optJSONArray("results")
                     ?: root.optJSONArray("series")
                     ?: root.optJSONArray("items")
-                    ?: return emptyList()
+                    ?: return emptyList<SearchResponse>() to false
             }
-            else -> return emptyList()
+            else -> return emptyList<SearchResponse>() to false
         }
 
         val results = mutableListOf<SearchResponse>()
         val seen = mutableSetOf<String>()
         for (i in 0 until arr.length()) {
             val obj = arr.optJSONObject(i) ?: continue
+            val seriesType = obj.optString("series_type", "Comic")
+            if (seriesType.equals("Novel", ignoreCase = true)) continue
+
             val title = obj.optString("title").trim()
             val slug = obj.optString("series_slug").ifBlank { obj.optString("slug") }.trim()
             val thumbnail = obj.optString("thumbnail").ifBlank { obj.optString("cover") }.trim()
+            val idInt = obj.optInt("id", -1)
+            val idStr = if (idInt > 0) idInt.toString() else obj.optString("id").trim()
+
+            if (slug.isNotBlank() && idStr.isNotBlank()) {
+                seriesIdCache[slug] = idStr
+            }
+
             if (title.isNotBlank() && slug.isNotBlank()) {
                 val seriesUrl = "$baseUrl/series/$slug"
                 if (seen.add(seriesUrl)) {
@@ -177,50 +208,67 @@ class OmegaScans : MangaManhwaProvider() {
                 }
             }
         }
-        return results
+
+        if (!trimmed.startsWith("{") && results.size >= 20) {
+            hasNext = true
+        }
+        return results to hasNext
     }
 
     // ======================================================================
-    // Fetcher for Latest Updates (API + HTML + RSC Fallback)
+    // Fetcher for Latest Updates (HeanCMS /query API + Homepage Fallback)
     // ======================================================================
-    private suspend fun fetchLatest(page: Int): List<SearchResponse> {
-        // Stage 1: Paginated API
-        val apiUrl = "https://api.omegascans.org/series/query?page=$page&perPage=30&order=desc&orderBy=latest"
-        val apiResp = runCatching { app.get(apiUrl, headers = apiHeaders()).text }.getOrNull()
-        if (!apiResp.isNullOrBlank()) {
-            val apiItems = runCatching { parseSeriesApiJson(apiResp) }.getOrDefault(emptyList())
-            if (apiItems.isNotEmpty()) {
-                log("✅ Latest API (page=$page): ${apiItems.size} items")
-                return apiItems
+    private suspend fun fetchLatestPage(page: Int): Pair<List<SearchResponse>, Boolean> {
+        // Stage 1: HeanCMS /query API (supports full pagination for page 1, 2, 3...)
+        val queryUrls = listOf(
+            "https://api.omegascans.org/query?page=$page&perPage=30&series_type=Comic&query_string=&orderBy=latest&adult=true&order=desc&status=All&tags_ids=%5B%5D",
+            "https://api.omegascans.org/query?page=$page&perPage=30&series_type=Comic&orderBy=latest&order=desc&adult=true"
+        )
+
+        for (apiUrl in queryUrls) {
+            val apiResp = runCatching { app.get(apiUrl, headers = apiHeaders()).text }.getOrNull()
+            if (!apiResp.isNullOrBlank()) {
+                val parsed = runCatching { parseSeriesApiJson(apiResp, page) }.getOrNull()
+                if (parsed != null && parsed.first.isNotEmpty()) {
+                    log("✅ Latest API (page=$page): ${parsed.first.size} items (hasNext=${parsed.second})")
+                    return parsed
+                }
             }
         }
 
-        // Stage 2: HTML + RSC Fallback
-        val targetUrl = if (page <= 1) baseUrl else "$baseUrl/series?page=$page"
-        val rawHtml = runCatching {
-            app.get(targetUrl, headers = browserHeaders()).text
-        }.getOrNull() ?: run {
-            log("❌ Homepage fetch failed")
-            return emptyList()
+        // Stage 2: Homepage HTML + RSC Fallback (only valid on page 1; /series?page=2 is 404 on OmegaScans)
+        if (page > 1) {
+            log("⚠️ Latest API returned 0 items for page=$page")
+            return emptyList<SearchResponse>() to false
         }
 
-        log("📄 Homepage HTML (page=$page): ${rawHtml.length} bytes")
+        val rawHtml = runCatching {
+            app.get(baseUrl, headers = browserHeaders()).text
+        }.getOrNull() ?: run {
+            log("❌ Homepage fetch failed")
+            return emptyList<SearchResponse>() to false
+        }
+
+        log("📄 Homepage HTML (page=1): ${rawHtml.length} bytes")
+
+        // Also harvest any series_slug -> id mappings from the homepage RSC stream
+        decodeRscStream(rawHtml)?.let { harvestSeriesIdsFromRsc(it) }
 
         val domItems = parseSeriesGrid(Jsoup.parse(rawHtml, baseUrl))
         if (domItems.isNotEmpty()) {
             log("✅ Homepage DOM: ${domItems.size} items")
-            return domItems
+            return domItems to true
         }
 
         log("⚠️ Homepage DOM: 0 items — trying RSC")
         val rscItems = decodeRscStream(rawHtml)?.let { parseSeriesFromRsc(it) } ?: emptyList()
         if (rscItems.isNotEmpty()) {
             log("✅ Homepage RSC: ${rscItems.size} items")
-            return rscItems
+            return rscItems to true
         }
 
         log("❌ All homepage methods failed")
-        return emptyList()
+        return emptyList<SearchResponse>() to false
     }
 
     // ======================================================================
@@ -235,12 +283,21 @@ class OmegaScans : MangaManhwaProvider() {
         val seriesSlug = mangaUrl.substringBefore('?').substringBefore('#').trimEnd('/').substringAfterLast('/')
         log("▶️ chapters($mangaUrl) slug=$seriesSlug")
 
-        val rawHtml = prefetchedHtml ?: runCatching {
-            app.get(mangaUrl, headers = browserHeaders()).text
-        }.getOrNull()
+        // Fast-path: check if we already cached series_id from /query or /trending
+        var seriesId = seriesIdCache[seriesSlug]
+        var rawHtml: String? = prefetchedHtml
 
-        // Stage 1: Direct chapter/query API (Most complete & accurate source on OmegaScans)
-        val seriesId = rawHtml?.let { extractSeriesId(it, seriesSlug) }
+        if (seriesId == null) {
+            if (rawHtml == null) {
+                rawHtml = runCatching { app.get(mangaUrl, headers = browserHeaders()).text }.getOrNull()
+            }
+            seriesId = rawHtml?.let { extractSeriesId(it, seriesSlug) }
+            if (seriesId != null) {
+                seriesIdCache[seriesSlug] = seriesId
+            }
+        }
+
+        // Stage 1: Direct chapter/query API
         if (seriesId != null) {
             log("🎯 series_id=$seriesId — direct API")
             val apiUrl = "https://api.omegascans.org/chapter/query?page=1&perPage=10000&series_id=$seriesId"
@@ -256,7 +313,11 @@ class OmegaScans : MangaManhwaProvider() {
                 log("⚠️ Direct API: 0 chapters")
             }
         } else {
-            log("⚠️ No series_id in HTML")
+            log("⚠️ No series_id found for slug=$seriesSlug")
+        }
+
+        if (rawHtml == null) {
+            rawHtml = runCatching { app.get(mangaUrl, headers = browserHeaders()).text }.getOrNull()
         }
 
         // Stage 2: _next/data
@@ -350,10 +411,7 @@ class OmegaScans : MangaManhwaProvider() {
     // Parsing Helpers
     // ======================================================================
     private fun extractSeriesId(html: String, slug: String): String? {
-        val decoded = decodeRscStream(html) ?: html
-        val directRegex = Regex(""""series_id"\s*:\s*(\d+)""")
-        directRegex.find(decoded)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }?.let { return it }
-
+        val decoded = decodeRscStream(html) ?: return null
         val marker = "\"series_slug\":\"$slug\""
         val stack = ArrayDeque<Int>()
         var inStr = false
@@ -378,15 +436,48 @@ class OmegaScans : MangaManhwaProvider() {
                     val chunk = decoded.substring(start, end)
                     runCatching {
                         val obj = JSONObject(chunk)
-                        val idStr = obj.optString("id")
-                        if (idStr.isNotBlank()) return idStr
+                        if (obj.optString("series_slug") != slug) return@runCatching
                         val idInt = obj.optInt("id", -1)
                         if (idInt > 0) return idInt.toString()
+                        val idStr = obj.optString("id")
+                        if (idStr.isNotBlank()) return idStr
                     }
                 }
             }
         }
         return null
+    }
+
+    private fun harvestSeriesIdsFromRsc(rsc: String) {
+        val stack = ArrayDeque<Int>()
+        var inStr = false
+        var esc = false
+        for (i in rsc.indices) {
+            val c = rsc[i]
+            if (inStr) {
+                if (esc) esc = false else if (c == '\\') esc = true else if (c == '"') inStr = false
+                continue
+            }
+            when (c) {
+                '"' -> inStr = true
+                '{' -> stack.push(i)
+                '}' -> {
+                    if (stack.isEmpty()) continue
+                    val start = stack.pop()
+                    val chunk = rsc.substring(start, i + 1)
+                    if (!chunk.contains("\"series_slug\"")) continue
+                    runCatching {
+                        val obj = JSONObject(chunk)
+                        val slug = obj.optString("series_slug").trim()
+                        val idInt = obj.optInt("id", -1)
+                        val idStr = if (idInt > 0) idInt.toString() else obj.optString("id").trim()
+                        if (slug.isNotBlank() && idStr.isNotBlank()) {
+                            seriesIdCache[slug] = idStr
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private fun parseChapterQueryResponse(json: String, seriesSlug: String, out: MutableList<Episode>) {
@@ -605,6 +696,9 @@ class OmegaScans : MangaManhwaProvider() {
         val obj = JSONObject(chunk)
         val slug = obj.optString("series_slug").ifBlank { return null }
         val title = obj.optString("title").ifBlank { return null }
+        val idInt = obj.optInt("id", -1)
+        val idStr = if (idInt > 0) idInt.toString() else obj.optString("id").trim()
+        if (idStr.isNotBlank()) seriesIdCache[slug] = idStr
         newAnimeSearchResponse(title, "$baseUrl/series/$slug", TvType.Anime) {
             this.posterUrl = obj.optString("thumbnail").ifBlank { null }
         }
@@ -802,7 +896,6 @@ class OmegaScans : MangaManhwaProvider() {
         val statusStr = doc.select("span.uppercase")
             .firstOrNull { it.text().equals("Ongoing", true) || it.text().equals("Completed", true) }?.text()
 
-        // Reuse rawHtml so we don't fetch the series page twice
         val episodes = fetchChaptersInternal(url, prefetchedHtml = rawHtml)
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
