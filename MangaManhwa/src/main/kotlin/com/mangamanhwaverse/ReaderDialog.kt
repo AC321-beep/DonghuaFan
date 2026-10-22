@@ -129,8 +129,9 @@ class ReaderDialog : DialogFragment() {
                 if (existing?.isAdded == true) {
                     existing.loadUrl(chapterName, chapterUrl, targetChapter)
                 } else {
+                    val instance = newInstance(title, chapterName, chapterUrl, referer, targetChapter)
                     fm.beginTransaction()
-                        .add(newInstance(title, chapterName, chapterUrl, referer, targetChapter), TAG)
+                        .add(instance, TAG)
                         .commitAllowingStateLoss()
                 }
             }
@@ -177,20 +178,31 @@ class ReaderDialog : DialogFragment() {
     private fun rootDomain(host: String?): String? {
         if (host.isNullOrBlank()) return null
         val parts = host.lowercase(Locale.US).split(".")
-        return if (parts.size >= 2) parts.takeLast(2).joinToString(".") else host.lowercase(Locale.US)
+        return if (parts.size >= 2) {
+            parts.takeLast(2).joinToString(".")
+        } else {
+            host.lowercase(Locale.US)
+        }
     }
 
     private fun isSameSiteHost(requestHost: String?): Boolean {
         if (requestHost.isNullOrBlank()) return false
         val reqLower = requestHost.lowercase(Locale.US).removePrefix("www.")
-        val curHost = runCatching { URI(currentChapterUrl).host?.lowercase(Locale.US)?.removePrefix("www.") }.getOrNull() ?: return false
-        if (reqLower == curHost || reqLower.endsWith(".$curHost") \vert{}\vert{} curHost.endsWith(".$reqLower")) return true
+        val curHost = runCatching {
+            URI(currentChapterUrl).host?.lowercase(Locale.US)?.removePrefix("www.")
+        }.getOrNull() ?: return false
+
+        if (reqLower == curHost) return true
+        if (reqLower.endsWith(".$curHost")) return true
+        if (curHost.endsWith(".$reqLower")) return true
 
         val root = rootDomain(curHost) ?: return false
         if (reqLower == root || reqLower.endsWith(".$root")) return true
 
         val reqRoot = rootDomain(reqLower) ?: return false
-        return KNOWN_MIRROR_PREFIXES.any { root.startsWith(it) && reqRoot.startsWith(it) }
+        return KNOWN_MIRROR_PREFIXES.any { prefix ->
+            root.startsWith(prefix) && reqRoot.startsWith(prefix)
+        }
     }
 
     private fun isBlockedUrl(url: String): Boolean {
@@ -262,9 +274,17 @@ class ReaderDialog : DialogFragment() {
             addFlags(128)
         }
         d.setOnKeyListener { _, keyCode, event ->
-            if (keyCode != KeyEvent.KEYCODE_BACK || event.action != KeyEvent.ACTION_UP) return@setOnKeyListener false
+            if (keyCode != KeyEvent.KEYCODE_BACK || event.action != KeyEvent.ACTION_UP) {
+                return@setOnKeyListener false
+            }
             val wv = webView
-            if (wv?.canGoBack() == true) { wv.goBack(); true } else { dismissAllowingStateLoss(); true }
+            if (wv?.canGoBack() == true) {
+                wv.goBack()
+                true
+            } else {
+                dismissAllowingStateLoss()
+                true
+            }
         }
         return d
     }
@@ -296,7 +316,11 @@ class ReaderDialog : DialogFragment() {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View {
         val ctx = requireContext()
         val density = resources.displayMetrics.density
         fun dp(v: Int) = (v * density).toInt()
@@ -364,26 +388,38 @@ class ReaderDialog : DialogFragment() {
                     }
                 }
 
-                override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message): Boolean {
+                override fun onCreateWindow(
+                    view: WebView,
+                    isDialog: Boolean,
+                    isUserGesture: Boolean,
+                    resultMsg: Message
+                ): Boolean {
                     return false
                 }
             }
 
             webViewClient = object : WebViewClient() {
 
-                override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                override fun shouldInterceptRequest(
+                    view: WebView,
+                    request: WebResourceRequest
+                ): WebResourceResponse? {
                     val u = request.url?.toString() ?: return null
                     return if (isBlockedUrl(u)) createBlockedResponse(u) else null
                 }
 
-                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                override fun shouldOverrideUrlLoading(
+                    view: WebView,
+                    request: WebResourceRequest
+                ): Boolean {
                     val u = request.url?.toString() ?: return false
                     if (!u.startsWith("http://") && !u.startsWith("https://")) return true
                     if (isBlockedUrl(u)) return true
 
                     val reqHost = runCatching { URI(u).host?.lowercase(Locale.US) }.getOrNull()
                     if (request.isForMainFrame && reqHost != null && !isSameSiteHost(reqHost)) {
-                        val isCf = reqHost.endsWith("cloudflare.com") || u.contains("cdn-cgi/challenge-platform")
+                        val isCf = reqHost.endsWith("cloudflare.com") ||
+                            u.contains("cdn-cgi/challenge-platform")
                         if (!isCf) {
                             log("🚫 Blocked cross-domain redirect: $u")
                             return true
@@ -392,26 +428,42 @@ class ReaderDialog : DialogFragment() {
                     return false
                 }
 
-                override fun onReceivedSslError(view: WebView?, handler: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) {
+                override fun onReceivedSslError(
+                    view: WebView?,
+                    handler: android.webkit.SslErrorHandler?,
+                    error: android.net.http.SslError?
+                ) {
                     handler?.proceed()
                 }
 
-                override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                override fun onReceivedError(
+                    view: WebView,
+                    request: WebResourceRequest,
+                    error: WebResourceError
+                ) {
                     if (!request.isForMainFrame) return
                     val url = request.url?.toString() ?: ""
                     if (!url.contains(baseUrl(), true)) return
 
                     progressBar?.visibility = View.GONE
-                    val desc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) error.description.toString() else "Network error"
+                    val desc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        error.description.toString()
+                    } else {
+                        "Network error"
+                    }
                     view.loadData(
                         "<html><body style=\"background:#07080C;color:#94A3B8;font-family:sans-serif;padding:40px;text-align:center\"><h3 style=\"color:#E2E8F0\">Couldn't load chapter</h3><p>$desc</p><p style=\"font-size:12px;margin-top:24px;word-break:break-all\">$url</p></body></html>",
-                        "text/html", "UTF-8"
+                        "text/html",
+                        "UTF-8"
                     )
                 }
 
                 override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                     super.onPageStarted(view, url, favicon)
-                    view.evaluateJavascript("try { window.open = function(){ return null; }; } catch(e){}", null)
+                    view.evaluateJavascript(
+                        "try { window.open = function(){ return null; }; } catch(e){}",
+                        null
+                    )
                 }
 
                 override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
@@ -422,7 +474,8 @@ class ReaderDialog : DialogFragment() {
                         pendingScrollRestore = loadSavedScroll(url)
                     }
 
-                    val numStr = Regex("(?:chapter|ch)[/\\-_]?([\\d.]+)", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
+                    val numStr = Regex("(?:chapter|ch)[/\\-_]?([\\d.]+)", RegexOption.IGNORE_CASE)
+                        .find(url)?.groupValues?.get(1)
                     if (numStr != null) {
                         currentChapterUrl = url
                         currentChapterName = "Ch. $numStr"
@@ -444,15 +497,17 @@ class ReaderDialog : DialogFragment() {
                     progressBar?.visibility = View.GONE
 
                     val title = view.title?.lowercase() ?: ""
-                    if (title.contains("just a moment") || title.contains("attention required") || title.contains("checking your browser")) {
-                        return
-                    }
+                    val isCf = title.contains("just a moment") ||
+                        title.contains("attention required") ||
+                        title.contains("checking your browser")
+                    if (isCf) return
 
                     if (!url.isNullOrBlank()) {
                         runCatching {
                             val h = URI(url).host
-                            if (!h.isNullOrBlank() && !view.settings.userAgentString.isNullOrBlank()) {
-                                CFState.setUserAgent(h, view.settings.userAgentString)
+                            val ua = view.settings.userAgentString
+                            if (!h.isNullOrBlank() && !ua.isNullOrBlank()) {
+                                CFState.setUserAgent(h, ua)
                             }
                             CookieManager.getInstance().flush()
                         }
@@ -500,7 +555,10 @@ class ReaderDialog : DialogFragment() {
 
         val scroll = HorizontalScrollView(ctx).apply {
             isHorizontalScrollBarEnabled = false
-            layoutParams = LinearLayout.LayoutParams(0, -1, 1f).apply { leftMargin = dp(6); rightMargin = dp(6) }
+            layoutParams = LinearLayout.LayoutParams(0, -1, 1f).apply {
+                leftMargin = dp(6)
+                rightMargin = dp(6)
+            }
         }
         val middle = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -531,7 +589,14 @@ class ReaderDialog : DialogFragment() {
         return bar
     }
 
-    private fun btn(ctx: Context, density: Float, label: String, bg: String?, fg: String?, onClick: () -> Unit): TextView {
+    private fun btn(
+        ctx: Context,
+        density: Float,
+        label: String,
+        bg: String?,
+        fg: String?,
+        onClick: () -> Unit
+    ): TextView {
         fun dp(v: Int) = (v * density).toInt()
         return TextView(ctx).apply {
             text = label
@@ -564,8 +629,12 @@ class ReaderDialog : DialogFragment() {
     private fun haptic() {
         runCatching {
             val v = requireContext().getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) v.vibrate(VibrationEffect.createOneShot(15, VibrationEffect.DEFAULT_AMPLITUDE))
-            else @Suppress("DEPRECATION") v.vibrate(15)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                v.vibrate(VibrationEffect.createOneShot(15, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                v.vibrate(15)
+            }
         }
     }
 
@@ -590,7 +659,11 @@ class ReaderDialog : DialogFragment() {
               try {
                 var z = $zoom;
                 var s = document.getElementById('mm-zoom');
-                if (!s) { s = document.createElement('style'); s.id = 'mm-zoom'; document.head.appendChild(s); }
+                if (!s) {
+                  s = document.createElement('style');
+                  s.id = 'mm-zoom';
+                  document.head.appendChild(s);
+                }
                 s.innerHTML =
                   ':root { --rpage-max-w: ' + z + '% !important; }' +
                   'img:not([data-mm-ad="1"]):not([src*="600x300"]):not([src*="compr.gif"]), canvas { max-width: 100% !important; width: 100% !important; height: auto !important; display: block !important; margin: 0 auto !important; }' +
@@ -598,7 +671,8 @@ class ReaderDialog : DialogFragment() {
                   '{ width: ' + z + '% !important; max-width: ' + z + '% !important; margin: 0 auto !important; }';
               } catch(e) {}
             })();
-            """.trimIndent(), null
+            """.trimIndent(),
+            null
         )
     }
 
@@ -679,10 +753,15 @@ class ReaderDialog : DialogFragment() {
         targetChapter = 0
 
         val slug = extractSlug(currentChapterUrl)
-        val cachedDirect = if (slug.isNotBlank()) ComixProvider.getCachedChapterUrl(context, slug, target.toString()) else null
+        val cachedDirect = if (slug.isNotBlank()) {
+            ComixProvider.getCachedChapterUrl(context, slug, target.toString())
+        } else {
+            null
+        }
         if (!cachedDirect.isNullOrBlank() && cachedDirect != currentChapterUrl) {
             currentChapterUrl = cachedDirect
-            view.loadUrl(cachedDirect, mapOf("Referer" to referer, "User-Agent" to (view.settings.userAgentString ?: MangaManhwaProvider.UA)))
+            val ua = view.settings.userAgentString ?: MangaManhwaProvider.UA
+            view.loadUrl(cachedDirect, mapOf("Referer" to referer, "User-Agent" to ua))
             return
         }
 
@@ -716,14 +795,16 @@ class ReaderDialog : DialogFragment() {
     private fun promptJump() {
         val ctx = context ?: return
         val input = EditText(ctx).apply {
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER or
+                android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
             hint = "Chapter number"
         }
         AlertDialog.Builder(ctx)
             .setTitle("Jump to chapter")
             .setView(input)
             .setPositiveButton("Go") { _, _ ->
-                val n = input.text.toString().trim().toDoubleOrNull()?.toInt() ?: return@setPositiveButton
+                val n = input.text.toString().trim().toDoubleOrNull()?.toInt()
+                    ?: return@setPositiveButton
                 if (n <= 0) return@setPositiveButton
                 targetChapter = n
                 currentChapterName = "Ch. $n"
@@ -782,12 +863,14 @@ class ReaderDialog : DialogFragment() {
                 head.appendChild(s);
               }
 
-              // 1. Promote lazy-loaded images immediately so all chapter pages start loading
               function promoteLazyImages() {
                 var imgs = document.querySelectorAll('img');
                 for (var i = 0; i < imgs.length; i++) {
                   var img = imgs[i];
-                  var lazySrc = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('data-original') || img.getAttribute('data-cfsrc');
+                  var lazySrc = img.getAttribute('data-src') ||
+                    img.getAttribute('data-lazy-src') ||
+                    img.getAttribute('data-original') ||
+                    img.getAttribute('data-cfsrc');
                   if (lazySrc) {
                     lazySrc = lazySrc.trim();
                     var curSrc = (img.getAttribute('src') || '').trim();
@@ -800,15 +883,16 @@ class ReaderDialog : DialogFragment() {
                 }
               }
 
-              // 2. Universal Algorithmic Reader Container Detector (no image dimension checks, so unloaded lazy images are never skipped!)
               function detectReaderContainer() {
-                var known = document.querySelector('#readerarea, .reading-content, .comic-images-wrapper, .container-chapter-reader, .rpage-main__inner, .rpage-main, .chapter-content, .manga-reading, #chapter-content, .viewer');
+                var known = document.querySelector(
+                  '#readerarea, .reading-content, .comic-images-wrapper, .container-chapter-reader, ' +
+                  '.rpage-main__inner, .rpage-main, .chapter-content, .manga-reading, #chapter-content, .viewer'
+                );
                 if (known) {
                   known.setAttribute('data-mm-reader', '1');
                   return known;
                 }
 
-                // Algorithmic fallback for any unknown site: find parent element holding >= 3 chapter candidate images
                 var allMedia = document.querySelectorAll('img, canvas');
                 var counts = new Map();
                 var bestEl = null, bestCount = 0;
@@ -817,10 +901,10 @@ class ReaderDialog : DialogFragment() {
                   var m = allMedia[i];
                   if (m.closest && m.closest('header, nav, footer, aside, #comments, #disqus_thread')) continue;
                   var src = (m.getAttribute('data-src') || m.getAttribute('src') || '').toLowerCase();
-                  if (src.indexOf('logo') !== -1 || src.indexOf('avatar') !== -1 || src.indexOf('icon') !== -1 || src.indexOf('600x300') !== -1 || src.indexOf('compr.gif') !== -1) continue;
+                  if (src.indexOf('logo') !== -1 || src.indexOf('avatar') !== -1 || src.indexOf('icon') !== -1) continue;
+                  if (src.indexOf('600x300') !== -1 || src.indexOf('compr.gif') !== -1) continue;
 
                   var p = m.parentElement;
-                  // If each image is wrapped in its own <figure> or <div class="page">, step up one level to the list container
                   if (p && p.children.length <= 2 && p.parentElement && p.parentElement !== document.body) {
                     p = p.parentElement;
                   }
@@ -838,7 +922,6 @@ class ReaderDialog : DialogFragment() {
                 return null;
               }
 
-              // 3. Safe Algorithmic Bottom-Truncator & Sibling Cleaner
               function cleanAfterReader() {
                 try {
                   promoteLazyImages();
@@ -854,12 +937,15 @@ class ReaderDialog : DialogFragment() {
                     var sib = cur.nextElementSibling;
                     while (sib) {
                       if (!sib.contains(readerBox) && sib.tagName !== 'SCRIPT' && sib.tagName !== 'STYLE') {
-                        var hasKeep = (sib.matches && sib.matches(keepSel)) || (sib.querySelector && sib.querySelector(keepSel));
+                        var hasKeep = (sib.matches && sib.matches(keepSel)) ||
+                          (sib.querySelector && sib.querySelector(keepSel));
                         if (!hasKeep) {
                           var txt = (sib.innerText || sib.textContent || '').slice(0, 600);
                           var idCls = ((sib.id || '') + ' ' + (sib.className && sib.className.toString ? sib.className.toString() : ''));
-                          // Hide trailing siblings after the reader box that match footer/comment/recommendation patterns or have no chapter images
-                          var hasReaderImgs = sib.querySelectorAll && sib.querySelectorAll('img').length >= 3 && !junkRegex.test(idCls) && !junkRegex.test(txt);
+                          var hasReaderImgs = sib.querySelectorAll &&
+                            sib.querySelectorAll('img').length >= 3 &&
+                            !junkRegex.test(idCls) &&
+                            !junkRegex.test(txt);
                           if (!hasReaderImgs) {
                             sib.setAttribute('data-mm-ad', '1');
                           }
@@ -888,7 +974,6 @@ class ReaderDialog : DialogFragment() {
                 mo.observe(document.body || document.documentElement, { childList: true, subtree: true });
               }
 
-              // 4. Cache Next/Prev navigation links & harvest chapter URLs
               try {
                 var links = document.querySelectorAll('a[href]');
                 var harvested = {}, harvestCount = 0;
@@ -911,7 +996,6 @@ class ReaderDialog : DialogFragment() {
                 }
               } catch(e) {}
 
-              // 5. Report detected chapter number to toolbar
               try {
                 var chText = '';
                 var m = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
@@ -920,7 +1004,9 @@ class ReaderDialog : DialogFragment() {
                   var nd = document.getElementById('__NEXT_DATA__');
                   if (nd) {
                     var props = JSON.parse(nd.textContent).props.pageProps;
-                    if (props && props.chapter && props.chapter.chapter !== undefined) chText = 'Ch. ' + props.chapter.chapter;
+                    if (props && props.chapter && props.chapter.chapter !== undefined) {
+                      chText = 'Ch. ' + props.chapter.chapter;
+                    }
                   }
                 }
                 if (!chText) {
@@ -933,29 +1019,37 @@ class ReaderDialog : DialogFragment() {
               } catch(e) {}
 
               function getScroller() {
-                var sels = ['[data-mm-reader="1"]', '.rpage-main', '#readerarea', '.reading-content', '.chapter-content', '.comic-images-wrapper', '.container-chapter-reader'];
+                var sels = [
+                  '[data-mm-reader="1"]', '.rpage-main', '#readerarea', '.reading-content',
+                  '.chapter-content', '.comic-images-wrapper', '.container-chapter-reader'
+                ];
                 for (var k = 0; k < sels.length; k++) {
                   var el = document.querySelector(sels[k]);
                   if (el && el.scrollHeight > el.clientHeight + 20) {
                     var oy = window.getComputedStyle(el).overflowY;
-                    if (oy === 'auto' || oy === 'scroll' || oy === 'overlay' || el.classList.contains('rpage-main')) return el;
+                    if (oy === 'auto' || oy === 'scroll' || oy === 'overlay' || el.classList.contains('rpage-main')) {
+                      return el;
+                    }
                   }
                 }
                 return null;
               }
 
-              // 6. Tap Zones & Scroll Tracking
               if (!window.__mmTapInstalled) {
                 window.__mmTapInstalled = true;
                 var sx = 0, sy = 0, st = 0, last = 0, moved = false;
 
                 function ignored(el) {
-                  return el && el.closest && !!el.closest('a, button, input, textarea, select, [role="dialog"], .rpage-modal, .rpage-chaplist, .rpage-settings');
+                  return el && el.closest && !!el.closest(
+                    'a, button, input, textarea, select, [role="dialog"], .rpage-modal, .rpage-chaplist, .rpage-settings'
+                  );
                 }
 
                 function atBottom() {
                   var sc = getScroller();
-                  if (sc && sc.scrollHeight > sc.clientHeight) return (sc.scrollTop + sc.clientHeight) >= (sc.scrollHeight - 150);
+                  if (sc && sc.scrollHeight > sc.clientHeight) {
+                    return (sc.scrollTop + sc.clientHeight) >= (sc.scrollHeight - 150);
+                  }
                   var h = window.innerHeight || document.documentElement.clientHeight;
                   var y = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
                   var dh = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
@@ -982,9 +1076,15 @@ class ReaderDialog : DialogFragment() {
                   var now = Date.now(); if (now - last < 180) return; last = now;
                   var w = window.innerWidth, h = window.innerHeight;
                   flash(x, y);
-                  if (x < w * 0.25) scrollByPage(-0.8);
-                  else if (x > w * 0.75) { if (atBottom() && window.MMReader) window.MMReader.onNext(); else scrollByPage(0.8); }
-                  else { if (atBottom() && y > h * 0.75 && window.MMReader) window.MMReader.onNext(); else if (window.MMReader) window.MMReader.onCenterTap(); }
+                  if (x < w * 0.25) {
+                    scrollByPage(-0.8);
+                  } else if (x > w * 0.75) {
+                    if (atBottom() && window.MMReader) window.MMReader.onNext();
+                    else scrollByPage(0.8);
+                  } else {
+                    if (atBottom() && y > h * 0.75 && window.MMReader) window.MMReader.onNext();
+                    else if (window.MMReader) window.MMReader.onCenterTap();
+                  }
                 }
 
                 document.addEventListener('touchstart', function(e){
@@ -1037,7 +1137,8 @@ class ReaderDialog : DialogFragment() {
                 };
               }
             })();
-            """.trimIndent(), null
+            """.trimIndent(),
+            null
         )
     }
 
@@ -1071,11 +1172,15 @@ class ReaderDialog : DialogFragment() {
 
         val directTargetUrl = if (shouldJump && slug.isNotBlank()) {
             ComixProvider.getCachedChapterUrl(context, slug, target.toString())
-        } else null
+        } else {
+            null
+        }
 
         val savedUrl = if (directTargetUrl == null && slug.isNotBlank() && !hasExplicitChapterInUrl && target == 0) {
             prefs.getString(slug, null)
-        } else null
+        } else {
+            null
+        }
 
         currentChapterUrl = directTargetUrl ?: savedUrl ?: url
         currentChapterName = if (target > 0 && name == "Chapter") "Ch. $target" else name
@@ -1109,7 +1214,11 @@ class ReaderDialog : DialogFragment() {
             chapterInfo?.text = currentChapterName
             return
         }
-        val clean = detectedTitle.substringBefore(" - ").substringBefore(" · ").substringBefore(" | ").trim()
+        val clean = detectedTitle
+            .substringBefore(" - ")
+            .substringBefore(" · ")
+            .substringBefore(" | ")
+            .trim()
         if (clean.isNotBlank() && !clean.equals("Ch. 0", true) && !clean.contains("Comix", true)) {
             currentChapterName = clean
             chapterInfo?.text = clean
@@ -1117,13 +1226,36 @@ class ReaderDialog : DialogFragment() {
     }
 
     class JsBridge(private val dialog: ReaderDialog) {
-        @JavascriptInterface fun onCenterTap() { dialog.activity?.runOnUiThread { dialog.toggleToolbar(); dialog.haptic() } }
-        @JavascriptInterface fun onNext() { dialog.activity?.runOnUiThread { dialog.haptic(); dialog.jsNext(1) } }
-        @JavascriptInterface fun onScrollPosition(url: String, y: Float) { dialog.saveScroll(url, y) }
-        @JavascriptInterface fun onChapterDetected(detectedTitle: String, detectedUrl: String) {
-            dialog.activity?.runOnUiThread { dialog.updateChapterTitle(detectedTitle, detectedUrl) }
+        @JavascriptInterface
+        fun onCenterTap() {
+            dialog.activity?.runOnUiThread {
+                dialog.toggleToolbar()
+                dialog.haptic()
+            }
         }
-        @JavascriptInterface fun onChaptersHarvested(jsonMap: String) {
+
+        @JavascriptInterface
+        fun onNext() {
+            dialog.activity?.runOnUiThread {
+                dialog.haptic()
+                dialog.jsNext(1)
+            }
+        }
+
+        @JavascriptInterface
+        fun onScrollPosition(url: String, y: Float) {
+            dialog.saveScroll(url, y)
+        }
+
+        @JavascriptInterface
+        fun onChapterDetected(detectedTitle: String, detectedUrl: String) {
+            dialog.activity?.runOnUiThread {
+                dialog.updateChapterTitle(detectedTitle, detectedUrl)
+            }
+        }
+
+        @JavascriptInterface
+        fun onChaptersHarvested(jsonMap: String) {
             runCatching {
                 val obj = JSONObject(jsonMap)
                 val ctx = dialog.context ?: return
