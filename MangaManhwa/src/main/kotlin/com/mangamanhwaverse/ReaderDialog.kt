@@ -19,6 +19,7 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -81,7 +82,12 @@ class ReaderDialog : DialogFragment() {
             "media.net", "mgid.com", "zergnet.com", "adroll.com", "gumgum.com",
             "33across.com", "teads.tv", "adsafeprotected.com",
             "serving-sys.com", "sizmek.com", "innovid.com",
-            "spotxchange.com", "tremorhub.com"
+            "spotxchange.com", "tremorhub.com",
+            // Newly audited ad/tracker hosts from FlameComics, Toonily, NyxScans, HiveScans
+            "radioonlinehd.com", "cleverwebserver.com", "adsboosters.xyz",
+            "dinomysstorm.com", "aqle3.com", "pubadx.one",
+            "perfops.net", "gcorelabs.com", "qcloudcdn.com",
+            "anyanalytics.org", "cdn.orange.com"
         )
 
         private val BLOCKED_URL_FRAGMENTS: List<String> = listOf(
@@ -94,7 +100,26 @@ class ReaderDialog : DialogFragment() {
             "600x300_compr",
             "_compr.gif",
             "google.com/g/collect",
-            "google-analytics.com/g/collect"
+            "google-analytics.com/g/collect",
+            "analytics.google.com/g/collect",
+            // Newly audited script/iframe fragments
+            "flamesradio.html",
+            "radioonlinehd.com",
+            "cleverwebserver.com",
+            "adsboosters.xyz",
+            "dinomysstorm.com",
+            "btag.min.js",
+            "pubadx-ad.js",
+            "pubadx.one",
+            "rom3.min.js",
+            "500b-bench.jpg",
+            "anyanalytics.org"
+        )
+
+        private val KNOWN_MIRROR_PREFIXES: List<String> = listOf(
+            "asura", "hive", "flame", "toonily", "mangakakalot",
+            "mangabat", "manganato", "natomanga", "manhuanext",
+            "cosmicscans", "omegascans", "mangatx", "mangabob", "nyxscans"
         )
 
         // Matches Comix's extensionless image CDN shards so isDiagnosticWorthy doesn't spam Logcat
@@ -103,7 +128,20 @@ class ReaderDialog : DialogFragment() {
             RegexOption.IGNORE_CASE
         )
 
-        fun show(activity: AppCompatActivity, title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int = 0) {
+        // Matches both /chapter-12, /chapter/12 AND FlameComics's /series/99/596241414bde1e53
+        private val EXPLICIT_CHAPTER_URL_REGEX = Regex(
+            """(?:(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)|/series/\d+/[0-9a-f]{8,})""",
+            RegexOption.IGNORE_CASE
+        )
+
+        fun show(
+            activity: AppCompatActivity,
+            title: String,
+            chapterName: String,
+            chapterUrl: String,
+            referer: String,
+            targetChapter: Int = 0
+        ) {
             if (activity.isFinishing || activity.isDestroyed) return
             val fm = activity.supportFragmentManager
             if (fm.isDestroyed) return
@@ -112,12 +150,20 @@ class ReaderDialog : DialogFragment() {
                 if (existing?.isAdded == true) {
                     existing.loadUrl(chapterName, chapterUrl, targetChapter)
                 } else {
-                    fm.beginTransaction().add(newInstance(title, chapterName, chapterUrl, referer, targetChapter), TAG).commitAllowingStateLoss()
+                    fm.beginTransaction()
+                        .add(newInstance(title, chapterName, chapterUrl, referer, targetChapter), TAG)
+                        .commitAllowingStateLoss()
                 }
             }
         }
 
-        fun newInstance(title: String, chapterName: String, chapterUrl: String, referer: String, targetChapter: Int) = ReaderDialog().apply {
+        fun newInstance(
+            title: String,
+            chapterName: String,
+            chapterUrl: String,
+            referer: String,
+            targetChapter: Int
+        ) = ReaderDialog().apply {
             arguments = Bundle().apply {
                 putString(ARG_TITLE, title)
                 putString(ARG_CHAPTER, chapterName)
@@ -157,11 +203,19 @@ class ReaderDialog : DialogFragment() {
 
     private fun isSameSiteHost(requestHost: String?): Boolean {
         if (requestHost.isNullOrBlank()) return false
-        val reqLower = requestHost.lowercase(Locale.US)
-        val curHost = runCatching { URI(currentChapterUrl).host?.lowercase(Locale.US) }.getOrNull() ?: return false
-        if (reqLower == curHost || reqLower.endsWith(".$curHost")) return true
+        val reqLower = requestHost.lowercase(Locale.US).removePrefix("www.")
+        val curHost = runCatching { URI(currentChapterUrl).host?.lowercase(Locale.US)?.removePrefix("www.") }.getOrNull() ?: return false
+        if (reqLower == curHost || reqLower.endsWith(".$curHost") || curHost.endsWith(".$reqLower")) return true
+
         val root = rootDomain(curHost) ?: return false
-        return reqLower == root || reqLower.endsWith(".$root")
+        if (reqLower == root || reqLower.endsWith(".$root")) return true
+
+        // Allow redirects between official mirror domains (e.g. hivetoon.com -> hivetoons.org, asuracomic.net -> asurascans.com)
+        val reqRoot = rootDomain(reqLower) ?: return false
+        for (prefix in KNOWN_MIRROR_PREFIXES) {
+            if (root.startsWith(prefix) && reqRoot.startsWith(prefix)) return true
+        }
+        return false
     }
 
     private fun isBlockedUrl(url: String): Boolean {
@@ -171,7 +225,6 @@ class ReaderDialog : DialogFragment() {
         if (COMIX_IMAGE_CDN_REGEX.containsMatchIn(url)) return false
 
         val lower = url.lowercase(Locale.US)
-        // Check fragments BEFORE same-host whitelist so OmegaScans self-hosted ad banners (600x300_compr.gif) are blocked
         for (frag in BLOCKED_URL_FRAGMENTS) {
             if (lower.contains(frag)) return true
         }
@@ -244,7 +297,7 @@ class ReaderDialog : DialogFragment() {
     }
 
     internal fun extractSlug(url: String): String {
-        val match = Regex("/(?:comic|title|series|manga)/([^/?#]+)").find(url)
+        val match = Regex("/(?:comic|comics|title|series|serie|manga)/([^/?#]+)").find(url)
         val slugRaw = match?.groupValues?.get(1) ?: return ""
         return slugRaw.substringBefore("-chapter-").trimEnd('-')
     }
@@ -253,7 +306,7 @@ class ReaderDialog : DialogFragment() {
         if (url.isBlank() || !url.startsWith("http")) return
         val slug = extractSlug(url)
         if (slug.isBlank()) return
-        val numStr = Regex("(?:chapter|ch)[-/]?(\\d+(?:\\.\\d+)?)", RegexOption.IGNORE_CASE)
+        val numStr = Regex("(?:chapter|ch)[/\\-_]?(\\d+(?:\\.\\d+)?)", RegexOption.IGNORE_CASE)
             .find(url)?.groupValues?.get(1) ?: return
         ComixProvider.cacheChapterUrl(context, slug, numStr, url)
     }
@@ -337,11 +390,15 @@ class ReaderDialog : DialogFragment() {
             setBackgroundColor(Color.parseColor("#07080C"))
         }
 
+        val cookieManager = CookieManager.getInstance()
+        cookieManager.setAcceptCookie(true)
+
         webView = WebView(ctx).apply {
             layoutParams = FrameLayout.LayoutParams(-1, -1)
             setBackgroundColor(Color.parseColor("#07080C"))
             isVerticalScrollBarEnabled = true
             isHorizontalScrollBarEnabled = false
+            cookieManager.setAcceptThirdPartyCookies(this, true)
 
             settings.apply {
                 javaScriptEnabled = true
@@ -357,8 +414,15 @@ class ReaderDialog : DialogFragment() {
                 javaScriptCanOpenWindowsAutomatically = false
                 setSupportMultipleWindows(true)
 
-                val defaultUa = try { WebSettings.getDefaultUserAgent(ctx) } catch (e: Exception) { MangaManhwaProvider.UA }
-                userAgentString = CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa
+                val host = runCatching { URI(currentChapterUrl).host }.getOrNull() ?: ""
+                val defaultUa = try {
+                    WebSettings.getDefaultUserAgent(ctx)
+                        .replace("; wv", "")
+                        .replace(Regex("""Version/\d+\.\d+\s*"""), "")
+                } catch (e: Exception) {
+                    MangaManhwaProvider.UA
+                }
+                userAgentString = CFState.userAgentFor(host)?.takeIf { it.isNotBlank() } ?: defaultUa
             }
 
             addJavascriptInterface(JsBridge(this@ReaderDialog), "MMReader")
@@ -431,7 +495,11 @@ class ReaderDialog : DialogFragment() {
                     val desc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) error.description.toString() else "Network error"
                     log("❌ WebView Load Error: $desc | URL:$url")
 
-                    view.loadData("<html><body style=\"background:#07080C;color:#94A3B8;font-family:sans-serif;padding:40px;text-align:center\"><h3 style=\"color:#E2E8F0\">Couldn't load chapter</h3><p>$desc</p><p style=\"font-size:12px;margin-top:24px;word-break:break-all\">$url</p></body></html>", "text/html", "UTF-8")
+                    view.loadData(
+                        "<html><body style=\"background:#07080C;color:#94A3B8;font-family:sans-serif;padding:40px;text-align:center\"><h3 style=\"color:#E2E8F0\">Couldn't load chapter</h3><p>$desc</p><p style=\"font-size:12px;margin-top:24px;word-break:break-all\">$url</p></body></html>",
+                        "text/html",
+                        "UTF-8"
+                    )
                 }
 
                 override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
@@ -458,7 +526,7 @@ class ReaderDialog : DialogFragment() {
                         pendingScrollRestore = loadSavedScroll(url)
                     }
 
-                    val numStr = Regex("(?:chapter|ch)[-/]?([\\d.]+)", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
+                    val numStr = Regex("(?:chapter|ch)[/\\-_]?([\\d.]+)", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
                     if (numStr != null) {
                         currentChapterUrl = url
                         currentChapterName = "Ch. $numStr"
@@ -469,6 +537,12 @@ class ReaderDialog : DialogFragment() {
                             prefs.edit().putString(slug, url).apply()
                         }
                         recordDiscoveredChapterUrl(url)
+                    } else if (EXPLICIT_CHAPTER_URL_REGEX.containsMatchIn(url)) {
+                        currentChapterUrl = url
+                        val slug = extractSlug(url)
+                        if (slug.isNotBlank()) {
+                            prefs.edit().putString(slug, url).apply()
+                        }
                     }
 
                     view.postDelayed({ injectReaderJs(view) }, 220L)
@@ -487,7 +561,16 @@ class ReaderDialog : DialogFragment() {
                     }
 
                     log("✅ WebView Page Finished: $url")
-                    if (!url.isNullOrBlank()) recordDiscoveredChapterUrl(url)
+                    if (!url.isNullOrBlank()) {
+                        runCatching {
+                            val h = URI(url).host
+                            if (!h.isNullOrBlank() && !view.settings.userAgentString.isNullOrBlank()) {
+                                CFState.setUserAgent(h, view.settings.userAgentString)
+                            }
+                            CookieManager.getInstance().flush()
+                        }
+                        recordDiscoveredChapterUrl(url)
+                    }
                     injectReaderJs(view)
                     applyZoom(view, currentZoom)
 
@@ -630,9 +713,10 @@ class ReaderDialog : DialogFragment() {
                   '.rpage-main, .rpage-main--long-strip { overflow-x: auto !important; }' +
                   'img:not([data-mm-ad="1"]):not([src*="600x300"]):not([src*="compr.gif"]), .rpage-page__img, canvas.rpage-page__img, canvas { max-width: 100% !important; width: 100% !important; height: auto !important; display: block !important; margin: 0 auto !important; }' +
                   ':is(.rpage-main__inner, .rpage-view, .rpage-view--pages, .reading-content, #readerarea, ' +
-                  '.viewer, .chapter-content, .manga-reading, #chapter-content) ' +
+                  '.viewer, .chapter-content, .manga-reading, #chapter-content, ' +
+                  '.comic-images-wrapper, .comic-body-container, .container-chapter-reader, .mantine-Stack-root) ' +
                   '{ width: ' + z + '% !important; max-width: ' + z + '% !important; margin: 0 auto !important; transition: width .15s ease-out, max-width .15s ease-out !important; }' +
-                  '.rpage-page, .swiper-zoom-container, .rpage-zoom-container { width: 100% !important; max-width: 100% !important; margin: 0 auto !important; }';
+                  '.rpage-page, .swiper-zoom-container, .rpage-zoom-container, figure.image-container { width: 100% !important; max-width: 100% !important; margin: 0 auto !important; }';
                 try {
                   var k = 'reader.default.v3';
                   var st = JSON.parse(localStorage.getItem(k) || '{}');
@@ -651,21 +735,40 @@ class ReaderDialog : DialogFragment() {
             (function(){
               var isNext = $isNext;
               var curNum = null;
-              var curMatch = /(?:chapter|ch)[-/]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
+              var curMatch = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
               if (curMatch) curNum = parseFloat(curMatch[1]);
 
+              // 1. Check Next.js __NEXT_DATA__ (FlameComics token-based chapters & standard Next.js readers)
+              try {
+                var nd = document.getElementById('__NEXT_DATA__');
+                if (nd) {
+                  var props = JSON.parse(nd.textContent).props.pageProps;
+                  if (props && props.chapter) {
+                    var tgt = isNext ? (props.chapter.nextChapter || props.nextChapter) : (props.chapter.prevChapter || props.prevChapter);
+                    if (tgt) {
+                      var tUrl = tgt.url || tgt.path || (tgt.token && props.chapter.series_id ? '/series/' + props.chapter.series_id + '/' + tgt.token : null);
+                      if (tUrl) {
+                        window.location.href = tUrl;
+                        return true;
+                      }
+                    }
+                  }
+                }
+              } catch(e){}
+
+              // 2. Check explicit rel="next"/"prev" or cached navigation links
               var candidates = [];
-              var relLink = document.querySelector(isNext ? 'a[rel="next"]' : 'a[rel="prev"]');
+              var relLink = document.querySelector(isNext ? 'a[rel="next"], a.next_page, a.btn-next' : 'a[rel="prev"], a.prev_page, a.btn-prev');
               if (relLink && relLink.href) candidates.push(relLink.href);
               if (isNext && window.__mmCachedNextUrl) candidates.push(window.__mmCachedNextUrl);
               if (!isNext && window.__mmCachedPrevUrl) candidates.push(window.__mmCachedPrevUrl);
 
               for (var i = 0; i < candidates.length; i++) {
                 var cUrl = candidates[i];
-                var cMatch = /(?:chapter|ch)[-/]?(\d+(?:\.\d+)?)/i.exec(cUrl);
-                if (!cMatch) continue;
-                var cNum = parseFloat(cMatch[1]);
-                if (curNum !== null) {
+                if (!cUrl || cUrl === window.location.href || cUrl.slice(-1) === '#') continue;
+                var cMatch = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(cUrl);
+                if (cMatch && curNum !== null) {
+                  var cNum = parseFloat(cMatch[1]);
                   if (isNext && cNum <= curNum) continue;
                   if (!isNext && cNum >= curNum) continue;
                 }
@@ -673,11 +776,12 @@ class ReaderDialog : DialogFragment() {
                 return true;
               }
 
+              // 3. Fallback: scan anchors for curNum + 1 / curNum - 1
               if (curNum !== null) {
                 var wantNum = isNext ? curNum + 1 : curNum - 1;
                 var anchors = document.querySelectorAll('a[href]');
                 for (var j = 0; j < anchors.length; j++) {
-                  var aMatch = /(?:chapter|ch)[-/]?(\d+(?:\.\d+)?)/i.exec(anchors[j].href);
+                  var aMatch = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(anchors[j].href);
                   if (aMatch && parseFloat(aMatch[1]) === wantNum) {
                     window.location.href = anchors[j].href;
                     return true;
@@ -685,26 +789,14 @@ class ReaderDialog : DialogFragment() {
                 }
               }
 
+              // 4. Fallback: aria-label or title buttons
               var btnSel = isNext
                 ? 'button[aria-label*="ext chapter" i], button[title*="ext chapter" i], a[aria-label*="ext chapter" i], a[title*="ext chapter" i]'
                 : 'button[aria-label*="rev chapter" i], button[title*="rev chapter" i], a[aria-label*="rev chapter" i], a[title*="rev chapter" i]';
               var btn = document.querySelector(btnSel);
               if (btn && !btn.disabled) { btn.click(); return true; }
 
-              try {
-                var nd = document.getElementById('__NEXT_DATA__');
-                if (nd) {
-                  var props = JSON.parse(nd.textContent).props.pageProps;
-                  if (props && props.chapter) {
-                    var tgt = isNext ? props.chapter.nextChapter : props.chapter.prevChapter;
-                    if (tgt) {
-                      window.location.href = tgt.url || tgt.path;
-                      return true;
-                    }
-                  }
-                }
-              } catch(e){}
-
+              // 5. Dispatch Left/Right Arrow keydown for SPA readers
               window.dispatchEvent(new KeyboardEvent('keydown', {
                 key: isNext ? 'ArrowRight' : 'ArrowLeft',
                 keyCode: isNext ? 39 : 37,
@@ -733,7 +825,7 @@ class ReaderDialog : DialogFragment() {
         val js = """
             (function() {
               var targetCh = $target;
-              var curMatch = /(?:chapter|ch)[-/]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
+              var curMatch = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
               if (curMatch && parseFloat(curMatch[1]) === parseFloat(targetCh)) return;
 
               var ticks = 0;
@@ -741,7 +833,7 @@ class ReaderDialog : DialogFragment() {
                 ticks++;
                 if (ticks > 40) { clearInterval(timer); return; }
 
-                var nowMatch = /(?:chapter|ch)[-/]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
+                var nowMatch = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
                 if (nowMatch && parseFloat(nowMatch[1]) === parseFloat(targetCh)) {
                     clearInterval(timer);
                     return;
@@ -762,7 +854,7 @@ class ReaderDialog : DialogFragment() {
 
                 for (var i = 0; i < anchors.length; i++) {
                     var aHref = anchors[i].href || '';
-                    var hm = /(?:chapter|ch)[-/]?(\d+(?:\.\d+)?)/i.exec(aHref);
+                    var hm = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(aHref);
                     if (hm && aHref.indexOf('http') === 0) {
                         harvested[hm[1]] = aHref;
                         harvestCount++;
@@ -785,7 +877,7 @@ class ReaderDialog : DialogFragment() {
                 for (var k = 0; k < anchors.length; k++) {
                     var txt = (anchors[k].innerText || anchors[k].textContent || '').trim().toLowerCase();
                     if ((txt === 'chapter ' + targetCh || txt === 'ch ' + targetCh || txt === 'ch. ' + targetCh)
-                        && !/(?:chapter|ch)[-/]?(\d+)/i.test(anchors[k].href || '')) {
+                        && !/(?:chapter|ch)[/\-_]?(\d+)/i.test(anchors[k].href || '')) {
                         window.location.href = anchors[k].href;
                         clearInterval(timer);
                         return;
@@ -845,7 +937,9 @@ class ReaderDialog : DialogFragment() {
                     return;
                   }
 
-                  var isOmega = window.location.hostname.indexOf('omegascans') !== -1;
+                  var host = window.location.hostname.toLowerCase();
+                  var isOmega = host.indexOf('omegascans') !== -1;
+                  var isFlame = host.indexOf('flamecomics') !== -1;
 
                   if (!document.getElementById('mm-css')) {
                     var s = document.createElement('style');
@@ -867,6 +961,11 @@ class ReaderDialog : DialogFragment() {
                       }
                       aside,
                       aside.fixed,
+                      [class*="Panel-module__"],
+                      [class*="Dock-module__"],
+                      [class*="TopChapterNavbar-module__"],
+                      iframe[src*="radioonlinehd"],
+                      iframe[src*="flamesradio"],
                       img[src*="600x300"],
                       img[src*="compr.gif"],
                       a:has(> img[src*="600x300"]),
@@ -891,7 +990,9 @@ class ReaderDialog : DialogFragment() {
                       [src*="exoclick"], [src*="exacdn"], [src*="adsterra"], [src*="hilltopads"],
                       [src*="clickadu"], [src*="smartfloralab"], [src*="openx"],
                       [src*="sharethrough"], [src*="media.net"], [src*="mgid"],
-                      [src*="zergnet"], [src*="gumgum"], [src*="teads"] { display: none !important; }
+                      [src*="zergnet"], [src*="gumgum"], [src*="teads"],
+                      [src*="pubadx"], [src*="adsboosters"], [src*="cleverwebserver"],
+                      [src*="dinomysstorm"], [src*="aqle3"] { display: none !important; }
 
                       [class^="ad-"], [class*=" ad-"], [class*="-ad-"], [class$="-ad"], [class~="ad"],
                       [id^="ad-"], [id*=" ad-"], [id*="-ad-"], [id$="-ad"], [id~="ad"],
@@ -910,6 +1011,7 @@ class ReaderDialog : DialogFragment() {
                       [class*="video-ad"], [class*="video-slider-ad"] { display: none !important; }
 
                       header, footer, .header, .footer, .site-header, .site-footer, #header, #footer, .navbar,
+                      .manga-reading-description, .c-breadcrumb-wrapper, .wp-manga-nav, .entry-header,
                       .google-anno, .cookie-notice, [class*="cookie-"], [id*="cookie-"],
                       .rpage-floatctl__col, .rpage-bottombar, .rpage-hoverzone, .rpage-dir2,
                       .rpage-strip-comments, .cm-widget, .share-block, .social-share, .sharedaddy,
@@ -927,7 +1029,8 @@ class ReaderDialog : DialogFragment() {
                       }
                       .rpage-main, .rpage-main--long-strip, .rpage-main__inner,
                       .reading-content, #readerarea, .viewer,
-                      .chapter-content, .manga-reading, #chapter-content {
+                      .chapter-content, .manga-reading, #chapter-content,
+                      .comic-images-wrapper, .comic-body-container, .container-chapter-reader {
                         padding-top: 0 !important;
                         margin-top: 0 !important;
                         padding-bottom: 0 !important;
@@ -937,11 +1040,32 @@ class ReaderDialog : DialogFragment() {
                     head.appendChild(s);
                   }
 
+                  // Force lazy-loaded images (Madara/Toonily/MangaThemesia) to load immediately
+                  function promoteLazyImages() {
+                    try {
+                      var imgs = document.querySelectorAll('.reading-content img, .page-break img, #readerarea img, .comic-images-wrapper img, .container-chapter-reader img, main img');
+                      for (var i = 0; i < imgs.length; i++) {
+                        var img = imgs[i];
+                        var lazySrc = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('data-original') || img.getAttribute('data-cfsrc');
+                        if (lazySrc) {
+                          lazySrc = lazySrc.trim();
+                          var curSrc = (img.getAttribute('src') || '').trim();
+                          if (lazySrc && (!curSrc || curSrc.indexOf('data:') === 0 || curSrc.indexOf('dflazy') !== -1)) {
+                            img.setAttribute('src', lazySrc);
+                          }
+                        }
+                        img.removeAttribute('loading');
+                        img.classList.remove('lazyload', 'lazyloading');
+                      }
+                    } catch(e) {}
+                  }
+
                   function getScroller() {
                     var candidates = [
                       '.rpage-main', '.rpage-main--long-strip',
                       '#readerarea', '.reading-content', '.chapter-content',
-                      '.manga-reading', '#chapter-content', '.viewer'
+                      '.manga-reading', '#chapter-content', '.viewer',
+                      '.comic-images-wrapper', '.comic-body-container', '.container-chapter-reader'
                     ];
                     for (var i = 0; i < candidates.length; i++) {
                       var el = document.querySelector(candidates[i]);
@@ -959,7 +1083,9 @@ class ReaderDialog : DialogFragment() {
                     var sels = '.rpage-main, .rpage-main--long-strip, .rpage-main__inner, ' +
                                '#readerarea, .reading-content, .chapter-content, ' +
                                '.manga-reading, #chapter-content, .viewer, ' +
-                               '.rpage-view, .rpage-view--pages';
+                               '.rpage-view, .rpage-view--pages, ' +
+                               '.comic-images-wrapper, .comic-body-container, ' +
+                               '.container-chapter-reader, .mantine-Stack-root';
                     var cur = start;
                     while (cur && cur !== document.body && cur !== document.documentElement) {
                       try {
@@ -983,7 +1109,7 @@ class ReaderDialog : DialogFragment() {
                         var href = a.href;
                         if (!href || href.indexOf('javascript:') === 0 || href.slice(-1) === '#') continue;
 
-                        var hm = /(?:chapter|ch)[-/]?(\d+(?:\.\d+)?)/i.exec(href);
+                        var hm = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(href);
                         if (hm && href.indexOf('http') === 0) {
                           harvested[hm[1]] = href;
                           harvestCount++;
@@ -995,13 +1121,13 @@ class ReaderDialog : DialogFragment() {
                         var aria  = (a.getAttribute('aria-label') || '').toLowerCase();
 
                         var nScore = 0;
-                        if (rel === 'next') nScore = 3;
+                        if (rel === 'next' || a.classList.contains('next_page')) nScore = 3;
                         else if (txt.includes('next chapter') || title.includes('next chapter') || aria.includes('next chapter')) nScore = 2;
                         else if (txt === 'next' && a.offsetParent !== null) nScore = 1;
                         if (nScore > bestNextScore) { bestNextScore = nScore; bestNextUrl = href; }
 
                         var pScore = 0;
-                        if (rel === 'prev' || rel === 'previous') pScore = 3;
+                        if (rel === 'prev' || rel === 'previous' || a.classList.contains('prev_page')) pScore = 3;
                         else if (txt.includes('prev chapter') || txt.includes('previous chapter') || title.includes('prev chapter') || aria.includes('prev chapter')) pScore = 2;
                         else if ((txt === 'prev' || txt === 'previous') && a.offsetParent !== null) pScore = 1;
                         if (pScore > bestPrevScore) { bestPrevScore = pScore; bestPrevUrl = href; }
@@ -1026,6 +1152,7 @@ class ReaderDialog : DialogFragment() {
                                '[class*="sponsor"], [id*="sponsor"], ' +
                                '[class^="promo-"], [class*=" promo-"], [class*="-promo-"], [class$="-promo"], [class~="promo"], ' +
                                '[class*="adsense"], [class*="adsbygoogle"], [id*="google_ads"], ' +
+                               '[class*="Panel-module__"], [class*="Dock-module__"], ' +
                                '.ai-top-bar, [class^="ai-top-bar"], [data-mm-ad="1"]';
 
                   function isInChrome(el) {
@@ -1047,10 +1174,9 @@ class ReaderDialog : DialogFragment() {
                     if (!img || img.tagName !== 'IMG') return false;
                     var src = (img.currentSrc || img.src || img.getAttribute('data-src') || '').toLowerCase();
                     if (src.indexOf('600x300') >= 0 || src.indexOf('compr.gif') >= 0) return true;
-                    if (isOmega) {
-                      var cls = (img.className && img.className.toString ? img.className.toString() : '').toLowerCase();
-                      if (cls.indexOf('max-w-[600px]') >= 0) return true;
-                    }
+                    var cls = (img.className && img.className.toString ? img.className.toString() : '');
+                    if (cls.indexOf('Panel-module__') >= 0 || cls.indexOf('Dock-module__') >= 0) return true;
+                    if (isOmega && cls.toLowerCase().indexOf('max-w-[600px]') >= 0) return true;
                     return false;
                   }
 
@@ -1064,13 +1190,13 @@ class ReaderDialog : DialogFragment() {
                     var src = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') ||
                               img.getAttribute('data-original') || img.getAttribute('data-cfsrc') ||
                               img.getAttribute('src') || '';
-                    return /\/chapter|\/page|\/pages\/|\/hi\/|\/\d{2,4}\.(jpg|jpeg|png|webp|avif)/i.test(src);
+                    return /\/chapter|\/page|\/pages\/|\/hi\/|\/uploads\/|\/\d{1,4}\.(jpg|jpeg|png|webp|avif)/i.test(src);
                   }
 
                   function isPageWrapper(el) {
                     if (!el || el.nodeType !== 1) return false;
                     try {
-                      if (el.matches && el.matches('.rpage-page, .page-break, .chapter-item, canvas.rpage-page__img, .rpage-page__img')) return true;
+                      if (el.matches && el.matches('.rpage-page, .page-break, .chapter-item, figure.image-container, canvas.rpage-page__img, .rpage-page__img')) return true;
                     } catch(e) {}
                     return false;
                   }
@@ -1080,7 +1206,7 @@ class ReaderDialog : DialogFragment() {
                     if (isPageWrapper(el)) return true;
                     if (el.tagName === 'IMG' && isPotentialPageImage(el)) return true;
                     try {
-                      var wrappers = el.querySelectorAll('.rpage-page, .page-break, .chapter-item, canvas.rpage-page__img, .rpage-page__img');
+                      var wrappers = el.querySelectorAll('.rpage-page, .page-break, .chapter-item, figure.image-container, canvas.rpage-page__img, .rpage-page__img');
                       for (var i = 0; i < wrappers.length; i++) {
                         if (!isInChrome(wrappers[i])) return true;
                       }
@@ -1163,18 +1289,26 @@ class ReaderDialog : DialogFragment() {
                     } catch(e) {}
                   }
 
-                  function killOmegaScansBanners() {
-                    if (!isOmega) return;
+                  function killSiteSpecificBanners() {
                     try {
-                      var asides = document.querySelectorAll('aside, [class*="z-[2147483647]"]');
-                      for (var a = 0; a < asides.length; a++) {
-                        if (asides[a].id === 'mm-tap-flash') continue;
-                        if (!isEssentialNavOrModal(asides[a])) {
-                          nukeEl(asides[a]);
+                      if (isOmega) {
+                        var asides = document.querySelectorAll('aside, [class*="z-[2147483647]"]');
+                        for (var a = 0; a < asides.length; a++) {
+                          if (asides[a].id === 'mm-tap-flash') continue;
+                          if (!isEssentialNavOrModal(asides[a])) {
+                            nukeEl(asides[a]);
+                          }
                         }
                       }
 
-                      var bannerImgs = document.querySelectorAll('img[src*="600x300"], img[src*="compr.gif"], img[class*="max-w-[600px]"]');
+                      if (isFlame) {
+                        var flameAds = document.querySelectorAll('[class*="Panel-module__"], [class*="Dock-module__"], [class*="TopChapterNavbar-module__"], iframe[src*="radioonlinehd"], iframe[src*="flamesradio"]');
+                        for (var f = 0; f < flameAds.length; f++) {
+                          nukeEl(flameAds[f]);
+                        }
+                      }
+
+                      var bannerImgs = document.querySelectorAll('img[src*="600x300"], img[src*="compr.gif"], img[class*="max-w-[600px]"], img[class*="Panel-module__"]');
                       for (var b = 0; b < bannerImgs.length; b++) {
                         var bImg = bannerImgs[b];
                         nukeEl(bImg);
@@ -1218,7 +1352,8 @@ class ReaderDialog : DialogFragment() {
 
                   window.__mmTruncateBottom = function() {
                     try {
-                      killOmegaScansBanners();
+                      promoteLazyImages();
+                      killSiteSpecificBanners();
                       cacheNavLinks();
                       var last = findLastContentPage();
                       if (!last) return;
@@ -1247,12 +1382,33 @@ class ReaderDialog : DialogFragment() {
                   function reportChapter() {
                     try {
                       var chText = '';
-                      var el = document.querySelector('.rpage-floatctl__chap .mono, .rpage-chap-ending__title, h1');
-                      if (el) chText = (el.innerText || el.textContent || '').trim();
-                      if (!chText || chText === 'Ch. 0' || chText === 'Ch.0') {
-                        var m = /(?:chapter|ch)[-/]?(\d+(\.\d+)?)/i.exec(window.location.href);
-                        if (m) chText = 'Ch. ' + m[1];
+                      // 1. Check URL first
+                      var m = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
+                      if (m) chText = 'Ch. ' + m[1];
+
+                      // 2. Check Next.js __NEXT_DATA__ (for FlameComics token URLs)
+                      if (!chText) {
+                        var nd = document.getElementById('__NEXT_DATA__');
+                        if (nd) {
+                          var props = JSON.parse(nd.textContent).props.pageProps;
+                          if (props && props.chapter && props.chapter.chapter !== undefined) {
+                            chText = 'Ch. ' + props.chapter.chapter;
+                          }
+                        }
                       }
+
+                      // 3. Check document.title
+                      if (!chText) {
+                        var tm = /(?:chapter|ch\.?)\s*(\d+(?:\.\d+)?)/i.exec(document.title || '');
+                        if (tm) chText = 'Ch. ' + tm[1];
+                      }
+
+                      // 4. Fallback to reader title elements
+                      if (!chText) {
+                        var el = document.querySelector('.rpage-floatctl__chap .mono, .rpage-chap-ending__title, h1:not(.sr-only)');
+                        if (el) chText = (el.innerText || el.textContent || '').trim();
+                      }
+
                       if (chText && chText !== 'Ch. 0' && chText !== 'Ch.0') {
                         if (window.MMReader && window.MMReader.onChapterDetected) {
                           window.MMReader.onChapterDetected(chText, window.location.href);
@@ -1272,7 +1428,7 @@ class ReaderDialog : DialogFragment() {
                     if (window.MutationObserver) {
                       var moTimer = null;
                       var mo = new MutationObserver(function() {
-                        if (isOmega) killOmegaScansBanners();
+                        killSiteSpecificBanners();
                         if (moTimer) clearTimeout(moTimer);
                         moTimer = setTimeout(function() {
                           moTimer = null;
@@ -1296,9 +1452,11 @@ class ReaderDialog : DialogFragment() {
                   if (!window.__mmAdInterval) {
                     window.__mmAdInterval = setInterval(function() {
                       try {
-                        killOmegaScansBanners();
+                        killSiteSpecificBanners();
                         var ads = document.querySelectorAll(
                           '.ai-top-bar, [class^="ai-top-bar"], ' +
+                          '[class*="Panel-module__"], [class*="Dock-module__"], ' +
+                          'iframe[src*="radioonlinehd"], iframe[src*="flamesradio"], ' +
                           'iframe[src*="smartfloralab"], iframe[src*="doubleclick"], ' +
                           'iframe[src*="googlesyndication"], iframe[src*="adservice.google"], ' +
                           'iframe[src*="amazon-adsystem"], iframe[src*="taboola"], ' +
@@ -1344,7 +1502,7 @@ class ReaderDialog : DialogFragment() {
                       var cur = el;
                       for (var i = 0; i < 4 && cur; i++) {
                         var cls = (cur.className && cur.className.toString()) || '';
-                        if (cls.indexOf('ai-top-bar') > -1) return true;
+                        if (cls.indexOf('ai-top-bar') > -1 || cls.indexOf('Panel-module__') > -1 || cls.indexOf('Dock-module__') > -1) return true;
                         if (cur.tagName === 'IFRAME' || cur.tagName === 'VIDEO' || cur.tagName === 'ASIDE') return true;
                         if (cur.tagName === 'IMG' && isBannerAdImage(cur)) return true;
                         cur = cur.parentElement;
@@ -1634,7 +1792,7 @@ class ReaderDialog : DialogFragment() {
         log("📖 Opening Reader: '$name' at $url (target=$target)")
 
         val slug = extractSlug(url)
-        val hasExplicitChapterInUrl = Regex("(?:chapter|ch)[-/]?(\\d+(?:\\.\\d+)?)", RegexOption.IGNORE_CASE).containsMatchIn(url)
+        val hasExplicitChapterInUrl = EXPLICIT_CHAPTER_URL_REGEX.containsMatchIn(url)
 
         val directTargetUrl = if (target > 0 && slug.isNotBlank()) {
             ComixProvider.getCachedChapterUrl(context, slug, target.toString())
@@ -1661,7 +1819,13 @@ class ReaderDialog : DialogFragment() {
 
         pendingScrollRestore = if (targetChapter > 0) -1f else loadSavedScroll(currentChapterUrl)
 
-        webView?.loadUrl(currentChapterUrl, mapOf("Referer" to referer, "User-Agent" to (webView?.settings?.userAgentString ?: MangaManhwaProvider.UA)))
+        val host = runCatching { URI(currentChapterUrl).host }.getOrNull() ?: ""
+        val ua = CFState.userAgentFor(host)?.takeIf { it.isNotBlank() }
+            ?: webView?.settings?.userAgentString
+            ?: MangaManhwaProvider.UA
+        webView?.settings?.userAgentString = ua
+
+        webView?.loadUrl(currentChapterUrl, mapOf("Referer" to referer, "User-Agent" to ua))
     }
 
     fun updateChapterTitle(detectedTitle: String, detectedUrl: String) {
@@ -1670,7 +1834,7 @@ class ReaderDialog : DialogFragment() {
             recordDiscoveredChapterUrl(detectedUrl)
         }
 
-        val m = Regex("(?:chapter|ch)[-/]?(\\d+(\\.\\d+)?)", RegexOption.IGNORE_CASE).find(detectedUrl)
+        val m = Regex("(?:chapter|ch)[/\\-_]?(\\d+(?:\\.\\d+)?)", RegexOption.IGNORE_CASE).find(detectedUrl)
         if (m != null) {
             val num = m.groupValues[1]
             if (num != "0") {
@@ -1685,7 +1849,7 @@ class ReaderDialog : DialogFragment() {
             detectedTitle.equals("Chapter 0", ignoreCase = true)
         ) return
 
-        val clean = detectedTitle.substringBefore(" - ").substringBefore(" · ").trim()
+        val clean = detectedTitle.substringBefore(" - ").substringBefore(" · ").substringBefore(" | ").trim()
         if (clean.isBlank() || clean == "Ch. 0" || clean == "Chapter 0") return
         currentChapterName = clean
         chapterInfo?.text = clean
