@@ -18,7 +18,6 @@ import android.view.KeyEvent
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -82,38 +81,20 @@ class ReaderDialog : DialogFragment() {
             "media.net", "mgid.com", "zergnet.com", "adroll.com", "gumgum.com",
             "33across.com", "teads.tv", "adsafeprotected.com",
             "serving-sys.com", "sizmek.com", "innovid.com",
-            "spotxchange.com", "tremorhub.com",
-            // Newly audited ad/tracker hosts from FlameComics, Toonily, NyxScans, HiveScans
-            "radioonlinehd.com", "cleverwebserver.com", "adsboosters.xyz",
-            "dinomysstorm.com", "aqle3.com", "pubadx.one",
-            "perfops.net", "gcorelabs.com", "qcloudcdn.com",
-            "anyanalytics.org", "cdn.orange.com"
+            "spotxchange.com", "tremorhub.com", "radioonlinehd.com",
+            "cleverwebserver.com", "adsboosters.xyz", "dinomysstorm.com",
+            "aqle3.com", "pubadx.one", "perfops.net", "gcorelabs.com",
+            "qcloudcdn.com", "anyanalytics.org", "cdn.orange.com"
         )
 
         private val BLOCKED_URL_FRAGMENTS: List<String> = listOf(
-            "paypal.com/xoplatform/logger",
-            "culinar9sync.com",
-            "smartfloralab.com",
-            "exacdn.com",
-            "popunder1000.js",
-            "ad-provider.js",
-            "600x300_compr",
-            "_compr.gif",
-            "google.com/g/collect",
-            "google-analytics.com/g/collect",
-            "analytics.google.com/g/collect",
-            // Newly audited script/iframe fragments
-            "flamesradio.html",
-            "radioonlinehd.com",
-            "cleverwebserver.com",
-            "adsboosters.xyz",
-            "dinomysstorm.com",
-            "btag.min.js",
-            "pubadx-ad.js",
-            "pubadx.one",
-            "rom3.min.js",
-            "500b-bench.jpg",
-            "anyanalytics.org"
+            "paypal.com/xoplatform/logger", "culinar9sync.com", "smartfloralab.com",
+            "exacdn.com", "popunder1000.js", "ad-provider.js", "600x300_compr",
+            "_compr.gif", "google.com/g/collect", "google-analytics.com/g/collect",
+            "analytics.google.com/g/collect", "flamesradio.html", "radioonlinehd.com",
+            "cleverwebserver.com", "adsboosters.xyz", "dinomysstorm.com",
+            "btag.min.js", "pubadx-ad.js", "pubadx.one", "rom3.min.js",
+            "500b-bench.jpg", "anyanalytics.org"
         )
 
         private val KNOWN_MIRROR_PREFIXES: List<String> = listOf(
@@ -122,13 +103,11 @@ class ReaderDialog : DialogFragment() {
             "cosmicscans", "omegascans", "mangatx", "mangabob", "nyxscans"
         )
 
-        // Matches Comix's extensionless image CDN shards so isDiagnosticWorthy doesn't spam Logcat
         private val COMIX_IMAGE_CDN_REGEX = Regex(
             """^https?://\d+\.[a-z0-9-]+\.site/hi/[A-Za-z0-9_-]+""",
             RegexOption.IGNORE_CASE
         )
 
-        // Matches both /chapter-12, /chapter/12 AND FlameComics's /series/99/596241414bde1e53
         private val EXPLICIT_CHAPTER_URL_REGEX = Regex(
             """(?:(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)|/series/\d+/[0-9a-f]{8,})""",
             RegexOption.IGNORE_CASE
@@ -205,95 +184,45 @@ class ReaderDialog : DialogFragment() {
         if (requestHost.isNullOrBlank()) return false
         val reqLower = requestHost.lowercase(Locale.US).removePrefix("www.")
         val curHost = runCatching { URI(currentChapterUrl).host?.lowercase(Locale.US)?.removePrefix("www.") }.getOrNull() ?: return false
-        if (reqLower == curHost || reqLower.endsWith(".$curHost") || curHost.endsWith(".$reqLower")) return true
+        if (reqLower == curHost || reqLower.endsWith(".$curHost") \vert{}\vert{} curHost.endsWith(".$reqLower")) return true
 
         val root = rootDomain(curHost) ?: return false
         if (reqLower == root || reqLower.endsWith(".$root")) return true
 
-        // Allow redirects between official mirror domains (e.g. hivetoon.com -> hivetoons.org, asuracomic.net -> asurascans.com)
         val reqRoot = rootDomain(reqLower) ?: return false
-        for (prefix in KNOWN_MIRROR_PREFIXES) {
-            if (root.startsWith(prefix) && reqRoot.startsWith(prefix)) return true
-        }
-        return false
+        return KNOWN_MIRROR_PREFIXES.any { root.startsWith(it) && reqRoot.startsWith(it) }
     }
 
     private fun isBlockedUrl(url: String): Boolean {
         if (url.isBlank() || !url.startsWith("http")) return false
-
-        // Never block Comix's manga page image CDN shards
         if (COMIX_IMAGE_CDN_REGEX.containsMatchIn(url)) return false
 
         val lower = url.lowercase(Locale.US)
-        for (frag in BLOCKED_URL_FRAGMENTS) {
-            if (lower.contains(frag)) return true
-        }
+        if (BLOCKED_URL_FRAGMENTS.any { lower.contains(it) }) return true
 
         val requestHost = runCatching { URI(url).host?.lowercase(Locale.US) }.getOrNull() ?: return false
         if (isSameSiteHost(requestHost)) return false
 
-        for (blocked in BLOCKED_HOSTS) {
-            if (requestHost == blocked || requestHost.endsWith(".$blocked")) return true
-        }
-
-        return false
+        return BLOCKED_HOSTS.any { requestHost == it || requestHost.endsWith(".$it") }
     }
 
     private fun createBlockedResponse(url: String): WebResourceResponse {
         val lower = url.lowercase(Locale.US).substringBefore('?')
         return when {
             lower.endsWith(".js") -> WebResourceResponse(
-                "application/javascript",
-                "utf-8",
-                200,
-                "OK",
-                BLOCKED_CORS_HEADERS,
+                "application/javascript", "utf-8", 200, "OK", BLOCKED_CORS_HEADERS,
                 ByteArrayInputStream("/* blocked */".toByteArray(Charsets.UTF_8))
             )
             lower.endsWith(".gif") || lower.endsWith(".png") || lower.endsWith(".jpg") ||
             lower.endsWith(".jpeg") || lower.endsWith(".webp") -> WebResourceResponse(
-                "image/gif",
-                null,
-                200,
-                "OK",
-                BLOCKED_CORS_HEADERS,
+                "image/gif", null, 200, "OK", BLOCKED_CORS_HEADERS,
                 ByteArrayInputStream(TRANSPARENT_GIF_BYTES)
             )
             else -> WebResourceResponse(
-                "text/plain",
-                "utf-8",
-                200,
-                "OK",
-                BLOCKED_CORS_HEADERS,
+                "text/plain", "utf-8", 200, "OK", BLOCKED_CORS_HEADERS,
                 ByteArrayInputStream(ByteArray(0))
             )
         }
-    }
-
-    private fun isDiagnosticWorthy(url: String): Boolean {
-        if (COMIX_IMAGE_CDN_REGEX.containsMatchIn(url)) return false
-
-        val lower = url.lowercase(Locale.US)
-
-        if (lower.matches(Regex(".*\\.(jpg|jpeg|png|gif|webp|avif|svg|ico|css|woff2?|ttf|otf|mp4|webm|m3u8|ts)(\\?.*)?$"))) return false
-
-        if (lower.contains("/_next/static/") || lower.contains("/_nuxt/") ||
-            lower.contains("/static/js/") || lower.contains("/assets/chunks/") ||
-            lower.contains("/webpack-runtime.") || lower.contains("/framework-")) return false
-
-        if (lower.contains("paypal.com") || lower.contains("cloudflare.com") ||
-            lower.contains("cloudflareinsights.com") ||
-            lower.contains("google-analytics.com") || lower.contains("googletagmanager.com") ||
-            lower.contains("fonts.gstatic.com") || lower.contains("fonts.googleapis.com") ||
-            lower.contains("fonts.cdnfonts.com") || lower.contains("onlinewebfonts.com") ||
-            lower.contains("whos.amung.us") || lower.contains("sharethis.com")) return false
-
-        runCatching {
-            val reqHost = URI(url).host?.lowercase(Locale.US)
-            if (isSameSiteHost(reqHost)) return false
-        }
-
-        return true
     }
 
     internal fun extractSlug(url: String): String {
@@ -436,13 +365,7 @@ class ReaderDialog : DialogFragment() {
                 }
 
                 override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message): Boolean {
-                    log("🚫 Blocked window.open popup")
                     return false
-                }
-
-                override fun onConsoleMessage(m: ConsoleMessage): Boolean {
-                    log("WV console: ${m.message()}")
-                    return true
                 }
             }
 
@@ -450,30 +373,18 @@ class ReaderDialog : DialogFragment() {
 
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                     val u = request.url?.toString() ?: return null
-                    if (isBlockedUrl(u)) {
-                        log("🚫 Blocked: $u")
-                        return createBlockedResponse(u)
-                    }
-                    if (Settings.verboseLog() && isDiagnosticWorthy(u)) {
-                        log("📡 NET: $u")
-                    }
-                    return null
+                    return if (isBlockedUrl(u)) createBlockedResponse(u) else null
                 }
 
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                     val u = request.url?.toString() ?: return false
-                    if (!u.startsWith("http://") && !u.startsWith("https://")) {
-                        if (u.startsWith("intent://") || u.startsWith("market://") || u.startsWith("whatsapp://") || u.startsWith("tg://")) return true
-                        return false
-                    }
-                    if (isBlockedUrl(u)) {
-                        log("🚫 Blocked navigation: $u")
-                        return true
-                    }
+                    if (!u.startsWith("http://") && !u.startsWith("https://")) return true
+                    if (isBlockedUrl(u)) return true
+
                     val reqHost = runCatching { URI(u).host?.lowercase(Locale.US) }.getOrNull()
                     if (request.isForMainFrame && reqHost != null && !isSameSiteHost(reqHost)) {
-                        val isCfChallenge = reqHost.endsWith("cloudflare.com") || u.contains("cdn-cgi/challenge-platform")
-                        if (!isCfChallenge) {
+                        val isCf = reqHost.endsWith("cloudflare.com") || u.contains("cdn-cgi/challenge-platform")
+                        if (!isCf) {
                             log("🚫 Blocked cross-domain redirect: $u")
                             return true
                         }
@@ -488,34 +399,19 @@ class ReaderDialog : DialogFragment() {
                 override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
                     if (!request.isForMainFrame) return
                     val url = request.url?.toString() ?: ""
-                    val isMainSite = url.contains("omegascans.org", true) || url.contains("comix.to", true) || url.contains(baseUrl(), true)
-                    if (!isMainSite) return
+                    if (!url.contains(baseUrl(), true)) return
 
                     progressBar?.visibility = View.GONE
                     val desc = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) error.description.toString() else "Network error"
-                    log("❌ WebView Load Error: $desc | URL:$url")
-
                     view.loadData(
                         "<html><body style=\"background:#07080C;color:#94A3B8;font-family:sans-serif;padding:40px;text-align:center\"><h3 style=\"color:#E2E8F0\">Couldn't load chapter</h3><p>$desc</p><p style=\"font-size:12px;margin-top:24px;word-break:break-all\">$url</p></body></html>",
-                        "text/html",
-                        "UTF-8"
+                        "text/html", "UTF-8"
                     )
                 }
 
                 override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                     super.onPageStarted(view, url, favicon)
-                    view.evaluateJavascript(
-                        """
-                        (function(){
-                            try {
-                                window.open = function(u){
-                                    try { if (window.MMReader && window.MMReader.onBlockedPopup) window.MMReader.onBlockedPopup(String(u||'')); } catch(e){}
-                                    return null;
-                                };
-                            } catch(e){}
-                        })();
-                        """.trimIndent(), null
-                    )
+                    view.evaluateJavascript("try { window.open = function(){ return null; }; } catch(e){}", null)
                 }
 
                 override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
@@ -531,21 +427,16 @@ class ReaderDialog : DialogFragment() {
                         currentChapterUrl = url
                         currentChapterName = "Ch. $numStr"
                         chapterInfo?.text = currentChapterName
-
                         val slug = extractSlug(url)
-                        if (slug.isNotBlank()) {
-                            prefs.edit().putString(slug, url).apply()
-                        }
+                        if (slug.isNotBlank()) prefs.edit().putString(slug, url).apply()
                         recordDiscoveredChapterUrl(url)
                     } else if (EXPLICIT_CHAPTER_URL_REGEX.containsMatchIn(url)) {
                         currentChapterUrl = url
                         val slug = extractSlug(url)
-                        if (slug.isNotBlank()) {
-                            prefs.edit().putString(slug, url).apply()
-                        }
+                        if (slug.isNotBlank()) prefs.edit().putString(slug, url).apply()
                     }
 
-                    view.postDelayed({ injectReaderJs(view) }, 220L)
+                    view.postDelayed({ injectReaderJs(view) }, 200L)
                 }
 
                 override fun onPageFinished(view: WebView, url: String?) {
@@ -553,14 +444,10 @@ class ReaderDialog : DialogFragment() {
                     progressBar?.visibility = View.GONE
 
                     val title = view.title?.lowercase() ?: ""
-                    val isChallenge = title.contains("just a moment") || title.contains("attention required") || title.contains("checking your browser")
-
-                    if (isChallenge) {
-                        log("🛡️ Cloudflare Turnstile detected in Reader. Please solve it manually.")
+                    if (title.contains("just a moment") || title.contains("attention required") || title.contains("checking your browser")) {
                         return
                     }
 
-                    log("✅ WebView Page Finished: $url")
                     if (!url.isNullOrBlank()) {
                         runCatching {
                             val h = URI(url).host
@@ -571,18 +458,17 @@ class ReaderDialog : DialogFragment() {
                         }
                         recordDiscoveredChapterUrl(url)
                     }
+
                     injectReaderJs(view)
                     applyZoom(view, currentZoom)
 
                     if (targetChapter > 0) {
                         pendingScrollRestore = -1f
                         checkAndJumpToTargetChapter(view)
-                    } else {
+                    } else if (pendingScrollRestore > 0f) {
                         val restoreY = pendingScrollRestore
-                        if (restoreY > 0f) {
-                            pendingScrollRestore = -1f
-                            view.postDelayed({ restoreScrollPosition(restoreY) }, 100L)
-                        }
+                        pendingScrollRestore = -1f
+                        view.postDelayed({ restoreScrollPosition(restoreY) }, 100L)
                     }
                 }
             }
@@ -595,9 +481,7 @@ class ReaderDialog : DialogFragment() {
         return root
     }
 
-    private fun baseUrl(): String {
-        return runCatching { URI(currentChapterUrl).host }.getOrNull() ?: ""
-    }
+    private fun baseUrl(): String = runCatching { URI(currentChapterUrl).host }.getOrNull() ?: ""
 
     private fun buildToolbar(ctx: Context, density: Float): View {
         fun dp(v: Int) = (v * density).toInt()
@@ -610,7 +494,9 @@ class ReaderDialog : DialogFragment() {
         }
 
         bar.addView(btn(ctx, density, "✕", "#281417", "#F87171") { dismissAllowingStateLoss() })
-        bar.addView(btn(ctx, density, "◀ Prev", null, "#CBD5E1") { jsNext(-1) }.apply { (layoutParams as? LinearLayout.LayoutParams)?.leftMargin = dp(6) })
+        bar.addView(btn(ctx, density, "◀ Prev", null, "#CBD5E1") { jsNext(-1) }.apply {
+            (layoutParams as? LinearLayout.LayoutParams)?.leftMargin = dp(6)
+        })
 
         val scroll = HorizontalScrollView(ctx).apply {
             isHorizontalScrollBarEnabled = false
@@ -668,13 +554,10 @@ class ReaderDialog : DialogFragment() {
     private fun toggleToolbar() {
         val b = toolbar ?: return
         toolbarVisible = !toolbarVisible
-        val target = if (toolbarVisible) 0f else b.height.toFloat()
         b.animate()
-            .translationY(target)
+            .translationY(if (toolbarVisible) 0f else b.height.toFloat())
             .setDuration(180)
-            .withEndAction {
-                if (!toolbarVisible) progressBar?.visibility = View.GONE
-            }
+            .withEndAction { if (!toolbarVisible) progressBar?.visibility = View.GONE }
             .start()
     }
 
@@ -710,19 +593,9 @@ class ReaderDialog : DialogFragment() {
                 if (!s) { s = document.createElement('style'); s.id = 'mm-zoom'; document.head.appendChild(s); }
                 s.innerHTML =
                   ':root { --rpage-max-w: ' + z + '% !important; }' +
-                  '.rpage-main, .rpage-main--long-strip { overflow-x: auto !important; }' +
-                  'img:not([data-mm-ad="1"]):not([src*="600x300"]):not([src*="compr.gif"]), .rpage-page__img, canvas.rpage-page__img, canvas { max-width: 100% !important; width: 100% !important; height: auto !important; display: block !important; margin: 0 auto !important; }' +
-                  ':is(.rpage-main__inner, .rpage-view, .rpage-view--pages, .reading-content, #readerarea, ' +
-                  '.viewer, .chapter-content, .manga-reading, #chapter-content, ' +
-                  '.comic-images-wrapper, .comic-body-container, .container-chapter-reader, .mantine-Stack-root) ' +
-                  '{ width: ' + z + '% !important; max-width: ' + z + '% !important; margin: 0 auto !important; transition: width .15s ease-out, max-width .15s ease-out !important; }' +
-                  '.rpage-page, .swiper-zoom-container, .rpage-zoom-container, figure.image-container { width: 100% !important; max-width: 100% !important; margin: 0 auto !important; }';
-                try {
-                  var k = 'reader.default.v3';
-                  var st = JSON.parse(localStorage.getItem(k) || '{}');
-                  st.ttbZoomPercent = Math.min(100, Math.max(10, z));
-                  localStorage.setItem(k, JSON.stringify(st));
-                } catch(e) {}
+                  'img:not([data-mm-ad="1"]):not([src*="600x300"]):not([src*="compr.gif"]), canvas { max-width: 100% !important; width: 100% !important; height: auto !important; display: block !important; margin: 0 auto !important; }' +
+                  ':is([data-mm-reader="1"], .rpage-main__inner, .rpage-view, .reading-content, #readerarea, .viewer, .chapter-content, .manga-reading, #chapter-content, .comic-images-wrapper, .comic-body-container, .container-chapter-reader, .mantine-Stack-root) ' +
+                  '{ width: ' + z + '% !important; max-width: ' + z + '% !important; margin: 0 auto !important; }';
               } catch(e) {}
             })();
             """.trimIndent(), null
@@ -738,7 +611,6 @@ class ReaderDialog : DialogFragment() {
               var curMatch = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
               if (curMatch) curNum = parseFloat(curMatch[1]);
 
-              // 1. Check Next.js __NEXT_DATA__ (FlameComics token-based chapters & standard Next.js readers)
               try {
                 var nd = document.getElementById('__NEXT_DATA__');
                 if (nd) {
@@ -747,16 +619,12 @@ class ReaderDialog : DialogFragment() {
                     var tgt = isNext ? (props.chapter.nextChapter || props.nextChapter) : (props.chapter.prevChapter || props.prevChapter);
                     if (tgt) {
                       var tUrl = tgt.url || tgt.path || (tgt.token && props.chapter.series_id ? '/series/' + props.chapter.series_id + '/' + tgt.token : null);
-                      if (tUrl) {
-                        window.location.href = tUrl;
-                        return true;
-                      }
+                      if (tUrl) { window.location.href = tUrl; return true; }
                     }
                   }
                 }
               } catch(e){}
 
-              // 2. Check explicit rel="next"/"prev" or cached navigation links
               var candidates = [];
               var relLink = document.querySelector(isNext ? 'a[rel="next"], a.next_page, a.btn-next' : 'a[rel="prev"], a.prev_page, a.btn-prev');
               if (relLink && relLink.href) candidates.push(relLink.href);
@@ -776,7 +644,6 @@ class ReaderDialog : DialogFragment() {
                 return true;
               }
 
-              // 3. Fallback: scan anchors for curNum + 1 / curNum - 1
               if (curNum !== null) {
                 var wantNum = isNext ? curNum + 1 : curNum - 1;
                 var anchors = document.querySelectorAll('a[href]');
@@ -789,18 +656,15 @@ class ReaderDialog : DialogFragment() {
                 }
               }
 
-              // 4. Fallback: aria-label or title buttons
               var btnSel = isNext
-                ? 'button[aria-label*="ext chapter" i], button[title*="ext chapter" i], a[aria-label*="ext chapter" i], a[title*="ext chapter" i]'
-                : 'button[aria-label*="rev chapter" i], button[title*="rev chapter" i], a[aria-label*="rev chapter" i], a[title*="rev chapter" i]';
+                ? 'button[aria-label*="ext chapter" i], a[aria-label*="ext chapter" i]'
+                : 'button[aria-label*="rev chapter" i], a[aria-label*="rev chapter" i]';
               var btn = document.querySelector(btnSel);
               if (btn && !btn.disabled) { btn.click(); return true; }
 
-              // 5. Dispatch Left/Right Arrow keydown for SPA readers
               window.dispatchEvent(new KeyboardEvent('keydown', {
                 key: isNext ? 'ArrowRight' : 'ArrowLeft',
                 keyCode: isNext ? 39 : 37,
-                code: isNext ? 'ArrowRight' : 'ArrowLeft',
                 bubbles: true
               }));
               return false;
@@ -825,77 +689,25 @@ class ReaderDialog : DialogFragment() {
         val js = """
             (function() {
               var targetCh = $target;
-              var curMatch = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
-              if (curMatch && parseFloat(curMatch[1]) === parseFloat(targetCh)) return;
-
-              var ticks = 0;
-              var timer = setInterval(function() {
-                ticks++;
-                if (ticks > 40) { clearInterval(timer); return; }
-
-                var nowMatch = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
-                if (nowMatch && parseFloat(nowMatch[1]) === parseFloat(targetCh)) {
-                    clearInterval(timer);
+              var anchors = document.querySelectorAll('a[href]');
+              for (var i = 0; i < anchors.length; i++) {
+                var aHref = anchors[i].href || '';
+                var hm = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(aHref);
+                if (hm && parseFloat(hm[1]) === parseFloat(targetCh)) {
+                  window.location.href = aHref;
+                  return;
+                }
+              }
+              var select = document.querySelector('select');
+              if (select) {
+                for (var j = 0; j < select.options.length; j++) {
+                  if (select.options[j].text.includes(targetCh)) {
+                    select.selectedIndex = j;
+                    select.dispatchEvent(new Event('change', { bubbles: true }));
                     return;
+                  }
                 }
-
-                if (ticks === 1) {
-                    var triggers = document.querySelectorAll('.rpage-floatctl__chap, .chapter-list-btn, .btn-chapter-list, .toggle-chapters');
-                    if (triggers.length === 0) {
-                        triggers = document.querySelectorAll('[aria-label*="chapter list" i], [aria-label*="chapter menu" i], [title*="chapter list" i]');
-                    }
-                    if (triggers.length > 0) triggers[0].click();
-                }
-
-                var anchors = document.querySelectorAll('a[href]');
-                var harvested = {};
-                var harvestCount = 0;
-                var targetHref = null;
-
-                for (var i = 0; i < anchors.length; i++) {
-                    var aHref = anchors[i].href || '';
-                    var hm = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(aHref);
-                    if (hm && aHref.indexOf('http') === 0) {
-                        harvested[hm[1]] = aHref;
-                        harvestCount++;
-                        if (parseFloat(hm[1]) === parseFloat(targetCh)) {
-                            targetHref = aHref;
-                        }
-                    }
-                }
-
-                if (harvestCount > 0 && window.MMReader && window.MMReader.onChaptersHarvested) {
-                    try { window.MMReader.onChaptersHarvested(JSON.stringify(harvested)); } catch(e) {}
-                }
-
-                if (targetHref) {
-                    window.location.href = targetHref;
-                    clearInterval(timer);
-                    return;
-                }
-
-                for (var k = 0; k < anchors.length; k++) {
-                    var txt = (anchors[k].innerText || anchors[k].textContent || '').trim().toLowerCase();
-                    if ((txt === 'chapter ' + targetCh || txt === 'ch ' + targetCh || txt === 'ch. ' + targetCh)
-                        && !/(?:chapter|ch)[/\-_]?(\d+)/i.test(anchors[k].href || '')) {
-                        window.location.href = anchors[k].href;
-                        clearInterval(timer);
-                        return;
-                    }
-                }
-
-                var select = document.querySelector('select');
-                if (select) {
-                    for (var j = 0; j < select.options.length; j++) {
-                        if (select.options[j].text.includes(targetCh)) {
-                            select.selectedIndex = j;
-                            select.dispatchEvent(new Event('change', { bubbles: true }));
-                            clearInterval(timer);
-                            return;
-                        }
-                    }
-                }
-              }, 100);
+              }
             })();
         """.trimIndent()
         view.evaluateJavascript(js, null)
@@ -923,862 +735,323 @@ class ReaderDialog : DialogFragment() {
     }
 
     private fun injectReaderJs(view: WebView) {
-        val diag = if (Settings.verboseLog()) "true" else "false"
         view.evaluateJavascript(
             """
             (function(){
-              window.__mmDiag = $diag;
-              function mmInject(retries) {
-                if (retries === undefined) retries = 0;
-                try {
-                  var head = document.head || document.getElementsByTagName('head')[0] || document.documentElement;
-                  if (!head || !head.appendChild) {
-                    if (retries < 20) setTimeout(function(){ mmInject(retries + 1); }, 100);
-                    return;
+              var head = document.head || document.documentElement;
+              if (!head) return;
+
+              if (!document.getElementById('mm-css')) {
+                var s = document.createElement('style');
+                s.id = 'mm-css';
+                s.innerHTML = `
+                  html, body { background-color: #07080C !important; margin: 0 !important; padding: 0 !important; }
+                  aside, [data-mm-ad="1"], .ai-top-bar, [class^="ai-top-bar"],
+                  [class*="Panel-module__"], [class*="Dock-module__"], [class*="TopChapterNavbar-module__"],
+                  iframe[src*="radioonlinehd"], iframe[src*="flamesradio"],
+                  img[src*="600x300"], img[src*="compr.gif"], img[class*="max-w-[600px]"],
+                  a:has(> img[src*="600x300"]), a:has(> img[src*="compr.gif"]),
+                  [class^="ad-"], [class*=" ad-"], [class*="-ad-"], [class$="-ad"], [class~="ad"],
+                  [id^="ad-"], [id*=" ad-"], [id*="-ad-"], [id$="-ad"], [id~="ad"],
+                  [class^="ads-"], [class*=" ads-"], [class*="-ads-"], [class~="ads"],
+                  [class*="advert"], [id*="advert"], [class*="sponsor"], [id*="sponsor"],
+                  [class*="adsense"], [class*="adsbygoogle"], [id*="google_ads"],
+                  [id*="div-gpt"], [id*="aswift"], ins.adsbygoogle, [data-ad-slot], [data-ad-client],
+                  iframe[src*="ads"], iframe[src*="pop"], iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
+                  header, footer, .header, .footer, .site-header, .site-footer, #header, #footer, .navbar,
+                  .manga-reading-description, .c-breadcrumb-wrapper, .wp-manga-nav, .entry-header,
+                  .cookie-notice, [class*="cookie-"], .rpage-floatctl__col, .rpage-bottombar,
+                  .rpage-strip-comments, .cm-widget, .share-block, .social-share,
+                  .mpage__recs, #comments, #disqus_thread, [id*="disqus"],
+                  .comment-section, .comments-area, .related-posts, .recommendations, .related-manga,
+                  .c-blog__heading, .entry-footer, .post-ratings, .manga-action {
+                    display: none !important;
+                    height: 0 !important;
+                    max-height: 0 !important;
+                    margin: 0 !important;
+                    padding: 0 !important;
+                    pointer-events: none !important;
+                    overflow: hidden !important;
                   }
-
-                  var host = window.location.hostname.toLowerCase();
-                  var isOmega = host.indexOf('omegascans') !== -1;
-                  var isFlame = host.indexOf('flamecomics') !== -1;
-
-                  if (!document.getElementById('mm-css')) {
-                    var s = document.createElement('style');
-                    s.id = 'mm-css';
-                    s.innerHTML = `
-                      html, body {
-                        background-color: #07080C !important;
-                        margin: 0 !important;
-                        padding: 0 !important;
-                      }
-                      [data-mm-ad="1"] {
-                        display: none !important;
-                        pointer-events: none !important;
-                        width: 0 !important;
-                        height: 0 !important;
-                        opacity: 0 !important;
-                        visibility: hidden !important;
-                        z-index: -9999 !important;
-                      }
-                      aside,
-                      aside.fixed,
-                      [class*="Panel-module__"],
-                      [class*="Dock-module__"],
-                      [class*="TopChapterNavbar-module__"],
-                      iframe[src*="radioonlinehd"],
-                      iframe[src*="flamesradio"],
-                      img[src*="600x300"],
-                      img[src*="compr.gif"],
-                      a:has(> img[src*="600x300"]),
-                      a:has(> img[src*="compr.gif"]),
-                      div:has(> a > img[src*="600x300"]),
-                      div:has(> a > img[src*="compr.gif"]) {
-                        display: none !important;
-                        pointer-events: none !important;
-                        height: 0 !important;
-                        max-height: 0 !important;
-                        padding: 0 !important;
-                        margin: 0 !important;
-                        overflow: hidden !important;
-                      }
-                      .ai-top-bar, [class^="ai-top-bar"] {
-                        position: absolute !important; top: -9999px !important; left: -9999px !important;
-                        width: 1px !important; height: 1px !important; opacity: 0 !important; pointer-events: none !important;
-                      }
-                      [src*="doubleclick.net"], [src*="googlesyndication.com"], [src*="adservice.google"],
-                      [src*="amazon-adsystem"], [src*="taboola"], [src*="outbrain"],
-                      [src*="criteo"], [src*="popads"], [src*="propellerads"],
-                      [src*="exoclick"], [src*="exacdn"], [src*="adsterra"], [src*="hilltopads"],
-                      [src*="clickadu"], [src*="smartfloralab"], [src*="openx"],
-                      [src*="sharethrough"], [src*="media.net"], [src*="mgid"],
-                      [src*="zergnet"], [src*="gumgum"], [src*="teads"],
-                      [src*="pubadx"], [src*="adsboosters"], [src*="cleverwebserver"],
-                      [src*="dinomysstorm"], [src*="aqle3"] { display: none !important; }
-
-                      [class^="ad-"], [class*=" ad-"], [class*="-ad-"], [class$="-ad"], [class~="ad"],
-                      [id^="ad-"], [id*=" ad-"], [id*="-ad-"], [id$="-ad"], [id~="ad"],
-                      [class^="ads-"], [class*=" ads-"], [class*="-ads-"], [class~="ads"],
-                      [id^="ads-"], [id*=" ads-"], [id*="-ads-"], [id~="ads"],
-                      [class*="advert"], [id*="advert"],
-                      [class*="sponsor"], [id*="sponsor"],
-                      [class^="promo-"], [class*=" promo-"], [class*="-promo-"], [class$="-promo"], [class~="promo"],
-                      [class*="adsense"], [class*="adsbygoogle"], [id*="google_ads"],
-                      [id*="div-gpt-ad"], [id*="div-gpt"], [id*="aswift"],
-                      ins.adsbygoogle, ins[data-ad-slot], ins[data-ad-client],
-                      [data-google-query-id], [data-ad-slot], [data-ad-client],
-                      iframe[src*="ads"], iframe[src*="pop"],
-                      iframe[src*="doubleclick"], iframe[src*="googlesyndication"],
-                      iframe[src*="smartfloralab"], iframe[src*="openx"],
-                      [class*="video-ad"], [class*="video-slider-ad"] { display: none !important; }
-
-                      header, footer, .header, .footer, .site-header, .site-footer, #header, #footer, .navbar,
-                      .manga-reading-description, .c-breadcrumb-wrapper, .wp-manga-nav, .entry-header,
-                      .google-anno, .cookie-notice, [class*="cookie-"], [id*="cookie-"],
-                      .rpage-floatctl__col, .rpage-bottombar, .rpage-hoverzone, .rpage-dir2,
-                      .rpage-strip-comments, .cm-widget, .share-block, .social-share, .sharedaddy,
-                      .mpage__recs, #comments, #disqus_thread, [id*="disqus"],
-                      .comment-section, .comments-area, .related-posts, .recommendations, .related-manga,
-                      .c-blog__heading, .entry-footer, .post-ratings, .manga-action, .chapter-Bookmarks {
-                        display: none !important;
-                      }
-                      .rpage-chap-ending {
-                        padding-bottom: 8px !important;
-                        margin-bottom: 0 !important;
-                      }
-                      .rpage-chap-ending__nav {
-                        margin-bottom: 8px !important;
-                      }
-                      .rpage-main, .rpage-main--long-strip, .rpage-main__inner,
-                      .reading-content, #readerarea, .viewer,
-                      .chapter-content, .manga-reading, #chapter-content,
-                      .comic-images-wrapper, .comic-body-container, .container-chapter-reader {
-                        padding-top: 0 !important;
-                        margin-top: 0 !important;
-                        padding-bottom: 0 !important;
-                        margin-bottom: 0 !important;
-                      }
-                    `;
-                    head.appendChild(s);
+                  [data-mm-reader="1"], .rpage-main, .reading-content, #readerarea, .viewer, .chapter-content,
+                  .manga-reading, #chapter-content, .comic-images-wrapper, .comic-body-container, .container-chapter-reader {
+                    padding-top: 0 !important; margin-top: 0 !important;
+                    padding-bottom: 0 !important; margin-bottom: 0 !important;
                   }
-
-                  // Force lazy-loaded images (Madara/Toonily/MangaThemesia) to load immediately
-                  function promoteLazyImages() {
-                    try {
-                      var imgs = document.querySelectorAll('.reading-content img, .page-break img, #readerarea img, .comic-images-wrapper img, .container-chapter-reader img, main img');
-                      for (var i = 0; i < imgs.length; i++) {
-                        var img = imgs[i];
-                        var lazySrc = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('data-original') || img.getAttribute('data-cfsrc');
-                        if (lazySrc) {
-                          lazySrc = lazySrc.trim();
-                          var curSrc = (img.getAttribute('src') || '').trim();
-                          if (lazySrc && (!curSrc || curSrc.indexOf('data:') === 0 || curSrc.indexOf('dflazy') !== -1)) {
-                            img.setAttribute('src', lazySrc);
-                          }
-                        }
-                        img.removeAttribute('loading');
-                        img.classList.remove('lazyload', 'lazyloading');
-                      }
-                    } catch(e) {}
-                  }
-
-                  function getScroller() {
-                    var candidates = [
-                      '.rpage-main', '.rpage-main--long-strip',
-                      '#readerarea', '.reading-content', '.chapter-content',
-                      '.manga-reading', '#chapter-content', '.viewer',
-                      '.comic-images-wrapper', '.comic-body-container', '.container-chapter-reader'
-                    ];
-                    for (var i = 0; i < candidates.length; i++) {
-                      var el = document.querySelector(candidates[i]);
-                      if (el && el.scrollHeight > el.clientHeight + 20) {
-                        var oy = window.getComputedStyle(el).overflowY;
-                        if (oy === 'auto' || oy === 'scroll' || oy === 'overlay' || el.classList.contains('rpage-main')) {
-                          return el;
-                        }
-                      }
-                    }
-                    return null;
-                  }
-
-                  function findReaderContainer(start) {
-                    var sels = '.rpage-main, .rpage-main--long-strip, .rpage-main__inner, ' +
-                               '#readerarea, .reading-content, .chapter-content, ' +
-                               '.manga-reading, #chapter-content, .viewer, ' +
-                               '.rpage-view, .rpage-view--pages, ' +
-                               '.comic-images-wrapper, .comic-body-container, ' +
-                               '.container-chapter-reader, .mantine-Stack-root';
-                    var cur = start;
-                    while (cur && cur !== document.body && cur !== document.documentElement) {
-                      try {
-                        if (cur.matches && cur.matches(sels)) return cur;
-                      } catch(e) {}
-                      cur = cur.parentElement;
-                    }
-                    return null;
-                  }
-
-                  function cacheNavLinks() {
-                    try {
-                      var bestNextUrl = null, bestNextScore = 0;
-                      var bestPrevUrl = null, bestPrevScore = 0;
-                      var links = document.querySelectorAll('a[href]');
-                      var harvested = {};
-                      var harvestCount = 0;
-
-                      for (var i = 0; i < links.length; i++) {
-                        var a = links[i];
-                        var href = a.href;
-                        if (!href || href.indexOf('javascript:') === 0 || href.slice(-1) === '#') continue;
-
-                        var hm = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(href);
-                        if (hm && href.indexOf('http') === 0) {
-                          harvested[hm[1]] = href;
-                          harvestCount++;
-                        }
-
-                        var rel   = (a.getAttribute('rel') || '').toLowerCase();
-                        var txt   = (a.innerText || a.textContent || '').trim().toLowerCase();
-                        var title = (a.getAttribute('title') || '').toLowerCase();
-                        var aria  = (a.getAttribute('aria-label') || '').toLowerCase();
-
-                        var nScore = 0;
-                        if (rel === 'next' || a.classList.contains('next_page')) nScore = 3;
-                        else if (txt.includes('next chapter') || title.includes('next chapter') || aria.includes('next chapter')) nScore = 2;
-                        else if (txt === 'next' && a.offsetParent !== null) nScore = 1;
-                        if (nScore > bestNextScore) { bestNextScore = nScore; bestNextUrl = href; }
-
-                        var pScore = 0;
-                        if (rel === 'prev' || rel === 'previous' || a.classList.contains('prev_page')) pScore = 3;
-                        else if (txt.includes('prev chapter') || txt.includes('previous chapter') || title.includes('prev chapter') || aria.includes('prev chapter')) pScore = 2;
-                        else if ((txt === 'prev' || txt === 'previous') && a.offsetParent !== null) pScore = 1;
-                        if (pScore > bestPrevScore) { bestPrevScore = pScore; bestPrevUrl = href; }
-                      }
-                      if (bestNextUrl) window.__mmCachedNextUrl = bestNextUrl;
-                      if (bestPrevUrl) window.__mmCachedPrevUrl = bestPrevUrl;
-
-                      if (harvestCount > 0 && window.MMReader && window.MMReader.onChaptersHarvested) {
-                        window.MMReader.onChaptersHarvested(JSON.stringify(harvested));
-                      }
-                    } catch(e) {}
-                  }
-
-                  var CHROME_SEL = 'header, nav, footer, aside, #comments, #disqus_thread, ' +
-                                   '.rpage-strip-comments, .cm-widget, .mpage__recs, .related-posts, ' +
-                                   '.recommendations, .comment-section, [role="banner"], [role="navigation"], [role="contentinfo"]';
-                  var AD_SEL = '[class^="ad-"], [class*=" ad-"], [class*="-ad-"], [class$="-ad"], [class~="ad"], ' +
-                               '[id^="ad-"], [id*=" ad-"], [id*="-ad-"], [id$="-ad"], [id~="ad"], ' +
-                               '[class^="ads-"], [class*=" ads-"], [class*="-ads-"], [class~="ads"], ' +
-                               '[id^="ads-"], [id*=" ads-"], [id*="-ads-"], [id~="ads"], ' +
-                               '[class*="advert"], [id*="advert"], ' +
-                               '[class*="sponsor"], [id*="sponsor"], ' +
-                               '[class^="promo-"], [class*=" promo-"], [class*="-promo-"], [class$="-promo"], [class~="promo"], ' +
-                               '[class*="adsense"], [class*="adsbygoogle"], [id*="google_ads"], ' +
-                               '[class*="Panel-module__"], [class*="Dock-module__"], ' +
-                               '.ai-top-bar, [class^="ai-top-bar"], [data-mm-ad="1"]';
-
-                  function isInChrome(el) {
-                    if (!el || !el.closest) return false;
-                    try { if (el.closest(CHROME_SEL)) return true; } catch(e) {}
-                    try { if (el.closest(AD_SEL)) return true; } catch(e) {}
-                    return false;
-                  }
-
-                  function isEssentialNavOrModal(el) {
-                    if (!el || !el.querySelector) return false;
-                    var sel = '.rpage-modal, .rpage-chaplist, .rpage-settings, .rpage-chappanel, .rpage-chap-ending, [role="dialog"], select';
-                    if (el.matches && el.matches(sel)) return true;
-                    if (el.querySelector(sel)) return true;
-                    return false;
-                  }
-
-                  function isBannerAdImage(img) {
-                    if (!img || img.tagName !== 'IMG') return false;
-                    var src = (img.currentSrc || img.src || img.getAttribute('data-src') || '').toLowerCase();
-                    if (src.indexOf('600x300') >= 0 || src.indexOf('compr.gif') >= 0) return true;
-                    var cls = (img.className && img.className.toString ? img.className.toString() : '');
-                    if (cls.indexOf('Panel-module__') >= 0 || cls.indexOf('Dock-module__') >= 0) return true;
-                    if (isOmega && cls.toLowerCase().indexOf('max-w-[600px]') >= 0) return true;
-                    return false;
-                  }
-
-                  function isPotentialPageImage(img) {
-                    if (!img || img.tagName !== 'IMG') return false;
-                    if (isBannerAdImage(img)) return false;
-                    if (img.naturalWidth > 0) return false;
-                    var w = parseInt(img.getAttribute('width') || '0', 10);
-                    var h = parseInt(img.getAttribute('height') || '0', 10);
-                    if (w >= 300 && h >= 400) return true;
-                    var src = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') ||
-                              img.getAttribute('data-original') || img.getAttribute('data-cfsrc') ||
-                              img.getAttribute('src') || '';
-                    return /\/chapter|\/page|\/pages\/|\/hi\/|\/uploads\/|\/\d{1,4}\.(jpg|jpeg|png|webp|avif)/i.test(src);
-                  }
-
-                  function isPageWrapper(el) {
-                    if (!el || el.nodeType !== 1) return false;
-                    try {
-                      if (el.matches && el.matches('.rpage-page, .page-break, .chapter-item, figure.image-container, canvas.rpage-page__img, .rpage-page__img')) return true;
-                    } catch(e) {}
-                    return false;
-                  }
-
-                  function isOrContainsUnloadedPage(el) {
-                    if (!el || el.nodeType !== 1 || isInChrome(el)) return false;
-                    if (isPageWrapper(el)) return true;
-                    if (el.tagName === 'IMG' && isPotentialPageImage(el)) return true;
-                    try {
-                      var wrappers = el.querySelectorAll('.rpage-page, .page-break, .chapter-item, figure.image-container, canvas.rpage-page__img, .rpage-page__img');
-                      for (var i = 0; i < wrappers.length; i++) {
-                        if (!isInChrome(wrappers[i])) return true;
-                      }
-                      var imgs = el.querySelectorAll('img');
-                      for (var j = 0; j < imgs.length; j++) {
-                        if (isPotentialPageImage(imgs[j])) return true;
-                      }
-                    } catch(e) {}
-                    return false;
-                  }
-
-                  function isContentPage(el) {
-                    if (!el || (el.tagName !== 'IMG' && el.tagName !== 'CANVAS')) return false;
-                    if (isBannerAdImage(el)) return false;
-                    if (!document.documentElement.contains(el) || isInChrome(el)) return false;
-                    var cs;
-                    try { cs = getComputedStyle(el); } catch(e) { cs = null; }
-                    if (cs) {
-                      if (cs.display === 'none' || cs.visibility === 'hidden') return false;
-                      var op = parseFloat(cs.opacity);
-                      if (!isNaN(op) && op < 0.1) return false;
-                    }
-                    var rect;
-                    try { rect = el.getBoundingClientRect(); } catch(e) { rect = null; }
-                    var nw = el.naturalWidth || el.width || 0;
-                    var nh = el.naturalHeight || el.height || 0;
-                    var w = Math.max(rect ? rect.width : 0, nw);
-                    var h = Math.max(rect ? rect.height : 0, nh);
-                    if (w < 200 || h < 220) return false;
-                    var vw = window.innerWidth || document.documentElement.clientWidth || 360;
-                    if (w < vw * 0.4) return false;
-                    if (h > 0 && w / h > 4) return false;
-                    return true;
-                  }
-
-                  function findLastContentPage() {
-                    var media = document.querySelectorAll('img, canvas');
-                    var candidates = [];
-                    for (var i = 0; i < media.length; i++) {
-                      if (isContentPage(media[i])) {
-                        var r = media[i].getBoundingClientRect();
-                        var w = r.width > 0 ? r.width : (media[i].naturalWidth || media[i].width || 0);
-                        candidates.push({ el: media[i], w: w });
-                      }
-                    }
-                    if (candidates.length < 2) return null;
-                    var buckets = {};
-                    for (var j = 0; j < candidates.length; j++) {
-                      var b = Math.round(candidates[j].w / 50);
-                      buckets[b] = (buckets[b] || 0) + 1;
-                    }
-                    var bestBucket = -1, bestCount = 0;
-                    for (var k in buckets) {
-                      if (Object.prototype.hasOwnProperty.call(buckets, k)) {
-                        if (buckets[k] > bestCount) { bestCount = buckets[k]; bestBucket = parseInt(k, 10); }
-                      }
-                    }
-                    if (bestBucket < 0 || bestCount < 2) return null;
-                    var targetW = bestBucket * 50;
-                    var vw = window.innerWidth || document.documentElement.clientWidth || 360;
-                    if (targetW < vw * 0.5) return null;
-                    var result = null;
-                    for (var m = 0; m < candidates.length; m++) {
-                      if (Math.abs(candidates[m].w - targetW) <= 35) result = candidates[m].el;
-                    }
-                    return result;
-                  }
-
-                  function nukeEl(el) {
-                    if (!el || !el.style) return;
-                    try {
-                      el.setAttribute('data-mm-ad', '1');
-                      el.style.setProperty('display', 'none', 'important');
-                      el.style.setProperty('pointer-events', 'none', 'important');
-                      el.style.setProperty('width', '0px', 'important');
-                      el.style.setProperty('height', '0px', 'important');
-                      el.style.setProperty('opacity', '0', 'important');
-                      el.style.setProperty('visibility', 'hidden', 'important');
-                      el.style.setProperty('z-index', '-9999', 'important');
-                    } catch(e) {}
-                  }
-
-                  function killSiteSpecificBanners() {
-                    try {
-                      if (isOmega) {
-                        var asides = document.querySelectorAll('aside, [class*="z-[2147483647]"]');
-                        for (var a = 0; a < asides.length; a++) {
-                          if (asides[a].id === 'mm-tap-flash') continue;
-                          if (!isEssentialNavOrModal(asides[a])) {
-                            nukeEl(asides[a]);
-                          }
-                        }
-                      }
-
-                      if (isFlame) {
-                        var flameAds = document.querySelectorAll('[class*="Panel-module__"], [class*="Dock-module__"], [class*="TopChapterNavbar-module__"], iframe[src*="radioonlinehd"], iframe[src*="flamesradio"]');
-                        for (var f = 0; f < flameAds.length; f++) {
-                          nukeEl(flameAds[f]);
-                        }
-                      }
-
-                      var bannerImgs = document.querySelectorAll('img[src*="600x300"], img[src*="compr.gif"], img[class*="max-w-[600px]"], img[class*="Panel-module__"]');
-                      for (var b = 0; b < bannerImgs.length; b++) {
-                        var bImg = bannerImgs[b];
-                        nukeEl(bImg);
-                        var pA = bImg.closest('a');
-                        if (pA) {
-                          nukeEl(pA);
-                          var pDiv = pA.parentElement;
-                          if (pDiv && pDiv.tagName === 'DIV' && pDiv.children.length === 1) {
-                            nukeEl(pDiv);
-                          }
-                        }
-                      }
-                    } catch(e) {}
-                  }
-
-                  function hideEl(el) {
-                    if (!el || !el.style) return;
-                    if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.tagName === 'LINK') return;
-                    if (isEssentialNavOrModal(el) || isOrContainsUnloadedPage(el)) return;
-                    var cs;
-                    try { cs = getComputedStyle(el); } catch(e) { cs = null; }
-                    if (cs && (cs.position === 'fixed' || cs.position === 'sticky') && el.tagName !== 'ASIDE') return;
-                    try { el.style.setProperty('display', 'none', 'important'); } catch(e) {}
-                  }
-
-                  function collapseBottomSpacing(startEl) {
-                    var cur = startEl, guard = 0;
-                    while (cur && cur !== document.documentElement && guard++ < 12) {
-                      try {
-                        cur.style.setProperty('padding-bottom', '0', 'important');
-                        cur.style.setProperty('margin-bottom', '0', 'important');
-                        cur.style.setProperty('border-bottom-width', '0', 'important');
-                      } catch(e) {}
-                      cur = cur.parentElement;
-                    }
-                    if (document.body) {
-                      document.body.style.setProperty('padding-bottom', '0', 'important');
-                      document.body.style.setProperty('margin-bottom', '0', 'important');
-                    }
-                  }
-
-                  window.__mmTruncateBottom = function() {
-                    try {
-                      promoteLazyImages();
-                      killSiteSpecificBanners();
-                      cacheNavLinks();
-                      var last = findLastContentPage();
-                      if (!last) return;
-                      var reader = findReaderContainer(last) || getScroller();
-                      var start;
-                      if (reader) {
-                        start = reader;
-                      } else {
-                        var p1 = last.parentElement;
-                        var p2 = p1 ? p1.parentElement : null;
-                        start = p2 || p1 || last;
-                      }
-                      var cur = start, guard = 0;
-                      while (cur && cur.parentElement && cur !== document.body && cur !== document.documentElement && guard++ < 15) {
-                        var sib = cur.nextElementSibling;
-                        while (sib) {
-                          if (!sib.contains(last)) hideEl(sib);
-                          sib = sib.nextElementSibling;
-                        }
-                        cur = cur.parentElement;
-                      }
-                      if (start && start.parentElement) collapseBottomSpacing(start.parentElement);
-                    } catch(e) {}
-                  };
-
-                  function reportChapter() {
-                    try {
-                      var chText = '';
-                      // 1. Check URL first
-                      var m = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
-                      if (m) chText = 'Ch. ' + m[1];
-
-                      // 2. Check Next.js __NEXT_DATA__ (for FlameComics token URLs)
-                      if (!chText) {
-                        var nd = document.getElementById('__NEXT_DATA__');
-                        if (nd) {
-                          var props = JSON.parse(nd.textContent).props.pageProps;
-                          if (props && props.chapter && props.chapter.chapter !== undefined) {
-                            chText = 'Ch. ' + props.chapter.chapter;
-                          }
-                        }
-                      }
-
-                      // 3. Check document.title
-                      if (!chText) {
-                        var tm = /(?:chapter|ch\.?)\s*(\d+(?:\.\d+)?)/i.exec(document.title || '');
-                        if (tm) chText = 'Ch. ' + tm[1];
-                      }
-
-                      // 4. Fallback to reader title elements
-                      if (!chText) {
-                        var el = document.querySelector('.rpage-floatctl__chap .mono, .rpage-chap-ending__title, h1:not(.sr-only)');
-                        if (el) chText = (el.innerText || el.textContent || '').trim();
-                      }
-
-                      if (chText && chText !== 'Ch. 0' && chText !== 'Ch.0') {
-                        if (window.MMReader && window.MMReader.onChapterDetected) {
-                          window.MMReader.onChapterDetected(chText, window.location.href);
-                        }
-                      }
-                    } catch(e) {}
-                  }
-
-                  reportChapter();
-                  window.__mmTruncateBottom();
-
-                  if (!window.__mmTruncObserversInstalled) {
-                    window.__mmTruncObserversInstalled = true;
-                    [250, 600, 1200, 2500, 5000].forEach(function(d) {
-                      setTimeout(function() { try { window.__mmTruncateBottom(); } catch(e) {} }, d);
-                    });
-                    if (window.MutationObserver) {
-                      var moTimer = null;
-                      var mo = new MutationObserver(function() {
-                        killSiteSpecificBanners();
-                        if (moTimer) clearTimeout(moTimer);
-                        moTimer = setTimeout(function() {
-                          moTimer = null;
-                          try { window.__mmTruncateBottom(); } catch(e) {}
-                        }, 400);
-                      });
-                      mo.observe(document.body || document.documentElement, { childList: true, subtree: true });
-                    }
-                    var loadTimer = null;
-                    document.addEventListener('load', function(e) {
-                      if (e.target && (e.target.tagName === 'IMG' || e.target.tagName === 'CANVAS')) {
-                        if (loadTimer) clearTimeout(loadTimer);
-                        loadTimer = setTimeout(function() {
-                          loadTimer = null;
-                          try { window.__mmTruncateBottom(); } catch(err) {}
-                        }, 300);
-                      }
-                    }, true);
-                  }
-
-                  if (!window.__mmAdInterval) {
-                    window.__mmAdInterval = setInterval(function() {
-                      try {
-                        killSiteSpecificBanners();
-                        var ads = document.querySelectorAll(
-                          '.ai-top-bar, [class^="ai-top-bar"], ' +
-                          '[class*="Panel-module__"], [class*="Dock-module__"], ' +
-                          'iframe[src*="radioonlinehd"], iframe[src*="flamesradio"], ' +
-                          'iframe[src*="smartfloralab"], iframe[src*="doubleclick"], ' +
-                          'iframe[src*="googlesyndication"], iframe[src*="adservice.google"], ' +
-                          'iframe[src*="amazon-adsystem"], iframe[src*="taboola"], ' +
-                          'iframe[src*="outbrain"], iframe[src*="criteo"], ' +
-                          'iframe[src*="openx"], iframe[src*="sharethrough"], ' +
-                          'iframe[src*="media.net"], iframe[src*="mgid"], ' +
-                          'iframe[src*="zergnet"], iframe[src*="gumgum"], ' +
-                          '[class*="ad-slot"], [class*="ad-slot "], [class$="ad-slot"], ' +
-                          '[class*="ad-container"], [class*="ad-wrapper"], ' +
-                          '[class^="adsense"], [class*=" adsense"], [class*="adsbygoogle"], ' +
-                          'ins.adsbygoogle, ins[data-ad-slot], ' +
-                          '[data-google-query-id], [data-ad-slot], [data-ad-client], ' +
-                          '[id*="google_ads"], [id*="div-gpt"], [id*="aswift"], ' +
-                          '[class^="ad-banner"], [class*=" ad-banner"], ' +
-                          '[class*="video-ad"], [class*="video-slider-ad"]'
-                        );
-                        for (var i = 0; i < ads.length; i++) {
-                          nukeEl(ads[i]);
-                        }
-                        if (document.body) {
-                          document.body.style.setProperty('padding-top', '0', 'important');
-                        }
-                      } catch(e) {}
-                    }, 350);
-                  }
-
-                  if (!window.__mmTapInstalled) {
-                    window.__mmTapInstalled = true;
-                    var MAX_MOVE = 14, MAX_TIME = 350, DEBOUNCE = 180;
-                    var sx = 0, sy = 0, st = 0, last = 0, moved = false;
-
-                    function ignored(el) {
-                      if (!el || !el.closest) return false;
-                      return !!el.closest(
-                        'a, button, input, textarea, select, [role="dialog"], ' +
-                        '.modal, .popup, .settings, .chapter-list, ' +
-                        '.rpage-modal, .rpage-chaplist, .rpage-settings, .rpage-chappanel, .rpage-cmpanel, .rpage-page__loader'
-                      );
-                    }
-
-                    function isLikelyAd(el) {
-                      if (!el) return false;
-                      var cur = el;
-                      for (var i = 0; i < 4 && cur; i++) {
-                        var cls = (cur.className && cur.className.toString()) || '';
-                        if (cls.indexOf('ai-top-bar') > -1 || cls.indexOf('Panel-module__') > -1 || cls.indexOf('Dock-module__') > -1) return true;
-                        if (cur.tagName === 'IFRAME' || cur.tagName === 'VIDEO' || cur.tagName === 'ASIDE') return true;
-                        if (cur.tagName === 'IMG' && isBannerAdImage(cur)) return true;
-                        cur = cur.parentElement;
-                      }
-                      return false;
-                    }
-
-                    function atBottom() {
-                      try {
-                        var sc = getScroller();
-                        if (sc && sc.scrollHeight > sc.clientHeight) {
-                          return (sc.scrollTop + sc.clientHeight) >= (sc.scrollHeight - 150);
-                        }
-                        var h = window.innerHeight || document.documentElement.clientHeight;
-                        var scrollPos = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0;
-                        var docHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-                        if (docHeight <= h) return false;
-                        return (scrollPos + h) >= (docHeight - 150);
-                      } catch(e) { return false; }
-                    }
-
-                    function scrollByPage(frac) {
-                      var h = window.innerHeight;
-                      var sc = getScroller();
-                      if (sc) {
-                        try { sc.scrollBy({ top: h * frac, behavior: 'smooth' }); }
-                        catch(e) { sc.scrollTop = (sc.scrollTop || 0) + h * frac; }
-                        return;
-                      }
-                      window.scrollBy({ top: h * frac, behavior: 'smooth' });
-                    }
-
-                    function handleTap(x, y) {
-                      var now = Date.now(); if (now - last < DEBOUNCE) return; last = now;
-                      var w = window.innerWidth, h = window.innerHeight;
-                      if (x < w * 0.25) {
-                        scrollByPage(-0.8); flash(x, y);
-                      } else if (x > w * 0.75) {
-                        if (atBottom()) {
-                          flash(x, y); if (window.MMReader) window.MMReader.onNext();
-                        } else {
-                          scrollByPage(0.8); flash(x, y);
-                        }
-                      } else {
-                        if (atBottom() && y > h * 0.75) {
-                          flash(x, y); if (window.MMReader) window.MMReader.onNext();
-                        } else {
-                          flash(x, y); if (window.MMReader) window.MMReader.onCenterTap();
-                        }
-                      }
-                    }
-
-                    document.addEventListener('touchstart', function(e){
-                      if (e.touches.length !== 1) return;
-                      var t = e.touches[0];
-                      sx = t.clientX; sy = t.clientY; st = Date.now(); moved = false;
-                    }, { passive: true, capture: true });
-
-                    document.addEventListener('touchmove', function(e){
-                      if (e.touches.length !== 1) return;
-                      var t = e.touches[0];
-                      if (Math.abs(t.clientX - sx) > MAX_MOVE || Math.abs(t.clientY - sy) > MAX_MOVE) moved = true;
-                    }, { passive: true, capture: true });
-
-                    document.addEventListener('touchend', function(e){
-                      if (e.changedTouches.length !== 1) return;
-                      if (moved) return;
-                      var t = e.changedTouches[0];
-                      if (Math.abs(t.clientX - sx) > MAX_MOVE) return;
-                      if (Math.abs(t.clientY - sy) > MAX_MOVE) return;
-                      if (Date.now() - st > MAX_TIME) return;
-                      if (isLikelyAd(t.target)) { e.preventDefault(); e.stopPropagation(); return; }
-                      if (ignored(t.target || e.target)) return;
-                      handleTap(t.clientX, t.clientY);
-                    }, { passive: true, capture: true });
-
-                    document.addEventListener('touchcancel', function(){ moved = true; }, { passive: true, capture: true });
-
-                    document.addEventListener('click', function(e){
-                      if ('ontouchstart' in window) return;
-                      if (isLikelyAd(e.target)) { e.preventDefault(); e.stopPropagation(); return; }
-                      if (ignored(e.target)) return;
-                      handleTap(e.clientX, e.clientY);
-                    }, false);
-                  }
-
-                  if (!window.__mmSoftNav) {
-                    window.__mmSoftNav = true;
-                    var relist = function(){
-                      setTimeout(function(){
-                        try {
-                          window.__mmCachedNextUrl = null;
-                          window.__mmCachedPrevUrl = null;
-                          reportChapter();
-                          if (window.__mmTruncateBottom) window.__mmTruncateBottom();
-                          if (window.MMReader) window.MMReader.onReinject();
-                        } catch(e){}
-                      }, 150);
-                    };
-                    [
-                      'popstate', 'turbo:load', 'turbo:render', 'turbo:initial-updated',
-                      'turbo:request-completed', 'pjax:end', 'swup:contentReplaced', 'inertia:navigate'
-                    ].forEach(function(ev){ window.addEventListener(ev, relist); });
-                  }
-
-                  function flash(x, y) {
-                    try {
-                      var d = document.createElement('div');
-                      d.id = 'mm-tap-flash';
-                      d.style.cssText = 'position:fixed;pointer-events:none;width:56px;height:56px;border-radius:50%;background:rgba(99,102,241,0.28);z-index:2147483647;transform:translate(-50%,-50%);transition:opacity .35s,transform .35s;opacity:1';
-                      d.style.left = x + 'px'; d.style.top = y + 'px'; document.body.appendChild(d);
-                      requestAnimationFrame(function(){ d.style.opacity = '0'; d.style.transform = 'translate(-50%,-50%) scale(1.4)'; });
-                      setTimeout(function(){ d.remove(); }, 450);
-                    } catch(e){}
-                  }
-
-                  if (!window.__mmScrollTrackerInstalled) {
-                    window.__mmScrollTrackerInstalled = true;
-                    var lastY = -1, lastT = 0, pendingTimer = null;
-                    function currentY() {
-                      var sc = getScroller();
-                      if (sc) return sc.scrollTop;
-                      return window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
-                    }
-                    function push(force) {
-                      var y = currentY();
-                      if (!force && Math.abs(y - lastY) < 6) return;
-                      lastY = y;
-                      try { if (window.MMReader && window.MMReader.onScrollPosition) window.MMReader.onScrollPosition(window.location.href, y); } catch (e) {}
-                    }
-                    function schedulePush() {
-                      var now = Date.now();
-                      if (now - lastT >= 500) { lastT = now; push(false); return; }
-                      if (pendingTimer) clearTimeout(pendingTimer);
-                      pendingTimer = setTimeout(function () { lastT = Date.now(); push(false); }, 500 - (now - lastT));
-                    }
-                    window.addEventListener('scroll', schedulePush, { passive: true });
-                    document.addEventListener('scroll', schedulePush, { passive: true, capture: true });
-                    window.addEventListener('pagehide', function () { push(true); });
-                    window.addEventListener('beforeunload', function () { push(true); });
-                    window.__mmPushScroll = function () { push(true); };
-                  }
-
-                  if (!window.__mmRestoreScroll) {
-                    window.__mmRestoreScroll = function (targetY) {
-                      if (typeof targetY !== 'number' || targetY <= 0) return;
-                      var cancelled = false;
-                      function cancel() { cancelled = true; }
-                      window.addEventListener('touchstart', cancel, { once: true, passive: true, capture: true });
-                      window.addEventListener('wheel',      cancel, { once: true, passive: true, capture: true });
-                      window.addEventListener('keydown',    cancel, { once: true });
-                      function apply() {
-                        if (cancelled) return;
-                        try {
-                          var sc = getScroller();
-                          if (sc) { sc.scrollTop = targetY; return; }
-                          window.scrollTo(0, targetY);
-                        } catch (e) {}
-                      }
-                      [0, 60, 150, 300, 500, 800, 1200, 1700, 2400, 3200, 4000].forEach(function (d) { setTimeout(apply, d); });
-                    };
-                  }
-
-                  if (window.__mmDiag && !window.__mmAuditScheduled) {
-                    window.__mmAuditScheduled = true;
-
-                    function runDomAudit(tag) {
-                      try {
-                        var suspects = [];
-                        var seen = new Set();
-                        var adRegex = /(?:^|[\s_-])(ad|ads|advert|banner|sponsor|promo|popunder|popup|adsbygoogle|adsense)(?:$|[\s_-])/i;
-                        var all = document.querySelectorAll('*');
-                        for (var i = 0; i < all.length; i++) {
-                          var el = all[i];
-                          if (seen.has(el) || el.id === 'mm-tap-flash') continue;
-                          var idCls = ((el.id || '') + ' ' + (el.className && el.className.toString ? el.className.toString() : '')).toLowerCase();
-                          var matched = adRegex.test(idCls) ||
-                                        el.tagName === 'ASIDE' ||
-                                        el.tagName === 'IFRAME' ||
-                                        isBannerAdImage(el) ||
-                                        el.hasAttribute('data-ad') ||
-                                        el.hasAttribute('data-ad-slot') ||
-                                        el.hasAttribute('data-google-query-id');
-                          if (!matched) continue;
-                          var r = el.getBoundingClientRect();
-                          if (r.width < 20 || r.height < 20) continue;
-                          var cs = getComputedStyle(el);
-                          if (cs.display === 'none' || cs.visibility === 'hidden' ||
-                              parseFloat(cs.opacity) < 0.1) continue;
-                          seen.add(el);
-                          suspects.push({
-                            tag: el.tagName,
-                            id: el.id || '',
-                            cls: (el.className && el.className.toString ? el.className.toString() : '').slice(0, 80),
-                            w: Math.round(r.width),
-                            h: Math.round(r.height),
-                            x: Math.round(r.x),
-                            y: Math.round(r.y),
-                            pos: cs.position,
-                            z: cs.zIndex,
-                            src: el.src || el.getAttribute('data-src') || el.getAttribute('data-lazy-src') || ''
-                          });
-                        }
-                        if (window.MMReader && window.MMReader.onAdAudit) {
-                          window.MMReader.onAdAudit('DOM[' + tag + ']:' + JSON.stringify(suspects));
-                        }
-                      } catch(e) {
-                        if (window.MMReader && window.MMReader.onAdAudit) {
-                          window.MMReader.onAdAudit('DOMERR:' + tag + ':' + e);
-                        }
-                      }
-                    }
-
-                    function runPixelScan(tag) {
-                      try {
-                        var out = [];
-                        var w = window.innerWidth, h = window.innerHeight;
-                        var ys = [Math.round(h * 0.05), Math.round(h * 0.2), Math.round(h * 0.4), Math.round(h * 0.6), Math.round(h * 0.8), Math.round(h * 0.95)];
-                        var xs = [Math.round(w * 0.15), Math.round(w * 0.5), Math.round(w * 0.85)];
-                        for (var yi = 0; yi < ys.length; yi++) {
-                          for (var xi = 0; xi < xs.length; xi++) {
-                            var x = xs[xi], y = ys[yi];
-                            var el = document.elementFromPoint(x, y);
-                            if (!el) continue;
-                            var path = [];
-                            var cur = el;
-                            for (var d = 0; d < 4 && cur; d++) {
-                              var seg = cur.tagName;
-                              if (cur.id) seg += '#' + cur.id;
-                              if (cur.className && cur.className.toString && cur.className.toString().trim().length > 0) {
-                                seg += '.' + cur.className.toString().trim().replace(/\s+/g, '.');
-                              }
-                              path.push(seg);
-                              cur = cur.parentElement;
-                            }
-                            out.push(x + ',' + y + ' → ' + path.join(' < '));
-                          }
-                        }
-                        if (window.MMReader && window.MMReader.onAdAudit) {
-                          window.MMReader.onAdAudit('PIXELS[' + tag + ']:' + out.join(' | '));
-                        }
-                      } catch(e) {
-                        if (window.MMReader && window.MMReader.onAdAudit) {
-                          window.MMReader.onAdAudit('PIXERR:' + tag + ':' + e);
-                        }
-                      }
-                    }
-
-                    setTimeout(function(){ runDomAudit('3s'); }, 3000);
-                    setTimeout(function(){ runPixelScan('4s'); }, 4000);
-                    setTimeout(function(){ runDomAudit('8s'); }, 8000);
-                    setTimeout(function(){ runPixelScan('9s'); }, 9000);
-                  }
-                } catch(e){ console.log("MM-Reader Error: " + e); }
+                `;
+                head.appendChild(s);
               }
-              mmInject(0);
+
+              // 1. Promote lazy-loaded images immediately so all chapter pages start loading
+              function promoteLazyImages() {
+                var imgs = document.querySelectorAll('img');
+                for (var i = 0; i < imgs.length; i++) {
+                  var img = imgs[i];
+                  var lazySrc = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.getAttribute('data-original') || img.getAttribute('data-cfsrc');
+                  if (lazySrc) {
+                    lazySrc = lazySrc.trim();
+                    var curSrc = (img.getAttribute('src') || '').trim();
+                    if (lazySrc && (!curSrc || curSrc.indexOf('data:') === 0 || curSrc.indexOf('dflazy') !== -1)) {
+                      img.setAttribute('src', lazySrc);
+                    }
+                  }
+                  img.removeAttribute('loading');
+                  img.classList.remove('lazyload', 'lazyloading');
+                }
+              }
+
+              // 2. Universal Algorithmic Reader Container Detector (no image dimension checks, so unloaded lazy images are never skipped!)
+              function detectReaderContainer() {
+                var known = document.querySelector('#readerarea, .reading-content, .comic-images-wrapper, .container-chapter-reader, .rpage-main__inner, .rpage-main, .chapter-content, .manga-reading, #chapter-content, .viewer');
+                if (known) {
+                  known.setAttribute('data-mm-reader', '1');
+                  return known;
+                }
+
+                // Algorithmic fallback for any unknown site: find parent element holding >= 3 chapter candidate images
+                var allMedia = document.querySelectorAll('img, canvas');
+                var counts = new Map();
+                var bestEl = null, bestCount = 0;
+
+                for (var i = 0; i < allMedia.length; i++) {
+                  var m = allMedia[i];
+                  if (m.closest && m.closest('header, nav, footer, aside, #comments, #disqus_thread')) continue;
+                  var src = (m.getAttribute('data-src') || m.getAttribute('src') || '').toLowerCase();
+                  if (src.indexOf('logo') !== -1 || src.indexOf('avatar') !== -1 || src.indexOf('icon') !== -1 || src.indexOf('600x300') !== -1 || src.indexOf('compr.gif') !== -1) continue;
+
+                  var p = m.parentElement;
+                  // If each image is wrapped in its own <figure> or <div class="page">, step up one level to the list container
+                  if (p && p.children.length <= 2 && p.parentElement && p.parentElement !== document.body) {
+                    p = p.parentElement;
+                  }
+                  if (!p || p === document.body || p === document.documentElement) continue;
+
+                  var c = (counts.get(p) || 0) + 1;
+                  counts.set(p, c);
+                  if (c > bestCount) { bestCount = c; bestEl = p; }
+                }
+
+                if (bestEl && bestCount >= 3) {
+                  bestEl.setAttribute('data-mm-reader', '1');
+                  return bestEl;
+                }
+                return null;
+              }
+
+              // 3. Safe Algorithmic Bottom-Truncator & Sibling Cleaner
+              function cleanAfterReader() {
+                try {
+                  promoteLazyImages();
+                  var readerBox = detectReaderContainer();
+                  if (!readerBox) return;
+
+                  var junkRegex = /comment|disqus|leave a reply|you may also like|related|recommend|popular|trending|bookmark|report|copyright|all rights reserved|social|share/i;
+                  var keepSel = 'select, [role="dialog"], .rpage-modal, .rpage-chaplist, .rpage-settings, .rpage-chap-ending';
+
+                  var cur = readerBox;
+                  var depth = 0;
+                  while (cur && cur !== document.body && cur !== document.documentElement && depth++ < 6) {
+                    var sib = cur.nextElementSibling;
+                    while (sib) {
+                      if (!sib.contains(readerBox) && sib.tagName !== 'SCRIPT' && sib.tagName !== 'STYLE') {
+                        var hasKeep = (sib.matches && sib.matches(keepSel)) || (sib.querySelector && sib.querySelector(keepSel));
+                        if (!hasKeep) {
+                          var txt = (sib.innerText || sib.textContent || '').slice(0, 600);
+                          var idCls = ((sib.id || '') + ' ' + (sib.className && sib.className.toString ? sib.className.toString() : ''));
+                          // Hide trailing siblings after the reader box that match footer/comment/recommendation patterns or have no chapter images
+                          var hasReaderImgs = sib.querySelectorAll && sib.querySelectorAll('img').length >= 3 && !junkRegex.test(idCls) && !junkRegex.test(txt);
+                          if (!hasReaderImgs) {
+                            sib.setAttribute('data-mm-ad', '1');
+                          }
+                        }
+                      }
+                      sib = sib.nextElementSibling;
+                    }
+                    cur.style.setProperty('padding-bottom', '0', 'important');
+                    cur.style.setProperty('margin-bottom', '0', 'important');
+                    cur = cur.parentElement;
+                  }
+                } catch(e) {}
+              }
+
+              cleanAfterReader();
+              setTimeout(cleanAfterReader, 600);
+              setTimeout(cleanAfterReader, 2000);
+
+              if (!window.__mmCleanObserver && window.MutationObserver) {
+                window.__mmCleanObserver = true;
+                var moTimer = null;
+                var mo = new MutationObserver(function() {
+                  if (moTimer) clearTimeout(moTimer);
+                  moTimer = setTimeout(cleanAfterReader, 500);
+                });
+                mo.observe(document.body || document.documentElement, { childList: true, subtree: true });
+              }
+
+              // 4. Cache Next/Prev navigation links & harvest chapter URLs
+              try {
+                var links = document.querySelectorAll('a[href]');
+                var harvested = {}, harvestCount = 0;
+                for (var j = 0; j < links.length; j++) {
+                  var a = links[j], href = a.href;
+                  if (!href || href.indexOf('javascript:') === 0 || href.slice(-1) === '#') continue;
+                  var hm = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(href);
+                  if (hm && href.indexOf('http') === 0) { harvested[hm[1]] = href; harvestCount++; }
+
+                  var rel = (a.getAttribute('rel') || '').toLowerCase();
+                  var txt = (a.innerText || a.textContent || '').trim().toLowerCase();
+                  if (rel === 'next' || a.classList.contains('next_page') || txt.includes('next chapter') || txt === 'next') {
+                    window.__mmCachedNextUrl = href;
+                  } else if (rel === 'prev' || rel === 'previous' || a.classList.contains('prev_page') || txt.includes('prev chapter') || txt === 'prev') {
+                    window.__mmCachedPrevUrl = href;
+                  }
+                }
+                if (harvestCount > 0 && window.MMReader && window.MMReader.onChaptersHarvested) {
+                  window.MMReader.onChaptersHarvested(JSON.stringify(harvested));
+                }
+              } catch(e) {}
+
+              // 5. Report detected chapter number to toolbar
+              try {
+                var chText = '';
+                var m = /(?:chapter|ch)[/\-_]?(\d+(?:\.\d+)?)/i.exec(window.location.href);
+                if (m) chText = 'Ch. ' + m[1];
+                if (!chText) {
+                  var nd = document.getElementById('__NEXT_DATA__');
+                  if (nd) {
+                    var props = JSON.parse(nd.textContent).props.pageProps;
+                    if (props && props.chapter && props.chapter.chapter !== undefined) chText = 'Ch. ' + props.chapter.chapter;
+                  }
+                }
+                if (!chText) {
+                  var tm = /(?:chapter|ch\.?)\s*(\d+(?:\.\d+)?)/i.exec(document.title || '');
+                  if (tm) chText = 'Ch. ' + tm[1];
+                }
+                if (chText && chText !== 'Ch. 0' && window.MMReader && window.MMReader.onChapterDetected) {
+                  window.MMReader.onChapterDetected(chText, window.location.href);
+                }
+              } catch(e) {}
+
+              function getScroller() {
+                var sels = ['[data-mm-reader="1"]', '.rpage-main', '#readerarea', '.reading-content', '.chapter-content', '.comic-images-wrapper', '.container-chapter-reader'];
+                for (var k = 0; k < sels.length; k++) {
+                  var el = document.querySelector(sels[k]);
+                  if (el && el.scrollHeight > el.clientHeight + 20) {
+                    var oy = window.getComputedStyle(el).overflowY;
+                    if (oy === 'auto' || oy === 'scroll' || oy === 'overlay' || el.classList.contains('rpage-main')) return el;
+                  }
+                }
+                return null;
+              }
+
+              // 6. Tap Zones & Scroll Tracking
+              if (!window.__mmTapInstalled) {
+                window.__mmTapInstalled = true;
+                var sx = 0, sy = 0, st = 0, last = 0, moved = false;
+
+                function ignored(el) {
+                  return el && el.closest && !!el.closest('a, button, input, textarea, select, [role="dialog"], .rpage-modal, .rpage-chaplist, .rpage-settings');
+                }
+
+                function atBottom() {
+                  var sc = getScroller();
+                  if (sc && sc.scrollHeight > sc.clientHeight) return (sc.scrollTop + sc.clientHeight) >= (sc.scrollHeight - 150);
+                  var h = window.innerHeight || document.documentElement.clientHeight;
+                  var y = window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0;
+                  var dh = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+                  return dh > h && (y + h) >= (dh - 150);
+                }
+
+                function scrollByPage(frac) {
+                  var h = window.innerHeight, sc = getScroller();
+                  if (sc) { sc.scrollBy({ top: h * frac, behavior: 'smooth' }); return; }
+                  window.scrollBy({ top: h * frac, behavior: 'smooth' });
+                }
+
+                function flash(x, y) {
+                  try {
+                    var d = document.createElement('div');
+                    d.style.cssText = 'position:fixed;pointer-events:none;width:56px;height:56px;border-radius:50%;background:rgba(99,102,241,0.28);z-index:2147483647;transform:translate(-50%,-50%);transition:opacity .35s,transform .35s;opacity:1;left:' + x + 'px;top:' + y + 'px';
+                    document.body.appendChild(d);
+                    requestAnimationFrame(function(){ d.style.opacity = '0'; d.style.transform = 'translate(-50%,-50%) scale(1.4)'; });
+                    setTimeout(function(){ d.remove(); }, 400);
+                  } catch(e){}
+                }
+
+                function handleTap(x, y) {
+                  var now = Date.now(); if (now - last < 180) return; last = now;
+                  var w = window.innerWidth, h = window.innerHeight;
+                  flash(x, y);
+                  if (x < w * 0.25) scrollByPage(-0.8);
+                  else if (x > w * 0.75) { if (atBottom() && window.MMReader) window.MMReader.onNext(); else scrollByPage(0.8); }
+                  else { if (atBottom() && y > h * 0.75 && window.MMReader) window.MMReader.onNext(); else if (window.MMReader) window.MMReader.onCenterTap(); }
+                }
+
+                document.addEventListener('touchstart', function(e){
+                  if (e.touches.length !== 1) return;
+                  sx = e.touches[0].clientX; sy = e.touches[0].clientY; st = Date.now(); moved = false;
+                }, { passive: true, capture: true });
+
+                document.addEventListener('touchmove', function(e){
+                  if (e.touches.length !== 1) return;
+                  if (Math.abs(e.touches[0].clientX - sx) > 14 || Math.abs(e.touches[0].clientY - sy) > 14) moved = true;
+                }, { passive: true, capture: true });
+
+                document.addEventListener('touchend', function(e){
+                  if (moved || e.changedTouches.length !== 1 || Date.now() - st > 350) return;
+                  var t = e.changedTouches[0];
+                  if (ignored(t.target || e.target)) return;
+                  handleTap(t.clientX, t.clientY);
+                }, { passive: true, capture: true });
+              }
+
+              if (!window.__mmScrollTrackerInstalled) {
+                window.__mmScrollTrackerInstalled = true;
+                var lastY = -1, lastT = 0;
+                function push(force) {
+                  var sc = getScroller();
+                  var y = sc ? sc.scrollTop : (window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0);
+                  if (!force && Math.abs(y - lastY) < 6) return;
+                  lastY = y;
+                  try { if (window.MMReader) window.MMReader.onScrollPosition(window.location.href, y); } catch (e) {}
+                }
+                window.addEventListener('scroll', function(){
+                  var now = Date.now();
+                  if (now - lastT >= 500) { lastT = now; push(false); }
+                }, { passive: true });
+                window.__mmPushScroll = function () { push(true); };
+              }
+
+              if (!window.__mmRestoreScroll) {
+                window.__mmRestoreScroll = function (targetY) {
+                  if (typeof targetY !== 'number' || targetY <= 0) return;
+                  var cancelled = false;
+                  window.addEventListener('touchstart', function(){ cancelled = true; }, { once: true, passive: true, capture: true });
+                  [50, 250, 700, 1500].forEach(function (d) {
+                    setTimeout(function(){
+                      if (cancelled) return;
+                      var sc = getScroller();
+                      if (sc) sc.scrollTop = targetY; else window.scrollTo(0, targetY);
+                    }, d);
+                  });
+                };
+              }
             })();
             """.trimIndent(), null
         )
     }
 
-    private fun positionKey(url: String): String {
-        if (url.isBlank()) return ""
-        return "pos::" + url.substringBefore('#').trimEnd('/')
-    }
+    private fun positionKey(url: String): String =
+        if (url.isBlank()) "" else "pos::" + url.substringBefore('#').trimEnd('/')
 
     private fun loadSavedScroll(url: String): Float {
         val k = positionKey(url)
-        if (k.isEmpty()) return -1f
-        return runCatching { prefs.getFloat(k, -1f) }.getOrDefault(-1f)
+        return if (k.isEmpty()) -1f else runCatching { prefs.getFloat(k, -1f) }.getOrDefault(-1f)
     }
 
     fun saveScroll(url: String, y: Float) {
         val k = positionKey(url)
-        if (k.isEmpty() || y < 0f) return
-        runCatching { prefs.edit().putFloat(k, y).apply() }
+        if (k.isNotEmpty() && y >= 0f) runCatching { prefs.edit().putFloat(k, y).apply() }
     }
 
     private fun restoreScrollPosition(y: Float) {
@@ -1794,25 +1067,22 @@ class ReaderDialog : DialogFragment() {
         val slug = extractSlug(url)
         val hasExplicitChapterInUrl = EXPLICIT_CHAPTER_URL_REGEX.containsMatchIn(url)
 
-        val directTargetUrl = if (target > 0 && slug.isNotBlank()) {
+        val shouldJump = !hasExplicitChapterInUrl && target > 0
+
+        val directTargetUrl = if (shouldJump && slug.isNotBlank()) {
             ComixProvider.getCachedChapterUrl(context, slug, target.toString())
-        } else {
-            null
-        }
+        } else null
 
         val savedUrl = if (directTargetUrl == null && slug.isNotBlank() && !hasExplicitChapterInUrl && target == 0) {
             prefs.getString(slug, null)
-        } else {
-            null
-        }
+        } else null
 
         currentChapterUrl = directTargetUrl ?: savedUrl ?: url
-        currentChapterName = name
-        targetChapter = if (directTargetUrl != null) 0 else target
-        if (target > 0) currentChapterName = "Ch. $target"
+        currentChapterName = if (target > 0 && name == "Chapter") "Ch. $target" else name
+        targetChapter = if (shouldJump && directTargetUrl == null) target else 0
         chapterInfo?.text = currentChapterName.ifBlank { "Chapter" }
 
-        if (slug.isNotBlank() && hasExplicitChapterInUrl && targetChapter == 0) {
+        if (slug.isNotBlank() && hasExplicitChapterInUrl) {
             prefs.edit().putString(slug, currentChapterUrl).apply()
             recordDiscoveredChapterUrl(currentChapterUrl)
         }
@@ -1833,42 +1103,27 @@ class ReaderDialog : DialogFragment() {
             currentChapterUrl = detectedUrl
             recordDiscoveredChapterUrl(detectedUrl)
         }
-
         val m = Regex("(?:chapter|ch)[/\\-_]?(\\d+(?:\\.\\d+)?)", RegexOption.IGNORE_CASE).find(detectedUrl)
-        if (m != null) {
-            val num = m.groupValues[1]
-            if (num != "0") {
-                currentChapterName = "Ch. $num"
-                chapterInfo?.text = currentChapterName
-                return
-            }
+        if (m != null && m.groupValues[1] != "0") {
+            currentChapterName = "Ch. ${m.groupValues[1]}"
+            chapterInfo?.text = currentChapterName
+            return
         }
-        if (detectedTitle.isBlank() ||
-            detectedTitle.contains("Comix", ignoreCase = true) ||
-            detectedTitle.equals("Ch. 0", ignoreCase = true) ||
-            detectedTitle.equals("Chapter 0", ignoreCase = true)
-        ) return
-
         val clean = detectedTitle.substringBefore(" - ").substringBefore(" · ").substringBefore(" | ").trim()
-        if (clean.isBlank() || clean == "Ch. 0" || clean == "Chapter 0") return
-        currentChapterName = clean
-        chapterInfo?.text = clean
+        if (clean.isNotBlank() && !clean.equals("Ch. 0", true) && !clean.contains("Comix", true)) {
+            currentChapterName = clean
+            chapterInfo?.text = clean
+        }
     }
 
     class JsBridge(private val dialog: ReaderDialog) {
         @JavascriptInterface fun onCenterTap() { dialog.activity?.runOnUiThread { dialog.toggleToolbar(); dialog.haptic() } }
         @JavascriptInterface fun onNext() { dialog.activity?.runOnUiThread { dialog.haptic(); dialog.jsNext(1) } }
-        @JavascriptInterface fun onReinject() { dialog.activity?.runOnUiThread { dialog.webView?.let { dialog.injectReaderJs(it) } } }
         @JavascriptInterface fun onScrollPosition(url: String, y: Float) { dialog.saveScroll(url, y) }
         @JavascriptInterface fun onChapterDetected(detectedTitle: String, detectedUrl: String) {
             dialog.activity?.runOnUiThread { dialog.updateChapterTitle(detectedTitle, detectedUrl) }
         }
-        @JavascriptInterface fun onBlockedPopup(url: String) {
-            if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/ReaderDialog", "🚫 Popup blocked: $url")
-        }
-
-        @JavascriptInterface
-        fun onChaptersHarvested(jsonMap: String) {
+        @JavascriptInterface fun onChaptersHarvested(jsonMap: String) {
             runCatching {
                 val obj = JSONObject(jsonMap)
                 val ctx = dialog.context ?: return
@@ -1880,24 +1135,6 @@ class ReaderDialog : DialogFragment() {
                     if (slug.isNotBlank() && chUrl.startsWith("http")) {
                         ComixProvider.cacheChapterUrl(ctx, slug, chNum, chUrl)
                     }
-                }
-            }
-        }
-
-        @JavascriptInterface fun onAdAudit(payload: String) {
-            if (!Settings.verboseLog()) return
-            val tag = "MangaManhwa/AdAudit"
-            val chunkSize = 3500
-            if (payload.length <= chunkSize) {
-                android.util.Log.e(tag, payload)
-            } else {
-                var i = 0
-                var part = 0
-                while (i < payload.length) {
-                    val end = minOf(i + chunkSize, payload.length)
-                    android.util.Log.e(tag, "[$part] " + payload.substring(i, end))
-                    i = end
-                    part++
                 }
             }
         }
