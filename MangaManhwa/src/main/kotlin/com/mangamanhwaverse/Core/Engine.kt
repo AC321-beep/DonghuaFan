@@ -11,6 +11,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Interceptor
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
@@ -21,7 +22,6 @@ abstract class MangaManhwaProvider : MainAPI() {
     final override val supportedTypes = setOf(TvType.Anime, TvType.Others)
     abstract val baseUrl: String
 
-    // 5 distinct categories so providers don't duplicate tabs or trigger 429 burst blocks
     override val mainPage = mainPageOf(
         "latest" to "Latest Updates",
         "popular" to "Popular",
@@ -151,7 +151,7 @@ abstract class MangaManhwaProvider : MainAPI() {
         val now = System.currentTimeMillis()
 
         htmlCache[absolute]?.let { (timestamp, cachedDoc) ->
-            if (now - timestamp < 25_000L) return cachedDoc
+            if (now - timestamp < 30_000L) return cachedDoc
         }
 
         val host = hostOf(absolute)
@@ -159,14 +159,41 @@ abstract class MangaManhwaProvider : MainAPI() {
 
         return mutex.withLock {
             htmlCache[absolute]?.let { (timestamp, cachedDoc) ->
-                if (System.currentTimeMillis() - timestamp < 25_000L) return@withLock cachedDoc
+                if (System.currentTimeMillis() - timestamp < 30_000L) return@withLock cachedDoc
             }
 
-            // Pace requests per host (450ms minimum gap) to prevent 429 Too Many Requests on Madara sites
+            // If CFSolver already captured HTML for this URL, use it immediately
+            CFState.getSolvedHtml(absolute)?.let { solvedHtml ->
+                val doc = Jsoup.parse(solvedHtml, absolute)
+                if (!isCfChallenge(200, doc)) {
+                    htmlCache[absolute] = System.currentTimeMillis() to doc
+                    return@withLock doc
+                }
+            }
+
+            // Check per-host 429 circuit breaker so queued tabs don't hammer a rate-limited server
+            val cooldownUntil = hostCooldownUntil[host] ?: 0L
+            val remainingCooldown = cooldownUntil - System.currentTimeMillis()
+            if (remainingCooldown > 0L) {
+                log("⏳ Host $host is in 429 cooldown (${remainingCooldown}ms left). Attempting WebView fallback...")
+                if (requiresCf && CFSolver(absolute).solve()) {
+                    CFState.getSolvedHtml(absolute)?.let { solvedHtml ->
+                        val solvedDoc = Jsoup.parse(solvedHtml, absolute)
+                        if (!isCfChallenge(200, solvedDoc)) {
+                            hostCooldownUntil.remove(host)
+                            htmlCache[absolute] = System.currentTimeMillis() to solvedDoc
+                            return@withLock solvedDoc
+                        }
+                    }
+                }
+                return@withLock null
+            }
+
+            // Pace requests per host (550ms minimum gap)
             val lastReq = hostLastRequest[host] ?: 0L
             val elapsed = System.currentTimeMillis() - lastReq
-            if (elapsed in 0..449) {
-                delay(450L - elapsed)
+            if (elapsed in 0..549) {
+                delay(550L - elapsed)
             }
             hostLastRequest[host] = System.currentTimeMillis()
 
@@ -176,25 +203,39 @@ abstract class MangaManhwaProvider : MainAPI() {
                 var doc = res.document
                 log("✅ Fetched HTML: $absolute (Code: ${res.code})")
 
-                // Never call CFSolver on 404
                 if (res.code == 404) return@runCatching null
 
-                // If 429 Rate Limited, back off 2 seconds and retry once (do NOT call CFSolver)
                 if (res.code == 429) {
-                    log("⏳ HTTP 429 on $host. Backing off 2000ms and retrying...")
-                    delay(2000L)
-                    hostLastRequest[host] = System.currentTimeMillis()
-                    res = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders(absolute))
-                    doc = res.document
-                    log("✅ Re-fetched HTML after 429 backoff: $absolute (Code: ${res.code})")
-                    if (res.code == 429) return@runCatching null
+                    // Activate 8-second circuit breaker for this host so other tabs don't spam OkHttp retries
+                    hostCooldownUntil[host] = System.currentTimeMillis() + 8_000L
+                    log("🛡️ HTTP 429 on $host. Invoking WebView CFSolver to bypass TLS/rate limit...")
+                    if (requiresCf && CFSolver(absolute).solve()) {
+                        CFState.getSolvedHtml(absolute)?.let { solvedHtml ->
+                            val solvedDoc = Jsoup.parse(solvedHtml, absolute)
+                            if (!isCfChallenge(200, solvedDoc)) {
+                                hostCooldownUntil.remove(host)
+                                htmlCache[absolute] = System.currentTimeMillis() to solvedDoc
+                                return@runCatching solvedDoc
+                            }
+                        }
+                    }
+                    return@runCatching null
                 }
 
-                // Invoke CFSolver only on genuine CF challenges or JS "Loading..." interstitials
                 if (requiresCf && isCfChallenge(res.code, doc)) {
                     log("🛡️ CF/JS challenge detected (code=${res.code}, title='${doc.title()}'). Invoking CFSolver...")
                     if (CFSolver(absolute).solve()) {
-                        delay(350L)
+                        // 1. Prefer the rendered DOM captured directly from the WebView
+                        CFState.getSolvedHtml(absolute)?.let { solvedHtml ->
+                            val solvedDoc = Jsoup.parse(solvedHtml, absolute)
+                            if (!isCfChallenge(200, solvedDoc)) {
+                                log("✅ Loaded HTML directly from WebView CF solve: $absolute")
+                                htmlCache[absolute] = System.currentTimeMillis() to solvedDoc
+                                return@runCatching solvedDoc
+                            }
+                        }
+                        // 2. Otherwise re-fetch once with updated cookies/UA
+                        delay(400L)
                         hostLastRequest[host] = System.currentTimeMillis()
                         res = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders(absolute))
                         doc = res.document
@@ -202,7 +243,7 @@ abstract class MangaManhwaProvider : MainAPI() {
                     }
                 }
 
-                if (res.code in 200..299 && !isCfChallenge(res.code, doc)) {
+                if (res.code in 200..299 && !isCfChallenge(res.code, doc) && doc.title().isNotBlank()) {
                     htmlCache[absolute] = System.currentTimeMillis() to doc
                 }
                 doc
@@ -333,6 +374,7 @@ abstract class MangaManhwaProvider : MainAPI() {
         const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         private val hostLocks = ConcurrentHashMap<String, Mutex>()
         private val hostLastRequest = ConcurrentHashMap<String, Long>()
+        private val hostCooldownUntil = ConcurrentHashMap<String, Long>()
         private val htmlCache = ConcurrentHashMap<String, Pair<Long, Document>>()
     }
 }
@@ -394,23 +436,49 @@ open class ThemeBasedProvider(
         }
     }.getOrDefault(false)
 
-    private suspend fun fetchCatalogPage(pathTemplate: String, page: Int): List<SearchResponse> {
-        if (pathTemplate.isBlank()) return emptyList()
-        ensureUrlResolved()
-        val path = pathTemplate.replace("{page}", "$page")
-        val doc = fetch(path) ?: return emptyList()
-        return parseList(doc)
+    private fun formatPagePath(pathTemplate: String, page: Int): String {
+        val raw = pathTemplate.replace("{page}", "$page")
+        // Collapse /page/1/ to / on page 1 so WordPress doesn't issue 301 canonical redirects
+        return if (page == 1) {
+            raw.replace("/page/1/", "/").replace("&paged=1", "")
+        } else {
+            raw
+        }
     }
 
-    override suspend fun popular(page: Int): List<SearchResponse> = fetchCatalogPage(config.popularPath, page)
-    override suspend fun latest(page: Int): List<SearchResponse> = fetchCatalogPage(config.latestPath, page)
-    override suspend fun trending(page: Int): List<SearchResponse> = fetchCatalogPage(config.trendingPath, page)
-    override suspend fun completed(page: Int): List<SearchResponse> = fetchCatalogPage(config.completedPath, page)
-    override suspend fun newReleases(page: Int): List<SearchResponse> = fetchCatalogPage(config.newPath, page)
+    private suspend fun fetchCatalogPage(pathTemplate: String, page: Int, mode: String): List<SearchResponse> {
+        if (pathTemplate.isBlank()) return emptyList()
+        ensureUrlResolved()
+        val path = formatPagePath(pathTemplate, page)
+        val doc = fetch(path)
+        var items = doc?.let(::parseList) ?: emptyList()
+
+        // If sub-route 404s (e.g. MangaBat / MangaKakalot) on page 1, fall back to cached root homepage "/"
+        if (items.isEmpty() && page == 1) {
+            val homeDoc = fetch("/") ?: return emptyList()
+            val allHomeItems = parseList(homeDoc)
+            if (allHomeItems.isNotEmpty()) {
+                items = when (mode) {
+                    "popular" -> allHomeItems.take(24)
+                    "trending" -> allHomeItems.reversed().take(24)
+                    "new" -> allHomeItems.drop(allHomeItems.size / 3).take(24).ifEmpty { allHomeItems }
+                    "completed" -> allHomeItems.drop(allHomeItems.size / 2).take(24).ifEmpty { allHomeItems }
+                    else -> allHomeItems
+                }
+            }
+        }
+        return items
+    }
+
+    override suspend fun popular(page: Int): List<SearchResponse> = fetchCatalogPage(config.popularPath, page, "popular")
+    override suspend fun latest(page: Int): List<SearchResponse> = fetchCatalogPage(config.latestPath, page, "latest")
+    override suspend fun trending(page: Int): List<SearchResponse> = fetchCatalogPage(config.trendingPath, page, "trending")
+    override suspend fun completed(page: Int): List<SearchResponse> = fetchCatalogPage(config.completedPath, page, "completed")
+    override suspend fun newReleases(page: Int): List<SearchResponse> = fetchCatalogPage(config.newPath, page, "new")
 
     override suspend fun searchPage(query: String, page: Int): List<SearchResponse> {
         ensureUrlResolved()
-        val path = config.searchPath.replace("{query}", URLEncoder.encode(query, "UTF-8")).replace("{page}", "$page")
+        val path = formatPagePath(config.searchPath.replace("{query}", URLEncoder.encode(query, "UTF-8")), page)
         return fetch(path)?.let(::parseList) ?: emptyList()
     }
 
@@ -462,10 +530,40 @@ open class ThemeBasedProvider(
             newAnimeSearchResponse(title, abs(href), TvType.Anime).apply { posterUrl = poster }
         }.distinctBy { it.url }
 
-        if (items.isEmpty()) {
+        if (items.isNotEmpty()) return items
+
+        // Universal Series Card Fallback (handles MangaBat, MangaKakalot, and custom Madara/MangaThemesia child themes)
+        val fallbackSeriesRegex = Regex("""/(?:manga|series|serie|comic|comics|story|read-)[/-][^/"'#?]+""", RegexOption.IGNORE_CASE)
+        val universalItems = mutableListOf<SearchResponse>()
+
+        doc.select("a[href]").forEach { a ->
+            val href = a.attr("href").trim()
+            if (!fallbackSeriesRegex.containsMatchIn(href)) return@forEach
+            if (Regex("""(?:chapter|ch)[/\-_]?\d+""", RegexOption.IGNORE_CASE).containsMatchIn(href)) return@forEach
+
+            val card = a.parent()?.parent() ?: a.parent() ?: a
+            val imgEl = a.selectFirst("img") ?: a.parent()?.selectFirst("img") ?: card.selectFirst("img") ?: return@forEach
+            val poster = extractImg(imgEl)?.let(::abs) ?: return@forEach
+
+            val title = (
+                cleanTitleElement(card.selectFirst("h3, h4, h5, .title, .tt, .story_name"))
+                    ?: a.attr("title").trim().takeIf { it.isNotBlank() }
+                    ?: imgEl.attr("alt").trim().takeIf { it.isNotBlank() && !it.equals("cover", true) }
+                    ?: cleanTitleElement(a)
+            )?.takeIf {
+                it.length > 1 &&
+                !it.startsWith("Chapter", true) &&
+                !it.startsWith("Ch.", true)
+            } ?: titleFromSlug(href)
+
+            universalItems.add(newAnimeSearchResponse(title, abs(href), TvType.Anime).apply { posterUrl = poster })
+        }
+
+        val distinctUniversal = universalItems.distinctBy { it.url }
+        if (distinctUniversal.isEmpty()) {
             log("⚠️ parseList: Found 0 items (title='${doc.title()}'). HTML selector might be broken!")
         }
-        return items
+        return distinctUniversal
     }
 
     private suspend fun resolveChapters(mangaUrl: String, doc: Document): List<Episode> {
@@ -515,7 +613,7 @@ open class ThemeBasedProvider(
     }
 
     private fun parseChapters(doc: Document): List<Episode> {
-        val eps = doc.select(config.chapterSelector).mapNotNull { a ->
+        var eps = doc.select(config.chapterSelector).mapNotNull { a ->
             val href = a.attr("href").trim()
             if (href.isBlank() || href == "#" || href.startsWith("javascript:", true)) return@mapNotNull null
 
@@ -527,17 +625,29 @@ open class ThemeBasedProvider(
             newEpisode(abs(href)) { this.name = chapName }
         }.distinctBy { it.data }
 
+        // Universal chapter link fallback if theme selector misses
+        if (eps.isEmpty()) {
+            eps = doc.select("a[href*='chapter-'], a[href*='/chapter/'], a[href*='/chap-']").mapNotNull { a ->
+                val href = a.attr("href").trim()
+                if (href.isBlank() || href == "#" || href.startsWith("javascript:", true)) return@mapNotNull null
+                val isLocked = a.selectFirst("i.fa-lock, .fa-lock") != null ||
+                    a.parents().any { p -> p.hasClass("premium-block") || p.hasClass("premium") }
+                if (isLocked) return@mapNotNull null
+                val chapName = a.text().trim().takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                newEpisode(abs(href)) { this.name = chapName }
+            }.distinctBy { it.data }
+        }
+
         return if (config.newestFirst) eps.reversed() else eps
     }
 }
 
 object Themes {
-    // True Madara WordPress sorting parameters (?m_orderby=views, latest, trending, new-manga)
     val Madara = ThemeConfig(
         popularPath = "/manga/page/{page}/?m_orderby=views",
         latestPath = "/manga/page/{page}/?m_orderby=latest",
         trendingPath = "/manga/page/{page}/?m_orderby=trending",
-        completedPath = "/?s=&post_type=wp-manga&status%5B%5D=end&m_orderby=views&paged={page}",
+        completedPath = "/manga/page/{page}/?m_orderby=rating",
         newPath = "/manga/page/{page}/?m_orderby=new-manga",
         searchPath = "/?s={query}&post_type=wp-manga&paged={page}",
         listSelector = "div.page-item-detail, div.c-tabs-item__content",
@@ -548,7 +658,6 @@ object Themes {
         posterSelector = ".summary_image img, .thumb img, .item-thumb img"
     )
 
-    // Toonily uses /search/ instead of /manga/ and requires toonily-mature=1 cookie
     val Toonily = ThemeConfig(
         popularPath = "/search/page/{page}/?m_orderby=views",
         latestPath = "/search/page/{page}/?m_orderby=latest",
@@ -580,16 +689,15 @@ object Themes {
         posterSelector = ".thumb img, .limit img"
     )
 
-    // Updated MangaBox routes (/genre-all/{page}) & selectors (.list-comic-item-wrap) for MangaKakalot.gg & MangaBats.com
     val MangaBox = ThemeConfig(
-        popularPath = "/genre-all/{page}?type=topview",
-        latestPath = "/genre-all/{page}",
-        trendingPath = "/genre-all/{page}?type=topview",
-        completedPath = "/genre-all/{page}?state=completed",
-        newPath = "/genre-all/{page}?type=newest",
+        popularPath = "/manga-list/hot-manga?page={page}",
+        latestPath = "/manga-list/latest-manga?page={page}",
+        trendingPath = "/manga-list/topview-manga?page={page}",
+        completedPath = "/manga-list/completed-manga?page={page}",
+        newPath = "/manga-list/new-manga?page={page}",
         searchPath = "/search/story/{query}?page={page}",
-        listSelector = ".list-comic-item-wrap, .list-truyen-item-wrap, .story_item, .content-genres-item, .itemupdate",
-        linkSelector = "h3 a, .story_name a, .genres-item-name, a.list-story-item",
+        listSelector = ".list-comic-item-wrap, .list-truyen-item-wrap, .story_item, .content-genres-item, .itemupdate, .truyen-list .item",
+        linkSelector = "h3 a, .story_name a, .genres-item-name, a.list-story-item, a",
         titleSelector = "h3 a, .story_name a, .genres-item-name, a.list-story-item",
         chapterSelector = ".chapter-list .row span a, .row-content-chapter li a, .chapter-name",
         pageSelector = ".container-chapter-reader img",
