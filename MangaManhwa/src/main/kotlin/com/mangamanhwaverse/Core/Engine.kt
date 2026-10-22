@@ -52,7 +52,6 @@ abstract class MangaManhwaProvider : MainAPI() {
         Interceptor { chain ->
             val original = chain.request()
             val modified = original.newBuilder().apply {
-                // Preserve XMLHttpRequest for Madara AJAX calls while stripping WebView package headers
                 if (original.header("X-Requested-With") != "XMLHttpRequest") {
                     removeHeader("X-Requested-With")
                 }
@@ -79,7 +78,7 @@ abstract class MangaManhwaProvider : MainAPI() {
         
         return newHomePageResponse(
             list = listOf(HomePageList(request.name, items.distinctBy { it.url })),
-            hasNext = items.size >= 16 // Lowered from 20 to 16 as Madara pages often return 16 items
+            hasNext = items.size >= 16
         )
     }
 
@@ -309,14 +308,12 @@ open class ThemeBasedProvider(
     }
 
     private suspend fun resolveChapters(mangaUrl: String, doc: Document): List<Episode> {
-        // 1. Try direct DOM parsing first
         var eps = parseChapters(doc)
         if (eps.isNotEmpty()) return eps
 
         val ajaxHeaders = mapOf("X-Requested-With" to "XMLHttpRequest")
         val cleanMangaUrl = abs(mangaUrl).trimEnd('/')
 
-        // 2. Fallback A: Modern Madara direct /ajax/chapters/ POST endpoint
         log("🔄 0 chapters in initial DOM. Trying Madara /ajax/chapters/ fallback...")
         fetchPost("$cleanMangaUrl/ajax/chapters/", referer = cleanMangaUrl, extraHeaders = ajaxHeaders)?.let { ajaxDoc ->
             eps = parseChapters(ajaxDoc)
@@ -326,7 +323,6 @@ open class ThemeBasedProvider(
             }
         }
 
-        // 3. Fallback B: Classic WordPress admin-ajax.php (action=manga_get_chapters)
         val postId = extractPostId(doc)
         if (!postId.isNullOrBlank()) {
             log("🔄 Trying admin-ajax.php fallback with postId=$postId...")
@@ -360,10 +356,8 @@ open class ThemeBasedProvider(
     private fun parseChapters(doc: Document): List<Episode> {
         val eps = doc.select(config.chapterSelector).mapNotNull { a ->
             val href = a.attr("href").trim()
-            // Ignore empty, dummy, or javascript links (e.g. coin-locked chapters pointing to "#")
             if (href.isBlank() || href == "#" || href.startsWith("javascript:", true)) return@mapNotNull null
 
-            // Ignore locked/premium chapter blocks
             val isLocked = a.selectFirst("i.fa-lock, .fa-lock") != null ||
                 a.parents().any { p -> p.hasClass("premium-block") || p.hasClass("premium") }
             if (isLocked) return@mapNotNull null
@@ -376,7 +370,6 @@ open class ThemeBasedProvider(
     }
 
     private fun img(el: Element): String? {
-        // Prioritize lazy-loading attributes BEFORE "src" so Madara's "dflazy.jpg" placeholder is skipped
         val candidates = listOf(
             el.attr("data-src"),
             el.attr("data-lazy-src"),
@@ -420,5 +413,19 @@ object Themes {
         listSelector = "div.listupd div.bs", linkSelector = "div.bsx > a", titleSelector = "div.tt",
         chapterSelector = "div.eplister ul li a, .eplister li a, #chapterlist ul li a",
         pageSelector = "div#readerarea img", posterSelector = ".thumb img, .limit img"
+    )
+    val MangaBox = ThemeConfig(
+        popularPath = "/manga_list?type=topview&category=all&state=all&page={page}",
+        latestPath = "/manga_list?type=latest&category=all&state=all&page={page}",
+        trendingPath = "/manga_list?type=topview&category=all&state=all&page={page}",
+        completedPath = "/manga_list?type=topview&category=all&state=Completed&page={page}",
+        newPath = "/manga_list?type=newest&category=all&state=all&page={page}",
+        searchPath = "/search/story/{query}?page={page}",
+        listSelector = ".list-truyen-item-wrap, .story_item, .content-genres-item",
+        linkSelector = "h3 a, .story_name a, .genres-item-name",
+        titleSelector = "h3 a, .story_name a, .genres-item-name",
+        chapterSelector = ".chapter-list .row span a, .program_list li a, .row-content-chapter li a",
+        pageSelector = ".container-chapter-reader img",
+        posterSelector = ".manga-info-pic img, .story_item img"
     )
 }
