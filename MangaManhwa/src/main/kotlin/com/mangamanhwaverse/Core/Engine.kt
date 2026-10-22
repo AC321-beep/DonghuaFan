@@ -52,7 +52,10 @@ abstract class MangaManhwaProvider : MainAPI() {
         Interceptor { chain ->
             val original = chain.request()
             val modified = original.newBuilder().apply {
-                removeHeader("X-Requested-With")
+                // Preserve XMLHttpRequest for Madara AJAX calls while stripping WebView package headers
+                if (original.header("X-Requested-With") != "XMLHttpRequest") {
+                    removeHeader("X-Requested-With")
+                }
                 CFState.userAgentFor(original.url.host)?.let { header("User-Agent", it) }
                 val cookies = CookieManager.getInstance().getCookie(original.url.toString())
                 if (!cookies.isNullOrEmpty()) header("Cookie", cookies)
@@ -76,7 +79,7 @@ abstract class MangaManhwaProvider : MainAPI() {
         
         return newHomePageResponse(
             list = listOf(HomePageList(request.name, items.distinctBy { it.url })),
-            hasNext = items.size >= 20
+            hasNext = items.size >= 16 // Lowered from 20 to 16 as Madara pages often return 16 items
         )
     }
 
@@ -143,7 +146,28 @@ abstract class MangaManhwaProvider : MainAPI() {
         }.getOrNull()
     }
 
-    protected fun abs(url: String): String = if (url.startsWith("http")) url else "$baseUrl${if (url.startsWith("/")) "" else "/"}$url"
+    protected suspend fun fetchPost(
+        url: String,
+        data: Map<String, String> = emptyMap(),
+        referer: String? = baseUrl,
+        extraHeaders: Map<String, String> = emptyMap()
+    ): Document? {
+        val absolute = if (url.startsWith("http")) url else abs(url)
+        log("⬇️ POSTing AJAX: $absolute")
+        return runCatching {
+            app.post(
+                absolute,
+                interceptor = unifiedInterceptor,
+                referer = referer,
+                headers = browserHeaders(extraHeaders),
+                data = data
+            ).document
+        }.onFailure {
+            logErr("❌ POST failed $absolute: ${it.message}", it)
+        }.getOrNull()
+    }
+
+    protected fun abs(url: String): String = if (url.startsWith("http")) url else "${baseUrl.trimEnd('/')}/${url.trimStart('/')}"
 
     protected fun browserHeaders(extra: Map<String, String> = emptyMap()): Map<String, String> = mapOf(
         "User-Agent" to UA, "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -159,13 +183,13 @@ abstract class MangaManhwaProvider : MainAPI() {
                doc.selectFirst("form#challenge-form") != null || doc.html().contains("cf-chl-")
     }
 
-    protected fun log(msg: String) {  if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/$name", msg)}
+    protected fun log(msg: String) { if (Settings.verboseLog()) android.util.Log.e("MangaManhwa/$name", msg) }
     protected fun logErr(msg: String, t: Throwable? = null) { android.util.Log.e("MangaManhwa/$name", msg, t) }
 
     private fun hostOf(url: String) = runCatching { URI(url).host }.getOrNull() ?: url
 
     protected fun titleFromSlug(url: String): String {
-        val raw = url.substringAfterLast("/").replace('-', ' ').trim()
+        val raw = url.trimEnd('/').substringAfterLast("/").replace('-', ' ').trim()
         if (raw.isBlank()) return "Untitled"
         return raw.split(' ').joinToString(" ") { w -> if (w.isEmpty()) w else w[0].uppercase() + w.drop(1) }
     }
@@ -243,8 +267,9 @@ open class ThemeBasedProvider(
     }
 
     override suspend fun chapters(mangaUrl: String): List<Episode> {
+        ensureUrlResolved()
         val doc = fetch(mangaUrl) ?: return emptyList()
-        return parseChapters(doc)
+        return resolveChapters(mangaUrl, doc)
     }
 
     override suspend fun pages(chapterUrl: String): List<String> {
@@ -258,7 +283,7 @@ open class ThemeBasedProvider(
     override suspend fun load(url: String): LoadResponse? {
         ensureUrlResolved()
         val doc = fetch(url) ?: return null
-        val episodes = parseChapters(doc)
+        val episodes = resolveChapters(url, doc)
         val title = doc.selectFirst("h1, .post-title h1, .entry-title")?.text()?.trim() ?: titleFromSlug(url)
         val poster = doc.selectFirst(config.posterSelector)?.let(::img)?.let(::abs)
         val plot = config.plotSelector.split(",").asSequence().mapNotNull { sel -> doc.selectFirst(sel.trim())?.text()?.trim() }.firstOrNull { it.isNotBlank() }
@@ -273,7 +298,7 @@ open class ThemeBasedProvider(
     private fun parseList(doc: Document): List<SearchResponse> {
         val items = doc.select(config.listSelector).mapNotNull { el ->
             val a = el.selectFirst(config.linkSelector) ?: return@mapNotNull null
-            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val href = a.attr("href").trim().takeIf { it.isNotBlank() && it != "#" } ?: return@mapNotNull null
             val title = (el.selectFirst(config.titleSelector)?.text()?.trim() ?: a.text().trim()).takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val poster = el.selectFirst(config.imageSelector)?.let(::img)?.let(::abs)
             newAnimeSearchResponse(title, abs(href), TvType.Anime).apply { posterUrl = poster }
@@ -283,20 +308,89 @@ open class ThemeBasedProvider(
         return items
     }
 
+    private suspend fun resolveChapters(mangaUrl: String, doc: Document): List<Episode> {
+        // 1. Try direct DOM parsing first
+        var eps = parseChapters(doc)
+        if (eps.isNotEmpty()) return eps
+
+        val ajaxHeaders = mapOf("X-Requested-With" to "XMLHttpRequest")
+        val cleanMangaUrl = abs(mangaUrl).trimEnd('/')
+
+        // 2. Fallback A: Modern Madara direct /ajax/chapters/ POST endpoint
+        log("🔄 0 chapters in initial DOM. Trying Madara /ajax/chapters/ fallback...")
+        fetchPost("$cleanMangaUrl/ajax/chapters/", referer = cleanMangaUrl, extraHeaders = ajaxHeaders)?.let { ajaxDoc ->
+            eps = parseChapters(ajaxDoc)
+            if (eps.isNotEmpty()) {
+                log("✅ Loaded ${eps.size} chapters via /ajax/chapters/")
+                return eps
+            }
+        }
+
+        // 3. Fallback B: Classic WordPress admin-ajax.php (action=manga_get_chapters)
+        val postId = extractPostId(doc)
+        if (!postId.isNullOrBlank()) {
+            log("🔄 Trying admin-ajax.php fallback with postId=$postId...")
+            fetchPost(
+                url = "/wp-admin/admin-ajax.php",
+                data = mapOf("action" to "manga_get_chapters", "manga" to postId),
+                referer = cleanMangaUrl,
+                extraHeaders = ajaxHeaders
+            )?.let { ajaxDoc ->
+                eps = parseChapters(ajaxDoc)
+                if (eps.isNotEmpty()) {
+                    log("✅ Loaded ${eps.size} chapters via admin-ajax.php")
+                    return eps
+                }
+            }
+        }
+
+        log("⚠️ parseChapters: Found 0 chapters after all fallbacks. HTML selector might be broken!")
+        return emptyList()
+    }
+
+    private fun extractPostId(doc: Document): String? {
+        return doc.selectFirst("#manga-chapters-holder[data-id]")?.attr("data-id")?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("[data-post-id]")?.attr("data-post-id")?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("input.rating-post-id, input[name=manga]")?.attr("value")?.takeIf { it.isNotBlank() }
+            ?: doc.selectFirst("a.wp-manga-action-button[data-post]")?.attr("data-post")?.takeIf { it.isNotBlank() }
+            ?: Regex("""postid-(\d+)""").find(doc.body()?.className() ?: "")?.groupValues?.get(1)
+            ?: Regex(""""manga_id"\s*:\s*"?(\d+)"?""").find(doc.html())?.groupValues?.get(1)
+    }
+
     private fun parseChapters(doc: Document): List<Episode> {
         val eps = doc.select(config.chapterSelector).mapNotNull { a ->
-            val href = a.attr("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            newEpisode(abs(href)) { this.name = a.text().trim() }
+            val href = a.attr("href").trim()
+            // Ignore empty, dummy, or javascript links (e.g. coin-locked chapters pointing to "#")
+            if (href.isBlank() || href == "#" || href.startsWith("javascript:", true)) return@mapNotNull null
+
+            // Ignore locked/premium chapter blocks
+            val isLocked = a.selectFirst("i.fa-lock, .fa-lock") != null ||
+                a.parents().any { p -> p.hasClass("premium-block") || p.hasClass("premium") }
+            if (isLocked) return@mapNotNull null
+
+            val chapName = a.text().trim().takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            newEpisode(abs(href)) { this.name = chapName }
         }.distinctBy { it.data }
         
-        if (eps.isEmpty()) log("⚠️ parseChapters: Found 0 chapters. HTML selector might be broken!")
         return if (config.newestFirst) eps.reversed() else eps
     }
 
-    private fun img(el: Element): String? = el.attr("src").takeIf { it.isNotBlank() && !it.startsWith("data:") }
-        ?: el.attr("data-src").takeIf { it.isNotBlank() } ?: el.attr("data-lazy-src").takeIf { it.isNotBlank() }
-        ?: el.attr("data-original").takeIf { it.isNotBlank() } ?: el.attr("srcset").split(",").firstOrNull()?.trim()?.substringBefore(" ")?.takeIf { it.isNotBlank() }
-        ?: el.attr("data-srcset").split(",").firstOrNull()?.trim()?.substringBefore(" ")?.takeIf { it.isNotBlank() }
+    private fun img(el: Element): String? {
+        // Prioritize lazy-loading attributes BEFORE "src" so Madara's "dflazy.jpg" placeholder is skipped
+        val candidates = listOf(
+            el.attr("data-src"),
+            el.attr("data-lazy-src"),
+            el.attr("data-original"),
+            el.attr("src"),
+            el.attr("data-srcset").split(",").firstOrNull()?.trim()?.substringBefore(" ") ?: "",
+            el.attr("srcset").split(",").firstOrNull()?.trim()?.substringBefore(" ") ?: ""
+        )
+        return candidates.map { it.trim() }.firstOrNull { url ->
+            url.isNotBlank() &&
+            !url.startsWith("data:", true) &&
+            !url.contains("dflazy.jpg", true)
+        }
+    }
 
     private fun shrink(url: String): String = when {
         url.contains("/large/") -> url.replace("/large/", "/small/")
@@ -314,14 +408,17 @@ object Themes {
         trendingPath = "/manga/?page={page}&order=rating", completedPath = "/manga/?page={page}&status=completed&order=popular",
         newPath = "/manga/?page={page}&order=latest", searchPath = "/?s={query}&post_type=wp-manga",
         listSelector = "div.c-tabs-item__content, div.page-item-detail", linkSelector = "h3 a, h4 a, .post-title a",
-        titleSelector = "h3 a, h4 a, .post-title a", chapterSelector = "li.wp-manga-chapter > a",
-        pageSelector = "div.reading-content img, div.page-break img", posterSelector = ".summary_image img, .thumb img"
+        titleSelector = "h3 a, h4 a, .post-title a",
+        chapterSelector = "li.wp-manga-chapter > a, div.chapter-item span.chapter a, .list-chapter .chapter-item a, ul.main.version-chap li a",
+        pageSelector = "div.reading-content img, div.page-break img, .read-container img",
+        posterSelector = ".summary_image img, .thumb img, .item-thumb img"
     )
     val MangaThemesia = ThemeConfig(
         popularPath = "/manga/?page={page}&order=popular", latestPath = "/manga/?page={page}&order=update",
         trendingPath = "/manga/?page={page}&order=views", completedPath = "/manga/?page={page}&status=completed",
         newPath = "/manga/?page={page}&order=latest", searchPath = "/manga/?title={query}&page={page}",
         listSelector = "div.listupd div.bs", linkSelector = "div.bsx > a", titleSelector = "div.tt",
-        chapterSelector = "div.eplister ul li a", pageSelector = "div#readerarea img", posterSelector = ".thumb img, .limit img"
+        chapterSelector = "div.eplister ul li a, .eplister li a, #chapterlist ul li a",
+        pageSelector = "div#readerarea img", posterSelector = ".thumb img, .limit img"
     )
 }
