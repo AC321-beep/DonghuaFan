@@ -66,16 +66,27 @@ class CFSolver(private val url: String) {
         return defaultUa
     }
 
-    private fun isChallengeTitle(title: String): Boolean {
+    private fun isChallengeOrErrorTitle(title: String): Boolean {
         val t = title.lowercase().trim()
         return t.isBlank() ||
                t == "about:blank" ||
+               t == "loading..." ||
+               t == "loading" ||
+               t.startsWith("loading...") ||
+               t.contains("please wait") ||
                t.contains("just a moment") ||
                t.contains("attention required") ||
                t.contains("checking your browser") ||
                t.contains("security check") ||
                t.contains("one more step") ||
-               t.contains("verify you are human")
+               t.contains("verify you are human") ||
+               t.contains("403 forbidden") ||
+               t.contains("429 too many requests") ||
+               t.contains("error 404") ||
+               t.contains("404 not found") ||
+               t.contains("page not found") ||
+               t.contains("this page does not exist") ||
+               t.contains("access denied")
     }
 
     suspend fun solve(): Boolean {
@@ -158,14 +169,14 @@ class CFSolver(private val url: String) {
                     if (currentUrl == "about:blank") return
                     val cookies = cookieManager.getCookie(currentUrl) ?: ""
                     val title = view?.title ?: ""
-                    if (cookies.contains("cf_clearance") || !isChallengeTitle(title)) {
+                    if (!isChallengeOrErrorTitle(title) || (cookies.contains("cf_clearance") && !title.equals("Loading...", true))) {
                         handler.postDelayed({ cleanup(true) }, 1200)
                     }
                 }
             }
 
             cont.invokeOnCancellation { cleanup(false) }
-            timeoutRunnable = Runnable { cleanup(false) }.also { handler.postDelayed(it, 12000L) }
+            timeoutRunnable = Runnable { cleanup(false) }.also { handler.postDelayed(it, 10000L) }
 
             decor.addView(webView)
             webView.loadUrl(url)
@@ -233,7 +244,7 @@ class CFSolver(private val url: String) {
                 if (currentUrl == "about:blank") return
                 val cookies = cookieManager.getCookie(currentUrl) ?: ""
                 val title = view?.title ?: ""
-                if (cookies.contains("cf_clearance") || !isChallengeTitle(title)) {
+                if (!isChallengeOrErrorTitle(title) || (cookies.contains("cf_clearance") && !title.equals("Loading...", true))) {
                     Handler(Looper.getMainLooper()).postDelayed({ finish(true) }, 800)
                 }
             }
