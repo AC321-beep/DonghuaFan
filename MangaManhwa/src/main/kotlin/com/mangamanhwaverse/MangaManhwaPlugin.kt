@@ -12,15 +12,13 @@ object AppContext {
 object ProviderRegistry {
     val providers = listOf(
         // ThemeSites
-        Manhuanext(), Toonily(), MangaTX(), FlameComics(), LuminousScans(), 
-        CosmicScans(), Disasterscans(), VyvyManga(), MangaBob(), HiveScans(), 
-        AsuraScans(), IgnisComic(), MangaKakalot(), MangaBat(), MangaReader(), 
-        MangaPanda(), MangaFox(), ManhwaWorld(), NyxScans(),
+        Manhuanext(), Toonily(), MangaTX(), MangaBob(),
+        LuminousScans(), CosmicScans(), IgnisComic(),
+        MangaKakalot(), MangaBat(),
         
         // API / Custom
-        MangaDex(), 
-        OmegaScans(), 
-        ComixProvider()
+        FlameComics(), AsuraScans(), HiveScans(), NyxScans(),
+        MangaDex(), OmegaScans(), ComixProvider()
     )
 
     val names: List<String> get() = providers.map { it.name }
