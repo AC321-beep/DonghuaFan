@@ -11,9 +11,9 @@ object AppContext {
 
 object ProviderRegistry {
     val providers = listOf(
-        // ThemeSites (Madara, MangaThemesia, MangaBox)
+        // ThemeSites (Madara, Toonily, MangaThemesia, MangaBox)
         Manhuanext(), Toonily(), MangaTX(), MangaBob(),
-        LuminousScans(), CosmicScans(), IgnisComic(),
+        CosmicScans(),
         MangaKakalot(), MangaBat(),
 
         // NextGen Web / API Providers
