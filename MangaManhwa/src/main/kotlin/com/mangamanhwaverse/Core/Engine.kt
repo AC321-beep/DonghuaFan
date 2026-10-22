@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.mangamanhwaverse.ReaderDialog
 import com.mangamanhwaverse.Settings
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.Interceptor
@@ -14,23 +15,28 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
 
 abstract class MangaManhwaProvider : MainAPI() {
     final override val supportedTypes = setOf(TvType.Anime, TvType.Others)
     abstract val baseUrl: String
 
+    // 5 distinct categories so providers don't duplicate tabs or trigger 429 burst blocks
     override val mainPage = mainPageOf(
-        "popular" to "Popular", "latest" to "Latest", "trending" to "Trending",
-        "hot" to "Hot Updates", "follows" to "Most Followed", "completed" to "Completed", "new" to "New Releases"
+        "latest" to "Latest Updates",
+        "popular" to "Popular",
+        "trending" to "Trending",
+        "new" to "New Releases",
+        "completed" to "Completed"
     )
 
     abstract suspend fun popular(page: Int): List<SearchResponse>
-    open suspend fun latest(page: Int): List<SearchResponse> = popular(page)
-    open suspend fun trending(page: Int): List<SearchResponse> = popular(page)
-    open suspend fun hot(page: Int): List<SearchResponse> = trending(page)
-    open suspend fun follows(page: Int): List<SearchResponse> = popular(page)
-    open suspend fun completed(page: Int): List<SearchResponse> = popular(page)
-    open suspend fun newReleases(page: Int): List<SearchResponse> = latest(page)
+    open suspend fun latest(page: Int): List<SearchResponse> = emptyList()
+    open suspend fun trending(page: Int): List<SearchResponse> = emptyList()
+    open suspend fun hot(page: Int): List<SearchResponse> = emptyList()
+    open suspend fun follows(page: Int): List<SearchResponse> = emptyList()
+    open suspend fun completed(page: Int): List<SearchResponse> = emptyList()
+    open suspend fun newReleases(page: Int): List<SearchResponse> = emptyList()
 
     abstract suspend fun searchPage(query: String, page: Int): List<SearchResponse>
     abstract suspend fun chapters(mangaUrl: String): List<Episode>
@@ -52,9 +58,14 @@ abstract class MangaManhwaProvider : MainAPI() {
                 }
                 val ua = CFState.userAgentFor(host) ?: UA
                 header("User-Agent", ua)
-                val cookies = CookieManager.getInstance().getCookie(original.url.toString())
-                if (!cookies.isNullOrEmpty()) {
-                    header("Cookie", cookies)
+                val existingCookie = original.header("Cookie")
+                val webViewCookies = CookieManager.getInstance().getCookie(original.url.toString())
+                val combinedCookies = listOfNotNull(
+                    webViewCookies?.takeIf { it.isNotBlank() },
+                    existingCookie?.takeIf { it.isNotBlank() }
+                ).joinToString("; ")
+                if (combinedCookies.isNotBlank()) {
+                    header("Cookie", combinedCookies)
                 }
             }.build()
             chain.proceed(modified)
@@ -113,7 +124,7 @@ abstract class MangaManhwaProvider : MainAPI() {
         if (activity.isFinishing || activity.isDestroyed) return false
 
         log("⬇️ loadLinks: $data")
-        val chapterNumRaw = Regex("(?:chapter|ch)[-\\s]?([\\d.]+)", RegexOption.IGNORE_CASE)
+        val chapterNumRaw = Regex("(?:chapter|ch)[/\\-_\\s#]*([\\d.]+)", RegexOption.IGNORE_CASE)
             .find(data)?.groupValues?.get(1)?.toDoubleOrNull()
         val chapterNum = chapterNumRaw?.toInt() ?: 0
         val chapterName = when {
@@ -123,10 +134,12 @@ abstract class MangaManhwaProvider : MainAPI() {
             else -> "Ch. $chapterNumRaw"
         }
 
+        val cleanUrl = data.substringBefore("#chapter-")
+
         val mounted = CompletableDeferred<Boolean>()
         activity.runOnUiThread {
             runCatching {
-                ReaderDialog.show(activity, name, chapterName, data, baseUrl, chapterNum)
+                ReaderDialog.show(activity, name, chapterName, cleanUrl, baseUrl, chapterNum)
             }.onSuccess { mounted.complete(true) }
              .onFailure { mounted.complete(false); logErr("❌ ReaderDialog failed to mount", it) }
         }
@@ -135,27 +148,70 @@ abstract class MangaManhwaProvider : MainAPI() {
 
     protected suspend fun fetch(url: String, referer: String? = baseUrl): Document? {
         val absolute = if (url.startsWith("http")) url else abs(url)
-        log("⬇️ Fetching HTML: $absolute")
+        val now = System.currentTimeMillis()
 
-        return runCatching {
-            var res = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders(absolute))
-            var doc = res.document
-            log("✅ Fetched HTML: $absolute (Code: ${res.code})")
+        htmlCache[absolute]?.let { (timestamp, cachedDoc) ->
+            if (now - timestamp < 25_000L) return cachedDoc
+        }
 
-            if (requiresCf && (res.code in listOf(403, 503, 429) || isCfChallenge(doc))) {
-                log("🛡️ CF challenge detected (code=${res.code}, title='${doc.title()}'). Invoking CFSolver...")
-                if (CFSolver(absolute).solve()) {
+        val host = hostOf(absolute)
+        val mutex = hostLocks.getOrPut(host) { Mutex() }
+
+        return mutex.withLock {
+            htmlCache[absolute]?.let { (timestamp, cachedDoc) ->
+                if (System.currentTimeMillis() - timestamp < 25_000L) return@withLock cachedDoc
+            }
+
+            // Pace requests per host (450ms minimum gap) to prevent 429 Too Many Requests on Madara sites
+            val lastReq = hostLastRequest[host] ?: 0L
+            val elapsed = System.currentTimeMillis() - lastReq
+            if (elapsed in 0..449) {
+                delay(450L - elapsed)
+            }
+            hostLastRequest[host] = System.currentTimeMillis()
+
+            log("⬇️ Fetching HTML: $absolute")
+            runCatching {
+                var res = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders(absolute))
+                var doc = res.document
+                log("✅ Fetched HTML: $absolute (Code: ${res.code})")
+
+                // Never call CFSolver on 404
+                if (res.code == 404) return@runCatching null
+
+                // If 429 Rate Limited, back off 2 seconds and retry once (do NOT call CFSolver)
+                if (res.code == 429) {
+                    log("⏳ HTTP 429 on $host. Backing off 2000ms and retrying...")
+                    delay(2000L)
+                    hostLastRequest[host] = System.currentTimeMillis()
                     res = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders(absolute))
                     doc = res.document
-                    log("✅ Re-fetched HTML after CF solve: $absolute (Code: ${res.code})")
+                    log("✅ Re-fetched HTML after 429 backoff: $absolute (Code: ${res.code})")
+                    if (res.code == 429) return@runCatching null
                 }
-            }
-            doc
-        }.onFailure {
-            val msg = it.message ?: ""
-            if (msg.contains("SSL", true) || msg.contains("TLS", true)) log("❌ fetch skipped (TLS): $absolute")
-            else logErr("❌ fetch failed $absolute: $msg", it)
-        }.getOrNull()
+
+                // Invoke CFSolver only on genuine CF challenges or JS "Loading..." interstitials
+                if (requiresCf && isCfChallenge(res.code, doc)) {
+                    log("🛡️ CF/JS challenge detected (code=${res.code}, title='${doc.title()}'). Invoking CFSolver...")
+                    if (CFSolver(absolute).solve()) {
+                        delay(350L)
+                        hostLastRequest[host] = System.currentTimeMillis()
+                        res = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders(absolute))
+                        doc = res.document
+                        log("✅ Re-fetched HTML after CF solve: $absolute (Code: ${res.code})")
+                    }
+                }
+
+                if (res.code in 200..299 && !isCfChallenge(res.code, doc)) {
+                    htmlCache[absolute] = System.currentTimeMillis() to doc
+                }
+                doc
+            }.onFailure {
+                val msg = it.message ?: ""
+                if (msg.contains("SSL", true) || msg.contains("TLS", true)) log("❌ fetch skipped (TLS): $absolute")
+                else logErr("❌ fetch failed $absolute: $msg", it)
+            }.getOrNull()
+        }
     }
 
     protected suspend fun fetchPost(
@@ -182,29 +238,45 @@ abstract class MangaManhwaProvider : MainAPI() {
     protected fun abs(url: String): String =
         if (url.startsWith("http")) url else "${baseUrl.trimEnd('/')}/${url.trimStart('/')}"
 
-    protected fun browserHeaders(targetUrl: String = baseUrl, extra: Map<String, String> = emptyMap()): Map<String, String> {
+    protected open fun browserHeaders(targetUrl: String = baseUrl, extra: Map<String, String> = emptyMap()): Map<String, String> {
         val host = hostOf(targetUrl)
         val ua = CFState.userAgentFor(host) ?: UA
         return mapOf(
             "User-Agent" to ua,
             "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language" to "en-US,en;q=0.9",
+            "Accept-Language" to "en-US,en;q=0.5",
             "Upgrade-Insecure-Requests" to "1"
         ) + extra
     }
 
-    protected fun isCfChallenge(doc: Document): Boolean {
-        val title = doc.title()
-        val html = doc.html()
-        return title.contains("Just a moment", true) ||
-               title.contains("Attention Required", true) ||
-               title.contains("Checking your browser", true) ||
-               title.contains("Security Check", true) ||
-               title.contains("One more step", true) ||
-               doc.selectFirst("div#cf-challenge-running, form#challenge-form, .cf-turnstile, #cf-wrapper, #challenge-error-title") != null ||
-               html.contains("cf-chl-") ||
-               html.contains("_cf_chl_opt") ||
-               html.contains("/cdn-cgi/challenge-platform/")
+    protected fun isCfChallenge(statusCode: Int, doc: Document): Boolean {
+        if (statusCode == 404 || statusCode == 429) return false
+        val title = doc.title().lowercase().trim()
+        val hasChallengeTitle = title == "loading..." ||
+                title == "loading" ||
+                title.startsWith("loading...") ||
+                title.contains("just a moment") ||
+                title.contains("attention required") ||
+                title.contains("checking your browser") ||
+                title.contains("security check") ||
+                title.contains("one more step") ||
+                title.contains("verify you are human")
+
+        val hasChallengeDom = doc.selectFirst("div#cf-challenge-running, form#challenge-form, #challenge-error-title") != null
+
+        if (hasChallengeTitle || hasChallengeDom) return true
+        if (statusCode == 403 || statusCode == 503) {
+            val html = doc.html()
+            return html.contains("cf-chl-") || html.contains("_cf_chl_opt") || html.contains("cloudflare", true)
+        }
+        return false
+    }
+
+    protected fun cleanTitleElement(el: Element?): String? {
+        if (el == null) return null
+        val clone = el.clone()
+        clone.select(".manga-title-badges, .badge, span.hot, span.new, span.up, span.end, span.top").remove()
+        return clone.text().trim().takeIf { it.isNotBlank() }
     }
 
     protected fun extractImg(el: Element): String? {
@@ -219,7 +291,10 @@ abstract class MangaManhwaProvider : MainAPI() {
         return candidates.map { it.trim() }.firstOrNull { url ->
             url.isNotBlank() &&
             !url.startsWith("data:", true) &&
-            !url.contains("dflazy.jpg", true)
+            !url.contains("dflazy.jpg", true) &&
+            !url.contains("logo.webp", true) &&
+            !url.contains("/logo", true) &&
+            !url.contains("avatar", true)
         }
     }
 
@@ -243,13 +318,22 @@ abstract class MangaManhwaProvider : MainAPI() {
     protected fun hostOf(url: String): String = runCatching { URI(url).host }.getOrNull() ?: url
 
     protected fun titleFromSlug(url: String): String {
-        val raw = url.trimEnd('/').substringAfterLast("/").replace('-', ' ').trim()
+        val raw = url.trimEnd('/')
+            .substringBefore("#")
+            .substringBefore("?")
+            .substringAfterLast("/")
+            .replace(Regex("""-[0-9a-f]{8}$""", RegexOption.IGNORE_CASE), "")
+            .replace('-', ' ')
+            .trim()
         if (raw.isBlank()) return "Untitled"
         return raw.split(' ').joinToString(" ") { w -> if (w.isEmpty()) w else w[0].uppercase() + w.drop(1) }
     }
 
     companion object {
-        const val UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
+        const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        private val hostLocks = ConcurrentHashMap<String, Mutex>()
+        private val hostLastRequest = ConcurrentHashMap<String, Long>()
+        private val htmlCache = ConcurrentHashMap<String, Pair<Long, Document>>()
     }
 }
 
@@ -263,7 +347,8 @@ data class ThemeConfig(
     val listSelector: String, val linkSelector: String, val titleSelector: String,
     val chapterSelector: String, val pageSelector: String, val imageSelector: String = "img",
     val posterSelector: String = "img", val plotSelector: String = ".summary__content p, .description-summary p, .entry-content p",
-    val newestFirst: Boolean = true
+    val newestFirst: Boolean = true,
+    val extraCookies: Map<String, String> = emptyMap()
 )
 
 open class ThemeBasedProvider(
@@ -277,6 +362,13 @@ open class ThemeBasedProvider(
 
     override val baseUrl: String
         get() = Settings.providerUrlOverride(name).takeIf { it.isNotBlank() } ?: (resolvedUrl ?: mainUrl)
+
+    override fun browserHeaders(targetUrl: String, extra: Map<String, String>): Map<String, String> {
+        val cookieHeader = if (config.extraCookies.isNotEmpty()) {
+            mapOf("Cookie" to config.extraCookies.entries.joinToString("; ") { "${it.key}=${it.value}" })
+        } else emptyMap()
+        return super.browserHeaders(targetUrl, cookieHeader + extra)
+    }
 
     private suspend fun ensureUrlResolved() {
         if (resolvedUrl != null || Settings.providerUrlOverride(name).isNotBlank()) return
@@ -303,29 +395,16 @@ open class ThemeBasedProvider(
     }.getOrDefault(false)
 
     private suspend fun fetchCatalogPage(pathTemplate: String, page: Int): List<SearchResponse> {
+        if (pathTemplate.isBlank()) return emptyList()
         ensureUrlResolved()
         val path = pathTemplate.replace("{page}", "$page")
         val doc = fetch(path) ?: return emptyList()
-        var items = parseList(doc)
-
-        // If a Madara site returns 0 items on /manga/ archive route, fall back to root homepage or CF solve
-        if (items.isEmpty() && page == 1) {
-            if (requiresCf && CFSolver(abs(path)).solve()) {
-                fetch(path)?.let { retryDoc -> items = parseList(retryDoc) }
-            }
-            if (items.isEmpty()) {
-                log("🔄 Fallback: Fetching root homepage for $name...")
-                fetch("/")?.let { homeDoc -> items = parseList(homeDoc) }
-            }
-        }
-        return items
+        return parseList(doc)
     }
 
     override suspend fun popular(page: Int): List<SearchResponse> = fetchCatalogPage(config.popularPath, page)
     override suspend fun latest(page: Int): List<SearchResponse> = fetchCatalogPage(config.latestPath, page)
     override suspend fun trending(page: Int): List<SearchResponse> = fetchCatalogPage(config.trendingPath, page)
-    override suspend fun hot(page: Int): List<SearchResponse> = trending(page)
-    override suspend fun follows(page: Int): List<SearchResponse> = popular(page)
     override suspend fun completed(page: Int): List<SearchResponse> = fetchCatalogPage(config.completedPath, page)
     override suspend fun newReleases(page: Int): List<SearchResponse> = fetchCatalogPage(config.newPath, page)
 
@@ -353,7 +432,8 @@ open class ThemeBasedProvider(
         ensureUrlResolved()
         val doc = fetch(url) ?: return null
         val episodes = resolveChapters(url, doc)
-        val title = doc.selectFirst("h1, .post-title h1, .entry-title")?.text()?.trim() ?: titleFromSlug(url)
+        val titleEl = doc.selectFirst(".post-title h1, .entry-title, .story-info-right h1, h1:not(.sr-only)")
+        val title = cleanTitleElement(titleEl) ?: titleFromSlug(url)
         val poster = doc.selectFirst(config.posterSelector)?.let(::extractImg)?.let(::abs)
         val plot = config.plotSelector.split(",").asSequence()
             .mapNotNull { sel -> doc.selectFirst(sel.trim())?.text()?.trim() }
@@ -372,12 +452,13 @@ open class ThemeBasedProvider(
             val a = el.selectFirst(config.linkSelector) ?: el.selectFirst("a[href]") ?: return@mapNotNull null
             val href = a.attr("href").trim().takeIf { it.isNotBlank() && it != "#" && !it.startsWith("javascript:") } ?: return@mapNotNull null
             val title = (
-                el.selectFirst(config.titleSelector)?.text()?.trim()?.takeIf { it.isNotBlank() }
+                cleanTitleElement(el.selectFirst(config.titleSelector))
                     ?: a.attr("title").trim().takeIf { it.isNotBlank() }
-                    ?: a.text().trim()
-            ).takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                    ?: cleanTitleElement(a)
+            )?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
 
-            val poster = (el.selectFirst(config.imageSelector) ?: el.selectFirst("img"))?.let(::extractImg)?.let(::abs)
+            val poster = (el.selectFirst(config.posterSelector) ?: el.selectFirst(config.imageSelector) ?: el.selectFirst("img"))
+                ?.let(::extractImg)?.let(::abs)
             newAnimeSearchResponse(title, abs(href), TvType.Anime).apply { posterUrl = poster }
         }.distinctBy { it.url }
 
@@ -451,25 +532,44 @@ open class ThemeBasedProvider(
 }
 
 object Themes {
+    // True Madara WordPress sorting parameters (?m_orderby=views, latest, trending, new-manga)
     val Madara = ThemeConfig(
-        popularPath = "/manga/?page={page}&order=popular",
-        latestPath = "/manga/?page={page}&order=update",
-        trendingPath = "/manga/?page={page}&order=rating",
-        completedPath = "/manga/?page={page}&status=completed&order=popular",
-        newPath = "/manga/?page={page}&order=latest",
-        searchPath = "/?s={query}&post_type=wp-manga",
-        listSelector = "div.c-tabs-item__content, div.page-item-detail, div.slider__item, div.popular-item-wrap",
-        linkSelector = "h3 a, h4 a, h5 a, .post-title a, .item-thumb a",
+        popularPath = "/manga/page/{page}/?m_orderby=views",
+        latestPath = "/manga/page/{page}/?m_orderby=latest",
+        trendingPath = "/manga/page/{page}/?m_orderby=trending",
+        completedPath = "/?s=&post_type=wp-manga&status%5B%5D=end&m_orderby=views&paged={page}",
+        newPath = "/manga/page/{page}/?m_orderby=new-manga",
+        searchPath = "/?s={query}&post_type=wp-manga&paged={page}",
+        listSelector = "div.page-item-detail, div.c-tabs-item__content",
+        linkSelector = "h3 a, h4 a, h5 a, .post-title a",
         titleSelector = "h3 a, h4 a, h5 a, .post-title a",
         chapterSelector = "li.wp-manga-chapter > a, div.chapter-item span.chapter a, .list-chapter .chapter-item a, ul.main.version-chap li a, .wp-manga-chapter a",
         pageSelector = "div.reading-content img, div.page-break img, .read-container img",
         posterSelector = ".summary_image img, .thumb img, .item-thumb img"
     )
+
+    // Toonily uses /search/ instead of /manga/ and requires toonily-mature=1 cookie
+    val Toonily = ThemeConfig(
+        popularPath = "/search/page/{page}/?m_orderby=views",
+        latestPath = "/search/page/{page}/?m_orderby=latest",
+        trendingPath = "/search/page/{page}/?m_orderby=trending",
+        completedPath = "/search/page/{page}/?status%5B0%5D=end&m_orderby=views",
+        newPath = "/search/page/{page}/?m_orderby=new-manga",
+        searchPath = "/search/{query}/page/{page}/",
+        listSelector = "div.page-item-detail, div.c-tabs-item__content",
+        linkSelector = "h3 a, h4 a, h5 a, .post-title a",
+        titleSelector = "h3 a, h4 a, h5 a, .post-title a",
+        chapterSelector = "li.wp-manga-chapter > a, ul.main.version-chap li a",
+        pageSelector = "div.reading-content img, div.page-break img",
+        posterSelector = ".summary_image img, .item-thumb img",
+        extraCookies = mapOf("toonily-mature" to "1")
+    )
+
     val MangaThemesia = ThemeConfig(
         popularPath = "/manga/?page={page}&order=popular",
         latestPath = "/manga/?page={page}&order=update",
         trendingPath = "/manga/?page={page}&order=views",
-        completedPath = "/manga/?page={page}&status=completed",
+        completedPath = "/manga/?page={page}&status=completed&order=popular",
         newPath = "/manga/?page={page}&order=latest",
         searchPath = "/manga/?title={query}&page={page}",
         listSelector = "div.listupd div.bs",
@@ -479,18 +579,21 @@ object Themes {
         pageSelector = "div#readerarea img",
         posterSelector = ".thumb img, .limit img"
     )
+
+    // Updated MangaBox routes (/genre-all/{page}) & selectors (.list-comic-item-wrap) for MangaKakalot.gg & MangaBats.com
     val MangaBox = ThemeConfig(
-        popularPath = "/manga_list?type=topview&category=all&state=all&page={page}",
-        latestPath = "/manga_list?type=latest&category=all&state=all&page={page}",
-        trendingPath = "/manga_list?type=topview&category=all&state=all&page={page}",
-        completedPath = "/manga_list?type=topview&category=all&state=Completed&page={page}",
-        newPath = "/manga_list?type=newest&category=all&state=all&page={page}",
+        popularPath = "/genre-all/{page}?type=topview",
+        latestPath = "/genre-all/{page}",
+        trendingPath = "/genre-all/{page}?type=topview",
+        completedPath = "/genre-all/{page}?state=completed",
+        newPath = "/genre-all/{page}?type=newest",
         searchPath = "/search/story/{query}?page={page}",
-        listSelector = ".list-truyen-item-wrap, .story_item, .content-genres-item",
-        linkSelector = "h3 a, .story_name a, .genres-item-name",
-        titleSelector = "h3 a, .story_name a, .genres-item-name",
-        chapterSelector = ".chapter-list .row span a, .program_list li a, .row-content-chapter li a",
+        listSelector = ".list-comic-item-wrap, .list-truyen-item-wrap, .story_item, .content-genres-item, .itemupdate",
+        linkSelector = "h3 a, .story_name a, .genres-item-name, a.list-story-item",
+        titleSelector = "h3 a, .story_name a, .genres-item-name, a.list-story-item",
+        chapterSelector = ".chapter-list .row span a, .row-content-chapter li a, .chapter-name",
         pageSelector = ".container-chapter-reader img",
-        posterSelector = ".manga-info-pic img, .story_item img"
+        posterSelector = ".manga-info-pic img, .story_item img, img",
+        plotSelector = "#noidungm, #panel-story-info-description, .entry-content p"
     )
 }
