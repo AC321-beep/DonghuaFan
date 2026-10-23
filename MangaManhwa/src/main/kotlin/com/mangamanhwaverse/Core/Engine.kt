@@ -162,14 +162,20 @@ abstract class MangaManhwaProvider : MainAPI() {
                 if (System.currentTimeMillis() - timestamp < 30_000L) return@withLock cachedDoc
             }
 
-            // If CFSolver already captured HTML for this URL, use it immediately
-            CFState.getSolvedHtml(absolute)?.let { solvedHtml ->
-                val doc = Jsoup.parse(solvedHtml, absolute)
-                if (!isCfChallenge(200, doc)) {
-                    htmlCache[absolute] = System.currentTimeMillis() to doc
-                    return@withLock doc
+            // HELPER: Deduplicates CFState HTML parsing and validation
+            fun checkAndCacheSolvedHtml(): Document? {
+                return CFState.getSolvedHtml(absolute)?.let { solvedHtml ->
+                    val solvedDoc = Jsoup.parse(solvedHtml, absolute)
+                    if (!isCfChallenge(200, solvedDoc)) {
+                        hostCooldownUntil.remove(host)
+                        htmlCache[absolute] = System.currentTimeMillis() to solvedDoc
+                        solvedDoc
+                    } else null
                 }
             }
+
+            // 1. Initial Solved Check
+            checkAndCacheSolvedHtml()?.let { return@withLock it }
 
             // Check per-host 429 circuit breaker so queued tabs don't hammer a rate-limited server
             val cooldownUntil = hostCooldownUntil[host] ?: 0L
@@ -177,14 +183,7 @@ abstract class MangaManhwaProvider : MainAPI() {
             if (remainingCooldown > 0L) {
                 log("⏳ Host $host is in 429 cooldown (${remainingCooldown}ms left). Attempting WebView fallback...")
                 if (requiresCf && CFSolver(absolute).solve()) {
-                    CFState.getSolvedHtml(absolute)?.let { solvedHtml ->
-                        val solvedDoc = Jsoup.parse(solvedHtml, absolute)
-                        if (!isCfChallenge(200, solvedDoc)) {
-                            hostCooldownUntil.remove(host)
-                            htmlCache[absolute] = System.currentTimeMillis() to solvedDoc
-                            return@withLock solvedDoc
-                        }
-                    }
+                    checkAndCacheSolvedHtml()?.let { return@withLock it }
                 }
                 return@withLock null
             }
@@ -210,14 +209,7 @@ abstract class MangaManhwaProvider : MainAPI() {
                     hostCooldownUntil[host] = System.currentTimeMillis() + 8_000L
                     log("🛡️ HTTP 429 on $host. Invoking WebView CFSolver to bypass TLS/rate limit...")
                     if (requiresCf && CFSolver(absolute).solve()) {
-                        CFState.getSolvedHtml(absolute)?.let { solvedHtml ->
-                            val solvedDoc = Jsoup.parse(solvedHtml, absolute)
-                            if (!isCfChallenge(200, solvedDoc)) {
-                                hostCooldownUntil.remove(host)
-                                htmlCache[absolute] = System.currentTimeMillis() to solvedDoc
-                                return@runCatching solvedDoc
-                            }
-                        }
+                        checkAndCacheSolvedHtml()?.let { return@runCatching it }
                     }
                     return@runCatching null
                 }
@@ -226,14 +218,11 @@ abstract class MangaManhwaProvider : MainAPI() {
                     log("🛡️ CF/JS challenge detected (code=${res.code}, title='${doc.title()}'). Invoking CFSolver...")
                     if (CFSolver(absolute).solve()) {
                         // 1. Prefer the rendered DOM captured directly from the WebView
-                        CFState.getSolvedHtml(absolute)?.let { solvedHtml ->
-                            val solvedDoc = Jsoup.parse(solvedHtml, absolute)
-                            if (!isCfChallenge(200, solvedDoc)) {
-                                log("✅ Loaded HTML directly from WebView CF solve: $absolute")
-                                htmlCache[absolute] = System.currentTimeMillis() to solvedDoc
-                                return@runCatching solvedDoc
-                            }
+                        checkAndCacheSolvedHtml()?.let { 
+                            log("✅ Loaded HTML directly from WebView CF solve: $absolute")
+                            return@runCatching it 
                         }
+                        
                         // 2. Otherwise re-fetch once with updated cookies/UA
                         delay(400L)
                         hostLastRequest[host] = System.currentTimeMillis()
@@ -613,7 +602,9 @@ open class ThemeBasedProvider(
     }
 
     private fun parseChapters(doc: Document): List<Episode> {
-        var eps = doc.select(config.chapterSelector).mapNotNull { a ->
+        val combinedSelector = "${config.chapterSelector}, a[href*='chapter-'], a[href*='/chapter/'], a[href*='/chap-']"
+        
+        val eps = doc.select(combinedSelector).mapNotNull { a ->
             val href = a.attr("href").trim()
             if (href.isBlank() || href == "#" || href.startsWith("javascript:", true)) return@mapNotNull null
 
@@ -624,19 +615,6 @@ open class ThemeBasedProvider(
             val chapName = a.text().trim().takeIf { it.isNotBlank() } ?: return@mapNotNull null
             newEpisode(abs(href)) { this.name = chapName }
         }.distinctBy { it.data }
-
-        // Universal chapter link fallback if theme selector misses
-        if (eps.isEmpty()) {
-            eps = doc.select("a[href*='chapter-'], a[href*='/chapter/'], a[href*='/chap-']").mapNotNull { a ->
-                val href = a.attr("href").trim()
-                if (href.isBlank() || href == "#" || href.startsWith("javascript:", true)) return@mapNotNull null
-                val isLocked = a.selectFirst("i.fa-lock, .fa-lock") != null ||
-                    a.parents().any { p -> p.hasClass("premium-block") || p.hasClass("premium") }
-                if (isLocked) return@mapNotNull null
-                val chapName = a.text().trim().takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                newEpisode(abs(href)) { this.name = chapName }
-            }.distinctBy { it.data }
-        }
 
         return if (config.newestFirst) eps.reversed() else eps
     }
@@ -705,3 +683,4 @@ object Themes {
         plotSelector = "#noidungm, #panel-story-info-description, .entry-content p"
     )
 }
+```<FollowUp label="Shall we dive into the MangaDex implementation next?" query="Let's build out the MangaDex provider next."/>
