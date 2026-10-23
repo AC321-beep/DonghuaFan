@@ -17,7 +17,7 @@ object ProviderRegistry {
         MangaKakalot(), MangaBat(),
 
         // NextGen Web / API Providers
-        FlameComics(), AsuraScans(), HiveScans(), NyxScans(),
+        FlameComics(), AsuraScans(), HiveToon(), NyxScans(),
 
         // Dedicated Custom / Aggregator Providers
         MangaDex(),
