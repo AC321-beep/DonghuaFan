@@ -683,4 +683,4 @@ object Themes {
         plotSelector = "#noidungm, #panel-story-info-description, .entry-content p"
     )
 }
-```<FollowUp label="Shall we dive into the MangaDex implementation next?" query="Let's build out the MangaDex provider next."/>
+
