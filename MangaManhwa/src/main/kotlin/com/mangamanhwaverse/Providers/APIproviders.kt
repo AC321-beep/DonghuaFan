@@ -9,14 +9,22 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 import kotlin.random.Random
 
-// Data classes for Next.js Chapter Extraction (Flame, Hive, Nyx)
+// ==========================================
+// Next.js JSON Data Models (Flame Comics)
+// ==========================================
 data class NextData(@JsonProperty("props") val props: Props?)
 data class Props(@JsonProperty("pageProps") val pageProps: PageProps?)
-data class PageProps(@JsonProperty("series") val seriesDetail: SeriesNode?)
+data class PageProps(
+    @JsonProperty("series") val seriesDetail: SeriesNode?,
+    @JsonProperty("chapters") val chapters: List<ChapterNode>? // Flame moved chapters here
+)
 data class SeriesNode(
     @JsonProperty("series_id") val seriesId: Int?,
     @JsonProperty("novel_id") val novelId: Int?,
-    @JsonProperty("chapters") val chapters: List<ChapterNode>?
+    @JsonProperty("title") val title: String?,
+    @JsonProperty("description") val description: String?,
+    @JsonProperty("cover") val cover: String?,
+    @JsonProperty("chapters") val chapters: List<ChapterNode>? // Legacy fallback
 )
 data class ChapterNode(
     @JsonProperty("chapter") val chapter: String?,
@@ -71,33 +79,54 @@ open class NextGenWebProvider(
         val doc = fetch(url) ?: return null
         val episodes = chaptersFromDoc(url, doc)
 
-        val ogTitle = doc.selectFirst("meta[property='og:title']")?.attr("content")
-            ?.substringBefore(" - $name")
-            ?.substringBefore(" - Asura")
-            ?.substringBefore(" - Flame")
-            ?.substringBefore(" - Hive")
-            ?.substringBefore(" | ")
-            ?.replace(Regex("""\s+Manhwa$""", RegexOption.IGNORE_CASE), "")
-            ?.trim()
-            ?.takeIf { it.isNotBlank() && !it.startsWith("Read Free", true) }
+        // 1. Next.js JSON Extraction (Flame Comics exact data)
+        val nextDataStr = doc.selectFirst("script#__NEXT_DATA__")?.data()
+        var title = ""
+        var poster = ""
+        var plot = ""
 
-        val domTitle = cleanTitleElement(doc.selectFirst("span.text-xl.font-bold, h1:not(.sr-only), .post-title h1"))
-            ?.replace(Regex("""\s+Manhwa$""", RegexOption.IGNORE_CASE), "")
-            ?.takeIf { it.isNotBlank() && !it.startsWith("Read Free", true) }
-
-        val title = ogTitle ?: domTitle ?: titleFromSlug(url)
-
-        var poster = doc.selectFirst("meta[property='og:image']")?.attr("content")?.trim()
-            ?.takeIf { it.isNotBlank() && !it.contains("logo", true) }?.let(::abs)
-            
-        if (poster == null) {
-            poster = doc.selectFirst("img[alt*='poster' i], img[alt*='cover' i], .grid img")?.let(::extractImg)?.let(::abs)
+        if (!nextDataStr.isNullOrBlank()) {
+            try {
+                val nextData = parseJson<NextData>(nextDataStr)
+                val series = nextData.props?.pageProps?.seriesDetail
+                if (series != null) {
+                    title = series.title ?: ""
+                    plot = series.description?.replace(Regex("<[^>]*>"), "")?.trim() ?: ""
+                    
+                    val id = series.seriesId ?: series.novelId
+                    val folder = if (series.novelId != null) "novels" else "series"
+                    poster = "https://cdn.flamecomics.xyz/uploads/images/$folder/$id/${series.cover}"
+                }
+            } catch (e: Exception) { e.printStackTrace() }
         }
-        
-        poster = poster?.let { cleanNextJsImage(it) }
 
-        val plot = doc.selectFirst("span.font-medium.text-sm, div[class*='synopsis'] p, .summary__content p, meta[property='og:description']")
-            ?.let { if (it.tagName() == "meta") it.attr("content") else it.text() }?.trim()
+        // 2. Fallback DOM Parsing (vComics & Astro)
+        if (title.isBlank()) {
+            val ogTitle = doc.selectFirst("meta[property='og:title']")?.attr("content")
+                ?.substringBefore(" - $name")
+                ?.substringBefore(" - Asura")
+                ?.substringBefore(" - Flame")
+                ?.substringBefore(" - Nyx")
+                ?.substringBefore(" | ")
+                ?.replace(Regex("""\s+Manhwa$""", RegexOption.IGNORE_CASE), "")
+                ?.trim()
+                ?.takeIf { it.isNotBlank() && !it.startsWith("Read Free", true) }
+
+            val domTitle = cleanTitleElement(doc.selectFirst("h1[itemProp='name'], span.text-xl.font-bold, h1:not(.sr-only), .post-title h1"))
+                ?.replace(Regex("""\s+Manhwa$""", RegexOption.IGNORE_CASE), "")
+                ?.takeIf { it.isNotBlank() && !it.startsWith("Read Free", true) }
+
+            title = ogTitle ?: domTitle ?: titleFromSlug(url)
+            
+            poster = doc.selectFirst("meta[property='og:image']")?.attr("content")?.trim()
+                ?.takeIf { it.isNotBlank() && !it.contains("logo", true) }?.let(::abs)
+                ?: doc.selectFirst("img[alt*='Cover' i], img[alt*='poster' i], .grid img")?.let(::extractImg)?.let(::abs) ?: ""
+                
+            plot = doc.selectFirst("div[itemprop='description'], span.font-medium.text-sm, div[class*='synopsis'] p, .summary__content p, meta[property='og:description']")
+                ?.let { if (it.tagName() == "meta") it.attr("content") else it.text() }?.trim() ?: ""
+        }
+
+        poster = cleanNextJsImage(poster)
 
         log("✅ Load: Title='$title' | Chapters=${episodes.size}")
         return newAnimeLoadResponse(title, url, TvType.Anime) {
@@ -141,8 +170,7 @@ open class NextGenWebProvider(
     }
 
     protected open fun parseSeriesCards(doc: Document, mode: String = "popular", page: Int = 1): List<SearchResponse> {
-        // 1. Check __NEXT_DATA__ JSON state FIRST (FlameComics/HiveScans/NyxScans) 
-        // using your original sorting & filtering logic to ensure categories function perfectly
+        // 1. Next.js JSON Extraction (Flame Comics local sorting)
         val nextData = doc.selectFirst("script#__NEXT_DATA__")?.data()
         if (!nextData.isNullOrBlank() && nextData.contains("\"series_id\"")) {
             data class FlameEntry(
@@ -155,8 +183,6 @@ open class NextGenWebProvider(
             )
             val entries = mutableListOf<FlameEntry>()
             val objRegex = Regex("""\{[^{}]*"series_id"\s*:\s*(\d+)[^{}]*\}""")
-            
-            // Also grab Novel IDs
             val novelObjRegex = Regex("""\{[^{}]*"novel_id"\s*:\s*(\d+)[^{}]*\}""")
             
             fun extractEntries(regex: Regex, isNovel: Boolean) {
@@ -166,7 +192,6 @@ open class NextGenWebProvider(
                     val title = Regex(""""title"\s*:\s*"([^"]+)"""").find(block)?.groupValues?.get(1) ?: return@forEach
                     var cover = Regex(""""cover"\s*:\s*"([^"]+)"""").find(block)?.groupValues?.get(1) ?: ""
                     
-                    // Construct Full CDN URL if it's just a filename
                     if (cover.isNotBlank() && !cover.startsWith("http")) {
                         val folder = if (isNovel) "novels" else "series"
                         cover = "https://cdn.flamecomics.xyz/uploads/images/$folder/$id/$cover"
@@ -201,12 +226,9 @@ open class NextGenWebProvider(
                     }
                 }
 
-                // Paginate locally
                 val pageSize = 30
                 val paged = if (mode == "search") sorted else sorted.drop((page - 1) * pageSize).take(pageSize)
                 return paged.map { e ->
-                    // Flame dynamically paths to either /novel/ or /series/ based on ID
-                    // If novel regex captured it, it might route differently, but /series/ generally redirects
                     newAnimeSearchResponse(e.title, abs("/series/${e.id}"), TvType.Anime).apply {
                         if (e.cover.isNotBlank()) posterUrl = e.cover
                     }
@@ -214,7 +236,7 @@ open class NextGenWebProvider(
             }
         }
 
-        // 2. Parse rendered DOM series cards (AsuraScans Astro format & Legacy sites)
+        // 2. DOM Parsing Fallback (vComics & Astro)
         val parsedCards = LinkedHashMap<String, ParsedCard>()
 
         doc.select("a[href]").forEach { a ->
@@ -229,10 +251,9 @@ open class NextGenWebProvider(
             var poster = imgEl?.let(::extractImg)?.let(::abs)
             poster = poster?.let { cleanNextJsImage(it) }
 
-            // Ignore text-only header/footer links that don't have a cover image
             if (poster == null && a.selectFirst("h3, h4, span.block.font-bold") == null) return@forEach
 
-            val rawTitle = a.selectFirst("span.block.font-bold, h3, h4, .title")?.text()?.trim()
+            val rawTitle = a.selectFirst("h3.line-clamp-2, span.block.font-bold, h3, h4, .title")?.text()?.trim()
                 ?: imgEl?.attr("alt")?.trim()?.takeIf { it.isNotBlank() && !it.equals("poster", true) && !it.equals("cover", true) }
                 ?: a.attr("title").trim()
                 ?: cardRoot.selectFirst("h3, h4, .title")?.text()?.trim()
@@ -276,7 +297,7 @@ open class NextGenWebProvider(
         val sidebarOrSlider = allCards.filter { it.isInSidebarOrSlider }
 
         val ordered = when (mode) {
-            "latest" -> mainGrid
+            "latest", "search" -> mainGrid
             "popular" -> {
                 if (sidebarOrSlider.size >= 5 && page == 1) {
                     (sidebarOrSlider + mainGrid.sortedByDescending { it.chapterCount }).distinctBy { it.response.url }
@@ -319,7 +340,7 @@ open class NextGenWebProvider(
     }
 
     protected open fun chaptersFromDoc(mangaUrl: String, doc: Document): List<Episode> {
-        val eps = mutableListOf<Episode>()
+        val epsMap = LinkedHashMap<String, Episode>()
         val cleanMangaUrl = abs(mangaUrl).trimEnd('/')
         val slugPath = cleanMangaUrl.substringAfter(baseUrl.trimEnd('/'))
         val baseSlug = slugPath.substringAfterLast("/").replace(Regex("""-[0-9a-f]{8}$""", RegexOption.IGNORE_CASE), "")
@@ -330,50 +351,67 @@ open class NextGenWebProvider(
             try {
                 val nextData = parseJson<NextData>(nextDataStr)
                 val series = nextData.props?.pageProps?.seriesDetail
-                if (series != null) {
+                
+                // Flame shifted their chapters payload directly into pageProps
+                val chaptersList = nextData.props?.pageProps?.chapters ?: series?.chapters
+
+                if (series != null && chaptersList != null) {
                     val id = series.seriesId ?: series.novelId
                     val route = if (series.novelId != null) "novel" else "series"
 
-                    series.chapters?.forEach { ch ->
+                    chaptersList.forEach { ch ->
                         val token = ch.token ?: return@forEach
                         val chapterUrl = "$mainUrl/$route/$id/$token"
-                        val name = if (!ch.title.isNullOrBlank()) "Chapter ${ch.chapter} - ${ch.title}" else "Chapter ${ch.chapter}"
+                        val chNum = ch.chapter ?: ""
+                        val name = if (!ch.title.isNullOrBlank()) "Chapter $chNum - ${ch.title}" else "Chapter $chNum"
                         
-                        eps.add(newEpisode(chapterUrl) { 
+                        epsMap[chapterUrl] = newEpisode(chapterUrl) { 
                             this.name = name 
-                        })
+                        }
                     }
-                    if (eps.isNotEmpty()) return eps.distinctBy { it.data }.reversed()
+                    if (epsMap.isNotEmpty()) return epsMap.values.toList().reversed()
                 }
             } catch (e: Exception) { e.printStackTrace() }
         }
 
-        // 2. Standard DOM chapter links (AsuraScans Astro format)
-        doc.select("a[href*='chapter'], div.chapter-list a, a.chapter-link").forEach { a ->
-            val href = a.attr("href").trim()
-            if (href.isBlank() || href == "#") return@forEach
+        // 2. Standard DOM chapter links (vComics & Astro fallback)
+        val chapterElements = doc.select(
+            "section[data-series-tab-panel='chapters'] a[href*='chapter'], " +
+            "div#chapterlist a[href], " +
+            "div.eplister a[href], " +
+            "ul.clstyle a[href], " +
+            "div.chapter-list a[href]"
+        ).ifEmpty {
+            doc.select("a[href*='chapter'], a.chapter-link")
+        }
 
-            // FIX: Prevent Asura's top "Read First Chapter" buttons from eating Chapter 1 
+        chapterElements.forEach { a ->
+            val href = a.attr("href").trim()
+            if (href.isBlank() || href == "#" || href.contains("All Chapters", ignoreCase = true)) return@forEach
+
+            val fullUrl = abs(href)
             val textLower = a.text().lowercase()
-            if (textLower.contains("read first") || textLower.contains("read latest") || textLower.contains("first chapter")) return@forEach
+
+            // FIX: Prevent top "Read First Chapter" buttons from eating Chapter 1 
+            if (textLower.contains("read first") || textLower.contains("read latest")) return@forEach
 
             if (baseSlug.length > 2 && !href.contains(baseSlug, ignoreCase = true)) return@forEach
 
-            val chapNumMatch = Regex("""chapter[/\-_\s]*([\d.]+)""", RegexOption.IGNORE_CASE).find(href)
-            val name = chapNumMatch?.let { "Chapter ${it.groupValues[1]}" }
-                ?: a.selectFirst("h3, span")?.text()?.trim()?.takeIf { it.isNotBlank() }
-                ?: a.text().trim()
+            val vComicsName = a.selectFirst("span.font-medium, span.text-sm")?.text()?.trim()
+            val backupName = a.selectFirst("h3, span.chapternum")?.text()?.trim() ?: a.text().trim()
+            
+            var name = vComicsName.takeIf { !it.isNullOrBlank() } ?: backupName
+            name = name.substringBefore(" ago").substringBefore(" days").substringBefore(" months").trim()
 
             if (name.isNotBlank()) {
-                eps.add(newEpisode(abs(href)) { this.name = name })
+                epsMap[fullUrl] = newEpisode(fullUrl) { this.name = name }
             }
         }
 
-        return eps.distinctBy { it.data }.reversed()
+        return epsMap.values.toList().reversed()
     }
 }
 
-// FlameComics uses standard /browse routing now
 class FlameComics : NextGenWebProvider(
     name = "FlameComics",
     mainUrl = "https://flamecomics.xyz",
@@ -385,7 +423,6 @@ class FlameComics : NextGenWebProvider(
     searchPath = "/browse?search={query}"
 )
 
-// Updated to Asura's new Astro dot-com domain with exact query params
 class AsuraScans : NextGenWebProvider(
     name = "AsuraScans",
     mainUrl = "https://asurascans.com",
