@@ -342,8 +342,6 @@ open class NextGenWebProvider(
     protected open fun chaptersFromDoc(mangaUrl: String, doc: Document): List<Episode> {
         val epsMap = LinkedHashMap<String, Episode>()
         val cleanMangaUrl = abs(mangaUrl).trimEnd('/')
-        val slugPath = cleanMangaUrl.substringAfter(baseUrl.trimEnd('/'))
-        val baseSlug = slugPath.substringAfterLast("/").replace(Regex("""-[0-9a-f]{8}$""", RegexOption.IGNORE_CASE), "")
 
         // 1. Next.js JSON Extraction (Flame Comics exact token linking)
         val nextDataStr = doc.selectFirst("script#__NEXT_DATA__")?.data()
@@ -374,15 +372,18 @@ open class NextGenWebProvider(
             } catch (e: Exception) { e.printStackTrace() }
         }
 
-        // 2. Standard DOM chapter links (vComics & Astro fallback)
+        // 2. Standard DOM chapter links (Asura, Hive, Nyx fallback)
         val chapterElements = doc.select(
             "section[data-series-tab-panel='chapters'] a[href*='chapter'], " +
             "div#chapterlist a[href], " +
             "div.eplister a[href], " +
             "ul.clstyle a[href], " +
-            "div.chapter-list a[href]"
+            "div.chapter-list a[href], " +
+            "div.flex.flex-col > a[href*='chapter'], " +
+            "div.flex.flex-col > a[href*='ch-'], " +
+            "div[class*='chapter'] a[href]" 
         ).ifEmpty {
-            doc.select("a[href*='chapter'], a.chapter-link")
+            doc.select("a[href*='chapter'], a.chapter-link, a[href*='ch-'], a[href*='ep-'], a[href*='episode']")
         }
 
         chapterElements.forEach { a ->
@@ -392,18 +393,25 @@ open class NextGenWebProvider(
             val fullUrl = abs(href)
             val textLower = a.text().lowercase()
 
-            // FIX: Prevent top "Read First Chapter" buttons from eating Chapter 1 
-            if (textLower.contains("read first") || textLower.contains("read latest")) return@forEach
+            // Block header buttons from interfering
+            if (textLower.contains("read first") || textLower.contains("read latest") || textLower == "first chapter") return@forEach
 
-            if (baseSlug.length > 2 && !href.contains(baseSlug, ignoreCase = true)) return@forEach
+            // Prevent linking back to the series page itself (Replaces the strict baseSlug check)
+            if (fullUrl == cleanMangaUrl || fullUrl == "$cleanMangaUrl/") return@forEach
 
-            val vComicsName = a.selectFirst("span.font-medium, span.text-sm")?.text()?.trim()
+            val vComicsName = a.selectFirst("span.font-medium, span.text-sm, p.font-medium, p.text-sm, .epcur")?.text()?.trim()
             val backupName = a.selectFirst("h3, span.chapternum")?.text()?.trim() ?: a.text().trim()
             
             var name = vComicsName.takeIf { !it.isNullOrBlank() } ?: backupName
             name = name.substringBefore(" ago").substringBefore(" days").substringBefore(" months").trim()
 
             if (name.isNotBlank()) {
+                // FIX FOR ASURA: Remove the key if it already exists before adding it again.
+                // This forces the LinkedHashMap to update the item's position to its correct 
+                // location within the actual chapter list, preventing Ch 1 from getting stuck.
+                if (epsMap.containsKey(fullUrl)) {
+                    epsMap.remove(fullUrl)
+                }
                 epsMap[fullUrl] = newEpisode(fullUrl) { this.name = name }
             }
         }
@@ -424,18 +432,18 @@ class FlameComics : NextGenWebProvider(
 )
 
 class AsuraScans : NextGenWebProvider(
-    name = "AsuraScans",
+    name = "Asura Scans",
     mainUrl = "https://asurascans.com",
-    popularPath = "/browse/comics?page={page}&order=bookmarks",
-    latestPath = "/browse/comics?page={page}&order=update",
-    trendingPath = "/browse/comics?page={page}&order=rating",
-    completedPath = "/browse/comics?page={page}&status=completed",
-    newPath = "/browse/comics?page={page}&order=desc",
-    searchPath = "/browse/comics?page={page}&search={query}"
+    popularPath = "/comics?page={page}&order=bookmarks",
+    latestPath = "/comics?page={page}&order=update",
+    trendingPath = "/comics?page={page}&order=rating",
+    completedPath = "/comics?page={page}&status=completed",
+    newPath = "/comics?page={page}&order=desc",
+    searchPath = "/comics?page={page}&search={query}"
 )
 
-class HiveScans : NextGenWebProvider(
-    name = "HiveScans",
+class HiveToon : NextGenWebProvider(
+    name = "Hive Toon",
     mainUrl = "https://hivetoons.org",
     popularPath = "/series?page={page}&order=popular",
     latestPath = "/series?page={page}&order=update",
