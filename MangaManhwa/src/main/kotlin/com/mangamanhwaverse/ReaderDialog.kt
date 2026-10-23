@@ -535,7 +535,7 @@ class ReaderDialog : DialogFragment() {
                         .find(url)?.groupValues?.get(1)
                     if (numStr != null) {
                         currentChapterUrl = url
-                        currentChapterName = "Ch. $numStr"
+                        currentChapterName = if (numStr == "0") "Prologue" else "Ch. $numStr"
                         chapterInfo?.text = currentChapterName
 
                         val slug = extractSlug(url)
@@ -721,10 +721,10 @@ class ReaderDialog : DialogFragment() {
                   ':root { --rpage-max-w: ' + z + '% !important; }' +
                   '.rpage-main, .rpage-main--long-strip { overflow-x: auto !important; }' +
                   'img:not([data-mm-ad="1"]):not([src*="600x300"]):not([src*="compr.gif"]), .rpage-page__img, canvas.rpage-page__img, canvas { max-width: 100% !important; width: 100% !important; height: auto !important; display: block !important; margin: 0 auto !important; }' +
-                  ':is(.rpage-main__inner, .rpage-view, .rpage-view--pages, .reading-content, #readerarea, ' +
+                  ':is(.rpage-main__inner, .rpage-view, .rpage-view--pages, .reading-content, .read-container, #readerarea, ' +
                   '.viewer, .chapter-content, .manga-reading, #chapter-content, .comic-images-wrapper, .container-chapter-reader) ' +
                   '{ width: ' + z + '% !important; max-width: ' + z + '% !important; margin: 0 auto !important; transition: width .15s ease-out, max-width .15s ease-out !important; }' +
-                  '.rpage-page, .swiper-zoom-container, .rpage-zoom-container, figure.image-container { width: 100% !important; max-width: 100% !important; margin: 0 auto !important; }';
+                  '.rpage-page, .swiper-zoom-container, .rpage-zoom-container, figure.image-container, .page-break { width: 100% !important; max-width: 100% !important; margin: 0 auto !important; }';
                 try {
                   var k = 'reader.default.v3';
                   var st = JSON.parse(localStorage.getItem(k) || '{}');
@@ -779,8 +779,8 @@ class ReaderDialog : DialogFragment() {
               }
 
               var btnSel = isNext
-                ? 'button[aria-label*="ext chapter" i], button[title*="ext chapter" i], a[aria-label*="ext chapter" i], a[title*="ext chapter" i]'
-                : 'button[aria-label*="rev chapter" i], button[title*="rev chapter" i], a[aria-label*="rev chapter" i], a[title*="rev chapter" i]';
+                ? 'button[aria-label*="ext chapter" i], button[title*="ext chapter" i], a[aria-label*="ext chapter" i], a[title*="ext chapter" i], a.next_page'
+                : 'button[aria-label*="rev chapter" i], button[title*="rev chapter" i], a[aria-label*="rev chapter" i], a[title*="rev chapter" i], a.prev_page';
               var btn = document.querySelector(btnSel);
               if (btn && !btn.disabled) { btn.click(); return true; }
 
@@ -831,7 +831,6 @@ class ReaderDialog : DialogFragment() {
             return
         }
 
-        // If already on a direct FlameComics token URL, don't run the jump timer
         if (Regex("""/series/\d+/[0-9a-f]{8,}""", RegexOption.IGNORE_CASE).containsMatchIn(currentChapterUrl)) {
             return
         }
@@ -1041,7 +1040,7 @@ class ReaderDialog : DialogFragment() {
                         margin-bottom: 8px !important;
                       }
                       .rpage-main, .rpage-main--long-strip, .rpage-main__inner,
-                      .reading-content, #readerarea, .viewer,
+                      .reading-content, .read-container, #readerarea, .viewer,
                       .chapter-content, .manga-reading, #chapter-content,
                       .comic-images-wrapper, .container-chapter-reader {
                         padding-top: 0 !important;
@@ -1056,7 +1055,7 @@ class ReaderDialog : DialogFragment() {
                   function getScroller() {
                     var candidates = [
                       '.rpage-main', '.rpage-main--long-strip',
-                      '#readerarea', '.reading-content', '.chapter-content',
+                      '#readerarea', '.reading-content', '.read-container', '.chapter-content',
                       '.manga-reading', '#chapter-content', '.viewer',
                       '.comic-images-wrapper', '.container-chapter-reader'
                     ];
@@ -1074,7 +1073,7 @@ class ReaderDialog : DialogFragment() {
 
                   function findReaderContainer(start) {
                     var sels = '.rpage-main, .rpage-main--long-strip, .rpage-main__inner, ' +
-                               '#readerarea, .reading-content, .chapter-content, ' +
+                               '#readerarea, .reading-content, .read-container, .chapter-content, ' +
                                '.manga-reading, #chapter-content, .viewer, ' +
                                '.rpage-view, .rpage-view--pages, ' +
                                '.comic-images-wrapper, .container-chapter-reader';
@@ -1113,13 +1112,13 @@ class ReaderDialog : DialogFragment() {
                         var aria  = (a.getAttribute('aria-label') || '').toLowerCase();
 
                         var nScore = 0;
-                        if (rel === 'next') nScore = 3;
+                        if (rel === 'next' || a.classList.contains('next_page')) nScore = 3;
                         else if (txt.includes('next chapter') || title.includes('next chapter') || aria.includes('next chapter')) nScore = 2;
                         else if (txt === 'next' && a.offsetParent !== null) nScore = 1;
                         if (nScore > bestNextScore) { bestNextScore = nScore; bestNextUrl = href; }
 
                         var pScore = 0;
-                        if (rel === 'prev' || rel === 'previous') pScore = 3;
+                        if (rel === 'prev' || rel === 'previous' || a.classList.contains('prev_page')) pScore = 3;
                         else if (txt.includes('prev chapter') || txt.includes('previous chapter') || title.includes('prev chapter') || aria.includes('prev chapter')) pScore = 2;
                         else if ((txt === 'prev' || txt === 'previous') && a.offsetParent !== null) pScore = 1;
                         if (pScore > bestPrevScore) { bestPrevScore = pScore; bestPrevUrl = href; }
@@ -1162,6 +1161,16 @@ class ReaderDialog : DialogFragment() {
                     return false;
                   }
 
+                  function isReaderWrapperOrContainsReader(el) {
+                    if (!el || el.nodeType !== 1) return false;
+                    var rSel = '.reading-content, .read-container, #readerarea, .rpage-main, .comic-images-wrapper, .container-chapter-reader, .page-break';
+                    try {
+                      if (el.matches && el.matches(rSel)) return true;
+                      if (el.querySelector && el.querySelector(rSel)) return true;
+                    } catch(e) {}
+                    return false;
+                  }
+
                   function isBannerAdImage(img) {
                     if (!img || img.tagName !== 'IMG') return false;
                     var src = (img.currentSrc || img.src || img.getAttribute('data-src') || '').toLowerCase();
@@ -1175,6 +1184,7 @@ class ReaderDialog : DialogFragment() {
                   function isPotentialPageImage(img) {
                     if (!img || img.tagName !== 'IMG') return false;
                     if (isBannerAdImage(img)) return false;
+                    if (img.classList && img.classList.contains('wp-manga-chapter-img')) return true;
                     if (img.naturalWidth > 0) return false;
                     var w = parseInt(img.getAttribute('width') || '0', 10);
                     var h = parseInt(img.getAttribute('height') || '0', 10);
@@ -1182,7 +1192,7 @@ class ReaderDialog : DialogFragment() {
                     var src = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') ||
                               img.getAttribute('data-original') || img.getAttribute('data-cfsrc') ||
                               img.getAttribute('src') || '';
-                    return /\/chapter|\/page|\/pages\/|\/hi\/|\/uploads\/|\/\d{2,4}\.(jpg|jpeg|png|webp|avif)/i.test(src);
+                    return /\/chapter|\/page|\/pages\/|\/hi\/|\/uploads\/|\/\d{1,4}\.(jpg|jpeg|png|webp|avif)/i.test(src);
                   }
 
                   function isPageWrapper(el) {
@@ -1195,7 +1205,7 @@ class ReaderDialog : DialogFragment() {
 
                   function isOrContainsUnloadedPage(el) {
                     if (!el || el.nodeType !== 1 || isInChrome(el)) return false;
-                    if (isPageWrapper(el)) return true;
+                    if (isPageWrapper(el) || isReaderWrapperOrContainsReader(el)) return true;
                     if (el.tagName === 'IMG' && isPotentialPageImage(el)) return true;
                     try {
                       var wrappers = el.querySelectorAll('.rpage-page, .page-break, .chapter-item, figure.image-container, canvas.rpage-page__img, .rpage-page__img');
@@ -1269,6 +1279,8 @@ class ReaderDialog : DialogFragment() {
 
                   function nukeEl(el) {
                     if (!el || !el.style) return;
+                    // Never nuke the reader container itself (e.g. div.read-container on Toonily/Madara)
+                    if (isReaderWrapperOrContainsReader(el)) return;
                     try {
                       el.setAttribute('data-mm-ad', '1');
                       el.style.setProperty('display', 'none', 'important');
@@ -1377,7 +1389,7 @@ class ReaderDialog : DialogFragment() {
                       if (el) chText = (el.innerText || el.textContent || '').trim();
                       if (!chText || chText === 'Ch. 0' || chText === 'Ch.0') {
                         var m = /(?:chapter|ch)[-/]?(\d+(\.\d+)?)/i.exec(window.location.href);
-                        if (m) chText = 'Ch. ' + m[1];
+                        if (m) chText = m[1] === '0' ? 'Prologue' : 'Ch. ' + m[1];
                       }
                       if (!chText) {
                         var nd = document.getElementById('__NEXT_DATA__');
@@ -1443,8 +1455,9 @@ class ReaderDialog : DialogFragment() {
                           'iframe[src*="openx"], iframe[src*="sharethrough"], ' +
                           'iframe[src*="media.net"], iframe[src*="mgid"], ' +
                           'iframe[src*="zergnet"], iframe[src*="gumgum"], ' +
-                          '[class*="ad-slot"], [class*="ad-slot "], [class$="ad-slot"], ' +
-                          '[class*="ad-container"], [class*="ad-wrapper"], ' +
+                          '[class^="ad-slot"], [class*=" ad-slot"], [class*="-ad-slot"], [class*="_ad-slot"], ' +
+                          '[class^="ad-container"], [class*=" ad-container"], [class*="-ad-container"], [class*="_ad-container"], ' +
+                          '[class^="ad-wrapper"], [class*=" ad-wrapper"], [class*="-ad-wrapper"], [class*="_ad-wrapper"], ' +
                           '[class^="adsense"], [class*=" adsense"], [class*="adsbygoogle"], ' +
                           'ins.adsbygoogle, ins[data-ad-slot], ' +
                           '[data-google-query-id], [data-ad-slot], [data-ad-client], ' +
@@ -1729,11 +1742,9 @@ class ReaderDialog : DialogFragment() {
         val m = Regex("(?:chapter|ch)[-/]?(\\d+(\\.\\d+)?)", RegexOption.IGNORE_CASE).find(detectedUrl)
         if (m != null) {
             val num = m.groupValues[1]
-            if (num != "0") {
-                currentChapterName = "Ch. $num"
-                chapterInfo?.text = currentChapterName
-                return
-            }
+            currentChapterName = if (num == "0") "Prologue" else "Ch. $num"
+            chapterInfo?.text = currentChapterName
+            return
         }
         if (detectedTitle.isBlank() ||
             detectedTitle.contains("Comix", ignoreCase = true) ||
