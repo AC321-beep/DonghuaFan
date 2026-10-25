@@ -73,7 +73,7 @@ abstract class MangaManhwaProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        log("⬇️ getMainPage: ${request.name} | Page $page")
+        log("⬇️ getMainPage: ${request.name} \vert{} Page$page")
         val items = runCatching {
             when (request.data) {
                 "popular" -> popular(page)
@@ -87,7 +87,7 @@ abstract class MangaManhwaProvider : MainAPI() {
             }
         }.onFailure { logErr("❌ getMainPage failed", it) }.getOrDefault(emptyList())
 
-        log("✅ getMainPage: Found ${items.size} items for ${request.name}")
+        log("✅ getMainPage: Found ${items.size} items for${request.name}")
         if (items.isEmpty()) return null
 
         return newHomePageResponse(
@@ -162,7 +162,6 @@ abstract class MangaManhwaProvider : MainAPI() {
                 if (System.currentTimeMillis() - timestamp < 30_000L) return@withLock cachedDoc
             }
 
-            // HELPER: Deduplicates CFState HTML parsing and validation
             fun checkAndCacheSolvedHtml(): Document? {
                 return CFState.getSolvedHtml(absolute)?.let { solvedHtml ->
                     val solvedDoc = Jsoup.parse(solvedHtml, absolute)
@@ -174,10 +173,8 @@ abstract class MangaManhwaProvider : MainAPI() {
                 }
             }
 
-            // 1. Initial Solved Check
             checkAndCacheSolvedHtml()?.let { return@withLock it }
 
-            // Check per-host 429 circuit breaker so queued tabs don't hammer a rate-limited server
             val cooldownUntil = hostCooldownUntil[host] ?: 0L
             val remainingCooldown = cooldownUntil - System.currentTimeMillis()
             if (remainingCooldown > 0L) {
@@ -188,7 +185,6 @@ abstract class MangaManhwaProvider : MainAPI() {
                 return@withLock null
             }
 
-            // Pace requests per host (550ms minimum gap)
             val lastReq = hostLastRequest[host] ?: 0L
             val elapsed = System.currentTimeMillis() - lastReq
             if (elapsed in 0..549) {
@@ -200,12 +196,11 @@ abstract class MangaManhwaProvider : MainAPI() {
             runCatching {
                 var res = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders(absolute))
                 var doc = res.document
-                log("✅ Fetched HTML: $absolute (Code: ${res.code})")
+                log("✅ Fetched HTML: $absolute (Code:${res.code})")
 
                 if (res.code == 404) return@runCatching null
 
                 if (res.code == 429) {
-                    // Activate 8-second circuit breaker for this host so other tabs don't spam OkHttp retries
                     hostCooldownUntil[host] = System.currentTimeMillis() + 8_000L
                     log("🛡️ HTTP 429 on $host. Invoking WebView CFSolver to bypass TLS/rate limit...")
                     if (requiresCf && CFSolver(absolute).solve()) {
@@ -217,18 +212,16 @@ abstract class MangaManhwaProvider : MainAPI() {
                 if (requiresCf && isCfChallenge(res.code, doc)) {
                     log("🛡️ CF/JS challenge detected (code=${res.code}, title='${doc.title()}'). Invoking CFSolver...")
                     if (CFSolver(absolute).solve()) {
-                        // 1. Prefer the rendered DOM captured directly from the WebView
-                        checkAndCacheSolvedHtml()?.let { 
+                        checkAndCacheSolvedHtml()?.let {
                             log("✅ Loaded HTML directly from WebView CF solve: $absolute")
-                            return@runCatching it 
+                            return@runCatching it
                         }
-                        
-                        // 2. Otherwise re-fetch once with updated cookies/UA
+
                         delay(400L)
                         hostLastRequest[host] = System.currentTimeMillis()
                         res = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders(absolute))
                         doc = res.document
-                        log("✅ Re-fetched HTML after CF solve: $absolute (Code: ${res.code})")
+                        log("✅ Re-fetched HTML after CF solve: $absolute (Code:${res.code})")
                     }
                 }
 
@@ -239,7 +232,7 @@ abstract class MangaManhwaProvider : MainAPI() {
             }.onFailure {
                 val msg = it.message ?: ""
                 if (msg.contains("SSL", true) || msg.contains("TLS", true)) log("❌ fetch skipped (TLS): $absolute")
-                else logErr("❌ fetch failed $absolute: $msg", it)
+                else logErr("❌ fetch failed $absolute:$msg", it)
             }.getOrNull()
         }
     }
@@ -261,8 +254,37 @@ abstract class MangaManhwaProvider : MainAPI() {
                 data = data
             ).document
         }.onFailure {
-            logErr("❌ POST failed $absolute: ${it.message}", it)
+            logErr("❌ POST failed $absolute:${it.message}", it)
         }.getOrNull()
+    }
+
+    /**
+     * Centralized helper for detecting the next page of chapters on paginated series pages.
+     * Supports both explicit "Next" buttons and numbered pager buttons (?page=2, /page/2/).
+     */
+    protected fun findNextChapterPageUrl(doc: Document, currentUrl: String, nextPage: Int): String? {
+        val explicitNext = doc.selectFirst(
+            "div.pagination a.next, ul.pagination li.next a, .hpage a.r, " +
+            "a.next.page-numbers, a[rel='next'], a.next-page, " +
+            "nav[aria-label*='pagination' i] a:containsOwn(Next), " +
+            "div[class*='pagination' i] a:containsOwn(Next)"
+        )?.attr("href")?.trim()
+
+        val numberedNext = if (explicitNext.isNullOrBlank()) {
+            doc.select("a[href*='page=$nextPage'], a[href*='page/$nextPage'], a[href*='chapter_page=$nextPage']")
+                .firstOrNull { a ->
+                    val t = a.text().trim()
+                    t == "$nextPage" || t.equals("Next", true) || t == "›" || t == "»"
+                }?.attr("href")?.trim()
+        } else null
+
+        val candidate = (explicitNext ?: numberedNext)?.takeIf { it.isNotBlank() && it != "#" && !it.startsWith("javascript:", true) }
+            ?: return null
+
+        val fullNext = abs(candidate)
+        if (fullNext == currentUrl) return null
+        if (Regex("""/(?:chapter|ch)[/\-_]?\d+""", RegexOption.IGNORE_CASE).containsMatchIn(fullNext)) return null
+        return fullNext
     }
 
     protected fun abs(url: String): String =
@@ -427,7 +449,6 @@ open class ThemeBasedProvider(
 
     private fun formatPagePath(pathTemplate: String, page: Int): String {
         val raw = pathTemplate.replace("{page}", "$page")
-        // Collapse /page/1/ to / on page 1 so WordPress doesn't issue 301 canonical redirects
         return if (page == 1) {
             raw.replace("/page/1/", "/").replace("&paged=1", "")
         } else {
@@ -442,7 +463,6 @@ open class ThemeBasedProvider(
         val doc = fetch(path)
         var items = doc?.let(::parseList) ?: emptyList()
 
-        // If sub-route 404s (e.g. MangaBat / MangaKakalot) on page 1, fall back to cached root homepage "/"
         if (items.isEmpty() && page == 1) {
             val homeDoc = fetch("/") ?: return emptyList()
             val allHomeItems = parseList(homeDoc)
@@ -473,8 +493,31 @@ open class ThemeBasedProvider(
 
     override suspend fun chapters(mangaUrl: String): List<Episode> {
         ensureUrlResolved()
-        val doc = fetch(mangaUrl) ?: return emptyList()
-        return resolveChapters(mangaUrl, doc)
+        val allEpisodes = mutableListOf<Episode>()
+        val seenUrls = mutableSetOf<String>()
+        var currentUrl = abs(mangaUrl)
+        var pageNum = 1
+
+        while (currentUrl.isNotBlank() && pageNum <= 25) {
+            val doc = fetch(currentUrl) ?: break
+            val pageEps = resolveChapters(currentUrl, doc)
+            if (pageEps.isEmpty()) break
+
+            var addedCount = 0
+            pageEps.forEach { ep ->
+                if (seenUrls.add(ep.data)) {
+                    allEpisodes.add(ep)
+                    addedCount++
+                }
+            }
+            if (addedCount == 0) break
+
+            val nextUrl = findNextChapterPageUrl(doc, currentUrl, pageNum + 1) ?: break
+            currentUrl = nextUrl
+            pageNum++
+        }
+
+        return if (config.newestFirst) allEpisodes.reversed() else allEpisodes
     }
 
     override suspend fun pages(chapterUrl: String): List<String> {
@@ -488,7 +531,7 @@ open class ThemeBasedProvider(
     override suspend fun load(url: String): LoadResponse? {
         ensureUrlResolved()
         val doc = fetch(url) ?: return null
-        val episodes = resolveChapters(url, doc)
+        val episodes = chapters(url)
         val titleEl = doc.selectFirst(".post-title h1, .entry-title, .story-info-right h1, h1:not(.sr-only)")
         val title = cleanTitleElement(titleEl) ?: titleFromSlug(url)
         val poster = doc.selectFirst(config.posterSelector)?.let(::extractImg)?.let(::abs)
@@ -521,7 +564,6 @@ open class ThemeBasedProvider(
 
         if (items.isNotEmpty()) return items
 
-        // Universal Series Card Fallback (handles MangaBat, MangaKakalot, and custom Madara/MangaThemesia child themes)
         val fallbackSeriesRegex = Regex("""/(?:manga|series|serie|comic|comics|story|read-)[/-][^/"'#?]+""", RegexOption.IGNORE_CASE)
         val universalItems = mutableListOf<SearchResponse>()
 
@@ -603,8 +645,8 @@ open class ThemeBasedProvider(
 
     private fun parseChapters(doc: Document): List<Episode> {
         val combinedSelector = "${config.chapterSelector}, a[href*='chapter-'], a[href*='/chapter/'], a[href*='/chap-']"
-        
-        val eps = doc.select(combinedSelector).mapNotNull { a ->
+
+        return doc.select(combinedSelector).mapNotNull { a ->
             val href = a.attr("href").trim()
             if (href.isBlank() || href == "#" || href.startsWith("javascript:", true)) return@mapNotNull null
 
@@ -615,8 +657,6 @@ open class ThemeBasedProvider(
             val chapName = a.text().trim().takeIf { it.isNotBlank() } ?: return@mapNotNull null
             newEpisode(abs(href)) { this.name = chapName }
         }.distinctBy { it.data }
-
-        return if (config.newestFirst) eps.reversed() else eps
     }
 }
 
@@ -683,4 +723,3 @@ object Themes {
         plotSelector = "#noidungm, #panel-story-info-description, .entry-content p"
     )
 }
-
