@@ -85,11 +85,18 @@ class ReaderDialog : DialogFragment() {
             "spotxchange.com", "tremorhub.com", "radioonlinehd.com",
             "cleverwebserver.com", "adsboosters.xyz", "dinomysstorm.com",
             "aqle3.com", "pubadx.one", "perfops.net", "gcorelabs.com",
-            "qcloudcdn.com", "anyanalytics.org", "cdn.orange.com"
+            "qcloudcdn.com", "anyanalytics.org", "cdn.orange.com",
+            "paypal.com", "paypalobjects.com", "paypal.me",
+            "ko-fi.com", "buymeacoffee.com", "patreon.com"
         )
 
         private val BLOCKED_URL_FRAGMENTS: List<String> = listOf(
-            "paypal.com/xoplatform/logger",
+            "paypal.com",
+            "paypalobjects.com",
+            "paypal.me",
+            "ko-fi.com",
+            "buymeacoffee.com",
+            "patreon.com",
             "culinar9sync.com",
             "smartfloralab.com",
             "exacdn.com",
@@ -120,7 +127,7 @@ class ReaderDialog : DialogFragment() {
         )
 
         private val COMIX_IMAGE_CDN_REGEX = Regex(
-            """^https?://\d+\.[a-z0-9-]+\.site/hi/[A-Za-z0-9_-]+""",
+            """^https?://[0-9]+\.[a-z0-9-]+\.site/hi/[A-Za-z0-9_-]+""",
             RegexOption.IGNORE_CASE
         )
 
@@ -247,7 +254,7 @@ class ReaderDialog : DialogFragment() {
                 ByteArrayInputStream("/* blocked */".toByteArray(Charsets.UTF_8))
             )
             lower.endsWith(".gif") || lower.endsWith(".png") || lower.endsWith(".jpg") ||
-            lower.endsWith(".jpeg") || lower.endsWith(".webp") -> WebResourceResponse(
+            lower.endsWith(".jpeg") || lower.endsWith(".webp") || lower.endsWith(".svg") -> WebResourceResponse(
                 "image/gif",
                 null,
                 200,
@@ -267,7 +274,7 @@ class ReaderDialog : DialogFragment() {
     }
 
     internal fun extractSlug(url: String): String {
-        val match = Regex("/(?:comic|comics|title|series|serie|manga)/([^/?#]+)").find(url)
+        val match = Regex("""/(?:comic|comics|title|series|serie|manga)/([^/?#]+)""").find(url)
         val slugRaw = match?.groupValues?.get(1) ?: return ""
         return slugRaw.substringBefore("-chapter-").trimEnd('-')
     }
@@ -276,7 +283,7 @@ class ReaderDialog : DialogFragment() {
         if (url.isBlank() || !url.startsWith("http")) return
         val slug = extractSlug(url)
         if (slug.isBlank()) return
-        val numStr = Regex("(?:chapter|ch)[-/]?(\\d+(?:\\.\\d+)?)", RegexOption.IGNORE_CASE)
+        val numStr = Regex("""(?:chapter|ch)[-/]?([0-9]+(?:\.[0-9]+)?)""", RegexOption.IGNORE_CASE)
             .find(url)?.groupValues?.get(1) ?: return
         ComixProvider.cacheChapterUrl(context, slug, numStr, url)
     }
@@ -531,7 +538,7 @@ class ReaderDialog : DialogFragment() {
                         pendingScrollRestore = loadSavedScroll(url)
                     }
 
-                    val numStr = Regex("(?:chapter|ch)[-/]?([\\d.]+)", RegexOption.IGNORE_CASE)
+                    val numStr = Regex("""(?:chapter|ch)[-/]?([0-9.]+)""", RegexOption.IGNORE_CASE)
                         .find(url)?.groupValues?.get(1)
                     if (numStr != null) {
                         currentChapterUrl = url
@@ -720,7 +727,7 @@ class ReaderDialog : DialogFragment() {
                 s.innerHTML =
                   ':root { --rpage-max-w: ' + z + '% !important; }' +
                   '.rpage-main, .rpage-main--long-strip { overflow-x: auto !important; }' +
-                  'img:not([data-mm-ad="1"]):not([src*="600x300"]):not([src*="compr.gif"]), .rpage-page__img, canvas.rpage-page__img, canvas { max-width: 100% !important; width: 100% !important; height: auto !important; display: block !important; margin: 0 auto !important; }' +
+                  'img:not([data-mm-ad="1"]):not([src*="600x300"]):not([src*="compr.gif"]):not([src*="paypal"]), .rpage-page__img, canvas.rpage-page__img, canvas { max-width: 100% !important; width: 100% !important; height: auto !important; display: block !important; margin: 0 auto !important; }' +
                   ':is(.rpage-main__inner, .rpage-view, .rpage-view--pages, .reading-content, .read-container, #readerarea, ' +
                   '.viewer, .chapter-content, .manga-reading, #chapter-content, .comic-images-wrapper, .container-chapter-reader) ' +
                   '{ width: ' + z + '% !important; max-width: ' + z + '% !important; margin: 0 auto !important; transition: width .15s ease-out, max-width .15s ease-out !important; }' +
@@ -831,7 +838,7 @@ class ReaderDialog : DialogFragment() {
             return
         }
 
-        if (Regex("""/series/\d+/[0-9a-f]{8,}""", RegexOption.IGNORE_CASE).containsMatchIn(currentChapterUrl)) {
+        if (Regex("""/series/[0-9]+/[0-9a-f]{8,}""", RegexOption.IGNORE_CASE).containsMatchIn(currentChapterUrl)) {
             return
         }
 
@@ -978,12 +985,29 @@ class ReaderDialog : DialogFragment() {
                       [class*="Dock-module__"],
                       iframe[src*="radioonlinehd"],
                       iframe[src*="flamesradio"],
+                      iframe[src*="paypal"],
                       img[src*="600x300"],
                       img[src*="compr.gif"],
+                      img[src*="paypal"],
+                      a[href*="paypal.com"],
+                      a[href*="paypal.me"],
+                      a[href*="ko-fi.com"],
+                      a[href*="patreon.com"],
+                      a[href*="buymeacoffee.com"],
+                      [class*="paypal" i], [id*="paypal" i],
+                      [class*="donate" i], [id*="donate" i],
+                      [class*="support-us" i], [id*="support-us" i],
+                      [class*="kofi" i], [id*="kofi" i],
+                      [class*="buymeacoffee" i], [id*="buymeacoffee" i],
+                      .go-to-top, #go-top, .back-to-top, #back-to-top,
+                      .scroll-to-top, #scroll-to-top, .scrollToTop, a.to-top,
+                      [class*="back-to-top" i], [class*="go-to-top" i], [class*="scroll-to-top" i],
                       a:has(> img[src*="600x300"]),
                       a:has(> img[src*="compr.gif"]),
+                      a:has(> img[src*="paypal"]),
                       div:has(> a > img[src*="600x300"]),
-                      div:has(> a > img[src*="compr.gif"]) {
+                      div:has(> a > img[src*="compr.gif"]),
+                      div:has(> a[href*="paypal"]) {
                         display: none !important;
                         pointer-events: none !important;
                         height: 0 !important;
@@ -1141,6 +1165,7 @@ class ReaderDialog : DialogFragment() {
                                '[id^="ads-"], [id*=" ads-"], [id*="-ads-"], [id~="ads"], ' +
                                '[class*="advert"], [id*="advert"], ' +
                                '[class*="sponsor"], [id*="sponsor"], ' +
+                               '[class*="paypal" i], [id*="paypal" i], [class*="donate" i], [id*="donate" i], [class*="support-us" i], [id*="support-us" i], ' +
                                '[class^="promo-"], [class*=" promo-"], [class*="-promo-"], [class$="-promo"], [class~="promo"], ' +
                                '[class*="adsense"], [class*="adsbygoogle"], [id*="google_ads"], ' +
                                '[class*="Panel-module__"], [class*="Dock-module__"], ' +
@@ -1174,7 +1199,7 @@ class ReaderDialog : DialogFragment() {
                   function isBannerAdImage(img) {
                     if (!img || img.tagName !== 'IMG') return false;
                     var src = (img.currentSrc || img.src || img.getAttribute('data-src') || '').toLowerCase();
-                    if (src.indexOf('600x300') >= 0 || src.indexOf('compr.gif') >= 0) return true;
+                    if (src.indexOf('600x300') >= 0 || src.indexOf('compr.gif') >= 0 || src.indexOf('paypal') >= 0) return true;
                     var cls = (img.className && img.className.toString ? img.className.toString() : '');
                     if (cls.indexOf('Panel-module__') >= 0 || cls.indexOf('Dock-module__') >= 0) return true;
                     if (isOmega && cls.toLowerCase().indexOf('max-w-[600px]') >= 0) return true;
@@ -1278,8 +1303,7 @@ class ReaderDialog : DialogFragment() {
                   }
 
                   function nukeEl(el) {
-                    if (!el || !el.style) return;
-                    // Never nuke the reader container itself (e.g. div.read-container on Toonily/Madara)
+                    if (!el || !el.style || el.id === 'mm-tap-flash') return;
                     if (isReaderWrapperOrContainsReader(el)) return;
                     try {
                       el.setAttribute('data-mm-ad', '1');
@@ -1293,7 +1317,7 @@ class ReaderDialog : DialogFragment() {
                     } catch(e) {}
                   }
 
-                  function killOmegaScansBanners() {
+                  function killFloatingAndBannerAds() {
                     try {
                       if (isOmega) {
                         var asides = document.querySelectorAll('aside, [class*="z-[2147483647]"]');
@@ -1310,17 +1334,54 @@ class ReaderDialog : DialogFragment() {
                           nukeEl(flameAds[f]);
                         }
                       }
-                      if (isOmega || isFlame) {
-                        var bannerImgs = document.querySelectorAll('img[src*="600x300"], img[src*="compr.gif"], img[class*="max-w-[600px]"], img[class*="Panel-module__"]');
-                        for (var b = 0; b < bannerImgs.length; b++) {
-                          var bImg = bannerImgs[b];
-                          nukeEl(bImg);
-                          var pA = bImg.closest('a');
-                          if (pA) {
-                            nukeEl(pA);
-                            var pDiv = pA.parentElement;
-                            if (pDiv && pDiv.tagName === 'DIV' && pDiv.children.length === 1) {
-                              nukeEl(pDiv);
+                      var bannerImgs = document.querySelectorAll('img[src*="600x300"], img[src*="compr.gif"], img[src*="paypal"], img[class*="max-w-[600px]"], img[class*="Panel-module__"]');
+                      for (var b = 0; b < bannerImgs.length; b++) {
+                        var bImg = bannerImgs[b];
+                        nukeEl(bImg);
+                        var pA = bImg.closest('a');
+                        if (pA) {
+                          nukeEl(pA);
+                          var pDiv = pA.parentElement;
+                          if (pDiv && pDiv.tagName === 'DIV' && pDiv.children.length <= 2) {
+                            nukeEl(pDiv);
+                          }
+                        }
+                      }
+
+                      // Nuke floating "SUPPORT US" / PayPal / Ko-fi / Donate pills & back-to-top buttons across all sites
+                      var floatSelectors = 'a[href*="paypal."], a[href*="ko-fi."], a[href*="patreon."], a[href*="buymeacoffee."], ' +
+                                           '[class*="paypal" i], [id*="paypal" i], [class*="donate" i], [id*="donate" i], ' +
+                                           '[class*="support-us" i], [id*="support-us" i], [class*="kofi" i], [id*="kofi" i], ' +
+                                           '.go-to-top, #go-top, .back-to-top, #back-to-top, .scroll-to-top, #scroll-to-top, .scrollToTop, a.to-top';
+                      var floatNodes = document.querySelectorAll(floatSelectors);
+                      for (var fn = 0; fn < floatNodes.length; fn++) {
+                        var node = floatNodes[fn];
+                        nukeEl(node);
+                        var fixedParent = node.parentElement;
+                        for (var up = 0; up < 3 && fixedParent && fixedParent !== document.body; up++) {
+                          var pcs = window.getComputedStyle(fixedParent);
+                          if (pcs && (pcs.position === 'fixed' || pcs.position === 'sticky')) {
+                            nukeEl(fixedParent);
+                            break;
+                          }
+                          fixedParent = fixedParent.parentElement;
+                        }
+                      }
+
+                      // Catch unlabeled fixed/sticky "SUPPORT US" or "DONATE" pills by text content
+                      var clickables = document.querySelectorAll('a, button, div');
+                      for (var c = 0; c < clickables.length; c++) {
+                        var el = clickables[c];
+                        if (el.id === 'mm-tap-flash' || el.getAttribute('data-mm-ad') === '1') continue;
+                        var txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+                        if (txt === 'support us' || txt === 'donate' || txt === 'support' || txt === 'buy me a coffee') {
+                          var cs = window.getComputedStyle(el);
+                          if (cs && (cs.position === 'fixed' || cs.position === 'sticky')) {
+                            nukeEl(el);
+                          } else if (el.parentElement) {
+                            var pcs2 = window.getComputedStyle(el.parentElement);
+                            if (pcs2 && (pcs2.position === 'fixed' || pcs2.position === 'sticky')) {
+                              nukeEl(el.parentElement);
                             }
                           }
                         }
@@ -1329,13 +1390,13 @@ class ReaderDialog : DialogFragment() {
                   }
 
                   function hideEl(el) {
-                    if (!el || !el.style) return;
+                    if (!el || !el.style || el.id === 'mm-tap-flash') return;
                     if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.tagName === 'LINK') return;
                     if (isEssentialNavOrModal(el) || isOrContainsUnloadedPage(el)) return;
-                    var cs;
-                    try { cs = getComputedStyle(el); } catch(e) { cs = null; }
-                    if (cs && (cs.position === 'fixed' || cs.position === 'sticky') && el.tagName !== 'ASIDE') return;
-                    try { el.style.setProperty('display', 'none', 'important'); } catch(e) {}
+                    try {
+                      el.setAttribute('data-mm-ad', '1');
+                      el.style.setProperty('display', 'none', 'important');
+                    } catch(e) {}
                   }
 
                   function collapseBottomSpacing(startEl) {
@@ -1356,7 +1417,7 @@ class ReaderDialog : DialogFragment() {
 
                   window.__mmTruncateBottom = function() {
                     try {
-                      killOmegaScansBanners();
+                      killFloatingAndBannerAds();
                       cacheNavLinks();
                       var last = findLastContentPage();
                       if (!last) return;
@@ -1419,7 +1480,7 @@ class ReaderDialog : DialogFragment() {
                     if (window.MutationObserver) {
                       var moTimer = null;
                       var mo = new MutationObserver(function() {
-                        if (isOmega || isFlame) killOmegaScansBanners();
+                        killFloatingAndBannerAds();
                         if (moTimer) clearTimeout(moTimer);
                         moTimer = setTimeout(function() {
                           moTimer = null;
@@ -1443,7 +1504,7 @@ class ReaderDialog : DialogFragment() {
                   if (!window.__mmAdInterval) {
                     window.__mmAdInterval = setInterval(function() {
                       try {
-                        killOmegaScansBanners();
+                        killFloatingAndBannerAds();
                         var ads = document.querySelectorAll(
                           '.ai-top-bar, [class^="ai-top-bar"], ' +
                           '[class*="Panel-module__"], [class*="Dock-module__"], ' +
@@ -1695,7 +1756,7 @@ class ReaderDialog : DialogFragment() {
 
         val slug = extractSlug(url)
         val hasExplicitChapterInUrl = Regex(
-            """(?:(?:chapter|ch)[-/]?(\d+(?:\.\d+)?)|/series/\d+/[0-9a-f]{8,})""",
+            """(?:(?:chapter|ch)[-/]?([0-9]+(?:\.[0-9]+)?)|/series/[0-9]+/[0-9a-f]{8,})""",
             RegexOption.IGNORE_CASE
         ).containsMatchIn(url)
 
@@ -1739,7 +1800,7 @@ class ReaderDialog : DialogFragment() {
             recordDiscoveredChapterUrl(detectedUrl)
         }
 
-        val m = Regex("(?:chapter|ch)[-/]?(\\d+(\\.\\d+)?)", RegexOption.IGNORE_CASE).find(detectedUrl)
+        val m = Regex("""(?:chapter|ch)[-/]?([0-9]+(\.[0-9]+)?)""", RegexOption.IGNORE_CASE).find(detectedUrl)
         if (m != null) {
             val num = m.groupValues[1]
             currentChapterName = if (num == "0") "Prologue" else "Ch. $num"
