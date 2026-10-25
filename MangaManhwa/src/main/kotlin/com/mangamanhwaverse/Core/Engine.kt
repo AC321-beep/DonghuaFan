@@ -73,7 +73,7 @@ abstract class MangaManhwaProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        log("⬇️ getMainPage: ${request.name} \vert{} Page$page")
+        log("⬇️ getMainPage: ${request.name} | Page $page")
         val items = runCatching {
             when (request.data) {
                 "popular" -> popular(page)
@@ -87,7 +87,7 @@ abstract class MangaManhwaProvider : MainAPI() {
             }
         }.onFailure { logErr("❌ getMainPage failed", it) }.getOrDefault(emptyList())
 
-        log("✅ getMainPage: Found ${items.size} items for${request.name}")
+        log("✅ getMainPage: Found ${items.size} items for ${request.name}")
         if (items.isEmpty()) return null
 
         return newHomePageResponse(
@@ -124,7 +124,7 @@ abstract class MangaManhwaProvider : MainAPI() {
         if (activity.isFinishing || activity.isDestroyed) return false
 
         log("⬇️ loadLinks: $data")
-        val chapterNumRaw = Regex("(?:chapter|ch)[/\\-_\\s#]*([\\d.]+)", RegexOption.IGNORE_CASE)
+        val chapterNumRaw = Regex("""(?:chapter|ch)[/_ #-]*([0-9.]+)""", RegexOption.IGNORE_CASE)
             .find(data)?.groupValues?.get(1)?.toDoubleOrNull()
         val chapterNum = chapterNumRaw?.toInt() ?: 0
         val chapterName = when {
@@ -196,7 +196,7 @@ abstract class MangaManhwaProvider : MainAPI() {
             runCatching {
                 var res = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders(absolute))
                 var doc = res.document
-                log("✅ Fetched HTML: $absolute (Code:${res.code})")
+                log("✅ Fetched HTML: $absolute (Code: ${res.code})")
 
                 if (res.code == 404) return@runCatching null
 
@@ -221,7 +221,7 @@ abstract class MangaManhwaProvider : MainAPI() {
                         hostLastRequest[host] = System.currentTimeMillis()
                         res = app.get(absolute, interceptor = unifiedInterceptor, referer = referer, headers = browserHeaders(absolute))
                         doc = res.document
-                        log("✅ Re-fetched HTML after CF solve: $absolute (Code:${res.code})")
+                        log("✅ Re-fetched HTML after CF solve: $absolute (Code: ${res.code})")
                     }
                 }
 
@@ -232,7 +232,7 @@ abstract class MangaManhwaProvider : MainAPI() {
             }.onFailure {
                 val msg = it.message ?: ""
                 if (msg.contains("SSL", true) || msg.contains("TLS", true)) log("❌ fetch skipped (TLS): $absolute")
-                else logErr("❌ fetch failed $absolute:$msg", it)
+                else logErr("❌ fetch failed $absolute: $msg", it)
             }.getOrNull()
         }
     }
@@ -254,14 +254,10 @@ abstract class MangaManhwaProvider : MainAPI() {
                 data = data
             ).document
         }.onFailure {
-            logErr("❌ POST failed $absolute:${it.message}", it)
+            logErr("❌ POST failed $absolute: ${it.message}", it)
         }.getOrNull()
     }
 
-    /**
-     * Centralized helper for detecting the next page of chapters on paginated series pages.
-     * Supports both explicit "Next" buttons and numbered pager buttons (?page=2, /page/2/).
-     */
     protected fun findNextChapterPageUrl(doc: Document, currentUrl: String, nextPage: Int): String? {
         val explicitNext = doc.selectFirst(
             "div.pagination a.next, ul.pagination li.next a, .hpage a.r, " +
@@ -283,7 +279,7 @@ abstract class MangaManhwaProvider : MainAPI() {
 
         val fullNext = abs(candidate)
         if (fullNext == currentUrl) return null
-        if (Regex("""/(?:chapter|ch)[/\-_]?\d+""", RegexOption.IGNORE_CASE).containsMatchIn(fullNext)) return null
+        if (Regex("""/(?:chapter|ch)[/_-]?[0-9]+""", RegexOption.IGNORE_CASE).containsMatchIn(fullNext)) return null
         return fullNext
     }
 
@@ -354,8 +350,8 @@ abstract class MangaManhwaProvider : MainAPI() {
         url.contains("/large/") -> url.replace("/large/", "/small/")
         url.contains("/big/") -> url.replace("/big/", "/small/")
         url.contains("/orig/") -> url.replace("/orig/", "/medium/")
-        url.contains("?w=") -> url.replace(Regex("""[?&]w=\d+"""), "?w=800")
-        url.contains("&width=") -> url.replace(Regex("""&width=\d+"""), "&width=800")
+        url.contains("?w=") -> url.replace(Regex("""[?&]w=[0-9]+"""), "?w=800")
+        url.contains("&width=") -> url.replace(Regex("""&width=[0-9]+"""), "&width=800")
         else -> url
     }
 
@@ -570,7 +566,7 @@ open class ThemeBasedProvider(
         doc.select("a[href]").forEach { a ->
             val href = a.attr("href").trim()
             if (!fallbackSeriesRegex.containsMatchIn(href)) return@forEach
-            if (Regex("""(?:chapter|ch)[/\-_]?\d+""", RegexOption.IGNORE_CASE).containsMatchIn(href)) return@forEach
+            if (Regex("""(?:chapter|ch)[/_-]?[0-9]+""", RegexOption.IGNORE_CASE).containsMatchIn(href)) return@forEach
 
             val card = a.parent()?.parent() ?: a.parent() ?: a
             val imgEl = a.selectFirst("img") ?: a.parent()?.selectFirst("img") ?: card.selectFirst("img") ?: return@forEach
@@ -639,8 +635,8 @@ open class ThemeBasedProvider(
             ?: doc.selectFirst("[data-post-id]")?.attr("data-post-id")?.takeIf { it.isNotBlank() }
             ?: doc.selectFirst("input.rating-post-id, input[name=manga]")?.attr("value")?.takeIf { it.isNotBlank() }
             ?: doc.selectFirst("a.wp-manga-action-button[data-post]")?.attr("data-post")?.takeIf { it.isNotBlank() }
-            ?: Regex("""postid-(\d+)""").find(doc.body()?.className() ?: "")?.groupValues?.get(1)
-            ?: Regex(""""manga_id"\s*:\s*"?(\d+)"?""").find(doc.html())?.groupValues?.get(1)
+            ?: Regex("""postid-([0-9]+)""").find(doc.body()?.className() ?: "")?.groupValues?.get(1)
+            ?: Regex(""""manga_id"[ ]*:[ ]*"?([0-9]+)"?""").find(doc.html())?.groupValues?.get(1)
     }
 
     private fun parseChapters(doc: Document): List<Episode> {
