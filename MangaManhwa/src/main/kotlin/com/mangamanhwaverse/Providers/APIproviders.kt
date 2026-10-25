@@ -170,6 +170,9 @@ open class NextGenWebProvider(
     }
 
     protected open fun parseSeriesCards(doc: Document, mode: String = "popular", page: Int = 1): List<SearchResponse> {
+        // DETECT ASURA/HIVE CATALOG: If the URL has ?page= or ?order=, the server already sorted it.
+        val isCatalogPage = doc.baseUri().contains("page=") || doc.baseUri().contains("order=") || doc.baseUri().contains("status=") || doc.baseUri().contains("search=") || doc.baseUri().contains("searchTerm=")
+
         // 1. Next.js JSON Extraction (Flame Comics local sorting)
         val nextData = doc.selectFirst("script#__NEXT_DATA__")?.data()
         if (!nextData.isNullOrBlank() && nextData.contains("\"series_id\"")) {
@@ -209,28 +212,40 @@ open class NextGenWebProvider(
 
             if (entries.isNotEmpty()) {
                 val distinctEntries = entries.distinctBy { it.id }
-                val sorted = when (mode) {
-                    "popular" -> distinctEntries.sortedByDescending { it.views }
-                    "new" -> distinctEntries.sortedByDescending { it.id }
-                    "completed" -> distinctEntries.filter {
-                        it.status.equals("Completed", true) || it.status.equals("Dropped", true)
-                    }.ifEmpty { distinctEntries.sortedBy { it.id } }
-                    "trending" -> distinctEntries
-                        .filter { !it.status.equals("Dropped", true) }
-                        .sortedByDescending { (it.views / (it.id.coerceAtLeast(1))) }
-                        .let { list -> if (list.take(10) == distinctEntries.sortedByDescending { it.views }.take(10)) list.shuffled(Random(page)) else list }
-                    else -> if (distinctEntries.any { it.lastEdit > 0L }) {
-                        distinctEntries.sortedByDescending { it.lastEdit }
-                    } else {
-                        distinctEntries
+                
+                // FLAME HACK: If the provider dumped 300+ items, we must paginate and sort it locally.
+                if (distinctEntries.size > 60) {
+                    val sorted = when (mode) {
+                        "popular" -> distinctEntries.sortedByDescending { it.views }
+                        "new" -> distinctEntries.sortedByDescending { it.id }
+                        "completed" -> distinctEntries.filter {
+                            it.status.equals("Completed", true) || it.status.equals("Dropped", true)
+                        }.ifEmpty { distinctEntries.sortedBy { it.id } }
+                        "trending" -> distinctEntries
+                            .filter { !it.status.equals("Dropped", true) }
+                            .sortedByDescending { (it.views / (it.id.coerceAtLeast(1))) }
+                            .let { list -> if (list.take(10) == distinctEntries.sortedByDescending { it.views }.take(10)) list.shuffled(Random(page)) else list }
+                        else -> if (distinctEntries.any { it.lastEdit > 0L }) {
+                            distinctEntries.sortedByDescending { it.lastEdit }
+                        } else {
+                            distinctEntries
+                        }
                     }
-                }
 
-                val pageSize = 30
-                val paged = if (mode == "search") sorted else sorted.drop((page - 1) * pageSize).take(pageSize)
-                return paged.map { e ->
-                    newAnimeSearchResponse(e.title, abs("/series/${e.id}"), TvType.Anime).apply {
-                        if (e.cover.isNotBlank()) posterUrl = e.cover
+                    val pageSize = 30
+                    val paged = if (mode == "search") sorted else sorted.drop((page - 1) * pageSize).take(pageSize)
+                    return paged.map { e ->
+                        newAnimeSearchResponse(e.title, abs("/series/${e.id}"), TvType.Anime).apply {
+                            if (e.cover.isNotBlank()) posterUrl = e.cover
+                        }
+                    }
+                } else {
+                    // SERVER PAGINATED: Trust the server's subset of items exactly as they are.
+                    return distinctEntries.map { e ->
+                        val route = if (doc.baseUri().contains("/comics")) "/comics" else "/series"
+                        newAnimeSearchResponse(e.title, abs("$route/${e.id}"), TvType.Anime).apply {
+                            if (e.cover.isNotBlank()) posterUrl = e.cover
+                        }
                     }
                 }
             }
@@ -296,8 +311,14 @@ open class NextGenWebProvider(
         val mainGrid = allCards.filter { !it.isInSidebarOrSlider }.ifEmpty { allCards }
         val sidebarOrSlider = allCards.filter { it.isInSidebarOrSlider }
 
+        // ASURA / HIVE FIX: If the URL is a dedicated catalog page, the server ALREADY sorted it perfectly.
+        // We bypass the manual sorting so categories remain unique and page 2 doesn't scramble.
+        if (isCatalogPage || mode == "latest" || mode == "search") {
+            return mainGrid.map { it.response }.distinctBy { it.url }
+        }
+
+        // FLAME FALLBACK: Only manually sort if fetching from a raw root domain without query tags.
         val ordered = when (mode) {
-            "latest", "search" -> mainGrid
             "popular" -> {
                 if (sidebarOrSlider.size >= 5 && page == 1) {
                     (sidebarOrSlider + mainGrid.sortedByDescending { it.chapterCount }).distinctBy { it.response.url }
