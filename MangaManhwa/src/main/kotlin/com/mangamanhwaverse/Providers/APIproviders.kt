@@ -44,7 +44,8 @@ open class NextGenWebProvider(
     private val seriesPathRegex: Regex = Regex("""/(?:series|comics|manga|novel)/[^/"'#?]+""")
 ) : MangaManhwaProvider() {
 
-    override val baseUrl: String get() = mainUrl
+    override val baseUrl: String
+    get() = com.mangamanhwaverse.Settings.providerUrlOverride(name).takeIf { it.isNotBlank() } ?: mainUrl
     override val requiresCf: Boolean = true
 
     private data class ParsedCard(
