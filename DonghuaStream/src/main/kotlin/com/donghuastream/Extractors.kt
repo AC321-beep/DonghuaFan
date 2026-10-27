@@ -4,12 +4,11 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.utils.*          // ExtractorApi, newExtractorLink,
-                                                   // M3u8Helper, INFER_TYPE, Qualities…
+import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.withTimeoutOrNull
 
 /* ==========================================================================
- * Dailymotion (unchanged from previous fix — already correct)
+ * Dailymotion — www / geo / embed / dai.ly
  * ========================================================================== */
 class LMANIMEDailymotion : ExtractorApi() {
     override val name            = "LMANIME-Dailymotion"
@@ -124,8 +123,11 @@ class VidHideExtractor : ExtractorApi() {
 }
 
 /* ==========================================================================
- * Rumble — adapated from reference: strict/trailer passes, JSON-escaped
- * slashes, quality-from-preceding-JSON, HLS variants with timeout
+ * Rumble — reference-inspired:
+ *   • JSON-escape aware URL regex (\/ and /)
+ *   • strict pass → trailer fallback pass
+ *   • quality read from 150 bytes *preceding* each MP4 URL
+ *   • HLS variants via M3u8Helper with 2.5s timeout
  * ========================================================================== */
 class RumbleExtractor : ExtractorApi() {
     override val name            = "Rumble"
@@ -151,7 +153,6 @@ class RumbleExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ) {
-        // Fast path — already a direct media URL
         if (url.endsWith(".mp4", true) || url.endsWith(".m3u8", true)) {
             val type = if (url.endsWith(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
             callback(newExtractorLink(name, name, url, type) { this.referer = url })
@@ -159,29 +160,27 @@ class RumbleExtractor : ExtractorApi() {
         }
 
         val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-            try { app.get(url, referer = referer ?: mainUrl).text } catch (e: Exception) { null }
+            try { app.get(url, referer = referer ?: mainUrl).text } catch (_: Exception) { null }
         } ?: return
 
-        // Narrow to the useful block first (avoids huge regex scans)
         val afterMp4   = html.substringAfter("{\"mp4", "")
         val scriptData = if (afterMp4.isEmpty()) html else afterMp4.substringBefore("\"evt\":{")
 
         val seen    = LinkedHashSet<String>()
         var emitted = false
 
-        // ---------- PASS 1 — strict ----------
+        /* PASS 1 — strict */
         RE_VIDEO_URL.findAll(scriptData).forEach { match ->
             val clean = match.value.replace("\\/", "/")
             if (!clean.contains("rumble.com", true)) return@forEach
             if (JUNK_KEYWORDS.any { clean.contains(it, true) }) return@forEach
-
             if (seen.add(clean)) {
                 emitted = true
                 emitOne(clean, match, scriptData, url, name, callback)
             }
         }
 
-        // ---------- PASS 2 — trailer fallback ----------
+        /* PASS 2 — trailer fallback */
         if (!emitted) {
             RE_VIDEO_URL.findAll(scriptData).forEach { match ->
                 val clean = match.value.replace("\\/", "/")
@@ -215,8 +214,7 @@ class RumbleExtractor : ExtractorApi() {
             return
         }
 
-        // MP4 — pull quality from the ~150 bytes *before* the URL
-        val start = (match.range.first - 150).coerceAtLeast(0)
+        val start     = (match.range.first - 150).coerceAtLeast(0)
         val preceding = scriptData.substring(start, match.range.first)
         val qMatch = RE_QUALITY_H.findAll(preceding).lastOrNull()
             ?: RE_QUALITY_BRACE.findAll(preceding).lastOrNull()
@@ -224,9 +222,8 @@ class RumbleExtractor : ExtractorApi() {
         val label = if (qMatch != null) "$labelBase ${qMatch.groupValues[1]}p" else labelBase
 
         callback(
-            newExtractorLink(name, label, cleanUrl, INFER_TYPE) {
+            newExtractorLink(name, label, cleanUrl, ExtractorLinkType.VIDEO) {
                 this.referer = referer
-                // Leave quality Unknown — label already carries resolution
                 this.quality = Qualities.Unknown.value
             }
         )
@@ -234,7 +231,7 @@ class RumbleExtractor : ExtractorApi() {
 }
 
 /* ==========================================================================
- * OkRu — official JSON API, quality map, MP4→HLS→DASH cascade
+ * OkRu — official JSON API, quality map, MP4 → HLS → DASH cascade
  * ========================================================================== */
 class OkRuExtractor : ExtractorApi() {
     override val name            = "OkRu"
@@ -275,9 +272,9 @@ class OkRuExtractor : ExtractorApi() {
                 try { app.post(apiUrl).parsedSafe<OkRuResponse>() } catch (_: Exception) { null }
             } ?: return
 
-            // ---------- MP4 ----------
+            /* MP4 */
             json.videos?.forEach { video ->
-                val qName = video.name?.lowercase().orEmpty()
+                val qName  = video.name?.lowercase().orEmpty()
                 val vidUrl = video.url.orEmpty()
                 if (vidUrl.isBlank() || vidUrl.contains("usr_login")) return@forEach
 
@@ -289,7 +286,7 @@ class OkRuExtractor : ExtractorApi() {
                         name   = "$name MP4",
                         source = "$name $label",
                         url    = vidUrl.replace("\\u0026", "&").replace("\\/", "/"),
-                        type   = INFER_TYPE,
+                        type   = ExtractorLinkType.VIDEO,
                     ) {
                         this.referer = "https://ok.ru/"
                         this.quality = qVal
@@ -297,7 +294,7 @@ class OkRuExtractor : ExtractorApi() {
                 )
             }
 
-            // ---------- HLS (preferred over DASH) ----------
+            /* HLS */
             var hlsSucceeded = false
             val hlsUrl = json.hlsManifestUrl.orEmpty()
             if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
@@ -306,14 +303,13 @@ class OkRuExtractor : ExtractorApi() {
                     try { M3u8Helper.generateM3u8("$name HLS", clean, url) }
                     catch (_: Exception) { emptyList() }
                 } ?: emptyList()
-
                 if (links.isNotEmpty()) {
                     links.forEach(callback)
                     hlsSucceeded = true
                 }
             }
 
-            // ---------- DASH fallback ----------
+            /* DASH fallback */
             if (!hlsSucceeded) {
                 val dash = json.dashManifestUrl.orEmpty()
                 if (dash.isNotBlank() && !dash.contains("usr_login")) {
@@ -328,7 +324,7 @@ class OkRuExtractor : ExtractorApi() {
                 }
             }
         } catch (_: Exception) {
-            // swallow — extractor failures shouldn't crash loadLinks
+            // swallow
         }
     }
 
@@ -347,7 +343,7 @@ class OkRuExtractor : ExtractorApi() {
 }
 
 /* ==========================================================================
- * Mp4Upload (unchanged)
+ * Mp4Upload
  * ========================================================================== */
 class Mp4UploadExtractor : ExtractorApi() {
     override val name            = "Mp4Upload"
@@ -380,9 +376,7 @@ class Mp4UploadExtractor : ExtractorApi() {
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/* Dailymotion DTOs                                                           */
-/* -------------------------------------------------------------------------- */
+/* Dailymotion DTOs */
 data class DailymotionMeta(
     @JsonProperty("id")        val id: String? = null,
     @JsonProperty("title")     val title: String? = null,
