@@ -391,3 +391,4 @@ object Settings {
             android.util.Log.e("MangaManhwa/Settings", "Restart failed", e)
         }
     }
+}
