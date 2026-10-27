@@ -16,7 +16,9 @@ import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.CommonActivity
+import com.lagradost.cloudstream3.MainAPI
 import java.net.URI
 
 object Settings {
@@ -128,7 +130,7 @@ object Settings {
 
         fun refreshSummaryUi() {
             val enabledCount = enabledProviderNames().size
-            statusLabel.text = "Selected — $enabledCount of $totalCount"
+            statusLabel.text = "Selected — $enabledCount of$totalCount"
             isUpdatingMasterProgrammatically = true
             cbAllProviders.isChecked = (enabledCount == totalCount && totalCount > 0)
             isUpdatingMasterProgrammatically = false
@@ -197,12 +199,11 @@ object Settings {
         AlertDialog.Builder(context)
             .setTitle("MangaManhwa Settings")
             .setView(scroll)
-            .setPositiveButton("Save & Restart") { _, _ ->
+            .setPositiveButton("Apply") { _, _ ->
                 setDataSaver(cbDataSaver.isChecked)
                 setPreloadNext(cbPreload.isChecked)
                 setVerboseLog(cbVerbose.isChecked)
-                // Provider selections are already persisted in real time via setEnabledProviderNames / cbAllProviders
-                restartApp(context)
+                applyChanges(context)
             }
             .setNegativeButton("Close", null)
             .show()
@@ -261,11 +262,12 @@ object Settings {
             .setPositiveButton("Apply") { _, _ ->
                 val picked = boxes.filterValues { it.isChecked }.keys
                 setEnabledProviderNames(picked)
+                syncActiveProviders()
                 onApplied()
                 Toast.makeText(
                     context,
-                    "${picked.size} of ${names.size} enabled — click Save & Restart to apply",
-                    Toast.LENGTH_LONG
+                    "${picked.size} of${names.size} sources enabled",
+                    Toast.LENGTH_SHORT
                 ).show()
             }
             .setNegativeButton("Cancel", null)
@@ -374,21 +376,43 @@ object Settings {
             .show()
     }
 
-   private fun restartApp(context: Context) {
-        try {
-            val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
-            if (intent != null) {
-                val componentName = intent.component
-                val mainIntent = android.content.Intent.makeRestartActivityTask(componentName)
-                context.startActivity(mainIntent)
+    fun syncActiveProviders() {
+        runCatching {
+            val ourNames = ProviderRegistry.names.toSet()
+            val desiredProviders = ProviderRegistry.providers.filter { isProviderEnabled(it.name) }
+
+            synchronized(APIHolder.allProviders) {
+                APIHolder.allProviders.removeAll { it.name in ourNames }
+                APIHolder.allProviders.addAll(desiredProviders)
             }
-            
-            // Kill immediately. The OS will seamlessly recreate the process to handle the intent.
-            android.os.Process.killProcess(android.os.Process.myPid())
-            @Suppress("UNREACHABLE_CODE")
-            Runtime.getRuntime().exit(0)
-        } catch (e: Exception) {
-            android.util.Log.e("MangaManhwa/Settings", "Restart failed", e)
+
+            runCatching {
+                val apisField = APIHolder::class.java.getDeclaredField("apis").apply { isAccessible = true }
+                val currentApis = apisField.get(APIHolder)
+                if (currentApis is MutableList<*>) {
+                    @Suppress("UNCHECKED_CAST")
+                    val mutableApis = currentApis as MutableList<MainAPI>
+                    synchronized(mutableApis) {
+                        mutableApis.removeAll { it.name in ourNames }
+                        mutableApis.addAll(desiredProviders)
+                    }
+                } else if (currentApis is List<*>) {
+                    @Suppress("UNCHECKED_CAST")
+                    val updated = (currentApis as List<MainAPI>).filter { it.name !in ourNames } + desiredProviders
+                    apisField.set(APIHolder, updated)
+                }
+            }
         }
+    }
+
+    private fun applyChanges(context: Context) {
+        syncActiveProviders()
+        val activity = resolveAppCompatActivity(context)
+        if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
+            activity.runOnUiThread {
+                runCatching { activity.recreate() }
+            }
+        }
+        Toast.makeText(context, "Settings applied!", Toast.LENGTH_SHORT).show()
     }
 }
