@@ -9,11 +9,23 @@ class LMANIME : MainAPI() {
 
     override var mainUrl  = "https://lmanime.com"
     override var name     = "LMANIME"
-    override var lang     = "en"
+    override var lang     = "zh"
     override val hasMainPage        = true
     override val hasQuickSearch     = true
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
+
+    /* ─── Date regexes (adopted from reference DonghuaStream impl) ─── */
+    private val dateRegex = Regex(
+        """([a-zA-Z]{3,}\s+\d{1,2},\s+\d{4}|\d{1,2}\s+[a-zA-Z]{3,}\s+\d{4}|\d{4}-\d{2}-\d{2})"""
+    )
+    private val relativeDateRegex = Regex(
+        """(?i)\d+\s+(mins?|minutes?|hours?|days?|weeks?|months?|years?)\s+ago"""
+    )
+    /* Format hints for addDate() — matches the three absolute patterns */
+    private val fmtMonthDayYear = Regex("""^[A-Za-z]+\s+\d{1,2},\s+\d{4}$""")   // October 25, 2026
+    private val fmtDayMonthYear = Regex("""^\d{1,2}\s+[A-Za-z]+\s+\d{4}$""")     // 25 October 2026
+    private val fmtIsoDate      = Regex("""^\d{4}-\d{2}-\d{2}$""")               // 2026-10-25
 
     override val mainPage = mainPageOf(
         "latest"                                 to "Latest Release",
@@ -23,6 +35,9 @@ class LMANIME : MainAPI() {
         "upcoming/"                              to "Upcoming",
     )
 
+    /* ------------------------------------------------------------------ */
+    /* MAIN PAGE                                                          */
+    /* ------------------------------------------------------------------ */
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = when {
             request.data == "latest" ->
@@ -39,6 +54,9 @@ class LMANIME : MainAPI() {
         return newHomePageResponse(request.name, items)
     }
 
+    /* ------------------------------------------------------------------ */
+    /* CARD PARSER                                                        */
+    /* ------------------------------------------------------------------ */
     private fun Element.toSearchResult(): SearchResponse? {
         val anchor = selectFirst("a[itemprop=url]") ?: return null
         val tt     = selectFirst("div.tt")
@@ -73,6 +91,9 @@ class LMANIME : MainAPI() {
         }
     }
 
+    /* ------------------------------------------------------------------ */
+    /* SEARCH                                                             */
+    /* ------------------------------------------------------------------ */
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -81,6 +102,9 @@ class LMANIME : MainAPI() {
         return doc.select("article.bs").mapNotNull { it.toSearchResult() }
     }
 
+    /* ------------------------------------------------------------------ */
+    /* LOAD                                                               */
+    /* ------------------------------------------------------------------ */
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
 
@@ -89,7 +113,7 @@ class LMANIME : MainAPI() {
             ?.text()?.substringAfter(":")?.trim()
 
         if (pageType.equals("Movie", true)) {
-            return loadAsMovie(url, document, TvType.AnimeMovie)   // ← now suspend-safe
+            return loadAsMovie(url, document, TvType.AnimeMovie)
         }
 
         val isEpisodePage = document.selectFirst("#singlepisode") != null ||
@@ -108,6 +132,9 @@ class LMANIME : MainAPI() {
         return loadAsMovie(url, document, TvType.Anime)
     }
 
+    /* ------------------------------------------------------------------ */
+    /* SERIES LOADER — date parsing adopted from reference                */
+    /* ------------------------------------------------------------------ */
     private suspend fun loadSeries(
         seriesUrl: String,
         episodeUrl: String,
@@ -131,9 +158,46 @@ class LMANIME : MainAPI() {
             val epNum = Regex("""Episode\s+(\d+)""", RegexOption.IGNORE_CASE)
                 .find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
 
+            /* ──────────────────────────────────────────────────────────
+             *  DATE EXTRACTION — 5-tier fallback
+             *   1-3: CSS selector for date containers (.playinfo span, …)
+             *        → absolute regex, then relative regex
+             *   4-5: full <li> text
+             *        → absolute regex, then relative regex
+             * ────────────────────────────────────────────────────────── */
+            val cssDate = a.selectFirst(
+                ".playinfo span, .epl-date, .epdate, .date, .released, .published, .time"
+            )?.text()?.trim()
+
+            val fullText = a.text()
+
+            val extractedDate: String? =
+                cssDate?.takeIf { it.isNotBlank() }?.let {
+                    dateRegex.find(it)?.value?.trim()
+                        ?: relativeDateRegex.find(it)?.value?.trim()
+                }
+                ?: dateRegex.find(fullText)?.value?.trim()
+                ?: relativeDateRegex.find(fullText)?.value?.trim()
+
             newEpisode(href) {
                 this.name    = epTitle.ifBlank { "Episode ${epNum ?: "?"}" }
                 this.episode = epNum
+
+                if (!extractedDate.isNullOrBlank()) {
+                    // Choose the correct SimpleDateFormat pattern only for
+                    // absolute dates — skip addDate for relative ones (e.g.
+                    // "2 days ago"), which would fail to parse.
+                    val addFormat = when {
+                        fmtMonthDayYear.matches(extractedDate) -> "MMMM d, yyyy"
+                        fmtDayMonthYear.matches(extractedDate) -> "d MMMM yyyy"
+                        fmtIsoDate.matches(extractedDate)      -> "yyyy-MM-dd"
+                        else                                    -> null
+                    }
+                    if (addFormat != null) {
+                        this.addDate(extractedDate, format = addFormat)
+                    }
+                    this.description = extractedDate
+                }
             }
         }.distinctBy { it.data }
 
@@ -164,9 +228,9 @@ class LMANIME : MainAPI() {
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  THE FIX — one keyword: `suspend` added to match newMovieLoadResponse
-    // ══════════════════════════════════════════════════════════════════════
+    /* ------------------------------------------------------------------ */
+    /* MOVIE FALLBACK                                                     */
+    /* ------------------------------------------------------------------ */
     private suspend fun loadAsMovie(
         url: String,
         document: Document,
@@ -189,13 +253,16 @@ class LMANIME : MainAPI() {
             .firstOrNull { it.text().contains("Released", true) }?.text()
             ?.let { t -> Regex("""\b((?:19|20)\d{2})\b""").find(t)?.value?.toIntOrNull() }
 
-        return newMovieLoadResponse(title, url, tvType, url) {   // ← now legal: caller is suspend
+        return newMovieLoadResponse(title, url, tvType, url) {
             this.posterUrl = poster
             this.plot      = plot
             if (year != null) this.year = year
         }
     }
 
+    /* ------------------------------------------------------------------ */
+    /* LOAD LINKS — unchanged                                            */
+    /* ------------------------------------------------------------------ */
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
