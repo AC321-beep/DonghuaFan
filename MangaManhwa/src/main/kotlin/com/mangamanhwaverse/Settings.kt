@@ -2,69 +2,109 @@ package com.mangamanhwaverse
 
 import android.app.AlertDialog
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.SharedPreferences
 import android.text.InputType
+import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import com.lagradost.cloudstream3.CommonActivity
+import java.net.URI
 
 object Settings {
     private lateinit var prefs: SharedPreferences
 
     fun init(context: Context) {
-        prefs = context.getSharedPreferences("mangamanhwaverse", Context.MODE_PRIVATE)
+        prefs = context.applicationContext.getSharedPreferences("mangamanhwaverse", Context.MODE_PRIVATE)
+    }
+
+    private fun ensurePrefs(): Boolean {
+        if (::prefs.isInitialized) return true
+        val ctx = AppContext.ctx ?: CommonActivity.activity ?: return false
+        init(ctx)
+        return ::prefs.isInitialized
     }
 
     // ── Core preferences ──
-    fun dataSaver(): Boolean = prefs.getBoolean("data_saver", false)
-    fun setDataSaver(v: Boolean) { prefs.edit().putBoolean("data_saver", v).commit() } // FIX: commit
+    fun dataSaver(): Boolean = if (ensurePrefs()) prefs.getBoolean("data_saver", false) else false
+    fun setDataSaver(v: Boolean) {
+        if (ensurePrefs()) prefs.edit().putBoolean("data_saver", v).commit()
+    }
 
-    fun preloadNext(): Boolean = prefs.getBoolean("preload_next", true)
-    fun setPreloadNext(v: Boolean) { prefs.edit().putBoolean("preload_next", v).commit() } // FIX: commit
+    fun preloadNext(): Boolean = if (ensurePrefs()) prefs.getBoolean("preload_next", true) else true
+    fun setPreloadNext(v: Boolean) {
+        if (ensurePrefs()) prefs.edit().putBoolean("preload_next", v).commit()
+    }
 
-    fun verboseLog(): Boolean = prefs.getBoolean("verbose_log", false)
-    fun setVerboseLog(v: Boolean) { prefs.edit().putBoolean("verbose_log", v).commit() } // FIX: commit
+    fun verboseLog(): Boolean = if (ensurePrefs()) prefs.getBoolean("verbose_log", false) else false
+    fun setVerboseLog(v: Boolean) {
+        if (ensurePrefs()) prefs.edit().putBoolean("verbose_log", v).commit()
+    }
 
-    // ── Master toggle ──
-    fun allProvidersEnabled(): Boolean = prefs.getBoolean("all_providers_enabled", true)
+    // ── Master toggle & Per-provider selection ──
+    fun allProvidersEnabled(): Boolean =
+        if (ensurePrefs()) prefs.getBoolean("all_providers_enabled", true) else true
 
     fun setAllProvidersEnabled(v: Boolean) {
-        prefs.edit().putBoolean("all_providers_enabled", v).commit() // FIX: commit
+        if (!ensurePrefs()) return
+        prefs.edit().putBoolean("all_providers_enabled", v).commit()
         if (v) setEnabledProviderNames(ProviderRegistry.names.toSet())
         else setEnabledProviderNames(emptySet())
     }
 
-    // ── Per-provider selection ──
-    fun enabledProviderNames(): Set<String> =
-        prefs.getStringSet("enabled_providers", emptySet()) ?: emptySet()
+    fun enabledProviderNames(): Set<String> {
+        if (!ensurePrefs()) return ProviderRegistry.names.toSet()
+        val validNames = ProviderRegistry.names.toSet()
+        if (!prefs.contains("enabled_providers")) {
+            return if (allProvidersEnabled()) validNames else emptySet()
+        }
+        val stored = prefs.getStringSet("enabled_providers", emptySet()) ?: emptySet()
+        return stored.intersect(validNames)
+    }
 
     fun setEnabledProviderNames(s: Set<String>) {
-        prefs.edit().putStringSet("enabled_providers", s).commit() // FIX: commit
+        if (!ensurePrefs()) return
+        val validPicked = s.intersect(ProviderRegistry.names.toSet())
+        val allChecked = validPicked.size == ProviderRegistry.names.size
+        prefs.edit()
+            .putStringSet("enabled_providers", HashSet(validPicked))
+            .putBoolean("all_providers_enabled", allChecked)
+            .commit()
     }
 
     fun isProviderEnabled(name: String): Boolean {
-        if (!prefs.contains("enabled_providers")) return allProvidersEnabled()
+        if (!ensurePrefs() || !prefs.contains("enabled_providers")) return allProvidersEnabled()
         return name in enabledProviderNames()
     }
 
-    fun hasInitializedProviderSet(): Boolean = prefs.contains("enabled_providers")
+    fun hasInitializedProviderSet(): Boolean =
+        ensurePrefs() && prefs.contains("enabled_providers")
 
     // ── Per-provider URL override ──
-    fun providerUrlOverride(name: String): String =
-        prefs.getString("url_override_$name", "") ?: ""
+    fun providerUrlOverride(name: String): String {
+        if (!ensurePrefs()) return ""
+        return prefs.getString("url_override_$name", "")?.trim()?.trimEnd('/') ?: ""
+    }
 
     fun setProviderUrlOverride(name: String, url: String) {
-        prefs.edit().putString("url_override_$name", url.trim()).apply() // apply() is fine here
+        if (!ensurePrefs()) return
+        val cleaned = url.trim().trimEnd('/')
+        prefs.edit().putString("url_override_$name", cleaned).commit()
     }
 
     // ═══════════════════════════════════════════════════════════════
     //  Main dialog
     // ═══════════════════════════════════════════════════════════════
     fun show(context: Context) {
-        if (!::prefs.isInitialized) init(context)
+        init(context)
 
         val density = context.resources.displayMetrics.density
         fun dp(v: Int) = (v * density).toInt()
@@ -74,20 +114,36 @@ object Settings {
             setPadding(dp(16), dp(16), dp(16), dp(16))
         }
 
-        val enabledCount = ProviderRegistry.names.count { isProviderEnabled(it) }
         val totalCount = ProviderRegistry.names.size
+        var isUpdatingMasterProgrammatically = false
+
+        val statusLabel = TextView(context).apply {
+            textSize = 12f
+            setPadding(0, dp(4), 0, dp(6))
+        }
 
         val cbAllProviders = CheckBox(context).apply {
             text = "Enable all sources"
-            isChecked = allProvidersEnabled()
         }
-        layout.addView(cbAllProviders)
 
-        layout.addView(TextView(context).apply {
-            text = "Selected — $enabledCount of $totalCount"
-            textSize = 12f
-            setPadding(0, dp(4), 0, dp(6))
-        })
+        fun refreshSummaryUi() {
+            val enabledCount = enabledProviderNames().size
+            statusLabel.text = "Selected — $enabledCount of $totalCount"
+            isUpdatingMasterProgrammatically = true
+            cbAllProviders.isChecked = (enabledCount == totalCount && totalCount > 0)
+            isUpdatingMasterProgrammatically = false
+        }
+
+        cbAllProviders.setOnCheckedChangeListener { _, isChecked ->
+            if (isUpdatingMasterProgrammatically) return@setOnCheckedChangeListener
+            setAllProvidersEnabled(isChecked)
+            refreshSummaryUi()
+        }
+
+        refreshSummaryUi()
+
+        layout.addView(cbAllProviders)
+        layout.addView(statusLabel)
 
         layout.addView(TextView(context).apply {
             text = "Manage sources"
@@ -95,7 +151,11 @@ object Settings {
             setBackgroundColor(0xFF151923.toInt())
             setTextColor(0xFFE2E8F0.toInt())
             isClickable = true
-            setOnClickListener { showSourcePicker(context) }
+            setOnClickListener {
+                showSourcePicker(context) {
+                    refreshSummaryUi()
+                }
+            }
         })
 
         val cbDataSaver = CheckBox(context).apply {
@@ -141,14 +201,14 @@ object Settings {
                 setDataSaver(cbDataSaver.isChecked)
                 setPreloadNext(cbPreload.isChecked)
                 setVerboseLog(cbVerbose.isChecked)
-                setAllProvidersEnabled(cbAllProviders.isChecked)
+                // Provider selections are already persisted in real time via setEnabledProviderNames / cbAllProviders
                 restartApp(context)
             }
-            .setNegativeButton("Cancel", null)
+            .setNegativeButton("Close", null)
             .show()
     }
 
-    private fun showSourcePicker(context: Context) {
+    private fun showSourcePicker(context: Context, onApplied: () -> Unit) {
         val names = ProviderRegistry.names.sorted()
         val initial = enabledProviderNames().toMutableSet()
         val density = context.resources.displayMetrics.density
@@ -201,8 +261,12 @@ object Settings {
             .setPositiveButton("Apply") { _, _ ->
                 val picked = boxes.filterValues { it.isChecked }.keys
                 setEnabledProviderNames(picked)
-                prefs.edit().putBoolean("all_providers_enabled", picked.size == names.size).commit()
-                Toast.makeText(context, "${picked.size} of ${names.size} enabled — Save & Restart to apply", Toast.LENGTH_LONG).show()
+                onApplied()
+                Toast.makeText(
+                    context,
+                    "${picked.size} of ${names.size} enabled — click Save & Restart to apply",
+                    Toast.LENGTH_LONG
+                ).show()
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -210,6 +274,8 @@ object Settings {
 
     private fun showUrlOverrideDialog(context: Context) {
         val names = ProviderRegistry.names.sorted()
+        if (names.isEmpty()) return
+
         val density = context.resources.displayMetrics.density
         fun dp(v: Int) = (v * density).toInt()
 
@@ -218,29 +284,60 @@ object Settings {
             setPadding(dp(16), dp(12), dp(16), dp(12))
         }
 
-        layout.addView(TextView(context).apply { text = "Provider name (e.g. AsuraScans)"; textSize = 12f })
-        val nameInput = EditText(context).apply { hint = names.firstOrNull() ?: "AsuraScans" }
-        layout.addView(nameInput)
+        layout.addView(TextView(context).apply {
+            text = "Select Provider"
+            textSize = 12f
+        })
 
-        layout.addView(TextView(context).apply { text = "New base URL (empty = default)"; textSize = 12f; setPadding(0, dp(10), 0, 0) })
-        val urlInput = EditText(context).apply { inputType = InputType.TYPE_TEXT_VARIATION_URI; hint = "https://newdomain.com" }
+        val providerSpinner = Spinner(context).apply {
+            adapter = ArrayAdapter(context, android.R.layout.simple_spinner_dropdown_item, names)
+        }
+        layout.addView(providerSpinner)
+
+        layout.addView(TextView(context).apply {
+            text = "New base URL (leave empty to reset to default)"
+            textSize = 12f
+            setPadding(0, dp(10), 0, 0)
+        })
+
+        val urlInput = EditText(context).apply {
+            inputType = InputType.TYPE_TEXT_VARIATION_URI
+            hint = "https://newdomain.com"
+        }
         layout.addView(urlInput)
+
+        providerSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val selectedName = names[position]
+                urlInput.setText(providerUrlOverride(selectedName))
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
 
         AlertDialog.Builder(context)
             .setTitle("Override Provider URL")
             .setView(layout)
             .setPositiveButton("Save") { _, _ ->
-                val n = nameInput.text.toString().trim()
+                val selectedName = providerSpinner.selectedItem as? String ?: return@setPositiveButton
                 val u = urlInput.text.toString().trim()
-                if (n.isBlank() || n !in names) {
-                    Toast.makeText(context, "Unknown provider: $n", Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
-                }
-                setProviderUrlOverride(n, u)
-                Toast.makeText(context, if (u.isBlank()) "Cleared override for $n" else "Override set for $n", Toast.LENGTH_SHORT).show()
+                setProviderUrlOverride(selectedName, u)
+                Toast.makeText(
+                    context,
+                    if (u.isBlank()) "Cleared override for $selectedName" else "Override set for $selectedName",
+                    Toast.LENGTH_SHORT
+                ).show()
             }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    private fun resolveAppCompatActivity(context: Context): AppCompatActivity? {
+        var cur: Context? = context
+        while (cur is ContextWrapper) {
+            if (cur is AppCompatActivity) return cur
+            cur = cur.baseContext
+        }
+        return CommonActivity.activity as? AppCompatActivity
     }
 
     private fun promptReaderUrl(context: Context) {
@@ -252,14 +349,26 @@ object Settings {
             .setTitle("Open reader")
             .setView(input)
             .setPositiveButton("Open") { _, _ ->
-                val url = input.text.toString().trim()
-                if (url.isBlank()) return@setPositiveButton
-                val activity = context as? androidx.appcompat.app.AppCompatActivity
+                val rawUrl = input.text.toString().trim()
+                if (rawUrl.isBlank()) return@setPositiveButton
+                val url = if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) {
+                    rawUrl
+                } else {
+                    "https://$rawUrl"
+                }
+
+                val activity = resolveAppCompatActivity(context)
                 if (activity == null) {
                     Toast.makeText(context, "Cannot open reader from this context", Toast.LENGTH_SHORT).show()
                     return@setPositiveButton
                 }
-                ReaderDialog.show(activity, "Custom", "Chapter", url, url.substringBefore("/", url), 0)
+
+                val refererOrigin = runCatching {
+                    val uri = URI(url)
+                    "${uri.scheme}://${uri.host}"
+                }.getOrDefault(url)
+
+                ReaderDialog.show(activity, "Custom", "Chapter", url, refererOrigin, 0)
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -271,9 +380,7 @@ object Settings {
             intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK)
             context.startActivity(intent)
         }
-        
-        // FIX: Delay the kill by 300ms to allow the OS to schedule the new activity
-        // and ensure all disk writes (commit) are fully flushed.
+
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
             android.os.Process.killProcess(android.os.Process.myPid())
             @Suppress("UNREACHABLE_CODE")
