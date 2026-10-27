@@ -3,6 +3,7 @@ package com.mangamanhwaverse.providers
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.AppUtils.parseJson
+import com.mangamanhwaverse.Settings
 import com.mangamanhwaverse.core.MangaManhwaProvider
 import org.jsoup.nodes.Document
 import java.net.URLDecoder
@@ -45,7 +46,8 @@ open class NextGenWebProvider(
 ) : MangaManhwaProvider() {
 
     override val baseUrl: String
-    get() = com.mangamanhwaverse.Settings.providerUrlOverride(name).takeIf { it.isNotBlank() } ?: mainUrl
+        get() = Settings.providerUrlOverride(name).takeIf { it.isNotBlank() } ?: mainUrl
+
     override val requiresCf: Boolean = true
 
     private data class ParsedCard(
@@ -109,12 +111,12 @@ open class NextGenWebProvider(
                 ?.substringBefore(" - Flame")
                 ?.substringBefore(" - Nyx")
                 ?.substringBefore(" | ")
-                ?.replace(Regex("""\s+Manhwa$""", RegexOption.IGNORE_CASE), "")
+                ?.replace(Regex("""[ ]+Manhwa$""", RegexOption.IGNORE_CASE), "")
                 ?.trim()
                 ?.takeIf { it.isNotBlank() && !it.startsWith("Read Free", true) }
 
             val domTitle = cleanTitleElement(doc.selectFirst("h1[itemProp='name'], span.text-xl.font-bold, h1:not(.sr-only), .post-title h1"))
-                ?.replace(Regex("""\s+Manhwa$""", RegexOption.IGNORE_CASE), "")
+                ?.replace(Regex("""[ ]+Manhwa$""", RegexOption.IGNORE_CASE), "")
                 ?.takeIf { it.isNotBlank() && !it.startsWith("Read Free", true) }
 
             title = ogTitle ?: domTitle ?: titleFromSlug(url)
@@ -195,7 +197,7 @@ open class NextGenWebProvider(
     }
 
     protected open fun parseSeriesCards(doc: Document, mode: String = "popular", page: Int = 1): List<SearchResponse> {
-        // 1. Next.js JSON Extraction (Flame Comics local sorting)
+        // 1. Next.js JSON Extraction (Strictly reserved for FlameComics)
         val nextData = doc.selectFirst("script#__NEXT_DATA__")?.data()
         if (name.contains("Flame", ignoreCase = true) && !nextData.isNullOrBlank() && nextData.contains("\"series_id\"")) {
             data class FlameEntry(
@@ -207,24 +209,24 @@ open class NextGenWebProvider(
                 val lastEdit: Long
             )
             val entries = mutableListOf<FlameEntry>()
-            val objRegex = Regex("""\{[^{}]*"series_id"\s*:\s*(\d+)[^{}]*\}""")
-            val novelObjRegex = Regex("""\{[^{}]*"novel_id"\s*:\s*(\d+)[^{}]*\}""")
+            val objRegex = Regex("""\{[^{}]*"series_id"[ ]*:[ ]*([0-9]+)[^{}]*\}""")
+            val novelObjRegex = Regex("""\{[^{}]*"novel_id"[ ]*:[ ]*([0-9]+)[^{}]*\}""")
 
             fun extractEntries(regex: Regex, isNovel: Boolean) {
                 regex.findAll(nextData).forEach { m ->
                     val block = m.value
                     val id = m.groupValues[1].toIntOrNull() ?: return@forEach
-                    val title = Regex(""""title"\s*:\s*"([^"]+)"""").find(block)?.groupValues?.get(1) ?: return@forEach
-                    var cover = Regex(""""cover"\s*:\s*"([^"]+)"""").find(block)?.groupValues?.get(1) ?: ""
+                    val title = Regex(""""title"[ ]*:[ ]*"([^"]+)"""").find(block)?.groupValues?.get(1) ?: return@forEach
+                    var cover = Regex(""""cover"[ ]*:[ ]*"([^"]+)"""").find(block)?.groupValues?.get(1) ?: ""
 
                     if (cover.isNotBlank() && !cover.startsWith("http")) {
                         val folder = if (isNovel) "novels" else "series"
                         cover = "https://cdn.flamecomics.xyz/uploads/images/$folder/$id/$cover"
                     }
 
-                    val status = Regex(""""status"\s*:\s*"([^"]+)"""").find(block)?.groupValues?.get(1) ?: ""
-                    val views = Regex(""""views"\s*:\s*(\d+)""").find(block)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                    val lastEdit = Regex(""""last_edit"\s*:\s*(\d+)""").find(block)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+                    val status = Regex(""""status"[ ]*:[ ]*"([^"]+)"""").find(block)?.groupValues?.get(1) ?: ""
+                    val views = Regex(""""views"[ ]*:[ ]*([0-9]+)""").find(block)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    val lastEdit = Regex(""""last_edit"[ ]*:[ ]*([0-9]+)""").find(block)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
                     entries.add(FlameEntry(id, title, cover, status, views, lastEdit))
                 }
             }
@@ -264,7 +266,7 @@ open class NextGenWebProvider(
         // 2. DOM Parsing (Asura, Hive, Nyx)
         val parsedCards = LinkedHashMap<String, ParsedCard>()
         val chapCountRegex = Regex(
-            """(?:(?:Chapter|Ch\.?)\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:Chapters?|Chs?\.?))""",
+            """(?:(?:Chapter|Ch\.?)[ ]*([0-9]+(?:\.[0-9]+)?)|([0-9]+(?:\.[0-9]+)?)[ ]*(?:Chapters?|Chs?\.?))""",
             RegexOption.IGNORE_CASE
         )
 
@@ -305,7 +307,7 @@ open class NextGenWebProvider(
             val chapMatch = chapCountRegex.find(cardText)
             val chapNum = (chapMatch?.groupValues?.getOrNull(1)?.takeIf { it.isNotBlank() }
                 ?: chapMatch?.groupValues?.getOrNull(2))?.toDoubleOrNull() ?: 0.0
-            val rating = Regex("""\b([789]\.\d|10\.0)\b""")
+            val rating = Regex("""\b([789]\.[0-9]|10\.0)\b""")
                 .find(cardText)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
             val isCompleted = cardText.contains("Completed", ignoreCase = true) ||
                 cardText.contains("Finished", ignoreCase = true)
@@ -370,7 +372,7 @@ open class NextGenWebProvider(
     }
 
     /**
-     * Extracts raw (un-reversed) chapters from a single Document.
+     * Extracts raw (un-reversed) chapters from a single Document in O(N) time.
      * Reversing is handled by the caller after multi-page aggregation and tail backfilling.
      */
     protected open fun chaptersFromDoc(mangaUrl: String, doc: Document): List<Episode> {
@@ -393,7 +395,7 @@ open class NextGenWebProvider(
 
                     chaptersList.forEach { ch ->
                         val token = ch.token ?: return@forEach
-                        val chapterUrl = "$mainUrl/$route/$id/$token"
+                        val chapterUrl = "${baseUrl.trimEnd('/')}/$route/$id/$token"
                         val chNum = ch.chapter ?: ""
                         val name = if (!ch.title.isNullOrBlank()) "Chapter $chNum - ${ch.title}" else "Chapter $chNum"
 
@@ -431,16 +433,14 @@ open class NextGenWebProvider(
             val href = a.attr("href").trim()
             if (href.isBlank() || href == "#" || href.startsWith("javascript:", true) || href.contains("All Chapters", ignoreCase = true)) return@forEach
 
-            // Exclude sidebar/recommendation cards when using unscoped fallback selectors
             if (!isScopedContainer) {
-                val inExcludedBlock = a.parents().any { p ->
-                    p.tagName() == "aside" ||
-                    p.className().contains("sidebar", true) ||
-                    p.text().startsWith("Recommended Series", true) ||
-                    p.text().startsWith("You May Also Like", true)
+                val inSidebar = a.parents().any { p ->
+                    p.tagName() == "aside" || p.className().contains("sidebar", true)
                 }
-                if (inExcludedBlock) return@forEach
-                if (baseSlug.length > 3 && href.contains("/comics/") && !href.contains(baseSlug, ignoreCase = true)) return@forEach
+                if (inSidebar) return@forEach
+                if (baseSlug.length > 3 && (href.contains("/comics/") || href.contains("/series/")) && !href.contains(baseSlug, ignoreCase = true)) {
+                    return@forEach
+                }
             }
 
             val fullUrl = abs(href)
@@ -468,16 +468,16 @@ open class NextGenWebProvider(
             }
         }
 
-        // 3. Next.js Inline Script Hydration Scan (catches chapters hidden behind "Show All" buttons)
-        if (baseSlug.length > 2) {
+        // 3. Fast Next.js Script Hydration Scan (only runs if DOM had < 5 chapters, with zero regex backtracking)
+        if (epsMap.size < 5 && baseSlug.length > 2) {
             val rawScripts = doc.select("script").joinToString("\n") { it.data() }.replace("\\/", "/")
             val scriptUrlRegex = Regex(
-                """(/(?:series|comics|manga)/[^"'\s\\]*${Regex.escape(baseSlug)}[^"'\s\\]*/(?:chapter|ch)[/\-_]?(\d+(?:[.\-_]\d+)?))""",
+                """/(?:series|comics|manga)/${Regex.escape(baseSlug)}(?:-[0-9a-f]{8})?/(?:chapter|ch)[/_-]?([0-9]+(?:\.[0-9]+)?)""",
                 RegexOption.IGNORE_CASE
             )
             scriptUrlRegex.findAll(rawScripts).forEach { m ->
-                val fullUrl = abs(m.groupValues[1])
-                val chNumStr = m.groupValues[2].replace('-', '.').replace('_', '.')
+                val fullUrl = abs(m.value)
+                val chNumStr = m.groupValues[1]
                 if (!epsMap.containsKey(fullUrl)) {
                     epsMap[fullUrl] = newEpisode(fullUrl) {
                         this.name = "Chapter $chNumStr"
@@ -496,14 +496,13 @@ open class NextGenWebProvider(
     private fun backfillMissingTailChapters(episodes: List<Episode>): List<Episode> {
         if (episodes.size < 15) return episodes
 
-        val numRegex = Regex("""(?:chapter|ch)[/\-_\s#]*(\d+(?:\.\d+)?)$""", RegexOption.IGNORE_CASE)
+        val numRegex = Regex("""(?:chapter|ch)[/_ #-]*([0-9]+(?:\.[0-9]+)?)$""", RegexOption.IGNORE_CASE)
         val firstNum = numRegex.find(episodes.first().data.trimEnd('/'))?.groupValues?.get(1)?.toDoubleOrNull() ?: return episodes
         val lastEp = episodes.last()
         val lastUrl = lastEp.data.trimEnd('/')
         val lastMatch = numRegex.find(lastUrl) ?: return episodes
         val lastNum = lastMatch.groupValues[1].toDoubleOrNull() ?: return episodes
 
-        // If the list is descending (e.g., 320 down to 51) and stops above Chapter 1 with an integer URL pattern
         if (firstNum > lastNum && lastNum > 1.0 && lastNum <= 250.0 && lastNum % 1.0 == 0.0) {
             val lastInt = lastNum.toInt()
             val suffix = lastMatch.groupValues[1]
