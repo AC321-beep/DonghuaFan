@@ -374,17 +374,20 @@ object Settings {
             .show()
     }
 
-    private fun restartApp(context: Context) {
-        val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
-        if (intent != null) {
-            intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK)
-            context.startActivity(intent)
-        }
-
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+   private fun restartApp(context: Context) {
+        try {
+            val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
+            if (intent != null) {
+                val componentName = intent.component
+                val mainIntent = android.content.Intent.makeRestartActivityTask(componentName)
+                context.startActivity(mainIntent)
+            }
+            
+            // Kill immediately. The OS will seamlessly recreate the process to handle the intent.
             android.os.Process.killProcess(android.os.Process.myPid())
             @Suppress("UNREACHABLE_CODE")
             Runtime.getRuntime().exit(0)
-        }, 300)
+        } catch (e: Exception) {
+            android.util.Log.e("MangaManhwa/Settings", "Restart failed", e)
+        }
     }
-}
