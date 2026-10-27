@@ -11,7 +11,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  * Dailymotion — www / geo / embed / dai.ly
  * ========================================================================== */
 class LMANIMEDailymotion : ExtractorApi() {
-    override val name            = "LMANIME-Dailymotion"
+    override val name            = "Dailymotion"
     override val mainUrl         = "dailymotion.com"
     override val requiresReferer = false
 
