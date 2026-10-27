@@ -3,8 +3,8 @@ package com.lmanime
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.extractors.ExtractorApi
-import com.lagradost.cloudstream3.newExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorApi          
+import com.lagradost.cloudstream3.utils.newExtractorLink   
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
@@ -14,7 +14,6 @@ import com.lagradost.cloudstream3.utils.Qualities
  * ========================================================================== */
 class LMANIMEDailymotion : ExtractorApi() {
     override val name            = "LMANIME-Dailymotion"
-    // NOTE: no "www." so geo.dailymotion.com also matches
     override val mainUrl         = "dailymotion.com"
     override val requiresReferer = false
 
@@ -53,7 +52,7 @@ class LMANIMEDailymotion : ExtractorApi() {
             if (!meta?.qualities?.auto.isNullOrEmpty()) return
         }
 
-        /* 2. fallback — scrape __PLAYER_CONFIG__ / player config */
+        /* 2. fallback — scrape player config */
         runCatching {
             val html = app.get(url, headers = headers).text
             val m3u8 = Regex(""""url"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""")
@@ -85,7 +84,7 @@ class LMANIMEDailymotion : ExtractorApi() {
 }
 
 /* ==========================================================================
- * VidHide — handles morencius.com (and other vidhide-style domains)
+ * VidHide / Morencius
  * ========================================================================== */
 class VidHideExtractor : ExtractorApi() {
     override val name            = "VidHide"
@@ -104,21 +103,19 @@ class VidHideExtractor : ExtractorApi() {
             app.get(embedUrl, headers = mapOf("Referer" to "https://lmanime.com/")).text
         }.getOrNull() ?: return
 
-        /* Try every reasonable m3u8 pattern */
-        val m3u8Patterns = listOf(
+        val patterns = listOf(
             Regex(""""file"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)""""),
             Regex("""'file'\s*:\s*'(https?://[^']+\.m3u8[^']*)'"""),
             Regex(""""url"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)""""),
             Regex("""(https?://[^"'\s\\]+\.m3u8[^"'\s\\]*)"""),
         )
-        for (pattern in m3u8Patterns) {
+        for (pattern in patterns) {
             val match = pattern.find(html) ?: continue
-            val link  = match.groupValues.last().replace("\\/", "/")
             callback(
                 newExtractorLink(
                     source = name,
                     name   = name,
-                    url    = link,
+                    url    = match.groupValues.last().replace("\\/", "/"),
                     type   = ExtractorLinkType.M3U8,
                 ) {
                     this.referer = embedUrl
@@ -128,7 +125,6 @@ class VidHideExtractor : ExtractorApi() {
             return
         }
 
-        /* MP4 fallback */
         Regex("""(https?://[^"'\s\\]+\.mp4[^"'\s\\]*)""").find(html)?.let { m ->
             callback(
                 newExtractorLink(
@@ -205,7 +201,6 @@ class OkRuExtractor : ExtractorApi() {
     ) {
         val html = runCatching { app.get(url).text }.getOrNull() ?: return
 
-        // OkRu hides the video metadata in HTML-encoded data-options attribute
         val options = Regex("""data-options="([^"]+)"""").find(html)
             ?.groupValues?.get(1) ?: return
 
@@ -213,7 +208,6 @@ class OkRuExtractor : ExtractorApi() {
             .replace("&quot;", "\"").replace("&amp;", "&")
             .replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">")
 
-        // HLS first
         for (p in listOf(
             Regex(""""hlsManifestUrl"\s*:\s*"([^"]+)""""),
             Regex(""""hls"\s*:\s*"([^"]+)""""),
@@ -229,7 +223,6 @@ class OkRuExtractor : ExtractorApi() {
             return
         }
 
-        // MP4 fallback
         Regex(""""url"\s*:\s*"([^"]+\.mp4[^"]*)"""")
             .findAll(decoded).forEach { m ->
                 callback(
@@ -244,7 +237,7 @@ class OkRuExtractor : ExtractorApi() {
 }
 
 /* ==========================================================================
- * Mp4Upload — converts download URL → embeddable player
+ * Mp4Upload
  * ========================================================================== */
 class Mp4UploadExtractor : ExtractorApi() {
     override val name            = "Mp4Upload"
