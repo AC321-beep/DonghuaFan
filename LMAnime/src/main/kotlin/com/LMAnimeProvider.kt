@@ -9,32 +9,26 @@ class LMANIME : MainAPI() {
 
     override var mainUrl  = "https://lmanime.com"
     override var name     = "LMANIME"
-    override var lang     = "zh"
+    override var lang     = "en"
     override val hasMainPage        = true
     override val hasQuickSearch     = true
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    // 👇 NEW: "Movies" row (filter by type=movie) added between Popular and Ongoing
     override val mainPage = mainPageOf(
         "latest"                                 to "Latest Release",
         "anime/?status=&type=&order=popular"     to "Popular",
-        "anime/?status=&type=movie&order=update" to "Movies",   // ← NEW
+        "anime/?status=&type=movie&order=update" to "Movies",
         "ongoing/"                               to "Ongoing",
         "upcoming/"                              to "Upcoming",
     )
 
-    /* ------------------------------------------------------------------ */
-    /* MAIN PAGE                                                          */
-    /* ------------------------------------------------------------------ */
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = when {
             request.data == "latest" ->
                 if (page == 1) "$mainUrl/" else "$mainUrl/page/$page/"
-
             request.data.contains("?") ->
                 "$mainUrl/${request.data}" + if (page > 1) "&page=$page" else ""
-
             else -> {
                 val base = request.data.trimEnd('/')
                 if (page > 1) "$mainUrl/$base/page/$page/" else "$mainUrl/$base/"
@@ -45,9 +39,6 @@ class LMANIME : MainAPI() {
         return newHomePageResponse(request.name, items)
     }
 
-    /* ------------------------------------------------------------------ */
-    /* CARD PARSER — now reads the typez badge                            */
-    /* ------------------------------------------------------------------ */
     private fun Element.toSearchResult(): SearchResponse? {
         val anchor = selectFirst("a[itemprop=url]") ?: return null
         val tt     = selectFirst("div.tt")
@@ -74,21 +65,14 @@ class LMANIME : MainAPI() {
             fixUrlNull(it.attr("data-src").ifEmpty { it.attr("src") })
         }
 
-        // 👇 NEW: read type badge (TV / ONA / Movie / OVA / Special / …)
         val typeText = selectFirst("div.typez")?.text()?.trim()
-        val tvType   = when {
-            typeText.equals("Movie", true) -> TvType.AnimeMovie
-            else                           -> TvType.Anime
-        }
+        val tvType   = if (typeText.equals("Movie", true)) TvType.AnimeMovie else TvType.Anime
 
         return newAnimeSearchResponse(fullTitle, href, tvType) {
             this.posterUrl = poster
         }
     }
 
-    /* ------------------------------------------------------------------ */
-    /* SEARCH                                                             */
-    /* ------------------------------------------------------------------ */
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -97,22 +81,17 @@ class LMANIME : MainAPI() {
         return doc.select("article.bs").mapNotNull { it.toSearchResult() }
     }
 
-    /* ------------------------------------------------------------------ */
-    /* LOAD — decides Movie vs Series from the "Type:" field              */
-    /* ------------------------------------------------------------------ */
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
 
-        // 👇 NEW: read Type from the single-info block (series *or* movie page)
         val pageType = document.select(".single-info .spe span")
             .firstOrNull { it.text().contains("Type:", true) }
             ?.text()?.substringAfter(":")?.trim()
 
         if (pageType.equals("Movie", true)) {
-            return loadAsMovie(url, document, TvType.AnimeMovie)
+            return loadAsMovie(url, document, TvType.AnimeMovie)   // ← now suspend-safe
         }
 
-        // Episode of a series?
         val isEpisodePage = document.selectFirst("#singlepisode") != null ||
                             url.contains("-episode-", true)
 
@@ -123,18 +102,12 @@ class LMANIME : MainAPI() {
                 ?.let { fixUrl(it) }
                 ?.takeIf { it.isNotBlank() && !it.contains("-episode-", true) }
 
-            if (seriesUrl != null) {
-                return loadSeries(seriesUrl, url, document)
-            }
+            if (seriesUrl != null) return loadSeries(seriesUrl, url, document)
         }
 
-        // Otherwise treat as a movie/anime movie fallback
         return loadAsMovie(url, document, TvType.Anime)
     }
 
-    /* ------------------------------------------------------------------ */
-    /* SERIES LOADER (ONA/TV)                                             */
-    /* ------------------------------------------------------------------ */
     private suspend fun loadSeries(
         seriesUrl: String,
         episodeUrl: String,
@@ -191,13 +164,13 @@ class LMANIME : MainAPI() {
         }
     }
 
-    /* ------------------------------------------------------------------ */
-    /* MOVIE FALLBACK — takes the TvType so movies get AnimeMovie         */
-    /* ------------------------------------------------------------------ */
-    private fun loadAsMovie(
+    // ══════════════════════════════════════════════════════════════════════
+    //  THE FIX — one keyword: `suspend` added to match newMovieLoadResponse
+    // ══════════════════════════════════════════════════════════════════════
+    private suspend fun loadAsMovie(
         url: String,
         document: Document,
-        tvType: TvType = TvType.Anime,      // 👈 parameter so movie pages use AnimeMovie
+        tvType: TvType = TvType.Anime,
     ): LoadResponse {
         val title = document.selectFirst("h1.entry-title")?.text()?.trim()
             ?: document.selectFirst("h1")?.text()?.trim()
@@ -216,16 +189,13 @@ class LMANIME : MainAPI() {
             .firstOrNull { it.text().contains("Released", true) }?.text()
             ?.let { t -> Regex("""\b((?:19|20)\d{2})\b""").find(t)?.value?.toIntOrNull() }
 
-        return newMovieLoadResponse(title, url, tvType, url) {
+        return newMovieLoadResponse(title, url, tvType, url) {   // ← now legal: caller is suspend
             this.posterUrl = poster
             this.plot      = plot
             if (year != null) this.year = year
         }
     }
 
-    /* ------------------------------------------------------------------ */
-    /* LOAD LINKS — unchanged                                            */
-    /* ------------------------------------------------------------------ */
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
