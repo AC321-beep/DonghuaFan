@@ -69,43 +69,6 @@ private fun isPlaceholderUrl(url: String): Boolean {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  EPISODE HTML MIRROR EXTRACTOR (helper, may be called externally)
-// ════════════════════════════════════════════════════════════════════════════
-fun extractEmbedUrlsFromHtml(html: String): List<String> {
-    val doc = Jsoup.parse(html)
-    val urls = LinkedHashSet<String>()
-
-    fun addCleanedUrl(raw: String) {
-        val cleaned = raw.trim().replace("&amp;", "&")
-        if (cleaned.isBlank() || isPlaceholderUrl(cleaned)) return
-        val normalized = if (cleaned.startsWith("//")) "https:$cleaned" else cleaned
-        val finalUrl = normalized.replace(Regex("""([#&])dl=1\b"""), "")
-        if (finalUrl.startsWith("http://", true) || finalUrl.startsWith("https://", true)) {
-            urls.add(finalUrl)
-        }
-    }
-
-    doc.select("#pembed iframe, .player-embed iframe").forEach { iframe ->
-        val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }.ifBlank { iframe.attr("data-litespeed-src") }
-        addCleanedUrl(src)
-    }
-    doc.select("select.mirror option[value]").forEach { option ->
-        val b64 = option.attr("value").trim()
-        if (b64.isBlank()) return@forEach
-        val decodedHtml = try { String(Base64.decode(b64, Base64.DEFAULT), Charsets.UTF_8) }
-                          catch (_: Exception) { return@forEach }
-        Jsoup.parseBodyFragment(decodedHtml).select("iframe").forEach { iframe ->
-            addCleanedUrl(iframe.attr("src").ifBlank { iframe.attr("data-src") })
-        }
-        if (decodedHtml.startsWith("http://", true) || decodedHtml.startsWith("https://", true)) {
-            addCleanedUrl(decodedHtml)
-        }
-    }
-    doc.select(".soraurlx a[href], .soraddlx a[href]").forEach { a -> addCleanedUrl(a.attr("href")) }
-    return urls.toList()
-}
-
-// ════════════════════════════════════════════════════════════════════════════
 //  UTILITIES
 // ════════════════════════════════════════════════════════════════════════════
 private fun isErrorPage(html: String): Boolean {
@@ -313,7 +276,8 @@ private suspend fun isValidM3u8(url: String, headers: Map<String, String>): Bool
         resp.code == 200 && resp.text.trimStart().startsWith("#EXTM3U")
     } catch (_: Exception) { false }
 
-private fun emitSubtitlesFromText(text: String, subtitleCallback: (SubtitleFile) -> Unit) {
+// FIX: was `fun` — newSubtitleFile is suspend in current Cloudstream
+private suspend fun emitSubtitlesFromText(text: String, subtitleCallback: (SubtitleFile) -> Unit) {
     if (text.isEmpty()) return
     val seen = HashSet<String>()
     RE_SUB_URL.findAll(text).forEach { m ->
@@ -399,7 +363,6 @@ private suspend fun manualJsUnpackExtraction(
     val response = respObj.text
     if (isErrorPage(response)) return false
 
-    // Unpack ALL packed scripts
     val unpackedBuilder = StringBuilder(response)
     RE_PACKED_SCRIPT.findAll(response).forEach { match ->
         JsUnpacker(match.value).unpack()?.let { unpackedBuilder.append("\n").append(it) }
@@ -482,7 +445,6 @@ class P2pstream : ExtractorApi() {
         private val RE_BASE64 = Regex("^[A-Za-z0-9+/=_-]{100,}$")
         private val JSON_TYPE = "application/json; charset=utf-8".toMediaTypeOrNull()
 
-        // Distinct key/IV pairs — Gemini bug was both IVs returning the same value
         private fun plexKeyWithHash(): ByteArray = "kiemtienmua911c#".toByteArray(Charsets.UTF_8)
         private fun plexKeyNoHash(): ByteArray   = "kiemtienmua911ca".toByteArray(Charsets.UTF_8)
         private fun plexDefaultIv(): ByteArray   = "1234567890oiuytr".toByteArray(Charsets.UTF_8)
@@ -541,7 +503,6 @@ class P2pstream : ExtractorApi() {
                             Log.e(TAG, "  +script ${scriptUrl.takeLast(60)} len=${sr.text.length}")
                             sb.append("\n").append(sr.text)
                             for (chunk in extractAllChunkUrls(sr.text).take(40)) {
-                                // Fix: resolveUrl avoids double-slash on "/assets/..."
                                 val chunkUrl = resolveUrl(chunk, scriptUrl, origin) ?: continue
                                 if (isTemplatePlaceholder(chunkUrl)) continue
                                 try {
@@ -598,7 +559,6 @@ class P2pstream : ExtractorApi() {
 
         ensureJsCached(origin, id, headers)
 
-        // Cache only on FOUND — moves on from PAYLOAD_UNKNOWN to try next endpoint
         for (tmpl in KNOWN_ENDPOINTS) {
             when (probeEndpoint(origin, tmpl, id, refHost, apiHeaders, subtitleCallback, callback)) {
                 ProbeResult.FOUND -> { workingEndpointCache[origin] = tmpl; return }
@@ -640,7 +600,6 @@ class P2pstream : ExtractorApi() {
         if (tryDirectMedia(body, origin, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
         if (tryJsonBody(body, origin, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
 
-        // Handle JSON-wrapped encrypted payloads {"data":"<hex>"}
         val candidatePayload = extractEncryptedCandidate(body)
         val isHex = RE_HEX.matches(candidatePayload)
         val isBase64 = !isHex && RE_BASE64.matches(candidatePayload)
@@ -723,7 +682,6 @@ class P2pstream : ExtractorApi() {
             return false
         }
 
-        // OpenSSL Salted__ format
         val isSalted = ct.size > 16 && String(ct.copyOfRange(0, 8), Charsets.US_ASCII) == "Salted__"
         if (isSalted) {
             Log.e(TAG, "    ↪ OpenSSL Salted__ format detected")
