@@ -301,6 +301,71 @@ class NarulDonghuaProvider : MainAPI() {
         }
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    //  YOUTUBE HELPERS
+    // ════════════════════════════════════════════════════════════════════════
+
+    // Detects any YouTube URL variant.
+    private fun isYouTubeUrl(url: String): Boolean {
+        return url.contains("youtube.com", true) ||
+               url.contains("youtu.be", true) ||
+               url.contains("youtube-nocookie.com", true)
+    }
+
+    // Normalizes all YouTube URL formats to a canonical watch URL.
+    // Fixes: youtu.be/ID, /embed/ID, /v/ID, youtube-nocookie.com/embed/ID,
+    // protocol-relative //youtube.com/..., and messy watch URLs with extra params.
+    private fun normalizeYouTubeUrl(url: String): String {
+        var u = url.trim()
+
+        // Add https: if missing (e.g. //youtube.com/...)
+        if (u.startsWith("//")) u = "https:$u"
+
+        // youtu.be/ID → youtube.com/watch?v=ID
+        if (u.contains("youtu.be/", true)) {
+            val id = u.substringAfter("youtu.be/", "")
+                .substringBefore("?").substringBefore("&").substringBefore("/")
+            if (id.isNotBlank() && id.length in 6..20) {
+                return "https://www.youtube.com/watch?v=$id"
+            }
+        }
+
+        // youtube-nocookie.com/embed/ID → youtube.com/watch?v=ID
+        // (some extractors don't recognize the nocookie domain)
+        if (u.contains("youtube-nocookie.com", true)) {
+            val id = Regex("""/(?:embed|v)/([A-Za-z0-9_-]{6,20})""")
+                .find(u)?.groupValues?.getOrNull(1)
+            if (id != null) return "https://www.youtube.com/watch?v=$id"
+        }
+
+        // youtube.com/embed/ID or /v/ID → watch URL
+        // (built-in extractor handles watch URLs more reliably than /embed/)
+        if (u.contains("/embed/", true) || u.contains("/v/", true)) {
+            val id = Regex("""/(?:embed|v)/([A-Za-z0-9_-]{6,20})""")
+                .find(u)?.groupValues?.getOrNull(1)
+            if (id != null) return "https://www.youtube.com/watch?v=$id"
+        }
+
+        // Standard watch URL — strip junk params, preserve v= and t=
+        if (u.contains("youtube.com/watch", true)) {
+            val videoId = Regex("""[?&]v=([A-Za-z0-9_-]{6,20})""")
+                .find(u)?.groupValues?.getOrNull(1)
+            if (videoId != null) {
+                val startTime = Regex("""[?&]t=(\d+)""")
+                    .find(u)?.groupValues?.getOrNull(1)
+                return if (startTime != null)
+                    "https://www.youtube.com/watch?v=$videoId&t=$startTime"
+                else
+                    "https://www.youtube.com/watch?v=$videoId"
+            }
+        }
+
+        return u
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  loadLinks
+    // ════════════════════════════════════════════════════════════════════════
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -363,6 +428,35 @@ class NarulDonghuaProvider : MainAPI() {
                 if (extracted) { Log.e("Narul/Prov", "   ✓ Byse OK"); return } else Log.e("Narul/Prov", "   ✗ Byse no links")
             }
 
+            // ── YouTube explicit handling ────────────────────────────────
+            // Normalizes URL to canonical watch?v= form (fixes /embed/, youtu.be,
+            // youtube-nocookie, protocol-relative), uses youtube.com as referer
+            // (naruldonghua.com referer confuses YouTube API), and retries once
+            // with cache-buster if first attempt fails.
+            if (isYouTubeUrl(url)) {
+                Log.e("Narul/Prov", "   try YouTube (explicit)")
+                val ytUrl = normalizeYouTubeUrl(url)
+                Log.e("Narul/Prov", "     normalized → $ytUrl")
+
+                try { loadExtractor(ytUrl, referer = "https://www.youtube.com/", trackSub, inner) }
+                catch (e: CancellationException) { throw e }
+                catch (e: Exception) { Log.e("Narul/Prov", "     ✗ YT attempt1: ${e.message}") }
+
+                if (!extracted) {
+                    val retryUrl = if (ytUrl.contains("?"))
+                        "$ytUrl&_cb=${System.currentTimeMillis()}"
+                    else
+                        "$ytUrl?_cb=${System.currentTimeMillis()}"
+                    Log.e("Narul/Prov", "     retry → $retryUrl")
+                    try { loadExtractor(retryUrl, referer = "https://www.youtube.com/", trackSub, inner) }
+                    catch (e: CancellationException) { throw e }
+                    catch (e: Exception) { Log.e("Narul/Prov", "     ✗ YT attempt2: ${e.message}") }
+                }
+
+                if (extracted) { Log.e("Narul/Prov", "   ✓ YouTube OK"); return }
+                Log.e("Narul/Prov", "   ✗ YouTube no links, continuing to generic")
+            }
+
             Log.e("Narul/Prov", "   try loadExtractor (generic)")
             try { loadExtractor(url, referer = mainUrl, trackSub, inner) }
             catch (e: CancellationException) { throw e } catch (e: Exception) { Log.e("Narul/Prov", "   ✗ generic: ${e.message}") }
@@ -419,6 +513,8 @@ class NarulDonghuaProvider : MainAPI() {
                         "abyssplayer.com", "abyysplayer.com",
                         "playhydrax.com", "ok.ru",
                         "youtube.com/embed", "youtube-nocookie.com", "youtu.be",
+                        // NEW: catch Byse / external player URLs if they appear directly
+                        "bysekoze.com", "bysejikuar.com", "n1mwq.org",
                     ).any { u.contains(it, true) }
                 }
                 .toList()
