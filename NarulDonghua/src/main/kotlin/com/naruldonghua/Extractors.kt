@@ -299,15 +299,19 @@ private suspend fun emitSubtitlesFromM3u8(m3u8Url: String, headers: Map<String, 
 private fun extractUrlsFromJson(json: JSONObject, depth: Int = 0): List<String> {
     if (depth > 5) return emptyList()
     val urls = mutableListOf<String>()
+    val urlRe = Regex("""(https?://[^"'\s\\]+\.(?:m3u8|mp4|mkv)[^"'\s\\]*)""")
     val keys = json.keys()
     while (keys.hasNext()) {
         when (val v = json.opt(keys.next())) {
             is String -> {
                 val s = v.replace("\\/", "/")
-                if ((s.startsWith("http") || s.startsWith("//")) &&
-                    (s.contains(".m3u8") || s.contains(".mp4") || s.contains(".mkv") ||
-                     s.contains("/manifest") || s.contains("/hls/") || s.contains("/stream/"))) {
-                    urls.add(s)
+                // URLs anywhere in the string (not just at start)
+                urlRe.findAll(s).forEach { urls.add(it.groupValues[1]) }
+                // Recurse if value is a nested JSON string (e.g. streamingConfig)
+                val trimmed = s.trimStart()
+                if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+                    try { urls.addAll(extractUrlsFromJson(JSONObject(s), depth + 1)) }
+                    catch (_: Exception) {}
                 }
             }
             is JSONObject -> urls.addAll(extractUrlsFromJson(v, depth + 1))
@@ -315,7 +319,7 @@ private fun extractUrlsFromJson(json: JSONObject, depth: Int = 0): List<String> 
                 when (val item = v.opt(i)) {
                     is String -> {
                         val s = item.replace("\\/", "/")
-                        if (s.startsWith("http") || s.startsWith("//")) urls.add(s)
+                        urlRe.findAll(s).forEach { urls.add(it.groupValues[1]) }
                     }
                     is JSONObject -> urls.addAll(extractUrlsFromJson(item, depth + 1))
                     else -> {}
@@ -966,7 +970,7 @@ class P2pstream : ExtractorApi() {
         return false
     }
 
-    private suspend fun tryJsonBody(
+       private suspend fun tryJsonBody(
         body: String, origin: String, headers: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
     ): Boolean {
@@ -978,7 +982,7 @@ class P2pstream : ExtractorApi() {
             val subArr = json.optJSONArray(subKey) ?: continue
             for (i in 0 until subArr.length()) {
                 val subObj = subArr.optJSONObject(i) ?: continue
-                val subUrl = subObj.optString("file").ifBlank { subObj.optString("url") }.ifBlank { subObj.optString("src") }
+                val subUrl = subObj.optString("file").ifBlank { subObj.optString("url") }.optBlank("src")
                 if (subUrl.isNotBlank() && !isPlaceholderUrl(subUrl)) {
                     val label = subObj.optString("label").ifBlank { subObj.optString("lang") }.ifBlank { "Sub" }
                     subtitleCallback(newSubtitleFile(label, resolveUrl(subUrl, "$origin/", origin) ?: subUrl) { this.headers = headers })
@@ -986,21 +990,41 @@ class P2pstream : ExtractorApi() {
             }
         }
 
-        // FIX: cf field uses valid-cert domain — prefer it over IP-based source field
-        for (k in listOf("cf", "CF", "manifest", "playlist", "master")) {
+        // 1. cf field — emit ONLY if M3u8Helper produces variants
+        for (k in listOf("cf", "CF", "cfMaster", "cfManifest", "manifest", "playlist", "master")) {
             val cfUrl = json.optString(k).trim()
-            if (cfUrl.isNotBlank() && !isPlaceholderUrl(cfUrl) &&
-                (cfUrl.startsWith("http") || cfUrl.startsWith("//"))) {
-                val resolved = resolveUrl(cfUrl, "$origin/", origin) ?: cfUrl
-                Log.e(TAG, "    ★ cf-style manifest [$k] → ${resolved.take(90)}")
-                emitHls(resolved, origin, headers, subtitleCallback, callback)
+            if (cfUrl.isBlank() || isPlaceholderUrl(cfUrl) ||
+                (!cfUrl.startsWith("http") && !cfUrl.startsWith("//"))) continue
+            val resolved = resolveUrl(cfUrl, "$origin/", origin) ?: cfUrl
+            Log.e(TAG, "    ★ cf-style manifest [$k] → ${resolved.take(90)}")
+            val variants = try {
+                withTimeoutOrNull(8_000L) {
+                    M3u8Helper.generateM3u8(name, resolved, "$origin/", headers = headers)
+                }
+            } catch (_: Exception) { null }
+            if (!variants.isNullOrEmpty()) {
+                Log.e(TAG, "    ✓ cf produced ${variants.size} variants")
+                variants.forEach(callback)
+                emitSubtitlesFromM3u8(resolved, headers, subtitleCallback)
                 return true
             }
+            Log.e(TAG, "    ✗ cf had 0 variants [$k] → fall through")
         }
 
+        // 2. source field directly — emit even if IP (Plex at least appears in list)
+        for (k in listOf("source", "src", "url", "hls", "mp4", "stream")) {
+            val u = json.optString(k).trim()
+            if (u.isBlank() || isPlaceholderUrl(u) ||
+                (!u.startsWith("http") && !u.startsWith("//"))) continue
+            val resolved = resolveUrl(u, "$origin/", origin) ?: u
+            Log.e(TAG, "    ★ source field [$k] → ${resolved.take(90)}")
+            emitSingleUrl(resolved, origin, headers, subtitleCallback, callback)
+            return true
+        }
+
+        // 3. Deep scan (with nested JSON recursion — see Fix B)
         val deep = extractUrlsFromJson(json).filter { !isPlaceholderUrl(it) }
         if (deep.isNotEmpty()) {
-            // FIX: sort domain URLs before IP URLs (IPs often have invalid SSL certs)
             val sorted = deep.distinct().sortedByDescending { u ->
                 val h = hostOf(u) ?: ""
                 !h.matches(Regex("""^\d+\.\d+\.\d+\.\d+$"""))
@@ -1008,39 +1032,12 @@ class P2pstream : ExtractorApi() {
             sorted.forEach { emitSingleUrl(it, origin, headers, subtitleCallback, callback) }
             return true
         }
-        val direct = listOf(json.optString("url"), json.optString("source"), json.optString("src"), json.optString("file"))
-            .firstOrNull { it.isNotBlank() && (it.startsWith("http") || it.startsWith("//")) && !isPlaceholderUrl(it) }
-        if (!direct.isNullOrBlank()) { emitSingleUrl(direct, origin, headers, subtitleCallback, callback); return true }
-        for (k in listOf("streams", "sources", "links", "videos", "mirrors", "data", "result")) {
-            val arr = json.optJSONArray(k) ?: continue
-            var any = false
-            for (i in 0 until arr.length()) {
-                val o = arr.optJSONObject(i) ?: continue
-                val u = o.optString("url").ifBlank { o.optString("file") }.ifBlank { o.optString("src") }
-                if (u.isNotBlank() && !isPlaceholderUrl(u)) { emitSingleUrl(u, origin, headers, subtitleCallback, callback); any = true }
-            }
-            if (any) return true
-        }
         return false
     }
 
-    private suspend fun emitSingleUrl(
-        url: String, origin: String, headers: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
-    ) {
-        val u = if (url.startsWith("//")) "https:$url" else url
-        if (u.contains(".m3u8")) emitHls(u, origin, headers, subtitleCallback, callback)
-        else callback(newExtractorLink(name, name, u, INFER_TYPE) { this.referer = "$origin/"; this.headers = headers })
-    }
-
-    private suspend fun emitHls(
-        m3u8: String, origin: String, headers: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
-    ) {
-        M3u8Helper.generateM3u8(name, m3u8, "$origin/", headers = headers).forEach(callback)
-        emitSubtitlesFromM3u8(m3u8, headers, subtitleCallback)
-    }
-}
+    // Helper for chained ifBlank
+    private fun JSONObject.optBlank(k: String): String =
+        optString(k).ifBlank { "" }
 
 // ════════════════════════════════════════════════════════════════════════════
 //  BYSE — FIXED: full browser headers + folder iframes + download page redirects
