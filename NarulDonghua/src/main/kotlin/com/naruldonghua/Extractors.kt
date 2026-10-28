@@ -1003,12 +1003,12 @@ class P2pstream : ExtractorApi() {
         val direct = listOf(json.optString("url"), json.optString("source"), json.optString("src"), json.optString("file"))
             .firstOrNull { it.isNotBlank() && (it.startsWith("http") || it.startsWith("//")) && !isPlaceholderUrl(it) }
         if (!direct.isNullOrBlank()) { emitSingleUrl(direct, origin, headers, subtitleCallback, callback); return true }
-        for (k in listOf("streams", "sources", "links", "videos", "mirrors", "data", "result")) {
+             for (k in listOf("streams", "sources", "links", "videos", "mirrors", "data", "result")) {
             val arr = json.optJSONArray(k) ?: continue
             var any = false
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
-                val u = o.optString("url").ifBlank { o.optString("file") }.optString("src")
+                val u = o.optString("url").ifBlank { o.optString("file") }.ifBlank { o.optString("src") }
                 if (u.isNotBlank() && !isPlaceholderUrl(u)) { emitSingleUrl(u, origin, headers, subtitleCallback, callback); any = true }
             }
             if (any) return true
