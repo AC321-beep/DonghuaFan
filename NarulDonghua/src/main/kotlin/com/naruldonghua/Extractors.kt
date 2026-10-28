@@ -31,6 +31,86 @@ private const val DEFAULT_UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
+// ════════════════════════════════════════════════════════════════════════════
+//  BROWSER MIMIC HEADERS
+// ════════════════════════════════════════════════════════════════════════════
+/**
+ * Full Chrome 131 request header set. Includes DNT, Sec-GPC, Priority, and
+ * complete Sec-CH-UA variants — all commonly checked by anti-bot fingerprinters.
+ *
+ * Do NOT add `Accept-Encoding: br` here — OkHttp can't decompress brotli and
+ * returns garbage. OkHttp transparently adds gzip handling itself.
+ *
+ * dest/mode/site match Chrome's actual Sec-Fetch-* values per resource type:
+ *   document  → navigate / same-origin / none       (page loads)
+ *   script    → no-cors  / same-origin              (JS files)
+ *   style     → no-cors  / same-origin              (CSS files)
+ *   image     → no-cors  / same-origin              (images)
+ *   empty     → cors     / same-origin              (fetch/XHR)
+ *   video     → no-cors  / cross-site               (video element src)
+ */
+private fun chromeHeaders(
+    dest: String = "document",
+    mode: String = "navigate",
+    site: String = "same-origin",
+    referer: String? = null,
+    accept: String = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    priority: String = "u=0, i",
+    origin: String? = null,
+): Map<String, String> {
+    val m = mutableMapOf(
+        "User-Agent" to DEFAULT_UA,
+        "Accept" to accept,
+        "Accept-Language" to "en-US,en;q=0.9",
+        "DNT" to "1",
+        "Sec-GPC" to "1",
+        "Sec-Ch-Ua" to "\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"131\"",
+        "Sec-Ch-Ua-Mobile" to "?0",
+        "Sec-Ch-Ua-Platform" to "\"Windows\"",
+        "Sec-Ch-Ua-Arch" to "\"x86\"",
+        "Sec-Ch-Ua-Bitness" to "\"64\"",
+        "Sec-Fetch-Dest" to dest,
+        "Sec-Fetch-Mode" to mode,
+        "Sec-Fetch-Site" to site,
+        "Priority" to priority,
+    )
+    if (!referer.isNullOrBlank()) m["Referer"] = referer
+    if (!origin.isNullOrBlank()) m["Origin"] = origin
+    if (mode == "navigate") {
+        m["Upgrade-Insecure-Requests"] = "1"
+        m["Sec-Fetch-User"] = "?1"
+    }
+    return m
+}
+
+/** Media/stream headers — video element loading a resource. */
+private fun chromeMediaHeaders(referer: String, origin: String? = null): Map<String, String> =
+    chromeHeaders(
+        dest = "video", mode = "no-cors", site = "cross-site",
+        referer = referer, origin = origin,
+        accept = "*/*", priority = "u=4, i",
+    )
+
+/**
+ * Prime the cookie jar by fetching the site root first. Many anti-bot systems
+ * (Cloudflare managed challenge, Byse-style Cloudflare Workers, DDoS-Guard)
+ * set a visitor cookie on / that later requests must carry. OkHttp's app
+ * persists cookies automatically, so this is enough to flip SSR on.
+ */
+private suspend fun primeCookies(origin: String, tag: String) {
+    try {
+        val h = chromeHeaders(dest = "document", mode = "navigate", site = "none", referer = null)
+        val r = app.get("$origin/", headers = h, timeout = 10L)
+        val cookie = r.headers["set-cookie"]?.take(80) ?: "none"
+        Log.e(tag, "  primeCookies → code=${r.code} set-cookie='${cookie}'")
+    } catch (e: Exception) {
+        Log.e(tag, "  primeCookies fail: ${e.message?.take(60)}")
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  REGEXES
+// ════════════════════════════════════════════════════════════════════════════
 private val RE_PACKED_SCRIPT = Regex(
     """eval\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,\s*[a-zA-Z0-9_]\s*\)[\s\S]*?split\(\s*['"]\|['"]\s*\)[\s\S]*?\}\s*\([\s\S]*?\)\s*\)""",
     RegexOption.IGNORE_CASE
@@ -305,9 +385,7 @@ private fun extractUrlsFromJson(json: JSONObject, depth: Int = 0): List<String> 
         when (val v = json.opt(keys.next())) {
             is String -> {
                 val s = v.replace("\\/", "/")
-                // URLs anywhere in the string (not just at start)
                 urlRe.findAll(s).forEach { urls.add(it.groupValues[1]) }
-                // Recurse if value is a nested JSON string (e.g. streamingConfig)
                 val trimmed = s.trimStart()
                 if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
                     try { urls.addAll(extractUrlsFromJson(JSONObject(s), depth + 1)) }
@@ -419,7 +497,7 @@ private suspend fun manualJsUnpackExtraction(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PLEX — FIXED: JSON first (prefers cf field with valid cert over source IP)
+//  PLEX — browser-mimic API headers + video-type cf fetch
 // ════════════════════════════════════════════════════════════════════════════
 class P2pstream : ExtractorApi() {
     override val name = "Plex"
@@ -542,13 +620,16 @@ class P2pstream : ExtractorApi() {
         Log.e(TAG, "origin=$origin id=$id")
 
         val refHost = referer?.let { hostOf(it) } ?: hostOf(origin) ?: origin
-        val headers = mapOf(
-            "Origin" to origin, "Referer" to "$origin/", "User-Agent" to DEFAULT_UA,
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+
+        // Full browser mimic — page headers for HTML, XHR headers for API
+        val pageHeaders = chromeHeaders(
+            dest = "document", mode = "navigate", site = "same-origin",
+            referer = "$origin/", origin = origin, priority = "u=0, i",
         )
-        val apiHeaders = headers + mapOf(
-            "Accept" to "application/json, text/plain, */*",
-            "Sec-Fetch-Dest" to "empty", "Sec-Fetch-Mode" to "cors", "Sec-Fetch-Site" to "same-origin",
+        val apiHeaders = chromeHeaders(
+            dest = "empty", mode = "cors", site = "same-origin",
+            referer = "$origin/", origin = origin,
+            accept = "application/json, text/plain, */*", priority = "u=1, i",
         )
 
         workingEndpointCache[origin]?.let { cached ->
@@ -558,7 +639,7 @@ class P2pstream : ExtractorApi() {
             }
         }
 
-        ensureJsCached(origin, id, headers)
+        ensureJsCached(origin, id, pageHeaders)
 
         for (tmpl in KNOWN_ENDPOINTS) {
             when (probeEndpoint(origin, tmpl, id, refHost, apiHeaders, subtitleCallback, callback)) {
@@ -598,7 +679,6 @@ class P2pstream : ExtractorApi() {
         when (resp.code) { 429 -> return ProbeResult.RATE_LIMITED; 404, 403, 410 -> return ProbeResult.NOT_FOUND }
         if (resp.code !in 200..299 || isErrorPage(body)) return ProbeResult.NOT_FOUND
 
-        // Defers JSON to tryJsonBody (which prefers cf field)
         if (tryDirectMedia(body, origin, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
         if (tryJsonBody(body, origin, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
 
@@ -678,7 +758,6 @@ class P2pstream : ExtractorApi() {
         suspend fun tryPlain(s: String, label: String): Boolean {
             if (!likelyPlain(s)) return false
             Log.e(TAG, "    ✓✓ $label PLAINTEXT=${s.take(400)}")
-            // FIX: JSON FIRST — cf field (valid domain) beats source IP (invalid cert)
             if (tryJsonBody(s, origin, apiHeaders, subtitleCallback, callback)) return true
             if (tryDirectMedia(s, origin, apiHeaders, subtitleCallback, callback)) return true
             if (tryExtractTokenAndProbe(s, origin, id, refHost, apiHeaders, subtitleCallback, callback)) return true
@@ -817,7 +896,6 @@ class P2pstream : ExtractorApi() {
         suspend fun tryPlain(s: String, label: String): Boolean {
             if (!likelyPlain(s)) return false
             Log.e(TAG, "    ✓ $label → ${s.take(200)}")
-            // FIX: JSON FIRST
             if (tryJsonBody(s, origin, apiHeaders, subtitleCallback, callback)) return true
             if (tryDirectMedia(s, origin, apiHeaders, subtitleCallback, callback)) return true
             if (tryExtractTokenAndProbe(s, origin, id, refHost, apiHeaders, subtitleCallback, callback)) return true
@@ -957,7 +1035,6 @@ class P2pstream : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
     ): Boolean {
         if (text.length > 800_000) return false
-        // FIX: skip JSON — let tryJsonBody handle it (its cf field has valid cert, source IP doesn't)
         val trimmed = text.trimStart()
         if (trimmed.startsWith("{") || trimmed.startsWith("[")) return false
         val n = text.replace("\\/", "/")
@@ -970,7 +1047,7 @@ class P2pstream : ExtractorApi() {
         return false
     }
 
-       private suspend fun tryJsonBody(
+    private suspend fun tryJsonBody(
         body: String, origin: String, headers: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
     ): Boolean {
@@ -982,7 +1059,7 @@ class P2pstream : ExtractorApi() {
             val subArr = json.optJSONArray(subKey) ?: continue
             for (i in 0 until subArr.length()) {
                 val subObj = subArr.optJSONObject(i) ?: continue
-                val subUrl = subObj.optString("file").ifBlank { subObj.optString("url") }.optBlank("src")
+                val subUrl = subObj.optString("file").ifBlank { subObj.optString("url") }.ifBlank { subObj.optString("src") }
                 if (subUrl.isNotBlank() && !isPlaceholderUrl(subUrl)) {
                     val label = subObj.optString("label").ifBlank { subObj.optString("lang") }.ifBlank { "Sub" }
                     subtitleCallback(newSubtitleFile(label, resolveUrl(subUrl, "$origin/", origin) ?: subUrl) { this.headers = headers })
@@ -990,7 +1067,9 @@ class P2pstream : ExtractorApi() {
             }
         }
 
-        // 1. cf field — emit ONLY if M3u8Helper produces variants
+        // Media headers for cf m3u8 fetch — video dest, Accept: */*
+        val mediaHeaders = chromeMediaHeaders("$origin/", origin)
+
         for (k in listOf("cf", "CF", "cfMaster", "cfManifest", "manifest", "playlist", "master")) {
             val cfUrl = json.optString(k).trim()
             if (cfUrl.isBlank() || isPlaceholderUrl(cfUrl) ||
@@ -999,48 +1078,60 @@ class P2pstream : ExtractorApi() {
             Log.e(TAG, "    ★ cf-style manifest [$k] → ${resolved.take(90)}")
             val variants = try {
                 withTimeoutOrNull(8_000L) {
-                    M3u8Helper.generateM3u8(name, resolved, "$origin/", headers = headers)
+                    M3u8Helper.generateM3u8(name, resolved, "$origin/", headers = mediaHeaders)
                 }
             } catch (_: Exception) { null }
             if (!variants.isNullOrEmpty()) {
                 Log.e(TAG, "    ✓ cf produced ${variants.size} variants")
                 variants.forEach(callback)
-                emitSubtitlesFromM3u8(resolved, headers, subtitleCallback)
+                emitSubtitlesFromM3u8(resolved, mediaHeaders, subtitleCallback)
                 return true
             }
             Log.e(TAG, "    ✗ cf had 0 variants [$k] → fall through")
         }
 
-        // 2. source field directly — emit even if IP (Plex at least appears in list)
         for (k in listOf("source", "src", "url", "hls", "mp4", "stream")) {
             val u = json.optString(k).trim()
             if (u.isBlank() || isPlaceholderUrl(u) ||
                 (!u.startsWith("http") && !u.startsWith("//"))) continue
             val resolved = resolveUrl(u, "$origin/", origin) ?: u
             Log.e(TAG, "    ★ source field [$k] → ${resolved.take(90)}")
-            emitSingleUrl(resolved, origin, headers, subtitleCallback, callback)
+            emitSingleUrl(resolved, origin, mediaHeaders, subtitleCallback, callback)
             return true
         }
 
-        // 3. Deep scan (with nested JSON recursion — see Fix B)
         val deep = extractUrlsFromJson(json).filter { !isPlaceholderUrl(it) }
         if (deep.isNotEmpty()) {
             val sorted = deep.distinct().sortedByDescending { u ->
                 val h = hostOf(u) ?: ""
                 !h.matches(Regex("""^\d+\.\d+\.\d+\.\d+$"""))
             }
-            sorted.forEach { emitSingleUrl(it, origin, headers, subtitleCallback, callback) }
+            sorted.forEach { emitSingleUrl(it, origin, mediaHeaders, subtitleCallback, callback) }
             return true
         }
         return false
     }
 
-    // Helper for chained ifBlank
-    private fun JSONObject.optBlank(k: String): String =
-        optString(k).ifBlank { "" }
+    private suspend fun emitSingleUrl(
+        url: String, origin: String, headers: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
+    ) {
+        val u = if (url.startsWith("//")) "https:$url" else url
+        if (u.contains(".m3u8")) emitHls(u, origin, headers, subtitleCallback, callback)
+        else callback(newExtractorLink(name, name, u, INFER_TYPE) { this.referer = "$origin/"; this.headers = headers })
+    }
+
+    private suspend fun emitHls(
+        m3u8: String, origin: String, headers: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
+    ) {
+        M3u8Helper.generateM3u8(name, m3u8, "$origin/", headers = headers).forEach(callback)
+        emitSubtitlesFromM3u8(m3u8, headers, subtitleCallback)
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════════════
-//  BYSE — FIXED: full browser headers + folder iframes + download page redirects
+//  BYSE — cookie prime + n1mwq direct + per-resource-type headers
 // ════════════════════════════════════════════════════════════════════════════
 class Bysekoze : ExtractorApi() {
     override val name = "Byse"
@@ -1050,31 +1141,19 @@ class Bysekoze : ExtractorApi() {
     companion object {
         private const val TAG = "Narul/Byse"
         private val RE_SCRIPT_SRC = Regex("""<script[^>]+src=["']([^"']+\.js[^"']*)["']""", RegexOption.IGNORE_CASE)
-
-        // Full Chrome page-load header set — server returns SSR HTML (with iframe) to real browsers
-        // but SPA shell (empty #root) to bare clients
-        private fun browserPageHeaders(origin: String): Map<String, String> = mapOf(
-            "User-Agent" to DEFAULT_UA,
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language" to "en-US,en;q=0.9",
-            "Cache-Control" to "no-cache",
-            "Pragma" to "no-cache",
-            "Referer" to "$origin/",
-            "Sec-Fetch-Dest" to "document",
-            "Sec-Fetch-Mode" to "navigate",
-            "Sec-Fetch-Site" to "same-origin",
-            "Sec-Fetch-User" to "?1",
-            "Upgrade-Insecure-Requests" to "1",
-            "Sec-Ch-Ua" to "\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"131\"",
-            "Sec-Ch-Ua-Mobile" to "?0",
-            "Sec-Ch-Ua-Platform" to "\"Windows\"",
-        )
     }
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         Log.e(TAG, "getUrl $url")
         val origin = originOf(url) ?: return
-        val pageHeaders = browserPageHeaders(origin)
+
+        // Cookie priming — bypass SPA-shell detection on subsequent requests
+        primeCookies(origin, TAG)
+
+        val pageHeaders = chromeHeaders(
+            dest = "document", mode = "navigate", site = "same-origin",
+            referer = "$origin/", origin = origin,
+        )
 
         if (manualJsUnpackExtraction(url, name, pageHeaders, subtitleCallback, callback)) return
 
@@ -1083,11 +1162,35 @@ class Bysekoze : ExtractorApi() {
             ?: url.substringAfter("/e/", "").substringBefore("/").substringBefore("?").takeIf { it.isNotBlank() }
             ?: return
 
-        // Folder URLs (/d/{hash}/{slug}): the folder page often renders the player directly
+        // ═════════════════════════════════════════════════════════════════════
+        //  n1mwq.org DIRECT — evidence from sample HTML (real browser sees):
+        //    <iframe src="https://n1mwq.org/a2lyf/{hash}"
+        //            referrerpolicy="origin-when-cross-origin">
+        //  n1mwq.org is a separate player host. It may not share Byse's TLS
+        //  fingerprint check → worth trying before the bysejikuar wall.
+        // ═════════════════════════════════════════════════════════════════════
+        val n1mwqUrl = "https://n1mwq.org/a2lyf/$hash"
+        Log.e(TAG, "  try n1mwq direct → $n1mwqUrl")
+        // referrerpolicy="origin-when-cross-origin" → only send origin as Referer
+        val n1mwqHeaders = chromeHeaders(
+            dest = "document", mode = "navigate", site = "cross-site",
+            referer = "$origin/",
+        )
+        if (manualJsUnpackExtraction(n1mwqUrl, name, n1mwqHeaders, subtitleCallback, callback)) {
+            Log.e(TAG, "  ✓ n1mwq via manualJsUnpack"); return
+        }
+        try {
+            var found = false
+            loadExtractor(n1mwqUrl, "$origin/", subtitleCallback) { link -> found = true; callback(link) }
+            if (found) { Log.e(TAG, "  ✓ n1mwq via loadExtractor"); return }
+        } catch (e: Exception) {
+            Log.e(TAG, "  n1mwq fail: ${e.message?.take(80)}")
+        }
+
+        // Folder URL: scrape iframes + /e/ + /download/ links
         if (url.contains("/d/", true)) {
             val folderDoc = try { app.get(url, headers = pageHeaders).document } catch (_: Exception) { null }
             if (folderDoc != null && !isErrorPage(folderDoc.html())) {
-                // FIX: check iframes on folder page (sample HTML shows iframe here)
                 val folderIframes = folderDoc.select("iframe[src], iframe[data-src], iframe[data-litespeed-src]")
                 Log.e(TAG, "  folder iframes: ${folderIframes.size}")
                 for (iframe in folderIframes) {
@@ -1104,7 +1207,6 @@ class Bysekoze : ExtractorApi() {
                     }
                 }
 
-                // Also check og:video / JSON-LD on folder page
                 val ogVideo = folderDoc.selectFirst("meta[property=og:video], meta[property=og:video:url], meta[property=og:video:secure_url]")
                     ?.attr("content")?.takeIf { it.isNotBlank() }
                 if (ogVideo != null && !isPlaceholderUrl(ogVideo)) {
@@ -1169,7 +1271,6 @@ class Bysekoze : ExtractorApi() {
         val iframeCount = doc.select("iframe").size
         Log.e(TAG, "    shell len=${shell.text.length} iframes=$iframeCount preview=${shell.text.take(200).replace("\n", "\\n")}")
 
-        // og:video / og:video:url
         val ogVideo = doc.selectFirst("meta[property=og:video], meta[property=og:video:url], meta[property=og:video:secure_url]")
             ?.attr("content")?.takeIf { it.isNotBlank() && !isPlaceholderUrl(it) }
         if (ogVideo != null) {
@@ -1186,7 +1287,6 @@ class Bysekoze : ExtractorApi() {
             return true
         }
 
-        // JSON-LD with video
         for (ldScript in doc.select("script[type='application/ld+json']")) {
             val data = ldScript.data()
             if (!data.contains("VideoObject", true) && !data.contains("contentUrl", true)) continue
@@ -1205,7 +1305,6 @@ class Bysekoze : ExtractorApi() {
             }
         }
 
-        // Iframe
         val iframes = doc.select(".jw8-player-shell iframe, iframe[src], iframe[data-src], iframe[data-litespeed-src]")
         for (iframe in iframes.distinct()) {
             val src = iframe.attr("src")
@@ -1226,7 +1325,6 @@ class Bysekoze : ExtractorApi() {
             }
         }
 
-        // Direct m3u8/mp4 in shell
         val html = shell.text.replace("\\/", "/")
         RE_M3U8_ANY.find(html)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { m3u8 ->
             Log.e(TAG, "    ✓ m3u8 in shell → ${m3u8.take(90)}")
@@ -1261,7 +1359,12 @@ class Bysekoze : ExtractorApi() {
             .firstOrNull { it.contains(".js") } ?: return false
         Log.e(TAG, "  tryJsChunks main js → $jsUrl")
 
-        val js = fetchText(jsUrl, headers) ?: return false
+        // Per-resource-type headers for JS chunks — Sec-Fetch-Dest: script
+        val scriptHeaders = chromeHeaders(
+            dest = "script", mode = "no-cors", site = "same-origin",
+            referer = embedUrl, accept = "*/*", priority = "u=1, i",
+        )
+        val js = fetchText(jsUrl, scriptHeaders) ?: return false
         Log.e(TAG, "    js len=${js.length}")
 
         val chunks = extractAllChunkUrls(js).sortedByDescending { c ->
@@ -1278,7 +1381,7 @@ class Bysekoze : ExtractorApi() {
         for (chunk in chunks.take(40)) {
             val chunkUrl = resolveUrl(chunk, embedUrl, origin) ?: continue
             if (isTemplatePlaceholder(chunkUrl)) continue
-            val chunkJs = fetchText(chunkUrl, headers) ?: continue
+            val chunkJs = fetchText(chunkUrl, scriptHeaders) ?: continue
 
             RE_M3U8_ANY.findAll(chunkJs).map { it.groupValues[1] }
                 .filter { !isPlaceholderUrl(it) }
@@ -1291,7 +1394,7 @@ class Bysekoze : ExtractorApi() {
         }
 
         Log.e(TAG, "    collected m3u8 (${allM3u8.distinct().size})")
-        val m3u8Headers = headers + mapOf("Referer" to "$origin/", "Origin" to origin)
+        val mediaHeaders = chromeMediaHeaders(embedUrl, origin)
 
         for (m3u8 in allM3u8.distinct().take(3)) {
             val alternates = mutableListOf(m3u8)
@@ -1301,21 +1404,21 @@ class Bysekoze : ExtractorApi() {
             for (alt in alternates.distinct()) {
                 try {
                     val links = withTimeoutOrNull(8_000L) {
-                        M3u8Helper.generateM3u8(name, alt, "$origin/", headers = m3u8Headers)
+                        M3u8Helper.generateM3u8(name, alt, "$origin/", headers = mediaHeaders)
                     }
                     if (!links.isNullOrEmpty()) {
                         links.forEach(callback)
-                        emitSubtitlesFromM3u8(alt, m3u8Headers, subtitleCallback)
+                        emitSubtitlesFromM3u8(alt, mediaHeaders, subtitleCallback)
                         return true
                     }
                 } catch (_: Exception) {}
             }
             for (alt in alternates.distinct()) {
-                if (isValidM3u8(alt, m3u8Headers)) {
+                if (isValidM3u8(alt, mediaHeaders)) {
                     callback(newExtractorLink(name, name, alt, INFER_TYPE) {
-                        this.referer = "$origin/"; this.headers = m3u8Headers
+                        this.referer = "$origin/"; this.headers = mediaHeaders
                     })
-                    emitSubtitlesFromM3u8(alt, m3u8Headers, subtitleCallback)
+                    emitSubtitlesFromM3u8(alt, mediaHeaders, subtitleCallback)
                     return true
                 }
             }
@@ -1327,22 +1430,22 @@ class Bysekoze : ExtractorApi() {
             if (cleanPath.contains("{") || cleanPath.contains(":")) continue
             val tryUrl = resolveUrl(cleanPath, embedUrl, origin) ?: continue
             try {
-                val r = app.get(tryUrl, headers = headers + ("Accept" to "application/json"))
+                val r = app.get(tryUrl, headers = scriptHeaders + ("Accept" to "application/json"))
                 if (r.code == 200 && !isErrorPage(r.text)) {
                     RE_M3U8_ANY.find(r.text)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { m3u8 ->
                         val links = withTimeoutOrNull(8_000L) {
-                            M3u8Helper.generateM3u8(name, m3u8, "$origin/", headers = m3u8Headers)
+                            M3u8Helper.generateM3u8(name, m3u8, "$origin/", headers = mediaHeaders)
                         }
                         if (!links.isNullOrEmpty()) {
                             links.forEach(callback)
-                            emitSubtitlesFromM3u8(m3u8, m3u8Headers, subtitleCallback)
+                            emitSubtitlesFromM3u8(m3u8, mediaHeaders, subtitleCallback)
                             return true
                         }
-                        if (isValidM3u8(m3u8, m3u8Headers)) {
+                        if (isValidM3u8(m3u8, mediaHeaders)) {
                             callback(newExtractorLink(name, name, m3u8, INFER_TYPE) {
-                                this.referer = "$origin/"; this.headers = m3u8Headers
+                                this.referer = "$origin/"; this.headers = mediaHeaders
                             })
-                            emitSubtitlesFromM3u8(m3u8, m3u8Headers, subtitleCallback)
+                            emitSubtitlesFromM3u8(m3u8, mediaHeaders, subtitleCallback)
                             return true
                         }
                     }
@@ -1353,7 +1456,6 @@ class Bysekoze : ExtractorApi() {
         return false
     }
 
-    // FIX: Download page may redirect via meta-refresh, JS, form, or "continue" button
     private suspend fun tryDownloadPage(
         downloadUrl: String,
         headers: Map<String, String>,
@@ -1389,7 +1491,6 @@ class Bysekoze : ExtractorApi() {
         val body = try { resp.text.replace("\\/", "/") } catch (_: Exception) { return false }
         Log.e(TAG, "    shell len=${body.length} preview=${body.take(200).replace("\n", "\\n")}")
 
-        // Direct m3u8/mp4
         RE_M3U8_ANY.find(body)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { m3u8 ->
             Log.e(TAG, "    ✓ m3u8 in download page → ${m3u8.take(90)}")
             M3u8Helper.generateM3u8(name, m3u8, downloadUrl, headers = headers).forEach(callback)
@@ -1406,7 +1507,6 @@ class Bysekoze : ExtractorApi() {
 
         val doc = Jsoup.parse(body)
 
-        // meta refresh
         val metaRefresh = doc.selectFirst("meta[http-equiv=refresh]")?.attr("content")
         if (!metaRefresh.isNullOrBlank()) {
             val redirectUrl = metaRefresh.substringAfter("url=", "").substringAfter("URL=", "").trim().trim('\'', '"')
@@ -1417,7 +1517,6 @@ class Bysekoze : ExtractorApi() {
             }
         }
 
-        // JS redirect in script tags
         for (script in doc.select("script:not([src])")) {
             val data = script.data()
             val jsRedirect = Regex("""(?:window\.location(?:\.href)?|location\.href|location\.replace)\s*=\s*["']([^"']+)["']""")
@@ -1431,7 +1530,6 @@ class Bysekoze : ExtractorApi() {
             }
         }
 
-        // Form action
         val form = doc.selectFirst("form[action]")
         if (form != null) {
             val action = form.attr("action").trim()
@@ -1444,7 +1542,6 @@ class Bysekoze : ExtractorApi() {
             }
         }
 
-        // "Continue"/"Proceed"/"Download" buttons/links (without .mp4/.m3u8 extension)
         val buttonPattern = Regex("""(?:download|proceed|continue|generate|get\s*link|unlock|verify|next)""", RegexOption.IGNORE_CASE)
         for (a in doc.select("a[href], button[data-href], button[data-url]")) {
             val href = a.attr("href").ifBlank { a.attr("data-href") }.ifBlank { a.attr("data-url") }
@@ -1456,7 +1553,6 @@ class Bysekoze : ExtractorApi() {
             if (tryDownloadPage(resolved, headers, subtitleCallback, callback, depth + 1)) return true
         }
 
-        // Iframe on download page
         for (iframe in doc.select("iframe[src], iframe[data-src], iframe[data-litespeed-src]")) {
             val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }.ifBlank { iframe.attr("data-litespeed-src") }
             if (src.isBlank() || isPlaceholderUrl(src)) continue
@@ -1478,7 +1574,7 @@ class Bysekoze : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  ABYSS — keeps the readHeadBytes fix (avoids >5MB .text exception)
+//  ABYSS — browser-mimic page + probe headers, cookie prime
 // ════════════════════════════════════════════════════════════════════════════
 class AbyssPlayer : ExtractorApi() {
     override val name = "Abyss"
@@ -1511,8 +1607,6 @@ class AbyssPlayer : ExtractorApi() {
                 .ifBlank { src.optString("type") }.ifBlank { src.optString("res") }
                 .ifBlank { src.optString("resolution") }
 
-         // Never read whole body of media URLs — would throw on large files.
-        // Accepts ResponseBody directly so it works with NiceResponse.body without type juggling.
         private fun readHeadBytes(body: okhttp3.ResponseBody?, maxBytes: Int = 500): String {
             if (body == null) return ""
             return try {
@@ -1528,21 +1622,19 @@ class AbyssPlayer : ExtractorApi() {
                 }
             } catch (_: Exception) { "" }
         }
-
-        private fun browserHeaders(referer: String): Map<String, String> = mapOf(
-            "User-Agent" to DEFAULT_UA, "Accept" to "*/*",
-            "Accept-Language" to "en-US,en;q=0.9",
-            "Referer" to referer, "Cache-Control" to "no-cache", "Pragma" to "no-cache",
-            "Sec-Fetch-Dest" to "video", "Sec-Fetch-Mode" to "no-cors", "Sec-Fetch-Site" to "cross-site",
-            "Sec-Ch-Ua" to "\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"131\"",
-            "Sec-Ch-Ua-Mobile" to "?0", "Sec-Ch-Ua-Platform" to "\"Windows\"",
-        )
     }
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         Log.e(TAG, "=== Abyss getUrl url=$url")
         val origin = originOf(url) ?: return
-        val pageHeaders = mapOf("User-Agent" to DEFAULT_UA, "Origin" to origin, "Referer" to (referer ?: "$origin/"))
+
+        // Cookie priming — Cloudflare Worker on abyssplayer.com may set visitor cookie
+        primeCookies(origin, TAG)
+
+        val pageHeaders = chromeHeaders(
+            dest = "document", mode = "navigate", site = "same-origin",
+            referer = referer ?: "$origin/", origin = origin,
+        )
 
         val doc = try { app.get(url, headers = pageHeaders).document } catch (e: Exception) {
             Log.e(TAG, "page fetch failed: ${e.message}"); return
@@ -1574,8 +1666,9 @@ class AbyssPlayer : ExtractorApi() {
 
         if (sampleUrl != null) {
             for (ref in refererCandidates) {
+                val probeHeaders = chromeMediaHeaders(ref, origin)
                 val probe = try {
-                    app.get(sampleUrl, headers = browserHeaders(ref), timeout = 10L)
+                    app.get(sampleUrl, headers = probeHeaders, timeout = 10L)
                 } catch (_: Exception) { null }
                 val ct = probe?.headers?.get("content-type")?.lowercase() ?: ""
                 Log.e(TAG, "  probe[ref=${ref.take(50)}] → code=${probe?.code} ct='$ct'")
@@ -1587,7 +1680,7 @@ class AbyssPlayer : ExtractorApi() {
             }
         }
 
-        val streamHeaders = browserHeaders(chosenReferer)
+        val streamHeaders = chromeMediaHeaders(chosenReferer, origin)
 
         val seenSubs = HashSet<String>()
         for (key in SUBTITLE_ARRAY_KEYS) {
