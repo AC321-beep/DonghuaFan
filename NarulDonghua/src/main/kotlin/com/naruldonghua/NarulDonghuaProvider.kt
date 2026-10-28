@@ -391,11 +391,12 @@ class NarulDonghuaProvider : MainAPI() {
                 Log.e("Narul/Prov", "skip ad: $url")
                 return
             }
-            if (!visited.add(url.substringBefore('#'))) {
+                       // Keep the hash for Plex so #hash and #hash&dl=1 are treated as separate fallbacks!
+            val visitKey = if (url.contains("p2pstream.vip", true)) url else url.substringBefore('#')
+            if (!visited.add(visitKey)) {
                 Log.e("Narul/Prov", "skip dup: $url")
                 return
             }
-
             Log.e("Narul/Prov", "── resolve[$label] $url")
 
             var extracted = false
