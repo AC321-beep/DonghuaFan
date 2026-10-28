@@ -27,9 +27,6 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-// ════════════════════════════════════════════════════════════════════════════
-//  CONSTANTS
-// ════════════════════════════════════════════════════════════════════════════
 private const val DEFAULT_UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -70,9 +67,6 @@ private fun isPlaceholderUrl(url: String): Boolean {
     return false
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  UTILITIES
-// ════════════════════════════════════════════════════════════════════════════
 private fun isErrorPage(html: String): Boolean {
     if (html.isBlank()) return true
     val lower = html.lowercase()
@@ -391,6 +385,7 @@ private suspend fun manualJsUnpackExtraction(
         .find(text)?.groupValues?.getOrNull(1)?.takeIf { !isTemplatePlaceholder(it) && !isPlaceholderUrl(it) }?.let { r ->
             if (r.startsWith("http") || r.startsWith("/") || r.startsWith("//")) {
                 val fixed = resolveUrl(r, url, origin) ?: return@let
+                Log.e("Narul/JS", "    JS-redirect → ${fixed.take(90)}")
                 if (manualJsUnpackExtraction(fixed, name, headers, subtitleCallback, callback, depth + 1)) return true
             }
         }
@@ -420,7 +415,7 @@ private suspend fun manualJsUnpackExtraction(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PLEX — handles p2pstream.vip + narulplex.p2pstream.vip + any subdomain
+//  PLEX — FIXED: JSON first (prefers cf field with valid cert over source IP)
 // ════════════════════════════════════════════════════════════════════════════
 class P2pstream : ExtractorApi() {
     override val name = "Plex"
@@ -599,6 +594,7 @@ class P2pstream : ExtractorApi() {
         when (resp.code) { 429 -> return ProbeResult.RATE_LIMITED; 404, 403, 410 -> return ProbeResult.NOT_FOUND }
         if (resp.code !in 200..299 || isErrorPage(body)) return ProbeResult.NOT_FOUND
 
+        // Defers JSON to tryJsonBody (which prefers cf field)
         if (tryDirectMedia(body, origin, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
         if (tryJsonBody(body, origin, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
 
@@ -678,7 +674,7 @@ class P2pstream : ExtractorApi() {
         suspend fun tryPlain(s: String, label: String): Boolean {
             if (!likelyPlain(s)) return false
             Log.e(TAG, "    ✓✓ $label PLAINTEXT=${s.take(400)}")
-            // CRITICAL: JSON first (prefers cf field with valid-cert domain over source field with IP)
+            // FIX: JSON FIRST — cf field (valid domain) beats source IP (invalid cert)
             if (tryJsonBody(s, origin, apiHeaders, subtitleCallback, callback)) return true
             if (tryDirectMedia(s, origin, apiHeaders, subtitleCallback, callback)) return true
             if (tryExtractTokenAndProbe(s, origin, id, refHost, apiHeaders, subtitleCallback, callback)) return true
@@ -817,7 +813,7 @@ class P2pstream : ExtractorApi() {
         suspend fun tryPlain(s: String, label: String): Boolean {
             if (!likelyPlain(s)) return false
             Log.e(TAG, "    ✓ $label → ${s.take(200)}")
-            // CRITICAL: JSON first (prefers cf field over source IP)
+            // FIX: JSON FIRST
             if (tryJsonBody(s, origin, apiHeaders, subtitleCallback, callback)) return true
             if (tryDirectMedia(s, origin, apiHeaders, subtitleCallback, callback)) return true
             if (tryExtractTokenAndProbe(s, origin, id, refHost, apiHeaders, subtitleCallback, callback)) return true
@@ -957,7 +953,7 @@ class P2pstream : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
     ): Boolean {
         if (text.length > 800_000) return false
-        // CRITICAL: skip JSON — let tryJsonBody handle it (JSON's cf field has valid-cert domain)
+        // FIX: skip JSON — let tryJsonBody handle it (its cf field has valid cert, source IP doesn't)
         val trimmed = text.trimStart()
         if (trimmed.startsWith("{") || trimmed.startsWith("[")) return false
         val n = text.replace("\\/", "/")
@@ -990,7 +986,7 @@ class P2pstream : ExtractorApi() {
             }
         }
 
-        // CRITICAL: cf/manifest/playlist/master fields use domain (valid cert) — prefer over source IP
+        // FIX: cf field uses valid-cert domain — prefer it over IP-based source field
         for (k in listOf("cf", "CF", "manifest", "playlist", "master")) {
             val cfUrl = json.optString(k).trim()
             if (cfUrl.isNotBlank() && !isPlaceholderUrl(cfUrl) &&
@@ -1004,10 +1000,10 @@ class P2pstream : ExtractorApi() {
 
         val deep = extractUrlsFromJson(json).filter { !isPlaceholderUrl(it) }
         if (deep.isNotEmpty()) {
-            // Prefer domain URLs over IP URLs (IPs often have invalid SSL certs)
+            // FIX: sort domain URLs before IP URLs (IPs often have invalid SSL certs)
             val sorted = deep.distinct().sortedByDescending { u ->
-                val host = hostOf(u) ?: ""
-                !host.matches(Regex("""^\d+\.\d+\.\d+\.\d+$"""))
+                val h = hostOf(u) ?: ""
+                !h.matches(Regex("""^\d+\.\d+\.\d+\.\d+$"""))
             }
             sorted.forEach { emitSingleUrl(it, origin, headers, subtitleCallback, callback) }
             return true
@@ -1047,7 +1043,7 @@ class P2pstream : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  BYSE — handles bysekoze.com + bysejikuar.com
+//  BYSE — FIXED: full browser headers + folder iframes + download page redirects
 // ════════════════════════════════════════════════════════════════════════════
 class Bysekoze : ExtractorApi() {
     override val name = "Byse"
@@ -1057,42 +1053,75 @@ class Bysekoze : ExtractorApi() {
     companion object {
         private const val TAG = "Narul/Byse"
         private val RE_SCRIPT_SRC = Regex("""<script[^>]+src=["']([^"']+\.js[^"']*)["']""", RegexOption.IGNORE_CASE)
+
+        // Full Chrome page-load header set — server returns SSR HTML (with iframe) to real browsers
+        // but SPA shell (empty #root) to bare clients
+        private fun browserPageHeaders(origin: String): Map<String, String> = mapOf(
+            "User-Agent" to DEFAULT_UA,
+            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Cache-Control" to "no-cache",
+            "Pragma" to "no-cache",
+            "Referer" to "$origin/",
+            "Sec-Fetch-Dest" to "document",
+            "Sec-Fetch-Mode" to "navigate",
+            "Sec-Fetch-Site" to "same-origin",
+            "Sec-Fetch-User" to "?1",
+            "Upgrade-Insecure-Requests" to "1",
+            "Sec-Ch-Ua" to "\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"131\"",
+            "Sec-Ch-Ua-Mobile" to "?0",
+            "Sec-Ch-Ua-Platform" to "\"Windows\"",
+        )
     }
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         Log.e(TAG, "getUrl $url")
         val origin = originOf(url) ?: return
-        // For page GETs, don't send Origin header — browsers don't send Origin on top-level GET
-        // and some servers serve different content when Origin is present
-        val pageHeaders = mapOf(
-            "Referer" to "$origin/", "User-Agent" to DEFAULT_UA,
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-        val withOrigin = pageHeaders + ("Origin" to origin)
+        val pageHeaders = browserPageHeaders(origin)
 
-        // Attempt 0: raw URL — try without Origin first
         if (manualJsUnpackExtraction(url, name, pageHeaders, subtitleCallback, callback)) return
-        if (manualJsUnpackExtraction(url, name, withOrigin, subtitleCallback, callback)) return
 
         val hash = url.substringAfter("/d/", "").substringBefore("/").substringBefore("?").takeIf { it.isNotBlank() }
             ?: url.substringAfter("/embed/", "").substringBefore("/").substringBefore("?").takeIf { it.isNotBlank() }
             ?: url.substringAfter("/e/", "").substringBefore("/").substringBefore("?").takeIf { it.isNotBlank() }
             ?: return
 
-        // Folder URLs: scrape iframes directly and /e/ /download/ links
+        // Folder URLs (/d/{hash}/{slug}): the folder page often renders the player directly
         if (url.contains("/d/", true)) {
             val folderDoc = try { app.get(url, headers = pageHeaders).document } catch (_: Exception) { null }
             if (folderDoc != null && !isErrorPage(folderDoc.html())) {
-                // NEW: check iframes directly in folder page
+                // FIX: check iframes on folder page (sample HTML shows iframe here)
                 val folderIframes = folderDoc.select("iframe[src], iframe[data-src], iframe[data-litespeed-src]")
                 Log.e(TAG, "  folder iframes: ${folderIframes.size}")
                 for (iframe in folderIframes) {
                     val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }.ifBlank { iframe.attr("data-litespeed-src") }
                     if (src.isNotBlank() && !isPlaceholderUrl(src)) {
                         val resolved = resolveUrl(src, url, origin) ?: continue
-                        Log.e(TAG, "  folder iframe → $resolved")
+                        Log.e(TAG, "  folder iframe → ${resolved.take(90)}")
                         if (manualJsUnpackExtraction(resolved, name, pageHeaders, subtitleCallback, callback)) return
+                        try {
+                            var found = false
+                            loadExtractor(resolved, url, subtitleCallback) { link -> found = true; callback(link) }
+                            if (found) { Log.e(TAG, "  ✓ folder iframe via loadExtractor"); return }
+                        } catch (_: Exception) {}
                     }
+                }
+
+                // Also check og:video / JSON-LD on folder page
+                val ogVideo = folderDoc.selectFirst("meta[property=og:video], meta[property=og:video:url], meta[property=og:video:secure_url]")
+                    ?.attr("content")?.takeIf { it.isNotBlank() }
+                if (ogVideo != null && !isPlaceholderUrl(ogVideo)) {
+                    val resolved = resolveUrl(ogVideo, url, origin) ?: ogVideo
+                    Log.e(TAG, "  folder og:video → ${resolved.take(90)}")
+                    if (resolved.contains(".m3u8")) {
+                        M3u8Helper.generateM3u8(name, resolved, url, headers = pageHeaders).forEach(callback)
+                        emitSubtitlesFromM3u8(resolved, pageHeaders, subtitleCallback)
+                        return
+                    }
+                    callback(newExtractorLink(name, name, resolved, INFER_TYPE) {
+                        this.referer = url; this.headers = pageHeaders
+                    })
+                    return
                 }
 
                 val eLinks = folderDoc.select("a[href*='/e/']").map { it.attr("href") }
@@ -1115,13 +1144,9 @@ class Bysekoze : ExtractorApi() {
             }
         }
 
-        // /e/{hash} — canonical video page
         if (tryEmbedPage("$origin/e/$hash", hash, pageHeaders, subtitleCallback, callback)) return
-        // /embed/{hash} — legacy
         if (tryEmbedPage("$origin/embed/$hash", hash, pageHeaders, subtitleCallback, callback)) return
-        // /d/{hash} without slug — might redirect to /e/ or have iframe
         if (tryEmbedPage("$origin/d/$hash", hash, pageHeaders, subtitleCallback, callback)) return
-        // /download/{hash} — final backup
         if (tryDownloadPage("$origin/download/$hash", pageHeaders, subtitleCallback, callback)) return
 
         Log.e(TAG, "✗ Byse exhausted")
@@ -1141,20 +1166,57 @@ class Bysekoze : ExtractorApi() {
         if (shell.code != 200 || isErrorPage(shell.text)) {
             Log.e(TAG, "    bad: ${shell.code}"); return false
         }
-        Log.e(TAG, "    shell len=${shell.text.length}")
         val origin = originOf(embedUrl) ?: return false
         val doc = Jsoup.parse(shell.text)
 
-        // PRIORITY 1: iframe with external player
+        val iframeCount = doc.select("iframe").size
+        Log.e(TAG, "    shell len=${shell.text.length} iframes=$iframeCount preview=${shell.text.take(200).replace("\n", "\\n")}")
+
+        // og:video / og:video:url
+        val ogVideo = doc.selectFirst("meta[property=og:video], meta[property=og:video:url], meta[property=og:video:secure_url]")
+            ?.attr("content")?.takeIf { it.isNotBlank() && !isPlaceholderUrl(it) }
+        if (ogVideo != null) {
+            val resolved = resolveUrl(ogVideo, embedUrl, origin) ?: ogVideo
+            Log.e(TAG, "    ✓ og:video → ${resolved.take(90)}")
+            if (resolved.contains(".m3u8")) {
+                M3u8Helper.generateM3u8(name, resolved, embedUrl, headers = headers).forEach(callback)
+                emitSubtitlesFromM3u8(resolved, headers, subtitleCallback)
+            } else {
+                callback(newExtractorLink(name, name, resolved, INFER_TYPE) {
+                    this.referer = embedUrl; this.headers = headers
+                })
+            }
+            return true
+        }
+
+        // JSON-LD with video
+        for (ldScript in doc.select("script[type='application/ld+json']")) {
+            val data = ldScript.data()
+            if (!data.contains("VideoObject", true) && !data.contains("contentUrl", true)) continue
+            RE_M3U8_ANY.find(data)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { m3u8 ->
+                Log.e(TAG, "    ✓ JSON-LD m3u8 → ${m3u8.take(90)}")
+                M3u8Helper.generateM3u8(name, m3u8, embedUrl, headers = headers).forEach(callback)
+                emitSubtitlesFromM3u8(m3u8, headers, subtitleCallback)
+                return true
+            }
+            RE_MP4_ANY.find(data)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { mp4 ->
+                Log.e(TAG, "    ✓ JSON-LD mp4 → ${mp4.take(90)}")
+                callback(newExtractorLink(name, name, mp4, INFER_TYPE) {
+                    this.referer = embedUrl; this.headers = headers
+                })
+                return true
+            }
+        }
+
+        // Iframe
         val iframes = doc.select(".jw8-player-shell iframe, iframe[src], iframe[data-src], iframe[data-litespeed-src]")
-        Log.e(TAG, "    iframes: ${iframes.size}")
         for (iframe in iframes.distinct()) {
             val src = iframe.attr("src")
                 .ifBlank { iframe.attr("data-src") }
                 .ifBlank { iframe.attr("data-litespeed-src") }
             if (src.isBlank() || isPlaceholderUrl(src)) continue
             val resolved = resolveUrl(src, embedUrl, origin) ?: continue
-            Log.e(TAG, "    iframe → $resolved")
+            Log.e(TAG, "    iframe → ${resolved.take(90)}")
 
             if (manualJsUnpackExtraction(resolved, name, headers, subtitleCallback, callback)) return true
 
@@ -1167,7 +1229,7 @@ class Bysekoze : ExtractorApi() {
             }
         }
 
-        // PRIORITY 2: m3u8 / mp4 directly in shell HTML
+        // Direct m3u8/mp4 in shell
         val html = shell.text.replace("\\/", "/")
         RE_M3U8_ANY.find(html)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { m3u8 ->
             Log.e(TAG, "    ✓ m3u8 in shell → ${m3u8.take(90)}")
@@ -1183,7 +1245,6 @@ class Bysekoze : ExtractorApi() {
             return true
         }
 
-        // PRIORITY 3: JS chunks
         return tryJsChunks(shell.text, embedUrl, hash, headers, subtitleCallback, callback)
     }
 
@@ -1295,12 +1356,15 @@ class Bysekoze : ExtractorApi() {
         return false
     }
 
+    // FIX: Download page may redirect via meta-refresh, JS, form, or "continue" button
     private suspend fun tryDownloadPage(
         downloadUrl: String,
         headers: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
+        depth: Int = 0,
     ): Boolean {
+        if (depth > 2) return false
         Log.e(TAG, "  tryDownloadPage → $downloadUrl")
         val resp = try { app.get(downloadUrl, headers = headers) } catch (e: Exception) {
             Log.e(TAG, "    fetch fail: ${e.message}"); return false
@@ -1326,14 +1390,15 @@ class Bysekoze : ExtractorApi() {
 
         val origin = originOf(downloadUrl) ?: return false
         val body = try { resp.text.replace("\\/", "/") } catch (_: Exception) { return false }
+        Log.e(TAG, "    shell len=${body.length} preview=${body.take(200).replace("\n", "\\n")}")
 
+        // Direct m3u8/mp4
         RE_M3U8_ANY.find(body)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { m3u8 ->
             Log.e(TAG, "    ✓ m3u8 in download page → ${m3u8.take(90)}")
             M3u8Helper.generateM3u8(name, m3u8, downloadUrl, headers = headers).forEach(callback)
             emitSubtitlesFromM3u8(m3u8, headers, subtitleCallback)
             return true
         }
-
         RE_MP4_ANY.find(body)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { mp4 ->
             Log.e(TAG, "    ✓ mp4 in download page → ${mp4.take(90)}")
             callback(newExtractorLink(name, name, mp4, INFER_TYPE) {
@@ -1342,28 +1407,65 @@ class Bysekoze : ExtractorApi() {
             return true
         }
 
-        for (iframe in Jsoup.parse(body).select("iframe[src]")) {
-            val src = iframe.attr("src").takeIf { it.isNotBlank() && !isPlaceholderUrl(it) } ?: continue
-            val resolved = resolveUrl(src, downloadUrl, origin) ?: continue
-            Log.e(TAG, "    iframe in download → $resolved")
-            if (manualJsUnpackExtraction(resolved, name, headers, subtitleCallback, callback)) return true
+        val doc = Jsoup.parse(body)
+
+        // meta refresh
+        val metaRefresh = doc.selectFirst("meta[http-equiv=refresh]")?.attr("content")
+        if (!metaRefresh.isNullOrBlank()) {
+            val redirectUrl = metaRefresh.substringAfter("url=", "").substringAfter("URL=", "").trim().trim('\'', '"')
+            if (redirectUrl.isNotBlank()) {
+                val resolved = resolveUrl(redirectUrl, downloadUrl, origin) ?: redirectUrl
+                Log.e(TAG, "    meta-refresh → ${resolved.take(90)}")
+                return tryDownloadPage(resolved, headers, subtitleCallback, callback, depth + 1)
+            }
         }
 
-        for (a in Jsoup.parse(body).select("a[href]")) {
-            val href = a.attr("href").takeIf { it.isNotBlank() } ?: continue
-            if (!href.contains(".mp4") && !href.contains(".mkv") &&
-                !href.contains(".m3u8") && !href.contains("/stream/")) continue
-            val resolved = resolveUrl(href, downloadUrl, origin) ?: continue
-            Log.e(TAG, "    file link → ${resolved.take(90)}")
-            if (resolved.contains(".m3u8")) {
-                M3u8Helper.generateM3u8(name, resolved, downloadUrl, headers = headers).forEach(callback)
-                emitSubtitlesFromM3u8(resolved, headers, subtitleCallback)
-            } else {
-                callback(newExtractorLink(name, name, resolved, INFER_TYPE) {
-                    this.referer = downloadUrl; this.headers = headers
-                })
+        // JS redirect in script tags
+        for (script in doc.select("script:not([src])")) {
+            val data = script.data()
+            val jsRedirect = Regex("""(?:window\.location(?:\.href)?|location\.href|location\.replace)\s*=\s*["']([^"']+)["']""")
+                .find(data)?.groupValues?.getOrNull(1)
+            if (!jsRedirect.isNullOrBlank() && !jsRedirect.startsWith("javascript:", true)) {
+                val resolved = resolveUrl(jsRedirect, downloadUrl, origin)
+                if (resolved != null) {
+                    Log.e(TAG, "    JS-redirect → ${resolved.take(90)}")
+                    return tryDownloadPage(resolved, headers, subtitleCallback, callback, depth + 1)
+                }
             }
-            return true
+        }
+
+        // Form action
+        val form = doc.selectFirst("form[action]")
+        if (form != null) {
+            val action = form.attr("action").trim()
+            if (action.isNotBlank() && !action.startsWith("javascript:", true)) {
+                val resolved = resolveUrl(action, downloadUrl, origin)
+                if (resolved != null) {
+                    Log.e(TAG, "    form action → ${resolved.take(90)}")
+                    return tryDownloadPage(resolved, headers, subtitleCallback, callback, depth + 1)
+                }
+            }
+        }
+
+        // "Continue"/"Proceed"/"Download" buttons/links (without .mp4/.m3u8 extension)
+        val buttonPattern = Regex("""(?:download|proceed|continue|generate|get\s*link|unlock|verify|next)""", RegexOption.IGNORE_CASE)
+        for (a in doc.select("a[href], button[data-href], button[data-url]")) {
+            val href = a.attr("href").ifBlank { a.attr("data-href") }.ifBlank { a.attr("data-url") }
+            val text = a.text().trim()
+            if (href.isBlank() || isPlaceholderUrl(href)) continue
+            if (!buttonPattern.containsMatchIn(text) && !buttonPattern.containsMatchIn(href)) continue
+            val resolved = resolveUrl(href, downloadUrl, origin) ?: continue
+            Log.e(TAG, "    button/link '$text' → ${resolved.take(90)}")
+            if (tryDownloadPage(resolved, headers, subtitleCallback, callback, depth + 1)) return true
+        }
+
+        // Iframe on download page
+        for (iframe in doc.select("iframe[src], iframe[data-src], iframe[data-litespeed-src]")) {
+            val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }.ifBlank { iframe.attr("data-litespeed-src") }
+            if (src.isBlank() || isPlaceholderUrl(src)) continue
+            val resolved = resolveUrl(src, downloadUrl, origin) ?: continue
+            Log.e(TAG, "    iframe → ${resolved.take(90)}")
+            if (manualJsUnpackExtraction(resolved, name, headers, subtitleCallback, callback)) return true
         }
 
         return false
@@ -1379,7 +1481,7 @@ class Bysekoze : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  ABYSS — handles abyssplayer.com + player.abyssplayer.com + abysplayserver.com
+//  ABYSS — keeps the readHeadBytes fix (avoids >5MB .text exception)
 // ════════════════════════════════════════════════════════════════════════════
 class AbyssPlayer : ExtractorApi() {
     override val name = "Abyss"
@@ -1412,9 +1514,8 @@ class AbyssPlayer : ExtractorApi() {
                 .ifBlank { src.optString("type") }.ifBlank { src.optString("res") }
                 .ifBlank { src.optString("resolution") }
 
-        // CRITICAL: never read body of media URLs (may be 100s of MB) — would throw
-        // "Content-Length > 5000000 bytes" exception. Use byteStream with limit instead.
-        private suspend fun readHeadBytes(resp: okhttp3.Response?, maxBytes: Int = 500): String {
+        // Never read whole body of media URLs — would throw on large files
+        private fun readHeadBytes(resp: okhttp3.Response?, maxBytes: Int = 500): String {
             if (resp == null) return ""
             return try {
                 val body = resp.body ?: return ""
@@ -1432,18 +1533,12 @@ class AbyssPlayer : ExtractorApi() {
         }
 
         private fun browserHeaders(referer: String): Map<String, String> = mapOf(
-            "User-Agent" to DEFAULT_UA,
-            "Accept" to "*/*",
+            "User-Agent" to DEFAULT_UA, "Accept" to "*/*",
             "Accept-Language" to "en-US,en;q=0.9",
-            "Referer" to referer,
-            "Cache-Control" to "no-cache",
-            "Pragma" to "no-cache",
-            "Sec-Fetch-Dest" to "video",
-            "Sec-Fetch-Mode" to "no-cors",
-            "Sec-Fetch-Site" to "cross-site",
+            "Referer" to referer, "Cache-Control" to "no-cache", "Pragma" to "no-cache",
+            "Sec-Fetch-Dest" to "video", "Sec-Fetch-Mode" to "no-cors", "Sec-Fetch-Site" to "cross-site",
             "Sec-Ch-Ua" to "\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"131\"",
-            "Sec-Ch-Ua-Mobile" to "?0",
-            "Sec-Ch-Ua-Platform" to "\"Windows\"",
+            "Sec-Ch-Ua-Mobile" to "?0", "Sec-Ch-Ua-Platform" to "\"Windows\"",
         )
     }
 
@@ -1470,7 +1565,6 @@ class AbyssPlayer : ExtractorApi() {
                 try { JSONObject(it) } catch (_: Exception) { null }
             } ?: return
 
-        // Probe referers — CRITICAL: don't read body via .text (would throw on large media)
         val refererCandidates = listOf(url, "${url.trimEnd('/')}/", "$origin/").distinct()
         var chosenReferer = refererCandidates.first()
 
@@ -1487,7 +1581,6 @@ class AbyssPlayer : ExtractorApi() {
                     app.get(sampleUrl, headers = browserHeaders(ref), timeout = 10L)
                 } catch (_: Exception) { null }
                 val ct = probe?.headers?.get("content-type")?.lowercase() ?: ""
-                // Don't read body — just check headers
                 Log.e(TAG, "  probe[ref=${ref.take(50)}] → code=${probe?.code} ct='$ct'")
                 if (probe != null && probe.code in 200..299) {
                     chosenReferer = ref
@@ -1560,7 +1653,6 @@ class AbyssPlayer : ExtractorApi() {
             return
         }
 
-        // CRITICAL: probe without reading .text (would throw on large media)
         val probe = try { app.get(srcUrl, headers = streamHeaders, timeout = 10L) } catch (_: Exception) { null }
         val ct = probe?.headers?.get("content-type")?.lowercase() ?: ""
         val headBytes = readHeadBytes(probe, 500)
