@@ -276,7 +276,6 @@ private suspend fun isValidM3u8(url: String, headers: Map<String, String>): Bool
         resp.code == 200 && resp.text.trimStart().startsWith("#EXTM3U")
     } catch (_: Exception) { false }
 
-// FIX: was `fun` — newSubtitleFile is suspend in current Cloudstream
 private suspend fun emitSubtitlesFromText(text: String, subtitleCallback: (SubtitleFile) -> Unit) {
     if (text.isEmpty()) return
     val seen = HashSet<String>()
@@ -983,6 +982,18 @@ class P2pstream : ExtractorApi() {
             }
         }
 
+        // NEW: Cloudflare-managed manifest (.txt / cf-master / manifest / playlist)
+        for (k in listOf("cf", "CF", "manifest", "playlist", "master")) {
+            val cfUrl = json.optString(k).trim()
+            if (cfUrl.isNotBlank() && !isPlaceholderUrl(cfUrl) &&
+                (cfUrl.startsWith("http") || cfUrl.startsWith("//"))) {
+                val resolved = resolveUrl(cfUrl, "$origin/", origin) ?: cfUrl
+                Log.e(TAG, "    ★ cf-style manifest [$k] → ${resolved.take(90)}")
+                emitHls(resolved, origin, headers, subtitleCallback, callback)
+                return true
+            }
+        }
+
         val deep = extractUrlsFromJson(json).filter { !isPlaceholderUrl(it) }
         if (deep.isNotEmpty()) {
             deep.distinct().forEach { emitSingleUrl(it, origin, headers, subtitleCallback, callback) }
@@ -996,7 +1007,7 @@ class P2pstream : ExtractorApi() {
             var any = false
             for (i in 0 until arr.length()) {
                 val o = arr.optJSONObject(i) ?: continue
-                val u = o.optString("url").ifBlank { o.optString("file") }.ifBlank { o.optString("src") }
+                val u = o.optString("url").ifBlank { o.optString("file") }.optString("src")
                 if (u.isNotBlank() && !isPlaceholderUrl(u)) { emitSingleUrl(u, origin, headers, subtitleCallback, callback); any = true }
             }
             if (any) return true
@@ -1224,7 +1235,12 @@ class AbyssPlayer : ExtractorApi() {
                 try { JSONObject(it) } catch (_: Exception) { null }
             } ?: return
 
-        val streamHeaders = mapOf("User-Agent" to DEFAULT_UA, "Referer" to "$origin/", "Origin" to origin)
+        // FIX: specific embed URL as Referer (was $origin/ root), drop Origin (CDN is cross-domain)
+        val streamHeaders = mapOf(
+            "User-Agent" to DEFAULT_UA,
+            "Referer" to url,
+        )
+
         val seenSubs = HashSet<String>()
         for (key in SUBTITLE_ARRAY_KEYS) {
             val arr = result.optJSONArray(key) ?: continue
@@ -1247,14 +1263,8 @@ class AbyssPlayer : ExtractorApi() {
             if (src == null) {
                 val stringUrl = sources.optString(i)
                 if (stringUrl.isBlank() || !seenUrls.add(stringUrl)) continue
-                if (stringUrl.contains(".m3u8")) {
-                    M3u8Helper.generateM3u8("$name HLS", stringUrl, "$origin/", headers = streamHeaders).forEach(callback)
-                    emitSubtitlesFromM3u8(stringUrl, streamHeaders, subtitleCallback)
-                } else {
-                    callback(newExtractorLink(name, name, stringUrl, INFER_TYPE) {
-                        this.referer = url; this.headers = streamHeaders
-                    })
-                }
+                Log.e(TAG, "  source[$i] (string) url=${stringUrl.take(80)}…")
+                emitAbyssUrl(stringUrl, Qualities.Unknown.value, streamHeaders, url, origin, subtitleCallback, callback)
                 continue
             }
 
@@ -1264,21 +1274,68 @@ class AbyssPlayer : ExtractorApi() {
 
             val rawLabel = pickLabel(src)
             val qualityInt = parseQuality(rawLabel)
+            Log.e(TAG, "  source[$i] label='$rawLabel' q=${qualityInt}p url=${srcUrl.take(80)}…")
 
-            if (srcUrl.contains(".m3u8")) {
-                M3u8Helper.generateM3u8("$name HLS", srcUrl, "$origin/", headers = streamHeaders).forEach { link ->
-                    val finalQ = if (link.quality != Qualities.Unknown.value) link.quality else qualityInt
-                    callback(newExtractorLink(link.source, link.name, link.url, link.type) {
-                        this.referer = link.referer; this.quality = finalQ
-                        this.headers = link.headers; this.extractorData = link.extractorData
-                    })
-                }
-                emitSubtitlesFromM3u8(srcUrl, streamHeaders, subtitleCallback)
-            } else {
-                callback(newExtractorLink(name, name, srcUrl, INFER_TYPE) {
-                    this.referer = url; this.quality = qualityInt; this.headers = streamHeaders
+            emitAbyssUrl(srcUrl, qualityInt, streamHeaders, url, origin, subtitleCallback, callback)
+        }
+    }
+
+    /**
+     * Emits a single Abyss source URL.
+     * FIX: Abyss CDN serves HLS manifests without `.m3u8` extension (`sora/xxx`).
+     * Route through M3u8Helper first — if it parses, emit real variant playlists.
+     * Otherwise fall back to raw video emission.
+     */
+    private suspend fun emitAbyssUrl(
+        srcUrl: String,
+        qualityInt: Int,
+        streamHeaders: Map<String, String>,
+        embedUrl: String,
+        origin: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ) {
+        // Direct .m3u8 extension → straight to M3u8Helper
+        if (srcUrl.contains(".m3u8", true)) {
+            M3u8Helper.generateM3u8(name, srcUrl, "$origin/", headers = streamHeaders).forEach { link ->
+                val finalQ = if (link.quality != Qualities.Unknown.value) link.quality else qualityInt
+                callback(newExtractorLink(link.source, link.name, link.url, link.type) {
+                    this.referer = link.referer; this.quality = finalQ
+                    this.headers = link.headers; this.extractorData = link.extractorData
                 })
             }
+            emitSubtitlesFromM3u8(srcUrl, streamHeaders, subtitleCallback)
+            return
         }
+
+        // No extension — probably HLS manifest disguised as extensionless path.
+        // Try M3u8Helper first (does its own fetch + parses #EXTM3U).
+        val variants = try {
+            withTimeoutOrNull(10_000L) {
+                M3u8Helper.generateM3u8(name, srcUrl, "$origin/", headers = streamHeaders)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "    M3u8Helper threw: ${e.message?.take(80)}")
+            null
+        }
+
+        if (!variants.isNullOrEmpty()) {
+            Log.e(TAG, "    ✓ detected as HLS → ${variants.size} variants")
+            variants.forEach { link ->
+                val finalQ = if (link.quality != Qualities.Unknown.value) link.quality else qualityInt
+                callback(newExtractorLink(link.source, link.name, link.url, link.type) {
+                    this.referer = link.referer; this.quality = finalQ
+                    this.headers = link.headers; this.extractorData = link.extractorData
+                })
+            }
+            emitSubtitlesFromM3u8(srcUrl, streamHeaders, subtitleCallback)
+            return
+        }
+
+        // Not HLS (or manifest fetch failed) — emit as raw video
+        Log.e(TAG, "    ↪ not HLS → emit as raw video")
+        callback(newExtractorLink(name, name, srcUrl, INFER_TYPE) {
+            this.referer = embedUrl; this.quality = qualityInt; this.headers = streamHeaders
+        })
     }
 }
