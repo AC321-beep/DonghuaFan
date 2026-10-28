@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.M3u8Helper
@@ -982,7 +983,7 @@ class P2pstream : ExtractorApi() {
             }
         }
 
-        // NEW: Cloudflare-managed manifest (.txt / cf-master / manifest / playlist)
+        // Cloudflare-managed manifest (.txt / cf-master / manifest / playlist)
         for (k in listOf("cf", "CF", "manifest", "playlist", "master")) {
             val cfUrl = json.optString(k).trim()
             if (cfUrl.isNotBlank() && !isPlaceholderUrl(cfUrl) &&
@@ -1210,6 +1211,26 @@ class AbyssPlayer : ExtractorApi() {
             src.optString("label").ifBlank { src.optString("quality") }
                 .ifBlank { src.optString("type") }.ifBlank { src.optString("res") }
                 .ifBlank { src.optString("resolution") }
+
+        /**
+         * Chrome's exact header set when loading a <video src="...">. Some CDNs reject
+         * requests missing Sec-Fetch-Dest: video, or Accept: *\/*, or Cache-Control.
+         * The Abyss CDN (sssrr.org) 404s bare clients but serves browsers.
+         */
+        private fun browserHeaders(referer: String): Map<String, String> = mapOf(
+            "User-Agent" to DEFAULT_UA,
+            "Accept" to "*/*",
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Referer" to referer,
+            "Cache-Control" to "no-cache",
+            "Pragma" to "no-cache",
+            "Sec-Fetch-Dest" to "video",
+            "Sec-Fetch-Mode" to "no-cors",
+            "Sec-Fetch-Site" to "cross-site",
+            "Sec-Ch-Ua" to "\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\", \"Google Chrome\";v=\"131\"",
+            "Sec-Ch-Ua-Mobile" to "?0",
+            "Sec-Ch-Ua-Platform" to "\"Windows\"",
+        )
     }
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
@@ -1235,11 +1256,35 @@ class AbyssPlayer : ExtractorApi() {
                 try { JSONObject(it) } catch (_: Exception) { null }
             } ?: return
 
-        // FIX: specific embed URL as Referer (was $origin/ root), drop Origin (CDN is cross-domain)
-        val streamHeaders = mapOf(
-            "User-Agent" to DEFAULT_UA,
-            "Referer" to url,
-        )
+        // Probe each candidate Referer against a sample source to find the one that works.
+        // CDN checks vary by request type; the specific embed URL usually wins.
+        val refererCandidates = listOf(url, "${url.trimEnd('/')}/", "$origin/").distinct()
+        var chosenReferer = refererCandidates.first()
+
+        val sourcesArr = result.optJSONArray("sources")
+        val sampleUrl: String? = sourcesArr?.let { arr ->
+            val objUrl = arr.optJSONObject(0)?.optString("url")
+            if (!objUrl.isNullOrBlank()) objUrl
+            else arr.opt(0)?.toString()?.takeIf { it.startsWith("http", true) }
+        }
+
+        if (sampleUrl != null) {
+            for (ref in refererCandidates) {
+                val probe = try {
+                    app.get(sampleUrl, headers = browserHeaders(ref), timeout = 10L)
+                } catch (_: Exception) { null }
+                val ct = probe?.headers?.get("content-type") ?: ""
+                val head = probe?.text?.take(40)?.replace("\n", "\\n") ?: ""
+                Log.e(TAG, "  probe[ref=${ref.take(50)}] → code=${probe?.code} ct='$ct' head='$head'")
+                if (probe != null && probe.code in 200..299) {
+                    chosenReferer = ref
+                    Log.e(TAG, "  ✓ using referer=$chosenReferer")
+                    break
+                }
+            }
+        }
+
+        val streamHeaders = browserHeaders(chosenReferer)
 
         val seenSubs = HashSet<String>()
         for (key in SUBTITLE_ARRAY_KEYS) {
@@ -1255,14 +1300,16 @@ class AbyssPlayer : ExtractorApi() {
             }
         }
 
-        val sources = result.optJSONArray("sources") ?: return
+        if (sourcesArr == null) return
         val seenUrls = HashSet<String>()
 
-        for (i in 0 until sources.length()) {
-            val src = sources.optJSONObject(i)
+        for (i in 0 until sourcesArr.length()) {
+            val src = sourcesArr.optJSONObject(i)
             if (src == null) {
-                val stringUrl = sources.optString(i)
-                if (stringUrl.isBlank() || !seenUrls.add(stringUrl)) continue
+                // FIX: JSONArray has no optString(int) — use opt(i)?.toString()
+                val raw = sourcesArr.opt(i)?.toString()
+                val stringUrl = raw?.takeIf { it.startsWith("http", true) }
+                if (stringUrl.isNullOrBlank() || !seenUrls.add(stringUrl)) continue
                 Log.e(TAG, "  source[$i] (string) url=${stringUrl.take(80)}…")
                 emitAbyssUrl(stringUrl, Qualities.Unknown.value, streamHeaders, url, origin, subtitleCallback, callback)
                 continue
@@ -1281,10 +1328,13 @@ class AbyssPlayer : ExtractorApi() {
     }
 
     /**
-     * Emits a single Abyss source URL.
-     * FIX: Abyss CDN serves HLS manifests without `.m3u8` extension (`sora/xxx`).
-     * Route through M3u8Helper first — if it parses, emit real variant playlists.
-     * Otherwise fall back to raw video emission.
+     * Emits a single Abyss source.
+     *
+     * Key insights:
+     *  - Extensionless `sora/*` URLs are HLS manifests (first logcat showed
+     *    "Invalid NAL length" in ProgressiveMediaPeriod → ExoPlayer parsed them as MP4)
+     *  - Forcing `ExtractorLinkType.M3U8` routes ExoPlayer to HlsMediaPeriod
+     *  - Full browser headers (Sec-Fetch-*, Accept: *\/*) make CDN accept the request
      */
     private suspend fun emitAbyssUrl(
         srcUrl: String,
@@ -1308,34 +1358,45 @@ class AbyssPlayer : ExtractorApi() {
             return
         }
 
-        // No extension — probably HLS manifest disguised as extensionless path.
-        // Try M3u8Helper first (does its own fetch + parses #EXTM3U).
-        val variants = try {
-            withTimeoutOrNull(10_000L) {
-                M3u8Helper.generateM3u8(name, srcUrl, "$origin/", headers = streamHeaders)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "    M3u8Helper threw: ${e.message?.take(80)}")
-            null
-        }
+        // Extensionless — probe ourselves to determine HLS vs MP4
+        val probe = try { app.get(srcUrl, headers = streamHeaders, timeout = 10L) } catch (_: Exception) { null }
+        val ct = probe?.headers?.get("content-type") ?: ""
+        val body = probe?.text ?: ""
+        val isHls = body.trimStart().startsWith("#EXTM3U") || ct.contains("mpegurl", true)
+        val isMp4 = ct.contains("video/mp4", true) ||
+                    (body.length >= 12 && body.substring(4, 8) == "ftyp")
+        Log.e(TAG, "    probe → code=${probe?.code} ct='$ct' hls=$isHls mp4=$isMp4 head='${body.take(60).replace("\n", "\\n")}'")
 
-        if (!variants.isNullOrEmpty()) {
-            Log.e(TAG, "    ✓ detected as HLS → ${variants.size} variants")
-            variants.forEach { link ->
-                val finalQ = if (link.quality != Qualities.Unknown.value) link.quality else qualityInt
-                callback(newExtractorLink(link.source, link.name, link.url, link.type) {
-                    this.referer = link.referer; this.quality = finalQ
-                    this.headers = link.headers; this.extractorData = link.extractorData
+        when {
+            // HLS confirmed → parse variants, emit real .m3u8 links
+            isHls -> {
+                Log.e(TAG, "    → HLS confirmed, extracting variants")
+                M3u8Helper.generateM3u8(name, srcUrl, "$origin/", headers = streamHeaders).forEach { link ->
+                    val finalQ = if (link.quality != Qualities.Unknown.value) link.quality else qualityInt
+                    callback(newExtractorLink(link.source, link.name, link.url, link.type) {
+                        this.referer = link.referer; this.quality = finalQ
+                        this.headers = link.headers; this.extractorData = link.extractorData
+                    })
+                }
+                emitSubtitlesFromM3u8(srcUrl, streamHeaders, subtitleCallback)
+            }
+
+            // Raw MP4 → progressive
+            isMp4 -> {
+                Log.e(TAG, "    → MP4 confirmed")
+                callback(newExtractorLink(name, name, srcUrl, INFER_TYPE) {
+                    this.referer = embedUrl; this.quality = qualityInt; this.headers = streamHeaders
                 })
             }
-            emitSubtitlesFromM3u8(srcUrl, streamHeaders, subtitleCallback)
-            return
-        }
 
-        // Not HLS (or manifest fetch failed) — emit as raw video
-        Log.e(TAG, "    ↪ not HLS → emit as raw video")
-        callback(newExtractorLink(name, name, srcUrl, INFER_TYPE) {
-            this.referer = embedUrl; this.quality = qualityInt; this.headers = streamHeaders
-        })
+            // Unknown — force M3U8 type. ProgressiveMediaPeriod was the failure path
+            // in the first logcat ("Invalid NAL length"); HlsMediaPeriod may succeed.
+            else -> {
+                Log.e(TAG, "    → unknown type, forcing M3U8 parser")
+                callback(newExtractorLink(name, name, srcUrl, ExtractorLinkType.M3U8) {
+                    this.referer = embedUrl; this.quality = qualityInt; this.headers = streamHeaders
+                })
+            }
+        }
     }
 }
