@@ -26,7 +26,7 @@ import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 // ════════════════════════════════════════════════════════════════════════════
-//  FILE-LEVEL CONSTANTS
+//  CONSTANTS
 // ════════════════════════════════════════════════════════════════════════════
 private const val DEFAULT_UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -43,23 +43,70 @@ private val RE_MP4_ANY   = Regex("""(https?://[^"'\s\\]+\.(?:mp4|mkv)[^"'\s\\]*)
 private val RE_SUB_URL   = Regex("""(https?://[^"'\s\\<>]+\.(?:vtt|srt|ass|ssa)(?:\?[^"'\s\\<>]*)?)""", RegexOption.IGNORE_CASE)
 private val RE_HLS_HINT  = Regex("""(https?://[^"'\s\\]+/(?:manifest|hls|playlist|master)(?:/[^"'\s\\]*)?)""", RegexOption.IGNORE_CASE)
 
-// ════════════════════════════════════════════════════════════════════════════
-//  PLACEHOLDER FILTER
-// ════════════════════════════════════════════════════════════════════════════
 private val PLACEHOLDER_DOMAINS = listOf(
     "site.com", "localhost", "127.0.0.1", "0.0.0.0",
     "yoursite", "yourdomain", "your-server", "your-url", "yoururl", "your_url",
     "test.com", "foo.com", "bar.com", "dummy.com", "fake.com",
     "placeholder", "sample.com", "demo.com", "domain.com",
 )
+
+private val IGNORED_EMBED_DOMAINS = listOf(
+    "a-ads.com", "disqus.com", "disquscdn.com", "googletagmanager.com",
+    "google-analytics.com", "doubleclick.net", "googlesyndication.com",
+    "cloudflareinsights.com", "yandex", "vlitag.com", "vntsm.com",
+    "todsquia.com", "ouo.io", "liadm.com", "facebook.com", "twitter.com",
+)
+
 private fun isPlaceholderUrl(url: String): Boolean {
-    val lower = url.lowercase()
+    val lower = url.lowercase().trim()
+    if (lower.isEmpty()) return true
+    if (lower.startsWith("blob:") || lower.startsWith("data:") ||
+        lower.startsWith("javascript:") || lower.startsWith("about:")) return true
     if (lower.contains("example")) return true
-    return PLACEHOLDER_DOMAINS.any { lower.contains(it) }
+    if (PLACEHOLDER_DOMAINS.any { lower.contains(it) }) return true
+    if (IGNORED_EMBED_DOMAINS.any { lower.contains(it) }) return true
+    return false
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  UTILITY HELPERS
+//  EPISODE HTML MIRROR EXTRACTOR (helper, may be called externally)
+// ════════════════════════════════════════════════════════════════════════════
+fun extractEmbedUrlsFromHtml(html: String): List<String> {
+    val doc = Jsoup.parse(html)
+    val urls = LinkedHashSet<String>()
+
+    fun addCleanedUrl(raw: String) {
+        val cleaned = raw.trim().replace("&amp;", "&")
+        if (cleaned.isBlank() || isPlaceholderUrl(cleaned)) return
+        val normalized = if (cleaned.startsWith("//")) "https:$cleaned" else cleaned
+        val finalUrl = normalized.replace(Regex("""([#&])dl=1\b"""), "")
+        if (finalUrl.startsWith("http://", true) || finalUrl.startsWith("https://", true)) {
+            urls.add(finalUrl)
+        }
+    }
+
+    doc.select("#pembed iframe, .player-embed iframe").forEach { iframe ->
+        val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }.ifBlank { iframe.attr("data-litespeed-src") }
+        addCleanedUrl(src)
+    }
+    doc.select("select.mirror option[value]").forEach { option ->
+        val b64 = option.attr("value").trim()
+        if (b64.isBlank()) return@forEach
+        val decodedHtml = try { String(Base64.decode(b64, Base64.DEFAULT), Charsets.UTF_8) }
+                          catch (_: Exception) { return@forEach }
+        Jsoup.parseBodyFragment(decodedHtml).select("iframe").forEach { iframe ->
+            addCleanedUrl(iframe.attr("src").ifBlank { iframe.attr("data-src") })
+        }
+        if (decodedHtml.startsWith("http://", true) || decodedHtml.startsWith("https://", true)) {
+            addCleanedUrl(decodedHtml)
+        }
+    }
+    doc.select(".soraurlx a[href], .soraddlx a[href]").forEach { a -> addCleanedUrl(a.attr("href")) }
+    return urls.toList()
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  UTILITIES
 // ════════════════════════════════════════════════════════════════════════════
 private fun isErrorPage(html: String): Boolean {
     if (html.isBlank()) return true
@@ -80,15 +127,23 @@ private fun originOf(url: String): String? =
 private fun hostOf(url: String): String? =
     Regex("""^https?://([^/?#]+)""").find(url)?.groupValues?.getOrNull(1)
 
-private fun resolveUrl(uri: String, masterUrl: String, origin: String): String = when {
-    uri.startsWith("http://", true) || uri.startsWith("https://", true) -> uri
-    uri.startsWith("//") -> "https:$uri"
-    uri.startsWith("/")  -> "$origin$uri"
-    else                 -> "${masterUrl.substringBeforeLast('/')}/$uri"
+private fun resolveUrl(uri: String, masterUrl: String, origin: String): String? {
+    val trimmed = uri.trim()
+    if (trimmed.isEmpty() ||
+        trimmed.startsWith("blob:", true) || trimmed.startsWith("data:", true) ||
+        trimmed.startsWith("javascript:", true) || trimmed.startsWith("about:", true) ||
+        trimmed.startsWith("mailto:", true)
+    ) return null
+    return when {
+        trimmed.startsWith("http://", true) || trimmed.startsWith("https://", true) -> trimmed
+        trimmed.startsWith("//") -> "https:$trimmed"
+        trimmed.startsWith("/")  -> "$origin$trimmed"
+        else -> "${masterUrl.substringBefore('?').substringBefore('#').substringBeforeLast('/')}/$trimmed"
+    }
 }
 
 private fun hexToBytes(hex: String): ByteArray? {
-    if (hex.length % 2 != 0) return null
+    if (hex.isEmpty() || hex.length % 2 != 0) return null
     val out = ByteArray(hex.length / 2)
     for (i in out.indices) {
         val hi = Character.digit(hex[i * 2], 16)
@@ -98,14 +153,20 @@ private fun hexToBytes(hex: String): ByteArray? {
     }
     return out
 }
-private fun bytesToHex(b: ByteArray): String = b.joinToString("") { "%02x".format(it) }
 
-private fun md5Bytes(s: String): ByteArray =
-    MessageDigest.getInstance("MD5").digest(s.toByteArray(Charsets.UTF_8))
-private fun sha1Bytes(s: String): ByteArray =
-    MessageDigest.getInstance("SHA-1").digest(s.toByteArray(Charsets.UTF_8))
-private fun sha256Bytes(s: String): ByteArray =
-    MessageDigest.getInstance("SHA-256").digest(s.toByteArray(Charsets.UTF_8))
+private fun decodePayloadBytes(payload: String, isHex: Boolean): ByteArray? {
+    val clean = payload.trim().removeSurrounding("\"")
+    if (isHex) return hexToBytes(clean)
+    return try {
+        val normalized = clean.replace('-', '+').replace('_', '/')
+        Base64.decode(normalized, Base64.DEFAULT)
+    } catch (_: Exception) { null }
+}
+
+private fun bytesToHex(b: ByteArray): String = b.joinToString("") { "%02x".format(it) }
+private fun md5Bytes(s: String): ByteArray = MessageDigest.getInstance("MD5").digest(s.toByteArray(Charsets.UTF_8))
+private fun sha1Bytes(s: String): ByteArray = MessageDigest.getInstance("SHA-1").digest(s.toByteArray(Charsets.UTF_8))
+private fun sha256Bytes(s: String): ByteArray = MessageDigest.getInstance("SHA-256").digest(s.toByteArray(Charsets.UTF_8))
 
 private fun tryAesCbc(ct: ByteArray, key: ByteArray, iv: ByteArray): ByteArray? {
     if (ct.isEmpty() || ct.size % 16 != 0) return null
@@ -116,6 +177,7 @@ private fun tryAesCbc(ct: ByteArray, key: ByteArray, iv: ByteArray): ByteArray? 
         c.doFinal(ct)
     } catch (_: Exception) { null }
 }
+
 private fun tryAesEcb(ct: ByteArray, key: ByteArray): ByteArray? {
     if (ct.isEmpty() || ct.size % 16 != 0) return null
     if (key.size !in listOf(16, 24, 32)) return null
@@ -125,6 +187,7 @@ private fun tryAesEcb(ct: ByteArray, key: ByteArray): ByteArray? {
         c.doFinal(ct)
     } catch (_: Exception) { null }
 }
+
 private fun tryAesGcm(ctAndTag: ByteArray, key: ByteArray, nonce: ByteArray): ByteArray? {
     if (ctAndTag.size < 16 || key.size !in listOf(16, 24, 32)) return null
     if (nonce.size !in listOf(12, 16)) return null
@@ -135,32 +198,19 @@ private fun tryAesGcm(ctAndTag: ByteArray, key: ByteArray, nonce: ByteArray): By
     } catch (_: Exception) { null }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  CryptoJS/OpenSSL EvpKDF
-// ════════════════════════════════════════════════════════════════════════════
-private fun evpKDF(
-    password: ByteArray,
-    salt: ByteArray,
-    keySize: Int = 32,
-    ivSize: Int = 16,
-    iterations: Int = 1,
-): Pair<ByteArray, ByteArray> {
+private fun evpKDF(password: ByteArray, salt: ByteArray, keySize: Int = 32, ivSize: Int = 16, iterations: Int = 1): Pair<ByteArray, ByteArray> {
     val target = keySize + ivSize
     val derived = ByteArray(target)
     var copied = 0
     var block: ByteArray? = null
     val md5 = MessageDigest.getInstance("MD5")
-
     while (copied < target) {
         if (block != null) md5.update(block)
         md5.update(password)
         if (salt.isNotEmpty()) md5.update(salt)
         block = md5.digest()
         md5.reset()
-        for (i in 1 until iterations) {
-            block = md5.digest(block!!)
-            md5.reset()
-        }
+        for (i in 1 until iterations) { block = md5.digest(block!!); md5.reset() }
         val n = minOf(block!!.size, target - copied)
         System.arraycopy(block, 0, derived, copied, n)
         copied += n
@@ -168,9 +218,6 @@ private fun evpKDF(
     return Pair(derived.copyOfRange(0, keySize), derived.copyOfRange(keySize, target))
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  Obfuscation-aware secret extraction
-// ════════════════════════════════════════════════════════════════════════════
 private fun extractObfuscatedSecrets(js: String): Pair<List<ByteArray>, List<String>> {
     val keys = mutableListOf<ByteArray>()
     val passwords = mutableListOf<String>()
@@ -216,44 +263,41 @@ private fun extractObfuscatedSecrets(js: String): Pair<List<ByteArray>, List<Str
             } catch (_: Exception) {}
         }
 
-    Regex("""(?:rawKey|secretKey|cryptoKey|aesKey|decryptKey)\s*[:=]\s*["'`]([A-Za-z0-9!@#$%^&*_+\-=./]{8,64})["'`]""",
-        RegexOption.IGNORE_CASE).findAll(js).take(200).forEach { m ->
-        val s = m.groupValues[1]
-        passwords.add(s)
-        val b = s.toByteArray(Charsets.UTF_8)
-        if (b.size in listOf(16, 24, 32)) keys.add(b)
+    Regex("""(?:rawKey|secretKey|cryptoKey|aesKey|decryptKey)\s*[:=]\s*["'`]([A-Za-z0-9!@#$%^&*_+\-=./]{8,64})["'`]""", RegexOption.IGNORE_CASE)
+        .findAll(js).take(200).forEach { m ->
+            val s = m.groupValues[1]
+            passwords.add(s)
+            val b = s.toByteArray(Charsets.UTF_8)
+            if (b.size in listOf(16, 24, 32)) keys.add(b)
+        }
+
+    Regex("""CryptoJS\.AES\.decrypt\([^)]{0,400}?["'`]([^"'`\s]{4,64})["'`]""")
+        .findAll(js).take(120).forEach { m -> passwords.add(m.groupValues[1]) }
+
+    Regex("""["'`]([0-9a-fA-F]{32}|[0-9a-fA-F]{64})["'`]""").findAll(js).take(200).forEach { m ->
+        hexToBytes(m.groupValues[1])?.let { keys.add(it) }
     }
 
     Log.e("Narul/SecretX", "extractObfuscatedSecrets: +${keys.size} keys, +${passwords.size} passwords")
     return Pair(keys, passwords)
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  PATCH C — targeted extraction near app markers (skips Shaka vendor noise)
-// ════════════════════════════════════════════════════════════════════════════
 private fun extractNearAppMarkers(js: String): List<String> {
     val found = mutableListOf<String>()
     val markers = listOf(
         "p2pstream", "narulplex", "naruldonghua",
-        "api/v1/info", "api/v1/player", "api/v1/",
+        "api/v1/info", "api/v1/player", "api/v1/folder", "api/v1/",
         "decrypt", "encrypt", "cipher", "crypto",
         "secret", "passphrase", "aeskey",
     )
     for (marker in markers) {
-        val re = Regex(
-            """${Regex.escape(marker)}[^\n]{0,120}?["'`]([A-Za-z0-9!@#$%^&*()_+\-=./:?]{8,80})["'`]""",
-            RegexOption.IGNORE_CASE
-        )
-        re.findAll(js).take(40).forEach { found.add(it.groupValues[1]) }
-
-        val re2 = Regex(
-            """["'`]([^"'`\s]{0,120}${Regex.escape(marker)}[^"'`\s]{0,120})["'`]""",
-            RegexOption.IGNORE_CASE
-        )
-        re2.findAll(js).take(20).forEach {
-            val s = it.groupValues[1]
-            if (s.length in 8..200) found.add(s)
-        }
+        Regex("""${Regex.escape(marker)}[^\n]{0,120}?["'`]([A-Za-z0-9!@#$%^&*()_+\-=./:?]{8,80})["'`]""", RegexOption.IGNORE_CASE)
+            .findAll(js).take(40).forEach { found.add(it.groupValues[1]) }
+        Regex("""["'`]([^"'`\s]{0,120}${Regex.escape(marker)}[^"'`\s]{0,120})["'`]""", RegexOption.IGNORE_CASE)
+            .findAll(js).take(20).forEach {
+                val s = it.groupValues[1]
+                if (s.length in 8..200) found.add(s)
+            }
     }
     Log.e("Narul/Markers", "extractNearAppMarkers: +${found.size} candidates")
     return found.distinct()
@@ -261,23 +305,20 @@ private fun extractNearAppMarkers(js: String): List<String> {
 
 private fun likelyPlain(s: String): Boolean =
     s.isNotBlank() && s.length > 8 && !s.contains('\u0000') &&
-    s.count { it.code in 32..126 || it.code == 9 || it.code == 10 } / s.length.toFloat() > 0.55f
+    s.count { it.code in 32..126 || it.code == 9 || it.code == 10 || it.code == 13 } / s.length.toFloat() > 0.55f
 
-// ════════════════════════════════════════════════════════════════════════════
-//  Validate that a URL actually serves an M3U8 manifest
-// ════════════════════════════════════════════════════════════════════════════
 private suspend fun isValidM3u8(url: String, headers: Map<String, String>): Boolean =
     try {
         val resp = app.get(url, headers = headers, timeout = 8L)
         resp.code == 200 && resp.text.trimStart().startsWith("#EXTM3U")
     } catch (_: Exception) { false }
 
-private suspend fun emitSubtitlesFromText(text: String, subtitleCallback: (SubtitleFile) -> Unit) {
+private fun emitSubtitlesFromText(text: String, subtitleCallback: (SubtitleFile) -> Unit) {
     if (text.isEmpty()) return
     val seen = HashSet<String>()
     RE_SUB_URL.findAll(text).forEach { m ->
         val subUrl = m.groupValues[1].replace("\\/", "/")
-        if (seen.add(subUrl)) subtitleCallback(newSubtitleFile("Sub", subUrl))
+        if (!isPlaceholderUrl(subUrl) && seen.add(subUrl)) subtitleCallback(newSubtitleFile("Sub", subUrl))
     }
 }
 
@@ -289,9 +330,10 @@ private suspend fun emitSubtitlesFromM3u8(m3u8Url: String, headers: Map<String, 
         val attrs = match.groupValues[1]
         if (!attrs.contains("TYPE=SUBTITLES", true)) return@forEach
         val uri = Regex("""URI="([^"]+)"""").find(attrs)?.groupValues?.get(1) ?: return@forEach
+        val resolved = resolveUrl(uri, m3u8Url, origin) ?: return@forEach
         val label = Regex("""NAME="([^"]+)"""").find(attrs)?.groupValues?.get(1)
             ?: Regex("""LANGUAGE="([^"]+)"""").find(attrs)?.groupValues?.get(1) ?: "Sub"
-        subtitleCallback(newSubtitleFile(label, resolveUrl(uri, m3u8Url, origin)) { this.headers = headers })
+        subtitleCallback(newSubtitleFile(label, resolved) { this.headers = headers })
     }
 }
 
@@ -305,12 +347,17 @@ private fun extractUrlsFromJson(json: JSONObject, depth: Int = 0): List<String> 
                 val s = v.replace("\\/", "/")
                 if ((s.startsWith("http") || s.startsWith("//")) &&
                     (s.contains(".m3u8") || s.contains(".mp4") || s.contains(".mkv") ||
-                     s.contains("/manifest") || s.contains("/hls/") || s.contains("/stream/"))) urls.add(s)
+                     s.contains("/manifest") || s.contains("/hls/") || s.contains("/stream/"))) {
+                    urls.add(s)
+                }
             }
             is JSONObject -> urls.addAll(extractUrlsFromJson(v, depth + 1))
             is JSONArray -> for (i in 0 until v.length()) {
                 when (val item = v.opt(i)) {
-                    is String -> { val s = item.replace("\\/", "/"); if (s.startsWith("http") || s.startsWith("//")) urls.add(s) }
+                    is String -> {
+                        val s = item.replace("\\/", "/")
+                        if (s.startsWith("http") || s.startsWith("//")) urls.add(s)
+                    }
                     is JSONObject -> urls.addAll(extractUrlsFromJson(item, depth + 1))
                     else -> {}
                 }
@@ -352,8 +399,12 @@ private suspend fun manualJsUnpackExtraction(
     val response = respObj.text
     if (isErrorPage(response)) return false
 
-    val packed = RE_PACKED_SCRIPT.find(response)?.value
-    val text = (JsUnpacker(packed ?: response).unpack() ?: response).replace("\\/", "/")
+    // Unpack ALL packed scripts
+    val unpackedBuilder = StringBuilder(response)
+    RE_PACKED_SCRIPT.findAll(response).forEach { match ->
+        JsUnpacker(match.value).unpack()?.let { unpackedBuilder.append("\n").append(it) }
+    }
+    val text = unpackedBuilder.toString().replace("\\/", "/")
     emitSubtitlesFromText(text, subtitleCallback)
 
     RE_M3U8_ATTR.find(text)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { m3u8 ->
@@ -365,32 +416,38 @@ private suspend fun manualJsUnpackExtraction(
         emitSubtitlesFromM3u8(m3u8, safeHeaders, subtitleCallback); return true
     }
     RE_MP4_ATTR.find(text)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { mp4 ->
-        callback(newExtractorLink(name, name, mp4, INFER_TYPE) { this.referer = url }); return true
+        callback(newExtractorLink(name, name, mp4, INFER_TYPE) { this.referer = url; this.headers = safeHeaders }); return true
     }
     RE_MP4_ANY.find(text)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { mp4 ->
-        callback(newExtractorLink(name, name, mp4, INFER_TYPE) { this.referer = url }); return true
+        callback(newExtractorLink(name, name, mp4, INFER_TYPE) { this.referer = url; this.headers = safeHeaders }); return true
     }
 
-    val origin = originOf(url)
+    val origin = originOf(url) ?: return false
     Regex("""(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']""")
         .find(text)?.groupValues?.getOrNull(1)?.takeIf { !isTemplatePlaceholder(it) && !isPlaceholderUrl(it) }?.let { r ->
             if (r.startsWith("http") || r.startsWith("/") || r.startsWith("//")) {
-                val fixed = resolveUrl(r, url, origin ?: return@let)
+                val fixed = resolveUrl(r, url, origin) ?: return@let
                 if (manualJsUnpackExtraction(fixed, name, headers, subtitleCallback, callback, depth + 1)) return true
             }
         }
-    Jsoup.parse(text).selectFirst("iframe")?.let { el ->
+
+    val doc = Jsoup.parse(text)
+    val iframes = doc.select("#pembed iframe, .player-embed iframe") + doc.select("iframe")
+    for (el in iframes.distinct()) {
         val src = el.attr("src").ifEmpty { el.attr("data-src") }.ifEmpty { el.attr("data-litespeed-src") }
         if (src.isNotBlank() && !isTemplatePlaceholder(src) && !isPlaceholderUrl(src)) {
-            val fixed = resolveUrl(src, url, origin ?: return@let)
+            val fixed = resolveUrl(src, url, origin) ?: continue
             if (manualJsUnpackExtraction(fixed, name, headers, subtitleCallback, callback, depth + 1)) return true
         }
     }
-    Jsoup.parse(text).select("script[src]").map { it.attr("src") }
-        .filter { it.isNotBlank() && !isTemplatePlaceholder(it) && !isPlaceholderUrl(it) &&
-            !it.contains("cloudflare", true) && !it.contains("google-analytics", true) &&
-            !it.contains("googletagmanager", true) && !it.contains("yandex", true) }
-        .mapNotNull { resolveUrl(it, url, origin ?: return@mapNotNull null) }
+
+    doc.select("script[src]").map { it.attr("src") }
+        .filter {
+            it.isNotBlank() && !isTemplatePlaceholder(it) && !isPlaceholderUrl(it) &&
+            !it.startsWith("blob:", true) && !it.contains("/wp-content/litespeed/", true) &&
+            !it.contains("jquery", true)
+        }
+        .mapNotNull { resolveUrl(it, url, origin) }
         .distinct().take(3).forEach { src ->
             if (manualJsUnpackExtraction(src, name, headers, subtitleCallback, callback, depth + 1)) return true
         }
@@ -398,7 +455,7 @@ private suspend fun manualJsUnpackExtraction(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PLEX
+//  PLEX — handles p2pstream.vip + narulplex.p2pstream.vip + any subdomain
 // ════════════════════════════════════════════════════════════════════════════
 class P2pstream : ExtractorApi() {
     override val name = "Plex"
@@ -411,6 +468,7 @@ class P2pstream : ExtractorApi() {
         private val workingEndpointCache = ConcurrentHashMap<String, String>()
 
         private val KNOWN_ENDPOINTS = listOf(
+            "/api/v1/folder?id={id}",
             "/api/v1/info?id={id}",
             "/api/v1/player?t={id}&w=1920&h=1080&r={ref}",
             "/api/v1/player?t={id}&w=1920&h=1080",
@@ -420,19 +478,21 @@ class P2pstream : ExtractorApi() {
         private val ENTRY_TEMPLATES = listOf("/?v={id}", "/?id={id}", "/{id}")
 
         private val RE_SCRIPT_SRC = Regex("""<script[^>]+src=["']([^"']+\.js[^"']*)["']""", RegexOption.IGNORE_CASE)
-        private val RE_HEX    = Regex("^[0-9a-fA-F]{100,}$")
-        private val RE_BASE64 = Regex("^[A-Za-z0-9+/=_-]{200,}$")
+        private val RE_HEX    = Regex("^[0-9a-fA-F]{64,}$")
+        private val RE_BASE64 = Regex("^[A-Za-z0-9+/=_-]{100,}$")
         private val JSON_TYPE = "application/json; charset=utf-8".toMediaTypeOrNull()
 
-        private fun plexKey(): ByteArray = "kiemtienmua911c#".toByteArray(Charsets.UTF_8)
-        private fun plexIvWithHash(): ByteArray = "1234567890oiuytr".toByteArray(Charsets.UTF_8)
-        private fun plexIvNoHash(): ByteArray = "1234567890oiuytr".toByteArray(Charsets.UTF_8)
+        // Distinct key/IV pairs — Gemini bug was both IVs returning the same value
+        private fun plexKeyWithHash(): ByteArray = "kiemtienmua911c#".toByteArray(Charsets.UTF_8)
+        private fun plexKeyNoHash(): ByteArray   = "kiemtienmua911ca".toByteArray(Charsets.UTF_8)
+        private fun plexDefaultIv(): ByteArray   = "1234567890oiuytr".toByteArray(Charsets.UTF_8)
+        private fun plexAltIv(): ByteArray       = "0123456789abcdef".toByteArray(Charsets.UTF_8)
 
         private fun base64KeyCandidate(): ByteArray? =
             try { Base64.decode("ITWMv7t88JGzI0xPwW8I0+LveiXX9SWbfdmt0ArUSyc=", Base64.DEFAULT) } catch (_: Exception) { null }
 
         private fun candidatePasswords(): List<String> = listOf(
-            "kiemtienmua911c#", "kiemtienmua911c", "kiemtienmua911c\$",
+            "kiemtienmua911c#", "kiemtienmua911ca", "kiemtienmua911c", "kiemtienmua911c\$",
             "kiemtienmua911c@", "kiemtienmua911c!", "kiemtien", "kiemtienmua911",
         )
     }
@@ -440,15 +500,12 @@ class P2pstream : ExtractorApi() {
     private enum class ProbeResult { FOUND, PAYLOAD_UNKNOWN, NOT_FOUND, RATE_LIMITED, ERROR }
 
     private fun looksLikeSpa(html: String): Boolean {
-        if (html.length < 300) return false
-        if (isErrorPage(html)) return false
+        if (html.length < 300 || isErrorPage(html)) return false
         val hasRoot = html.contains("id=\"root\"") || html.contains("id=\"app\"")
         val hasVite = html.contains("/assets/index-") || html.contains("/assets/main-")
         val hasBundle = RE_SCRIPT_SRC.findAll(html).any { m ->
             val s = m.groupValues[1]
-            s.endsWith(".js", true) &&
-                !s.contains("cloudflareinsights", true) && !s.contains("googletagmanager", true) &&
-                !s.contains("google-analytics", true) && !s.contains("yandex", true)
+            s.endsWith(".js", true) && !isPlaceholderUrl(s)
         }
         return hasRoot || hasVite || hasBundle
     }
@@ -463,23 +520,15 @@ class P2pstream : ExtractorApi() {
                 if (resp.code != 200 || isErrorPage(resp.text) || !looksLikeSpa(resp.text)) continue
                 val html = resp.text
 
-                // Extract ALL external script srcs on the page
                 val scriptSrcs = RE_SCRIPT_SRC.findAll(html).map { it.groupValues[1] }
-                    .filter { !it.contains("cloudflareinsights", true) && !it.contains("googletagmanager", true) &&
-                        !it.contains("google-analytics", true) && !it.contains("yandex", true) }
+                    .filter { !isPlaceholderUrl(it) }
                     .distinct()
-                    .map { u -> when {
-                        u.startsWith("http") -> u
-                        u.startsWith("//")   -> "https:$u"
-                        u.startsWith("/")    -> "$origin$u"
-                        else                 -> "$origin/$u"
-                    }}
-                    .toList()   // ✅ Sequence → List, so .size works
+                    .mapNotNull { u -> resolveUrl(u, shellUrl, origin) }
+                    .toList()
                 Log.e(TAG, "  found ${scriptSrcs.size} script tags:")
                 scriptSrcs.take(8).forEach { Log.e(TAG, "    • ${it.takeLast(70)}") }
 
-                val inlineScripts = Jsoup.parse(html).select("script:not([src])")
-                    .joinToString("\n") { it.data() }
+                val inlineScripts = Jsoup.parse(html).select("script:not([src])").joinToString("\n") { it.data() }
                 Log.e(TAG, "  inline scripts len=${inlineScripts.length}")
 
                 val sb = StringBuilder()
@@ -492,7 +541,8 @@ class P2pstream : ExtractorApi() {
                             Log.e(TAG, "  +script ${scriptUrl.takeLast(60)} len=${sr.text.length}")
                             sb.append("\n").append(sr.text)
                             for (chunk in extractAllChunkUrls(sr.text).take(40)) {
-                                val chunkUrl = if (chunk.startsWith("http")) chunk else "$origin/$chunk"
+                                // Fix: resolveUrl avoids double-slash on "/assets/..."
+                                val chunkUrl = resolveUrl(chunk, scriptUrl, origin) ?: continue
                                 if (isTemplatePlaceholder(chunkUrl)) continue
                                 try {
                                     val cr = app.get(chunkUrl, headers = headers)
@@ -513,13 +563,23 @@ class P2pstream : ExtractorApi() {
         }
     }
 
+    private fun extractVideoId(url: String): String {
+        val cleanUrl = url.replace("&amp;", "&")
+        val fromHash = cleanUrl.substringAfter("#", "").substringBefore("&").substringBefore("?").trim()
+        if (fromHash.isNotBlank()) return fromHash
+        val fromQuery = Regex("""[?&](?:v|id|t)=([^&#]+)""").find(cleanUrl)?.groupValues?.getOrNull(1)?.trim()
+        if (!fromQuery.isNullOrBlank()) return fromQuery
+        return cleanUrl.substringBefore("?").substringBefore("#").trimEnd('/').substringAfterLast('/')
+    }
+
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        Log.e(TAG, "=== Plex START url=$url")
+        Log.e(TAG, "=== Plex START url=$url referer=$referer")
         val origin = originOf(url) ?: return
-        val id = url.substringAfter("#", "").substringBefore("&").trim()
-        if (id.isBlank()) return
+        val id = extractVideoId(url)
+        if (id.isBlank() || id == hostOf(origin)) return
         Log.e(TAG, "origin=$origin id=$id")
 
+        val refHost = referer?.let { hostOf(it) } ?: hostOf(origin) ?: origin
         val headers = mapOf(
             "Origin" to origin, "Referer" to "$origin/", "User-Agent" to DEFAULT_UA,
             "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -530,18 +590,18 @@ class P2pstream : ExtractorApi() {
         )
 
         workingEndpointCache[origin]?.let { cached ->
-            when (probeEndpoint(origin, cached, id, apiHeaders, subtitleCallback, callback)) {
-                ProbeResult.FOUND, ProbeResult.PAYLOAD_UNKNOWN, ProbeResult.RATE_LIMITED -> return
+            when (probeEndpoint(origin, cached, id, refHost, apiHeaders, subtitleCallback, callback)) {
+                ProbeResult.FOUND, ProbeResult.RATE_LIMITED -> return
                 else -> workingEndpointCache.remove(origin)
             }
         }
 
         ensureJsCached(origin, id, headers)
 
+        // Cache only on FOUND — moves on from PAYLOAD_UNKNOWN to try next endpoint
         for (tmpl in KNOWN_ENDPOINTS) {
-            when (probeEndpoint(origin, tmpl, id, apiHeaders, subtitleCallback, callback)) {
+            when (probeEndpoint(origin, tmpl, id, refHost, apiHeaders, subtitleCallback, callback)) {
                 ProbeResult.FOUND -> { workingEndpointCache[origin] = tmpl; return }
-                ProbeResult.PAYLOAD_UNKNOWN -> { workingEndpointCache[origin] = tmpl; return }
                 ProbeResult.RATE_LIMITED -> return
                 else -> {}
             }
@@ -550,9 +610,8 @@ class P2pstream : ExtractorApi() {
         val js = scriptCache[origin]
         if (js != null) {
             for (tmpl in discoverEndpointsFromJs(js).take(10)) {
-                when (probeEndpoint(origin, tmpl, id, apiHeaders, subtitleCallback, callback)) {
+                when (probeEndpoint(origin, tmpl, id, refHost, apiHeaders, subtitleCallback, callback)) {
                     ProbeResult.FOUND -> { workingEndpointCache[origin] = tmpl; return }
-                    ProbeResult.PAYLOAD_UNKNOWN -> { workingEndpointCache[origin] = tmpl; return }
                     ProbeResult.RATE_LIMITED -> return
                     else -> {}
                 }
@@ -561,15 +620,12 @@ class P2pstream : ExtractorApi() {
     }
 
     private suspend fun probeEndpoint(
-        origin: String, template: String, id: String, apiHeaders: Map<String, String>,
+        origin: String, template: String, id: String, refHost: String,
+        apiHeaders: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
     ): ProbeResult {
-        val path = template.replace("{id}", id).replace("{ref}", hostOf(origin) ?: origin)
-        val url = when {
-            path.startsWith("http") -> path
-            path.startsWith("/")    -> "$origin$path"
-            else                    -> "$origin/$path"
-        }
+        val path = template.replace("{id}", id).replace("{ref}", refHost)
+        val url = resolveUrl(path, "$origin/", origin) ?: return ProbeResult.ERROR
         Log.e(TAG, "→ GET $url")
 
         val resp = try { app.get(url, headers = apiHeaders) } catch (e: Exception) {
@@ -579,33 +635,33 @@ class P2pstream : ExtractorApi() {
         Log.e(TAG, "  ${resp.code} len=${body.length} preview=${body.take(160).replace("\n", "\\n")}")
 
         when (resp.code) { 429 -> return ProbeResult.RATE_LIMITED; 404, 403, 410 -> return ProbeResult.NOT_FOUND }
-        if (resp.code !in 200..299) return ProbeResult.NOT_FOUND
-        if (isErrorPage(body)) return ProbeResult.NOT_FOUND
+        if (resp.code !in 200..299 || isErrorPage(body)) return ProbeResult.NOT_FOUND
 
         if (tryDirectMedia(body, origin, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
         if (tryJsonBody(body, origin, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
 
-        val trimmed = body.trim()
-        val isHex = RE_HEX.matches(trimmed)
-        val isBase64 = !isHex && RE_BASE64.matches(trimmed)
+        // Handle JSON-wrapped encrypted payloads {"data":"<hex>"}
+        val candidatePayload = extractEncryptedCandidate(body)
+        val isHex = RE_HEX.matches(candidatePayload)
+        val isBase64 = !isHex && RE_BASE64.matches(candidatePayload)
 
         if (isHex || isBase64) {
-            Log.e(TAG, "  ⚠ encrypted payload (hex=$isHex b64=$isBase64 len=${trimmed.length})")
+            Log.e(TAG, "  ⚠ encrypted payload (hex=$isHex b64=$isBase64 len=${candidatePayload.length})")
 
             if (isHex) {
-                val dec = hexToBytes(trimmed)?.let { String(it, Charsets.UTF_8) }
+                val dec = hexToBytes(candidatePayload)?.let { String(it, Charsets.UTF_8) }
                 if (dec != null && likelyPlain(dec)) {
                     if (tryDirectMedia(dec, origin, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
                     if (tryJsonBody(dec, origin, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
-                    if (tryExtractTokenAndProbe(dec, origin, id, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
+                    if (tryExtractTokenAndProbe(dec, origin, id, refHost, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
                 }
             }
 
-            if (tryEncDecPayload(trimmed, origin, subtitleCallback, callback)) return ProbeResult.FOUND
-            if (tryKnownPlexDecrypt(trimmed, origin, subtitleCallback, callback)) return ProbeResult.FOUND
+            if (tryEncDecPayload(candidatePayload, origin, refHost, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
+            if (tryKnownPlexDecrypt(candidatePayload, isHex, origin, id, refHost, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
 
             val js = scriptCache[origin]
-            if (js != null && tryDecryptWithExtractedKeys(trimmed, js, origin, id, subtitleCallback, callback)) return ProbeResult.FOUND
+            if (js != null && tryDecryptWithExtractedKeys(candidatePayload, isHex, js, origin, id, refHost, apiHeaders, subtitleCallback, callback)) return ProbeResult.FOUND
 
             Log.e(TAG, "══════ UNKNOWN PAYLOAD ══════")
             Log.e(TAG, "url=$url len=${body.length}")
@@ -616,20 +672,31 @@ class P2pstream : ExtractorApi() {
         return ProbeResult.NOT_FOUND
     }
 
+    private fun extractEncryptedCandidate(body: String): String {
+        val trimmed = body.trim().removeSurrounding("\"")
+        if (trimmed.startsWith("{")) {
+            try {
+                val json = JSONObject(trimmed)
+                for (key in listOf("data", "result", "source", "sources", "payload", "hash", "token", "encrypted")) {
+                    val v = json.optString(key).trim()
+                    if (RE_HEX.matches(v) || RE_BASE64.matches(v)) return v
+                }
+            } catch (_: Exception) {}
+        }
+        return trimmed
+    }
+
     private suspend fun tryExtractTokenAndProbe(
-        plaintext: String, origin: String, originalId: String,
+        plaintext: String, origin: String, originalId: String, refHost: String,
         apiHeaders: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
     ): Boolean {
         val json = try { JSONObject(plaintext) } catch (_: Exception) { return false }
-        val token = json.optString("token")
-            .ifBlank { json.optString("t") }
-            .ifBlank { json.optString("hash") }
+        val token = json.optString("token").ifBlank { json.optString("t") }.ifBlank { json.optString("hash") }
         if (token.isBlank() || token == originalId) return false
 
         Log.e(TAG, "    ★ decrypted token='$token' → probing /player")
-        val ref = hostOf(origin) ?: origin
-        val playerUrl = "$origin/api/v1/player?t=$token&w=1920&h=1080&r=$ref"
+        val playerUrl = "$origin/api/v1/player?t=$token&w=1920&h=1080&r=$refHost"
         val resp = try { app.get(playerUrl, headers = apiHeaders) } catch (_: Exception) { return false }
         if (resp.code !in 200..299) return false
         val body = resp.text
@@ -639,53 +706,54 @@ class P2pstream : ExtractorApi() {
     }
 
     private suspend fun tryKnownPlexDecrypt(
-        payloadHex: String, origin: String,
+        payload: String, isHex: Boolean, origin: String, id: String, refHost: String,
+        apiHeaders: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val ct = hexToBytes(payloadHex) ?: return false
-        val key = plexKey()
-        Log.e(TAG, "    ★ known key=${bytesToHex(key)} len=${key.size} ct=${ct.size}")
+        val ct = decodePayloadBytes(payload, isHex) ?: return false
+        val keys = listOfNotNull(plexKeyWithHash(), plexKeyNoHash(), base64KeyCandidate())
+        val ivs = listOf("iv-default" to plexDefaultIv(), "iv-alt" to plexAltIv(), "iv-zero" to ByteArray(16))
 
         suspend fun tryPlain(s: String, label: String): Boolean {
             if (!likelyPlain(s)) return false
             Log.e(TAG, "    ✓✓ $label PLAINTEXT=${s.take(400)}")
-            if (tryDirectMedia(s, origin, emptyMap(), subtitleCallback, callback)) return true
-            if (tryJsonBody(s, origin, emptyMap(), subtitleCallback, callback)) return true
-            if (tryExtractTokenAndProbe(s, origin, "", emptyMap(), subtitleCallback, callback)) return true
+            if (tryDirectMedia(s, origin, apiHeaders, subtitleCallback, callback)) return true
+            if (tryJsonBody(s, origin, apiHeaders, subtitleCallback, callback)) return true
+            if (tryExtractTokenAndProbe(s, origin, id, refHost, apiHeaders, subtitleCallback, callback)) return true
             return false
         }
 
-        if (payloadHex.startsWith("53616c7465645f5f", true) && payloadHex.length > 32) {
+        // OpenSSL Salted__ format
+        val isSalted = ct.size > 16 && String(ct.copyOfRange(0, 8), Charsets.US_ASCII) == "Salted__"
+        if (isSalted) {
             Log.e(TAG, "    ↪ OpenSSL Salted__ format detected")
-            val salt = hexToBytes(payloadHex.substring(16, 32)) ?: return false
-            val realCt = hexToBytes(payloadHex.substring(32)) ?: return false
+            val salt = ct.copyOfRange(8, 16)
+            val realCt = ct.copyOfRange(16, ct.size)
             for (pw in candidatePasswords()) {
-                val (k, iv) = evpKDF(pw.toByteArray(), salt, 32, 16)
-                tryAesCbc(realCt, k, iv)?.let { p -> if (tryPlain(String(p, Charsets.UTF_8), "Salted__ pass='$pw'")) return true }
-            }
-        }
-
-        for ((label, iv) in listOf("iv-hash" to plexIvWithHash(), "iv-no-hash" to plexIvNoHash())) {
-            tryAesCbc(ct, key, iv)?.let { p -> if (tryPlain(String(p, Charsets.UTF_8), label)) return true }
-                ?: Log.e(TAG, "    ✗ $label: BadPadding")
-        }
-
-        if (ct.size > 32) {
-            val prefixedIv = ct.copyOf(16)
-            val strippedCt = ct.copyOfRange(16, ct.size)
-            val keysToTry = mutableListOf(plexKey())
-            base64KeyCandidate()?.let { keysToTry.add(it) }
-            for (k in keysToTry) {
-                tryAesCbc(strippedCt, k, prefixedIv)?.let { p ->
-                    if (tryPlain(String(p, Charsets.UTF_8), "prefixed-IV key=${bytesToHex(k).take(20)}…")) return true
+                for (ks in listOf(32, 16)) {
+                    val (k, iv) = evpKDF(pw.toByteArray(Charsets.UTF_8), salt, ks, 16)
+                    tryAesCbc(realCt, k, iv)?.let { p ->
+                        if (tryPlain(String(p, Charsets.UTF_8), "Salted__ pass='$pw' ks=$ks")) return true
+                    }
                 }
             }
-            Log.e(TAG, "    ↪ prefixed-IV CBC attempts done (first-16-bytes as IV)")
         }
 
-        base64KeyCandidate()?.let { b64Key ->
-            for ((label, iv) in listOf("iv-hash" to plexIvWithHash(), "iv-no-hash" to plexIvNoHash())) {
-                tryAesCbc(ct, b64Key, iv)?.let { p -> if (tryPlain(String(p, Charsets.UTF_8), "b64-key + $label")) return true }
+        for (key in keys) {
+            for ((label, iv) in ivs) {
+                tryAesCbc(ct, key, iv)?.let { p ->
+                    if (tryPlain(String(p, Charsets.UTF_8), "$label key=${bytesToHex(key).take(16)}")) return true
+                }
+            }
+        }
+
+        if (ct.size > 32 && ct.size % 16 == 0) {
+            val prefixedIv = ct.copyOf(16)
+            val strippedCt = ct.copyOfRange(16, ct.size)
+            for (k in keys) {
+                tryAesCbc(strippedCt, k, prefixedIv)?.let { p ->
+                    if (tryPlain(String(p, Charsets.UTF_8), "prefixed-IV key=${bytesToHex(k).take(16)}…")) return true
+                }
             }
         }
 
@@ -701,12 +769,11 @@ class P2pstream : ExtractorApi() {
             }
         }
 
-        Log.e(TAG, "    ↪ GCM attempts (nonce=12/16)")
         for (nonceLen in listOf(12, 16)) {
             if (ct.size <= nonceLen + 16) continue
             val nonce = ct.copyOf(nonceLen)
             val ctAndTag = ct.copyOfRange(nonceLen, ct.size)
-            for (k in listOfNotNull(plexKey(), base64KeyCandidate())) {
+            for (k in keys) {
                 tryAesGcm(ctAndTag, k, nonce)?.let { p ->
                     if (tryPlain(String(p, Charsets.UTF_8), "GCM nonce=$nonceLen")) return true
                 }
@@ -716,14 +783,16 @@ class P2pstream : ExtractorApi() {
     }
 
     private suspend fun tryDecryptWithExtractedKeys(
-        payloadHex: String, js: String, origin: String, id: String,
+        payload: String, isHex: Boolean, js: String, origin: String, id: String, refHost: String,
+        apiHeaders: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val ct = hexToBytes(payloadHex) ?: return false
+        val ct = decodePayloadBytes(payload, isHex) ?: return false
 
         val rawKeys = mutableListOf<ByteArray>()
         val passwords = mutableListOf<String>()
-        rawKeys.add(plexKey())
+        rawKeys.add(plexKeyWithHash())
+        rawKeys.add(plexKeyNoHash())
 
         Regex("""["'`]([0-9a-fA-F]{32})["'`]""").findAll(js).forEach { hexToBytes(it.groupValues[1])?.let(rawKeys::add) }
         Regex("""["'`]([0-9a-fA-F]{64})["'`]""").findAll(js).forEach { hexToBytes(it.groupValues[1])?.let(rawKeys::add) }
@@ -731,15 +800,11 @@ class P2pstream : ExtractorApi() {
         Regex("""["'`]([A-Za-z0-9!@#$%^&*()_+\-=./]{16})["'`]""").findAll(js).take(300).forEach { passwords.add(it.groupValues[1]) }
         Regex("""["'`]([A-Za-z0-9!@#$%^&*()_+\-=./]{32})["'`]""").findAll(js).take(300).forEach { passwords.add(it.groupValues[1]) }
 
-        Regex("""(?:key|secret|pass(?:word|phrase)?|decrypt|aes|cipher|iv)[^\w]{0,20}["'`]([^"'`\s]{8,64})["'`]""",
-            RegexOption.IGNORE_CASE).findAll(js).take(120).forEach { passwords.add(it.groupValues[1]) }
+        Regex("""(?:key|secret|pass(?:word|phrase)?|decrypt|aes|cipher|iv)[^\w]{0,20}["'`]([^"'`\s]{8,64})["'`]""", RegexOption.IGNORE_CASE)
+            .findAll(js).take(120).forEach { passwords.add(it.groupValues[1]) }
 
         Regex("""CryptoJS\.AES\.decrypt\([^)]{0,400}?["'`]([^"'`\s]{4,64})["'`]""")
             .findAll(js).take(60).forEach { passwords.add(it.groupValues[1]) }
-
-        Regex("""["'`]([A-Za-z0-9!@#$%^&*_+\-=./]{16})["'`]""").findAll(js).take(200).forEach {
-            passwords.add(it.groupValues[1].reversed())
-        }
 
         Regex("""["'`]([A-Za-z0-9+/]{22,}==?)["'`]""").findAll(js).take(200).forEach { m ->
             try {
@@ -748,14 +813,12 @@ class P2pstream : ExtractorApi() {
             } catch (_: Exception) {}
         }
 
-        val payloadLower = payloadHex.lowercase()
-        val payloadUpper = payloadHex.uppercase()
+        val payloadLower = payload.lowercase()
         rawKeys.add(md5Bytes(payloadLower))
         rawKeys.add(sha1Bytes(payloadLower).copyOf(16))
         rawKeys.add(sha256Bytes(payloadLower))
         passwords.add(payloadLower.take(32))
         passwords.add(payloadLower.takeLast(32))
-        passwords.add(payloadUpper.take(32))
         if (ct.size > 16) passwords.add(bytesToHex(ct.copyOf(16)))
         if (ct.size > 32) passwords.add(bytesToHex(ct.copyOf(32)))
 
@@ -774,16 +837,12 @@ class P2pstream : ExtractorApi() {
             passwords.add(id)
             passwords.add(id.uppercase())
             passwords.add(id.reversed())
-            Log.e(TAG, "    ↪ added ID-derived keys (id='$id')")
         }
 
         val (obfKeys, obfPasswords) = extractObfuscatedSecrets(js)
         rawKeys.addAll(obfKeys)
         passwords.addAll(obfPasswords)
-
-        val appStrings = extractNearAppMarkers(js)
-        passwords.addAll(appStrings)
-        Log.e(TAG, "    ↪ app-marker candidates: ${appStrings.take(10).map { it.take(30) }}")
+        passwords.addAll(extractNearAppMarkers(js))
 
         passwords.forEach { pw ->
             val b = pw.toByteArray(Charsets.UTF_8)
@@ -791,45 +850,55 @@ class P2pstream : ExtractorApi() {
         }
 
         val uniqueKeys = rawKeys.distinctBy { bytesToHex(it) }
-        Log.e(TAG, "    ${uniqueKeys.size} raw-key candidates, ${passwords.distinct().size} password candidates")
-        Log.e(TAG, "    ── top 10 keys: ${uniqueKeys.take(10).map { bytesToHex(it).take(16) + "…" }}")
-        Log.e(TAG, "    ── top 15 passwords: ${passwords.distinct().take(15).map { it.take(24) }}")
+        val uniquePasswords = passwords.distinct()
+        Log.e(TAG, "    ${uniqueKeys.size} raw-key candidates, ${uniquePasswords.size} password candidates")
 
         suspend fun tryPlain(s: String, label: String): Boolean {
             if (!likelyPlain(s)) return false
             Log.e(TAG, "    ✓ $label → ${s.take(200)}")
-            if (tryDirectMedia(s, origin, emptyMap(), subtitleCallback, callback)) return true
-            if (tryJsonBody(s, origin, emptyMap(), subtitleCallback, callback)) return true
-            if (tryExtractTokenAndProbe(s, origin, "", emptyMap(), subtitleCallback, callback)) return true
+            if (tryDirectMedia(s, origin, apiHeaders, subtitleCallback, callback)) return true
+            if (tryJsonBody(s, origin, apiHeaders, subtitleCallback, callback)) return true
+            if (tryExtractTokenAndProbe(s, origin, id, refHost, apiHeaders, subtitleCallback, callback)) return true
             return false
         }
 
-        val zeroIv = ByteArray(16)
-        val ivs = listOf("known-hash" to plexIvWithHash(), "known-nohash" to plexIvNoHash(), "zero" to zeroIv)
-
-        for (key in uniqueKeys) {
-            for ((ivLabel, iv) in ivs) {
-                tryAesCbc(ct, key, iv)?.let { p -> if (tryPlain(String(p, Charsets.UTF_8), "cbc($ivLabel) key=${bytesToHex(key).take(20)}…")) return true }
-            }
-            tryAesEcb(ct, key)?.let { p -> if (tryPlain(String(p, Charsets.UTF_8), "ecb key=${bytesToHex(key).take(20)}…")) return true }
-        }
-
-        if (ct.size > 32) {
-            val prefixedIv = ct.copyOf(16)
-            val strippedCt = ct.copyOfRange(16, ct.size)
-            var prefixedHits = 0
-            for (key in uniqueKeys) {
-                tryAesCbc(strippedCt, key, prefixedIv)?.let { p ->
-                    if (tryPlain(String(p, Charsets.UTF_8), "prefixed-IV key=${bytesToHex(key).take(20)}…")) {
-                        prefixedHits++
-                        return true
+        val isSalted = ct.size > 16 && String(ct.copyOfRange(0, 8), Charsets.US_ASCII) == "Salted__"
+        if (isSalted) {
+            val salt = ct.copyOfRange(8, 16)
+            val realCt = ct.copyOfRange(16, ct.size)
+            for (pw in uniquePasswords.take(200)) {
+                for (ks in listOf(32, 16)) {
+                    val (k, iv) = evpKDF(pw.toByteArray(Charsets.UTF_8), salt, ks, 16)
+                    tryAesCbc(realCt, k, iv)?.let { p ->
+                        if (tryPlain(String(p, Charsets.UTF_8), "Salted__ js-pass='${pw.take(20)}'")) return true
                     }
                 }
             }
-            Log.e(TAG, "    ↪ prefixed-IV CBC tried ${uniqueKeys.size} keys (${prefixedHits} hits)")
         }
 
-        for (password in passwords.distinct().take(150)) {
+        val ivs = listOf("default" to plexDefaultIv(), "alt" to plexAltIv(), "zero" to ByteArray(16))
+        for (key in uniqueKeys) {
+            for ((ivLabel, iv) in ivs) {
+                tryAesCbc(ct, key, iv)?.let { p ->
+                    if (tryPlain(String(p, Charsets.UTF_8), "cbc($ivLabel) key=${bytesToHex(key).take(20)}…")) return true
+                }
+            }
+            tryAesEcb(ct, key)?.let { p ->
+                if (tryPlain(String(p, Charsets.UTF_8), "ecb key=${bytesToHex(key).take(20)}…")) return true
+            }
+        }
+
+        if (ct.size > 32 && ct.size % 16 == 0) {
+            val prefixedIv = ct.copyOf(16)
+            val strippedCt = ct.copyOfRange(16, ct.size)
+            for (key in uniqueKeys) {
+                tryAesCbc(strippedCt, key, prefixedIv)?.let { p ->
+                    if (tryPlain(String(p, Charsets.UTF_8), "prefixed-IV key=${bytesToHex(key).take(20)}…")) return true
+                }
+            }
+        }
+
+        for (password in uniquePasswords.take(150)) {
             val pw = password.toByteArray(Charsets.UTF_8)
             for (salt in listOf(ByteArray(0), ByteArray(8))) {
                 for (keySize in listOf(32, 16)) {
@@ -855,66 +924,56 @@ class P2pstream : ExtractorApi() {
     }
 
     private suspend fun tryEncDecPayload(
-        payload: String, origin: String,
+        payload: String, origin: String, refHost: String,
+        apiHeaders: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
     ): Boolean {
         val decHeaders = mapOf(
             "User-Agent" to DEFAULT_UA, "Origin" to "https://enc-dec.app",
             "Referer" to "https://enc-dec.app/", "Content-Type" to "application/json",
         )
-
         val agentCandidates = listOf(
-            hostOf(origin) ?: "",
-            "naruldonghua.com",
-            "narulplex",
-            "p2pstream",
-            DEFAULT_UA,
-            "Mozilla/5.0",
-            "Chrome",
+            hostOf(origin) ?: "", "naruldonghua.com", "narulplex", "p2pstream", DEFAULT_UA,
         ).filter { it.isNotBlank() }.distinct()
 
         for (decoder in listOf("dec-rapid", "dec-mega")) {
             for (agent in agentCandidates) {
                 try {
                     val reqBody = JSONObject().apply {
-                        put("text", payload)
-                        put("agent", agent)
+                        put("text", payload); put("agent", agent)
                     }.toString().toRequestBody(JSON_TYPE)
                     val resp = app.post("https://enc-dec.app/api/$decoder", headers = decHeaders, requestBody = reqBody)
                     val text = resp.text
-                    Log.e(TAG, "    $decoder(agent='${agent.take(30)}…') → ${resp.code} len=${text.length} body=${text.take(180).replace("\n", "\\n")}")
-                    if (resp.code == 200 && tryDecodedResult(text, origin, subtitleCallback, callback)) return true
+                    Log.e(TAG, "    $decoder(agent='${agent.take(30)}…') → ${resp.code} len=${text.length}")
+                    if (resp.code == 200 && tryDecodedResult(text, origin, refHost, apiHeaders, subtitleCallback, callback)) return true
                 } catch (_: Exception) {}
             }
         }
 
-        for (decoder in listOf("dec-abyss")) {
-            try {
-                val reqBody = """{"text":"$payload"}""".toRequestBody(JSON_TYPE)
-                val resp = app.post("https://enc-dec.app/api/$decoder", headers = decHeaders, requestBody = reqBody)
-                val text = resp.text
-                Log.e(TAG, "    $decoder(text-only) → ${resp.code} len=${text.length} body=${text.take(180).replace("\n", "\\n")}")
-                if (resp.code == 200 && tryDecodedResult(text, origin, subtitleCallback, callback)) return true
-            } catch (_: Exception) {}
-        }
-
+        try {
+            val reqBody = JSONObject().apply { put("text", payload) }.toString().toRequestBody(JSON_TYPE)
+            val resp = app.post("https://enc-dec.app/api/dec-abyss", headers = decHeaders, requestBody = reqBody)
+            if (resp.code == 200 && tryDecodedResult(resp.text, origin, refHost, apiHeaders, subtitleCallback, callback)) return true
+        } catch (_: Exception) {}
         return false
     }
 
     private suspend fun tryDecodedResult(
-        text: String, origin: String,
+        text: String, origin: String, refHost: String,
+        apiHeaders: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
     ): Boolean {
         if (!text.contains(".m3u8") && !text.contains(".mp4") &&
             !text.contains("\"sources\"") && !text.contains("\"url\"") && !text.contains("\"token\"")) return false
         try {
             val json = JSONObject(text)
-            val result = json.optJSONObject("result") ?: json
-            if (tryJsonBody(result.toString(), origin, emptyMap(), subtitleCallback, callback)) return true
-            if (tryDirectMedia(result.toString(), origin, emptyMap(), subtitleCallback, callback)) return true
-            if (tryExtractTokenAndProbe(result.toString(), origin, "", emptyMap(), subtitleCallback, callback)) return true
+            val resultStr = json.optJSONObject("result")?.toString()
+                ?: json.optString("result").takeIf { it.isNotBlank() } ?: json.toString()
+            if (tryJsonBody(resultStr, origin, apiHeaders, subtitleCallback, callback)) return true
+            if (tryDirectMedia(resultStr, origin, apiHeaders, subtitleCallback, callback)) return true
+            if (tryExtractTokenAndProbe(resultStr, origin, "", refHost, apiHeaders, subtitleCallback, callback)) return true
         } catch (_: Exception) {
-            if (tryDirectMedia(text, origin, emptyMap(), subtitleCallback, callback)) return true
+            if (tryDirectMedia(text, origin, apiHeaders, subtitleCallback, callback)) return true
         }
         return false
     }
@@ -923,28 +982,54 @@ class P2pstream : ExtractorApi() {
         val found = mutableListOf<String>()
         Regex("""["'`](/(?:api|v1|v2|ajax|embed|source|video|link|stream|resolve|fetch|play)/[a-zA-Z0-9_\-/.]{2,100})["'`]""", RegexOption.IGNORE_CASE)
             .findAll(js).map { it.groupValues[1] }.distinct()
-            .filter { p -> listOf("video","source","stream","embed","resolve","play").any { p.contains(it, true) } && !p.contains("/assets/") }
-            .forEach { p -> found.add("$p?id={id}"); found.add("$p?hash={id}") }
+            .filter { p ->
+                listOf("video", "source", "stream", "embed", "resolve", "play", "info", "player", "folder").any { p.contains(it, true) } &&
+                !p.contains("/assets/")
+            }
+            .forEach { p -> found.add("$p?id={id}"); found.add("$p?t={id}") }
         return found.distinct().take(8)
     }
 
-    private suspend fun tryDirectMedia(text: String, origin: String, headers: Map<String, String>, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+    private suspend fun tryDirectMedia(
+        text: String, origin: String, headers: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
+    ): Boolean {
         if (text.length > 800_000) return false
         val n = text.replace("\\/", "/")
+        emitSubtitlesFromText(n, subtitleCallback)
         RE_M3U8_ATTR.find(n)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { emitHls(it, origin, headers, subtitleCallback, callback); return true }
         RE_M3U8_ANY.find(n)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { emitHls(it, origin, headers, subtitleCallback, callback); return true }
-        RE_MP4_ATTR.find(n)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { callback(newExtractorLink(name, name, it, INFER_TYPE) { this.referer = "$origin/" }); return true }
-        RE_MP4_ANY.find(n)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { callback(newExtractorLink(name, name, it, INFER_TYPE) { this.referer = "$origin/" }); return true }
+        RE_MP4_ATTR.find(n)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { callback(newExtractorLink(name, name, it, INFER_TYPE) { this.referer = "$origin/"; this.headers = headers }); return true }
+        RE_MP4_ANY.find(n)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { callback(newExtractorLink(name, name, it, INFER_TYPE) { this.referer = "$origin/"; this.headers = headers }); return true }
         RE_HLS_HINT.find(n)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { emitHls(it, origin, headers, subtitleCallback, callback); return true }
         return false
     }
 
-    private suspend fun tryJsonBody(body: String, origin: String, headers: Map<String, String>, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+    private suspend fun tryJsonBody(
+        body: String, origin: String, headers: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
+    ): Boolean {
         val t = body.trimStart()
         if (!t.startsWith("{") && !t.startsWith("[")) return false
         val json = try { JSONObject(body) } catch (_: Exception) { return false }
+
+        for (subKey in listOf("subtitles", "tracks", "captions", "subs")) {
+            val subArr = json.optJSONArray(subKey) ?: continue
+            for (i in 0 until subArr.length()) {
+                val subObj = subArr.optJSONObject(i) ?: continue
+                val subUrl = subObj.optString("file").ifBlank { subObj.optString("url") }.ifBlank { subObj.optString("src") }
+                if (subUrl.isNotBlank() && !isPlaceholderUrl(subUrl)) {
+                    val label = subObj.optString("label").ifBlank { subObj.optString("lang") }.ifBlank { "Sub" }
+                    subtitleCallback(newSubtitleFile(label, resolveUrl(subUrl, "$origin/", origin) ?: subUrl) { this.headers = headers })
+                }
+            }
+        }
+
         val deep = extractUrlsFromJson(json).filter { !isPlaceholderUrl(it) }
-        if (deep.isNotEmpty()) { deep.distinct().forEach { emitSingleUrl(it, origin, headers, subtitleCallback, callback) }; return true }
+        if (deep.isNotEmpty()) {
+            deep.distinct().forEach { emitSingleUrl(it, origin, headers, subtitleCallback, callback) }
+            return true
+        }
         val direct = listOf(json.optString("url"), json.optString("source"), json.optString("src"), json.optString("file"))
             .firstOrNull { it.isNotBlank() && (it.startsWith("http") || it.startsWith("//")) && !isPlaceholderUrl(it) }
         if (!direct.isNullOrBlank()) { emitSingleUrl(direct, origin, headers, subtitleCallback, callback); return true }
@@ -961,20 +1046,26 @@ class P2pstream : ExtractorApi() {
         return false
     }
 
-    private suspend fun emitSingleUrl(url: String, origin: String, headers: Map<String, String>, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+    private suspend fun emitSingleUrl(
+        url: String, origin: String, headers: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
+    ) {
         val u = if (url.startsWith("//")) "https:$url" else url
         if (u.contains(".m3u8")) emitHls(u, origin, headers, subtitleCallback, callback)
-        else callback(newExtractorLink(name, name, u, INFER_TYPE) { this.referer = "$origin/" })
+        else callback(newExtractorLink(name, name, u, INFER_TYPE) { this.referer = "$origin/"; this.headers = headers })
     }
 
-    private suspend fun emitHls(m3u8: String, origin: String, headers: Map<String, String>, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+    private suspend fun emitHls(
+        m3u8: String, origin: String, headers: Map<String, String>,
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
+    ) {
         M3u8Helper.generateM3u8(name, m3u8, "$origin/", headers = headers).forEach(callback)
         emitSubtitlesFromM3u8(m3u8, headers, subtitleCallback)
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  BYSE — unchanged (CDN is DNS-dead; extractor already fails cleanly)
+//  BYSE — handles bysekoze.com + bysejikuar.com
 // ════════════════════════════════════════════════════════════════════════════
 class Bysekoze : ExtractorApi() {
     override val name = "Byse"
@@ -995,8 +1086,9 @@ class Bysekoze : ExtractorApi() {
         )
         if (manualJsUnpackExtraction(url, name, headers, subtitleCallback, callback)) return
 
-        val hash = url.substringAfter("/d/").substringBefore("/").takeIf { it.isNotBlank() }
-            ?: url.substringAfter("/embed/").substringBefore("/").takeIf { it.isNotBlank() }
+        val hash = url.substringAfter("/d/", "").substringBefore("/").substringBefore("?").takeIf { it.isNotBlank() }
+            ?: url.substringAfter("/embed/", "").substringBefore("/").substringBefore("?").takeIf { it.isNotBlank() }
+            ?: url.substringAfter("/e/", "").substringBefore("/").substringBefore("?").takeIf { it.isNotBlank() }
             ?: return
         val embedUrl = "$origin/embed/$hash"
         Log.e(TAG, "vite embed → $embedUrl")
@@ -1007,8 +1099,8 @@ class Bysekoze : ExtractorApi() {
         if (shell.code != 200 || isErrorPage(shell.text)) { Log.e(TAG, "shell bad: ${shell.code}"); return }
 
         val jsUrl = RE_SCRIPT_SRC.findAll(shell.text).map { it.groupValues[1] }
-            .filter { !isTemplatePlaceholder(it) }
-            .map { if (it.startsWith("/")) "$origin$it" else if (it.startsWith("http")) it else "$origin/$it" }
+            .filter { !isTemplatePlaceholder(it) && !isPlaceholderUrl(it) }
+            .mapNotNull { resolveUrl(it, embedUrl, origin) }
             .firstOrNull { it.contains(".js") } ?: return
         Log.e(TAG, "main js → $jsUrl")
 
@@ -1027,86 +1119,66 @@ class Bysekoze : ExtractorApi() {
         val allM3u8 = mutableListOf<String>()
         val allApiPaths = mutableListOf<String>()
         for (chunk in chunks.take(40)) {
-            val chunkUrl = if (chunk.startsWith("http")) chunk else "$origin/$chunk"
+            val chunkUrl = resolveUrl(chunk, embedUrl, origin) ?: continue
             if (isTemplatePlaceholder(chunkUrl)) continue
             val chunkJs = fetchText(chunkUrl, headers) ?: continue
             Log.e(TAG, "  chunk ${chunk.takeLast(50)} len=${chunkJs.length}")
 
             RE_M3U8_ANY.findAll(chunkJs).map { it.groupValues[1] }
                 .filter { !isPlaceholderUrl(it) }
-                .distinct()
-                .forEach { allM3u8.add(it) }
+                .distinct().forEach { allM3u8.add(it) }
 
-            Regex("""["'`](/(?:api|v1|v2|embed|source|video|stream|resolve|play)/[a-zA-Z0-9_\-/.]{2,80})["'`]""", RegexOption.IGNORE_CASE)
+            Regex("""["'`](/(?:api|v1|v2|embed|source|video|stream|resolve|play)/[a-zA-Z0-9_\-/.:{]{2,80})["'`]""", RegexOption.IGNORE_CASE)
                 .findAll(chunkJs).map { it.groupValues[1] }.distinct()
                 .filter { !it.contains("/assets/") && !it.contains("/static/") }
                 .forEach { allApiPaths.add(it) }
         }
 
-        Log.e(TAG, "── collected m3u8 (${allM3u8.distinct().size}): ${allM3u8.distinct().map { it.take(60) }}")
-
+        Log.e(TAG, "── collected m3u8 (${allM3u8.distinct().size})")
         val m3u8Headers = headers + mapOf("Referer" to "$origin/", "Origin" to origin)
 
         for (m3u8 in allM3u8.distinct().take(3)) {
-            Log.e(TAG, "── try m3u8: ${m3u8.take(90)}")
-            val alternates = mutableListOf<String>()
-            alternates += m3u8
+            val alternates = mutableListOf(m3u8)
             if (m3u8.contains("premium.api.byse.sx", true)) {
                 alternates += m3u8.replace("premium.api.byse.sx", "bysejikuar.com", true)
             }
-
             for (alt in alternates.distinct()) {
-                val host = hostOf(alt) ?: continue
-                val startMs = System.currentTimeMillis()
                 try {
                     val links = withTimeoutOrNull(8_000L) {
                         M3u8Helper.generateM3u8(name, alt, "$origin/", headers = m3u8Headers)
                     }
-                    val elapsed = System.currentTimeMillis() - startMs
-                    if (links == null) { Log.e(TAG, "    TIMEOUT $host after ${elapsed}ms"); continue }
-                    Log.e(TAG, "    $host → ${links.size} variants in ${elapsed}ms")
-                    if (links.isNotEmpty()) {
+                    if (!links.isNullOrEmpty()) {
                         links.forEach(callback)
                         emitSubtitlesFromM3u8(alt, m3u8Headers, subtitleCallback)
-                        Log.e(TAG, "    ✓ emitted from $host")
                         return
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "    FAIL $host in ${System.currentTimeMillis()-startMs}ms: ${e.javaClass.simpleName}: ${e.message?.take(80)}")
+                    Log.e(TAG, "    FAIL: ${e.message?.take(80)}")
                 }
             }
-
             for (alt in alternates.distinct()) {
-                val host = hostOf(alt) ?: continue
-                Log.e(TAG, "    ↪ raw-validate $host")
                 if (isValidM3u8(alt, m3u8Headers)) {
-                    Log.e(TAG, "    ✓ raw-validate OK on $host → emitting as M3U8")
                     callback(newExtractorLink(name, name, alt, INFER_TYPE) {
-                        this.referer = "$origin/"
-                        this.headers = m3u8Headers
+                        this.referer = "$origin/"; this.headers = m3u8Headers
                     })
                     emitSubtitlesFromM3u8(alt, m3u8Headers, subtitleCallback)
                     return
-                } else {
-                    Log.e(TAG, "    ✗ raw-validate FAILED on $host (not a valid #EXTM3U)")
                 }
             }
         }
 
         for (path in allApiPaths.distinct().take(10)) {
-            val tryUrl = "$origin$path"
-                .replace("{hash}", hash).replace(":hash", hash)
+            val cleanPath = path.replace("{hash}", hash).replace(":hash", hash)
                 .replace(":id", hash).replace("{id}", hash)
-            if (tryUrl.contains("{") || tryUrl.contains(":")) continue
-            Log.e(TAG, "  try API: $tryUrl")
+            if (cleanPath.contains("{") || cleanPath.contains(":")) continue
+            val tryUrl = resolveUrl(cleanPath, embedUrl, origin) ?: continue
             try {
                 val r = app.get(tryUrl, headers = headers + ("Accept" to "application/json"))
-                Log.e(TAG, "    ${r.code} len=${r.text.length} preview=${r.text.take(120)}")
                 if (r.code == 200 && !isErrorPage(r.text)) {
                     RE_M3U8_ANY.find(r.text)?.groupValues?.get(1)?.takeIf { !isPlaceholderUrl(it) }?.let { m3u8 ->
-                        val startMs = System.currentTimeMillis()
-                        val links = withTimeoutOrNull(8_000L) { M3u8Helper.generateM3u8(name, m3u8, "$origin/", headers = m3u8Headers) }
-                        Log.e(TAG, "    api m3u8 → ${links?.size ?: 0} in ${System.currentTimeMillis()-startMs}ms")
+                        val links = withTimeoutOrNull(8_000L) {
+                            M3u8Helper.generateM3u8(name, m3u8, "$origin/", headers = m3u8Headers)
+                        }
                         if (!links.isNullOrEmpty()) {
                             links.forEach(callback)
                             emitSubtitlesFromM3u8(m3u8, m3u8Headers, subtitleCallback)
@@ -1114,38 +1186,31 @@ class Bysekoze : ExtractorApi() {
                         }
                         if (isValidM3u8(m3u8, m3u8Headers)) {
                             callback(newExtractorLink(name, name, m3u8, INFER_TYPE) {
-                                this.referer = "$origin/"
-                                this.headers = m3u8Headers
+                                this.referer = "$origin/"; this.headers = m3u8Headers
                             })
                             emitSubtitlesFromM3u8(m3u8, m3u8Headers, subtitleCallback)
                             return
                         }
-                        Log.e(TAG, "    ✗ api m3u8 not valid #EXTM3U → skipping")
                     }
                 }
             } catch (e: Exception) { Log.e(TAG, "    API fail: ${e.message?.take(80)}") }
         }
-
-        Log.e(TAG, "✗ Byse exhausted (no valid stream found)")
+        Log.e(TAG, "✗ Byse exhausted")
     }
 
     private suspend fun fetchText(url: String, headers: Map<String, String>): String? =
         try {
             val r = app.get(url, headers = headers, timeout = 15L)
-            Log.e(TAG, "    fetch $url → code=${r.code} len=${r.text.length}")
             if (r.code == 200 && !isErrorPage(r.text) &&
                 !r.text.startsWith("<!doctype", true) && !r.text.startsWith("<html", true)) r.text
             else null
-        } catch (e: Exception) {
-            Log.e(TAG, "    fetch FAIL $url → ${e.javaClass.simpleName}: ${e.message?.take(100)}")
-            null
-        }
+        } catch (_: Exception) { null }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  ABYSS — unchanged (verified working)
+//  ABYSS — handles abyssplayer.com + player.abyssplayer.com + abysplayserver.com
+//          + abyysplayer.com + playhydrax.com
 // ════════════════════════════════════════════════════════════════════════════
-@Suppress("DEPRECATION")
 class AbyssPlayer : ExtractorApi() {
     override val name = "Abyss"
     override val mainUrl = "https://abyssplayer.com"
@@ -1154,7 +1219,7 @@ class AbyssPlayer : ExtractorApi() {
     companion object {
         private const val TAG = "Narul/Abyss"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaTypeOrNull()
-        private val RE_DATAS = Regex("""const\s+datas\s*=\s*"([^"]*)"""")
+        private val RE_DATAS = Regex("""(?:const|let|var|window\.)\s*datas\s*=\s*["']([^"']+)["']""")
         private val DECODER_HEADERS = mapOf(
             "User-Agent" to DEFAULT_UA, "Origin" to "https://playhydrax.com",
             "Referer" to "https://playhydrax.com/", "Content-Type" to "application/json",
@@ -1162,11 +1227,11 @@ class AbyssPlayer : ExtractorApi() {
         private val SUBTITLE_ARRAY_KEYS = listOf("subtitles", "tracks", "captions", "subs")
 
         private fun parseQuality(label: String): Int = when {
-            label.contains("2160") || label.contains("4K", true)   -> Qualities.P2160.value
-            label.contains("1440") || label.contains("2K", true)   -> Qualities.P1440.value
-            label.contains("1080") || label.contains("FHD", true)  -> Qualities.P1080.value
-            label.contains("720")  || label.contains("HD", true)   -> Qualities.P720.value
-            label.contains("480")  || label.contains("SD", true)   -> Qualities.P480.value
+            label.contains("2160") || label.contains("4K", true)  -> Qualities.P2160.value
+            label.contains("1440") || label.contains("2K", true)  -> Qualities.P1440.value
+            label.contains("1080") || label.contains("FHD", true) -> Qualities.P1080.value
+            label.contains("720")  || label.contains("HD", true)  -> Qualities.P720.value
+            label.contains("480")  || label.contains("SD", true)  -> Qualities.P480.value
             label.contains("360") -> Qualities.P360.value
             label.contains("240") -> Qualities.P240.value
             else -> Qualities.Unknown.value
@@ -1181,7 +1246,7 @@ class AbyssPlayer : ExtractorApi() {
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         Log.e(TAG, "=== Abyss getUrl url=$url")
         val origin = originOf(url) ?: return
-        val pageHeaders = mapOf("User-Agent" to DEFAULT_UA, "Origin" to origin, "Referer" to "$origin/")
+        val pageHeaders = mapOf("User-Agent" to DEFAULT_UA, "Origin" to origin, "Referer" to (referer ?: "$origin/"))
 
         val doc = try { app.get(url, headers = pageHeaders).document } catch (e: Exception) {
             Log.e(TAG, "page fetch failed: ${e.message}"); return
@@ -1190,14 +1255,18 @@ class AbyssPlayer : ExtractorApi() {
         val encrypted = RE_DATAS.find(scriptData)?.groupValues?.getOrNull(1) ?: return
         Log.e(TAG, "encrypted length=${encrypted.length}")
 
-        val reqBody = """{"text":"$encrypted"}""".toRequestBody(JSON_MEDIA_TYPE)
+        val reqBody = JSONObject().apply { put("text", encrypted) }.toString().toRequestBody(JSON_MEDIA_TYPE)
         val responseText = try {
             app.post("https://enc-dec.app/api/dec-abyss", headers = DECODER_HEADERS, requestBody = reqBody).text
         } catch (e: Exception) { Log.e(TAG, "decoder failed: ${e.message}"); return }
-        Log.e(TAG, "decoder response length=${responseText.length}")
 
-        val result = JSONObject(responseText).optJSONObject("result") ?: return
+        val rootJson = try { JSONObject(responseText) } catch (_: Exception) { return }
+        val result = rootJson.optJSONObject("result")
+            ?: rootJson.optString("result").takeIf { it.startsWith("{") }?.let {
+                try { JSONObject(it) } catch (_: Exception) { null }
+            } ?: return
 
+        val streamHeaders = mapOf("User-Agent" to DEFAULT_UA, "Referer" to "$origin/", "Origin" to origin)
         val seenSubs = HashSet<String>()
         for (key in SUBTITLE_ARRAY_KEYS) {
             val arr = result.optJSONArray(key) ?: continue
@@ -1207,61 +1276,49 @@ class AbyssPlayer : ExtractorApi() {
                     .ifBlank { obj.optString("src") }.ifBlank { obj.optString("srcUrl") }
                 if (subUrl.isBlank() || !seenSubs.add(subUrl)) continue
                 val label = obj.optString("label").ifBlank { obj.optString("name") }
-                    .ifBlank { obj.optString("lang") }.ifBlank { obj.optString("language") }
-                    .ifBlank { "Sub" }
-                subtitleCallback(newSubtitleFile(label, subUrl) {
-                    this.headers = mapOf("Referer" to "$origin/", "Origin" to origin)
-                })
+                    .ifBlank { obj.optString("lang") }.ifBlank { obj.optString("language") }.ifBlank { "Sub" }
+                subtitleCallback(newSubtitleFile(label, subUrl) { this.headers = streamHeaders })
             }
         }
 
         val sources = result.optJSONArray("sources") ?: return
-        Log.e(TAG, "sources count=${sources.length()}")
         val seenUrls = HashSet<String>()
 
         for (i in 0 until sources.length()) {
             val src = sources.optJSONObject(i)
-
             if (src == null) {
                 val stringUrl = sources.optString(i)
                 if (stringUrl.isBlank() || !seenUrls.add(stringUrl)) continue
                 if (stringUrl.contains(".m3u8")) {
-                    M3u8Helper.generateM3u8("$name HLS", stringUrl, origin).forEach { link ->
-                        callback(ExtractorLink(
-                            name = link.name, source = "$name HLS", url = link.url,
-                            referer = link.referer, quality = link.quality, type = link.type,
-                            headers = link.headers, extractorData = link.extractorData,
-                        ))
-                    }
-                    emitSubtitlesFromM3u8(stringUrl, pageHeaders, subtitleCallback)
+                    M3u8Helper.generateM3u8("$name HLS", stringUrl, "$origin/", headers = streamHeaders).forEach(callback)
+                    emitSubtitlesFromM3u8(stringUrl, streamHeaders, subtitleCallback)
                 } else {
-                    callback(newExtractorLink(name, name, stringUrl, INFER_TYPE) { this.referer = url })
+                    callback(newExtractorLink(name, name, stringUrl, INFER_TYPE) {
+                        this.referer = url; this.headers = streamHeaders
+                    })
                 }
                 continue
             }
 
             if (!src.optBoolean("status", false) && !src.has("url")) continue
-            val srcUrl = src.optString("url")
+            val srcUrl = src.optString("url").ifBlank { src.optString("file") }
             if (srcUrl.isBlank() || !seenUrls.add(srcUrl)) continue
 
             val rawLabel = pickLabel(src)
             val qualityInt = parseQuality(rawLabel)
-            Log.e(TAG, "  source[$i] label='$rawLabel' q=${qualityInt}p url=${srcUrl.take(60)}…")
 
             if (srcUrl.contains(".m3u8")) {
-                M3u8Helper.generateM3u8("$name HLS", srcUrl, origin).forEach { link ->
+                M3u8Helper.generateM3u8("$name HLS", srcUrl, "$origin/", headers = streamHeaders).forEach { link ->
                     val finalQ = if (link.quality != Qualities.Unknown.value) link.quality else qualityInt
-                    callback(ExtractorLink(
-                        name = link.name, source = "$name HLS", url = link.url,
-                        referer = link.referer, quality = finalQ, type = link.type,
-                        headers = link.headers, extractorData = link.extractorData,
-                    ))
+                    callback(newExtractorLink(link.source, link.name, link.url, link.type) {
+                        this.referer = link.referer; this.quality = finalQ
+                        this.headers = link.headers; this.extractorData = link.extractorData
+                    })
                 }
-                emitSubtitlesFromM3u8(srcUrl, pageHeaders, subtitleCallback)
+                emitSubtitlesFromM3u8(srcUrl, streamHeaders, subtitleCallback)
             } else {
                 callback(newExtractorLink(name, name, srcUrl, INFER_TYPE) {
-                    this.referer = url
-                    this.quality = qualityInt
+                    this.referer = url; this.quality = qualityInt; this.headers = streamHeaders
                 })
             }
         }
