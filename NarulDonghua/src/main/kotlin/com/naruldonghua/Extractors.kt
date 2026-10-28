@@ -1514,11 +1514,11 @@ class AbyssPlayer : ExtractorApi() {
                 .ifBlank { src.optString("type") }.ifBlank { src.optString("res") }
                 .ifBlank { src.optString("resolution") }
 
-        // Never read whole body of media URLs — would throw on large files
-        private fun readHeadBytes(resp: okhttp3.Response?, maxBytes: Int = 500): String {
-            if (resp == null) return ""
+         // Never read whole body of media URLs — would throw on large files.
+        // Accepts ResponseBody directly so it works with NiceResponse.body without type juggling.
+        private fun readHeadBytes(body: okhttp3.ResponseBody?, maxBytes: Int = 500): String {
+            if (body == null) return ""
             return try {
-                val body = resp.body ?: return ""
                 body.byteStream().use { stream ->
                     val buf = ByteArray(maxBytes)
                     var total = 0
