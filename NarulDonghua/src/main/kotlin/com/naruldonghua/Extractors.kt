@@ -1655,7 +1655,7 @@ class AbyssPlayer : ExtractorApi() {
 
         val probe = try { app.get(srcUrl, headers = streamHeaders, timeout = 10L) } catch (_: Exception) { null }
         val ct = probe?.headers?.get("content-type")?.lowercase() ?: ""
-        val headBytes = readHeadBytes(probe, 500)
+        val headBytes = readHeadBytes(probe?.body, 500)
 
         val isHls = headBytes.trimStart().startsWith("#EXTM3U") || ct.contains("mpegurl", true) || ct.contains("m3u8", true)
         val isMp4 = ct.contains("video/mp4", true) || ct.contains("octet-stream", true) ||
