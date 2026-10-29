@@ -31,7 +31,7 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-private const val DEFAULT_UA =
+internal const val DEFAULT_UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
@@ -72,6 +72,9 @@ private fun chromeHeaders(
     return m
 }
 
+/**
+ * Minimal headers for Abyss, Byse, and Plex media CDNs that reject full browser fingerprints.
+ */
 private fun mediaHeadersMinimal(referer: String): Map<String, String> = mapOf(
     "User-Agent" to DEFAULT_UA,
     "Accept" to "*/*",
@@ -95,11 +98,11 @@ private val RE_PACKED_SCRIPT = Regex(
     RegexOption.IGNORE_CASE
 )
 private val RE_M3U8_ATTR = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.m3u8[^"']*)["']""", RegexOption.IGNORE_CASE)
-private val RE_M3U8_ANY  = Regex("""(https?://[^"'\s\\]+\.m3u8[^"'\s\\]*)""")
+private val RE_M3U8_ANY  = Regex("""(https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
 private val RE_MP4_ATTR  = Regex("""(?:file|src|source)\s*[:=]\s*["'](https?://[^"']+\.(?:mp4|mkv)[^"']*)["']""", RegexOption.IGNORE_CASE)
-private val RE_MP4_ANY   = Regex("""(https?://[^"'\s\\]+\.(?:mp4|mkv)[^"'\s\\]*)""")
+private val RE_MP4_ANY   = Regex("""(https?://[^"'\s\\<>]+\.(?:mp4|mkv)[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
 private val RE_SUB_URL   = Regex("""(https?://[^"'\s\\<>]+\.(?:vtt|srt|ass|ssa)(?:\?[^"'\s\\<>]*)?)""", RegexOption.IGNORE_CASE)
-private val RE_HLS_HINT  = Regex("""(https?://[^"'\s\\]+/(?:manifest|hls|playlist|master)(?:/[^"'\s\\]*)?)""", RegexOption.IGNORE_CASE)
+private val RE_HLS_HINT  = Regex("""(https?://[^"'\s\\<>]+/(?:manifest|hls|playlist|master)(?:/[^"'\s\\<>]*)?)""", RegexOption.IGNORE_CASE)
 
 private val PLACEHOLDER_DOMAINS = setOf(
     "site.com", "localhost", "127.0.0.1", "0.0.0.0", "example.com", "example.org",
@@ -112,17 +115,17 @@ private val PLACEHOLDER_TOKENS = listOf(
 private val IGNORED_EMBED_DOMAINS = listOf(
     "a-ads.com", "disqus.com", "disquscdn.com", "googletagmanager.com",
     "google-analytics.com", "doubleclick.net", "googlesyndication.com",
-    "cloudflareinsights.com", "yandex", "vlitag.com", "vntsm.com",
+    "cloudflareinsights.com", "yandex.ru", "vlitag.com", "vntsm.com",
     "todsquia.com", "ouo.io", "liadm.com", "facebook.com", "twitter.com",
 )
 
-private fun originOf(url: String): String? =
-    Regex("""^(https?://[^/?#]+)""").find(url.trim())?.groupValues?.getOrNull(1)
+internal fun originOf(url: String): String? =
+    Regex("""^(https?://[^/?#]+)""", RegexOption.IGNORE_CASE).find(url.trim())?.groupValues?.getOrNull(1)
 
-private fun hostOf(url: String): String? =
-    Regex("""^https?://([^/?#:]+)""").find(url.trim())?.groupValues?.getOrNull(1)?.lowercase()
+internal fun hostOf(url: String): String? =
+    Regex("""^https?://([^/?#:]+)""", RegexOption.IGNORE_CASE).find(url.trim())?.groupValues?.getOrNull(1)?.lowercase()
 
-private fun isPlaceholderUrl(url: String): Boolean {
+internal fun isPlaceholderUrl(url: String): Boolean {
     val lower = url.lowercase().trim()
     if (lower.isEmpty()) return true
     if (lower.startsWith("blob:") || lower.startsWith("data:") ||
@@ -137,7 +140,7 @@ private fun isPlaceholderUrl(url: String): Boolean {
     return false
 }
 
-private fun isErrorPage(html: String): Boolean {
+internal fun isErrorPage(html: String): Boolean {
     if (html.isBlank()) return true
     val lower = html.lowercase()
     if (lower.contains("cf-browser-verification") || lower.contains("checking your browser")) return true
@@ -153,7 +156,7 @@ private fun isErrorPage(html: String): Boolean {
     return false
 }
 
-private fun resolveUrl(uri: String, masterUrl: String, origin: String): String? {
+internal fun resolveUrl(uri: String, masterUrl: String, origin: String): String? {
     val trimmed = uri.trim().replace("&amp;", "&")
     if (trimmed.isEmpty() ||
         trimmed.startsWith("blob:", true) || trimmed.startsWith("data:", true) ||
@@ -870,7 +873,7 @@ class P2pstream : ExtractorApi() {
             val prefixedIv = ct.copyOf(16)
             val strippedCt = ct.copyOfRange(16, ct.size)
             for (key in uniqueKeys) {
-                tryAesCbc(strippedCt, k = key, iv = prefixedIv)?.let { p -> if (tryPlain(String(p, Charsets.UTF_8))) return true }
+                tryAesCbc(strippedCt, key, prefixedIv)?.let { p -> if (tryPlain(String(p, Charsets.UTF_8))) return true }
             }
         }
 
@@ -1073,7 +1076,6 @@ class P2pstream : ExtractorApi() {
         val t = body.trimStart()
         if (!t.startsWith("{") && !t.startsWith("[")) return false
 
-        // Fix: Properly parse top-level JSONArray responses instead of crashing JSONObject(body)
         if (t.startsWith("[")) {
             val arr = try { JSONArray(t) } catch (_: Exception) { return false }
             val wrapper = JSONObject().put("items", arr)
@@ -1244,12 +1246,6 @@ class Bysekoze : ExtractorApi() {
         Log.e(TAG, "✗ Byse exhausted for hash=$hash")
     }
 
-    /**
-     * Queries Byse's REST API:
-     * 1. GET {origin}/api/videos/{hash}/embed/details -> discovers `embed_frame_url`
-     * 2. GET {embedOrigin}/api/videos/{hash}/embed/playback -> returns AES-256-GCM `playback` object
-     * 3. Decrypts `playback` (`iv` + `payload` + `key_parts` or `iv2` + `payload2` + `decrypt_keys`)
-     */
     private suspend fun tryByseRestApi(
         originalUrl: String,
         origin: String,
@@ -1307,10 +1303,8 @@ class Bysekoze : ExtractorApi() {
                 if (resp.code !in 200..299 || !resp.text.trimStart().startsWith("{")) continue
 
                 val rootJson = JSONObject(resp.text)
-                // Case A: Unencrypted sources directly in response
                 if (emitByseDecodedJson(rootJson, pbOrigin, frameRef, subtitleCallback, callback)) return true
 
-                // Case B: Encrypted `playback` object
                 val playbackObj = rootJson.optJSONObject("playback") ?: rootJson
                 val decryptedText = decryptBysePlayback(playbackObj)
                     ?: tryExternalByseDecoder(playbackObj, frameRef)
@@ -1331,11 +1325,6 @@ class Bysekoze : ExtractorApi() {
         return false
     }
 
-    /**
-     * Decrypts Byse's AES-256-GCM playback object:
-     * 1. Primary: `key = b64UrlDecode(key_parts[0]) + b64UrlDecode(key_parts[1])`, `iv = b64UrlDecode(iv)`, `ct = b64UrlDecode(payload)`
-     * 2. Fallback: `key = b64UrlDecode(decrypt_keys.edge_1) + b64UrlDecode(decrypt_keys.edge_2)`, `iv = b64UrlDecode(iv2)`, `ct = b64UrlDecode(payload2)`
-     */
     private fun decryptBysePlayback(playback: JSONObject): String? {
         // 1. Primary payload + iv + key_parts
         val ivB64 = playback.optString("iv")
@@ -1420,7 +1409,6 @@ class Bysekoze : ExtractorApi() {
             "Referer" to "$pbOrigin/",
         )
 
-        // Subtitles / tracks
         for (subKey in listOf("tracks", "subtitles", "captions", "subs")) {
             val arr = json.optJSONArray(subKey) ?: continue
             for (i in 0 until arr.length()) {
@@ -1548,7 +1536,6 @@ class Bysekoze : ExtractorApi() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         val origin = originOf(embedUrl) ?: return false
-        // Fix: Skip polyfills / jQuery and prioritize Vite index/video bundles
         val jsUrls = RE_SCRIPT_SRC.findAll(shellHtml).map { it.groupValues[1] }
             .filter {
                 !isTemplatePlaceholder(it) && !isPlaceholderUrl(it) &&
@@ -1888,4 +1875,3 @@ class AbyssPlayer : ExtractorApi() {
         }
     }
 }
-        
