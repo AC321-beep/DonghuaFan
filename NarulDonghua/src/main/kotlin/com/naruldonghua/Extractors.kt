@@ -11,10 +11,8 @@ import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.INFER_TYPE
-import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -29,7 +27,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import java.io.ByteArrayOutputStream
-import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.Cipher
@@ -47,7 +44,6 @@ internal const val DEFAULT_UA =
 private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaTypeOrNull()
 private val RE_M3U8_ANY = Regex("""(https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
 private val RE_MP4_ANY  = Regex("""(https?://[^"'\s\\<>]+\.(?:mp4|mkv)[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
-private val RE_SUB_URL  = Regex("""(https?://[^"'\s\\<>]+\.(?:vtt|srt|ass|ssa)(?:\?[^"'\s\\<>]*)?)""", RegexOption.IGNORE_CASE)
 
 private fun chromeHeaders(
     dest: String = "document", mode: String = "navigate", site: String = "same-origin",
@@ -167,10 +163,6 @@ private fun b64UrlDecode(input: String): ByteArray? = try {
 private fun decodePayloadBytes(payload: String, isHex: Boolean): ByteArray? =
     if (isHex) hexToBytes(payload.trim().removeSurrounding("\"")) else b64UrlDecode(payload.trim().removeSurrounding("\""))
 
-private fun tryAesCbc(ct: ByteArray, key: ByteArray, iv: ByteArray): ByteArray? = try {
-    Cipher.getInstance("AES/CBC/PKCS5Padding").apply { init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv)) }.doFinal(ct)
-} catch (_: Exception) { null }
-
 private fun tryAesGcm(ctAndTag: ByteArray, key: ByteArray, nonce: ByteArray): ByteArray? = try {
     Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce)) }.doFinal(ctAndTag)
 } catch (_: Exception) { null }
@@ -189,43 +181,61 @@ class Bysekoze : ExtractorApi() {
 
         private fun extractHash(url: String): String? {
             val clean = url.substringBefore("?").substringBefore("#").trimEnd('/')
-            for (marker in listOf("/d/", "/embed/", "/e/", "/v/", "/video/", "/download/", "/a2lyf/", "/cx5h/", "/w6u1/")) {
-                val after = clean.substringAfter(marker, "")
-                if (after.isNotBlank()) return after.substringBefore("/").trim().takeIf { it.length in 6..32 }
-            }
-            return clean.substringAfterLast('/').takeIf { it.matches(Regex("^[a-zA-Z0-9]{8,24}$")) }
+            // Match patterns like /d/HASH/slug or /e/HASH
+            val match = Regex("""/(?:d|embed|e|v|video|download|a2lyf|cx5h|w6u1)/([a-zA-Z0-9]{8,32})""").find(clean)
+            if (match != null) return match.groupValues[1]
+            return clean.substringAfterLast('/').takeIf { it.matches(Regex("^[a-zA-Z0-9]{8,32}$")) }
         }
     }
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val origin = originOf(url) ?: return
         val hash = extractHash(url) ?: return
+        Log.e(TAG, "=== Byse START url=$url hash=$hash")
 
-        // 1. Check direct Download APIs
-        val isDownload = url.contains("/d/") || url.contains("/download/") || url.contains("/a2lyf/")
-        if (isDownload && tryDownloadApi(url, origin, hash, subtitleCallback, callback)) return
+        // 1. BYPASS ADS/DOWNLOAD PAGE: Forcibly construct the /e/ (embed) endpoint
+        val shellUrl = "$origin/e/$hash"
+        val headers = mapOf("Referer" to (referer ?: mainUrl), "User-Agent" to DEFAULT_UA)
 
-        // 2. Standard Byse REST API -> POST /playback -> AES GCM
-        if (tryByseRestApi(url, origin, hash, referer, subtitleCallback, callback)) return
+        // 2. FETCH EMBED HTML & EXTRACT INLINE JSON (Footreplays Logic)
+        val html = try {
+            withTimeoutOrNull(8_000L) { app.get(shellUrl, headers = headers).text } ?: ""
+        } catch (_: Exception) { "" }
 
-        // 3. Try to unpack the Embed HTML (Check for <meta>, injected JSON script, or iframe)
-        val pageHeaders = chromeHeaders(referer = "$origin/", origin = origin)
-        val embedCandidates = listOf("$origin/e/$hash", "$origin/embed/$hash", "https://f16px.com/e/$hash", "https://n1mwq.org/e/$hash").distinct()
+        val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+        val iv = Regex(""""iv"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+        val payload = Regex(""""payload"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+        val keyPartsStr = Regex(""""key_parts"\s*:\s*\[(.*?)\]""").find(html)?.groupValues?.get(1)
 
-        for (embedUrl in embedCandidates) {
-            if (tryEmbedPage(embedUrl, hash, pageHeaders, subtitleCallback, callback)) return
+        if (algorithm != null && iv != null && payload != null && keyPartsStr != null) {
+            val keyParts = keyPartsStr.split(",").map { it.replace("\"", "").trim() }
+            val pbJson = """{"playback":{"algorithm":"$algorithm","iv":"$iv","payload":"$payload","key_parts":[${keyParts.joinToString(",") { "\"$it\"" }}]}}"""
+            
+            val pbObj = runCatching { JSONObject(pbJson) }.getOrNull()?.optJSONObject("playback")
+            if (pbObj != null) {
+                val decryptedText = decryptBysePlayback(pbObj) ?: tryExternalByseDecoder(pbObj, shellUrl)
+                if (!decryptedText.isNullOrBlank()) {
+                    if (emitByseDecodedAny(decryptedText, origin, shellUrl, subtitleCallback, callback)) {
+                        Log.e(TAG, "✓ Byse extracted via inline JSON")
+                        return
+                    }
+                }
+            }
         }
 
-        // 4. Ultimate Fallback: Stealth WebView Interceptors (Bypasses Cloudflare)
+        // 3. FALLBACK: REST API (/details & /playback via POST)
+        if (tryByseRestApi(url, origin, hash, referer, subtitleCallback, callback)) {
+            Log.e(TAG, "✓ Byse extracted via REST API")
+            return
+        }
+
+        // 4. ULTIMATE FALLBACK: Stealth WebView Interceptors (Bypasses Cloudflare / Complex JS redirects)
         val activity = CommonActivity.activity ?: return
         if (activity.isFinishing || activity.isDestroyed) return
 
-        val shellUrl = "$origin/e/$hash"
-        val interceptHeaders = mapOf("Referer" to (referer ?: "https://naruldonghua.com/"), "User-Agent" to DEFAULT_UA)
-
-        var result = runSilentM3u8Interceptor(activity, shellUrl, interceptHeaders)
+        var result = runSilentM3u8Interceptor(activity, shellUrl, headers)
         if (result == null) {
-            result = runInteractiveM3u8Interceptor(activity, shellUrl, interceptHeaders)
+            result = runInteractiveM3u8Interceptor(activity, shellUrl, headers)
         }
 
         if (result != null) {
@@ -233,43 +243,10 @@ class Bysekoze : ExtractorApi() {
                 this.referer = shellUrl
                 this.headers = result.headers
             })
+            Log.e(TAG, "✓ Byse extracted via WebView Interceptor")
+        } else {
+            Log.e(TAG, "✗ Byse exhausted for hash=$hash")
         }
-    }
-
-    private suspend fun tryDownloadApi(
-        originalUrl: String, origin: String, hash: String, 
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val apiPaths = listOf(
-            "$origin/api/videos/$hash/download",
-            "$origin/api/download/$hash",
-            "$origin/api/v1/download/$hash"
-        )
-        for (apiUrl in apiPaths) {
-            try {
-                val resp = withTimeoutOrNull(8_000L) { app.get(apiUrl, headers = mapOf("User-Agent" to DEFAULT_UA, "Accept" to "application/json")) }
-                if (resp != null && resp.code == 200 && resp.text.trimStart().startsWith("{")) {
-                    if (emitByseDecodedAny(resp.text, origin, originalUrl, subtitleCallback, callback)) return true
-                }
-            } catch (_: Exception) {}
-        }
-        
-        try {
-            val resp = withTimeoutOrNull(8_000L) { app.get(originalUrl, headers = mapOf("User-Agent" to DEFAULT_UA)) }
-            val text = resp?.text ?: return false
-            var emitted = false
-            
-            RE_M3U8_ANY.find(text)?.groupValues?.get(1)?.let { m3u8 ->
-                M3u8Helper.generateM3u8(name, m3u8, originalUrl).forEach(callback)
-                emitted = true
-            }
-            RE_MP4_ANY.find(text)?.groupValues?.get(1)?.let { mp4 ->
-                callback(newExtractorLink(name, name, mp4, INFER_TYPE) { this.referer = originalUrl })
-                emitted = true
-            }
-            return emitted
-        } catch (_: Exception) {}
-        return false
     }
 
     private suspend fun tryByseRestApi(
@@ -299,6 +276,7 @@ class Bysekoze : ExtractorApi() {
                     "X-Requested-With" to "XMLHttpRequest", "X-Embed-Origin" to (hostOf(origin) ?: "bysejikuar.com"),
                     "X-Embed-Parent" to originalUrl, "X-Embed-Referer" to (referer ?: "https://naruldonghua.com/")
                 )
+                // POST Request fixes the HTTP 405 error
                 val resp = withTimeoutOrNull(10_000L) { app.post("$pbOrigin/api/videos/$hash/embed/playback", headers = pbHeaders, requestBody = postBody) } ?: continue
                 val text = resp.text.trimStart()
                 
@@ -330,7 +308,10 @@ class Bysekoze : ExtractorApi() {
             for (i in 0 until keyParts.length()) b64UrlDecode(keyParts.optString(i))?.let { keyOut.write(it) }
             
             if (iv != null && ct != null && keyOut.size() > 0) {
-                tryAesGcm(ct, keyOut.toByteArray(), iv)?.let { return String(it, Charsets.UTF_8).takeIf { s -> s.trimStart().let { t -> t.startsWith("{") || t.startsWith("[") } } }
+                tryAesGcm(ct, keyOut.toByteArray(), iv)?.let { decryptedBytes -> 
+                    // Stripping BOM (\uFEFF) which causes JSONObject to crash
+                    return String(decryptedBytes, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\t').takeIf { it.startsWith("{") || it.startsWith("[") }
+                }
             }
         }
         
@@ -343,7 +324,9 @@ class Bysekoze : ExtractorApi() {
             val edge1 = b64UrlDecode(decryptKeys.optString("edge_1"))
             val edge2 = b64UrlDecode(decryptKeys.optString("edge_2"))
             if (iv2 != null && ct2 != null && edge1 != null && edge2 != null) {
-                tryAesGcm(ct2, edge1 + edge2, iv2)?.let { return String(it, Charsets.UTF_8).takeIf { s -> s.trimStart().let { t -> t.startsWith("{") || t.startsWith("[") } } }
+                tryAesGcm(ct2, edge1 + edge2, iv2)?.let { decryptedBytes -> 
+                    return String(decryptedBytes, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\t').takeIf { it.startsWith("{") || it.startsWith("[") }
+                }
             }
         }
         return null
@@ -405,40 +388,6 @@ class Bysekoze : ExtractorApi() {
             }
         }
         return emittedAny
-    }
-
-    private suspend fun tryEmbedPage(
-        embedUrl: String, hash: String, headers: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val shell = try { withTimeoutOrNull(8_000L) { app.get(embedUrl, headers = headers) } ?: return false } catch (_: Exception) { return false }
-        val text = try { shell.text } catch (_: Exception) { "" }
-        if (shell.code != 200 || isErrorPage(text)) return false
-        
-        // Sometimes Byse embeds the JSON directly in the HTML instead of via API
-        val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
-        val iv = Regex(""""iv"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
-        val payload = Regex(""""payload"\s*:\s*"([^"]+)"""").find(text)?.groupValues?.get(1)
-        val keyPartsStr = Regex(""""key_parts"\s*:\s*\[(.*?)\]""").find(text)?.groupValues?.get(1)
-        
-        if (algorithm != null && iv != null && payload != null && keyPartsStr != null) {
-            val keyParts = keyPartsStr.split(",").map { it.replace("\"", "").trim() }
-            val pbJson = """{"playback":{"algorithm":"$algorithm","iv":"$iv","payload":"$payload","key_parts":[${keyParts.joinToString(",") { "\"$it\"" }}]}}"""
-            
-            val pbObj = runCatching { JSONObject(pbJson) }.getOrNull()?.optJSONObject("playback")
-            if (pbObj != null) {
-                val decryptedText = decryptBysePlayback(pbObj) ?: tryExternalByseDecoder(pbObj, embedUrl)
-                if (!decryptedText.isNullOrBlank()) {
-                    if (emitByseDecodedAny(decryptedText, originOf(embedUrl) ?: embedUrl, embedUrl, subtitleCallback, callback)) return true
-                }
-            }
-        }
-
-        RE_M3U8_ANY.find(text.replace("\\/", "/"))?.groupValues?.get(1)?.let { m3u8 ->
-            M3u8Helper.generateM3u8(name, m3u8, embedUrl, headers = headers).forEach(callback)
-            return true
-        }
-        return false
     }
 
     // ════════════════════════════════════════════════════════════════════════════
@@ -769,7 +718,7 @@ class P2pstream : ExtractorApi() {
             
             urls.distinct().forEach { url ->
                 // INTERCEPT API LINKS: Do not emit /folder or /download directly to ExoPlayer!
-                if (url.contains("/api/v1/folder") || url.contains("/api/v1/download") || url.contains("/api/v1/source")) {
+                if (url.contains("/api/v1/folder") || url.contains("/api/v1/download") || url.contains("/api/v1/source") || url.contains("/api/v1/video")) {
                     try {
                         val nestedResp = withTimeoutOrNull(8_000L) { app.get(url, headers = headers) }
                         if (nestedResp != null && nestedResp.code in 200..299) {
