@@ -1,9 +1,7 @@
 package com.naruldonghua
 
-import android.annotation.SuppressLint
 import android.util.Base64
 import android.util.Log
-import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
@@ -15,25 +13,19 @@ import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import org.jsoup.Jsoup
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
-import kotlin.coroutines.resume
 
 internal const val DEFAULT_UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -46,15 +38,11 @@ private val RE_M3U8_ANY = Regex("""(https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*)""",
 private val RE_MP4_ANY  = Regex("""(https?://[^"'\s\\<>]+\.(?:mp4|mkv)[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
 
 private fun chromeHeaders(
-    dest: String = "document", 
-    mode: String = "navigate", 
-    site: String = "same-origin",
-    referer: String? = null, 
-    origin: String? = null,
-    accept: String = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+    dest: String = "document", mode: String = "navigate", site: String = "same-origin",
+    referer: String? = null, origin: String? = null,
 ): Map<String, String> = buildMap {
     put("User-Agent", DEFAULT_UA)
-    put("Accept", accept)
+    put("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
     put("Accept-Language", "en-US,en;q=0.9")
     put("Sec-Fetch-Dest", dest)
     put("Sec-Fetch-Mode", mode)
@@ -197,11 +185,20 @@ class Bysekoze : ExtractorApi() {
         val hash = extractHash(url) ?: return
         Log.e(TAG, "=== Byse START url=$url hash=$hash")
 
-        // 1. BYPASS ADS/DOWNLOAD PAGE: Forcibly construct the /e/ (embed) endpoint
+        // 1. Check direct Download APIs if applicable
+        val isDownload = url.contains("/d/") || url.contains("/download/") || url.contains("/a2lyf/")
+        if (isDownload) {
+            if (tryDownloadApi(url, origin, hash, subtitleCallback, callback)) {
+                Log.e(TAG, "✓ Byse extracted via Download API")
+                return
+            }
+        }
+
+        // 2. BYPASS ADS/DOWNLOAD PAGE: Forcibly construct the /e/ (embed) endpoint
         val shellUrl = "$origin/e/$hash"
         val headers = mapOf("Referer" to (referer ?: mainUrl), "User-Agent" to DEFAULT_UA)
 
-        // 2. FETCH EMBED HTML & EXTRACT INLINE JSON (Footreplays Logic)
+        // 3. FETCH EMBED HTML & EXTRACT INLINE JSON (Footreplays Logic)
         val html = try {
             withTimeoutOrNull(8_000L) { app.get(shellUrl, headers = headers).text } ?: ""
         } catch (_: Exception) { "" }
@@ -227,30 +224,56 @@ class Bysekoze : ExtractorApi() {
             }
         }
 
-        // 3. FALLBACK: REST API (/details & /playback via POST)
+        // 4. FALLBACK: REST API (/details & /playback via POST)
         if (tryByseRestApi(url, origin, hash, referer, subtitleCallback, callback)) {
             Log.e(TAG, "✓ Byse extracted via REST API")
             return
         }
 
-        // 4. ULTIMATE FALLBACK: Stealth WebView Interceptors (Bypasses Cloudflare / Complex JS redirects)
-        val activity = CommonActivity.activity ?: return
-        if (activity.isFinishing || activity.isDestroyed) return
-
-        var result = runSilentM3u8Interceptor(activity, shellUrl, headers)
-        if (result == null) {
-            result = runInteractiveM3u8Interceptor(activity, shellUrl, headers)
+        // 5. ULTIMATE FALLBACK: Raw HTML M3U8 Scraping
+        RE_M3U8_ANY.find(html.replace("\\/", "/"))?.groupValues?.get(1)?.let { m3u8 ->
+            M3u8Helper.generateM3u8(name, m3u8, shellUrl, headers = headers).forEach(callback)
+            Log.e(TAG, "✓ Byse extracted via raw M3U8 in HTML")
+            return
         }
 
-        if (result != null) {
-            callback.invoke(newExtractorLink(name, name, result.url, ExtractorLinkType.M3U8) {
-                this.referer = shellUrl
-                this.headers = result.headers
-            })
-            Log.e(TAG, "✓ Byse extracted via WebView Interceptor")
-        } else {
-            Log.e(TAG, "✗ Byse exhausted for hash=$hash")
+        Log.e(TAG, "✗ Byse exhausted for hash=$hash")
+    }
+
+    private suspend fun tryDownloadApi(
+        originalUrl: String, origin: String, hash: String, 
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val apiPaths = listOf(
+            "$origin/api/videos/$hash/download",
+            "$origin/api/download/$hash",
+            "$origin/api/v1/download/$hash"
+        )
+        for (apiUrl in apiPaths) {
+            try {
+                val resp = withTimeoutOrNull(8_000L) { app.get(apiUrl, headers = mapOf("User-Agent" to DEFAULT_UA, "Accept" to "application/json")) }
+                if (resp != null && resp.code == 200 && resp.text.trimStart().startsWith("{")) {
+                    if (emitByseDecodedAny(resp.text, origin, originalUrl, subtitleCallback, callback)) return true
+                }
+            } catch (_: Exception) {}
         }
+        
+        try {
+            val resp = withTimeoutOrNull(8_000L) { app.get(originalUrl, headers = mapOf("User-Agent" to DEFAULT_UA)) }
+            val text = resp?.text ?: return false
+            var emitted = false
+            
+            RE_M3U8_ANY.find(text)?.groupValues?.get(1)?.let { m3u8 ->
+                M3u8Helper.generateM3u8(name, m3u8, originalUrl).forEach(callback)
+                emitted = true
+            }
+            RE_MP4_ANY.find(text)?.groupValues?.get(1)?.let { mp4 ->
+                callback(newExtractorLink(name, name, mp4, INFER_TYPE) { this.referer = originalUrl })
+                emitted = true
+            }
+            return emitted
+        } catch (_: Exception) {}
+        return false
     }
 
     private suspend fun tryByseRestApi(
@@ -392,262 +415,6 @@ class Bysekoze : ExtractorApi() {
             }
         }
         return emittedAny
-    }
-
-    // ════════════════════════════════════════════════════════════════════════════
-    //  WEBVIEW INTERCEPTORS (Cloudflare Bypass)
-    // ════════════════════════════════════════════════════════════════════════════
-    data class InterceptResult(val url: String, val headers: Map<String, String>)
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun runSilentM3u8Interceptor(
-        activity: android.app.Activity, 
-        urlToResolve: String, 
-        headers: Map<String, String>
-    ): InterceptResult? = withContext(Dispatchers.Main) {
-        suspendCancellableCoroutine { cont ->
-            val root = activity.window?.decorView as? android.view.ViewGroup
-            
-            val done = AtomicBoolean(false)
-            val handler = android.os.Handler(android.os.Looper.getMainLooper())
-            var timeoutRunnable: Runnable? = null
-            var clickRunnable: Runnable? = null
-            var webView: android.webkit.WebView? = null 
-
-            fun finish(result: InterceptResult?) {
-                if (!done.compareAndSet(false, true)) return
-                timeoutRunnable?.let { handler.removeCallbacks(it) }
-                clickRunnable?.let { handler.removeCallbacks(it) }
-                runCatching {
-                    webView?.let { wv ->
-                        root?.removeView(wv)
-                        wv.stopLoading()
-                        wv.destroy()
-                    }
-                }
-                if (cont.isActive) cont.resume(result)
-            }
-
-            val wv = android.webkit.WebView(activity).apply {
-                layoutParams = android.view.ViewGroup.LayoutParams(
-                    activity.resources.displayMetrics.widthPixels,
-                    activity.resources.displayMetrics.heightPixels
-                )
-                translationX = 20000f // Keep offscreen
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    useWideViewPort = true
-                    loadWithOverviewMode = true
-                    mediaPlaybackRequiresUserGesture = false 
-                    userAgentString = DEFAULT_UA
-                }
-
-                webViewClient = object : android.webkit.WebViewClient() {
-                    @SuppressLint("WebViewClientOnReceivedSslError")
-                    override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
-                    
-                    override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
-                        val reqUrl = request?.url?.toString() ?: return null
-                        if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
-                            val reqHeaders = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
-                            reqHeaders["Referer"] = urlToResolve
-                            activity.runOnUiThread { finish(InterceptResult(reqUrl, reqHeaders)) }
-                        }
-                        return super.shouldInterceptRequest(view, request)
-                    }
-                }
-            }
-            webView = wv 
-
-            cont.invokeOnCancellation { finish(null) }
-
-            // KOTLIN-CONTROLLED STEALTH AUTO-CLICKER (Bypasses CF Bot Detection)
-            clickRunnable = object : Runnable {
-                override fun run() {
-                    if (done.get()) return
-                    val js = """
-                        (function() {
-                            if (document.title.toLowerCase().includes('just a moment')) return;
-                            if (document.title.toLowerCase().includes('attention required')) return;
-                            
-                            var vids = document.querySelectorAll('video');
-                            var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .plyr__control--overlaid, [class*="play"]');
-                            
-                            if (vids.length > 0 || buttons.length > 0) {
-                                buttons.forEach(b => {
-                                    b.click();
-                                    b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
-                                });
-                                vids.forEach(v => { 
-                                    v.muted = true; 
-                                    var p = v.play();
-                                    if (p !== undefined) p.catch(e => {}); 
-                                });
-                            }
-                        })();
-                    """.trimIndent()
-                    webView?.evaluateJavascript(js, null)
-                    handler.postDelayed(this, 1000L)
-                }
-            }
-
-            timeoutRunnable = Runnable { finish(null) }
-
-            root?.addView(wv)
-            wv.loadUrl(urlToResolve, headers)
-            
-            // DELAY THE CLICKER: Let CF run naturally for 2.5 seconds without any JS interference
-            handler.postDelayed(clickRunnable!!, 2500L)
-            
-            // Strict 8 second timeout for silent mode
-            handler.postDelayed(timeoutRunnable!!, 8000L) 
-        }
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun runInteractiveM3u8Interceptor(
-        activity: android.app.Activity, 
-        urlToResolve: String, 
-        headers: Map<String, String>
-    ): InterceptResult? = withContext(Dispatchers.Main) {
-        suspendCancellableCoroutine { cont ->
-            val dialog = android.app.Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
-                setCancelable(false)
-                setCanceledOnTouchOutside(false)
-            }
-            val done = AtomicBoolean(false)
-            val handler = android.os.Handler(android.os.Looper.getMainLooper())
-            var clickRunnable: Runnable? = null
-            var timeoutRunnable: Runnable? = null
-            var webView: android.webkit.WebView? = null
-
-            val layout = android.widget.LinearLayout(activity).apply {
-                orientation = android.widget.LinearLayout.VERTICAL
-                setBackgroundColor(android.graphics.Color.parseColor("#1A1A1A"))
-            }
-
-            val headerLayout = android.widget.LinearLayout(activity).apply {
-                orientation = android.widget.LinearLayout.HORIZONTAL
-                setPadding(32, 28, 32, 28)
-            }
-            val header = android.widget.TextView(activity).apply {
-                text = "Decrypting Byse Stream... Please Wait"
-                setTextColor(android.graphics.Color.WHITE)
-                textSize = 15f
-                layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            }
-            
-            fun finish(result: InterceptResult?) {
-                if (!done.compareAndSet(false, true)) return
-                clickRunnable?.let { handler.removeCallbacks(it) }
-                timeoutRunnable?.let { handler.removeCallbacks(it) }
-                android.webkit.CookieManager.getInstance().flush()
-                runCatching { 
-                    webView?.let { wv ->
-                        layout.removeView(wv)
-                        wv.stopLoading()
-                        wv.destroy()
-                    }
-                    dialog.dismiss() 
-                }
-                if (cont.isActive) cont.resume(result)
-            }
-
-            val closeBtn = android.widget.TextView(activity).apply {
-                text = "✖"
-                setTextColor(android.graphics.Color.WHITE)
-                textSize = 18f
-                setPadding(20, 0, 0, 0)
-                setOnClickListener { finish(null) }
-            }
-
-            headerLayout.addView(header)
-            headerLayout.addView(closeBtn)
-            layout.addView(headerLayout)
-
-            val progressBar = android.widget.ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
-                layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, 8)
-            }
-            layout.addView(progressBar)
-
-            val wv = android.webkit.WebView(activity).apply {
-                layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT)
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    useWideViewPort = true
-                    loadWithOverviewMode = true
-                    mediaPlaybackRequiresUserGesture = false 
-                    userAgentString = DEFAULT_UA
-                }
-
-                webChromeClient = object : android.webkit.WebChromeClient() {
-                    override fun onProgressChanged(view: android.webkit.WebView?, newProgress: Int) {
-                        progressBar.progress = newProgress
-                        progressBar.visibility = if (newProgress == 100) android.view.View.GONE else android.view.View.VISIBLE
-                    }
-                }
-
-                webViewClient = object : android.webkit.WebViewClient() {
-                    @SuppressLint("WebViewClientOnReceivedSslError")
-                    override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
-
-                    override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
-                        val reqUrl = request?.url?.toString() ?: return null
-                        if (reqUrl.contains(".m3u8") || reqUrl.contains(".m3u")) {
-                            val reqHeaders = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
-                            reqHeaders["Referer"] = urlToResolve
-                            activity.runOnUiThread { finish(InterceptResult(reqUrl, reqHeaders)) }
-                        }
-                        return super.shouldInterceptRequest(view, request)
-                    }
-                }
-            }
-            webView = wv
-            
-            clickRunnable = object : Runnable {
-                override fun run() {
-                    if (done.get()) return
-                    val js = """
-                        (function() {
-                            if (document.title.toLowerCase().includes('just a moment')) return;
-                            if (document.title.toLowerCase().includes('attention required')) return;
-                            
-                            var vids = document.querySelectorAll('video');
-                            var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .plyr__control--overlaid, [class*="play"]');
-                            
-                            if (vids.length > 0 || buttons.length > 0) {
-                                buttons.forEach(b => {
-                                    b.click();
-                                    b.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
-                                });
-                                vids.forEach(v => { 
-                                    v.muted = true; 
-                                    var p = v.play();
-                                    if (p !== undefined) p.catch(e => {}); 
-                                });
-                            }
-                        })();
-                    """.trimIndent()
-                    webView?.evaluateJavascript(js, null)
-                    
-                    handler.postDelayed(this, 1000L)
-                }
-            }
-
-            layout.addView(wv)
-            dialog.setContentView(layout)
-            dialog.setOnDismissListener { if (!done.get()) finish(null) }
-
-            dialog.show()
-            wv.loadUrl(urlToResolve, headers)
-
-            handler.postDelayed(clickRunnable!!, 3500L)
-
-            timeoutRunnable = Runnable { finish(null) }
-            handler.postDelayed(timeoutRunnable!!, 25_000L) // 25s Timeout for visual bypass
-        }
     }
 }
 
