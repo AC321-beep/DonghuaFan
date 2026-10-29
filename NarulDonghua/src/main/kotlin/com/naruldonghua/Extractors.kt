@@ -46,11 +46,15 @@ private val RE_M3U8_ANY = Regex("""(https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*)""",
 private val RE_MP4_ANY  = Regex("""(https?://[^"'\s\\<>]+\.(?:mp4|mkv)[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
 
 private fun chromeHeaders(
-    dest: String = "document", mode: String = "navigate", site: String = "same-origin",
-    referer: String? = null, origin: String? = null,
+    dest: String = "document", 
+    mode: String = "navigate", 
+    site: String = "same-origin",
+    referer: String? = null, 
+    origin: String? = null,
+    accept: String = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
 ): Map<String, String> = buildMap {
     put("User-Agent", DEFAULT_UA)
-    put("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+    put("Accept", accept)
     put("Accept-Language", "en-US,en;q=0.9")
     put("Sec-Fetch-Dest", dest)
     put("Sec-Fetch-Mode", mode)
