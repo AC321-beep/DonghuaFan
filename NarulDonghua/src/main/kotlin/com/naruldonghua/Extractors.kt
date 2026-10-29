@@ -13,18 +13,14 @@ import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
-import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 internal const val DEFAULT_UA =
@@ -38,11 +34,15 @@ private val RE_M3U8_ANY = Regex("""(https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*)""",
 private val RE_MP4_ANY  = Regex("""(https?://[^"'\s\\<>]+\.(?:mp4|mkv)[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
 
 private fun chromeHeaders(
-    dest: String = "document", mode: String = "navigate", site: String = "same-origin",
-    referer: String? = null, origin: String? = null,
+    dest: String = "document", 
+    mode: String = "navigate", 
+    site: String = "same-origin",
+    referer: String? = null, 
+    origin: String? = null,
+    accept: String = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
 ): Map<String, String> = buildMap {
     put("User-Agent", DEFAULT_UA)
-    put("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+    put("Accept", accept)
     put("Accept-Language", "en-US,en;q=0.9")
     put("Sec-Fetch-Dest", dest)
     put("Sec-Fetch-Mode", mode)
@@ -303,7 +303,6 @@ class Bysekoze : ExtractorApi() {
                     "X-Requested-With" to "XMLHttpRequest", "X-Embed-Origin" to (hostOf(origin) ?: "bysejikuar.com"),
                     "X-Embed-Parent" to originalUrl, "X-Embed-Referer" to (referer ?: "https://naruldonghua.com/")
                 )
-                // POST Request fixes the HTTP 405 error
                 val resp = withTimeoutOrNull(10_000L) { app.post("$pbOrigin/api/videos/$hash/embed/playback", headers = pbHeaders, requestBody = postBody) } ?: continue
                 val text = resp.text.trimStart()
                 
