@@ -169,11 +169,10 @@ class Bysekoze : ExtractorApi() {
 
     companion object {
         private const val TAG = "Narul/Byse"
-        private val KNOWN_BYSE_HOSTS = listOf("https://bysejikuar.com", "https://bysekoze.com", "https://f16px.com", "https://n1mwq.org", "https://byse.sx")
+        private val KNOWN_BYSE_HOSTS = listOf("https://n1mwq.org", "https://f16px.com", "https://bysejikuar.com", "https://bysekoze.com", "https://byse.sx")
 
         private fun extractHash(url: String): String? {
             val clean = url.substringBefore("?").substringBefore("#").trimEnd('/')
-            // Match patterns like /d/HASH/slug or /e/HASH
             val match = Regex("""/(?:d|embed|e|v|video|download|a2lyf|cx5h|w6u1)/([a-zA-Z0-9]{8,32})""").find(clean)
             if (match != null) return match.groupValues[1]
             return clean.substringAfterLast('/').takeIf { it.matches(Regex("^[a-zA-Z0-9]{8,32}$")) }
@@ -185,24 +184,27 @@ class Bysekoze : ExtractorApi() {
         val hash = extractHash(url) ?: return
         Log.e(TAG, "=== Byse START url=$url hash=$hash")
 
-        // 1. Check direct Download APIs if applicable
-        val isDownload = url.contains("/d/") || url.contains("/download/") || url.contains("/a2lyf/")
-        if (isDownload) {
-            if (tryDownloadApi(url, origin, hash, subtitleCallback, callback)) {
-                Log.e(TAG, "✓ Byse extracted via Download API")
-                return
+        val headers = mapOf("Referer" to (referer ?: mainUrl), "User-Agent" to DEFAULT_UA)
+
+        // 1. BYPASS ADS: Scan multiple hosts for the actual /e/ embed page
+        val embedCandidates = (KNOWN_BYSE_HOSTS + origin).distinct().map { "$it/e/$hash" }
+        
+        var html = ""
+        var workingEmbedUrl = ""
+
+        for (embedUrl in embedCandidates) {
+            val pageHtml = try {
+                withTimeoutOrNull(6_000L) { app.get(embedUrl, headers = headers).text } ?: ""
+            } catch (_: Exception) { "" }
+            
+            if (pageHtml.contains("algorithm") || pageHtml.contains("key_parts") || pageHtml.contains("m3u8") || pageHtml.contains("player")) {
+                html = pageHtml
+                workingEmbedUrl = embedUrl
+                break
             }
         }
 
-        // 2. BYPASS ADS/DOWNLOAD PAGE: Forcibly construct the /e/ (embed) endpoint
-        val shellUrl = "$origin/e/$hash"
-        val headers = mapOf("Referer" to (referer ?: mainUrl), "User-Agent" to DEFAULT_UA)
-
-        // 3. FETCH EMBED HTML & EXTRACT INLINE JSON (Footreplays Logic)
-        val html = try {
-            withTimeoutOrNull(8_000L) { app.get(shellUrl, headers = headers).text } ?: ""
-        } catch (_: Exception) { "" }
-
+        // 2. FETCH INLINE JSON
         val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         val iv = Regex(""""iv"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         val payload = Regex(""""payload"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
@@ -214,9 +216,9 @@ class Bysekoze : ExtractorApi() {
             
             val pbObj = runCatching { JSONObject(pbJson) }.getOrNull()?.optJSONObject("playback")
             if (pbObj != null) {
-                val decryptedText = decryptBysePlayback(pbObj) ?: tryExternalByseDecoder(pbObj, shellUrl)
+                val decryptedText = decryptBysePlayback(pbObj) ?: tryExternalByseDecoder(pbObj, workingEmbedUrl)
                 if (!decryptedText.isNullOrBlank()) {
-                    if (emitByseDecodedAny(decryptedText, origin, shellUrl, subtitleCallback, callback)) {
+                    if (emitByseDecodedAny(decryptedText, originOf(workingEmbedUrl) ?: origin, workingEmbedUrl, subtitleCallback, callback)) {
                         Log.e(TAG, "✓ Byse extracted via inline JSON")
                         return
                     }
@@ -224,16 +226,24 @@ class Bysekoze : ExtractorApi() {
             }
         }
 
-        // 4. FALLBACK: REST API (/details & /playback via POST)
+        // 3. FALLBACK: REST API (/details & /playback via POST)
         if (tryByseRestApi(url, origin, hash, referer, subtitleCallback, callback)) {
             Log.e(TAG, "✓ Byse extracted via REST API")
             return
         }
 
-        // 5. ULTIMATE FALLBACK: Raw HTML M3U8 Scraping
-        RE_M3U8_ANY.find(html.replace("\\/", "/"))?.groupValues?.get(1)?.let { m3u8 ->
-            M3u8Helper.generateM3u8(name, m3u8, shellUrl, headers = headers).forEach(callback)
-            Log.e(TAG, "✓ Byse extracted via raw M3U8 in HTML")
+        // 4. FALLBACK: Raw HTML M3U8 Scraping
+        if (html.isNotBlank()) {
+            RE_M3U8_ANY.find(html.replace("\\/", "/"))?.groupValues?.get(1)?.let { m3u8 ->
+                M3u8Helper.generateM3u8(name, m3u8, workingEmbedUrl.ifBlank { url }, headers = headers).forEach(callback)
+                Log.e(TAG, "✓ Byse extracted via raw M3U8 in HTML")
+                return
+            }
+        }
+
+        // 5. ULTIMATE FALLBACK: Download APIs (For pure direct mp4 endpoints)
+        if (tryDownloadApi(url, origin, hash, subtitleCallback, callback)) {
+            Log.e(TAG, "✓ Byse extracted via Download API")
             return
         }
 
@@ -251,15 +261,15 @@ class Bysekoze : ExtractorApi() {
         )
         for (apiUrl in apiPaths) {
             try {
-                val resp = withTimeoutOrNull(8_000L) { app.get(apiUrl, headers = mapOf("User-Agent" to DEFAULT_UA, "Accept" to "application/json")) }
-                if (resp != null && resp.code == 200 && resp.text.trimStart().startsWith("{")) {
+                val resp = withTimeoutOrNull(6_000L) { app.get(apiUrl, headers = mapOf("User-Agent" to DEFAULT_UA, "Accept" to "application/json")) }
+                if (resp != null && resp.code in 200..299 && resp.text.trimStart().startsWith("{")) {
                     if (emitByseDecodedAny(resp.text, origin, originalUrl, subtitleCallback, callback)) return true
                 }
             } catch (_: Exception) {}
         }
         
         try {
-            val resp = withTimeoutOrNull(8_000L) { app.get(originalUrl, headers = mapOf("User-Agent" to DEFAULT_UA)) }
+            val resp = withTimeoutOrNull(6_000L) { app.get(originalUrl, headers = mapOf("User-Agent" to DEFAULT_UA)) }
             val text = resp?.text ?: return false
             var emitted = false
             
@@ -284,7 +294,14 @@ class Bysekoze : ExtractorApi() {
         for (host in (listOf(origin) + KNOWN_BYSE_HOSTS).distinct()) {
             val detailsUrl = "$host/api/videos/$hash/embed/details"
             try {
-                val resp = withTimeoutOrNull(8_000L) { app.get(detailsUrl, headers = mapOf("User-Agent" to DEFAULT_UA, "Referer" to "$host/e/$hash", "Origin" to host)) } ?: continue
+                val headers = mapOf(
+                    "User-Agent" to DEFAULT_UA, 
+                    "Accept" to "application/json, text/plain, */*",
+                    "Referer" to "$host/e/$hash",
+                    "Origin" to host,
+                    "X-Requested-With" to "XMLHttpRequest"
+                )
+                val resp = withTimeoutOrNull(6_000L) { app.get(detailsUrl, headers = headers) } ?: continue
                 if (resp.code in 200..299 && resp.text.trimStart().startsWith("{")) {
                     embedFrameUrl = JSONObject(resp.text).optString("embed_frame_url").takeIf { it.startsWith("http") }
                     if (embedFrameUrl != null) break
@@ -303,7 +320,8 @@ class Bysekoze : ExtractorApi() {
                     "X-Requested-With" to "XMLHttpRequest", "X-Embed-Origin" to (hostOf(origin) ?: "bysejikuar.com"),
                     "X-Embed-Parent" to originalUrl, "X-Embed-Referer" to (referer ?: "https://naruldonghua.com/")
                 )
-                val resp = withTimeoutOrNull(10_000L) { app.post("$pbOrigin/api/videos/$hash/embed/playback", headers = pbHeaders, requestBody = postBody) } ?: continue
+                
+                val resp = withTimeoutOrNull(8_000L) { app.post("$pbOrigin/api/videos/$hash/embed/playback", headers = pbHeaders, requestBody = postBody) } ?: continue
                 val text = resp.text.trimStart()
                 
                 if (resp.code !in 200..299 || (!text.startsWith("{") && !text.startsWith("["))) continue
@@ -335,7 +353,6 @@ class Bysekoze : ExtractorApi() {
             
             if (iv != null && ct != null && keyOut.size() > 0) {
                 tryAesGcm(ct, keyOut.toByteArray(), iv)?.let { decryptedBytes -> 
-                    // Stripping BOM (\uFEFF) which causes JSONObject to crash
                     return String(decryptedBytes, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\t').takeIf { it.startsWith("{") || it.startsWith("[") }
                 }
             }
@@ -362,7 +379,7 @@ class Bysekoze : ExtractorApi() {
         return try {
             val reqJson = JSONObject().apply { put("text", playback); put("agent", DEFAULT_UA) }
             val headers = mapOf("User-Agent" to DEFAULT_UA, "Content-Type" to "application/json", "Origin" to "https://enc-dec.app", "Referer" to referer)
-            val resp = withTimeoutOrNull(8_000L) { app.post("https://enc-dec.app/api/dec-byse", headers = headers, requestBody = reqJson.toString().toRequestBody(JSON_MEDIA_TYPE)) } ?: return null
+            val resp = withTimeoutOrNull(6_000L) { app.post("https://enc-dec.app/api/dec-byse", headers = headers, requestBody = reqJson.toString().toRequestBody(JSON_MEDIA_TYPE)) } ?: return null
             val text = resp.text.trimStart()
             if (resp.code == 200 && text.isNotBlank()) {
                 val root = JSONObject(text)
@@ -400,7 +417,7 @@ class Bysekoze : ExtractorApi() {
             val streamUrl = resolveUrl(rawUrl, refererUrl, pbOrigin) ?: rawUrl
             
             if (streamUrl.contains(".m3u8", true) || streamUrl.contains("/hls/", true) || streamUrl.contains("/master", true)) {
-                val variants = try { withTimeoutOrNull(8_000L) { M3u8Helper.generateM3u8(name, streamUrl, "$pbOrigin/", headers = streamHeaders) } } catch (_: Exception) { null }
+                val variants = try { withTimeoutOrNull(6_000L) { M3u8Helper.generateM3u8(name, streamUrl, "$pbOrigin/", headers = streamHeaders) } } catch (_: Exception) { null }
                 if (!variants.isNullOrEmpty()) {
                     variants.forEach { link -> callback(newExtractorLink(link.source, link.name, link.url, link.type) { this.referer = link.referer; this.quality = link.quality; this.headers = link.headers }) }
                     emittedAny = true
@@ -487,7 +504,6 @@ class P2pstream : ExtractorApi() {
             }
             
             urls.distinct().forEach { url ->
-                // INTERCEPT API LINKS: Do not emit /folder or /download directly to ExoPlayer!
                 if (url.contains("/api/v1/folder") || url.contains("/api/v1/download") || url.contains("/api/v1/source") || url.contains("/api/v1/video")) {
                     try {
                         val nestedResp = withTimeoutOrNull(8_000L) { app.get(url, headers = headers) }
@@ -532,9 +548,10 @@ class AbyssPlayer : ExtractorApi() {
         var doc = resp.document
         var effectiveUrl = resp.url.ifBlank { url }
 
+        // Handles short.icu redirects (meta refresh & JS assignments)
         if (effectiveUrl.contains("short.icu", true) || doc.html().contains("location.href")) {
             val redirect = doc.selectFirst("meta[http-equiv=refresh]")?.attr("content")?.substringAfter("url=")?.trim('\'', '"', ' ') 
-                ?: Regex("""(?:window\.location(?:\.href)?|location\.href)\s*=\s*["']([^"']+)["']""").find(doc.html())?.groupValues?.getOrNull(1)
+                ?: Regex("""(?:window\.location(?:\.href)?|location\.href|location\.replace)\s*\(?=\s*["']([^"']+)["']""").find(doc.html())?.groupValues?.getOrNull(1)
             
             if (!redirect.isNullOrBlank() && !redirect.startsWith("javascript:")) {
                 resolveUrl(redirect, effectiveUrl, originOf(effectiveUrl) ?: initialOrigin)?.let { resolved ->
@@ -550,7 +567,7 @@ class AbyssPlayer : ExtractorApi() {
 
         val decBody = JSONObject().apply { put("text", encrypted) }.toString().toRequestBody(JSON_MEDIA_TYPE)
         val decText = try {
-            withTimeoutOrNull(10_000L) { app.post("https://enc-dec.app/api/dec-abyss", headers = mapOf("User-Agent" to DEFAULT_UA, "Origin" to "https://playhydrax.com", "Content-Type" to "application/json"), requestBody = decBody).text } ?: return
+            withTimeoutOrNull(8_000L) { app.post("https://enc-dec.app/api/dec-abyss", headers = mapOf("User-Agent" to DEFAULT_UA, "Origin" to "https://playhydrax.com", "Content-Type" to "application/json"), requestBody = decBody).text } ?: return
         } catch (_: Exception) { return }
 
         val rootText = decText.trimStart()
