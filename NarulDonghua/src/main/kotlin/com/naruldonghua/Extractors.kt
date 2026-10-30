@@ -774,7 +774,7 @@ class Bysekoze : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  RUMBLE EXTRACTOR (HTML-scraping version — as provided)
+//  RUMBLE EXTRACTOR (HTML-scraping) — ExtractorLinkType.VIDEO replaced with INFER_TYPE
 // ════════════════════════════════════════════════════════════════════════════
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
@@ -786,7 +786,7 @@ class Rumble : ExtractorApi() {
         private const val SPLIT_TIMEOUT_MS = 2_500L
 
         private val RE_VIDEO_URL = Regex(
-            """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*"""
+            """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>''""]+\.(?:mp4|m3u8)[^"'\s<>''""]*"""
         )
         private val RE_QUALITY_H = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""")
         private val RE_QUALITY_BRACE = Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
@@ -802,8 +802,9 @@ class Rumble : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         if (url.endsWith(".mp4", ignoreCase = true) || url.endsWith(".m3u8", ignoreCase = true)) {
+            // FIX: was ExtractorLinkType.VIDEO which may not exist in every CS version
             val linkType = if (url.endsWith(".m3u8", ignoreCase = true))
-                ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                ExtractorLinkType.M3U8 else INFER_TYPE
             callback(newExtractorLink(name, name, url, linkType) { this.referer = url })
             return
         }
@@ -891,7 +892,7 @@ class Rumble : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PLEX EXTRACTOR (P2pstream) — File 1 signature restored
+//  PLEX EXTRACTOR (P2pstream) — robust ID extraction + diagnostics
 // ════════════════════════════════════════════════════════════════════════════
 class P2pstream : ExtractorApi() {
     override val name = "Plex"
@@ -899,6 +900,7 @@ class P2pstream : ExtractorApi() {
     override val requiresReferer = true
 
     companion object {
+        private const val TAG = "Narul/Plex"
         private val RE_HEX = Regex("^[0-9a-fA-F]{64,}$")
         private val RE_BASE64 = Regex("^[A-Za-z0-9+/=_-]{100,}$")
         private val KNOWN_ENDPOINTS = listOf(
@@ -908,15 +910,58 @@ class P2pstream : ExtractorApi() {
             "/api/v1/download?id={id}",
             "/api/v1/source?id={id}&dl=1"
         )
+
+        /**
+         * Robust ID extractor. Handles:
+         *   1. Hash fragment:   https://p2pstream.vip/embed#abc123
+         *   2. Path prefix:     https://p2pstream.vip/e/abc123
+         *   3. Query param:     https://p2pstream.vip/?id=abc123
+         *   4. Last segment:    https://p2pstream.vip/abc123
+         */
+        private fun extractPlexId(url: String): String? {
+            // 1. Hash fragment (original format)
+            url.substringAfter("#", "").substringBefore("&").substringBefore("?").trim()
+                .takeIf { it.isNotBlank() && !it.contains("/") }
+                ?.let { return it }
+
+            // 2. Path prefixes
+            Regex("""/(?:e|embed|v|video|d)/([A-Za-z0-9_-]+)""").find(url)?.groupValues?.getOrNull(1)
+                ?.let { return it }
+
+            // 3. Query parameters
+            Regex("""[?&](?:id|v|t)=([A-Za-z0-9_-]+)""").find(url)?.groupValues?.getOrNull(1)
+                ?.let { return it }
+
+            // 4. Last path segment
+            return url.substringBefore("?").substringBefore("#").trimEnd('/')
+                .substringAfterLast('/')
+                .takeIf { it.matches(Regex("^[A-Za-z0-9_-]{6,32}$")) }
+        }
     }
 
-    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        val origin = originOf(url) ?: return
-        val id = url.substringAfter("#", "").substringBefore("&").substringBefore("?").trim()
-        if (id.isBlank() || id.equals(hostOf(origin), true)) return
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        Log.d(TAG, "START url=$url")
+        val origin = originOf(url) ?: run {
+            Log.e(TAG, "no origin for $url")
+            return
+        }
+        val id = extractPlexId(url) ?: run {
+            Log.e(TAG, "no id extracted from $url")
+            return
+        }
+        Log.d(TAG, "id=$id origin=$origin")
+
+        if (id.equals(hostOf(origin), true)) {
+            Log.e(TAG, "id equals hostname, bailing")
+            return
+        }
 
         val refHost = referer?.let { hostOf(it) } ?: origin
-        // Restored to File 1's exact call — Sec-Fetch-Dest: empty, Sec-Fetch-Mode: cors
         val apiHeaders = chromeHeaders(
             dest = "empty",
             mode = "cors",
@@ -927,29 +972,48 @@ class P2pstream : ExtractorApi() {
 
         for (tmpl in KNOWN_ENDPOINTS) {
             val endpointUrl = resolveUrl(tmpl.replace("{id}", id).replace("{ref}", refHost), "$origin/", origin) ?: continue
-            val resp = try { withTimeoutOrNull(10_000L) { app.get(endpointUrl, headers = apiHeaders) } ?: continue } catch (_: Exception) { continue }
+            val resp = try {
+                withTimeoutOrNull(10_000L) { app.get(endpointUrl, headers = apiHeaders) }
+            } catch (_: Exception) { null } ?: run {
+                Log.d(TAG, "timeout on ${tmpl.substringBefore('?')}")
+                continue
+            }
+
+            val bodyLen = runCatching { resp.text.length }.getOrDefault(0)
+            Log.d(TAG, "endpoint ${tmpl.substringBefore('?')} → ${resp.code} (len=$bodyLen)")
+
             if (resp.code !in 200..299) continue
 
             val ct = resp.headers["content-type"]?.lowercase() ?: ""
             if (ct.startsWith("video/") || ct.contains("mpegurl") || resp.url.contains(".m3u8")) {
-                callback(newExtractorLink(name, name, resp.url, INFER_TYPE) { this.referer = "$origin/"; this.headers = apiHeaders })
+                Log.d(TAG, "direct media content-type on ${tmpl.substringBefore('?')}")
+                callback(newExtractorLink(name, name, resp.url, INFER_TYPE) {
+                    this.referer = "$origin/"
+                    this.headers = apiHeaders
+                })
                 return
             }
 
             val body = try { resp.text } catch (_: Exception) { continue }
-            if (tryDirectMedia(body, origin, apiHeaders, subtitleCallback, callback)) return
+            if (tryDirectMedia(body, origin, apiHeaders, subtitleCallback, callback)) {
+                Log.d(TAG, "✓ resolved via ${tmpl.substringBefore('?')}")
+                return
+            }
 
             val payload = body.trim().removeSurrounding("\"")
             if (RE_HEX.matches(payload) || RE_BASE64.matches(payload)) {
                 decodePayloadBytes(payload, RE_HEX.matches(payload))?.let { dec ->
                     val s = String(dec, Charsets.UTF_8).trimStart()
                     if (s.startsWith("{") || s.startsWith("[")) {
-                        tryDirectMedia(s, origin, apiHeaders, subtitleCallback, callback)
-                        return
+                        if (tryDirectMedia(s, origin, apiHeaders, subtitleCallback, callback)) {
+                            Log.d(TAG, "✓ resolved via ${tmpl.substringBefore('?')} (base64)")
+                            return
+                        }
                     }
                 }
             }
         }
+        Log.e(TAG, "✗ all endpoints exhausted for id=$id")
     }
 
     private suspend fun tryDirectMedia(
@@ -981,7 +1045,10 @@ class P2pstream : ExtractorApi() {
                     M3u8Helper.generateM3u8(name, url, "$origin/", headers = headers).forEach(callback)
                     emittedAny = true
                 } else if (!url.endsWith(".htm") && !url.endsWith(".html")) {
-                    callback(newExtractorLink(name, name, url, INFER_TYPE) { this.referer = "$origin/"; this.headers = headers })
+                    callback(newExtractorLink(name, name, url, INFER_TYPE) {
+                        this.referer = "$origin/"
+                        this.headers = headers
+                    })
                     emittedAny = true
                 }
             }
