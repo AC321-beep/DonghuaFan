@@ -892,7 +892,7 @@ class Rumble : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PLEX EXTRACTOR (P2pstream) — subdomain API fix
+//  PLEX EXTRACTOR (P2pstream) — full diagnostic + relative URL + expanded keys
 // ════════════════════════════════════════════════════════════════════════════
 class P2pstream : ExtractorApi() {
     override val name = "Plex"
@@ -903,11 +903,14 @@ class P2pstream : ExtractorApi() {
         private const val TAG = "Narul/Plex"
         private val RE_HEX = Regex("^[0-9a-fA-F]{64,}$")
         private val RE_BASE64 = Regex("^[A-Za-z0-9+/=_-]{100,}$")
+
+        // /player needs ?t= but also try ?id= (different API generations)
         private val KNOWN_ENDPOINTS = listOf(
-            "/api/v1/player?t={id}&w=1920&h=1080&r={ref}",
             "/api/v1/info?id={id}",
-            "/api/v1/folder?id={id}",
             "/api/v1/download?id={id}",
+            "/api/v1/player?t={id}&w=1920&h=1080&r={ref}",
+            "/api/v1/player?id={id}&r={ref}",
+            "/api/v1/folder?id={id}",
             "/api/v1/source?id={id}&dl=1"
         )
 
@@ -923,6 +926,81 @@ class P2pstream : ExtractorApi() {
                 .substringAfterLast('/')
                 .takeIf { it.matches(Regex("^[A-Za-z0-9_-]{6,32}$")) }
         }
+
+        /** Expanded JSON miner: accepts absolute URLs, relative paths, and more key names. */
+        private fun mineMediaUrls(json: JSONObject, depth: Int = 0): List<String> {
+            if (depth > 5) return emptyList()
+            val urls = mutableListOf<String>()
+            val keys = json.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                when (val v = json.opt(key)) {
+                    is String -> {
+                        val s = v.replace("\\/", "/").trim()
+                        if (s.isEmpty()) continue
+
+                        // Absolute media URLs
+                        RE_M3U8_ANY.findAll(s).forEach { urls.add(it.groupValues[1]) }
+                        RE_MP4_ANY.findAll(s).forEach { urls.add(it.groupValues[1]) }
+
+                        // Relative media paths (m3u8/mp4)
+                        if (s.startsWith("/") && (s.contains(".m3u8") || s.contains(".mp4"))) {
+                            urls.add(s)
+                        }
+
+                        // Any recognized "media" key — accept absolute OR relative path
+                        val isMediaKey = key.equals("file", true) || key.equals("url", true) ||
+                            key.equals("src", true) || key.equals("source", true) ||
+                            key.equals("stream", true) || key.equals("link", true) ||
+                            key.equals("href", true) || key.equals("download", true) ||
+                            key.equals("playlist", true) || key.equals("hls", true) ||
+                            key.equals("video", true) || key.equals("path", true) ||
+                            key.equals("location", true) || key.equals("master", true) ||
+                            key.equals("quality_url", true) || key.equals("hls_url", true)
+
+                        if (isMediaKey && (s.startsWith("http") || s.startsWith("/"))) {
+                            val lower = s.lowercase()
+                            if (!lower.endsWith(".jpg") && !lower.endsWith(".jpeg") &&
+                                !lower.endsWith(".png") && !lower.endsWith(".webp") &&
+                                !lower.endsWith(".gif") && !lower.endsWith(".vtt") &&
+                                !lower.endsWith(".srt") && !lower.contains("/embed/")) {
+                                urls.add(s)
+                            }
+                        }
+
+                        // Recurse into stringified JSON
+                        if (s.startsWith("{") || s.startsWith("[")) {
+                            try {
+                                if (s.startsWith("{")) urls.addAll(mineMediaUrls(JSONObject(s), depth + 1))
+                                else urls.addAll(mineMediaUrlsArray(JSONArray(s), depth + 1))
+                            } catch (_: Exception) {}
+                        }
+                    }
+                    is JSONObject -> urls.addAll(mineMediaUrls(v, depth + 1))
+                    is JSONArray -> urls.addAll(mineMediaUrlsArray(v, depth + 1))
+                }
+            }
+            return urls
+        }
+
+        private fun mineMediaUrlsArray(arr: JSONArray, depth: Int = 0): List<String> {
+            if (depth > 5) return emptyList()
+            val urls = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                when (val item = arr.opt(i)) {
+                    is String -> {
+                        val s = item.replace("\\/", "/").trim()
+                        RE_M3U8_ANY.findAll(s).forEach { urls.add(it.groupValues[1]) }
+                        RE_MP4_ANY.findAll(s).forEach { urls.add(it.groupValues[1]) }
+                        if (s.startsWith("/") && (s.contains(".m3u8") || s.contains(".mp4"))) urls.add(s)
+                        if (s.contains(".m3u8") || s.contains(".mp4") || s.contains("/hls/")) urls.add(s)
+                    }
+                    is JSONObject -> urls.addAll(mineMediaUrls(item, depth + 1))
+                    is JSONArray -> urls.addAll(mineMediaUrlsArray(item, depth + 1))
+                }
+            }
+            return urls
+        }
     }
 
     override suspend fun getUrl(
@@ -935,26 +1013,20 @@ class P2pstream : ExtractorApi() {
             Log.e(TAG, "no origin for $url"); return
         }
         val id = extractPlexId(url) ?: run {
-            Log.e(TAG, "no id extracted from $url"); return
+            Log.e(TAG, "no id for $url"); return
         }
-        Log.e(TAG, "START url=$url id=$id urlOrigin=$urlOrigin")
+        Log.e(TAG, "START id=$id urlOrigin=$urlOrigin")
 
         if (id.equals(hostOf(urlOrigin), true)) {
             Log.e(TAG, "id equals hostname, bailing"); return
         }
 
         val refHost = referer?.let { hostOf(it) } ?: urlOrigin
-
-        // KEY FIX: player URLs use subdomains (narulplex.p2pstream.vip)
-        // but the API lives on the root domain (p2pstream.vip).
-        // Try both, deduplicated.
         val apiOrigins = listOf(urlOrigin, mainUrl).distinct()
-        Log.e(TAG, "api origins to try: $apiOrigins")
+        Log.e(TAG, "api origins: $apiOrigins")
 
         for (apiOrigin in apiOrigins) {
-            // Sec-Fetch-Site: urlOrigin is same-origin; mainUrl is same-site (different subdomain)
             val fetchSite = if (apiOrigin == urlOrigin) "same-origin" else "same-site"
-
             val apiHeaders = chromeHeaders(
                 dest = "empty",
                 mode = "cors",
@@ -976,14 +1048,14 @@ class P2pstream : ExtractorApi() {
                     Log.e(TAG, "TIMEOUT $endpointUrl"); continue
                 }
 
-                val bodyLen = runCatching { resp.text.length }.getOrDefault(0)
-                Log.e(TAG, "GET $endpointUrl → ${resp.code} (len=$bodyLen)")
+                val body = runCatching { resp.text }.getOrDefault("")
+                Log.e(TAG, "GET $endpointUrl → ${resp.code} (len=${body.length})")
 
                 if (resp.code !in 200..299) continue
 
                 val ct = resp.headers["content-type"]?.lowercase() ?: ""
                 if (ct.startsWith("video/") || ct.contains("mpegurl") || resp.url.contains(".m3u8")) {
-                    Log.e(TAG, "✓ direct media via ${apiOrigin}")
+                    Log.e(TAG, "✓ direct content-type ${resp.url}")
                     callback(newExtractorLink(name, name, resp.url, INFER_TYPE) {
                         this.referer = "$urlOrigin/"
                         this.headers = apiHeaders
@@ -991,12 +1063,17 @@ class P2pstream : ExtractorApi() {
                     return
                 }
 
-                val body = try { resp.text } catch (_: Exception) { continue }
+                // Dump body preview so we can see the structure in the next log
+                if (body.length in 100..10_000) {
+                    Log.e(TAG, "BODY[${tmpl.substringBefore('?')}]: ${body.take(800)}")
+                }
+
                 if (tryDirectMedia(body, urlOrigin, apiHeaders, subtitleCallback, callback)) {
                     Log.e(TAG, "✓ resolved via $endpointUrl")
                     return
                 }
 
+                // Base64 / hex envelope fallback
                 val payload = body.trim().removeSurrounding("\"")
                 if (RE_HEX.matches(payload) || RE_BASE64.matches(payload)) {
                     decodePayloadBytes(payload, RE_HEX.matches(payload))?.let { dec ->
@@ -1016,42 +1093,59 @@ class P2pstream : ExtractorApi() {
 
     private suspend fun tryDirectMedia(
         text: String, origin: String, headers: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
+        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
+        depth: Int = 0
     ): Boolean {
+        if (depth > 2) return false
         val trimmed = text.trimStart()
-        var emittedAny = false
 
-        if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
-            val urls = if (trimmed.startsWith("[")) {
-                runCatching { extractMediaUrlsFromJsonArray(JSONArray(trimmed)) }.getOrNull() ?: emptyList()
-            } else {
-                runCatching { extractMediaUrlsFromJson(JSONObject(trimmed)) }.getOrNull() ?: emptyList()
-            }
+        if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+            Log.e(TAG, "  miner[${depth}]: body not JSON — preview='${trimmed.take(120)}'")
+            return false
+        }
 
-            urls.distinct().forEach { url ->
-                if (url.contains("/api/v1/folder") || url.contains("/api/v1/download") ||
-                    url.contains("/api/v1/source") || url.contains("/api/v1/video")) {
+        val urls = if (trimmed.startsWith("[")) {
+            runCatching { mineMediaUrlsArray(JSONArray(trimmed)) }.getOrNull() ?: emptyList()
+        } else {
+            runCatching { mineMediaUrls(JSONObject(trimmed)) }.getOrNull() ?: emptyList()
+        }
+
+        Log.e(TAG, "  miner[${depth}]: ${urls.size} candidates ${urls.take(6)}")
+
+        var emitted = false
+        urls.distinct().forEach { rawUrl ->
+            val url = if (rawUrl.startsWith("http")) rawUrl
+                      else resolveUrl(rawUrl, "$origin/", origin) ?: return@forEach
+
+            Log.e(TAG, "  miner[${depth}]: considering $url")
+
+            when {
+                url.contains("/api/v1/folder") || url.contains("/api/v1/download") ||
+                url.contains("/api/v1/source") || url.contains("/api/v1/video") -> {
                     try {
-                        val nestedResp = withTimeoutOrNull(8_000L) { app.get(url, headers = headers) }
-                        if (nestedResp != null && nestedResp.code in 200..299) {
-                            if (tryDirectMedia(nestedResp.text, origin, headers, subtitleCallback, callback)) {
-                                emittedAny = true
-                            }
+                        val nested = withTimeoutOrNull(8_000L) { app.get(url, headers = headers) }
+                        if (nested != null && nested.code in 200..299) {
+                            if (tryDirectMedia(nested.text, origin, headers, subtitleCallback, callback, depth + 1))
+                                emitted = true
                         }
                     } catch (_: Exception) {}
-                } else if (url.contains(".m3u8")) {
+                }
+                url.contains(".m3u8") -> {
                     M3u8Helper.generateM3u8(name, url, "$origin/", headers = headers).forEach(callback)
-                    emittedAny = true
-                } else if (!url.endsWith(".htm") && !url.endsWith(".html")) {
+                    emitted = true
+                }
+                url.contains(".mp4") || url.contains(".webm") || url.contains(".mkv") ||
+                url.contains("/hls/") || url.contains("/stream/") || url.contains("/dl/") -> {
                     callback(newExtractorLink(name, name, url, INFER_TYPE) {
                         this.referer = "$origin/"
                         this.headers = headers
                     })
-                    emittedAny = true
+                    emitted = true
                 }
+                else -> Log.e(TAG, "  miner[${depth}]: skip (not media-like): $url")
             }
-            if (emittedAny) return true
         }
+        if (emitted) return true
 
         RE_M3U8_ANY.find(text.replace("\\/", "/"))?.groupValues?.get(1)?.let { m3u8 ->
             M3u8Helper.generateM3u8(name, m3u8, "$origin/", headers = headers).forEach(callback)
