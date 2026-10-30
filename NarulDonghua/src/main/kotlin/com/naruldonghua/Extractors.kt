@@ -70,13 +70,19 @@ data class BysePlayback(
 //  SHARED HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 private fun chromeHeaders(
+    dest: String = "document",
+    mode: String = "navigate",
+    site: String = "same-origin",
     referer: String? = null,
     origin: String? = null,
-    accept: String = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    accept: String = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
 ): Map<String, String> = buildMap {
     put("User-Agent", DEFAULT_UA)
     put("Accept", accept)
     put("Accept-Language", "en-US,en;q=0.9")
+    put("Sec-Fetch-Dest", dest)
+    put("Sec-Fetch-Mode", mode)
+    put("Sec-Fetch-Site", site)
     referer?.let { put("Referer", it) }
     origin?.let { put("Origin", it) }
 }
@@ -247,7 +253,6 @@ class Bysekoze : ExtractorApi() {
         }
     }
 
-    // Lock-free coordinator — no Mutex, no runBlocking, no suspension
     private class EmissionCoordinator {
         private val seen = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         @Volatile private var won = false
@@ -274,7 +279,6 @@ class Bysekoze : ExtractorApi() {
         val coord = EmissionCoordinator()
         val anyEmitted = AtomicBoolean(false)
 
-        // Non-suspend so it can be passed directly as loadExtractor's callback
         val safeEmit: (ExtractorLink) -> Unit = { link ->
             if (coord.tryEmit("${link.url}|${link.referer}")) {
                 anyEmitted.set(true)
@@ -282,7 +286,6 @@ class Bysekoze : ExtractorApi() {
             }
         }
 
-        // ── Race the two cheap HTTP paths ─────────────────────────────────
         coroutineScope {
             val inlineJob = async(Dispatchers.IO) {
                 try { tryInlineJsonPath(url, origin, hash, referer, subtitleCallback, coord, safeEmit) }
@@ -303,7 +306,6 @@ class Bysekoze : ExtractorApi() {
             return
         }
 
-        // ── Custom WebView fallback (ad-redirect hardened) ────────────────
         val activity = CommonActivity.activity
             ?: throw ErrorLoadingException("Byse: no Activity for WebView fallback")
         if (activity.isFinishing || activity.isDestroyed) {
@@ -327,7 +329,6 @@ class Bysekoze : ExtractorApi() {
         }
     }
 
-    // ── Path 1: dynamic iframe → inline JSON → Jackson ───────────────────
     private suspend fun tryInlineJsonPath(
         url: String, origin: String, hash: String, referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -338,12 +339,11 @@ class Bysekoze : ExtractorApi() {
 
         val shellUrl = "$origin/e/$hash"
         val shellHtml = withTimeoutOrNull(8_000L) {
-            app.get(shellUrl, headers = chromeHeaders(referer ?: "$origin/")).text
+            app.get(shellUrl, headers = chromeHeaders(referer = referer ?: "$origin/")).text
         } ?: return
         if (isErrorPage(shellHtml)) return
         if (coord.isWon()) return
 
-        // (a) Inline JSON directly on shell page
         extractInlinePlayback(shellHtml)?.let { pb ->
             val decrypted = decryptBysePlayback(pb) ?: tryExternalByseDecoder(pb, shellUrl)
             if (!decrypted.isNullOrBlank()) {
@@ -353,21 +353,18 @@ class Bysekoze : ExtractorApi() {
         }
         if (coord.isWon()) return
 
-        // (b) Follow the discovered iframe (dynamic — no hardcoded paths)
         val iframeUrl = extractIframeSrc(shellHtml, shellUrl) ?: return
         val iframeOrigin = originOf(iframeUrl) ?: origin
         Log.e(TAG, "→ iframe discovered: $iframeUrl")
 
-        // (c) Delegate to loadExtractor for known players
         val found = try {
             loadExtractor(iframeUrl, referer, subtitleCallback) { link -> emit(link) }
         } catch (_: Exception) { false }
 
         if (found && coord.isWon()) return
 
-        // (d) Fetch iframe ourselves and parse Byse payload
         val playerHtml = withTimeoutOrNull(8_000L) {
-            app.get(iframeUrl, headers = chromeHeaders(shellUrl)).text
+            app.get(iframeUrl, headers = chromeHeaders(referer = shellUrl)).text
         } ?: return
         if (isErrorPage(playerHtml)) return
         if (coord.isWon()) return
@@ -377,7 +374,6 @@ class Bysekoze : ExtractorApi() {
         emitDecrypted(decrypted, iframeOrigin, iframeUrl, subtitleCallback, emit)
     }
 
-    // ── Path 2: REST API ─────────────────────────────────────────────────
     private suspend fun tryRestApiPath(
         url: String, origin: String, hash: String, referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -416,7 +412,6 @@ class Bysekoze : ExtractorApi() {
         emitDecrypted(decrypted, origin, frameRef, subtitleCallback, emit)
     }
 
-    // ── Jackson emission (single-arg tryParseJson, array-safe miner) ────
     private suspend fun emitDecrypted(
         json: String, pbOrigin: String, refererUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -484,7 +479,6 @@ class Bysekoze : ExtractorApi() {
         return emitted
     }
 
-    // ── Envelope decryption ──────────────────────────────────────────────
     private fun decryptBysePlayback(playback: JSONObject): String? {
         val ivB64 = playback.optString("iv")
         val payloadB64 = playback.optString("payload")
@@ -540,12 +534,8 @@ class Bysekoze : ExtractorApi() {
             ?: root.optString("result").takeIf { it.trimStart().let { t -> t.startsWith("{") || t.startsWith("[") } }
     } catch (_: Exception) { null }
 
-    // ══════════════════════════════════════════════════════════════════════
-    //  CUSTOM WEBVIEW INTERCEPTORS (ad-redirect hardened)
-    // ══════════════════════════════════════════════════════════════════════
     data class InterceptResult(val url: String, val headers: Map<String, String>)
 
-    /** True only when the request is a main-frame navigation to a non-Byse host. */
     private fun isAdHijack(request: android.webkit.WebResourceRequest?, shellUrl: String): Boolean {
         if (request == null) return false
         if (!request.isForMainFrame) return false
@@ -784,17 +774,25 @@ class Bysekoze : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  RUMBLE EXTRACTOR (new — matches provider's Rumble() call)
+//  RUMBLE EXTRACTOR (HTML-scraping version — as provided)
 // ════════════════════════════════════════════════════════════════════════════
 class Rumble : ExtractorApi() {
-    override val name = "Rumble"
-    override val mainUrl = "https://rumble.com"
-    override val requiresReferer = true
+    override var name = "Rumble"
+    override var mainUrl = "https://rumble.com"
+    override val requiresReferer = false
 
     companion object {
-        private const val TAG = "Narul/Rumble"
-        private val RE_RUMBLE_ID = Regex("""rumble\.com/embed/([a-zA-Z0-9]+)""", RegexOption.IGNORE_CASE)
-        private val RUMBLE_FORMATS = listOf("mp4", "hls", "webm")
+        private const val FETCH_TIMEOUT_MS = 12_000L
+        private const val SPLIT_TIMEOUT_MS = 2_500L
+
+        private val RE_VIDEO_URL = Regex(
+            """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*"""
+        )
+        private val RE_QUALITY_H = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""")
+        private val RE_QUALITY_BRACE = Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
+
+        private val JUNK_KEYWORDS = listOf("/assets/", "loop", "preview", "tracker", "thumb")
+        private val HARD_JUNK = listOf("/assets/", "tracker", "thumb")
     }
 
     override suspend fun getUrl(
@@ -803,55 +801,97 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val embedId = RE_RUMBLE_ID.find(url)?.groupValues?.getOrNull(1) ?: run {
-            Log.e(TAG, "No embed id in $url")
+        if (url.endsWith(".mp4", ignoreCase = true) || url.endsWith(".m3u8", ignoreCase = true)) {
+            val linkType = if (url.endsWith(".m3u8", ignoreCase = true))
+                ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            callback(newExtractorLink(name, name, url, linkType) { this.referer = url })
             return
         }
 
-        val body = try {
-            withTimeoutOrNull(10_000L) {
-                app.get(
-                    "https://rumble.com/embedJS/u3/?request=video&ver=2&v=$embedId",
-                    headers = mapOf(
-                        "User-Agent" to DEFAULT_UA,
-                        "Referer"    to url,
-                    )
-                ).text
-            }
-        } catch (_: Exception) { null } ?: return
+        val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+            try { app.get(url, referer = referer ?: mainUrl).text } catch (e: Exception) { null }
+        } ?: return
 
-        val ua = runCatching { JSONObject(body).optJSONObject("ua") }.getOrNull() ?: run {
-            Log.e(TAG, "No ua node in Rumble response for $embedId")
-            return
-        }
+        val afterMp4 = html.substringAfter("{\"mp4", "")
+        val scriptData = if (afterMp4.isEmpty()) html else afterMp4.substringBefore("\"evt\":{")
 
+        val scrapedUrls = LinkedHashSet<String>()
         var emitted = false
-        for (formatKey in RUMBLE_FORMATS) {
-            val fmtObj = ua.optJSONObject(formatKey) ?: continue
-            val qKeys = fmtObj.keys()
-            while (qKeys.hasNext()) {
-                val qKey = qKeys.next()
-                val streamUrl = fmtObj.optJSONObject(qKey)?.optString("url")
-                    ?.takeIf { it.startsWith("http") } ?: continue
-                val quality = qKey.filter { it.isDigit() }.toIntOrNull() ?: Qualities.Unknown.value
-                val isM3u8 = streamUrl.contains(".m3u8", true) || formatKey == "hls"
-                callback(newExtractorLink(
-                    name, name, streamUrl,
-                    if (isM3u8) ExtractorLinkType.M3U8 else INFER_TYPE
-                ) {
-                    this.referer = "https://rumble.com/"
-                    this.quality = quality
-                })
+
+        RE_VIDEO_URL.findAll(scriptData).forEach { match ->
+            val cleanUrl = match.value.replace("\\/", "/")
+
+            if (!cleanUrl.contains("rumble.com", ignoreCase = true)) return@forEach
+            if (JUNK_KEYWORDS.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
+
+            if (scrapedUrls.add(cleanUrl)) {
                 emitted = true
+                emitOne(cleanUrl, match, scriptData, url, name, callback)
             }
         }
 
-        if (!emitted) Log.e(TAG, "No streams emitted for embed $embedId")
+        if (!emitted) {
+            RE_VIDEO_URL.findAll(scriptData).forEach { match ->
+                val cleanUrl = match.value.replace("\\/", "/")
+
+                if (HARD_JUNK.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
+
+                if (scrapedUrls.add(cleanUrl)) {
+                    emitOne(cleanUrl, match, scriptData, url, "$name Trailer", callback)
+                }
+            }
+        }
+    }
+
+    private suspend fun emitOne(
+        cleanUrl: String,
+        match: MatchResult,
+        scriptData: String,
+        referer: String,
+        labelBase: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
+            callback(
+                newExtractorLink(name, "$labelBase (Auto)", cleanUrl, ExtractorLinkType.M3U8) {
+                    this.referer = referer
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+
+            val variants = try {
+                withTimeoutOrNull(SPLIT_TIMEOUT_MS) {
+                    M3u8Helper.generateM3u8(labelBase, cleanUrl, referer)
+                }
+            } catch (e: Exception) { null }
+            variants?.forEach(callback)
+
+        } else if (cleanUrl.contains(".mp4", ignoreCase = true)) {
+            val precedingText = scriptData.substring(
+                Math.max(0, match.range.first - 150),
+                match.range.first
+            )
+
+            val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull()
+                ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
+
+            val displayLabel = if (qMatch != null)
+                "$labelBase ${qMatch.groupValues[1]}p"
+            else
+                labelBase
+
+            callback(
+                newExtractorLink(name, displayLabel, cleanUrl, INFER_TYPE) {
+                    this.referer = referer
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+        }
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PLEX EXTRACTOR (unchanged)
+//  PLEX EXTRACTOR (P2pstream) — File 1 signature restored
 // ════════════════════════════════════════════════════════════════════════════
 class P2pstream : ExtractorApi() {
     override val name = "Plex"
@@ -876,7 +916,14 @@ class P2pstream : ExtractorApi() {
         if (id.isBlank() || id.equals(hostOf(origin), true)) return
 
         val refHost = referer?.let { hostOf(it) } ?: origin
-        val apiHeaders = chromeHeaders(referer = "$origin/", origin = origin, accept = "application/json, text/plain, */*")
+        // Restored to File 1's exact call — Sec-Fetch-Dest: empty, Sec-Fetch-Mode: cors
+        val apiHeaders = chromeHeaders(
+            dest = "empty",
+            mode = "cors",
+            referer = "$origin/",
+            origin = origin,
+            accept = "application/json, text/plain, */*"
+        )
 
         for (tmpl in KNOWN_ENDPOINTS) {
             val endpointUrl = resolveUrl(tmpl.replace("{id}", id).replace("{ref}", refHost), "$origin/", origin) ?: continue
@@ -950,7 +997,7 @@ class P2pstream : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  ABYSS EXTRACTOR (unchanged)
+//  ABYSS EXTRACTOR
 // ════════════════════════════════════════════════════════════════════════════
 class AbyssPlayer : ExtractorApi() {
     override val name = "Abyss"
