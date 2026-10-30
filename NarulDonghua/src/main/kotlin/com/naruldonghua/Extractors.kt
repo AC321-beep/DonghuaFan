@@ -892,7 +892,7 @@ class Rumble : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PLEX EXTRACTOR — folder→player token flow + AES-GCM fallback
+//  PLEX EXTRACTOR — WebView based (bypasses token/crypto entirely)
 // ════════════════════════════════════════════════════════════════════════════
 class P2pstream : ExtractorApi() {
     override val name = "Plex"
@@ -901,87 +901,9 @@ class P2pstream : ExtractorApi() {
 
     companion object {
         private const val TAG = "Narul/Plex"
-        private val RE_HEX = Regex("^[0-9a-fA-F]{64,}$")
-        private val RE_BASE64 = Regex("^[A-Za-z0-9+/=_-]{100,}$")
-        private val RE_HEX_ANY = Regex("^[a-fA-F0-9]+$")
-        private val RE_HEX_TOKEN = Regex("^[a-fA-F0-9]{16,128}$")
-
-        private fun extractPlexId(url: String): String? {
-            url.substringAfter("#", "").substringBefore("&").substringBefore("?").trim()
-                .takeIf { it.isNotBlank() && !it.contains("/") }
-                ?.let { return it }
-            Regex("""/(?:e|embed|v|video|d)/([A-Za-z0-9_-]+)""").find(url)?.groupValues?.getOrNull(1)
-                ?.let { return it }
-            Regex("""[?&](?:id|v|t)=([A-Za-z0-9_-]+)""").find(url)?.groupValues?.getOrNull(1)
-                ?.let { return it }
-            return url.substringBefore("?").substringBefore("#").trimEnd('/')
-                .substringAfterLast('/')
-                .takeIf { it.matches(Regex("^[A-Za-z0-9_-]{6,32}$")) }
-        }
-
-        private fun looksLikeMedia(s: String, keyHint: String = ""): Boolean {
-            val lower = s.lowercase()
-            if (lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") ||
-                lower.endsWith(".webp") || lower.endsWith(".gif") || lower.endsWith(".ico") ||
-                lower.endsWith(".vtt") || lower.endsWith(".srt") || lower.endsWith(".css") ||
-                lower.endsWith(".js") || lower.endsWith(".woff") || lower.endsWith(".woff2")) return false
-
-            if (lower.contains(".mp4") || lower.contains(".m3u8") || lower.contains(".webm") ||
-                lower.contains(".mkv") || lower.contains(".m4v") ||
-                lower.contains("/hls/") || lower.contains("/stream/") || lower.contains("/dl/") ||
-                lower.contains("/download/") || lower.contains("/media/") || lower.contains("/master")) return true
-
-            val k = keyHint.lowercase()
-            val strongKey = k.contains("file") || k.contains("src") || k.contains("stream") ||
-                            k.contains("hls") || k.contains("m3u8") || k.contains("mp4") ||
-                            k.contains("playlist") || k.contains("play_url") || k.contains("playurl") ||
-                            k.contains("download") || k.contains("link") || k.contains("video_url") ||
-                            k.contains("videourl") || k.contains("source") || k.contains("media") ||
-                            (k == "url") || k.endsWith("_url") || k.endsWith("url")
-
-            val weakKey = k.contains("thumb") || k.contains("poster") || k.contains("image") ||
-                          k.contains("icon") || k.contains("avatar") || k.contains("banner") ||
-                          k.contains("cover") || k.contains("logo")
-
-            return strongKey && !weakKey
-        }
-
-        private fun mineUrls(value: Any?, keyHint: String = "", depth: Int = 0): List<String> {
-            if (depth > 6) return emptyList()
-            val urls = mutableListOf<String>()
-
-            when (value) {
-                is String -> {
-                    val s = value.replace("\\/", "/").trim()
-                    if (s.isEmpty()) return urls
-                    if (s.startsWith("http://") || s.startsWith("https://")) {
-                        if (looksLikeMedia(s, keyHint) || RE_M3U8_ANY.find(s) != null || RE_MP4_ANY.find(s) != null) urls.add(s)
-                    } else if (s.startsWith("/") && !s.startsWith("//")) {
-                        if (looksLikeMedia(s, keyHint)) urls.add(s)
-                    }
-                    RE_M3U8_ANY.findAll(s).forEach { urls.add(it.groupValues[1]) }
-                    RE_MP4_ANY.findAll(s).forEach { urls.add(it.groupValues[1]) }
-                    if ((s.startsWith("{") || s.startsWith("[")) && s.length > 20) {
-                        runCatching {
-                            if (s.startsWith("{")) urls.addAll(mineUrls(JSONObject(s), keyHint, depth + 1))
-                            else urls.addAll(mineUrls(JSONArray(s), keyHint, depth + 1))
-                        }
-                    }
-                }
-                is JSONObject -> {
-                    val keys = value.keys()
-                    while (keys.hasNext()) {
-                        val k = keys.next()
-                        urls.addAll(mineUrls(value.opt(k), k, depth + 1))
-                    }
-                }
-                is JSONArray -> {
-                    for (i in 0 until value.length()) urls.addAll(mineUrls(value.opt(i), keyHint, depth + 1))
-                }
-            }
-            return urls
-        }
     }
+
+    data class InterceptResult(val url: String, val headers: Map<String, String>)
 
     override suspend fun getUrl(
         url: String,
@@ -989,169 +911,284 @@ class P2pstream : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val urlOrigin = originOf(url) ?: run { Log.e(TAG, "no origin"); return }
-        val id = extractPlexId(url) ?: run { Log.e(TAG, "no id"); return }
-        Log.e(TAG, "START id=$id urlOrigin=$urlOrigin")
+        Log.e(TAG, "START url=$url")
 
-        if (id.equals(hostOf(urlOrigin), true)) return
+        if (url.contains(".m3u8", true) || url.contains(".mp4", true)) {
+            Log.e(TAG, "✓ direct media URL")
+            val type = if (url.contains(".m3u8", true)) ExtractorLinkType.M3U8 else INFER_TYPE
+            callback(newExtractorLink(name, name, url, type) { this.referer = url })
+            return
+        }
 
-        val refHost = referer?.let { hostOf(it) } ?: urlOrigin
-        val apiOrigins = listOf(urlOrigin, mainUrl).distinct()
-        Log.e(TAG, "api origins: $apiOrigins")
+        val activity = CommonActivity.activity ?: run {
+            Log.e(TAG, "✗ no Activity for WebView"); return
+        }
+        if (activity.isFinishing || activity.isDestroyed) {
+            Log.e(TAG, "✗ Activity destroyed"); return
+        }
 
-        for (apiOrigin in apiOrigins) {
-            val fetchSite = if (apiOrigin == urlOrigin) "same-origin" else "same-site"
-            val apiHeaders = chromeHeaders(
-                dest = "empty", mode = "cors", site = fetchSite,
-                referer = "$urlOrigin/", origin = urlOrigin,
-                accept = "application/json, text/plain, text/html, */*"
-            )
+        val shellHost = hostOf(url) ?: "p2pstream.vip"
+        val headers = mapOf(
+            "Referer" to "https://$shellHost/",
+            "User-Agent" to DEFAULT_UA
+        )
 
-            // ─── STEP 1: get token from /folder ─────────────────────
-            var token: String? = null
-            try {
-                val folderResp = withTimeoutOrNull(8_000L) {
-                    app.get("$apiOrigin/api/v1/folder?id=$id", headers = apiHeaders)
+        Log.e(TAG, "→ loading WebView: $url")
+        var result = runSilentM3u8Interceptor(activity, url, headers)
+        if (result == null) {
+            Log.e(TAG, "→ silent failed, trying interactive")
+            result = runInteractiveM3u8Interceptor(activity, url, headers)
+        }
+
+        if (result != null) {
+            Log.e(TAG, "✓ Plex WebView intercepted: ${result.url}")
+            callback(newExtractorLink(name, name, result.url, ExtractorLinkType.M3U8) {
+                this.referer = url
+                this.headers = result.headers
+            })
+        } else {
+            Log.e(TAG, "✗ Plex exhausted (WebView timed out)")
+        }
+    }
+
+    private fun isPlexAdHijack(request: android.webkit.WebResourceRequest?, shellUrl: String): Boolean {
+        if (request == null || !request.isForMainFrame) return false
+        val reqUrl = request.url.toString()
+        if (reqUrl.startsWith("data:") || reqUrl.startsWith("blob:") || reqUrl.startsWith("about:")) return false
+        val reqHost = hostOf(reqUrl) ?: return false
+        val shellHost = hostOf(shellUrl) ?: ""
+        if (reqHost == shellHost) return false
+        if (reqHost == "p2pstream.vip") return false
+        if (reqHost.endsWith(".p2pstream.vip")) return false
+        return true
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun runSilentM3u8Interceptor(
+        activity: android.app.Activity,
+        urlToResolve: String,
+        headers: Map<String, String>
+    ): InterceptResult? = withContext(Dispatchers.Main) {
+        suspendCancellableCoroutine { cont ->
+            val root = activity.window?.decorView as? android.view.ViewGroup
+            val done = AtomicBoolean(false)
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            var timeoutRunnable: Runnable? = null
+            var clickRunnable: Runnable? = null
+            var webView: android.webkit.WebView? = null
+
+            fun finish(result: InterceptResult?) {
+                if (!done.compareAndSet(false, true)) return
+                timeoutRunnable?.let { handler.removeCallbacks(it) }
+                clickRunnable?.let { handler.removeCallbacks(it) }
+                runCatching {
+                    webView?.let { wv -> root?.removeView(wv); wv.stopLoading(); wv.destroy() }
                 }
-                if (folderResp != null && folderResp.code == 200) {
-                    val folderBody = folderResp.text.trim()
-                    Log.e(TAG, "folder[$apiOrigin]: ${folderBody.take(80)} (${folderBody.length}b)")
-                    if (folderBody.matches(RE_HEX_TOKEN)) {
-                        token = folderBody
-                        Log.e(TAG, "→ token=$token")
-                    }
-                }
-            } catch (_: Exception) {}
+                if (cont.isActive) cont.resume(result)
+            }
 
-            // ─── STEP 2: /player with token (the real API flow) ──────
-            if (token != null) {
-                val playerUrls = listOf(
-                    "$apiOrigin/api/v1/player?t=$token&w=1920&h=1080&r=$refHost",
-                    "$apiOrigin/api/v1/player?token=$token&id=$id&r=$refHost",
-                    "$apiOrigin/api/v1/player?t=$token&r=$refHost"
+            val wv = android.webkit.WebView(activity).apply {
+                layoutParams = android.view.ViewGroup.LayoutParams(
+                    activity.resources.displayMetrics.widthPixels,
+                    activity.resources.displayMetrics.heightPixels
                 )
-                for (playerUrl in playerUrls) {
-                    try {
-                        val resp = withTimeoutOrNull(8_000L) { app.get(playerUrl, headers = apiHeaders) } ?: continue
-                        if (resp.code !in 200..299) continue
-                        val body = resp.text.trim()
-                        Log.e(TAG, "player(token): ${body.take(400)} (${body.length}b)")
-                        if ((body.startsWith("{") || body.startsWith("[")) && !body.contains("\"error\"")) {
-                            if (tryDirectMedia(body, urlOrigin, apiHeaders, subtitleCallback, callback, 0)) {
-                                Log.e(TAG, "✓ resolved via /player with token")
-                                return
-                            }
+                translationX = 20000f
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
+                    mediaPlaybackRequiresUserGesture = false
+                    userAgentString = DEFAULT_UA
+                    setSupportMultipleWindows(false)
+                    javaScriptCanOpenWindowsAutomatically = false
+                }
+                webViewClient = object : android.webkit.WebViewClient() {
+                    @SuppressLint("WebViewClientOnReceivedSslError")
+                    override fun onReceivedSslError(v: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
+
+                    override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean {
+                        if (isPlexAdHijack(request, urlToResolve)) {
+                            Log.e(TAG, "ad hijack blocked: ${request?.url}")
+                            return true
                         }
-                    } catch (_: Exception) {}
-                }
-            }
-
-            // ─── STEP 3: token as AES-128 key for /info & /download ──
-            val keyBytes = token?.let { hexToBytes(it) }?.takeIf { it.size == 16 }
-            if (keyBytes != null) {
-                for (path in listOf("/api/v1/info?id=$id", "/api/v1/download?id=$id")) {
-                    try {
-                        val resp = withTimeoutOrNull(8_000L) {
-                            app.get("$apiOrigin$path", headers = apiHeaders)
-                        } ?: continue
-                        if (resp.code != 200) continue
-                        val body = resp.text.trim()
-                        if (!body.matches(RE_HEX_ANY) || body.length < 200) continue
-
-                        val bytes = hexToBytes(body) ?: continue
-                        Log.e(TAG, "decrypt $path: ${bytes.size} bytes, key=${keyBytes.size} bytes")
-
-                        for ((ivLen, label) in listOf(12 to "12", 16 to "16")) {
-                            if (bytes.size <= ivLen + 16) continue
-                            val iv = bytes.copyOfRange(0, ivLen)
-                            val ct = bytes.copyOfRange(ivLen, bytes.size)
-                            tryAesGcm(ct, keyBytes, iv)?.let { plain ->
-                                val text = String(plain, Charsets.UTF_8)
-                                Log.e(TAG, "AES-GCM($label): ${text.take(300)}")
-                                if ((text.startsWith("{") || text.startsWith("[")) &&
-                                    tryDirectMedia(text, urlOrigin, apiHeaders, subtitleCallback, callback, 0)) {
-                                    Log.e(TAG, "✓ resolved via AES-GCM($label)")
-                                    return
-                                }
-                            }
-                        }
-                    } catch (_: Exception) {}
-                }
-            }
-
-            // ─── STEP 4: legacy JSON endpoints (original code path) ──
-            for (tmpl in listOf(
-                "/api/v1/info?id={id}",
-                "/api/v1/download?id={id}",
-                "/api/v1/player?t={id}&w=1920&h=1080&r={ref}"
-            )) {
-                val endpointUrl = resolveUrl(
-                    tmpl.replace("{id}", id).replace("{ref}", refHost),
-                    "$apiOrigin/", apiOrigin
-                ) ?: continue
-                val resp = try {
-                    withTimeoutOrNull(10_000L) { app.get(endpointUrl, headers = apiHeaders) }
-                } catch (_: Exception) { null } ?: continue
-                val body = runCatching { resp.text }.getOrDefault("")
-                Log.e(TAG, "GET $endpointUrl → ${resp.code} (len=${body.length})")
-                if (resp.code !in 200..299 || body.length < 100) continue
-
-                if (tryDirectMedia(body, urlOrigin, apiHeaders, subtitleCallback, callback, 0)) {
-                    Log.e(TAG, "✓ resolved (legacy JSON) via $endpointUrl")
-                    return
-                }
-            }
-        }
-        Log.e(TAG, "✗ all paths exhausted for id=$id")
-    }
-
-    private suspend fun emitUrls(
-        urls: List<String>, origin: String, headers: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        var emitted = false
-        urls.distinct().forEach { raw ->
-            val u = if (raw.startsWith("http")) raw
-                    else resolveUrl(raw, "$origin/", origin) ?: return@forEach
-            when {
-                u.contains("/api/v1/") -> try {
-                    val nested = withTimeoutOrNull(8_000L) { app.get(u, headers = headers) }
-                    if (nested != null && nested.code in 200..299) {
-                        if (tryDirectMedia(nested.text, origin, headers, subtitleCallback, callback, 1)) emitted = true
+                        return super.shouldOverrideUrlLoading(view, request)
                     }
-                } catch (_: Exception) {}
-                u.contains(".m3u8") -> {
-                    M3u8Helper.generateM3u8(name, u, "$origin/", headers = headers).forEach(callback)
-                    emitted = true
-                }
-                else -> {
-                    callback(newExtractorLink(name, name, u, INFER_TYPE) {
-                        this.referer = "$origin/"; this.headers = headers
-                    })
-                    emitted = true
+
+                    override fun shouldInterceptRequest(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
+                        val u = request?.url?.toString() ?: return null
+                        if (u.contains(".m3u8") || u.contains(".m3u")) {
+                            val rh = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
+                            rh["Referer"] = urlToResolve
+                            Log.e(TAG, "→ intercepted m3u8: $u")
+                            activity.runOnUiThread { finish(InterceptResult(u, rh)) }
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
                 }
             }
+            webView = wv
+            cont.invokeOnCancellation { finish(null) }
+
+            clickRunnable = object : Runnable {
+                override fun run() {
+                    if (done.get()) return
+                    val js = """
+                        (function() {
+                            window.open = function() { return null; };
+                            var vids = document.querySelectorAll('video');
+                            var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .plyr__control--overlaid, [class*="play"], button[aria-label*="play" i]');
+                            if (vids.length > 0 || buttons.length > 0) {
+                                buttons.forEach(b => b.click());
+                                vids.forEach(v => {
+                                    v.muted = true;
+                                    var p = v.play();
+                                    if (p !== undefined) p.catch(e => {});
+                                });
+                            }
+                        })();
+                    """.trimIndent()
+                    webView?.evaluateJavascript(js, null)
+                    handler.postDelayed(this, 1000L)
+                }
+            }
+            timeoutRunnable = Runnable { finish(null) }
+
+            root?.addView(wv)
+            wv.loadUrl(urlToResolve, headers)
+            handler.postDelayed(clickRunnable!!, 2500L)
+            handler.postDelayed(timeoutRunnable!!, 15_000L)
         }
-        return emitted
     }
 
-    private suspend fun tryDirectMedia(
-        text: String, origin: String, headers: Map<String, String>,
-        subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit,
-        depth: Int = 0
-    ): Boolean {
-        if (depth > 2) return false
-        val trimmed = text.trimStart()
-        if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return false
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun runInteractiveM3u8Interceptor(
+        activity: android.app.Activity,
+        urlToResolve: String,
+        headers: Map<String, String>
+    ): InterceptResult? = withContext(Dispatchers.Main) {
+        suspendCancellableCoroutine { cont ->
+            val dialog = android.app.Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
+                setCancelable(false); setCanceledOnTouchOutside(false)
+            }
+            val done = AtomicBoolean(false)
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
+            var clickRunnable: Runnable? = null
+            var timeoutRunnable: Runnable? = null
+            var webView: android.webkit.WebView? = null
 
-        val candidates = runCatching {
-            if (trimmed.startsWith("[")) mineUrls(JSONArray(trimmed))
-            else mineUrls(JSONObject(trimmed))
-        }.getOrNull() ?: emptyList()
+            val layout = android.widget.LinearLayout(activity).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                setBackgroundColor(android.graphics.Color.parseColor("#1A1A1A"))
+            }
+            val headerLayout = android.widget.LinearLayout(activity).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
+                setPadding(32, 28, 32, 28)
+            }
+            val header = android.widget.TextView(activity).apply {
+                text = "Loading Plex stream… please wait"
+                setTextColor(android.graphics.Color.WHITE); textSize = 15f
+                layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            fun finish(result: InterceptResult?) {
+                if (!done.compareAndSet(false, true)) return
+                clickRunnable?.let { handler.removeCallbacks(it) }
+                timeoutRunnable?.let { handler.removeCallbacks(it) }
+                android.webkit.CookieManager.getInstance().flush()
+                runCatching {
+                    webView?.let { wv -> layout.removeView(wv); wv.stopLoading(); wv.destroy() }
+                    dialog.dismiss()
+                }
+                if (cont.isActive) cont.resume(result)
+            }
+            val closeBtn = android.widget.TextView(activity).apply {
+                text = "✖"; setTextColor(android.graphics.Color.WHITE); textSize = 18f
+                setPadding(20, 0, 0, 0); setOnClickListener { finish(null) }
+            }
+            headerLayout.addView(header); headerLayout.addView(closeBtn); layout.addView(headerLayout)
+            val progressBar = android.widget.ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
+                layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, 8)
+            }
+            layout.addView(progressBar)
 
-        if (candidates.isNotEmpty()) Log.e(TAG, "  miner[$depth]: ${candidates.size} candidates ${candidates.take(8)}")
-        if (candidates.isEmpty()) return false
-        return emitUrls(candidates, origin, headers, subtitleCallback, callback)
+            val wv = android.webkit.WebView(activity).apply {
+                layoutParams = android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
+                    mediaPlaybackRequiresUserGesture = false
+                    userAgentString = DEFAULT_UA
+                    setSupportMultipleWindows(false)
+                    javaScriptCanOpenWindowsAutomatically = false
+                }
+                webChromeClient = object : android.webkit.WebChromeClient() {
+                    override fun onProgressChanged(v: android.webkit.WebView?, p: Int) {
+                        progressBar.progress = p
+                        progressBar.visibility = if (p == 100) android.view.View.GONE else android.view.View.VISIBLE
+                    }
+                }
+                webViewClient = object : android.webkit.WebViewClient() {
+                    @SuppressLint("WebViewClientOnReceivedSslError")
+                    override fun onReceivedSslError(v: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
+
+                    override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean {
+                        if (isPlexAdHijack(request, urlToResolve)) {
+                            Log.e(TAG, "ad hijack blocked: ${request?.url}")
+                            return true
+                        }
+                        return super.shouldOverrideUrlLoading(view, request)
+                    }
+
+                    override fun shouldInterceptRequest(v: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
+                        val u = request?.url?.toString() ?: return null
+                        if (u.contains(".m3u8") || u.contains(".m3u")) {
+                            val rh = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
+                            rh["Referer"] = urlToResolve
+                            Log.e(TAG, "→ intercepted m3u8: $u")
+                            activity.runOnUiThread { finish(InterceptResult(u, rh)) }
+                        }
+                        return super.shouldInterceptRequest(v, request)
+                    }
+                }
+            }
+            webView = wv
+
+            clickRunnable = object : Runnable {
+                override fun run() {
+                    if (done.get()) return
+                    val js = """
+                        (function() {
+                            window.open = function() { return null; };
+                            var vids = document.querySelectorAll('video');
+                            var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .plyr__control--overlaid, [class*="play"], button[aria-label*="play" i]');
+                            if (vids.length > 0 || buttons.length > 0) {
+                                buttons.forEach(b => b.click());
+                                vids.forEach(v => {
+                                    v.muted = true;
+                                    var p = v.play();
+                                    if (p !== undefined) p.catch(e => {});
+                                });
+                            }
+                        })();
+                    """.trimIndent()
+                    webView?.evaluateJavascript(js, null)
+                    handler.postDelayed(this, 1000L)
+                }
+            }
+            layout.addView(wv)
+            dialog.setContentView(layout)
+            dialog.setOnDismissListener { if (!done.get()) finish(null) }
+            dialog.show()
+            wv.loadUrl(urlToResolve, headers)
+            handler.postDelayed(clickRunnable!!, 3500L)
+            timeoutRunnable = Runnable { finish(null) }
+            handler.postDelayed(timeoutRunnable!!, 40_000L)
+        }
     }
 }
 // ════════════════════════════════════════════════════════════════════════════
