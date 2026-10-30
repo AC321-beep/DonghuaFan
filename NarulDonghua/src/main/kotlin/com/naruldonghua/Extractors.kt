@@ -151,7 +151,7 @@ private fun tryAesGcm(ctAndTag: ByteArray, key: ByteArray, nonce: ByteArray): By
 } catch (_: Exception) { null }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  JSON MINERS (shared by P2pstream and AbyssPlayer)
+//  JSON MINERS (shared by Bysekoze & AbyssPlayer)
 // ════════════════════════════════════════════════════════════════════════════
 private fun extractMediaUrlsFromJson(json: JSONObject, depth: Int = 0): List<String> {
     if (depth > 5) return emptyList()
@@ -204,7 +204,7 @@ private fun extractMediaUrlsFromJsonArray(arr: JSONArray, depth: Int = 0): List<
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  BYSE EXTRACTOR
+//  BYSE EXTRACTOR — unchanged from working version
 // ════════════════════════════════════════════════════════════════════════════
 class Bysekoze : ExtractorApi() {
     override val name = "Byse"
@@ -774,7 +774,7 @@ class Bysekoze : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  RUMBLE EXTRACTOR (HTML-scraping) — ExtractorLinkType.VIDEO replaced with INFER_TYPE
+//  RUMBLE EXTRACTOR — unchanged
 // ════════════════════════════════════════════════════════════════════════════
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
@@ -802,7 +802,6 @@ class Rumble : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         if (url.endsWith(".mp4", ignoreCase = true) || url.endsWith(".m3u8", ignoreCase = true)) {
-            // FIX: was ExtractorLinkType.VIDEO which may not exist in every CS version
             val linkType = if (url.endsWith(".m3u8", ignoreCase = true))
                 ExtractorLinkType.M3U8 else INFER_TYPE
             callback(newExtractorLink(name, name, url, linkType) { this.referer = url })
@@ -951,6 +950,7 @@ class P2pstream : ExtractorApi() {
         }
     }
 
+    /** Blocks main-frame navigation to non-p2pstream hosts (ad hijacks). */
     private fun isPlexAdHijack(request: android.webkit.WebResourceRequest?, shellUrl: String): Boolean {
         if (request == null || !request.isForMainFrame) return false
         val reqUrl = request.url.toString()
@@ -1191,8 +1191,9 @@ class P2pstream : ExtractorApi() {
         }
     }
 }
+
 // ════════════════════════════════════════════════════════════════════════════
-//  ABYSS EXTRACTOR
+//  ABYSS EXTRACTOR — unchanged
 // ════════════════════════════════════════════════════════════════════════════
 class AbyssPlayer : ExtractorApi() {
     override val name = "Abyss"
