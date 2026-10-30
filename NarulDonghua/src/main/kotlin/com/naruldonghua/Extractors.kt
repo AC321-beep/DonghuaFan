@@ -892,7 +892,7 @@ class Rumble : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PLEX EXTRACTOR (P2pstream) — robust ID extraction + diagnostics
+//  PLEX EXTRACTOR (P2pstream) — subdomain API fix
 // ════════════════════════════════════════════════════════════════════════════
 class P2pstream : ExtractorApi() {
     override val name = "Plex"
@@ -911,28 +911,14 @@ class P2pstream : ExtractorApi() {
             "/api/v1/source?id={id}&dl=1"
         )
 
-        /**
-         * Robust ID extractor. Handles:
-         *   1. Hash fragment:   https://p2pstream.vip/embed#abc123
-         *   2. Path prefix:     https://p2pstream.vip/e/abc123
-         *   3. Query param:     https://p2pstream.vip/?id=abc123
-         *   4. Last segment:    https://p2pstream.vip/abc123
-         */
         private fun extractPlexId(url: String): String? {
-            // 1. Hash fragment (original format)
             url.substringAfter("#", "").substringBefore("&").substringBefore("?").trim()
                 .takeIf { it.isNotBlank() && !it.contains("/") }
                 ?.let { return it }
-
-            // 2. Path prefixes
             Regex("""/(?:e|embed|v|video|d)/([A-Za-z0-9_-]+)""").find(url)?.groupValues?.getOrNull(1)
                 ?.let { return it }
-
-            // 3. Query parameters
             Regex("""[?&](?:id|v|t)=([A-Za-z0-9_-]+)""").find(url)?.groupValues?.getOrNull(1)
                 ?.let { return it }
-
-            // 4. Last path segment
             return url.substringBefore("?").substringBefore("#").trimEnd('/')
                 .substringAfterLast('/')
                 .takeIf { it.matches(Regex("^[A-Za-z0-9_-]{6,32}$")) }
@@ -945,75 +931,87 @@ class P2pstream : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        Log.d(TAG, "START url=$url")
-        val origin = originOf(url) ?: run {
-            Log.e(TAG, "no origin for $url")
-            return
+        val urlOrigin = originOf(url) ?: run {
+            Log.e(TAG, "no origin for $url"); return
         }
         val id = extractPlexId(url) ?: run {
-            Log.e(TAG, "no id extracted from $url")
-            return
+            Log.e(TAG, "no id extracted from $url"); return
         }
-        Log.d(TAG, "id=$id origin=$origin")
+        Log.e(TAG, "START url=$url id=$id urlOrigin=$urlOrigin")
 
-        if (id.equals(hostOf(origin), true)) {
-            Log.e(TAG, "id equals hostname, bailing")
-            return
+        if (id.equals(hostOf(urlOrigin), true)) {
+            Log.e(TAG, "id equals hostname, bailing"); return
         }
 
-        val refHost = referer?.let { hostOf(it) } ?: origin
-        val apiHeaders = chromeHeaders(
-            dest = "empty",
-            mode = "cors",
-            referer = "$origin/",
-            origin = origin,
-            accept = "application/json, text/plain, */*"
-        )
+        val refHost = referer?.let { hostOf(it) } ?: urlOrigin
 
-        for (tmpl in KNOWN_ENDPOINTS) {
-            val endpointUrl = resolveUrl(tmpl.replace("{id}", id).replace("{ref}", refHost), "$origin/", origin) ?: continue
-            val resp = try {
-                withTimeoutOrNull(10_000L) { app.get(endpointUrl, headers = apiHeaders) }
-            } catch (_: Exception) { null } ?: run {
-                Log.d(TAG, "timeout on ${tmpl.substringBefore('?')}")
-                continue
-            }
+        // KEY FIX: player URLs use subdomains (narulplex.p2pstream.vip)
+        // but the API lives on the root domain (p2pstream.vip).
+        // Try both, deduplicated.
+        val apiOrigins = listOf(urlOrigin, mainUrl).distinct()
+        Log.e(TAG, "api origins to try: $apiOrigins")
 
-            val bodyLen = runCatching { resp.text.length }.getOrDefault(0)
-            Log.d(TAG, "endpoint ${tmpl.substringBefore('?')} → ${resp.code} (len=$bodyLen)")
+        for (apiOrigin in apiOrigins) {
+            // Sec-Fetch-Site: urlOrigin is same-origin; mainUrl is same-site (different subdomain)
+            val fetchSite = if (apiOrigin == urlOrigin) "same-origin" else "same-site"
 
-            if (resp.code !in 200..299) continue
+            val apiHeaders = chromeHeaders(
+                dest = "empty",
+                mode = "cors",
+                site = fetchSite,
+                referer = "$urlOrigin/",
+                origin = urlOrigin,
+                accept = "application/json, text/plain, */*"
+            )
 
-            val ct = resp.headers["content-type"]?.lowercase() ?: ""
-            if (ct.startsWith("video/") || ct.contains("mpegurl") || resp.url.contains(".m3u8")) {
-                Log.d(TAG, "direct media content-type on ${tmpl.substringBefore('?')}")
-                callback(newExtractorLink(name, name, resp.url, INFER_TYPE) {
-                    this.referer = "$origin/"
-                    this.headers = apiHeaders
-                })
-                return
-            }
+            for (tmpl in KNOWN_ENDPOINTS) {
+                val endpointUrl = resolveUrl(
+                    tmpl.replace("{id}", id).replace("{ref}", refHost),
+                    "$apiOrigin/", apiOrigin
+                ) ?: continue
 
-            val body = try { resp.text } catch (_: Exception) { continue }
-            if (tryDirectMedia(body, origin, apiHeaders, subtitleCallback, callback)) {
-                Log.d(TAG, "✓ resolved via ${tmpl.substringBefore('?')}")
-                return
-            }
+                val resp = try {
+                    withTimeoutOrNull(10_000L) { app.get(endpointUrl, headers = apiHeaders) }
+                } catch (_: Exception) { null } ?: run {
+                    Log.e(TAG, "TIMEOUT $endpointUrl"); continue
+                }
 
-            val payload = body.trim().removeSurrounding("\"")
-            if (RE_HEX.matches(payload) || RE_BASE64.matches(payload)) {
-                decodePayloadBytes(payload, RE_HEX.matches(payload))?.let { dec ->
-                    val s = String(dec, Charsets.UTF_8).trimStart()
-                    if (s.startsWith("{") || s.startsWith("[")) {
-                        if (tryDirectMedia(s, origin, apiHeaders, subtitleCallback, callback)) {
-                            Log.d(TAG, "✓ resolved via ${tmpl.substringBefore('?')} (base64)")
-                            return
+                val bodyLen = runCatching { resp.text.length }.getOrDefault(0)
+                Log.e(TAG, "GET $endpointUrl → ${resp.code} (len=$bodyLen)")
+
+                if (resp.code !in 200..299) continue
+
+                val ct = resp.headers["content-type"]?.lowercase() ?: ""
+                if (ct.startsWith("video/") || ct.contains("mpegurl") || resp.url.contains(".m3u8")) {
+                    Log.e(TAG, "✓ direct media via ${apiOrigin}")
+                    callback(newExtractorLink(name, name, resp.url, INFER_TYPE) {
+                        this.referer = "$urlOrigin/"
+                        this.headers = apiHeaders
+                    })
+                    return
+                }
+
+                val body = try { resp.text } catch (_: Exception) { continue }
+                if (tryDirectMedia(body, urlOrigin, apiHeaders, subtitleCallback, callback)) {
+                    Log.e(TAG, "✓ resolved via $endpointUrl")
+                    return
+                }
+
+                val payload = body.trim().removeSurrounding("\"")
+                if (RE_HEX.matches(payload) || RE_BASE64.matches(payload)) {
+                    decodePayloadBytes(payload, RE_HEX.matches(payload))?.let { dec ->
+                        val s = String(dec, Charsets.UTF_8).trimStart()
+                        if (s.startsWith("{") || s.startsWith("[")) {
+                            if (tryDirectMedia(s, urlOrigin, apiHeaders, subtitleCallback, callback)) {
+                                Log.e(TAG, "✓ resolved via $endpointUrl (b64)")
+                                return
+                            }
                         }
                     }
                 }
             }
         }
-        Log.e(TAG, "✗ all endpoints exhausted for id=$id")
+        Log.e(TAG, "✗ all origins × endpoints exhausted for id=$id")
     }
 
     private suspend fun tryDirectMedia(
@@ -1062,7 +1060,6 @@ class P2pstream : ExtractorApi() {
         return false
     }
 }
-
 // ════════════════════════════════════════════════════════════════════════════
 //  ABYSS EXTRACTOR
 // ════════════════════════════════════════════════════════════════════════════
