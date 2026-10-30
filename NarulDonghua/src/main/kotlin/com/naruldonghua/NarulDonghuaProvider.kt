@@ -4,12 +4,18 @@ import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.INFER_TYPE
+import com.lagradost.cloudstream3.utils.M3u8Helper
+import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -27,14 +33,17 @@ class NarulDonghuaProvider : MainAPI() {
     companion object {
         private const val TAG = "Narul/Prov"
         
+        // ── Precompiled Regexes (Memory Optimization) ──
         private val RE_BG_URL = Regex("""url\(['"]?(.*?)['"]?\)""")
         private val RE_EP_HREF = Regex("""episode-(\d+)-""", RegexOption.IGNORE_CASE)
         private val RE_EP_TEXT = Regex("""(?:Eps?|Episode)\s*(\d+)""", RegexOption.IGNORE_CASE)
         private val RE_RAW_URL = Regex("""https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/[^"'\s<>\\]+""")
         private val STATIC_ASSET_EXT = Regex("""\.(?:png|jpe?g|gif|webp|svg|ico|css|js|woff2?|ttf|eot|json|xml)(?:\?.*)?$""", RegexOption.IGNORE_CASE)
         private val RE_JS_REDIRECT = Regex("""(?:window\.location(?:\.href)?|location\.replace)\s*\(?=\s*["']([^"']+)["']""")
+        private val RE_RUMBLE_ID = Regex("""rumble\.com/embed/([a-zA-Z0-9]+)""", RegexOption.IGNORE_CASE)
         private val RE_HTTP_URL = Regex("""https?://[^\s"'<>]+""")
 
+        // ── Static Lookups (Avoids re-allocating lists on every loop) ──
         private val BYSE_DOMAINS = listOf("bysekoze.com", "bysejikuar.com", "byse.sx", "bysevepoin.com", "g9r6.com", "n1mwq.org", "f16px.com")
         private val AD_DOMAINS = listOf(
             "a-ads.com", "doubleclick", "googlesyndication", "googleadservices",
@@ -43,8 +52,10 @@ class NarulDonghuaProvider : MainAPI() {
             "static.cloudflareinsights.com", "mc.yandex.ru",
             "disqus.com", "accounts.google.com"
         )
+        private val RUMBLE_FORMATS = listOf("mp4", "hls", "webm")
     }
 
+    // ── Headers ──────────────────────────────────────────────────────────
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -77,6 +88,7 @@ class NarulDonghuaProvider : MainAPI() {
 
     private val cardSelector = "article.bs, div.swiper-slide.item:not(.swiper-slide-duplicate)"
 
+    // ── Categories ───────────────────────────────────────────────────────
     override val mainPage = mainPageOf(
         "anime/?status=&type=&order=update||anime/?status=&type=&order=latest" to "Latest Release",
         "anime/?status=&type=movie&order=update"     to "Movie",
@@ -239,16 +251,10 @@ class NarulDonghuaProvider : MainAPI() {
             val epNum = RE_EP_HREF.find(href)?.groupValues?.getOrNull(1)?.toIntOrNull()
                 ?: RE_EP_TEXT.find(node.selectFirst(".playinfo span")?.text().orEmpty())?.groupValues?.getOrNull(1)?.toIntOrNull()
 
-            // Safe localized date parsing modeled from Animexin
-            val dateText = node.selectFirst(".epl-date, .date, .time")?.text()?.trim()
-
             newEpisode(href) {
                 this.name = name
                 this.posterUrl = poster
                 if (epNum != null) this.episode = epNum
-                if (!dateText.isNullOrBlank()) {
-                    this.addDate(dateText, format = "MMMM d, yyyy")
-                }
             }
         }.distinctBy { it.data }.sortedByDescending { it.episode ?: 0 }
 
@@ -271,6 +277,7 @@ class NarulDonghuaProvider : MainAPI() {
         }
     }
 
+    // ── YouTube Helpers ──────────────────────────────────────────────────
     private fun isYouTubeUrl(url: String): Boolean =
         url.contains("youtube.com", true) || url.contains("youtu.be", true) || url.contains("youtube-nocookie.com", true)
 
@@ -298,6 +305,7 @@ class NarulDonghuaProvider : MainAPI() {
         return u
     }
 
+    // ── loadLinks ────────────────────────────────────────────────────────
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -328,6 +336,7 @@ class NarulDonghuaProvider : MainAPI() {
             var extracted = false
             val inner: (ExtractorLink) -> Unit = { extracted = true; trackLink(it) }
 
+            // 1. Handle short.icu (Abyss/Hydrax shortener)
             if (url.contains("short.icu/", true)) {
                 resolveRedirectUrl(url)?.let { target ->
                     if (target != url) {
@@ -338,24 +347,26 @@ class NarulDonghuaProvider : MainAPI() {
                 }
             }
 
+            // 2. Extractors matching
             when {
-                isDailymotionUrl(url) -> runCatching { loadExtractor(normalizeDailymotionUrl(url), referer = "https://www.dailymotion.com/", trackSub, inner) }.onSuccess { if (extracted) { Log.e(TAG, "   ✓ DM OK"); return } }
+                isDailymotionUrl(url) -> runCatching { if (extractDailymotion(url, trackSub, inner)) { Log.e(TAG, "   ✓ DM OK"); return } }
                 url.contains("p2pstream.vip", true) -> runCatching { P2pstream().getUrl(url, mainUrl, trackSub, inner) }.onSuccess { if (extracted) { Log.e(TAG, "   ✓ Plex OK"); return } }
                 url.contains("abysplayserver.com", true) || url.contains("abyssplayer.com", true) || url.contains("abyysplayer.com", true) || url.contains("playhydrax.com", true) -> {
                     runCatching { AbyssPlayer().getUrl(url, mainUrl, trackSub, inner) }.onSuccess { if (extracted) { Log.e(TAG, "   ✓ Abyss OK"); return } }
                 }
                 isByseUrl(url) -> runCatching { Bysekoze().getUrl(url, mainUrl, trackSub, inner) }.onSuccess { if (extracted) { Log.e(TAG, "   ✓ Byse OK"); return } }
-                // Integrated the decoupled Rumble Extractor
-                url.contains("rumble.com/", true) -> runCatching { Rumble().getUrl(url, mainUrl, trackSub, inner) }.onSuccess { if (extracted) { Log.e(TAG, "   ✓ Rumble OK"); return } }
+                url.contains("rumble.com/", true) -> runCatching { if (extractRumble(url, inner)) { Log.e(TAG, "   ✓ Rumble OK"); return } }
                 isYouTubeUrl(url) -> runCatching { loadExtractor(normalizeYouTubeUrl(url), referer = "https://www.youtube.com/", trackSub, inner) }.onSuccess { if (extracted) { Log.e(TAG, "   ✓ YouTube OK"); return } }
             }
 
+            // 3. Generic Extractor
             runCatching { loadExtractor(url, referer = mainUrl, trackSub, inner) }
             if (extracted) {
                 Log.e(TAG, "   ✓ generic OK")
                 return
             }
 
+            // 4. Nested iframe fallback
             if (!url.startsWith(mainUrl, true)) {
                 val nested = fetch(url, timeoutMs = 8_000L)?.let { page ->
                     page.selectFirst("iframe[data-litespeed-src]")?.attr("data-litespeed-src")
@@ -440,17 +451,82 @@ class NarulDonghuaProvider : MainAPI() {
         } catch (_: Exception) { null }
     }
 
+    // ── Rumble Extractor ──────────────────────────────────────────────────
+    private suspend fun extractRumble(url: String, callback: (ExtractorLink) -> Unit): Boolean {
+        val embedId = RE_RUMBLE_ID.find(url)?.groupValues?.getOrNull(1) ?: return false
+        val body = withTimeoutOrNull(10_000L) { app.get("https://rumble.com/embedJS/u3/?request=video&ver=2&v=$embedId", headers = mapOf("User-Agent" to defaultHeaders["User-Agent"]!!, "Referer" to url)).text } ?: return false
+        val ua = runCatching { JSONObject(body).optJSONObject("ua") }.getOrNull() ?: return false
+        var found = false
+
+        for (formatKey in RUMBLE_FORMATS) {
+            val fmtObj = ua.optJSONObject(formatKey) ?: continue
+            val qKeys = fmtObj.keys()
+            while (qKeys.hasNext()) {
+                val qKey = qKeys.next()
+                val streamUrl = fmtObj.optJSONObject(qKey)?.optString("url")?.takeIf { it.startsWith("http") } ?: continue
+                val quality = qKey.filter { it.isDigit() }.toIntOrNull() ?: Qualities.Unknown.value
+                val isM3u8 = streamUrl.contains(".m3u8", true) || formatKey == "hls"
+                callback(newExtractorLink("Rumble", "Rumble", streamUrl, if (isM3u8) ExtractorLinkType.M3U8 else INFER_TYPE) { this.referer = "https://rumble.com/"; this.quality = quality })
+                found = true
+            }
+        }
+        return found
+    }
+
+    // ── Dailymotion ──────────────────────────────────────────────────────
     private fun isDailymotionUrl(url: String) = url.contains("dailymotion.com", true) || url.contains("dai.ly", true)
 
-    private fun normalizeDailymotionUrl(url: String): String {
-        val videoId = when {
-            url.contains("geo.dailymotion.com", true) -> Regex("""[?&]video=([A-Za-z0-9]+)""").find(url)?.groupValues?.getOrNull(1)
-            url.contains("/embed/video/", true) -> url.substringAfter("/embed/video/").substringBefore("?").substringBefore("/").substringBefore("_").takeIf { it.matches(Regex("[A-Za-z0-9]+")) }
-            url.contains("/video/", true) -> url.substringAfter("/video/").substringBefore("_").substringBefore("?").substringBefore("/").takeIf { it.matches(Regex("[A-Za-z0-9]+")) }
-            url.contains("dai.ly/", true) -> url.substringAfter("dai.ly/").substringBefore("?").substringBefore("/").takeIf { it.matches(Regex("[A-Za-z0-9]+")) }
-            else -> null
+    private fun extractDailymotionVideoId(url: String): String? = when {
+        url.contains("geo.dailymotion.com", true) -> Regex("""[?&]video=([A-Za-z0-9]+)""").find(url)?.groupValues?.getOrNull(1)
+        url.contains("/embed/video/", true) -> url.substringAfter("/embed/video/").substringBefore("?").substringBefore("/").substringBefore("_").takeIf { it.matches(Regex("[A-Za-z0-9]+")) }
+        url.contains("/video/", true) -> url.substringAfter("/video/").substringBefore("_").substringBefore("?").substringBefore("/").takeIf { it.matches(Regex("[A-Za-z0-9]+")) }
+        url.contains("dai.ly/", true) -> url.substringAfter("dai.ly/").substringBefore("?").substringBefore("/").takeIf { it.matches(Regex("[A-Za-z0-9]+")) }
+        else -> null
+    }
+
+    private suspend fun extractDailymotion(url: String, subCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        val videoId = extractDailymotionVideoId(url) ?: return false
+        val dmHeaders = mapOf("User-Agent" to defaultHeaders["User-Agent"]!!, "Referer" to "https://www.dailymotion.com/", "Origin" to "https://www.dailymotion.com")
+        val geoUrl = if (url.contains("geo.dailymotion.com", true)) url else "https://geo.dailymotion.com/player/x9mpt.html?video=$videoId"
+        var m3u8Url: String? = null
+
+        try {
+            val geoDoc = withTimeoutOrNull(10_000L) { app.get(geoUrl, headers = dmHeaders).document }
+            val configScript = geoDoc?.select("script")?.firstOrNull { it.data().contains("__PLAYER_CONFIG__") }
+            if (configScript != null) {
+                val raw = configScript.data()
+                val start = raw.indexOf('{')
+                val end = raw.lastIndexOf('}')
+                if (start in 0 until end) {
+                    runCatching { m3u8Url = JSONObject(raw.substring(start, end + 1)).optJSONObject("criticalMetadata")?.optJSONObject("stream")?.optString("url")?.takeIf { it.isNotBlank() } }
+                }
+            }
+            if (m3u8Url == null && geoDoc != null) {
+                m3u8Url = Regex("""https?://[^"'\s]+\.m3u8[^"'\s]*""").find(geoDoc.outerHtml())?.value
+            }
+        } catch (_: Exception) {}
+
+        if (m3u8Url.isNullOrBlank()) {
+            try {
+                val body = withTimeoutOrNull(10_000L) { app.get("https://www.dailymotion.com/player/metadata/video/$videoId", headers = dmHeaders).text }.orEmpty()
+                if (body.isNotBlank()) {
+                    val json = JSONObject(body)
+                    m3u8Url = json.optJSONObject("qualities")?.optJSONArray("auto")?.optJSONObject(0)?.optString("url")?.takeIf { it.isNotBlank() }
+                    val subsObj = json.optJSONObject("subtitles")?.optJSONObject("data") ?: json.optJSONObject("subtitles")
+                    subsObj?.keys()?.forEach { lang ->
+                        val item = subsObj.optJSONObject(lang)
+                        val subUrl = item?.optJSONArray("urls")?.optString(0)?.ifBlank { item.optString("urls") }
+                        if (!subUrl.isNullOrBlank() && subUrl.startsWith("http")) subCallback(newSubtitleFile(lang, subUrl) { headers = dmHeaders })
+                    }
+                }
+            } catch (_: Exception) {}
         }
-        return if (videoId != null) "https://www.dailymotion.com/video/$videoId" else url
+
+        val finalM3u8 = m3u8Url?.takeIf { it.isNotBlank() } ?: return false
+        val variants = M3u8Helper.generateM3u8("Dailymotion", finalM3u8, "https://www.dailymotion.com/", headers = dmHeaders)
+        if (variants.isNotEmpty()) variants.forEach(callback)
+        else callback(newExtractorLink("Dailymotion", "Dailymotion", finalM3u8, ExtractorLinkType.M3U8) { this.referer = "https://www.dailymotion.com/"; this.headers = dmHeaders })
+        return true
     }
 
     private fun decodeServerValue(raw: String): String? {
