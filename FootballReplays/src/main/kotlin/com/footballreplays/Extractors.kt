@@ -384,7 +384,7 @@ class Vtbe : ExtractorApi() {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
+/// ════════════════════════════════════════════════════════════════════════════
 //  BYSE HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 private fun byse_originOf(url: String): String? =
@@ -510,7 +510,7 @@ private fun byse_extractMediaUrlsFromJsonArray(arr: JSONArray, depth: Int = 0): 
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  BYSE SNIFFER
+//  BYSE SNIFFER — logs /api/ fetches and XHRs from inside WebView
 // ════════════════════════════════════════════════════════════════════════════
 private val BYSE_SNIFFER_JS = """
     (function(){
@@ -546,7 +546,9 @@ private val BYSE_SNIFFER_JS = """
 """.trimIndent()
 
 // ════════════════════════════════════════════════════════════════════════════
-//  BYSE EXTRACTOR
+//  BYSE EXTRACTOR (Option B — REST paths trimmed)
+//   Flow: HTTP → CFSolver → inline-decrypt (if payload in HTML)
+//         → Silent WebView (18 s, invisible) → Interactive WebView (fallback)
 // ════════════════════════════════════════════════════════════════════════════
 open class ByseSX : ExtractorApi() {
     override var name = "Byse"
@@ -565,7 +567,7 @@ open class ByseSX : ExtractorApi() {
 
         private fun extractHash(url: String): String? {
             val clean = url.substringBefore("?").substringBefore("#").trimEnd('/')
-            Regex("""/(?:d|embed|e|v|video|download|a2lyf|cx5h|w6u1|jjplw|hzjr|84a|oio|l3qxr)/([a-zA-Z0-9]{8,32})""")
+            Regex("""/(?:d|embed|e|v|video|download|a2lyf|cx5h|w6u1|jjplw|hzjr|84a|oio|l3qxr|ut6)/([a-zA-Z0-9]{8,32})""")
                 .find(clean)?.let { return it.groupValues[1] }
             return clean.substringAfterLast('/')
                 .takeIf { it.matches(Regex("^[a-zA-Z0-9]{8,32}$")) }
@@ -629,14 +631,9 @@ open class ByseSX : ExtractorApi() {
                 } catch (_: Exception) { "" }
             }
         }
-        // Broad cookie diagnostics
-        val cm = android.webkit.CookieManager.getInstance()
-        Log.e(TAG, "  cookies(origin)=${runCatching { cm.getCookie(origin) }.getOrNull() ?: "(none)"}")
-        Log.e(TAG, "  cookies(origin/)=${runCatching { cm.getCookie("$origin/") }.getOrNull() ?: "(none)"}")
-        Log.e(TAG, "  cookies(shellUrl)=${runCatching { cm.getCookie(shellUrl) }.getOrNull() ?: "(none)"}")
         Log.e(TAG, "  shell: len=${shellHtml.length} hasAlgo=${shellHtml.contains("\"algorithm\"")} hasPayload=${shellHtml.contains("\"payload\"")}")
 
-        // 3) Decrypt shell inline
+        // 3) Inline decrypt (only fires if payload lives in shell HTML — some mirrors, v1–v3)
         if (shellHtml.isNotBlank() && !byse_isErrorPage(shellHtml)) {
             if (decryptInline(shellHtml, origin, shellUrl, subtitleCallback, safeEmit)) {
                 Log.e(TAG, "✓ Byse resolved via Shell + Inline JSON")
@@ -644,21 +641,7 @@ open class ByseSX : ExtractorApi() {
             }
         }
 
-        // 4) NEW: /embed/details endpoint — the actual one the player uses
-        tryDetailsEndpoint(url, origin, hash, referer, subtitleCallback, coord, safeEmit)
-        if (anyEmitted.get()) {
-            Log.e(TAG, "✓ Byse resolved via /embed/details (shell origin $origin)")
-            return
-        }
-
-        // 5) Old /embed/playback variants (kept as fallback)
-        tryPlaybackEndpointVariants(url, origin, hash, referer, subtitleCallback, coord, safeEmit)
-        if (anyEmitted.get()) {
-            Log.e(TAG, "✓ Byse resolved via /embed/playback (shell origin $origin)")
-            return
-        }
-
-        // 6) Silent WebView on shell — full-size off-screen, 18s timeout
+        // 4) Silent WebView — primary path (works for v4+, invisible, no dialog)
         val activity = CommonActivity.activity ?: return
         if (activity.isFinishing || activity.isDestroyed) return
 
@@ -677,7 +660,7 @@ open class ByseSX : ExtractorApi() {
             return
         }
 
-        // 7) Interactive dialog — last resort
+        // 5) Interactive dialog — last resort for CAPTCHA / real-gesture players
         Log.e(TAG, "→ Silent failed, using interactive dialog")
         val interactiveResult = runInteractiveM3u8Interceptor(
             activity, shellUrl,
@@ -695,110 +678,7 @@ open class ByseSX : ExtractorApi() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  /embed/details — GET, no body
-    // ══════════════════════════════════════════════════════════════════════
-    private suspend fun tryDetailsEndpoint(
-        url: String, apiOrigin: String, hash: String, referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        coord: EmissionCoordinator,
-        emit: (ExtractorLink) -> Unit
-    ) {
-        if (coord.isWon()) return
-        val detailsUrl = "$apiOrigin/api/videos/$hash/embed/details"
-
-        val cookies = runCatching {
-            android.webkit.CookieManager.getInstance().getCookie(apiOrigin)
-        }.getOrNull()
-
-        val headers = buildMap {
-            put("User-Agent",       BYSE_UA)
-            put("Accept",           "application/json, text/plain, */*")
-            put("Referer",          "$apiOrigin/e/$hash")
-            put("Origin",           apiOrigin)
-            put("X-Requested-With", "XMLHttpRequest")
-            put("X-Embed-Origin",   byse_hostOf(apiOrigin) ?: "byse.sx")
-            put("X-Embed-Parent",   url)
-            put("X-Embed-Referer",  referer ?: "https://www.footreplays.com/")
-            if (!cookies.isNullOrBlank()) put("Cookie", cookies)
-        }
-
-        Log.e(TAG, "  DETAILS GET $detailsUrl")
-        val resp = withTimeoutOrNull(8_000L) { app.get(detailsUrl, headers = headers) }
-            ?: run { Log.e(TAG, "  DETAILS timeout"); return }
-
-        val text = resp.text.trimStart()
-        Log.e(TAG, "  DETAILS → code=${resp.code} len=${text.length} body=${text.take(400)}")
-        if (resp.code !in 200..299) return
-        if (!text.startsWith("{") && !text.startsWith("[")) return
-        if (coord.isWon()) return
-
-        // Case A: plain sources in the response
-        if (emitDecrypted(text, apiOrigin, "$apiOrigin/e/$hash", subtitleCallback, emit)) {
-            Log.e(TAG, "  DETAILS: emitted directly")
-            return
-        }
-
-        // Case B: encrypted playback object
-        val root = runCatching { JSONObject(text) }.getOrNull() ?: return
-        val pbObj = root.optJSONObject("playback") ?: root
-        val local = decryptBysePlayback(pbObj)
-        if (local != null) {
-            Log.e(TAG, "  DETAILS decrypt: OK local len=${local.length}")
-            emitDecrypted(local, apiOrigin, "$apiOrigin/e/$hash", subtitleCallback, emit)
-            return
-        }
-        Log.e(TAG, "  DETAILS decrypt: local failed, trying enc-dec.app…")
-        val decrypted = tryExternalByseDecoder(pbObj, "$apiOrigin/e/$hash") ?: return
-        emitDecrypted(decrypted, apiOrigin, "$apiOrigin/e/$hash", subtitleCallback, emit)
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  /embed/playback — POST, multi-body (kept as secondary)
-    // ══════════════════════════════════════════════════════════════════════
-    private suspend fun tryPlaybackEndpointVariants(
-        url: String, apiOrigin: String, hash: String, referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        coord: EmissionCoordinator,
-        emit: (ExtractorLink) -> Unit
-    ) {
-        if (coord.isWon()) return
-        val frameRef = "$apiOrigin/e/$hash"
-        val cookies = runCatching {
-            android.webkit.CookieManager.getInstance().getCookie(apiOrigin)
-        }.getOrNull()
-        val headers = buildMap {
-            put("User-Agent",       BYSE_UA)
-            put("Content-Type",     "application/json")
-            put("Referer",          frameRef)
-            put("Origin",           apiOrigin)
-            put("X-Requested-With", "XMLHttpRequest")
-            put("X-Embed-Origin",   byse_hostOf(apiOrigin) ?: "byse.sx")
-            put("X-Embed-Parent",   url)
-            put("X-Embed-Referer",  referer ?: "https://www.footreplays.com/")
-            if (!cookies.isNullOrBlank()) put("Cookie", cookies)
-        }
-        val endpoint = "$apiOrigin/api/videos/$hash/embed/playback"
-        val variants = listOf("""{"password":""}""", """{"id":"$hash","password":""}""")
-        var successBody: String? = null
-        for (v in variants) {
-            val r = withTimeoutOrNull(6_000L) {
-                app.post(endpoint, headers = headers,
-                    requestBody = v.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
-            } ?: continue
-            Log.e(TAG, "  PLAYBACK body=$v → code=${r.code} body=${r.text.take(160)}")
-            if (r.code in 200..299) { successBody = r.text; break }
-        }
-        val text = successBody?.trimStart() ?: return
-        if (!text.startsWith("{") && !text.startsWith("[")) return
-        if (coord.isWon()) return
-        if (emitDecrypted(text, apiOrigin, frameRef, subtitleCallback, emit)) return
-        val root = runCatching { JSONObject(text) }.getOrNull() ?: return
-        val pbObj = root.optJSONObject("playback") ?: root
-        val local = decryptBysePlayback(pbObj)
-            ?: tryExternalByseDecoder(pbObj, frameRef) ?: return
-        emitDecrypted(local, apiOrigin, frameRef, subtitleCallback, emit)
-    }
-
+    //  Inline payload decrypt (v1–v3 direct-from-HTML; rare on current mirrors)
     // ══════════════════════════════════════════════════════════════════════
     private suspend fun decryptInline(
         html: String, origin: String, refererUrl: String,
@@ -811,15 +691,22 @@ open class ByseSX : ExtractorApi() {
         val keyParts  = Regex(""""key_parts"\s*:\s*\[(.*?)\]""").find(html)?.groupValues?.get(1) ?: return false
         val kp = keyParts.split(",").map { it.replace("\"", "").trim() }.filter { it.isNotBlank() }
         if (kp.isEmpty()) return false
+
         val version = Regex(""""version"\s*:\s*"?([^",}\s]+)"?""").find(html)
             ?.groupValues?.get(1)?.trim() ?: "?"
         Log.e(TAG, "  inline v=$version kp=${kp.size} payloadLen=${payload.length}")
+
         val pbJson = """{"playback":{"algorithm":"$algorithm","iv":"$iv","payload":"$payload","key_parts":[${kp.joinToString(",") { "\"$it\"" }}]}}"""
         val pbObj = runCatching { JSONObject(pbJson).optJSONObject("playback") }.getOrNull() ?: return false
+
         val local = decryptBysePlayback(pbObj)
+        if (local != null) Log.e(TAG, "  inline decrypt: OK local len=${local.length}")
+        else               Log.e(TAG, "  inline decrypt: local failed, enc-dec.app…")
+
         val decrypted = local
             ?: tryExternalByseDecoder(pbObj, refererUrl)
-            ?: return false
+            ?: run { Log.e(TAG, "  inline decrypt: enc-dec.app also failed"); return false }
+
         return emitDecrypted(decrypted, origin, refererUrl, subtitleCallback, emit)
     }
 
@@ -890,6 +777,7 @@ open class ByseSX : ExtractorApi() {
 
     // ══════════════════════════════════════════════════════════════════════
     private fun decryptBysePlayback(playback: JSONObject): String? {
+        // (a) v1–v3: iv / payload / key_parts → SHA-256(concat)
         val ivB64 = playback.optString("iv"); val payloadB64 = playback.optString("payload")
         val keyParts = playback.optJSONArray("key_parts")
         if (ivB64.isNotBlank() && payloadB64.isNotBlank() && keyParts != null) {
@@ -905,6 +793,7 @@ open class ByseSX : ExtractorApi() {
                 }
             }
         }
+        // (b) alternate schema: iv2 / payload2 / decrypt_keys.{edge_1, edge_2}
         val iv2B64 = playback.optString("iv2"); val payload2B64 = playback.optString("payload2")
         val dk = playback.optJSONObject("decrypt_keys")
         if (iv2B64.isNotBlank() && payload2B64.isNotBlank() && dk != null) {
@@ -919,9 +808,10 @@ open class ByseSX : ExtractorApi() {
         return null
     }
 
+    // ══════════════════════════════════════════════════════════════════════
     private suspend fun tryExternalByseDecoder(playback: JSONObject, referer: String): String? = try {
         val reqJson = JSONObject().apply { put("text", playback); put("agent", BYSE_UA) }
-        val resp = withTimeoutOrNull(8_000L) {
+        val resp = withTimeoutOrNull(6_000L) {
             app.post("https://enc-dec.app/api/dec-byse",
                 headers = mapOf("User-Agent" to BYSE_UA, "Content-Type" to "application/json",
                     "Origin" to "https://enc-dec.app", "Referer" to referer),
@@ -937,14 +827,15 @@ open class ByseSX : ExtractorApi() {
     } catch (_: Exception) { null }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  Silent WebView — FULL-SIZE but off-screen (fixes 1×1 coord bug)
+    //  Silent WebView — full-size off-screen (correct JS coordinate math),
+    //  18s timeout, sniffer injected
     // ══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun runSilentM3u8Interceptor(
         activity: android.app.Activity,
         urlToResolve: String,
         headers: Map<String, String>,
-        timeoutMs: Long = 10_000L
+        timeoutMs: Long = 18_000L
     ): InterceptResult? = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             val root = activity.window?.decorView as? android.view.ViewGroup
@@ -963,13 +854,11 @@ open class ByseSX : ExtractorApi() {
             }
 
             val wv = android.webkit.WebView(activity).apply {
-                // Full-size (correct layout coords for JS) but positioned 20000px off-screen
                 layoutParams = android.view.ViewGroup.LayoutParams(
                     activity.resources.displayMetrics.widthPixels,
                     activity.resources.displayMetrics.heightPixels
                 )
                 translationX = 20000f
-                // no alpha=0 — fully opaque, just off-screen
                 settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
@@ -1044,6 +933,8 @@ open class ByseSX : ExtractorApi() {
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  Interactive WebView — visible dialog, last resort
     // ══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun runInteractiveM3u8Interceptor(
@@ -1165,6 +1056,8 @@ open class ByseSX : ExtractorApi() {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  BYSE DATA CLASSES
 // ════════════════════════════════════════════════════════════════════════════
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class ByseSource(
