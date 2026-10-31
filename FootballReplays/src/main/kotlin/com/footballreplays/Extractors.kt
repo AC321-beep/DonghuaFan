@@ -32,6 +32,7 @@ import javax.crypto.spec.SecretKeySpec
 import kotlin.coroutines.resume
 
 const val DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+private const val BYSE_UA = DEFAULT_UA
 
 // ============================================================================
 // BYSE HELPER FUNCTIONS (Prefixed to avoid conflicts)
@@ -283,10 +284,8 @@ open class HQCloud : ExtractorApi() {
         for (domain in domains) {
             val newUrl = "https://$domain$path"
             try {
-                // First try standard HTTP
                 var response = app.get(newUrl, referer = "https://hgcloud.to/").text
                 
-                // If blocked by CF, use our CFSolver
                 if (response.length < 2000 || response.contains("just a moment") || response.contains("cf-browser-verification")) {
                     Log.e("HQCloud", "→ CF Challenge detected on $newUrl. Using CFSolver...")
                     CFSolver(newUrl).solve()
@@ -542,7 +541,6 @@ open class ByseSX : ExtractorApi() {
         val shellUrl = "$origin/e/$hash"
         var shellHtml = ""
 
-        // 1. Try fast HTTP
         try {
             val resp = app.get(shellUrl, headers = byse_chromeHeaders(referer ?: "$origin/"))
             if (resp.code == 200 && !byse_isErrorPage(resp.text)) {
@@ -550,7 +548,6 @@ open class ByseSX : ExtractorApi() {
             }
         } catch (_: Exception) {}
 
-        // 2. CF Solver fallback if blocked
         if (!shellHtml.contains("\"algorithm\"") && !shellHtml.contains("\"payload\"")) {
             Log.e(TAG, "→ Shell blocked by CF or missing payload, using Silent CFSolver...")
             CFSolver(shellUrl).solve()
@@ -561,14 +558,12 @@ open class ByseSX : ExtractorApi() {
             }
         }
 
-        // 3. Decrypt Shell
         if (shellHtml.isNotBlank() && !byse_isErrorPage(shellHtml)) {
             if (decryptInline(shellHtml, origin, shellUrl, subtitleCallback, safeEmit)) {
                 Log.e(TAG, "✓ Byse resolved via Shell + Inline JSON")
                 return
             }
             
-            // 4. Iframe Discovery
             val iframeUrl = Regex("""<iframe[^>]+src\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
                 .find(shellHtml)?.groupValues?.getOrNull(1)?.let { byse_resolveUrl(it, shellUrl, origin) }
                 
@@ -600,14 +595,12 @@ open class ByseSX : ExtractorApi() {
             }
         }
 
-        // 5. REST API Fallback
         tryRestApiPath(url, origin, hash, referer, subtitleCallback, coord, safeEmit)
         if (anyEmitted.get()) {
             Log.e(TAG, "✓ Byse resolved via REST API")
             return
         }
 
-        // 6. WebView Fallback
         val activity = CommonActivity.activity ?: return
         if (activity.isFinishing || activity.isDestroyed) return
 
@@ -706,7 +699,6 @@ open class ByseSX : ExtractorApi() {
                 val keyOut = java.io.ByteArrayOutputStream()
                 for (i in 0 until keyParts.length()) byse_b64UrlDecode(keyParts.optString(i))?.let { keyOut.write(it) }
                 if (keyOut.size() > 0) {
-                    // 🎯 SHA-256 Fix: Hash ALL key parts
                     val rawKeyBytes = keyOut.toByteArray()
                     val finalAesKey = MessageDigest.getInstance("SHA-256").digest(rawKeyBytes)
                     
