@@ -173,14 +173,17 @@ class Rumble : ExtractorApi() {
         private const val SPLIT_TIMEOUT_MS = 2_500L
 
         private val RE_VIDEO_URL = Regex(
-            \"\"\"https?:(?:\\\\/|/)(?:\\\\/|/)[^"'\\s<>‘’“”]+\\.(?:mp4|m3u8)[^"'\\s<>‘’“”]*\"\"\"
+            """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>''""]+\.(?:mp4|m3u8)[^"'\s<>''""]*"""
         )
-        private val RE_QUALITY_H = Regex(\"\"\"(?:\\\\"h\\\\"|"h")\\s*:\\s*(\\d{3,4})\"\"\")
-        private val RE_QUALITY_BRACE = Regex(\"\"\"(?:\\\\"|")(\\d{3,4})(?:\\\\"|")\\s*:\\s*\\{\"\"\")
-        private val RE_JSON_CONFIG = Regex(\"\"\"Rumble\\("play",\\s*\\{(.*?)\\}\\);\"\"\", RegexOption.DOT_MATCHES_ALL)
+        private val RE_QUALITY_H = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""")
+        private val RE_QUALITY_BRACE = Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
+        private val RE_JSON_CONFIG =
+            Regex("""Rumble\("play",\s*\{(.*?)\}\)""", RegexOption.DOT_MATCHES_ALL)
 
-        private val JUNK_KEYWORDS = listOf("/assets/", "loop", "preview", "tracker", "thumb")
-        private val HARD_JUNK = listOf("/assets/", "tracker", "thumb")
+        private val JUNK_KEYWORDS =
+            listOf("/assets/", "loop", "preview", "tracker", "thumb", ".tar?")
+        private val HARD_JUNK =
+            listOf("/assets/", "tracker", "thumb", ".tar?")
     }
 
     override suspend fun getUrl(
@@ -189,7 +192,7 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Fast path
+        // Fast path — direct file
         if (url.endsWith(".mp4", ignoreCase = true) || url.endsWith(".m3u8", ignoreCase = true)) {
             val linkType = if (url.endsWith(".m3u8", ignoreCase = true))
                 ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
@@ -198,41 +201,52 @@ class Rumble : ExtractorApi() {
         }
 
         val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-            try { app.get(url, referer = referer ?: mainUrl).text } catch (e: Exception) { null }
+            try { app.get(url, referer = referer ?: mainUrl).text }
+            catch (e: Exception) { null }
         } ?: return
 
-        // 1. Try to extract directly from the new Rumble player configuration script block
+        // 1. API path — extract videoId from Rumble("play", {...}) config block, hit API
         val configMatch = RE_JSON_CONFIG.find(html)
         if (configMatch != null) {
             val jsonBody = "{" + configMatch.groupValues[1] + "}"
             try {
-                val json = JSONObject(jsonBody)
-                val videoId = json.optJSONObject("video")?.optString("id")
+                val videoId = JSONObject(jsonBody).optJSONObject("video")?.optString("id")
                 if (!videoId.isNullOrBlank()) {
-                    // Try to hit the API if we found a clean video ID
-                    val apiUrl = "https://rumble.com/embedJS/u3/?request=video&v=$videoId"
-                    val apiResponse = app.get(apiUrl).text
-                    if (apiResponse.isNotBlank()) {
-                         extractFromScriptData(apiResponse, url, callback)
-                         return
+                    val apiUrls = listOf(
+                        "https://rumble.com/embedJS/u4/?ifr=0&dref=&request=video&ver=2&v=$videoId",
+                        "https://rumble.com/embedJS/u3/?request=video&v=$videoId"
+                    )
+                    for (apiUrl in apiUrls) {
+                        val apiResponse = runCatching { app.get(apiUrl).text }.getOrNull()
+                            ?: continue
+                        if (extractFromScriptData(apiResponse, url, callback)) return
                     }
+                    // Both API endpoints emitted nothing — fall through to HTML scrape
                 }
-            } catch(e: Exception) {}
+            } catch (e: Exception) {
+                // Malformed JSON — fall through to HTML scrape
+            }
         }
-        
-        // 2. Fallback to the standard HTML scraping if the JSON extraction failed
-        val afterMp4 = html.substringAfter("{\\"mp4", "")
-        val scriptData = if (afterMp4.isEmpty()) html else afterMp4.substringBefore("\\"evt\\":{")
+
+        // 2. Fallback — scrape the inline data block from the HTML
+        val afterMp4 = html.substringAfter("{\"mp4", "")
+        val scriptData = if (afterMp4.isEmpty()) html else afterMp4.substringBefore("\"evt\":{")
         extractFromScriptData(scriptData, url, callback)
     }
-    
-    private suspend fun extractFromScriptData(scriptData: String, url: String, callback: (ExtractorLink) -> Unit) {
+
+    /** Extracts all playable URLs from a Rumble script-data blob.
+     *  Returns true if at least one link was emitted via [callback]. */
+    private suspend fun extractFromScriptData(
+        scriptData: String,
+        url: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
         val scrapedUrls = LinkedHashSet<String>()
         var emitted = false
 
         // ===================== PASS 1 — strict =====================
         RE_VIDEO_URL.findAll(scriptData).forEach { match ->
-            val cleanUrl = match.value.replace("\\\\/", "/")
+            val cleanUrl = match.value.replace("\\/", "/")
 
             if (!cleanUrl.contains("rumble.com", ignoreCase = true)) return@forEach
             if (JUNK_KEYWORDS.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
@@ -246,15 +260,18 @@ class Rumble : ExtractorApi() {
         // ===================== PASS 2 — trailer fallback =====================
         if (!emitted) {
             RE_VIDEO_URL.findAll(scriptData).forEach { match ->
-                val cleanUrl = match.value.replace("\\\\/", "/")
+                val cleanUrl = match.value.replace("\\/", "/")
 
                 if (HARD_JUNK.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
 
                 if (scrapedUrls.add(cleanUrl)) {
+                    emitted = true
                     emitOne(cleanUrl, match, scriptData, url, "$name Trailer", callback)
                 }
             }
         }
+
+        return emitted
     }
 
     private suspend fun emitOne(
@@ -289,8 +306,6 @@ class Rumble : ExtractorApi() {
             val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull()
                 ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
 
-            // Label carries the resolution — leave quality at Unknown so
-            // CloudStream doesn't append "360p" a second time in the picker.
             val displayLabel = if (qMatch != null)
                 "$labelBase ${qMatch.groupValues[1]}p"
             else
