@@ -443,13 +443,17 @@ open class ByseSX : ExtractorApi() {
     ) {
         val origin = byse_originOf(url) ?: return
         val hash = extractHash(url) ?: return
-        val shellUrl = "$origin/e/$hash"
+              val shellUrl = "$origin/e/$hash"
+        var shellHtml = ""
 
-        // Pre-warm CF challenge if the shell is protected
         try {
             val resp = app.get(shellUrl, headers = byse_chromeHeaders(referer ?: "$origin/"))
-            if (!(resp.code == 200 && !byse_isErrorPage(resp.text))) CFSolver(shellUrl).solve()
-        } catch (_: Exception) {
+            if (resp.code == 200 && !byse_isErrorPage(resp.text)) shellHtml = resp.text
+        } catch (_: Exception) {}
+
+        // Run CFSolver whenever shell HTML lacks the
+        // payload — this covers both classic 403 CF and modern 200 JS challenges.
+        if (!shellHtml.contains("\"algorithm\"") && !shellHtml.contains("\"payload\"")) {
             CFSolver(shellUrl).solve()
         }
 
