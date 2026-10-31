@@ -510,9 +510,46 @@ private fun byse_extractMediaUrlsFromJsonArray(arr: JSONArray, depth: Int = 0): 
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+//  BYSE SNIFFER — wraps window.fetch + XMLHttpRequest to log /api/ calls
+// ════════════════════════════════════════════════════════════════════════════
+private val BYSE_SNIFFER_JS = """
+    (function(){
+        if (window.__byseSniffer) return;
+        window.__byseSniffer = true;
+        try {
+            var of = window.fetch;
+            window.fetch = function(){
+                try {
+                    var u = arguments[0];
+                    var b = arguments[1] && arguments[1].body;
+                    if (u && String(u).indexOf('/api/') >= 0) {
+                        console.log('[SNIFF] fetch ' + u + ' BODY=' + (b ? String(b).slice(0,600) : '(no body)'));
+                    }
+                } catch(e) {}
+                return of.apply(this, arguments);
+            };
+        } catch(e) {}
+        try {
+            var ox = XMLHttpRequest.prototype.open;
+            var os = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(m,u){ this.__u=u; this.__m=m; return ox.apply(this, arguments); };
+            XMLHttpRequest.prototype.send = function(b){
+                try {
+                    if (this.__u && String(this.__u).indexOf('/api/') >= 0) {
+                        console.log('[SNIFF] xhr ' + this.__m + ' ' + this.__u + ' BODY=' + (b ? String(b).slice(0,600) : '(no body)'));
+                    }
+                } catch(e) {}
+                return os.apply(this, arguments);
+            };
+        } catch(e) {}
+    })();
+""".trimIndent()
+
+// ════════════════════════════════════════════════════════════════════════════
 //  BYSE EXTRACTOR
-//   Stages: HTTP → CFSolver → Shell/Iframe inline decrypt → REST (both origins)
-//           → Silent WebView (shell) → Silent WebView (iframe) → Interactive
+//   Stages: HTTP → CFSolver → Shell/Iframe inline decrypt → REST (multi-body,
+//           both origins) → Silent WebView (shell) → Silent WebView (iframe)
+//           → Interactive WebView (sniffer + body log)
 // ════════════════════════════════════════════════════════════════════════════
 open class ByseSX : ExtractorApi() {
     override var name = "Byse"
@@ -531,7 +568,7 @@ open class ByseSX : ExtractorApi() {
 
         private fun extractHash(url: String): String? {
             val clean = url.substringBefore("?").substringBefore("#").trimEnd('/')
-            Regex("""/(?:d|embed|e|v|video|download|a2lyf|cx5h|w6u1|jjplw|hzjr|84a)/([a-zA-Z0-9]{8,32})""")
+            Regex("""/(?:d|embed|e|v|video|download|a2lyf|cx5h|w6u1|jjplw|hzjr|84a|oio)/([a-zA-Z0-9]{8,32})""")
                 .find(clean)?.let { return it.groupValues[1] }
             return clean.substringAfterLast('/')
                 .takeIf { it.matches(Regex("^[a-zA-Z0-9]{8,32}$")) }
@@ -599,6 +636,7 @@ open class ByseSX : ExtractorApi() {
                 } catch (_: Exception) { "" }
             }
         }
+        Log.e(TAG, "  after CFSolver(shell) cookies: ${runCatching { android.webkit.CookieManager.getInstance().getCookie(origin) }.getOrNull()?.take(160) ?: "(none)"}")
         Log.e(TAG, "  shell: len=${shellHtml.length} hasAlgo=${shellHtml.contains("\"algorithm\"")} hasPayload=${shellHtml.contains("\"payload\"")} hasIv=${shellHtml.contains("\"iv\"")}")
 
         // 3) Decrypt shell
@@ -635,6 +673,7 @@ open class ByseSX : ExtractorApi() {
                         } catch (_: Exception) { "" }
                     }
                 }
+                Log.e(TAG, "  after CFSolver(iframe) cookies: ${runCatching { android.webkit.CookieManager.getInstance().getCookie(iframeOrigin) }.getOrNull()?.take(160) ?: "(none)"}")
                 Log.e(TAG, "  iframe: len=${playerHtml.length} hasAlgo=${playerHtml.contains("\"algorithm\"")} hasPayload=${playerHtml.contains("\"payload\"")} hasIv=${playerHtml.contains("\"iv\"")}")
 
                 if (playerHtml.isNotBlank() && !byse_isErrorPage(playerHtml)) {
@@ -653,7 +692,7 @@ open class ByseSX : ExtractorApi() {
             return
         }
 
-                // 5b) REST API — iframe origin
+        // 5b) REST API — iframe origin
         val iframeOrigin = discoveredIframeOrigin
         if (iframeOrigin != null && iframeOrigin != origin) {
             Log.e(TAG, "→ REST API retry on iframe origin $iframeOrigin")
@@ -702,7 +741,7 @@ open class ByseSX : ExtractorApi() {
             }
         }
 
-        // 7) Interactive dialog — true last resort
+        // 7) Interactive dialog — true last resort (with sniffer)
         Log.e(TAG, "→ Silent failed on both, using interactive dialog")
         val interactiveResult = runInteractiveM3u8Interceptor(
             activity, shellUrl,
@@ -720,7 +759,7 @@ open class ByseSX : ExtractorApi() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  INLINE DECRYPTION (with per-regex diagnostics)
+    //  INLINE DECRYPTION
     // ══════════════════════════════════════════════════════════════════════
     private suspend fun decryptInline(
         html: String, origin: String, refererUrl: String,
@@ -757,7 +796,7 @@ open class ByseSX : ExtractorApi() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  REST API — with cookie passthrough + body logging
+    //  REST API — multi-body variant + cookie passthrough + body logging
     // ══════════════════════════════════════════════════════════════════════
     private suspend fun tryRestApiPath(
         url: String, apiOrigin: String, hash: String, referer: String?,
@@ -766,14 +805,12 @@ open class ByseSX : ExtractorApi() {
         emit: (ExtractorLink) -> Unit
     ) {
         if (coord.isWon()) return
-        val postBody = """{"password":""}""".toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
         val frameRef = "$apiOrigin/e/$hash"
 
-        // Pass through cookies CFSolver harvested — okhttp has its own jar and would otherwise miss cf_clearance
         val cfCookies = runCatching {
             android.webkit.CookieManager.getInstance().getCookie(apiOrigin)
         }.getOrNull()
-        Log.e(TAG, "  REST cookies(${byse_hostOf(apiOrigin)}): ${cfCookies?.take(140) ?: "(none)"}")
+        Log.e(TAG, "  REST cookies(${byse_hostOf(apiOrigin)}): ${cfCookies?.take(160) ?: "(none)"}")
 
         val pbHeaders = buildMap {
             put("User-Agent",       BYSE_UA)
@@ -788,16 +825,36 @@ open class ByseSX : ExtractorApi() {
         }
 
         val endpoint = "$apiOrigin/api/videos/$hash/embed/playback"
-        Log.e(TAG, "  REST POST $endpoint")
-        val resp = withTimeoutOrNull(10_000L) {
-            app.post(endpoint, headers = pbHeaders, requestBody = postBody)
-        } ?: run { Log.e(TAG, "  REST timeout"); return }
 
-        val bodyText = resp.text
-        Log.e(TAG, "  REST → code=${resp.code} len=${bodyText.length} body=${bodyText.take(300)}")
+        val bodyVariants = listOf(
+            """{"password":""}""",
+            """{}""",
+            """{"id":"$hash","password":""}""",
+            """{"hash":"$hash","password":""}""",
+            """{"password":"","id":"$hash"}""",
+            """{"v":"$hash"}""",
+            """{"password":"","referer":"${referer ?: ""}"}""",
+            """{"id":"$hash"}""",
+        )
 
-        val text = bodyText.trimStart()
-        if (resp.code !in 200..299) return
+        var successBody: String? = null
+        for (variant in bodyVariants) {
+            val r = withTimeoutOrNull(8_000L) {
+                app.post(
+                    endpoint,
+                    headers = pbHeaders,
+                    requestBody = variant.toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
+                )
+            } ?: continue
+            Log.e(TAG, "  REST body=$variant → code=${r.code} body=${r.text.take(200)}")
+            if (r.code in 200..299) { successBody = r.text; break }
+        }
+        if (successBody == null) {
+            Log.e(TAG, "  REST: all ${bodyVariants.size} body variants failed")
+            return
+        }
+
+        val text = successBody.trimStart()
         if (!text.startsWith("{") && !text.startsWith("[")) return
         if (coord.isWon()) return
         if (emitDecrypted(text, apiOrigin, frameRef, subtitleCallback, emit)) return
@@ -899,7 +956,7 @@ open class ByseSX : ExtractorApi() {
     //  LOCAL AES
     // ══════════════════════════════════════════════════════════════════════
     private fun decryptBysePlayback(playback: JSONObject): String? {
-        // (a) v1–v3: iv / payload / key_parts → SHA-256(concat)
+        // (a) v1–v3
         val ivB64 = playback.optString("iv")
         val payloadB64 = playback.optString("payload")
         val keyParts = playback.optJSONArray("key_parts")
@@ -922,7 +979,7 @@ open class ByseSX : ExtractorApi() {
             }
         }
 
-        // (b) alternate schema: iv2 / payload2 / decrypt_keys.{edge_1, edge_2}
+        // (b) alternate schema
         val iv2B64      = playback.optString("iv2")
         val payload2B64 = playback.optString("payload2")
         val dk          = playback.optJSONObject("decrypt_keys")
@@ -981,7 +1038,7 @@ open class ByseSX : ExtractorApi() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  SILENT WebView — accepts any URL, configurable timeout
+    //  SILENT WebView — accepts any URL, timeout configurable, has sniffer
     // ══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun runSilentM3u8Interceptor(
@@ -1007,7 +1064,6 @@ open class ByseSX : ExtractorApi() {
             }
 
             val wv = android.webkit.WebView(activity).apply {
-                // 1×1 px, off-screen, fully transparent, non-focusable
                 layoutParams = android.view.ViewGroup.LayoutParams(1, 1)
                 translationX = -20000f
                 translationY = -20000f
@@ -1025,7 +1081,17 @@ open class ByseSX : ExtractorApi() {
                     setSupportMultipleWindows(false)
                     javaScriptCanOpenWindowsAutomatically = false
                 }
+                webChromeClient = object : android.webkit.WebChromeClient() {
+                    override fun onConsoleMessage(msg: android.webkit.ConsoleMessage?): Boolean {
+                        msg?.message()?.let { m -> if (m.contains("[SNIFF]")) Log.e(TAG, "  [silent] $m") }
+                        return true
+                    }
+                }
                 webViewClient = object : android.webkit.WebViewClient() {
+                    override fun onPageStarted(view: android.webkit.WebView?, u: String?, fav: android.graphics.Bitmap?) {
+                        super.onPageStarted(view, u, fav)
+                        view?.evaluateJavascript(BYSE_SNIFFER_JS, null)
+                    }
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(v: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
                     override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean {
@@ -1088,7 +1154,7 @@ open class ByseSX : ExtractorApi() {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  INTERACTIVE WebView — last resort, visible dialog
+    //  INTERACTIVE WebView — visible dialog + sniffer
     // ══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun runInteractiveM3u8Interceptor(
@@ -1160,8 +1226,16 @@ open class ByseSX : ExtractorApi() {
                         progressBar.progress = p
                         progressBar.visibility = if (p == 100) android.view.View.GONE else android.view.View.VISIBLE
                     }
+                    override fun onConsoleMessage(msg: android.webkit.ConsoleMessage?): Boolean {
+                        msg?.message()?.let { m -> if (m.contains("[SNIFF]")) Log.e(TAG, "  [interactive] $m") }
+                        return true
+                    }
                 }
                 webViewClient = object : android.webkit.WebViewClient() {
+                    override fun onPageStarted(view: android.webkit.WebView?, u: String?, fav: android.graphics.Bitmap?) {
+                        super.onPageStarted(view, u, fav)
+                        view?.evaluateJavascript(BYSE_SNIFFER_JS, null)
+                    }
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(v: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
                     override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean {
