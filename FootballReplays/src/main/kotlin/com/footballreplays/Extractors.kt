@@ -510,7 +510,8 @@ private fun byse_extractMediaUrlsFromJsonArray(arr: JSONArray, depth: Int = 0): 
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  BYSE EXTRACTOR — HTTP + Dual CFSolver + SHA-256 / v4 / enc-dec.app + WebView
+//  BYSE EXTRACTOR — HTTP + Dual CFSolver + SHA-256 / v4 / enc-dec.app
+//                  + Multi-Origin REST + WebView
 // ════════════════════════════════════════════════════════════════════════════
 open class ByseSX : ExtractorApi() {
     override var name = "Byse"
@@ -529,7 +530,7 @@ open class ByseSX : ExtractorApi() {
 
         private fun extractHash(url: String): String? {
             val clean = url.substringBefore("?").substringBefore("#").trimEnd('/')
-            Regex("""/(?:d|embed|e|v|video|download|a2lyf|cx5h|w6u1|jjplw)/([a-zA-Z0-9]{8,32})""")
+            Regex("""/(?:d|embed|e|v|video|download|a2lyf|cx5h|w6u1|jjplw|hzjr)/([a-zA-Z0-9]{8,32})""")
                 .find(clean)?.let { return it.groupValues[1] }
             return clean.substringAfterLast('/')
                 .takeIf { it.matches(Regex("^[a-zA-Z0-9]{8,32}$")) }
@@ -574,6 +575,7 @@ open class ByseSX : ExtractorApi() {
 
         val shellUrl = "$origin/e/$hash"
         var shellHtml = ""
+        var discoveredIframeOrigin: String? = null      // ← FIX A state
 
         // 1) Fast HTTP
         try {
@@ -593,6 +595,9 @@ open class ByseSX : ExtractorApi() {
             }
         }
 
+        // FIX B: shell diagnostics
+        Log.e(TAG, "  shell: len=${shellHtml.length} hasAlgo=${shellHtml.contains("\"algorithm\"")} hasPayload=${shellHtml.contains("\"payload\"")} hasIv=${shellHtml.contains("\"iv\"")}")
+
         // 3) Decrypt shell
         if (shellHtml.isNotBlank() && !byse_isErrorPage(shellHtml)) {
             if (decryptInline(shellHtml, origin, shellUrl, subtitleCallback, safeEmit)) {
@@ -608,6 +613,7 @@ open class ByseSX : ExtractorApi() {
             if (iframeUrl != null) {
                 Log.e(TAG, "→ iframe discovered: $iframeUrl")
                 val iframeOrigin = byse_originOf(iframeUrl) ?: origin
+                discoveredIframeOrigin = iframeOrigin                 // ← FIX A state
                 var playerHtml = ""
 
                 try {
@@ -626,6 +632,9 @@ open class ByseSX : ExtractorApi() {
                     }
                 }
 
+                // FIX B: iframe diagnostics
+                Log.e(TAG, "  iframe: len=${playerHtml.length} hasAlgo=${playerHtml.contains("\"algorithm\"")} hasPayload=${playerHtml.contains("\"payload\"")} hasIv=${playerHtml.contains("\"iv\"")}")
+
                 if (playerHtml.isNotBlank() && !byse_isErrorPage(playerHtml)) {
                     if (decryptInline(playerHtml, iframeOrigin, iframeUrl, subtitleCallback, safeEmit)) {
                         Log.e(TAG, "✓ Byse resolved via Iframe + Inline JSON")
@@ -635,11 +644,22 @@ open class ByseSX : ExtractorApi() {
             }
         }
 
-        // 5) REST API fallback
+        // 5) REST API — SHELL origin first
         tryRestApiPath(url, origin, hash, referer, subtitleCallback, coord, safeEmit)
         if (anyEmitted.get()) {
-            Log.e(TAG, "✓ Byse resolved via REST API")
+            Log.e(TAG, "✓ Byse resolved via REST API (shell origin $origin)")
             return
+        }
+
+        // 5b) FIX A — ALSO try IFRAME origin (this is what the player API actually lives on)
+        val iframeOrigin = discoveredIframeOrigin
+        if (iframeOrigin != null && iframeOrigin != origin) {
+            Log.e(TAG, "→ REST API retry on iframe origin $iframeOrigin")
+            tryRestApiPath(url, iframeOrigin, hash, referer, subtitleCallback, coord, safeEmit)
+            if (anyEmitted.get()) {
+                Log.e(TAG, "✓ Byse resolved via REST API (iframe origin $iframeOrigin)")
+                return
+            }
         }
 
         // 6) WebView interceptor — last resort
@@ -656,6 +676,8 @@ open class ByseSX : ExtractorApi() {
                 this.headers = result.headers
             })
             Log.e(TAG, "✓ Byse via custom WebView interceptor")
+        } else {
+            Log.e(TAG, "✗ Byse exhausted")
         }
     }
 
@@ -665,14 +687,19 @@ open class ByseSX : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         emit: (ExtractorLink) -> Unit
     ): Boolean {
-        val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return false
-        val iv        = Regex(""""iv"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return false
-        val payload   = Regex(""""payload"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return false
-        val keyParts  = Regex(""""key_parts"\s*:\s*\[(.*?)\]""").find(html)?.groupValues?.get(1) ?: return false
+        // FIX B: log which regex is the failing one
+        val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+        if (algorithm == null) { Log.e(TAG, "  ✗ algorithm miss (htmlLen=${html.length})"); return false }
+        val iv = Regex(""""iv"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+        if (iv == null) { Log.e(TAG, "  ✗ iv miss"); return false }
+        val payload = Regex(""""payload"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+        if (payload == null) { Log.e(TAG, "  ✗ payload miss"); return false }
+        val keyParts = Regex(""""key_parts"\s*:\s*\[(.*?)\]""").find(html)?.groupValues?.get(1)
+        if (keyParts == null) { Log.e(TAG, "  ✗ key_parts miss"); return false }
         val kp = keyParts.split(",").map { it.replace("\"", "").trim() }.filter { it.isNotBlank() }
-        if (kp.isEmpty()) return false
+        if (kp.isEmpty()) { Log.e(TAG, "  ✗ kp empty"); return false }
 
-        val version   = Regex(""""version"\s*:\s*"?([^",}\s]+)"?""").find(html)
+        val version = Regex(""""version"\s*:\s*"?([^",}\s]+)"?""").find(html)
             ?.groupValues?.get(1)?.trim() ?: "?"
         Log.e(TAG, "  inline payload v=$version algo=$algorithm kp=${kp.size} payloadLen=${payload.length}")
 
@@ -692,39 +719,45 @@ open class ByseSX : ExtractorApi() {
 
     // ───────────────────────── REST API fallback ─────────────────────────
     private suspend fun tryRestApiPath(
-        url: String, origin: String, hash: String, referer: String?,
+        url: String, apiOrigin: String, hash: String, referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         coord: EmissionCoordinator,
         emit: (ExtractorLink) -> Unit
     ) {
         if (coord.isWon()) return
         val postBody = """{"password":""}""".toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
-        val frameRef = "$origin/e/$hash"
+        val frameRef = "$apiOrigin/e/$hash"
         val pbHeaders = mapOf(
             "User-Agent"       to BYSE_UA,
             "Content-Type"     to "application/json",
             "Referer"          to frameRef,
-            "Origin"           to origin,
+            "Origin"           to apiOrigin,
             "X-Requested-With" to "XMLHttpRequest",
-            "X-Embed-Origin"   to (byse_hostOf(origin) ?: "byse.sx"),
+            "X-Embed-Origin"   to (byse_hostOf(apiOrigin) ?: "byse.sx"),
             "X-Embed-Parent"   to url,
             "X-Embed-Referer"  to (referer ?: "https://www.footreplays.com/"),
         )
+        val endpoint = "$apiOrigin/api/videos/$hash/embed/playback"
+        Log.e(TAG, "  REST POST $endpoint")
         val resp = withTimeoutOrNull(10_000L) {
-            app.post("$origin/api/videos/$hash/embed/playback", headers = pbHeaders, requestBody = postBody)
-        } ?: return
+            app.post(endpoint, headers = pbHeaders, requestBody = postBody)
+        } ?: run { Log.e(TAG, "  REST timeout"); return }
+        Log.e(TAG, "  REST → code=${resp.code} len=${resp.text.length}")
         val text = resp.text.trimStart()
         if (resp.code !in 200..299) return
         if (!text.startsWith("{") && !text.startsWith("[")) return
         if (coord.isWon()) return
-        if (emitDecrypted(text, origin, frameRef, subtitleCallback, emit)) return
+        if (emitDecrypted(text, apiOrigin, frameRef, subtitleCallback, emit)) return
 
         val root = runCatching { JSONObject(text) }.getOrNull() ?: return
         val pbObj = root.optJSONObject("playback") ?: root
-        val decrypted = decryptBysePlayback(pbObj)
+        val local = decryptBysePlayback(pbObj)
+        if (local != null) Log.e(TAG, "  REST decrypt: OK local len=${local.length}")
+        else               Log.e(TAG, "  REST decrypt: local FAILED, trying enc-dec.app…")
+        val decrypted = local
             ?: tryExternalByseDecoder(pbObj, frameRef)
-            ?: return
-        emitDecrypted(decrypted, origin, frameRef, subtitleCallback, emit)
+            ?: run { Log.e(TAG, "  REST decrypt: enc-dec.app also failed"); return }
+        emitDecrypted(decrypted, apiOrigin, frameRef, subtitleCallback, emit)
     }
 
     // ───────────────────────── Emission ─────────────────────────
@@ -803,6 +836,7 @@ open class ByseSX : ExtractorApi() {
                 emitted = true
             }
         }
+        Log.e(TAG, "  emitDecrypted → $emitted")
         return emitted
     }
 
@@ -869,17 +903,23 @@ open class ByseSX : ExtractorApi() {
                 requestBody = reqJson.toString()
                     .toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
             )
-        } ?: return null
+        } ?: run { Log.e(TAG, "  enc-dec.app timeout"); return null }
         val text = resp.text.trimStart()
-        if (resp.code != 200 || text.isBlank()) return null
-        Log.e(TAG, "  enc-dec.app /dec-byse → ${resp.code} len=${text.length}")
+        if (resp.code != 200 || text.isBlank()) {
+            Log.e(TAG, "  enc-dec.app → code=${resp.code} len=${text.length}")
+            return null
+        }
+        Log.e(TAG, "  enc-dec.app → ${resp.code} len=${text.length}")
         val root = JSONObject(text)
         root.optJSONObject("result")?.toString()
             ?: root.optJSONArray("result")?.toString()
             ?: root.optString("result").takeIf {
                 it.trimStart().let { t -> t.startsWith("{") || t.startsWith("[") }
             }
-    } catch (_: Exception) { null }
+    } catch (e: Exception) {
+        Log.e(TAG, "  enc-dec.app threw: ${e.message}")
+        null
+    }
 
     // ───────────────────────── WebView: silent interceptor ─────────────────────────
     @SuppressLint("SetJavaScriptEnabled")
