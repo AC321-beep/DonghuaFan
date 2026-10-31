@@ -32,40 +32,37 @@ class AnimexinProvider : MainAPI() {
         "anime/?status=completed&type=&order=update" to "Completed"
     )
 
-    private suspend fun resolveCloudflare(url: String): Boolean = suspendCancellableCoroutine { cont ->
-        var resumed = false
-        CommonActivity.activity?.runOnUiThread {
-            val dialog = CFDialog(url) { success ->
-                if (!resumed) {
-                    resumed = true
-                    cont.resume(success)
-                }
+   private suspend fun getSafeDocument(url: String): Document {
+        // runCatching safely handles OkHttp throwing exceptions on 403/503 errors
+        val responseResult = runCatching { app.get(url, interceptor = cfInterceptor) }
+
+        val needsSolve = responseResult.fold(
+            onSuccess = { resp ->
+                val doc = resp.document
+                val title = doc.title().lowercase()
+                
+                // Only trigger if HTTP code is a block OR strong Cloudflare DOM markers are present
+                resp.code in listOf(403, 503) ||
+                listOf("just a moment", "security verification", "attention required", "cloudflare", "verify you are human").any { title.contains(it) } ||
+                doc.selectFirst("div.cf-turnstile, #cf-wrapper") != null
+            },
+            onFailure = { e ->
+                // Trigger solve if the request crashed specifically due to a 403/503 block
+                e.message?.contains("403") == true || e.message?.contains("503") == true
             }
-            dialog.show()
-        } ?: run {
-            if (!resumed) {
-                resumed = true
-                cont.resume(false)
-            }
-        }
-    }
+        )
 
-    private suspend fun getSafeDocument(url: String): Document {
-        var response = app.get(url, interceptor = cfInterceptor)
-        var doc = response.document
-
-        val isChallenge = listOf("just a moment", "security verification", "attention required", "cloudflare")
-            .any { doc.title().lowercase().contains(it) } || doc.select("div.cf-turnstile").isNotEmpty()
-
-        if (isChallenge || response.code in listOf(403, 503)) {
-            if (resolveCloudflare(url)) {
-                response = app.get(url, interceptor = cfInterceptor)
-                doc = response.document
+        if (needsSolve) {
+            // Trigger the new CFSolver (attempts silent 1x1 first, falls back to dialog)
+            if (CFSolver(url).solve()) {
+                return app.get(url, interceptor = cfInterceptor).document
             } else {
                 throw Error("Cloudflare bypass was cancelled or failed.")
             }
         }
-        return doc
+        
+        // If no solve was needed, return the successfully fetched document
+        return responseResult.getOrThrow().document
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
