@@ -1,271 +1,12 @@
-package com.footballreplays
+package com.footreplays
 
-import android.annotation.SuppressLint
+import android.util.Log
 import org.jsoup.nodes.Element
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
 import java.net.URI
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.coroutines.resume
+import java.net.URLEncoder
 
-// ==========================================
-// Cloudflare Bypass Utilities
-// ==========================================
-object CFState {
-    var userAgent: String = ""
-}
-
-class CFInterceptor : okhttp3.Interceptor {
-    override fun intercept(chain: okhttp3.Interceptor.Chain): okhttp3.Response {
-        val original = chain.request()
-        val builder = original.newBuilder()
-
-        val defaultUa = try {
-            android.webkit.WebSettings.getDefaultUserAgent(CommonActivity.activity)
-        } catch (e: Exception) {
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
-        }
-        val ua = CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa
-        builder.header("User-Agent", ua)
-        builder.removeHeader("X-Requested-With")
-
-        val cookies = android.webkit.CookieManager.getInstance().getCookie(original.url.toString())
-        if (!cookies.isNullOrEmpty()) {
-            builder.header("Cookie", cookies)
-        }
-
-        if (original.header("Accept") == null) builder.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-        if (original.header("Accept-Language") == null) builder.header("Accept-Language", "en-US,en;q=0.5")
-        if (original.header("Connection") == null) builder.header("Connection", "keep-alive")
-        if (original.header("Upgrade-Insecure-Requests") == null) builder.header("Upgrade-Insecure-Requests", "1")
-        if (original.header("Sec-Fetch-Dest") == null) builder.header("Sec-Fetch-Dest", "document")
-        if (original.header("Sec-Fetch-Mode") == null) builder.header("Sec-Fetch-Mode", "navigate")
-        if (original.header("Sec-Fetch-Site") == null) builder.header("Sec-Fetch-Site", "none")
-
-        return chain.proceed(builder.build())
-    }
-}
-
-object CloudflareResolver {
-    fun isCloudflareChallenge(html: String): Boolean {
-        val lower = html.lowercase()
-        return lower.contains("just a moment") || 
-               lower.contains("cf-browser-verification") || 
-               lower.contains("turnstile") ||
-               lower.contains("ray id")
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    suspend fun attemptSilentResolution(activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>): Boolean = withContext(Dispatchers.Main) {
-        suspendCancellableCoroutine { cont ->
-            val root = activity.window?.decorView as? android.view.ViewGroup
-
-            val done = AtomicBoolean(false)
-            val handler = android.os.Handler(android.os.Looper.getMainLooper())
-            var checkRunnable: Runnable? = null
-            var timeoutRunnable: Runnable? = null
-            var webView: android.webkit.WebView? = null
-
-            fun cleanup(success: Boolean) {
-                if (!done.compareAndSet(false, true)) return
-                checkRunnable?.let { handler.removeCallbacks(it) }
-                timeoutRunnable?.let { handler.removeCallbacks(it) }
-                runCatching {
-                    webView?.let { wv ->
-                        root?.removeView(wv)
-                        wv.stopLoading()
-                        wv.destroy()
-                    }
-                }
-                if (success) android.webkit.CookieManager.getInstance().flush()
-                if (cont.isActive) cont.resume(success)
-            }
-
-            val wv = android.webkit.WebView(activity).apply {
-                layoutParams = android.view.ViewGroup.LayoutParams(
-                    activity.resources.displayMetrics.widthPixels,
-                    activity.resources.displayMetrics.heightPixels
-                )
-                translationX = 20000f // Off-screen
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    useWideViewPort = true
-                    loadWithOverviewMode = true
-                    cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
-                    mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    userAgentString = CFState.userAgent.ifBlank { userAgentString }
-                }
-                android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-
-                webViewClient = object : android.webkit.WebViewClient() {
-                    @SuppressLint("WebViewClientOnReceivedSslError")
-                    override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
-                }
-            }
-            webView = wv
-
-            cont.invokeOnCancellation { cleanup(false) }
-
-            checkRunnable = object : Runnable {
-                override fun run() {
-                    if (done.get()) return
-                    val cookies = android.webkit.CookieManager.getInstance().getCookie(urlToResolve) ?: ""
-                    val title = webView?.title?.lowercase() ?: ""
-                    val isChallenge = title.contains("just a moment") || title.contains("attention required") || title.contains("security verification")
-
-                    if (!isChallenge && cookies.contains("cf_clearance")) {
-                        cleanup(true)
-                        return
-                    }
-                    handler.postDelayed(this, 500L)
-                }
-            }
-
-            timeoutRunnable = Runnable { 
-                cleanup(false) 
-            }
-
-            root?.addView(wv)
-            wv.loadUrl(urlToResolve, headers)
-            handler.postDelayed(checkRunnable!!, 800L)
-            handler.postDelayed(timeoutRunnable!!, 5000L) // 5 Second Timeout
-        }
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    suspend fun attemptInteractiveResolution(activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>): Boolean = withContext(Dispatchers.Main) {
-        suspendCancellableCoroutine { cont ->
-            val dialog = android.app.Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
-                setCancelable(false)
-                setCanceledOnTouchOutside(false)
-            }
-            val done = AtomicBoolean(false)
-            val handler = android.os.Handler(android.os.Looper.getMainLooper())
-
-            val layout = android.widget.LinearLayout(activity).apply {
-                orientation = android.widget.LinearLayout.VERTICAL
-                setBackgroundColor(android.graphics.Color.parseColor("#1A1A1A"))
-            }
-
-            val headerLayout = android.widget.LinearLayout(activity).apply {
-                orientation = android.widget.LinearLayout.HORIZONTAL
-                setPadding(32, 28, 32, 28)
-            }
-            val header = android.widget.TextView(activity).apply {
-                text = "Bypassing Security... Please Wait"
-                setTextColor(android.graphics.Color.WHITE)
-                textSize = 15f
-                layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            }
-            
-            var webView: android.webkit.WebView? = null
-
-            fun finish(success: Boolean) {
-                if (!done.compareAndSet(false, true)) return
-                android.webkit.CookieManager.getInstance().flush()
-                runCatching { 
-                    // CRITICAL REQUIREMENT: Destroy the WebView to free memory and kill ghost audio
-                    webView?.let { wv ->
-                        layout.removeView(wv)
-                        wv.stopLoading()
-                        wv.destroy()
-                    }
-                    dialog.dismiss() 
-                }
-                if (cont.isActive) cont.resume(success)
-            }
-
-            val closeBtn = android.widget.TextView(activity).apply {
-                text = "✖"
-                setTextColor(android.graphics.Color.WHITE)
-                textSize = 18f
-                setPadding(20, 0, 0, 0)
-                setOnClickListener { finish(false) }
-            }
-
-            headerLayout.addView(header)
-            headerLayout.addView(closeBtn)
-            layout.addView(headerLayout)
-
-            val progressBar = android.widget.ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
-                layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, 8)
-            }
-            layout.addView(progressBar)
-
-            val wv = android.webkit.WebView(activity).apply {
-                layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT)
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    useWideViewPort = true
-                    loadWithOverviewMode = true
-                    cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
-                    mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                    userAgentString = CFState.userAgent.ifBlank { userAgentString }
-                }
-                android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-
-                fun checkStatus(view: android.webkit.WebView?) {
-                    if (done.get()) return
-                    val title = view?.title?.lowercase() ?: ""
-                    val cookies = android.webkit.CookieManager.getInstance().getCookie(urlToResolve) ?: ""
-                    val isChallenge = title.contains("just a moment") || title.contains("attention required") || title.contains("security verification")
-
-                    val isSuccess = (!isChallenge && cookies.contains("cf_clearance")) || 
-                                    (!isChallenge && (title.contains("football replays") || title.contains("football")))
-
-                    if (isSuccess) {
-                        header.text = "Success! Loading..."
-                        header.setTextColor(android.graphics.Color.GREEN)
-                        handler.postDelayed({ finish(true) }, 800)
-                    }
-                }
-
-                webChromeClient = object : android.webkit.WebChromeClient() {
-                    override fun onProgressChanged(view: android.webkit.WebView?, newProgress: Int) {
-                        progressBar.progress = newProgress
-                        progressBar.visibility = if (newProgress == 100) android.view.View.GONE else android.view.View.VISIBLE
-                        if (newProgress == 100) checkStatus(view)
-                    }
-                }
-
-                webViewClient = object : android.webkit.WebViewClient() {
-                    @SuppressLint("WebViewClientOnReceivedSslError")
-                    override fun onReceivedSslError(view: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, error: android.net.http.SslError?) { h?.proceed() }
-                    override fun onPageFinished(view: android.webkit.WebView?, url: String?) { checkStatus(view) }
-                }
-            }
-            webView = wv
-
-            layout.addView(wv)
-            dialog.setContentView(layout)
-            dialog.setOnDismissListener { if (!done.get()) finish(false) }
-
-            dialog.show()
-            wv.loadUrl(urlToResolve, headers)
-
-            handler.postDelayed({ if (!done.get()) finish(false) }, 30_000L)
-        }
-    }
-    
-    suspend fun resolve(url: String, headers: Map<String, String> = emptyMap()): Boolean {
-        val activity = CommonActivity.activity ?: return false
-        if (activity.isFinishing || activity.isDestroyed) return false
-        
-        if (attemptSilentResolution(activity, url, headers)) return true
-        return attemptInteractiveResolution(activity, url, headers)
-    }
-}
-
-// ==========================================
-// Main Provider Class
-// ==========================================
 class FootballReplays : MainAPI() {
     override var mainUrl = "https://www.footreplays.com"
     override var name = "FootballReplays"
@@ -275,7 +16,7 @@ class FootballReplays : MainAPI() {
     override val supportedTypes = setOf(TvType.Others)
 
     override val mainPage = mainPageOf(
-        "${mainUrl}/international/" to "FIFA/International",
+        "${mainUrl}/international/" to "International",
         "${mainUrl}/uefa/" to "UEFA",
         "${mainUrl}/england/" to "England",
         "${mainUrl}/spain/" to "Spain",
@@ -287,10 +28,9 @@ class FootballReplays : MainAPI() {
     )
 
     private fun getPosterHeaders(): Map<String, String> {
-        val defaultUa = try { android.webkit.WebSettings.getDefaultUserAgent(CommonActivity.activity) } catch(e: Exception) { "Mozilla/5.0" }
         val headers = mutableMapOf(
             "Referer" to "$mainUrl/",
-            "User-Agent" to (CFState.userAgent.takeIf { it.isNotBlank() } ?: defaultUa)
+            "User-Agent" to DEFAULT_UA
         )
         val cookies = android.webkit.CookieManager.getInstance().getCookie(mainUrl)
         if (!cookies.isNullOrEmpty()) {
@@ -299,27 +39,27 @@ class FootballReplays : MainAPI() {
         return headers
     }
 
+    // 🎯 NEW: Uses CFSolver for the main site!
     private suspend fun fetchHtml(url: String): String {
-        return try {
-            val response = app.get(url, interceptor = CFInterceptor()).text
-            if (CloudflareResolver.isCloudflareChallenge(response)) {
-                CloudflareResolver.resolve(mainUrl, getPosterHeaders())
-                app.get(url, interceptor = CFInterceptor()).text
-            } else {
-                response
+        // 1. Check if CFSolver already has the cached HTML
+        CFState.getSolvedHtml(url)?.let { return it }
+
+        // 2. Try standard HTTP
+        try {
+            val response = app.get(url, headers = getPosterHeaders()).text
+            if (!response.contains("cf-browser-verification") && !response.contains("just a moment")) {
+                return response
             }
-        } catch (e: Exception) {
-            if (e.message?.contains("403") == true || e.message?.contains("503") == true) {
-                CloudflareResolver.resolve(mainUrl, getPosterHeaders())
-                try {
-                    app.get(url, interceptor = CFInterceptor()).text
-                } catch (e2: Exception) {
-                    ""
-                }
-            } else {
-                ""
-            }
-        }
+        } catch (_: Exception) {}
+
+        // 3. Fallback to CFSolver
+        Log.e("FootballReplays", "→ CF Challenge detected on $url. Using CFSolver...")
+        CFSolver(url).solve()
+        
+        // 4. Return solved HTML or retry HTTP
+        return CFState.getSolvedHtml(url) ?: try {
+            app.get(url, headers = getPosterHeaders()).text
+        } catch (_: Exception) { "" }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -381,10 +121,10 @@ class FootballReplays : MainAPI() {
         val displayDate = kickOffMatch ?: fallbackDate
 
         val episodes = mutableListOf<Episode>()
-        document.select("table.video-table").forEachIndexed { tIdx, table ->
+        document.select("table.video-table").forEachIndexed { _, table ->
             val sourceName = table.selectFirst("thead tr th[colspan]")?.text()?.trim() ?: "Source"
             
-            table.select("tbody tr").forEachIndexed { rIdx, tr ->
+            table.select("tbody tr").forEachIndexed { _, tr ->
                 val part = tr.select("td").firstOrNull()?.text()?.trim() ?: "Video"
                 val onclickAttr = tr.selectFirst("a.play-button")?.attr("onclick") ?: return@forEachIndexed
                 
@@ -458,64 +198,60 @@ class FootballReplays : MainAPI() {
         val iframeUrl = if (videoUrl.startsWith("//")) "https:$videoUrl" else videoUrl
 
         var emitted = 0
-        val extractedLinks = mutableListOf<ExtractorLink>()
 
-        loadExtractor(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
-            extractedLinks.add(link)
-        }
+        // 🎯 Check if it's Byse first to avoid loadExtractor timeout
+        val uri = try { URI(iframeUrl) } catch (_: Exception) { null }
+        val path = uri?.path ?: ""
+        val looksLikeByse = uri != null && (
+            path.contains("/d/") || 
+            path.contains("/e/") || 
+            path.contains("/v/") || 
+            uri.host?.contains("byse") == true
+        )
 
-        for (link in extractedLinks) {
-            emitted++
-            val newLink = newExtractorLink(
-                source = customName,
-                name = customName,
-                url = link.url,
-                type = link.type
-            ) {
-                this.referer = link.referer
-                this.quality = link.quality
-                this.headers = link.headers
-            }
-            callback(newLink)
-        }
-
-        if (emitted == 0) {
-            val uri = try { URI(iframeUrl) } catch (_: Exception) { null }
-            val path = uri?.path ?: ""
-            val looksLikeByse = uri != null && (
-                path.contains("/d/") || 
-                path.contains("/e/") || 
-                path.contains("/v/") || 
-                uri.host?.contains("byse") == true
-            )
-
-            if (looksLikeByse) {
-                try {
-                    val byseLinks = mutableListOf<ExtractorLink>()
-                    
-                    ByseSX().getUrl(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
-                        byseLinks.add(link)
-                    }
-                    
-                    for (link in byseLinks) {
-                        emitted++
-                        val newLink = newExtractorLink(
-                            source = customName,
-                            name = customName,
-                            url = link.url,
-                            type = link.type
-                        ) {
-                            this.referer = link.referer
-                            this.quality = link.quality
-                            this.headers = link.headers
-                        }
-                        callback(newLink)
-                    }
-                } catch (e: Exception) {
+        if (looksLikeByse) {
+            try {
+                ByseSX().getUrl(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
+                    emitted++
+                    callback(newExtractorLink(
+                        source = customName,
+                        name = customName,
+                        url = link.url,
+                        type = link.type
+                    ) {
+                        this.referer = link.referer
+                        this.quality = link.quality
+                        this.headers = link.headers
+                    })
                 }
-            } else {
+            } catch (e: Exception) {
+                Log.e("FootballReplays", "ByseSX failed: ${e.message}")
             }
         }
-        return true
+
+        // Fallback to generic extractor if Byse failed or it's not Byse
+        if (emitted == 0) {
+            val extractedLinks = mutableListOf<ExtractorLink>()
+
+            loadExtractor(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
+                extractedLinks.add(link)
+            }
+
+            for (link in extractedLinks) {
+                emitted++
+                callback(newExtractorLink(
+                    source = customName,
+                    name = customName,
+                    url = link.url,
+                    type = link.type
+                ) {
+                    this.referer = link.referer
+                    this.quality = link.quality
+                    this.headers = link.headers
+                })
+            }
+        }
+
+        return emitted > 0
     }
 }
