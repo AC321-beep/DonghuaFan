@@ -161,3 +161,63 @@ class Dtube : ExtractorApi() {
         return null
     }
 }
+
+class Rumble : ExtractorApi() {
+    override val name = "Rumble"
+    override val mainUrl = "https://rumble.com"
+    override val requiresReferer = false
+
+    companion object {
+        private val RE_VIDEO_URL = Regex(
+            """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*"""
+        )
+        private val RE_QUALITY_H = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""")
+        private val RE_QUALITY_BRACE = Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
+
+        private val JUNK = listOf("/assets/", "loop", "preview", "tracker")
+    }
+
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        // Fast path — already a direct file
+        if (url.endsWith(".mp4") || url.endsWith(".m3u8")) {
+            callback(newExtractorLink(name, name, url, INFER_TYPE) { this.referer = referer ?: mainUrl })
+            return
+        }
+
+        val html = try { app.get(url, referer = referer ?: mainUrl).text } catch (e: Exception) { return }
+
+        // LinkedHashSet → insertion order preserved → highest quality first
+        val scrapedUrls = LinkedHashSet<String>()
+
+        RE_VIDEO_URL.findAll(html).forEach { match ->
+            val cleanUrl = match.value.replace("\\/", "/")
+
+            if (JUNK.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
+
+            if (scrapedUrls.add(cleanUrl)) {
+                if (cleanUrl.contains(".m3u8")) {
+                    M3u8Helper.generateM3u8(name, cleanUrl, url).forEach(callback)
+                } else if (cleanUrl.contains(".mp4")) {
+                    val precedingText = html.substring(Math.max(0, match.range.first - 150), match.range.first)
+
+                    val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull()
+                        ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
+
+                    val qualityInt = qMatch?.groupValues?.get(1)?.toIntOrNull() ?: Qualities.Unknown.value
+
+                    callback(
+                        newExtractorLink(
+                            name = name,
+                            source = if (qualityInt != Qualities.Unknown.value) "$name ${qualityInt}p" else name,
+                            url = cleanUrl,
+                            type = INFER_TYPE
+                        ) {
+                            this.referer = url
+                            this.quality = qualityInt
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
