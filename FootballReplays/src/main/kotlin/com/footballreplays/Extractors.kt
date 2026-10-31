@@ -653,7 +653,7 @@ open class ByseSX : ExtractorApi() {
             return
         }
 
-        // 5b) REST API — iframe origin
+                // 5b) REST API — iframe origin
         val iframeOrigin = discoveredIframeOrigin
         if (iframeOrigin != null && iframeOrigin != origin) {
             Log.e(TAG, "→ REST API retry on iframe origin $iframeOrigin")
@@ -669,34 +669,34 @@ open class ByseSX : ExtractorApi() {
         if (activity.isFinishing || activity.isDestroyed) return
 
         Log.e(TAG, "→ Silent WebView on shell")
-        var result = runSilentM3u8Interceptor(
+        val shellResult = runSilentM3u8Interceptor(
             activity, shellUrl,
             mapOf("Referer" to "$origin/", "User-Agent" to BYSE_UA),
             timeoutMs = 12_000L
         )
-        if (result != null) {
+        if (shellResult != null) {
             Log.e(TAG, "✓ Byse via SILENT WebView (shell) — no UI")
-            callback(newExtractorLink(name, name, result.url, ExtractorLinkType.M3U8) {
+            callback(newExtractorLink(name, name, shellResult.url, ExtractorLinkType.M3U8) {
                 this.referer = shellUrl
-                this.headers = result.headers
+                this.headers = shellResult.headers
             })
             return
         }
 
-        // 6b) Silent WebView — iframe URL directly (this is where the player JS lives)
+        // 6b) Silent WebView — iframe URL directly
         val silentIframeUrl = iframeUrlForSilent
         if (silentIframeUrl != null) {
             Log.e(TAG, "→ Silent WebView on iframe $silentIframeUrl")
-            result = runSilentM3u8Interceptor(
+            val iframeResult = runSilentM3u8Interceptor(
                 activity, silentIframeUrl,
                 mapOf("Referer" to shellUrl, "User-Agent" to BYSE_UA),
                 timeoutMs = 20_000L
             )
-            if (result != null) {
+            if (iframeResult != null) {
                 Log.e(TAG, "✓ Byse via SILENT WebView (iframe) — no UI")
-                callback(newExtractorLink(name, name, result.url, ExtractorLinkType.M3U8) {
+                callback(newExtractorLink(name, name, iframeResult.url, ExtractorLinkType.M3U8) {
                     this.referer = silentIframeUrl
-                    this.headers = result.headers
+                    this.headers = iframeResult.headers
                 })
                 return
             }
@@ -704,15 +704,15 @@ open class ByseSX : ExtractorApi() {
 
         // 7) Interactive dialog — true last resort
         Log.e(TAG, "→ Silent failed on both, using interactive dialog")
-        result = runInteractiveM3u8Interceptor(
+        val interactiveResult = runInteractiveM3u8Interceptor(
             activity, shellUrl,
             mapOf("Referer" to "$origin/", "User-Agent" to BYSE_UA)
         )
-        if (result != null) {
+        if (interactiveResult != null) {
             Log.e(TAG, "✓ Byse via INTERACTIVE WebView")
-            callback(newExtractorLink(name, name, result.url, ExtractorLinkType.M3U8) {
+            callback(newExtractorLink(name, name, interactiveResult.url, ExtractorLinkType.M3U8) {
                 this.referer = shellUrl
-                this.headers = result.headers
+                this.headers = interactiveResult.headers
             })
         } else {
             Log.e(TAG, "✗ Byse exhausted")
