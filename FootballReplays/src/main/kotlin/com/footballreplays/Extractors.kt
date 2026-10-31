@@ -510,8 +510,9 @@ private fun byse_extractMediaUrlsFromJsonArray(arr: JSONArray, depth: Int = 0): 
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  BYSE EXTRACTOR — HTTP + Dual CFSolver + SHA-256 / v4 / enc-dec.app
-//                  + Multi-Origin REST + WebView
+//  BYSE EXTRACTOR
+//   Stages: HTTP → CFSolver → Shell/Iframe inline decrypt → REST (both origins)
+//           → Silent WebView (shell) → Silent WebView (iframe) → Interactive
 // ════════════════════════════════════════════════════════════════════════════
 open class ByseSX : ExtractorApi() {
     override var name = "Byse"
@@ -530,7 +531,7 @@ open class ByseSX : ExtractorApi() {
 
         private fun extractHash(url: String): String? {
             val clean = url.substringBefore("?").substringBefore("#").trimEnd('/')
-            Regex("""/(?:d|embed|e|v|video|download|a2lyf|cx5h|w6u1|jjplw|hzjr)/([a-zA-Z0-9]{8,32})""")
+            Regex("""/(?:d|embed|e|v|video|download|a2lyf|cx5h|w6u1|jjplw|hzjr|84a)/([a-zA-Z0-9]{8,32})""")
                 .find(clean)?.let { return it.groupValues[1] }
             return clean.substringAfterLast('/')
                 .takeIf { it.matches(Regex("^[a-zA-Z0-9]{8,32}$")) }
@@ -556,6 +557,9 @@ open class ByseSX : ExtractorApi() {
         return reqHost != shellHost && !ALLOWED_HOSTS.contains(reqHost)
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  MAIN ENTRY
+    // ══════════════════════════════════════════════════════════════════════
     override suspend fun getUrl(
         url: String, referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -575,7 +579,8 @@ open class ByseSX : ExtractorApi() {
 
         val shellUrl = "$origin/e/$hash"
         var shellHtml = ""
-        var discoveredIframeOrigin: String? = null      // ← FIX A state
+        var discoveredIframeOrigin: String? = null
+        var iframeUrlForSilent: String? = null
 
         // 1) Fast HTTP
         try {
@@ -594,8 +599,6 @@ open class ByseSX : ExtractorApi() {
                 } catch (_: Exception) { "" }
             }
         }
-
-        // FIX B: shell diagnostics
         Log.e(TAG, "  shell: len=${shellHtml.length} hasAlgo=${shellHtml.contains("\"algorithm\"")} hasPayload=${shellHtml.contains("\"payload\"")} hasIv=${shellHtml.contains("\"iv\"")}")
 
         // 3) Decrypt shell
@@ -613,7 +616,8 @@ open class ByseSX : ExtractorApi() {
             if (iframeUrl != null) {
                 Log.e(TAG, "→ iframe discovered: $iframeUrl")
                 val iframeOrigin = byse_originOf(iframeUrl) ?: origin
-                discoveredIframeOrigin = iframeOrigin                 // ← FIX A state
+                discoveredIframeOrigin = iframeOrigin
+                iframeUrlForSilent = iframeUrl
                 var playerHtml = ""
 
                 try {
@@ -631,8 +635,6 @@ open class ByseSX : ExtractorApi() {
                         } catch (_: Exception) { "" }
                     }
                 }
-
-                // FIX B: iframe diagnostics
                 Log.e(TAG, "  iframe: len=${playerHtml.length} hasAlgo=${playerHtml.contains("\"algorithm\"")} hasPayload=${playerHtml.contains("\"payload\"")} hasIv=${playerHtml.contains("\"iv\"")}")
 
                 if (playerHtml.isNotBlank() && !byse_isErrorPage(playerHtml)) {
@@ -644,14 +646,14 @@ open class ByseSX : ExtractorApi() {
             }
         }
 
-        // 5) REST API — SHELL origin first
+        // 5) REST API — shell origin
         tryRestApiPath(url, origin, hash, referer, subtitleCallback, coord, safeEmit)
         if (anyEmitted.get()) {
             Log.e(TAG, "✓ Byse resolved via REST API (shell origin $origin)")
             return
         }
 
-        // 5b) FIX A — ALSO try IFRAME origin (this is what the player API actually lives on)
+        // 5b) REST API — iframe origin
         val iframeOrigin = discoveredIframeOrigin
         if (iframeOrigin != null && iframeOrigin != origin) {
             Log.e(TAG, "→ REST API retry on iframe origin $iframeOrigin")
@@ -662,32 +664,69 @@ open class ByseSX : ExtractorApi() {
             }
         }
 
-        // 6) WebView interceptor — last resort
+        // 6) Silent WebView — shell
         val activity = CommonActivity.activity ?: return
         if (activity.isFinishing || activity.isDestroyed) return
 
-        val headers = mapOf("Referer" to "$origin/", "User-Agent" to BYSE_UA)
-        var result = runSilentM3u8Interceptor(activity, shellUrl, headers)
-        if (result == null) result = runInteractiveM3u8Interceptor(activity, shellUrl, headers)
-
+        Log.e(TAG, "→ Silent WebView on shell")
+        var result = runSilentM3u8Interceptor(
+            activity, shellUrl,
+            mapOf("Referer" to "$origin/", "User-Agent" to BYSE_UA),
+            timeoutMs = 12_000L
+        )
         if (result != null) {
+            Log.e(TAG, "✓ Byse via SILENT WebView (shell) — no UI")
             callback(newExtractorLink(name, name, result.url, ExtractorLinkType.M3U8) {
                 this.referer = shellUrl
                 this.headers = result.headers
             })
-            Log.e(TAG, "✓ Byse via custom WebView interceptor")
+            return
+        }
+
+        // 6b) Silent WebView — iframe URL directly (this is where the player JS lives)
+        val silentIframeUrl = iframeUrlForSilent
+        if (silentIframeUrl != null) {
+            Log.e(TAG, "→ Silent WebView on iframe $silentIframeUrl")
+            result = runSilentM3u8Interceptor(
+                activity, silentIframeUrl,
+                mapOf("Referer" to shellUrl, "User-Agent" to BYSE_UA),
+                timeoutMs = 20_000L
+            )
+            if (result != null) {
+                Log.e(TAG, "✓ Byse via SILENT WebView (iframe) — no UI")
+                callback(newExtractorLink(name, name, result.url, ExtractorLinkType.M3U8) {
+                    this.referer = silentIframeUrl
+                    this.headers = result.headers
+                })
+                return
+            }
+        }
+
+        // 7) Interactive dialog — true last resort
+        Log.e(TAG, "→ Silent failed on both, using interactive dialog")
+        result = runInteractiveM3u8Interceptor(
+            activity, shellUrl,
+            mapOf("Referer" to "$origin/", "User-Agent" to BYSE_UA)
+        )
+        if (result != null) {
+            Log.e(TAG, "✓ Byse via INTERACTIVE WebView")
+            callback(newExtractorLink(name, name, result.url, ExtractorLinkType.M3U8) {
+                this.referer = shellUrl
+                this.headers = result.headers
+            })
         } else {
             Log.e(TAG, "✗ Byse exhausted")
         }
     }
 
-    // ───────────────────────── Inline decryption ─────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    //  INLINE DECRYPTION (with per-regex diagnostics)
+    // ══════════════════════════════════════════════════════════════════════
     private suspend fun decryptInline(
         html: String, origin: String, refererUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         emit: (ExtractorLink) -> Unit
     ): Boolean {
-        // FIX B: log which regex is the failing one
         val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
         if (algorithm == null) { Log.e(TAG, "  ✗ algorithm miss (htmlLen=${html.length})"); return false }
         val iv = Regex(""""iv"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
@@ -717,7 +756,9 @@ open class ByseSX : ExtractorApi() {
         return emitDecrypted(decrypted, origin, refererUrl, subtitleCallback, emit)
     }
 
-    // ───────────────────────── REST API fallback ─────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    //  REST API — with cookie passthrough + body logging
+    // ══════════════════════════════════════════════════════════════════════
     private suspend fun tryRestApiPath(
         url: String, apiOrigin: String, hash: String, referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -727,23 +768,35 @@ open class ByseSX : ExtractorApi() {
         if (coord.isWon()) return
         val postBody = """{"password":""}""".toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull())
         val frameRef = "$apiOrigin/e/$hash"
-        val pbHeaders = mapOf(
-            "User-Agent"       to BYSE_UA,
-            "Content-Type"     to "application/json",
-            "Referer"          to frameRef,
-            "Origin"           to apiOrigin,
-            "X-Requested-With" to "XMLHttpRequest",
-            "X-Embed-Origin"   to (byse_hostOf(apiOrigin) ?: "byse.sx"),
-            "X-Embed-Parent"   to url,
-            "X-Embed-Referer"  to (referer ?: "https://www.footreplays.com/"),
-        )
+
+        // Pass through cookies CFSolver harvested — okhttp has its own jar and would otherwise miss cf_clearance
+        val cfCookies = runCatching {
+            android.webkit.CookieManager.getInstance().getCookie(apiOrigin)
+        }.getOrNull()
+        Log.e(TAG, "  REST cookies(${byse_hostOf(apiOrigin)}): ${cfCookies?.take(140) ?: "(none)"}")
+
+        val pbHeaders = buildMap {
+            put("User-Agent",       BYSE_UA)
+            put("Content-Type",     "application/json")
+            put("Referer",          frameRef)
+            put("Origin",           apiOrigin)
+            put("X-Requested-With", "XMLHttpRequest")
+            put("X-Embed-Origin",   byse_hostOf(apiOrigin) ?: "byse.sx")
+            put("X-Embed-Parent",   url)
+            put("X-Embed-Referer",  referer ?: "https://www.footreplays.com/")
+            if (!cfCookies.isNullOrBlank()) put("Cookie", cfCookies)
+        }
+
         val endpoint = "$apiOrigin/api/videos/$hash/embed/playback"
         Log.e(TAG, "  REST POST $endpoint")
         val resp = withTimeoutOrNull(10_000L) {
             app.post(endpoint, headers = pbHeaders, requestBody = postBody)
         } ?: run { Log.e(TAG, "  REST timeout"); return }
-        Log.e(TAG, "  REST → code=${resp.code} len=${resp.text.length}")
-        val text = resp.text.trimStart()
+
+        val bodyText = resp.text
+        Log.e(TAG, "  REST → code=${resp.code} len=${bodyText.length} body=${bodyText.take(300)}")
+
+        val text = bodyText.trimStart()
         if (resp.code !in 200..299) return
         if (!text.startsWith("{") && !text.startsWith("[")) return
         if (coord.isWon()) return
@@ -760,7 +813,9 @@ open class ByseSX : ExtractorApi() {
         emitDecrypted(decrypted, apiOrigin, frameRef, subtitleCallback, emit)
     }
 
-    // ───────────────────────── Emission ─────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    //  EMIT DECRYPTED
+    // ══════════════════════════════════════════════════════════════════════
     private suspend fun emitDecrypted(
         json: String, pbOrigin: String, refererUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -840,7 +895,9 @@ open class ByseSX : ExtractorApi() {
         return emitted
     }
 
-    // ───────────────────────── Local AES decryption ─────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    //  LOCAL AES
+    // ══════════════════════════════════════════════════════════════════════
     private fun decryptBysePlayback(playback: JSONObject): String? {
         // (a) v1–v3: iv / payload / key_parts → SHA-256(concat)
         val ivB64 = playback.optString("iv")
@@ -885,7 +942,9 @@ open class ByseSX : ExtractorApi() {
         return null
     }
 
-    // ───────────────────────── External decoder (v4+) ─────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    //  EXTERNAL DECODER (v4+)
+    // ══════════════════════════════════════════════════════════════════════
     private suspend fun tryExternalByseDecoder(playback: JSONObject, referer: String): String? = try {
         val reqJson = JSONObject().apply {
             put("text",  playback)
@@ -921,10 +980,15 @@ open class ByseSX : ExtractorApi() {
         null
     }
 
-    // ───────────────────────── WebView: silent interceptor ─────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    //  SILENT WebView — accepts any URL, configurable timeout
+    // ══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun runSilentM3u8Interceptor(
-        activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>
+        activity: android.app.Activity,
+        urlToResolve: String,
+        headers: Map<String, String>,
+        timeoutMs: Long = 10_000L
     ): InterceptResult? = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             val root = activity.window?.decorView as? android.view.ViewGroup
@@ -943,14 +1007,20 @@ open class ByseSX : ExtractorApi() {
             }
 
             val wv = android.webkit.WebView(activity).apply {
-                layoutParams = android.view.ViewGroup.LayoutParams(
-                    activity.resources.displayMetrics.widthPixels,
-                    activity.resources.displayMetrics.heightPixels
-                )
-                translationX = 20000f
+                // 1×1 px, off-screen, fully transparent, non-focusable
+                layoutParams = android.view.ViewGroup.LayoutParams(1, 1)
+                translationX = -20000f
+                translationY = -20000f
+                alpha = 0f
+                isFocusable = false
+                isFocusableInTouchMode = false
                 settings.apply {
-                    javaScriptEnabled = true; domStorageEnabled = true; useWideViewPort = true
-                    loadWithOverviewMode = true; mediaPlaybackRequiresUserGesture = false
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
+                    mediaPlaybackRequiresUserGesture = false
                     userAgentString = BYSE_UA
                     setSupportMultipleWindows(false)
                     javaScriptCanOpenWindowsAutomatically = false
@@ -965,6 +1035,7 @@ open class ByseSX : ExtractorApi() {
                     override fun shouldInterceptRequest(v: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
                         val u = request?.url?.toString() ?: return null
                         if (u.contains(".m3u8") || u.contains(".m3u")) {
+                            Log.e(TAG, "  ✓ silent intercepted: $u")
                             val rh = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
                             rh["Referer"] = urlToResolve
                             activity.runOnUiThread { finish(InterceptResult(u, rh)) }
@@ -982,28 +1053,43 @@ open class ByseSX : ExtractorApi() {
                     val js = """
                         (function() {
                             window.open = function() { return null; };
-                            var vids = document.querySelectorAll('video');
-                            var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .plyr__control--overlaid, [class*="play"]');
-                            if (vids.length > 0 || buttons.length > 0) {
-                                buttons.forEach(b => b.click());
-                                vids.forEach(v => { v.muted = true; var p = v.play(); if (p !== undefined) p.catch(e => {}); });
-                            }
+                            document.querySelectorAll('video').forEach(v => {
+                                try { v.muted = true; v.autoplay = true; v.playsInline = true; v.play(); } catch(e) {}
+                            });
+                            var sels = [
+                                '.play-button', '.vjs-big-play-button', '.plyr__control--overlaid',
+                                '[class*="play"]', 'button[aria-label*="lay"]', '.jw-icon-display',
+                                '#play', '#playButton', '.btn-play'
+                            ];
+                            sels.forEach(function(s) {
+                                try { document.querySelectorAll(s).forEach(b => { try { b.click(); } catch(e) {} }); } catch(e) {}
+                            });
+                            document.querySelectorAll('iframe').forEach(function(f) {
+                                try {
+                                    var d = f.contentDocument; if (!d) return;
+                                    d.querySelectorAll('video').forEach(v => { v.muted = true; try { v.play(); } catch(e) {} });
+                                    d.querySelectorAll('.play-button, [class*="play"]').forEach(b => { try { b.click(); } catch(e) {} });
+                                } catch(e) {}
+                            });
+                            try { document.body && document.body.click(); } catch(e) {}
                         })();
                     """.trimIndent()
                     webView?.evaluateJavascript(js, null)
-                    handler.postDelayed(this, 1000L)
+                    handler.postDelayed(this, 1200L)
                 }
             }
             timeoutRunnable = Runnable { finish(null) }
 
             root?.addView(wv)
             wv.loadUrl(urlToResolve, headers)
-            handler.postDelayed(clickRunnable!!, 2500L)
-            handler.postDelayed(timeoutRunnable!!, 10_000L)
+            handler.postDelayed(clickRunnable!!, 1500L)
+            handler.postDelayed(timeoutRunnable!!, timeoutMs)
         }
     }
 
-    // ───────────────────────── WebView: interactive interceptor ─────────────────────────
+    // ══════════════════════════════════════════════════════════════════════
+    //  INTERACTIVE WebView — last resort, visible dialog
+    // ══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun runInteractiveM3u8Interceptor(
         activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>
@@ -1101,16 +1187,29 @@ open class ByseSX : ExtractorApi() {
                     val js = """
                         (function() {
                             window.open = function() { return null; };
-                            var vids = document.querySelectorAll('video');
-                            var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .plyr__control--overlaid, [class*="play"]');
-                            if (vids.length > 0 || buttons.length > 0) {
-                                buttons.forEach(b => b.click());
-                                vids.forEach(v => { v.muted = true; var p = v.play(); if (p !== undefined) p.catch(e => {}); });
-                            }
+                            document.querySelectorAll('video').forEach(v => {
+                                try { v.muted = true; v.autoplay = true; v.playsInline = true; v.play(); } catch(e) {}
+                            });
+                            var sels = [
+                                '.play-button', '.vjs-big-play-button', '.plyr__control--overlaid',
+                                '[class*="play"]', 'button[aria-label*="lay"]', '.jw-icon-display',
+                                '#play', '#playButton', '.btn-play'
+                            ];
+                            sels.forEach(function(s) {
+                                try { document.querySelectorAll(s).forEach(b => { try { b.click(); } catch(e) {} }); } catch(e) {}
+                            });
+                            document.querySelectorAll('iframe').forEach(function(f) {
+                                try {
+                                    var d = f.contentDocument; if (!d) return;
+                                    d.querySelectorAll('video').forEach(v => { v.muted = true; try { v.play(); } catch(e) {} });
+                                    d.querySelectorAll('.play-button, [class*="play"]').forEach(b => { try { b.click(); } catch(e) {} });
+                                } catch(e) {}
+                            });
+                            try { document.body && document.body.click(); } catch(e) {}
                         })();
                     """.trimIndent()
                     webView?.evaluateJavascript(js, null)
-                    handler.postDelayed(this, 1000L)
+                    handler.postDelayed(this, 1200L)
                 }
             }
             layout.addView(wv)
@@ -1118,7 +1217,7 @@ open class ByseSX : ExtractorApi() {
             dialog.setOnDismissListener { if (!done.get()) finish(null) }
             dialog.show()
             wv.loadUrl(urlToResolve, headers)
-            handler.postDelayed(clickRunnable!!, 3500L)
+            handler.postDelayed(clickRunnable!!, 3000L)
             timeoutRunnable = Runnable { finish(null) }
             handler.postDelayed(timeoutRunnable!!, 25_000L)
         }
