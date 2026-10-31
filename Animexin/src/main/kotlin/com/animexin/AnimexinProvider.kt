@@ -7,11 +7,13 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.suspendCancellableCoroutine
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.coroutines.resume
 
 class AnimexinProvider : MainAPI() {
     override var mainUrl = "https://animexin.dev"
@@ -30,37 +32,40 @@ class AnimexinProvider : MainAPI() {
         "anime/?status=completed&type=&order=update" to "Completed"
     )
 
-    private suspend fun getSafeDocument(url: String): Document {
-        // runCatching safely handles OkHttp throwing exceptions on 403/503 errors
-        val responseResult = runCatching { app.get(url, interceptor = cfInterceptor) }
-
-        val needsSolve = responseResult.fold(
-            onSuccess = { resp ->
-                val doc = resp.document
-                val title = doc.title().lowercase()
-                
-                // Only trigger if HTTP code is a block OR strong Cloudflare DOM markers are present
-                resp.code in listOf(403, 503) ||
-                listOf("just a moment", "security verification", "attention required", "cloudflare", "verify you are human").any { title.contains(it) } ||
-                doc.selectFirst("div.cf-turnstile, #cf-wrapper") != null
-            },
-            onFailure = { e ->
-                // Trigger solve if the request crashed specifically due to a 403/503 block
-                e.message?.contains("403") == true || e.message?.contains("503") == true
+    private suspend fun resolveCloudflare(url: String): Boolean = suspendCancellableCoroutine { cont ->
+        var resumed = false
+        CommonActivity.activity?.runOnUiThread {
+            val dialog = CFDialog(url) { success ->
+                if (!resumed) {
+                    resumed = true
+                    cont.resume(success)
+                }
             }
-        )
+            dialog.show()
+        } ?: run {
+            if (!resumed) {
+                resumed = true
+                cont.resume(false)
+            }
+        }
+    }
 
-        if (needsSolve) {
-            // Trigger the new CFSolver (attempts silent 1x1 first, falls back to dialog)
-            if (CFSolver(url).solve()) {
-                return app.get(url, interceptor = cfInterceptor).document
+    private suspend fun getSafeDocument(url: String): Document {
+        var response = app.get(url, interceptor = cfInterceptor)
+        var doc = response.document
+
+        val isChallenge = listOf("just a moment", "security verification", "attention required", "cloudflare")
+            .any { doc.title().lowercase().contains(it) } || doc.select("div.cf-turnstile").isNotEmpty()
+
+        if (isChallenge || response.code in listOf(403, 503)) {
+            if (resolveCloudflare(url)) {
+                response = app.get(url, interceptor = cfInterceptor)
+                doc = response.document
             } else {
                 throw Error("Cloudflare bypass was cancelled or failed.")
             }
         }
-        
-        // If no solve was needed, return the successfully fetched document
-        return responseResult.getOrThrow().document
+        return doc
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -204,6 +209,7 @@ class AnimexinProvider : MainAPI() {
         val extractedIframeUrls = ConcurrentHashMap.newKeySet<String>()
         val yieldedStreamUrls = ConcurrentHashMap.newKeySet<String>()
 
+        // Detect language from any combination of label / attribute / URL.
         fun detectLang(vararg sources: String?): String? {
             val combined = sources.filterNotNull().joinToString(" ").lowercase()
             val hasIndo = combined.contains("indonesia") || combined.contains("indo") || combined.contains("bahasa")
@@ -216,6 +222,7 @@ class AnimexinProvider : MainAPI() {
             }
         }
 
+        // Short label appended to the picker name.
         fun langTag(lang: String?): String? = when (lang) {
             "eng" -> "[Eng]"
             "ind" -> "[Indo]"
@@ -228,24 +235,25 @@ class AnimexinProvider : MainAPI() {
             else if (finalUrl.startsWith("/")) finalUrl = "https://animexin.dev$finalUrl"
             else if (!finalUrl.startsWith("http")) finalUrl = "https://$finalUrl"
 
-            val dedupUrl = finalUrl 
+            val dedupUrl = finalUrl.substringBefore("?")
             if (!extractedIframeUrls.add(dedupUrl)) return
 
             val tag = langTag(lang)
 
+           // Tag lang on every link AND append [Eng]/[Indo] to the displayed name/source.
+            // Emit immediately — no buffering, no delay.
             val trackingCallback: (ExtractorLink) -> Unit = { link ->
                 val localized = if (tag != null) {
                     val newName = if (!link.name.contains(tag)) "${link.name} $tag" else link.name
                     val newSource = if (!link.source.contains(tag)) "${link.source} $tag" else link.source
                     
+                    // Manually rebuild the ExtractorLink since .copy() is no longer supported
                     ExtractorLink(
                         source = newSource,
                         name = newName,
                         url = link.url,
                         referer = link.referer,
                         quality = link.quality,
-                        isM3u8 = link.isM3u8, 
-                        isDash = link.isDash, 
                         type = link.type,
                         headers = link.headers,
                         extractorData = link.extractorData
@@ -267,10 +275,6 @@ class AnimexinProvider : MainAPI() {
                         Dtube().getUrl(finalUrl, mainUrl)?.forEach { trackingCallback(it) }
                         true
                     }
-                    "rumble.com" in finalUrl -> {
-                        loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, trackingCallback)
-                        true
-                    }
                     else -> false
                 }
 
@@ -282,13 +286,16 @@ class AnimexinProvider : MainAPI() {
             }
         }
 
+        // 1) Server dropdown / list entries
         val servers = document.select(
             ".mobius option, select.mirror option, .server-list li a[data-embed], " +
             ".server-list li a[data-em], .server option, .player option"
         )
 
+        // Read the user's system/app locale (e.g. "en" for English, "id" or "in" for Indonesian)
         val userLang = Locale.getDefault().language
 
+        // Sort servers dynamically based on user language preference before processing them
         val sortedServers = servers.sortedByDescending { server ->
             val lang = detectLang(
                 server.text(),
@@ -299,10 +306,14 @@ class AnimexinProvider : MainAPI() {
             )
 
             when {
+                // User prefers Indonesian
                 (userLang == "id" || userLang == "in") && lang == "ind" -> 2
                 (userLang == "id" || userLang == "in") && lang == "eng" -> 1
+                
+                // User prefers English (or anything else defaults to English priority)
                 lang == "eng" -> 2
                 lang == "ind" -> 1
+                
                 else -> 0
             }
         }
@@ -344,6 +355,7 @@ class AnimexinProvider : MainAPI() {
             }.awaitAll()
         }
 
+        // 2) Bare iframes in page
         document.select("iframe").forEach { iframe ->
             val src = iframe.attr("src")
             if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
