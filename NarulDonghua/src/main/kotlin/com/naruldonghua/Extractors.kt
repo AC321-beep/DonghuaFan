@@ -197,7 +197,7 @@ private fun extractMediaUrlsFromJsonArray(arr: JSONArray, depth: Int = 0): List<
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  BYSE EXTRACTOR — HTTP + Silent CFSolver + SHA-256 AES Decryption + WebView Fallback
+//  BYSE EXTRACTOR — HTTP + Dual CFSolver + SHA-256 Decryption + WebView Fallback
 // ════════════════════════════════════════════════════════════════════════════
 class Bysekoze : ExtractorApi() {
     override val name = "Byse"
@@ -253,7 +253,7 @@ class Bysekoze : ExtractorApi() {
         val shellUrl = "$origin/e/$hash"
         var shellHtml = ""
 
-        // 1. Try fast HTTP first
+        // 1. Try standard HTTP for the Shell
         try {
             val resp = app.get(shellUrl, headers = chromeHeaders(referer = referer ?: "$origin/"))
             if (resp.code == 200 && !isErrorPage(resp.text)) {
@@ -261,50 +261,68 @@ class Bysekoze : ExtractorApi() {
             }
         } catch (_: Exception) {}
 
-        // 2. If Cloudflare blocked us or missing payload, trigger the Silent Solver
+        // 2. If Shell is blocked by Cloudflare, use Silent CFSolver
         if (!shellHtml.contains("\"algorithm\"") && !shellHtml.contains("\"payload\"")) {
-            Log.e(TAG, "→ HTTP blocked by CF or missing payload, using Silent CFSolver...")
-            val solver = CFSolver(shellUrl)
-            solver.solve()
-            
+            Log.e(TAG, "→ Shell blocked by CF or missing payload, using Silent CFSolver...")
+            CFSolver(shellUrl).solve()
             shellHtml = CFState.getSolvedHtml(shellUrl) ?: ""
             
             if (shellHtml.isBlank()) {
-                shellHtml = try {
-                    app.get(shellUrl, headers = chromeHeaders(referer = referer ?: "$origin/")).text
-                } catch (_: Exception) { "" }
+                shellHtml = try { app.get(shellUrl, headers = chromeHeaders(referer = referer ?: "$origin/")).text } catch (_: Exception) { "" }
             }
         }
 
+        // 3. Decrypt Shell HTML
         if (shellHtml.isNotBlank() && !isErrorPage(shellHtml)) {
             if (decryptInline(shellHtml, origin, shellUrl, subtitleCallback, safeEmit)) {
-                Log.e(TAG, "✓ Byse resolved via HTTP/CFSolver + Inline JSON")
+                Log.e(TAG, "✓ Byse resolved via Shell + Inline JSON")
                 return
             }
             
-            val iframeUrl = RE_IFRAME.find(shellHtml)?.groupValues?.getOrNull(1)
-                ?.let { resolveUrl(it, shellUrl, origin) }
-                
+            // 4. Iframe Discovery
+            val iframeUrl = RE_IFRAME.find(shellHtml)?.groupValues?.getOrNull(1)?.let { resolveUrl(it, shellUrl, origin) }
             if (iframeUrl != null) {
                 Log.e(TAG, "→ iframe discovered: $iframeUrl")
-                val playerHtml = try {
-                    app.get(iframeUrl, headers = chromeHeaders(referer = shellUrl)).text
-                } catch (_: Exception) { "" }
-                
-                if (playerHtml.isNotBlank() && decryptInline(playerHtml, originOf(iframeUrl) ?: origin, iframeUrl, subtitleCallback, safeEmit)) {
-                    Log.e(TAG, "✓ Byse resolved via iframe")
-                    return
+                val iframeOrigin = originOf(iframeUrl) ?: origin
+                var playerHtml = ""
+
+                // 5. Try standard HTTP for the Iframe
+                try {
+                    val resp = app.get(iframeUrl, headers = chromeHeaders(referer = shellUrl))
+                    if (resp.code == 200 && !isErrorPage(resp.text)) {
+                        playerHtml = resp.text
+                    }
+                } catch (_: Exception) {}
+
+                // 6. If Iframe is blocked by Cloudflare, use Silent CFSolver
+                if (!playerHtml.contains("\"algorithm\"") && !playerHtml.contains("\"payload\"")) {
+                    Log.e(TAG, "→ Iframe blocked by CF, using Silent CFSolver...")
+                    CFSolver(iframeUrl).solve()
+                    playerHtml = CFState.getSolvedHtml(iframeUrl) ?: ""
+                    
+                    if (playerHtml.isBlank()) {
+                        playerHtml = try { app.get(iframeUrl, headers = chromeHeaders(referer = shellUrl)).text } catch (_: Exception) { "" }
+                    }
+                }
+
+                // 7. Decrypt Iframe HTML
+                if (playerHtml.isNotBlank() && !isErrorPage(playerHtml)) {
+                    if (decryptInline(playerHtml, iframeOrigin, iframeUrl, subtitleCallback, safeEmit)) {
+                        Log.e(TAG, "✓ Byse resolved via Iframe + Inline JSON")
+                        return
+                    }
                 }
             }
         }
 
+        // 8. REST API Fallback
         tryRestApiPath(url, origin, hash, referer, subtitleCallback, coord, safeEmit)
         if (anyEmitted.get()) {
             Log.e(TAG, "✓ Byse resolved via REST API")
             return
         }
 
-        // 3. ULTIMATE FALLBACK: Custom WebView Interceptor
+        // 9. Ultimate Fallback: WebView Interceptor
         val activity = CommonActivity.activity ?: throw ErrorLoadingException("Byse: no Activity for WebView fallback")
         if (activity.isFinishing || activity.isDestroyed) throw ErrorLoadingException("Byse: Activity destroyed")
 
@@ -337,7 +355,7 @@ class Bysekoze : ExtractorApi() {
         val pbJson = """{"playback":{"algorithm":"$algorithm","iv":"$iv","payload":"$payload","key_parts":[${kp.joinToString(",") { "\"$it\"" }}]}}"""
         val pbObj = runCatching { JSONObject(pbJson).optJSONObject("playback") }.getOrNull() ?: return false
         
-        val decrypted = decryptBysePlayback(pbObj) ?: return false
+        val decrypted = decryptBysePlayback(pbObj) ?: tryExternalByseDecoder(pbObj, refererUrl) ?: return false
         return emitDecrypted(decrypted, origin, refererUrl, subtitleCallback, emit)
     }
 
@@ -364,7 +382,7 @@ class Bysekoze : ExtractorApi() {
         if (emitDecrypted(text, origin, frameRef, subtitleCallback, emit)) return
         val root = runCatching { JSONObject(text) }.getOrNull() ?: return
         val pbObj = root.optJSONObject("playback") ?: root
-        val decrypted = decryptBysePlayback(pbObj) ?: return
+        val decrypted = decryptBysePlayback(pbObj) ?: tryExternalByseDecoder(pbObj, frameRef) ?: return
         emitDecrypted(decrypted, origin, frameRef, subtitleCallback, emit)
     }
 
@@ -426,12 +444,24 @@ class Bysekoze : ExtractorApi() {
                 val keyOut = java.io.ByteArrayOutputStream()
                 for (i in 0 until keyParts.length()) b64UrlDecode(keyParts.optString(i))?.let { keyOut.write(it) }
                 if (keyOut.size() > 0) {
+                    // 🎯 SHA-256 Fix: Hash the concatenated key parts to get a valid 32-byte AES key
                     val rawKeyBytes = keyOut.toByteArray()
                     val finalAesKey = MessageDigest.getInstance("SHA-256").digest(rawKeyBytes)
                     
                     tryAesGcm(ct, finalAesKey, iv)?.let { b ->
                         return String(b, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\t').takeIf { it.startsWith("{") || it.startsWith("[") }
                     }
+                }
+            }
+        }
+        val iv2B64 = playback.optString("iv2"); val payload2B64 = playback.optString("payload2")
+        val dk = playback.optJSONObject("decrypt_keys")
+        if (iv2B64.isNotBlank() && payload2B64.isNotBlank() && dk != null) {
+            val iv2 = b64UrlDecode(iv2B64); val ct2 = b64UrlDecode(payload2B64)
+            val e1 = b64UrlDecode(dk.optString("edge_1")); val e2 = b64UrlDecode(dk.optString("edge_2"))
+            if (iv2 != null && ct2 != null && e1 != null && e2 != null) {
+                tryAesGcm(ct2, e1 + e2, iv2)?.let { b ->
+                    return String(b, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\t').takeIf { it.startsWith("{") || it.startsWith("[") }
                 }
             }
         }
@@ -454,7 +484,7 @@ class Bysekoze : ExtractorApi() {
     } catch (_: Exception) { null }
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  WEBVIEW INTERCEPTORS — REQUIRED FOR BYSE
+    //  WEBVIEW INTERCEPTORS — ULTIMATE FALLBACK
     // ══════════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun runSilentM3u8Interceptor(activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>): InterceptResult? = withContext(Dispatchers.Main) {
