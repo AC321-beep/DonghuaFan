@@ -1,34 +1,19 @@
 package com.footballreplays
 
 import android.annotation.SuppressLint
-import android.util.Base64
 import android.util.Log
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
 import com.lagradost.cloudstream3.extractors.DoodLaExtractor
 import com.lagradost.cloudstream3.extractors.Voe
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URI
 import java.net.URLEncoder
-import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
-import javax.crypto.Cipher
-import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
 import kotlin.coroutines.resume
 
 const val DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
@@ -167,7 +152,7 @@ class VideaHu : ExtractorApi() {
 }
 
 // ==========================================
-// HQCloud & HQLinks Extractors (Updated to use CFSolver)
+// HQCloud & HQLinks Extractors
 // ==========================================
 open class HQCloud : ExtractorApi() {
     override val name = "HQCloud"
@@ -189,7 +174,6 @@ open class HQCloud : ExtractorApi() {
                 var response = app.get(newUrl, referer = "https://hgcloud.to/").text
                 
                 if (response.length < 2000 || response.contains("just a moment") || response.contains("cf-browser-verification")) {
-                    Log.e("HQCloud", "→ CF Challenge detected on $newUrl. Using CFSolver...")
                     CFSolver(newUrl).solve()
                     response = CFState.getSolvedHtml(newUrl) ?: app.get(newUrl, referer = "https://hgcloud.to/").text
                 }
@@ -384,7 +368,7 @@ class Vtbe : ExtractorApi() {
     }
 }
 
-/// ════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
 //  BYSE HELPERS
 // ════════════════════════════════════════════════════════════════════════════
 private fun byse_originOf(url: String): String? =
@@ -404,19 +388,6 @@ private fun byse_isErrorPage(html: String): Boolean {
     return false
 }
 
-private fun byse_resolveUrl(uri: String, masterUrl: String, origin: String): String? {
-    val trimmed = uri.trim().replace("&amp;", "&")
-    if (trimmed.isEmpty() ||
-        trimmed.startsWith("javascript:", true) ||
-        trimmed.startsWith("data:", true)) return null
-    return when {
-        trimmed.startsWith("http://", true) || trimmed.startsWith("https://", true) -> trimmed
-        trimmed.startsWith("//") -> "https:$trimmed"
-        trimmed.startsWith("/")  -> "$origin$trimmed"
-        else -> "${masterUrl.substringBefore('?').substringBefore('#').substringBeforeLast('/')}/$trimmed"
-    }
-}
-
 private fun byse_chromeHeaders(referer: String): Map<String, String> = mapOf(
     "User-Agent"      to BYSE_UA,
     "Accept"          to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -427,128 +398,8 @@ private fun byse_chromeHeaders(referer: String): Map<String, String> = mapOf(
     "Referer"         to referer,
 )
 
-private fun byse_mediaHeaders(referer: String): Map<String, String> = mapOf(
-    "User-Agent"     to BYSE_UA,
-    "Accept"         to "*/*",
-    "Referer"        to referer,
-    "Sec-Fetch-Dest" to "video",
-    "Sec-Fetch-Mode" to "no-cors",
-    "Sec-Fetch-Site" to "cross-site",
-)
-
-private fun byse_b64UrlDecode(input: String): ByteArray? = try {
-    Base64.decode(
-        input.trim()
-            .replace('-', '+')
-            .replace('_', '/')
-            .replace(Regex("\\s+"), "")
-            .padEnd((input.length + 3) / 4 * 4, '='),
-        Base64.DEFAULT
-    )
-} catch (_: Exception) { null }
-
-private fun byse_tryAesGcm(ctAndTag: ByteArray, key: ByteArray, nonce: ByteArray): ByteArray? = try {
-    Cipher.getInstance("AES/GCM/NoPadding")
-        .apply { init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce)) }
-        .doFinal(ctAndTag)
-} catch (_: Exception) { null }
-
-private fun byse_extractMediaUrlsFromJson(json: JSONObject, depth: Int = 0): List<String> {
-    if (depth > 5) return emptyList()
-    val urls = mutableListOf<String>()
-    val keys = json.keys()
-    while (keys.hasNext()) {
-        val key = keys.next()
-        when (val v = json.opt(key)) {
-            is String -> {
-                val s = v.replace("\\/", "/").trim()
-                Regex("""(https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
-                    .findAll(s).forEach { urls.add(it.groupValues[1]) }
-                Regex("""(https?://[^"'\s\\<>]+\.(?:mp4|mkv)[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
-                    .findAll(s).forEach { urls.add(it.groupValues[1]) }
-                if (key.equals("file", true) || key.equals("url", true) ||
-                    key.equals("src", true) || key.equals("source", true) ||
-                    key.equals("stream", true)) {
-                    if (s.startsWith("http") && !s.endsWith(".jpg") && !s.endsWith(".png") &&
-                        !s.endsWith(".vtt") && !s.contains("/embed/")) {
-                        urls.add(s)
-                    }
-                }
-                if (s.startsWith("{") || s.startsWith("[")) {
-                    try {
-                        if (s.startsWith("{")) urls.addAll(byse_extractMediaUrlsFromJson(JSONObject(s), depth + 1))
-                        else urls.addAll(byse_extractMediaUrlsFromJsonArray(JSONArray(s), depth + 1))
-                    } catch (_: Exception) {}
-                }
-            }
-            is JSONObject -> urls.addAll(byse_extractMediaUrlsFromJson(v, depth + 1))
-            is JSONArray  -> urls.addAll(byse_extractMediaUrlsFromJsonArray(v, depth + 1))
-        }
-    }
-    return urls
-}
-
-private fun byse_extractMediaUrlsFromJsonArray(arr: JSONArray, depth: Int = 0): List<String> {
-    if (depth > 5) return emptyList()
-    val urls = mutableListOf<String>()
-    for (i in 0 until arr.length()) {
-        when (val item = arr.opt(i)) {
-            is String -> {
-                val s = item.replace("\\/", "/").trim()
-                Regex("""(https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
-                    .findAll(s).forEach { urls.add(it.groupValues[1]) }
-                Regex("""(https?://[^"'\s\\<>]+\.(?:mp4|mkv)[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
-                    .findAll(s).forEach { urls.add(it.groupValues[1]) }
-                if (s.contains(".m3u8", true) || s.contains(".mp4", true) ||
-                    s.contains("/hls/", true)) urls.add(s)
-            }
-            is JSONObject -> urls.addAll(byse_extractMediaUrlsFromJson(item, depth + 1))
-            is JSONArray  -> urls.addAll(byse_extractMediaUrlsFromJsonArray(item, depth + 1))
-        }
-    }
-    return urls
-}
-
 // ════════════════════════════════════════════════════════════════════════════
-//  BYSE SNIFFER — logs /api/ fetches and XHRs from inside WebView
-// ════════════════════════════════════════════════════════════════════════════
-private val BYSE_SNIFFER_JS = """
-    (function(){
-        if (window.__byseSniffer) return;
-        window.__byseSniffer = true;
-        try {
-            var of = window.fetch;
-            window.fetch = function(){
-                try {
-                    var u = arguments[0];
-                    var b = arguments[1] && arguments[1].body;
-                    if (u && String(u).indexOf('/api/') >= 0) {
-                        console.log('[SNIFF] fetch ' + u + ' BODY=' + (b ? String(b).slice(0,600) : '(no body)'));
-                    }
-                } catch(e) {}
-                return of.apply(this, arguments);
-            };
-        } catch(e) {}
-        try {
-            var ox = XMLHttpRequest.prototype.open;
-            var os = XMLHttpRequest.prototype.send;
-            XMLHttpRequest.prototype.open = function(m,u){ this.__u=u; this.__m=m; return ox.apply(this, arguments); };
-            XMLHttpRequest.prototype.send = function(b){
-                try {
-                    if (this.__u && String(this.__u).indexOf('/api/') >= 0) {
-                        console.log('[SNIFF] xhr ' + this.__m + ' ' + this.__u + ' BODY=' + (b ? String(b).slice(0,600) : '(no body)'));
-                    }
-                } catch(e) {}
-                return os.apply(this, arguments);
-            };
-        } catch(e) {}
-    })();
-""".trimIndent()
-
-// ════════════════════════════════════════════════════════════════════════════
-//  BYSE EXTRACTOR (Option B — REST paths trimmed)
-//   Flow: HTTP → CFSolver → inline-decrypt (if payload in HTML)
-//         → Silent WebView (18 s, invisible) → Interactive WebView (fallback)
+//  BYSE EXTRACTOR — silent WebView primary, interactive fallback
 // ════════════════════════════════════════════════════════════════════════════
 open class ByseSX : ExtractorApi() {
     override var name = "Byse"
@@ -556,7 +407,6 @@ open class ByseSX : ExtractorApi() {
     override val requiresReferer = true
 
     companion object {
-        private const val TAG = "FootballReplays/Byse"
         private val KNOWN_BYSE_HOSTS = listOf(
             "https://byse.sx", "https://bysekoze.com", "https://bysejikuar.com",
             "https://bysevepoin.com", "https://bysefujedu.com",
@@ -574,13 +424,6 @@ open class ByseSX : ExtractorApi() {
         }
     }
 
-    private class EmissionCoordinator {
-        private val seen = ConcurrentHashMap.newKeySet<String>()
-        @Volatile private var won = false
-        fun tryEmit(key: String): Boolean { if (!seen.add(key)) return false; won = true; return true }
-        fun isWon(): Boolean = won
-    }
-
     data class InterceptResult(val url: String, val headers: Map<String, String>)
 
     private fun isAdHijack(request: android.webkit.WebResourceRequest?, shellUrl: String): Boolean {
@@ -593,7 +436,6 @@ open class ByseSX : ExtractorApi() {
         return reqHost != shellHost && !ALLOWED_HOSTS.contains(reqHost)
     }
 
-    // ══════════════════════════════════════════════════════════════════════
     override suspend fun getUrl(
         url: String, referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -601,58 +443,25 @@ open class ByseSX : ExtractorApi() {
     ) {
         val origin = byse_originOf(url) ?: return
         val hash = extractHash(url) ?: return
-        Log.e(TAG, "=== Byse START hash=$hash origin=$origin")
-
-        val coord = EmissionCoordinator()
-        val anyEmitted = AtomicBoolean(false)
-        val safeEmit: (ExtractorLink) -> Unit = { link ->
-            if (coord.tryEmit("${link.url}|${link.referer}")) {
-                anyEmitted.set(true); callback(link)
-            }
-        }
-
         val shellUrl = "$origin/e/$hash"
-        var shellHtml = ""
 
-        // 1) Fast HTTP
+        // Pre-warm CF challenge if the shell is protected
         try {
             val resp = app.get(shellUrl, headers = byse_chromeHeaders(referer ?: "$origin/"))
-            if (resp.code == 200 && !byse_isErrorPage(resp.text)) shellHtml = resp.text
-        } catch (_: Exception) {}
-
-        // 2) Silent CFSolver if blocked
-        if (!shellHtml.contains("\"algorithm\"") && !shellHtml.contains("\"payload\"")) {
-            Log.e(TAG, "→ Shell blocked by CF or missing payload, using Silent CFSolver...")
+            if (!(resp.code == 200 && !byse_isErrorPage(resp.text))) CFSolver(shellUrl).solve()
+        } catch (_: Exception) {
             CFSolver(shellUrl).solve()
-            shellHtml = CFState.getSolvedHtml(shellUrl) ?: ""
-            if (shellHtml.isBlank()) {
-                shellHtml = try {
-                    app.get(shellUrl, headers = byse_chromeHeaders(referer ?: "$origin/")).text
-                } catch (_: Exception) { "" }
-            }
-        }
-        Log.e(TAG, "  shell: len=${shellHtml.length} hasAlgo=${shellHtml.contains("\"algorithm\"")} hasPayload=${shellHtml.contains("\"payload\"")}")
-
-        // 3) Inline decrypt (only fires if payload lives in shell HTML — some mirrors, v1–v3)
-        if (shellHtml.isNotBlank() && !byse_isErrorPage(shellHtml)) {
-            if (decryptInline(shellHtml, origin, shellUrl, subtitleCallback, safeEmit)) {
-                Log.e(TAG, "✓ Byse resolved via Shell + Inline JSON")
-                return
-            }
         }
 
-        // 4) Silent WebView — primary path (works for v4+, invisible, no dialog)
         val activity = CommonActivity.activity ?: return
         if (activity.isFinishing || activity.isDestroyed) return
 
-        Log.e(TAG, "→ Silent WebView on shell (18s)")
         val shellResult = runSilentM3u8Interceptor(
             activity, shellUrl,
             mapOf("Referer" to "$origin/", "User-Agent" to BYSE_UA),
             timeoutMs = 18_000L
         )
         if (shellResult != null) {
-            Log.e(TAG, "✓ Byse via SILENT WebView (shell) — no UI")
             callback(newExtractorLink(name, name, shellResult.url, ExtractorLinkType.M3U8) {
                 this.referer = shellUrl
                 this.headers = shellResult.headers
@@ -660,175 +469,20 @@ open class ByseSX : ExtractorApi() {
             return
         }
 
-        // 5) Interactive dialog — last resort for CAPTCHA / real-gesture players
-        Log.e(TAG, "→ Silent failed, using interactive dialog")
         val interactiveResult = runInteractiveM3u8Interceptor(
             activity, shellUrl,
             mapOf("Referer" to "$origin/", "User-Agent" to BYSE_UA)
         )
         if (interactiveResult != null) {
-            Log.e(TAG, "✓ Byse via INTERACTIVE WebView")
             callback(newExtractorLink(name, name, interactiveResult.url, ExtractorLinkType.M3U8) {
                 this.referer = shellUrl
                 this.headers = interactiveResult.headers
             })
-        } else {
-            Log.e(TAG, "✗ Byse exhausted")
         }
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  Inline payload decrypt (v1–v3 direct-from-HTML; rare on current mirrors)
-    // ══════════════════════════════════════════════════════════════════════
-    private suspend fun decryptInline(
-        html: String, origin: String, refererUrl: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        emit: (ExtractorLink) -> Unit
-    ): Boolean {
-        val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return false
-        val iv        = Regex(""""iv"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return false
-        val payload   = Regex(""""payload"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return false
-        val keyParts  = Regex(""""key_parts"\s*:\s*\[(.*?)\]""").find(html)?.groupValues?.get(1) ?: return false
-        val kp = keyParts.split(",").map { it.replace("\"", "").trim() }.filter { it.isNotBlank() }
-        if (kp.isEmpty()) return false
-
-        val version = Regex(""""version"\s*:\s*"?([^",}\s]+)"?""").find(html)
-            ?.groupValues?.get(1)?.trim() ?: "?"
-        Log.e(TAG, "  inline v=$version kp=${kp.size} payloadLen=${payload.length}")
-
-        val pbJson = """{"playback":{"algorithm":"$algorithm","iv":"$iv","payload":"$payload","key_parts":[${kp.joinToString(",") { "\"$it\"" }}]}}"""
-        val pbObj = runCatching { JSONObject(pbJson).optJSONObject("playback") }.getOrNull() ?: return false
-
-        val local = decryptBysePlayback(pbObj)
-        if (local != null) Log.e(TAG, "  inline decrypt: OK local len=${local.length}")
-        else               Log.e(TAG, "  inline decrypt: local failed, enc-dec.app…")
-
-        val decrypted = local
-            ?: tryExternalByseDecoder(pbObj, refererUrl)
-            ?: run { Log.e(TAG, "  inline decrypt: enc-dec.app also failed"); return false }
-
-        return emitDecrypted(decrypted, origin, refererUrl, subtitleCallback, emit)
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    private suspend fun emitDecrypted(
-        json: String, pbOrigin: String, refererUrl: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        emit: (ExtractorLink) -> Unit
-    ): Boolean {
-        val playback = tryParseJson<BysePlaybackDecrypt>(json)
-        var emitted = false
-        if (playback != null) {
-            (playback.tracks ?: playback.subtitles)?.forEach { sub ->
-                sub.file?.takeIf { it.isNotBlank() }?.let { f ->
-                    subtitleCallback(newSubtitleFile(sub.label ?: "Sub",
-                        byse_resolveUrl(f, refererUrl, pbOrigin) ?: f) {
-                        this.headers = byse_mediaHeaders("$pbOrigin/")
-                    })
-                }
-            }
-            playback.sources?.forEach { src ->
-                val raw = src.file ?: return@forEach
-                val streamUrl = byse_resolveUrl(raw, refererUrl, pbOrigin) ?: raw
-                val quality = when {
-                    src.label?.contains("2160") == true -> Qualities.P2160.value
-                    src.label?.contains("1440") == true -> Qualities.P1440.value
-                    src.label?.contains("1080") == true -> Qualities.P1080.value
-                    src.label?.contains("720")  == true -> Qualities.P720.value
-                    src.label?.contains("480")  == true -> Qualities.P480.value
-                    src.label?.contains("360")  == true -> Qualities.P360.value
-                    else -> Qualities.Unknown.value
-                }
-                if (streamUrl.contains(".m3u8", true)) {
-                    M3u8Helper.generateM3u8(name, streamUrl, "$pbOrigin/",
-                        headers = byse_mediaHeaders("$pbOrigin/")).forEach { link ->
-                        val finalQ = if (link.quality != Qualities.Unknown.value) link.quality else quality
-                        emit(newExtractorLink(link.source, link.name, link.url, link.type) {
-                            this.referer = link.referer; this.quality = finalQ; this.headers = link.headers
-                        })
-                    }
-                } else {
-                    emit(newExtractorLink(name, name, streamUrl, INFER_TYPE) {
-                        this.referer = "$pbOrigin/"; this.quality = quality
-                        this.headers = byse_mediaHeaders("$pbOrigin/")
-                    })
-                }
-                emitted = true
-            }
-        }
-        if (!emitted) {
-            val trimmed = json.trimStart()
-            val deep = when {
-                trimmed.startsWith("[") -> runCatching { byse_extractMediaUrlsFromJsonArray(JSONArray(trimmed)) }.getOrNull() ?: emptyList()
-                trimmed.startsWith("{") -> runCatching { byse_extractMediaUrlsFromJson(JSONObject(trimmed)) }.getOrNull() ?: emptyList()
-                else -> emptyList()
-            }
-            deep.distinct().forEach { raw ->
-                val streamUrl = byse_resolveUrl(raw, refererUrl, pbOrigin) ?: raw
-                emit(newExtractorLink(name, name, streamUrl, INFER_TYPE) {
-                    this.referer = "$pbOrigin/"; this.headers = byse_mediaHeaders("$pbOrigin/")
-                })
-                emitted = true
-            }
-        }
-        Log.e(TAG, "  emit → $emitted")
-        return emitted
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    private fun decryptBysePlayback(playback: JSONObject): String? {
-        // (a) v1–v3: iv / payload / key_parts → SHA-256(concat)
-        val ivB64 = playback.optString("iv"); val payloadB64 = playback.optString("payload")
-        val keyParts = playback.optJSONArray("key_parts")
-        if (ivB64.isNotBlank() && payloadB64.isNotBlank() && keyParts != null) {
-            val iv = byse_b64UrlDecode(ivB64); val ct = byse_b64UrlDecode(payloadB64)
-            if (iv != null && ct != null) {
-                val keyOut = java.io.ByteArrayOutputStream()
-                for (i in 0 until keyParts.length()) byse_b64UrlDecode(keyParts.optString(i))?.let { keyOut.write(it) }
-                if (keyOut.size() > 0) {
-                    val finalAesKey = MessageDigest.getInstance("SHA-256").digest(keyOut.toByteArray())
-                    byse_tryAesGcm(ct, finalAesKey, iv)?.let { b ->
-                        return String(b, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\t').takeIf { it.startsWith("{") || it.startsWith("[") }
-                    }
-                }
-            }
-        }
-        // (b) alternate schema: iv2 / payload2 / decrypt_keys.{edge_1, edge_2}
-        val iv2B64 = playback.optString("iv2"); val payload2B64 = playback.optString("payload2")
-        val dk = playback.optJSONObject("decrypt_keys")
-        if (iv2B64.isNotBlank() && payload2B64.isNotBlank() && dk != null) {
-            val iv2 = byse_b64UrlDecode(iv2B64); val ct2 = byse_b64UrlDecode(payload2B64)
-            val e1 = byse_b64UrlDecode(dk.optString("edge_1")); val e2 = byse_b64UrlDecode(dk.optString("edge_2"))
-            if (iv2 != null && ct2 != null && e1 != null && e2 != null) {
-                byse_tryAesGcm(ct2, e1 + e2, iv2)?.let { b ->
-                    return String(b, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\t').takeIf { it.startsWith("{") || it.startsWith("[") }
-                }
-            }
-        }
-        return null
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    private suspend fun tryExternalByseDecoder(playback: JSONObject, referer: String): String? = try {
-        val reqJson = JSONObject().apply { put("text", playback); put("agent", BYSE_UA) }
-        val resp = withTimeoutOrNull(6_000L) {
-            app.post("https://enc-dec.app/api/dec-byse",
-                headers = mapOf("User-Agent" to BYSE_UA, "Content-Type" to "application/json",
-                    "Origin" to "https://enc-dec.app", "Referer" to referer),
-                requestBody = reqJson.toString().toRequestBody("application/json; charset=utf-8".toMediaTypeOrNull()))
-        } ?: return null
-        val text = resp.text.trimStart()
-        if (resp.code != 200 || text.isBlank()) { Log.e(TAG, "  enc-dec → ${resp.code}"); return null }
-        Log.e(TAG, "  enc-dec → ${resp.code} len=${text.length}")
-        val root = JSONObject(text)
-        root.optJSONObject("result")?.toString()
-            ?: root.optJSONArray("result")?.toString()
-            ?: root.optString("result").takeIf { it.trimStart().let { t -> t.startsWith("{") || t.startsWith("[") } }
-    } catch (_: Exception) { null }
-
-    // ══════════════════════════════════════════════════════════════════════
-    //  Silent WebView — full-size off-screen (correct JS coordinate math),
-    //  18s timeout, sniffer injected
+    //  Silent WebView — full-size, off-screen, no dialog
     // ══════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun runSilentM3u8Interceptor(
@@ -870,27 +524,16 @@ open class ByseSX : ExtractorApi() {
                     setSupportMultipleWindows(false)
                     javaScriptCanOpenWindowsAutomatically = false
                 }
-                webChromeClient = object : android.webkit.WebChromeClient() {
-                    override fun onConsoleMessage(msg: android.webkit.ConsoleMessage?): Boolean {
-                        msg?.message()?.let { m -> if (m.contains("[SNIFF]")) Log.e(TAG, "  [silent] $m") }
-                        return true
-                    }
-                }
                 webViewClient = object : android.webkit.WebViewClient() {
-                    override fun onPageStarted(view: android.webkit.WebView?, u: String?, fav: android.graphics.Bitmap?) {
-                        super.onPageStarted(view, u, fav)
-                        view?.evaluateJavascript(BYSE_SNIFFER_JS, null)
-                    }
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(v: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
                     override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean {
-                        if (isAdHijack(request, urlToResolve)) { Log.e(TAG, "Ad blocked: ${request?.url}"); return true }
+                        if (isAdHijack(request, urlToResolve)) return true
                         return super.shouldOverrideUrlLoading(view, request)
                     }
                     override fun shouldInterceptRequest(v: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
                         val u = request?.url?.toString() ?: return null
                         if (u.contains(".m3u8") || u.contains(".m3u")) {
-                            Log.e(TAG, "  ✓ silent intercepted: $u")
                             val rh = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
                             rh["Referer"] = urlToResolve
                             activity.runOnUiThread { finish(InterceptResult(u, rh)) }
@@ -993,20 +636,12 @@ open class ByseSX : ExtractorApi() {
                         progressBar.progress = p
                         progressBar.visibility = if (p == 100) android.view.View.GONE else android.view.View.VISIBLE
                     }
-                    override fun onConsoleMessage(msg: android.webkit.ConsoleMessage?): Boolean {
-                        msg?.message()?.let { m -> if (m.contains("[SNIFF]")) Log.e(TAG, "  [interactive] $m") }
-                        return true
-                    }
                 }
                 webViewClient = object : android.webkit.WebViewClient() {
-                    override fun onPageStarted(view: android.webkit.WebView?, u: String?, fav: android.graphics.Bitmap?) {
-                        super.onPageStarted(view, u, fav)
-                        view?.evaluateJavascript(BYSE_SNIFFER_JS, null)
-                    }
                     @SuppressLint("WebViewClientOnReceivedSslError")
                     override fun onReceivedSslError(v: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
                     override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean {
-                        if (isAdHijack(request, urlToResolve)) { Log.e(TAG, "Ad blocked: ${request?.url}"); return true }
+                        if (isAdHijack(request, urlToResolve)) return true
                         return super.shouldOverrideUrlLoading(view, request)
                     }
                     override fun shouldInterceptRequest(v: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
@@ -1055,27 +690,3 @@ open class ByseSX : ExtractorApi() {
         }
     }
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-//  BYSE DATA CLASSES
-// ════════════════════════════════════════════════════════════════════════════
-@JsonIgnoreProperties(ignoreUnknown = true)
-data class ByseSource(
-    @JsonProperty("file")  val file:  String? = null,
-    @JsonProperty("label") val label: String? = null,
-    @JsonProperty("type")  val type:  String? = null,
-)
-
-@JsonIgnoreProperties(ignoreUnknown = true)
-data class ByseSubtitle(
-    @JsonProperty("file")     val file:     String? = null,
-    @JsonProperty("label")    val label:    String? = null,
-    @JsonProperty("language") val language: String? = null,
-)
-
-@JsonIgnoreProperties(ignoreUnknown = true)
-data class BysePlaybackDecrypt(
-    @JsonProperty("sources")   val sources:   List<ByseSource>?   = null,
-    @JsonProperty("tracks")    val tracks:    List<ByseSubtitle>? = null,
-    @JsonProperty("subtitles") val subtitles: List<ByseSubtitle>? = null,
-)
