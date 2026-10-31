@@ -33,7 +33,8 @@ class Vtbe : ExtractorApi() {
             val response = app.get(url, referer = mainUrl).document
             val script = response.selectFirst("script:containsData(function(p,a,c,k,e,d))")?.data() ?: return null
             val unpacked = JsUnpacker(script).unpack() ?: return null
-            val link = Regex(\"\"\"sources:\s*\[\s*\{\s*file:\s*['"](.*?)['\"]\"\"\").find(unpacked)?.groupValues?.get(1) ?: return null
+            val link = Regex("""sources:\s*\[\s*\{\s*file:\s*['"](.*?)['"]""")
+                .find(unpacked)?.groupValues?.get(1) ?: return null
 
             return listOf(
                 ExtractorLink(
@@ -52,13 +53,14 @@ class Vtbe : ExtractorApi() {
 }
 
 class OkRu : ExtractorApi() {
-    override val name = "OkRu" 
+    override val name = "OkRu"
     override val mainUrl = "https://ok.ru"
     override val requiresReferer = false
 
     override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
         try {
-            val id = Regex(\"\"\"/video(?:embed)?/(\d+)\"\"\").find(url)?.groupValues?.get(1) ?: url.substringAfterLast("/").substringBefore("?")
+            val id = Regex("""/video(?:embed)?/(\d+)""").find(url)?.groupValues?.get(1)
+                ?: url.substringAfterLast("/").substringBefore("?")
             if (id.isBlank()) return null
 
             val jsonStr = app.post("https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id").text
@@ -67,7 +69,7 @@ class OkRu : ExtractorApi() {
 
             val links = mutableListOf<ExtractorLink>()
             val videos = json.optJSONArray("videos")
-            
+
             if (videos != null && videos.length() > 0) {
                 for (i in 0 until videos.length()) {
                     val video = videos.getJSONObject(i)
@@ -79,17 +81,22 @@ class OkRu : ExtractorApi() {
                     val qualityValue = when (qName) {
                         "mobile" -> Qualities.P144.value
                         "lowest" -> Qualities.P240.value
-                        "low" -> Qualities.P360.value
-                        "sd" -> Qualities.P480.value
-                        "hd" -> Qualities.P720.value
-                        "full" -> Qualities.P1080.value
-                        "quad" -> Qualities.P1440.value
-                        "ultra" -> Qualities.P2160.value
-                        else -> Qualities.Unknown.value
+                        "low"    -> Qualities.P360.value
+                        "sd"     -> Qualities.P480.value
+                        "hd"     -> Qualities.P720.value
+                        "full"   -> Qualities.P1080.value
+                        "quad"   -> Qualities.P1440.value
+                        "ultra"  -> Qualities.P2160.value
+                        else     -> Qualities.Unknown.value
                     }
 
                     links.add(
-                        newExtractorLink(name = "${this.name} MP4", source = "${this.name} MP4", url = vidUrl.replace("\\\\u0026", "&").replace("\\\\/", "/"), type = INFER_TYPE) {
+                        newExtractorLink(
+                            name = "${this.name} MP4",
+                            source = "${this.name} MP4",
+                            url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"),
+                            type = INFER_TYPE
+                        ) {
                             this.referer = "https://ok.ru/"
                             this.quality = qualityValue
                         }
@@ -99,7 +106,13 @@ class OkRu : ExtractorApi() {
 
             val hlsUrl = json.optString("hlsManifestUrl")
             if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
-                links.addAll(M3u8Helper.generateM3u8("$name HLS", hlsUrl.replace("\\\\u0026", "&").replace("\\\\/", "/"), url))
+                links.addAll(
+                    M3u8Helper.generateM3u8(
+                        "$name HLS",
+                        hlsUrl.replace("\\u0026", "&").replace("\\/", "/"),
+                        url
+                    )
+                )
             }
 
             return links
@@ -116,8 +129,13 @@ class Dtube : ExtractorApi() {
 
     override suspend fun getUrl(url: String, referer: String?): List<ExtractorLink>? {
         try {
-            var videoId = Regex(\"\"\"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\"\"\", RegexOption.IGNORE_CASE).find(url)?.groupValues?.get(1)
-            val shortId = Regex(\"\"\"[?&]v=([a-zA-Z0-9_-]+)\"\"\").find(url)?.groupValues?.get(1) ?: if (videoId == null) url.substringAfterLast("/").takeIf { it.isNotBlank() } else null
+            var videoId = Regex(
+                """([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})""",
+                RegexOption.IGNORE_CASE
+            ).find(url)?.groupValues?.get(1)
+
+            val shortId = Regex("""[?&]v=([a-zA-Z0-9_-]+)""").find(url)?.groupValues?.get(1)
+                ?: if (videoId == null) url.substringAfterLast("/").takeIf { it.isNotBlank() } else null
 
             val lookupId = shortId ?: videoId
             if (lookupId != null) {
@@ -139,7 +157,7 @@ class Dtube : ExtractorApi() {
                         }
                     }
                 } catch (e: Exception) {
-                    // Suppress API exceptions, fallback to probing nodes
+                    // Fall back to probing nodes
                 }
             }
 
@@ -152,7 +170,7 @@ class Dtube : ExtractorApi() {
                             return M3u8Helper.generateM3u8(name, m3u8Url, url)
                         }
                     } catch (e: Exception) {
-                        // Suppress node failure, try next node
+                        // Try next node
                     }
                 }
             }
@@ -173,7 +191,7 @@ class Rumble : ExtractorApi() {
         private const val SPLIT_TIMEOUT_MS = 2_500L
 
         private val RE_VIDEO_URL = Regex(
-            """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>''""]+\.(?:mp4|m3u8)[^"'\s<>''""]*"""
+            """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*"""
         )
         private val RE_QUALITY_H = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""")
         private val RE_QUALITY_BRACE = Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
@@ -205,7 +223,7 @@ class Rumble : ExtractorApi() {
             catch (e: Exception) { null }
         } ?: return
 
-        // 1. API path — extract videoId from Rumble("play", {...}) config block, hit API
+        // 1. API path — extract videoId from Rumble("play", {...}) config block
         val configMatch = RE_JSON_CONFIG.find(html)
         if (configMatch != null) {
             val jsonBody = "{" + configMatch.groupValues[1] + "}"
@@ -224,7 +242,7 @@ class Rumble : ExtractorApi() {
                     // Both API endpoints emitted nothing — fall through to HTML scrape
                 }
             } catch (e: Exception) {
-                // Malformed JSON — fall through to HTML scrape
+                // Malformed JSON — fall through
             }
         }
 
@@ -234,8 +252,7 @@ class Rumble : ExtractorApi() {
         extractFromScriptData(scriptData, url, callback)
     }
 
-    /** Extracts all playable URLs from a Rumble script-data blob.
-     *  Returns true if at least one link was emitted via [callback]. */
+    /** Returns true if at least one link was emitted via [callback]. */
     private suspend fun extractFromScriptData(
         scriptData: String,
         url: String,
@@ -244,7 +261,7 @@ class Rumble : ExtractorApi() {
         val scrapedUrls = LinkedHashSet<String>()
         var emitted = false
 
-        // ===================== PASS 1 — strict =====================
+        // PASS 1 — strict (rumble.com only, full junk filter)
         RE_VIDEO_URL.findAll(scriptData).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
 
@@ -257,7 +274,7 @@ class Rumble : ExtractorApi() {
             }
         }
 
-        // ===================== PASS 2 — trailer fallback =====================
+        // PASS 2 — trailer fallback (only if strict pass emitted nothing)
         if (!emitted) {
             RE_VIDEO_URL.findAll(scriptData).forEach { match ->
                 val cleanUrl = match.value.replace("\\/", "/")
