@@ -682,7 +682,7 @@ class Rumble : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PLEX EXTRACTOR — hlsVideo* fix (no WebView — API-based as you wanted)
+//  PLEX EXTRACTOR — hlsVideo* fix (Removed Tiktok tag)
 // ════════════════════════════════════════════════════════════════════════════
 class P2pstream : ExtractorApi() {
     override val name = "Plex"
@@ -948,17 +948,19 @@ class P2pstream : ExtractorApi() {
             Log.e(TAG, "    ★ $k [$provider] → ${resolved.take(120)}")
 
             if (resolved.contains(".m3u8", true) || resolved.contains("/hls/", true)) {
-                val variants = try { withTimeoutOrNull(6_000L) { M3u8Helper.generateM3u8("$name [$provider]", resolved, "$origin/", headers = headers) } } catch (_: Exception) { null }
+                val variants = try { withTimeoutOrNull(6_000L) { M3u8Helper.generateM3u8(name, resolved, "$origin/", headers = headers) } } catch (_: Exception) { null }
                 if (!variants.isNullOrEmpty()) {
                     variants.forEach(callback)
                     Log.e(TAG, "    ✓ $provider: ${variants.size} variants emitted")
                     return true
                 }
                 Log.e(TAG, "    ⚠ $provider: 0 variants, emitting raw m3u8")
-                callback(newExtractorLink(name, "$name [$provider]", resolved, ExtractorLinkType.M3U8) { this.referer = "$origin/"; this.headers = headers })
+                // REMOVED [provider] TAG
+                callback(newExtractorLink(name, name, resolved, ExtractorLinkType.M3U8) { this.referer = "$origin/"; this.headers = headers })
                 return true
             } else {
-                callback(newExtractorLink(name, "$name [$provider]", resolved, INFER_TYPE) { this.referer = "$origin/"; this.headers = headers })
+                // REMOVED [provider] TAG
+                callback(newExtractorLink(name, name, resolved, INFER_TYPE) { this.referer = "$origin/"; this.headers = headers })
                 return true
             }
         }
@@ -982,7 +984,7 @@ class P2pstream : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  ABYSS EXTRACTOR
+//  ABYSS EXTRACTOR — Updated Quality parsing
 // ════════════════════════════════════════════════════════════════════════════
 class AbyssPlayer : ExtractorApi() {
     override val name = "Abyss"
@@ -1031,11 +1033,25 @@ class AbyssPlayer : ExtractorApi() {
                     val srcObj = sourcesArr.optJSONObject(i)
                     val srcUrl = srcObj?.optString("url") ?: sourcesArr.optString(i)
                     if (srcUrl.isBlank() || !srcUrl.startsWith("http")) continue
-                    val qLabel = srcObj?.optString("label") ?: ""
+                    
+                    // 1. Check explicit fields
+                    val qLabel = (srcObj?.optString("label") ?: "").ifBlank { srcObj?.optString("quality") ?: "" }
+                    
+                    // 2. Check URL path for resolution (e.g. /1080p/, /720p/)
+                    val urlQuality = Regex("""(2160|1440|1080|720|480|360)p?""")
+                        .find(srcUrl)?.groupValues?.get(1)?.toIntOrNull() ?: Qualities.Unknown.value
+
+                    // 3. Determine final quality
                     val quality = when {
-                        qLabel.contains("1080") -> Qualities.P1080.value; qLabel.contains("720") -> Qualities.P720.value
-                        qLabel.contains("480") -> Qualities.P480.value; else -> Qualities.Unknown.value
+                        qLabel.contains("2160") || qLabel.contains("4K", true) || urlQuality == 2160 -> Qualities.P2160.value
+                        qLabel.contains("1440") || urlQuality == 1440 -> Qualities.P1440.value
+                        qLabel.contains("1080") || qLabel.contains("FHD", true) || urlQuality == 1080 -> Qualities.P1080.value
+                        qLabel.contains("720") || qLabel.contains("HD", true) || urlQuality == 720 -> Qualities.P720.value
+                        qLabel.contains("480") || qLabel.contains("SD", true) || urlQuality == 480 -> Qualities.P480.value
+                        qLabel.contains("360") || urlQuality == 360 -> Qualities.P360.value
+                        else -> Qualities.Unknown.value
                     }
+
                     if (srcUrl.contains(".m3u8", true)) {
                         M3u8Helper.generateM3u8(name, srcUrl, "$initialOrigin/", headers = streamHeaders).forEach { link ->
                             val finalQ = if (link.quality != Qualities.Unknown.value) link.quality else quality
