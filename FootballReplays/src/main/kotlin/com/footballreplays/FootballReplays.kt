@@ -1,4 +1,4 @@
-package com.footreplays
+package com.footballreplays
 
 import android.util.Log
 import org.jsoup.nodes.Element
