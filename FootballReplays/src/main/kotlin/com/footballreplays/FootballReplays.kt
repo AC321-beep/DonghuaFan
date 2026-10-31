@@ -39,7 +39,7 @@ class FootballReplays : MainAPI() {
         return headers
     }
 
-    // 🎯 NEW: Uses CFSolver for the main site!
+    // 🎯 Uses CFSolver for the main site
     private suspend fun fetchHtml(url: String): String {
         // 1. Check if CFSolver already has the cached HTML
         CFState.getSolvedHtml(url)?.let { return it }
@@ -55,7 +55,7 @@ class FootballReplays : MainAPI() {
         // 3. Fallback to CFSolver
         Log.e("FootballReplays", "→ CF Challenge detected on $url. Using CFSolver...")
         CFSolver(url).solve()
-        
+
         // 4. Return solved HTML or retry HTTP
         return CFState.getSolvedHtml(url) ?: try {
             app.get(url, headers = getPosterHeaders()).text
@@ -101,7 +101,9 @@ class FootballReplays : MainAPI() {
         return newSearchResponseList(aramaCevap, hasNext = true)
     }
 
-    override suspend fun quickSearch(query: String): List<SearchResponse>? = search(query)
+    // ✅ FIX: pass page argument; return the items list
+    override suspend fun quickSearch(query: String): List<SearchResponse>? =
+        search(query, 1).items
 
     override suspend fun load(url: String): LoadResponse? {
         val html = fetchHtml(url)
@@ -115,7 +117,7 @@ class FootballReplays : MainAPI() {
 
         val kickOffRegex = Regex("""Kick-off:\s*([^.]+)""", RegexOption.IGNORE_CASE)
         val kickOffMatch = kickOffRegex.find(rawDescription)?.groupValues?.getOrNull(1)
-        
+
         val fallbackDate = document.selectFirst("time.updated-date")?.text()
             ?.replace("Last updated:", "", ignoreCase = true)?.trim()
         val displayDate = kickOffMatch ?: fallbackDate
@@ -123,14 +125,14 @@ class FootballReplays : MainAPI() {
         val episodes = mutableListOf<Episode>()
         document.select("table.video-table").forEachIndexed { _, table ->
             val sourceName = table.selectFirst("thead tr th[colspan]")?.text()?.trim() ?: "Source"
-            
+
             table.select("tbody tr").forEachIndexed { _, tr ->
                 val part = tr.select("td").firstOrNull()?.text()?.trim() ?: "Video"
                 val onclickAttr = tr.selectFirst("a.play-button")?.attr("onclick") ?: return@forEachIndexed
-                
+
                 val regex = Regex("""loadVideo\('([^']+)'\)""")
                 val videoUrl = regex.find(onclickAttr)?.groupValues?.get(1) ?: return@forEachIndexed
-                
+
                 val episodeData = "$videoUrl|$sourceName - $part"
                 val currentEpisodeSize = episodes.size
 
@@ -155,7 +157,7 @@ class FootballReplays : MainAPI() {
 
         return newTvSeriesLoadResponse(title, url, TvType.Others, episodes) {
             this.posterUrl = poster
-            this.posterHeaders = getPosterHeaders() 
+            this.posterHeaders = getPosterHeaders()
             this.plot = plotText
             this.year = year
             this.tags = document.select("div.efoot-bar.tag-bar a").map { it.text() }
@@ -203,15 +205,20 @@ class FootballReplays : MainAPI() {
         val uri = try { URI(iframeUrl) } catch (_: Exception) { null }
         val path = uri?.path ?: ""
         val looksLikeByse = uri != null && (
-            path.contains("/d/") || 
-            path.contains("/e/") || 
-            path.contains("/v/") || 
+            path.contains("/d/") ||
+            path.contains("/e/") ||
+            path.contains("/v/") ||
             uri.host?.contains("byse") == true
         )
 
         if (looksLikeByse) {
             try {
+                // ✅ FIX: collect inside the non-suspend callback, emit outside in suspend scope
+                val byseLinks = mutableListOf<ExtractorLink>()
                 ByseSX().getUrl(iframeUrl, "$mainUrl/", subtitleCallback) { link ->
+                    byseLinks.add(link)
+                }
+                for (link in byseLinks) {
                     emitted++
                     callback(newExtractorLink(
                         source = customName,
