@@ -258,7 +258,7 @@ class Bysekoze : ExtractorApi() {
 
         if (shellHtml.isNotBlank() && !isErrorPage(shellHtml)) {
             // 3. Decrypt the HTML using SHA-256 + AES-GCM
-            if (decryptInline(shellHtml, origin, shellUrl, subtitleCallback, safeEmit) != null) {
+            if (decryptInline(shellHtml, origin, shellUrl, subtitleCallback, safeEmit)) {
                 Log.e(TAG, "✓ Byse resolved via HTTP/CFSolver + Inline JSON")
                 return
             }
@@ -273,7 +273,7 @@ class Bysekoze : ExtractorApi() {
                     app.get(iframeUrl, headers = chromeHeaders(referer = shellUrl)).text
                 } catch (_: Exception) { "" }
                 
-                if (playerHtml.isNotBlank() && decryptInline(playerHtml, originOf(iframeUrl) ?: origin, iframeUrl, subtitleCallback, safeEmit) != null) {
+                if (playerHtml.isNotBlank() && decryptInline(playerHtml, originOf(iframeUrl) ?: origin, iframeUrl, subtitleCallback, safeEmit)) {
                     Log.e(TAG, "✓ Byse resolved via iframe")
                     return
                 }
@@ -281,7 +281,8 @@ class Bysekoze : ExtractorApi() {
         }
 
         // 5. REST API Fallback (uses the cf_clearance cookie set by CFSolver)
-        if (tryRestApiPath(url, origin, hash, referer, subtitleCallback, safeEmit)) {
+        tryRestApiPath(url, origin, hash, referer, subtitleCallback, coord, safeEmit)
+        if (anyEmitted.get()) {
             Log.e(TAG, "✓ Byse resolved via REST API")
             return
         }
@@ -291,20 +292,19 @@ class Bysekoze : ExtractorApi() {
     }
 
     private suspend fun decryptInline(html: String, origin: String, refererUrl: String,
-        subtitleCallback: (SubtitleFile) -> Unit, emit: (ExtractorLink) -> Unit): Unit? {
-        val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return null
-        val iv        = Regex(""""iv"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return null
-        val payload   = Regex(""""payload"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return null
-        val keyParts  = Regex(""""key_parts"\s*:\s*\[(.*?)\]""").find(html)?.groupValues?.get(1) ?: return null
+        subtitleCallback: (SubtitleFile) -> Unit, emit: (ExtractorLink) -> Unit): Boolean {
+        val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return false
+        val iv        = Regex(""""iv"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return false
+        val payload   = Regex(""""payload"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return false
+        val keyParts  = Regex(""""key_parts"\s*:\s*\[(.*?)\]""").find(html)?.groupValues?.get(1) ?: return false
         val kp = keyParts.split(",").map { it.replace("\"", "").trim() }.filter { it.isNotBlank() }
-        if (kp.isEmpty()) return null
+        if (kp.isEmpty()) return false
         val pbJson = """{"playback":{"algorithm":"$algorithm","iv":"$iv","payload":"$payload","key_parts":[${kp.joinToString(",") { "\"$it\"" }}]}}"""
-        val pbObj = runCatching { JSONObject(pbJson).optJSONObject("playback") }.getOrNull() ?: return null
+        val pbObj = runCatching { JSONObject(pbJson).optJSONObject("playback") }.getOrNull() ?: return false
         
         // Local decryption ONLY (External decoder removed)
-        val decrypted = decryptBysePlayback(pbObj) ?: return null
-        emitDecrypted(decrypted, origin, refererUrl, subtitleCallback, emit)
-        return Unit
+        val decrypted = decryptBysePlayback(pbObj) ?: return false
+        return emitDecrypted(decrypted, origin, refererUrl, subtitleCallback, emit)
     }
 
     private suspend fun tryRestApiPath(url: String, origin: String, hash: String, referer: String?,
