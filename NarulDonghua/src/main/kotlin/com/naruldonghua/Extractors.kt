@@ -17,7 +17,10 @@ import com.lagradost.cloudstream3.utils.INFER_TYPE
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -25,12 +28,10 @@ import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.Cipher
-import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.coroutines.resume
@@ -39,12 +40,9 @@ internal const val DEFAULT_UA =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaTypeOrNull()
-private val RE_M3U8_ANY   = Regex("""(https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
-private val RE_MP4_ANY    = Regex("""(https?://[^"'\s\\<>]+\.(?:mp4|mkv)[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
-private val RE_IFRAME     = Regex("""<iframe[^>]+src\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-private val RE_ORIGIN     = Regex("""^(https?://[^/?#]+)""", RegexOption.IGNORE_CASE)
-private val RE_HOST       = Regex("""^https?://([^/?#:]+)""", RegexOption.IGNORE_CASE)
-private val RE_WHITESPACE = Regex("""\s+""")
+private val RE_M3U8_ANY = Regex("""(https?://[^"'\s\\<>]+\.m3u8[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
+private val RE_MP4_ANY  = Regex("""(https?://[^"'\s\\<>]+\.(?:mp4|mkv)[^"'\s\\<>]*)""", RegexOption.IGNORE_CASE)
+private val RE_IFRAME   = Regex("""<iframe[^>]+src\s*=\s*["']([^"']+)["']""", RegexOption.IGNORE_CASE)
 
 // ════════════════════════════════════════════════════════════════════════════
 //  JACKSON SCHEMA
@@ -84,11 +82,9 @@ private fun mediaHeadersMinimal(referer: String): Map<String, String> = mapOf(
 )
 
 internal fun originOf(url: String): String? =
-    RE_ORIGIN.find(url.trim())?.groupValues?.getOrNull(1)
-
+    Regex("""^(https?://[^/?#]+)""", RegexOption.IGNORE_CASE).find(url.trim())?.groupValues?.getOrNull(1)
 internal fun hostOf(url: String): String? =
-    RE_HOST.find(url.trim())?.groupValues?.getOrNull(1)?.lowercase()
-
+    Regex("""^https?://([^/?#:]+)""", RegexOption.IGNORE_CASE).find(url.trim())?.groupValues?.getOrNull(1)?.lowercase()
 internal fun isErrorPage(html: String): Boolean {
     if (html.isBlank()) return true
     val lower = html.lowercase()
@@ -96,7 +92,6 @@ internal fun isErrorPage(html: String): Boolean {
     if (html.length < 10_000 && (lower.contains("<title>404") || lower.contains("404 not found") || lower.contains("503 service"))) return true
     return false
 }
-
 internal fun resolveUrl(uri: String, masterUrl: String, origin: String): String? {
     val trimmed = uri.trim().replace("&amp;", "&")
     if (trimmed.isEmpty() || trimmed.startsWith("javascript:", true) || trimmed.startsWith("data:", true)) return null
@@ -114,52 +109,38 @@ internal fun resolveUrl(uri: String, masterUrl: String, origin: String): String?
 private fun hexToBytes(hex: String): ByteArray? {
     if (hex.isEmpty() || hex.length % 2 != 0) return null
     return ByteArray(hex.length / 2) { i ->
-        val hi = Character.digit(hex[i * 2], 16)
-        val lo = Character.digit(hex[i * 2 + 1], 16)
-        if (hi == -1 || lo == -1) return null
-        ((hi shl 4) or lo).toByte()
+        ((Character.digit(hex[i * 2], 16) shl 4) or Character.digit(hex[i * 2 + 1], 16)).toByte()
     }
 }
-
 private fun bytesToHex(b: ByteArray): String = b.joinToString("") { "%02x".format(it) }
-
 private fun b64UrlDecode(input: String): ByteArray? = try {
-    val cleaned = input.trim().replace('-', '+').replace('_', '/').replace(RE_WHITESPACE, "")
-    val padded = cleaned.padEnd((cleaned.length + 3) / 4 * 4, '=')
-    Base64.decode(padded, Base64.DEFAULT)
+    Base64.decode(input.trim().replace('-', '+').replace('_', '/').replace(Regex("\\s+"), "").padEnd((input.length + 3) / 4 * 4, '='), Base64.DEFAULT)
 } catch (_: Exception) { null }
-
-private fun decodePayloadBytes(payload: String, isHex: Boolean): ByteArray? {
-    val clean = payload.trim().removeSurrounding("\"")
-    return if (isHex) hexToBytes(clean) else b64UrlDecode(clean)
-}
-
+private fun decodePayloadBytes(payload: String, isHex: Boolean): ByteArray? =
+    if (isHex) hexToBytes(payload.trim().removeSurrounding("\"")) else b64UrlDecode(payload.trim().removeSurrounding("\""))
 private fun tryAesGcm(ctAndTag: ByteArray, key: ByteArray, nonce: ByteArray): ByteArray? = try {
     Cipher.getInstance("AES/GCM/NoPadding").apply {
-        init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
+        init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), javax.crypto.spec.GCMParameterSpec(128, nonce))
     }.doFinal(ctAndTag)
 } catch (_: Exception) { null }
-
 private fun tryAesCbc(ct: ByteArray, key: ByteArray, iv: ByteArray): ByteArray? {
     if (ct.isEmpty() || ct.size % 16 != 0) return null
     if (key.size !in listOf(16, 24, 32) || iv.size != 16) return null
     return try {
-        Cipher.getInstance("AES/CBC/PKCS5Padding").apply {
-            init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-        }.doFinal(ct)
+        val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
+        c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+        c.doFinal(ct)
     } catch (_: Exception) { null }
 }
-
 private fun tryAesEcb(ct: ByteArray, key: ByteArray): ByteArray? {
     if (ct.isEmpty() || ct.size % 16 != 0) return null
     if (key.size !in listOf(16, 24, 32)) return null
     return try {
-        Cipher.getInstance("AES/ECB/PKCS5Padding").apply {
-            init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"))
-        }.doFinal(ct)
+        val c = Cipher.getInstance("AES/ECB/PKCS5Padding")
+        c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"))
+        c.doFinal(ct)
     } catch (_: Exception) { null }
 }
-
 private fun likelyPlain(s: String): Boolean =
     s.isNotBlank() && s.length > 8 && !s.contains('\u0000') &&
     s.count { it.code in 32..126 || it.code == 9 || it.code == 10 || it.code == 13 } / s.length.toFloat() > 0.55f
@@ -197,7 +178,6 @@ private fun extractMediaUrlsFromJson(json: JSONObject, depth: Int = 0): List<Str
     }
     return urls
 }
-
 private fun extractMediaUrlsFromJsonArray(arr: JSONArray, depth: Int = 0): List<String> {
     if (depth > 5) return emptyList()
     val urls = mutableListOf<String>()
@@ -232,29 +212,11 @@ class Bysekoze : ExtractorApi() {
         )
         private val ALLOWED_HOSTS: Set<String> = KNOWN_BYSE_HOSTS.mapNotNull { hostOf(it) }.toSet()
 
-        private val RE_HASH_PATH = Regex("""/(?:d|embed|e|v|video|download|a2lyf|cx5h|w6u1)/([a-zA-Z0-9]{8,32})""")
-        private val RE_HASH_RAW  = Regex("""^[a-zA-Z0-9]{8,32}$""")
-        private val RE_ALGO      = Regex(""""algorithm"\s*:\s*"([^"]+)"""")
-        private val RE_IV        = Regex(""""iv"\s*:\s*"([^"]+)"""")
-        private val RE_PAYLOAD   = Regex(""""payload"\s*:\s*"([^"]+)"""")
-        private val RE_KEY_PARTS = Regex(""""key_parts"\s*:\s*\[(.*?)\]""")
-
-        private val AUTO_PLAY_JS = """
-            (function() {
-                window.open = function() { return null; };
-                var vids = document.querySelectorAll('video');
-                var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .plyr__control--overlaid, [class*="play"]');
-                if (vids.length > 0 || buttons.length > 0) {
-                    buttons.forEach(b => b.click());
-                    vids.forEach(v => { v.muted = true; var p = v.play(); if (p !== undefined) p.catch(e => {}); });
-                }
-            })();
-        """.trimIndent()
-
         private fun extractHash(url: String): String? {
             val clean = url.substringBefore("?").substringBefore("#").trimEnd('/')
-            RE_HASH_PATH.find(clean)?.let { return it.groupValues[1] }
-            return clean.substringAfterLast('/').takeIf { RE_HASH_RAW.matches(it) }
+            Regex("""/(?:d|embed|e|v|video|download|a2lyf|cx5h|w6u1)/([a-zA-Z0-9]{8,32})""")
+                .find(clean)?.let { return it.groupValues[1] }
+            return clean.substringAfterLast('/').takeIf { it.matches(Regex("^[a-zA-Z0-9]{8,32}$")) }
         }
     }
 
@@ -268,7 +230,8 @@ class Bysekoze : ExtractorApi() {
     data class InterceptResult(val url: String, val headers: Map<String, String>)
 
     private fun isAdHijack(request: android.webkit.WebResourceRequest?, shellUrl: String): Boolean {
-        if (request == null || !request.isForMainFrame) return false
+        if (request == null) return false
+        if (!request.isForMainFrame) return false
         val reqUrl = request.url.toString()
         if (reqUrl.startsWith("data:") || reqUrl.startsWith("blob:") || reqUrl.startsWith("about:")) return false
         val reqHost = hostOf(reqUrl) ?: return false
@@ -303,7 +266,7 @@ class Bysekoze : ExtractorApi() {
             Log.e(TAG, "→ Shell blocked by CF or missing payload, using Silent CFSolver...")
             CFSolver(shellUrl).solve()
             shellHtml = CFState.getSolvedHtml(shellUrl) ?: ""
-
+            
             if (shellHtml.isBlank()) {
                 shellHtml = try { app.get(shellUrl, headers = chromeHeaders(referer = referer ?: "$origin/")).text } catch (_: Exception) { "" }
             }
@@ -315,7 +278,7 @@ class Bysekoze : ExtractorApi() {
                 Log.e(TAG, "✓ Byse resolved via Shell + Inline JSON")
                 return
             }
-
+            
             // 4. Iframe Discovery
             val iframeUrl = RE_IFRAME.find(shellHtml)?.groupValues?.getOrNull(1)?.let { resolveUrl(it, shellUrl, origin) }
             if (iframeUrl != null) {
@@ -336,7 +299,7 @@ class Bysekoze : ExtractorApi() {
                     Log.e(TAG, "→ Iframe blocked by CF, using Silent CFSolver...")
                     CFSolver(iframeUrl).solve()
                     playerHtml = CFState.getSolvedHtml(iframeUrl) ?: ""
-
+                    
                     if (playerHtml.isBlank()) {
                         playerHtml = try { app.get(iframeUrl, headers = chromeHeaders(referer = shellUrl)).text } catch (_: Exception) { "" }
                     }
@@ -383,15 +346,15 @@ class Bysekoze : ExtractorApi() {
 
     private suspend fun decryptInline(html: String, origin: String, refererUrl: String,
         subtitleCallback: (SubtitleFile) -> Unit, emit: (ExtractorLink) -> Unit): Boolean {
-        val algorithm = RE_ALGO.find(html)?.groupValues?.get(1) ?: return false
-        val iv        = RE_IV.find(html)?.groupValues?.get(1) ?: return false
-        val payload   = RE_PAYLOAD.find(html)?.groupValues?.get(1) ?: return false
-        val keyParts  = RE_KEY_PARTS.find(html)?.groupValues?.get(1) ?: return false
+        val algorithm = Regex(""""algorithm"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return false
+        val iv        = Regex(""""iv"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return false
+        val payload   = Regex(""""payload"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1) ?: return false
+        val keyParts  = Regex(""""key_parts"\s*:\s*\[(.*?)\]""").find(html)?.groupValues?.get(1) ?: return false
         val kp = keyParts.split(",").map { it.replace("\"", "").trim() }.filter { it.isNotBlank() }
         if (kp.isEmpty()) return false
         val pbJson = """{"playback":{"algorithm":"$algorithm","iv":"$iv","payload":"$payload","key_parts":[${kp.joinToString(",") { "\"$it\"" }}]}}"""
         val pbObj = runCatching { JSONObject(pbJson).optJSONObject("playback") }.getOrNull() ?: return false
-
+        
         val decrypted = decryptBysePlayback(pbObj) ?: tryExternalByseDecoder(pbObj, refererUrl) ?: return false
         return emitDecrypted(decrypted, origin, refererUrl, subtitleCallback, emit)
     }
@@ -427,12 +390,11 @@ class Bysekoze : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit, emit: (ExtractorLink) -> Unit): Boolean {
         val playback = tryParseJson<BysePlayback>(json)
         var emitted = false
-        val minHeaders = mediaHeadersMinimal("$pbOrigin/")
         if (playback != null) {
             (playback.tracks ?: playback.subtitles)?.forEach { sub ->
                 sub.file?.takeIf { it.isNotBlank() }?.let { f ->
                     subtitleCallback(newSubtitleFile(sub.label ?: "Sub", resolveUrl(f, refererUrl, pbOrigin) ?: f) {
-                        this.headers = minHeaders
+                        this.headers = mediaHeadersMinimal("$pbOrigin/")
                     })
                 }
             }
@@ -446,10 +408,10 @@ class Bysekoze : ExtractorApi() {
                     else -> Qualities.Unknown.value
                 }
                 if (streamUrl.contains(".m3u8", true)) {
-                    M3u8Helper.generateM3u8(name, streamUrl, "$pbOrigin/", headers = minHeaders).forEach { emit(it) }
+                    M3u8Helper.generateM3u8(name, streamUrl, "$pbOrigin/", headers = mediaHeadersMinimal("$pbOrigin/")).forEach { emit(it) }
                 } else {
                     emit(newExtractorLink(name, name, streamUrl, INFER_TYPE) {
-                        this.referer = "$pbOrigin/"; this.quality = quality; this.headers = minHeaders
+                        this.referer = "$pbOrigin/"; this.quality = quality; this.headers = mediaHeadersMinimal("$pbOrigin/")
                     })
                 }
                 emitted = true
@@ -465,7 +427,7 @@ class Bysekoze : ExtractorApi() {
             deep.distinct().forEach { raw ->
                 val streamUrl = resolveUrl(raw, refererUrl, pbOrigin) ?: raw
                 emit(newExtractorLink(name, name, streamUrl, INFER_TYPE) {
-                    this.referer = "$pbOrigin/"; this.headers = minHeaders
+                    this.referer = "$pbOrigin/"; this.headers = mediaHeadersMinimal("$pbOrigin/")
                 })
                 emitted = true
             }
@@ -479,11 +441,13 @@ class Bysekoze : ExtractorApi() {
         if (ivB64.isNotBlank() && payloadB64.isNotBlank() && keyParts != null) {
             val iv = b64UrlDecode(ivB64); val ct = b64UrlDecode(payloadB64)
             if (iv != null && ct != null) {
-                val keyOut = ByteArrayOutputStream()
+                val keyOut = java.io.ByteArrayOutputStream()
                 for (i in 0 until keyParts.length()) b64UrlDecode(keyParts.optString(i))?.let { keyOut.write(it) }
                 if (keyOut.size() > 0) {
-                    // SHA-256 Fix: Hash the concatenated key parts to get a valid 32-byte AES key
-                    val finalAesKey = MessageDigest.getInstance("SHA-256").digest(keyOut.toByteArray())
+                    // 🎯 SHA-256 Fix: Hash the concatenated key parts to get a valid 32-byte AES key
+                    val rawKeyBytes = keyOut.toByteArray()
+                    val finalAesKey = MessageDigest.getInstance("SHA-256").digest(rawKeyBytes)
+                    
                     tryAesGcm(ct, finalAesKey, iv)?.let { b ->
                         return String(b, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\t').takeIf { it.startsWith("{") || it.startsWith("[") }
                     }
@@ -523,36 +487,6 @@ class Bysekoze : ExtractorApi() {
     //  WEBVIEW INTERCEPTORS — ULTIMATE FALLBACK
     // ══════════════════════════════════════════════════════════════════════════
     @SuppressLint("SetJavaScriptEnabled")
-    private fun configureInterceptorWebView(
-        wv: android.webkit.WebView,
-        activity: android.app.Activity,
-        urlToResolve: String,
-        onIntercept: (InterceptResult) -> Unit
-    ) {
-        wv.settings.apply {
-            javaScriptEnabled = true; domStorageEnabled = true; useWideViewPort = true
-            loadWithOverviewMode = true; mediaPlaybackRequiresUserGesture = false
-            userAgentString = DEFAULT_UA; setSupportMultipleWindows(false); javaScriptCanOpenWindowsAutomatically = false
-        }
-        wv.webViewClient = object : android.webkit.WebViewClient() {
-            @SuppressLint("WebViewClientOnReceivedSslError")
-            override fun onReceivedSslError(v: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
-            override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean {
-                if (isAdHijack(request, urlToResolve)) { Log.e(TAG, "Ad blocked: ${request?.url}"); return true }
-                return super.shouldOverrideUrlLoading(view, request)
-            }
-            override fun shouldInterceptRequest(v: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
-                val u = request?.url?.toString() ?: return null
-                if (u.contains(".m3u8") || u.contains(".m3u")) {
-                    val rh = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
-                    rh["Referer"] = urlToResolve
-                    activity.runOnUiThread { onIntercept(InterceptResult(u, rh)) }
-                }
-                return super.shouldInterceptRequest(v, request)
-            }
-        }
-    }
-
     private suspend fun runSilentM3u8Interceptor(activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>): InterceptResult? = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             val root = activity.window?.decorView as? android.view.ViewGroup
@@ -573,7 +507,28 @@ class Bysekoze : ExtractorApi() {
             val wv = android.webkit.WebView(activity).apply {
                 layoutParams = android.view.ViewGroup.LayoutParams(activity.resources.displayMetrics.widthPixels, activity.resources.displayMetrics.heightPixels)
                 translationX = 20000f
-                configureInterceptorWebView(this, activity, urlToResolve, ::finish)
+                settings.apply {
+                    javaScriptEnabled = true; domStorageEnabled = true; useWideViewPort = true
+                    loadWithOverviewMode = true; mediaPlaybackRequiresUserGesture = false
+                    userAgentString = DEFAULT_UA; setSupportMultipleWindows(false); javaScriptCanOpenWindowsAutomatically = false
+                }
+                webViewClient = object : android.webkit.WebViewClient() {
+                    @SuppressLint("WebViewClientOnReceivedSslError")
+                    override fun onReceivedSslError(v: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
+                    override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean {
+                        if (isAdHijack(request, urlToResolve)) { Log.e(TAG, "Ad blocked: ${request?.url}"); return true }
+                        return super.shouldOverrideUrlLoading(view, request)
+                    }
+                    override fun shouldInterceptRequest(v: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
+                        val u = request?.url?.toString() ?: return null
+                        if (u.contains(".m3u8") || u.contains(".m3u")) {
+                            val rh = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
+                            rh["Referer"] = urlToResolve
+                            activity.runOnUiThread { finish(InterceptResult(u, rh)) }
+                        }
+                        return super.shouldInterceptRequest(v, request)
+                    }
+                }
             }
             webView = wv
             cont.invokeOnCancellation { finish(null) }
@@ -581,7 +536,18 @@ class Bysekoze : ExtractorApi() {
             clickRunnable = object : Runnable {
                 override fun run() {
                     if (done.get()) return
-                    webView?.evaluateJavascript(AUTO_PLAY_JS, null)
+                    val js = """
+                        (function() {
+                            window.open = function() { return null; };
+                            var vids = document.querySelectorAll('video');
+                            var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .plyr__control--overlaid, [class*="play"]');
+                            if (vids.length > 0 || buttons.length > 0) {
+                                buttons.forEach(b => b.click());
+                                vids.forEach(v => { v.muted = true; var p = v.play(); if (p !== undefined) p.catch(e => {}); });
+                            }
+                        })();
+                    """.trimIndent()
+                    webView?.evaluateJavascript(js, null)
                     handler.postDelayed(this, 1000L)
                 }
             }
@@ -594,6 +560,7 @@ class Bysekoze : ExtractorApi() {
         }
     }
 
+    @SuppressLint("SetJavaScriptEnabled")
     private suspend fun runInteractiveM3u8Interceptor(activity: android.app.Activity, urlToResolve: String, headers: Map<String, String>): InterceptResult? = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { cont ->
             val dialog = android.app.Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply { setCancelable(false); setCanceledOnTouchOutside(false) }
@@ -630,10 +597,31 @@ class Bysekoze : ExtractorApi() {
 
             val wv = android.webkit.WebView(activity).apply {
                 layoutParams = android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT)
-                configureInterceptorWebView(this, activity, urlToResolve, ::finish)
+                settings.apply {
+                    javaScriptEnabled = true; domStorageEnabled = true; useWideViewPort = true
+                    loadWithOverviewMode = true; mediaPlaybackRequiresUserGesture = false
+                    userAgentString = DEFAULT_UA; setSupportMultipleWindows(false); javaScriptCanOpenWindowsAutomatically = false
+                }
                 webChromeClient = object : android.webkit.WebChromeClient() {
                     override fun onProgressChanged(v: android.webkit.WebView?, p: Int) {
                         progressBar.progress = p; progressBar.visibility = if (p == 100) android.view.View.GONE else android.view.View.VISIBLE
+                    }
+                }
+                webViewClient = object : android.webkit.WebViewClient() {
+                    @SuppressLint("WebViewClientOnReceivedSslError")
+                    override fun onReceivedSslError(v: android.webkit.WebView?, h: android.webkit.SslErrorHandler?, e: android.net.http.SslError?) { h?.proceed() }
+                    override fun shouldOverrideUrlLoading(view: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): Boolean {
+                        if (isAdHijack(request, urlToResolve)) { Log.e(TAG, "Ad blocked: ${request?.url}"); return true }
+                        return super.shouldOverrideUrlLoading(view, request)
+                    }
+                    override fun shouldInterceptRequest(v: android.webkit.WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
+                        val u = request?.url?.toString() ?: return null
+                        if (u.contains(".m3u8") || u.contains(".m3u")) {
+                            val rh = request.requestHeaders?.toMutableMap() ?: mutableMapOf()
+                            rh["Referer"] = urlToResolve
+                            activity.runOnUiThread { finish(InterceptResult(u, rh)) }
+                        }
+                        return super.shouldInterceptRequest(v, request)
                     }
                 }
             }
@@ -642,7 +630,18 @@ class Bysekoze : ExtractorApi() {
             clickRunnable = object : Runnable {
                 override fun run() {
                     if (done.get()) return
-                    webView?.evaluateJavascript(AUTO_PLAY_JS, null)
+                    val js = """
+                        (function() {
+                            window.open = function() { return null; };
+                            var vids = document.querySelectorAll('video');
+                            var buttons = document.querySelectorAll('.play-button, .vjs-big-play-button, .plyr__control--overlaid, [class*="play"]');
+                            if (vids.length > 0 || buttons.length > 0) {
+                                buttons.forEach(b => b.click());
+                                vids.forEach(v => { v.muted = true; var p = v.play(); if (p !== undefined) p.catch(e => {}); });
+                            }
+                        })();
+                    """.trimIndent()
+                    webView?.evaluateJavascript(js, null)
                     handler.postDelayed(this, 1000L)
                 }
             }
@@ -659,7 +658,7 @@ class Bysekoze : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  RUMBLE EXTRACTOR 
+//  RUMBLE EXTRACTOR — (Exact copy from working file)
 // ════════════════════════════════════════════════════════════════════════════
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
@@ -682,7 +681,7 @@ class Rumble : ExtractorApi() {
             callback(newExtractorLink(name, name, url, type) { this.referer = url }); return
         }
         val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-            try { app.get(url, referer = referer ?: mainUrl).text } catch (_: Exception) { null }
+            try { app.get(url, referer = referer ?: mainUrl).text } catch (e: Exception) { null }
         } ?: return
         val afterMp4 = html.substringAfter("{\"mp4", "")
         val scriptData = if (afterMp4.isEmpty()) html else afterMp4.substringBefore("\"evt\":{")
@@ -706,10 +705,10 @@ class Rumble : ExtractorApi() {
     private suspend fun emitOne(cleanUrl: String, match: MatchResult, scriptData: String, referer: String, labelBase: String, callback: (ExtractorLink) -> Unit) {
         if (cleanUrl.contains(".m3u8", true)) {
             callback(newExtractorLink(name, "$labelBase (Auto)", cleanUrl, ExtractorLinkType.M3U8) { this.referer = referer; this.quality = Qualities.Unknown.value })
-            val variants = try { withTimeoutOrNull(SPLIT_TIMEOUT_MS) { M3u8Helper.generateM3u8(labelBase, cleanUrl, referer) } } catch (_: Exception) { null }
+            val variants = try { withTimeoutOrNull(SPLIT_TIMEOUT_MS) { M3u8Helper.generateM3u8(labelBase, cleanUrl, referer) } } catch (e: Exception) { null }
             variants?.forEach(callback)
         } else if (cleanUrl.contains(".mp4", true)) {
-            val precedingText = scriptData.substring(maxOf(0, match.range.first - 150), match.range.first)
+            val precedingText = scriptData.substring(Math.max(0, match.range.first - 150), match.range.first)
             val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull() ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
             val displayLabel = if (qMatch != null) "$labelBase ${qMatch.groupValues[1]}p" else labelBase
             callback(newExtractorLink(name, displayLabel, cleanUrl, INFER_TYPE) { this.referer = referer; this.quality = Qualities.Unknown.value })
@@ -718,7 +717,7 @@ class Rumble : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PLEX EXTRACTOR 
+//  PLEX EXTRACTOR — (Exact copy from working file)
 // ════════════════════════════════════════════════════════════════════════════
 class P2pstream : ExtractorApi() {
     override val name = "Plex"
@@ -727,9 +726,8 @@ class P2pstream : ExtractorApi() {
 
     companion object {
         private const val TAG = "Narul/Plex"
-        private val RE_HEX       = Regex("^[0-9a-fA-F]{64,}$")
-        private val RE_BASE64    = Regex("^[A-Za-z0-9+/=_-]{100,}$")
-        private val RE_VIDEO_QRY = Regex("""[?&](?:v|id|t)=([^&#]+)""")
+        private val RE_HEX = Regex("^[0-9a-fA-F]{64,}$")
+        private val RE_BASE64 = Regex("^[A-Za-z0-9+/=_-]{100,}$")
 
         private val KNOWN_ENDPOINTS = listOf(
             "/api/v1/download?id={id}",
@@ -742,13 +740,13 @@ class P2pstream : ExtractorApi() {
 
         private val workingEndpointCache = ConcurrentHashMap<String, String>()
 
-        private val KEY_POOL: List<ByteArray> = listOf(
+        private fun keyPool(): List<ByteArray> = listOf(
             "kiemtienmua911c#", "kiemtienmua911ca", "kiemtienmua911c", "kiemtienmua911c\$",
             "kiemtienmua911c@", "kiemtienmua911c!", "kiemtienmua911cn", "kiemtienmua911cm",
             "kiemtienmua911cp", "kiemtienmua911c1", "kiemtienmua911c2", "kiemtien", "kiemtienmua911",
         ).mapNotNull { s -> s.toByteArray(Charsets.UTF_8).takeIf { it.size in listOf(16, 24, 32) } }
 
-        private val IV_POOL: List<ByteArray> = listOf(
+        private fun ivPool(): List<ByteArray> = listOf(
             "1234567890oiuytr", "0123456789abcdef", "0987654321poiuytr", "abcdefghijklmnop",
         ).map { it.toByteArray(Charsets.UTF_8) }.filter { it.size == 16 }
 
@@ -756,7 +754,7 @@ class P2pstream : ExtractorApi() {
             val cleanUrl = url.replace("&amp;", "&")
             val fromHash = cleanUrl.substringAfter("#", "").substringBefore("&").substringBefore("?").trim()
             if (fromHash.isNotBlank()) return fromHash
-            val fromQuery = RE_VIDEO_QRY.find(cleanUrl)?.groupValues?.getOrNull(1)?.trim()
+            val fromQuery = Regex("""[?&](?:v|id|t)=([^&#]+)""").find(cleanUrl)?.groupValues?.getOrNull(1)?.trim()
             if (!fromQuery.isNullOrBlank()) return fromQuery
             return cleanUrl.substringBefore("?").substringBefore("#").trimEnd('/').substringAfterLast('/')
         }
@@ -800,7 +798,7 @@ class P2pstream : ExtractorApi() {
 
         val resp = try {
             withTimeoutOrNull(6_000L) { app.get(url, headers = apiHeaders) }
-        } catch (_: Exception) { null } ?: run { Log.e(TAG, "  timeout/error"); return ProbeResult.ERROR }
+        } catch (e: Exception) { null } ?: run { Log.e(TAG, "  timeout/error"); return ProbeResult.ERROR }
 
         val body = resp.text
         Log.e(TAG, "  ${resp.code} len=${body.length}")
@@ -842,7 +840,8 @@ class P2pstream : ExtractorApi() {
     private suspend fun tryKnownPlexDecrypt(payload: String, isHex: Boolean, origin: String, id: String, refHost: String,
         apiHeaders: Map<String, String>, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val ct = decodePayloadBytes(payload, isHex) ?: return false
-        Log.e(TAG, "  AES-CBC brute: ${KEY_POOL.size} keys × ${IV_POOL.size} IVs")
+        val keys = keyPool(); val ivs = ivPool()
+        Log.e(TAG, "  AES-CBC brute: ${keys.size} keys × ${ivs.size} IVs")
 
         suspend fun tryPlain(s: String, label: String): Boolean {
             if (!likelyPlain(s)) return false
@@ -853,15 +852,15 @@ class P2pstream : ExtractorApi() {
             return false
         }
 
-        for (key in KEY_POOL) for (iv in IV_POOL) {
+        for (key in keys) for (iv in ivs) {
             tryAesCbc(ct, key, iv)?.let { p -> if (tryPlain(String(p, Charsets.UTF_8), "CBC key=${bytesToHex(key).take(16)}")) return true }
         }
-        for (key in KEY_POOL) {
+        for (key in keys) {
             tryAesEcb(ct, key)?.let { p -> if (tryPlain(String(p, Charsets.UTF_8), "ECB key=${bytesToHex(key).take(16)}")) return true }
         }
         if (ct.size > 32 && ct.size % 16 == 0) {
             val prefixedIv = ct.copyOf(16); val strippedCt = ct.copyOfRange(16, ct.size)
-            for (key in KEY_POOL) {
+            for (key in keys) {
                 tryAesCbc(strippedCt, key, prefixedIv)?.let { p ->
                     if (tryPlain(String(p, Charsets.UTF_8), "prefixed-IV key=${bytesToHex(key).take(16)}")) return true
                 }
@@ -874,9 +873,9 @@ class P2pstream : ExtractorApi() {
         apiHeaders: Map<String, String>, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val decHeaders = mapOf("User-Agent" to DEFAULT_UA, "Origin" to "https://enc-dec.app",
             "Referer" to "https://enc-dec.app/", "Content-Type" to "application/json")
-        val body = JSONObject().apply { put("text", payload) }.toString().toRequestBody(JSON_MEDIA_TYPE)
         for (decoder in listOf("dec-rapid", "dec-mega")) {
             try {
+                val body = JSONObject().apply { put("text", payload) }.toString().toRequestBody(JSON_MEDIA_TYPE)
                 val resp = withTimeoutOrNull(8_000L) { app.post("https://enc-dec.app/api/$decoder", headers = decHeaders, requestBody = body) } ?: continue
                 if (resp.code == 200) {
                     val text = resp.text
@@ -1015,18 +1014,12 @@ class P2pstream : ExtractorApi() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  ABYSS EXTRACTOR 
+//  ABYSS EXTRACTOR — (Exact copy from working file)
 // ════════════════════════════════════════════════════════════════════════════
 class AbyssPlayer : ExtractorApi() {
     override val name = "Abyss"
     override val mainUrl = "https://abyssplayer.com"
     override val requiresReferer = true
-
-    companion object {
-        private val RE_LOC_HREF    = Regex("""(?:window\.location(?:\.href)?|location\.href)\s*=\s*["']([^"']+)["']""")
-        private val RE_DATAS       = Regex("""(?:(?:const|let|var)\s+|window\.)?datas\s*=\s*["']([^"']+)["']""")
-        private val RE_URL_QUALITY = Regex("""(2160|1440|1080|720|480|360)p?""")
-    }
 
     override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val initialOrigin = originOf(url) ?: return
@@ -1038,7 +1031,7 @@ class AbyssPlayer : ExtractorApi() {
 
         if (effectiveUrl.contains("short.icu", true) || doc.html().contains("location.href")) {
             val redirect = doc.selectFirst("meta[http-equiv=refresh]")?.attr("content")?.substringAfter("url=")?.trim('\'', '"', ' ')
-                ?: RE_LOC_HREF.find(doc.html())?.groupValues?.getOrNull(1)
+                ?: Regex("""(?:window\.location(?:\.href)?|location\.href)\s*=\s*["']([^"']+)["']""").find(doc.html())?.groupValues?.getOrNull(1)
             if (!redirect.isNullOrBlank() && !redirect.startsWith("javascript:")) {
                 resolveUrl(redirect, effectiveUrl, originOf(effectiveUrl) ?: initialOrigin)?.let { resolved ->
                     resp = try { withTimeoutOrNull(10_000L) { app.get(resolved, headers = pageHeaders) } ?: return } catch (_: Exception) { return }
@@ -1049,25 +1042,16 @@ class AbyssPlayer : ExtractorApi() {
         }
 
         val scriptData = doc.select("script").joinToString("\n") { it.data() }
-        val encrypted = RE_DATAS.find(scriptData)?.groupValues?.getOrNull(1) ?: return
+        val encrypted = Regex("""(?:(?:const|let|var)\s+|window\.)?datas\s*=\s*["']([^"']+)["']""").find(scriptData)?.groupValues?.getOrNull(1) ?: return
 
         val decBody = JSONObject().apply { put("text", encrypted) }.toString().toRequestBody(JSON_MEDIA_TYPE)
         val decText = try {
-            withTimeoutOrNull(10_000L) {
-                app.post(
-                    "https://enc-dec.app/api/dec-abyss",
-                    headers = mapOf("User-Agent" to DEFAULT_UA, "Origin" to "https://playhydrax.com", "Content-Type" to "application/json"),
-                    requestBody = decBody
-                ).text
-            } ?: return
+            withTimeoutOrNull(10_000L) { app.post("https://enc-dec.app/api/dec-abyss", headers = mapOf("User-Agent" to DEFAULT_UA, "Origin" to "https://playhydrax.com", "Content-Type" to "application/json"), requestBody = decBody).text } ?: return
         } catch (_: Exception) { return }
 
         val rootText = decText.trimStart()
         val resultJson = if (rootText.startsWith("{")) {
-            try {
-                val rootObj = JSONObject(rootText)
-                rootObj.optJSONObject("result") ?: JSONObject(rootObj.getString("result"))
-            } catch (_: Exception) { null }
+            try { JSONObject(rootText).optJSONObject("result") ?: JSONObject(JSONObject(rootText).getString("result")) } catch (_: Exception) { null }
         } else null
 
         val streamHeaders = mediaHeadersMinimal(effectiveUrl)
@@ -1079,9 +1063,11 @@ class AbyssPlayer : ExtractorApi() {
                     val srcObj = sourcesArr.optJSONObject(i)
                     val srcUrl = srcObj?.optString("url") ?: sourcesArr.optString(i)
                     if (srcUrl.isBlank() || !srcUrl.startsWith("http")) continue
-
+                    
                     val qLabel = (srcObj?.optString("label") ?: "").ifBlank { srcObj?.optString("quality") ?: "" }
-                    val urlQuality = RE_URL_QUALITY.find(srcUrl)?.groupValues?.get(1)?.toIntOrNull() ?: Qualities.Unknown.value
+                    
+                    val urlQuality = Regex("""(2160|1440|1080|720|480|360)p?""")
+                        .find(srcUrl)?.groupValues?.get(1)?.toIntOrNull() ?: Qualities.Unknown.value
 
                     val quality = when {
                         qLabel.contains("2160") || qLabel.contains("4K", true) || urlQuality == 2160 -> Qualities.P2160.value
