@@ -3,6 +3,7 @@ package com.lmanime
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.extractors.VidHidePro
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
@@ -16,7 +17,7 @@ class VidHideExtractor : VidHidePro() {
 }
 
 /* ==========================================================================
- * Rumble
+ * Rumble 
  * ========================================================================== */
 class RumbleExtractor : ExtractorApi() {
     override val name            = "Rumble"
@@ -120,7 +121,7 @@ class RumbleExtractor : ExtractorApi() {
 /* ==========================================================================
  * OkRu 
  * ========================================================================== */
-class OkRuCustom : ExtractorApi() {
+class OkRuExtractor : ExtractorApi() {
     override val name = "OkRu"
     override val mainUrl = "https://ok.ru"
     override val requiresReferer = false
@@ -237,7 +238,6 @@ class OkRuCustom : ExtractorApi() {
         val url: String? = null,
     )
 }
-
 
 /* ==========================================================================
  * Mp4Upload
