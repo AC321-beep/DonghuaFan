@@ -1,7 +1,5 @@
 package com.lmanime
 
-import com.fasterxml.jackson.annotation.JsonIgnoreProperties
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.VidHidePro
@@ -10,70 +8,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
 /* ==========================================================================
- * Dailymotion — www / geo / embed / dai.ly
- * ========================================================================== */
-class LMANIMEDailymotion : ExtractorApi() {
-    override val name            = "Dailymotion"
-    override val mainUrl         = "dailymotion.com"
-    override val requiresReferer = false
-
-    override suspend fun getUrl(
-        url: String, referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-    ) {
-        val videoId = extractVideoId(url) ?: return
-        val headers = mapOf("Referer" to "https://www.dailymotion.com/")
-
-        runCatching {
-            val meta = app.get(
-                "https://www.dailymotion.com/player/metadata/video/$videoId",
-                headers = headers,
-            ).parsedSafe<DailymotionMeta>()
-
-            meta?.qualities?.auto?.forEach { q ->
-                val link = q.url ?: return@forEach
-                if (q.type?.contains("mpegURL", true) == true) {
-                    callback(
-                        newExtractorLink(name, name, link, ExtractorLinkType.M3U8) {
-                            this.referer = "https://www.dailymotion.com/"
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                }
-            }
-            if (!meta?.qualities?.auto.isNullOrEmpty()) return
-        }
-
-        runCatching {
-            val html = app.get(url, headers = headers).text
-            Regex(""""url"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)"""")
-                .find(html)?.groupValues?.get(1)?.replace("\\/", "/")?.let { m3u8 ->
-                    callback(
-                        newExtractorLink(name, name, m3u8, ExtractorLinkType.M3U8) {
-                            this.referer = "https://www.dailymotion.com/"
-                        }
-                    )
-                }
-        }
-    }
-
-    private fun extractVideoId(url: String): String? = when {
-        url.contains("?video=") || url.contains("&video=") ->
-            Regex("""[?&]video=([a-zA-Z0-9]+)""").find(url)?.groupValues?.get(1)
-        url.contains("/embed/video/") ->
-            Regex("""/embed/video/([a-zA-Z0-9]+)""").find(url)?.groupValues?.get(1)
-        url.contains("dai.ly/") ->
-            Regex("""dai\.ly/([a-zA-Z0-9]+)""").find(url)?.groupValues?.get(1)
-        url.contains("/video/") ->
-            Regex("""/video/([a-zA-Z0-9]+)""").find(url)?.groupValues?.get(1)
-        else -> null
-    }
-}
-
-/* ==========================================================================
- * VidHide / Morencius  — FIXED: built-in VidHidePro subclass
- * handles the obfuscated JW Player page from HTML.txt
+ * VidHide / Morencius — built-in VidHidePro subclass
  * ========================================================================== */
 class VidHideExtractor : VidHidePro() {
     override val name    = "VidHide"
@@ -81,11 +16,7 @@ class VidHideExtractor : VidHidePro() {
 }
 
 /* ==========================================================================
- * Rumble — reference-inspired:
- *   • JSON-escape aware URL regex (\/ and /)
- *   • strict pass → trailer fallback pass
- *   • quality read from 150 bytes *preceding* each MP4 URL
- *   • HLS variants via M3u8Helper with 2.5s timeout
+ * Rumble
  * ========================================================================== */
 class RumbleExtractor : ExtractorApi() {
     override val name            = "Rumble"
@@ -127,7 +58,6 @@ class RumbleExtractor : ExtractorApi() {
         val seen    = LinkedHashSet<String>()
         var emitted = false
 
-        /* PASS 1 — strict */
         RE_VIDEO_URL.findAll(scriptData).forEach { match ->
             val clean = match.value.replace("\\/", "/")
             if (!clean.contains("rumble.com", true)) return@forEach
@@ -138,7 +68,6 @@ class RumbleExtractor : ExtractorApi() {
             }
         }
 
-        /* PASS 2 — trailer fallback */
         if (!emitted) {
             RE_VIDEO_URL.findAll(scriptData).forEach { match ->
                 val clean = match.value.replace("\\/", "/")
@@ -189,7 +118,7 @@ class RumbleExtractor : ExtractorApi() {
 }
 
 /* ==========================================================================
- * OkRu 
+ * OkRu — Animexin parse + DASH fallback
  * ========================================================================== */
 class OkRuExtractor : ExtractorApi() {
     override val name            = "OkRu"
@@ -228,7 +157,6 @@ class OkRuExtractor : ExtractorApi() {
         if (!jsonStr.startsWith("{")) return
         val json = try { JSONObject(jsonStr) } catch (_: Exception) { return }
 
-        /* MP4 */
         json.optJSONArray("videos")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val v = arr.getJSONObject(i)
@@ -253,7 +181,6 @@ class OkRuExtractor : ExtractorApi() {
             }
         }
 
-        /* HLS */
         val hlsUrl = json.optString("hlsManifestUrl")
         if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
             M3u8Helper.generateM3u8(
@@ -263,7 +190,6 @@ class OkRuExtractor : ExtractorApi() {
             ).forEach(callback)
         }
 
-        /* DASH fallback */
         val dash = json.optString("dashManifestUrl")
         if (dash.isNotBlank() && !dash.contains("usr_login")) {
             callback(
@@ -311,17 +237,3 @@ class Mp4UploadExtractor : ExtractorApi() {
         }
     }
 }
-
-/* Dailymotion DTOs */
-data class DailymotionMeta(
-    @JsonProperty("id")        val id: String? = null,
-    @JsonProperty("title")     val title: String? = null,
-    @JsonProperty("qualities") val qualities: DailymotionQualities? = null,
-)
-data class DailymotionQualities(
-    @JsonProperty("auto") val auto: List<DailymotionQuality>? = null,
-)
-data class DailymotionQuality(
-    @JsonProperty("type") val type: String? = null,
-    @JsonProperty("url")  val url: String? = null,
-)
