@@ -70,56 +70,12 @@ class LMANIMEDailymotion : ExtractorApi() {
 }
 
 /* ==========================================================================
- * VidHide / Morencius
+ * VidHide / Morencius  — FIXED: built-in VidHidePro subclass
+ * handles the obfuscated JW Player page from HTML.txt
  * ========================================================================== */
-class VidHideExtractor : ExtractorApi() {
-    override val name            = "VidHide"
-    override val mainUrl         = "morencius.com"
-    override val requiresReferer = false
-
-    override suspend fun getUrl(
-        url: String, referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-    ) {
-        val id = extractId(url) ?: return
-        val embedUrl = "https://morencius.com/embed/$id"
-        val html = runCatching {
-            app.get(embedUrl, headers = mapOf("Referer" to "https://lmanime.com/")).text
-        }.getOrNull() ?: return
-
-        val patterns = listOf(
-            Regex(""""file"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)""""),
-            Regex("""'file'\s*:\s*'(https?://[^']+\.m3u8[^']*)'"""),
-            Regex(""""url"\s*:\s*"(https?://[^"]+\.m3u8[^"]*)""""),
-            Regex("""(https?://[^"'\s\\]+\.m3u8[^"'\s\\]*)"""),
-        )
-        for (p in patterns) {
-            val m = p.find(html) ?: continue
-            callback(
-                newExtractorLink(name, name, m.groupValues.last().replace("\\/", "/"), ExtractorLinkType.M3U8) {
-                    this.referer = embedUrl
-                    this.quality = Qualities.Unknown.value
-                }
-            )
-            return
-        }
-
-        Regex("""(https?://[^"'\s\\]+\.mp4[^"'\s\\]*)""").find(html)?.let { m ->
-            callback(
-                newExtractorLink(name, name, m.groupValues[1].replace("\\/", "/"), ExtractorLinkType.VIDEO) {
-                    this.referer = embedUrl
-                }
-            )
-        }
-    }
-
-    private fun extractId(url: String): String? = when {
-        url.contains("/embed/") -> url.substringAfter("/embed/").substringBefore("/").substringBefore("?")
-        url.contains("/file/")  -> url.substringAfter("/file/").substringBefore("/").substringBefore("?")
-        url.contains("/v/")     -> url.substringAfter("/v/").substringBefore("/").substringBefore("?")
-        else -> null
-    }
+class VidHideExtractor : VidHidePro() {
+    override val name    = "VidHide"
+    override val mainUrl = "https://morencius.com"
 }
 
 /* ==========================================================================
@@ -231,7 +187,7 @@ class RumbleExtractor : ExtractorApi() {
 }
 
 /* ==========================================================================
- * OkRu — official JSON API, quality map, MP4 → HLS → DASH cascade
+ * OkRu 
  * ========================================================================== */
 class OkRuExtractor : ExtractorApi() {
     override val name            = "OkRu"
@@ -239,7 +195,6 @@ class OkRuExtractor : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
-        private const val FETCH_TIMEOUT_MS = 12_000L
         private val RE_VIDEO_ID  = Regex("""/video(?:embed)?/(\d+)""")
         private val RE_MID_PARAM = Regex("""[?&]mid=(\d+)""")
 
@@ -260,86 +215,65 @@ class OkRuExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ) {
-        try {
-            val id = RE_VIDEO_ID.find(url)?.groupValues?.get(1)
-                ?: RE_MID_PARAM.find(url)?.groupValues?.get(1)
-                ?: url.substringAfterLast("/").substringBefore("?")
-            if (id.isBlank() || !id.all { it.isDigit() }) return
+        val id = RE_VIDEO_ID.find(url)?.groupValues?.get(1)
+            ?: RE_MID_PARAM.find(url)?.groupValues?.get(1)
+            ?: url.substringAfterLast("/").substringBefore("?")
+        if (id.isBlank()) return
 
-            val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id"
+        val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id"
 
-            val json = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-                try { app.post(apiUrl).parsedSafe<OkRuResponse>() } catch (_: Exception) { null }
-            } ?: return
+        val jsonStr = try { app.post(apiUrl).text } catch (_: Exception) { return }
+        if (!jsonStr.startsWith("{")) return
+        val json = try { JSONObject(jsonStr) } catch (_: Exception) { return }
 
-            /* MP4 */
-            json.videos?.forEach { video ->
-                val qName  = video.name?.lowercase().orEmpty()
-                val vidUrl = video.url.orEmpty()
-                if (vidUrl.isBlank() || vidUrl.contains("usr_login")) return@forEach
+        /* MP4 */
+        json.optJSONArray("videos")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val v = arr.getJSONObject(i)
+                val qName  = v.optString("name").lowercase()
+                val vidUrl = v.optString("url")
+                if (vidUrl.isBlank() || vidUrl.contains("usr_login")) continue
 
-                val qVal  = QUALITY_MAP[qName] ?: Qualities.Unknown.value
-                val label = if (qVal != Qualities.Unknown.value) "MP4 ${qVal}p" else "MP4 $qName"
+                val q     = QUALITY_MAP[qName] ?: Qualities.Unknown.value
+                val label = if (q != Qualities.Unknown.value) "MP4 ${q}p" else "MP4 $qName"
 
                 callback(
                     newExtractorLink(
                         name   = "$name MP4",
                         source = "$name $label",
                         url    = vidUrl.replace("\\u0026", "&").replace("\\/", "/"),
-                        type   = ExtractorLinkType.VIDEO,
+                        type   = INFER_TYPE,
                     ) {
                         this.referer = "https://ok.ru/"
-                        this.quality = qVal
+                        this.quality = q
                     }
                 )
             }
+        }
 
-            /* HLS */
-            var hlsSucceeded = false
-            val hlsUrl = json.hlsManifestUrl.orEmpty()
-            if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
-                val clean = hlsUrl.replace("\\u0026", "&").replace("\\/", "/")
-                val links = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-                    try { M3u8Helper.generateM3u8("$name HLS", clean, url) }
-                    catch (_: Exception) { emptyList() }
-                } ?: emptyList()
-                if (links.isNotEmpty()) {
-                    links.forEach(callback)
-                    hlsSucceeded = true
-                }
-            }
+        /* HLS */
+        val hlsUrl = json.optString("hlsManifestUrl")
+        if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
+            M3u8Helper.generateM3u8(
+                "$name HLS",
+                hlsUrl.replace("\\u0026", "&").replace("\\/", "/"),
+                url
+            ).forEach(callback)
+        }
 
-            /* DASH fallback */
-            if (!hlsSucceeded) {
-                val dash = json.dashManifestUrl.orEmpty()
-                if (dash.isNotBlank() && !dash.contains("usr_login")) {
-                    callback(
-                        newExtractorLink(
-                            name   = "$name DASH",
-                            source = "$name DASH",
-                            url    = dash.replace("\\u0026", "&").replace("\\/", "/"),
-                            type   = ExtractorLinkType.DASH,
-                        ) { this.referer = "https://ok.ru/" }
-                    )
-                }
-            }
-        } catch (_: Exception) {
-            // swallow
+        /* DASH fallback */
+        val dash = json.optString("dashManifestUrl")
+        if (dash.isNotBlank() && !dash.contains("usr_login")) {
+            callback(
+                newExtractorLink(
+                    name   = "$name DASH",
+                    source = "$name DASH",
+                    url    = dash.replace("\\u0026", "&").replace("\\/", "/"),
+                    type   = ExtractorLinkType.DASH,
+                ) { this.referer = "https://ok.ru/" }
+            )
         }
     }
-
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    private data class OkRuResponse(
-        val videos: List<OkRuVideo>? = null,
-        val hlsManifestUrl: String? = null,
-        val dashManifestUrl: String? = null,
-    )
-
-    @JsonIgnoreProperties(ignoreUnknown = true)
-    private data class OkRuVideo(
-        val name: String? = null,
-        val url: String? = null,
-    )
 }
 
 /* ==========================================================================
