@@ -408,31 +408,50 @@ class LMANIME : MainAPI() {
 
         val sortedIframes = iframeEntries.sortedByDescending { priority(it.second) }
 
-        /* ── 6. Emit via loadExtractor with [Lang] tag ─────────────── */
-        for ((url, lang) in sortedIframes) {
-            val normalized = normalizeDailymotion(url)
-            val tag = langTag(lang)
-            val wrapper: (ExtractorLink) -> Unit = { link ->
-                val newName   = if (tag != null && !link.name.contains(tag))   "${link.name} $tag"   else link.name
-                val newSource = if (tag != null && !link.source.contains(tag)) "${link.source} $tag" else link.source
-                callback(
-                    ExtractorLink(
-                        source        = newSource,
-                        name          = newName,
-                        url           = link.url,
-                        referer       = link.referer,
-                        quality       = link.quality,
-                        type          = link.type,
-                        headers       = link.headers,
-                        extractorData = link.extractorData,
-                    )
-                )
-                found = true
-            }
-            runCatching {
-                loadExtractor(normalized, data, subtitleCallback, wrapper)
-            }
-        }
+       /* ── 6. Dispatch to custom extractor, fall back to loadExtractor ─ */
+suspend fun dispatch(url: String, lang: String?) {
+    val tag = langTag(lang)
+    val wrapped: (ExtractorLink) -> Unit = { link ->
+        val newName   = if (tag != null && !link.name.contains(tag))   "${link.name} $tag"   else link.name
+        val newSource = if (tag != null && !link.source.contains(tag)) "${link.source} $tag" else link.source
+        callback(
+            ExtractorLink(
+                source        = newSource,
+                name          = newName,
+                url           = link.url,
+                referer       = link.referer,
+                quality       = link.quality,
+                type          = link.type,
+                headers       = link.headers,
+                extractorData = link.extractorData,
+            )
+        )
+        found = true
+    }
+
+    when {
+        url.contains("morencius.com") ->
+            VidHideExtractor().getUrl(url, data, subtitleCallback, wrapped)
+
+        url.contains("rumble.com") ->
+            RumbleExtractor().getUrl(url, data, subtitleCallback, wrapped)
+
+        url.contains("ok.ru") || url.contains("odnoklassniki.ru") ->
+            OkRuExtractor().getUrl(url, data, subtitleCallback, wrapped)
+
+        url.contains("mp4upload.com") ->
+            Mp4UploadExtractor().getUrl(url, data, subtitleCallback, wrapped)
+
+        else ->
+            // Built-in extractors (Dailymotion, Filesim, StreamWish, …)
+            loadExtractor(url, data, subtitleCallback, wrapped)
+    }
+}
+
+for ((url, lang) in sortedIframes) {
+    val normalized = normalizeDailymotion(url)
+    runCatching { dispatch(normalized, lang) }
+}
 
         /* ── 7. Direct .m3u8 / .mp4 ────────────────────────────────── */
         for (videoUrl in videoUrls) {
