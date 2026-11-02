@@ -22,10 +22,9 @@ class LMANIME : MainAPI() {
     private val relativeDateRegex = Regex(
         """(?i)\d+\s+(mins?|minutes?|hours?|days?|weeks?|months?|years?)\s+ago"""
     )
-    /* Format hints for addDate() — matches the three absolute patterns */
-    private val fmtMonthDayYear = Regex("""^[A-Za-z]+\s+\d{1,2},\s+\d{4}$""")   // October 25, 2026
-    private val fmtDayMonthYear = Regex("""^\d{1,2}\s+[A-Za-z]+\s+\d{4}$""")     // 25 October 2026
-    private val fmtIsoDate      = Regex("""^\d{4}-\d{2}-\d{2}$""")               // 2026-10-25
+    private val fmtMonthDayYear = Regex("""^[A-Za-z]+\s+\d{1,2},\s+\d{4}$""")
+    private val fmtDayMonthYear = Regex("""^\d{1,2}\s+[A-Za-z]+\s+\d{4}$""")
+    private val fmtIsoDate      = Regex("""^\d{4}-\d{2}-\d{2}$""")
 
     override val mainPage = mainPageOf(
         "latest"                                 to "Latest Release",
@@ -133,7 +132,7 @@ class LMANIME : MainAPI() {
     }
 
     /* ------------------------------------------------------------------ */
-    /* SERIES LOADER — date parsing adopted from reference                */
+    /* SERIES LOADER                                                      */
     /* ------------------------------------------------------------------ */
     private suspend fun loadSeries(
         seriesUrl: String,
@@ -158,13 +157,6 @@ class LMANIME : MainAPI() {
             val epNum = Regex("""Episode\s+(\d+)""", RegexOption.IGNORE_CASE)
                 .find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
 
-            /* ──────────────────────────────────────────────────────────
-             *  DATE EXTRACTION — 5-tier fallback
-             *   1-3: CSS selector for date containers (.playinfo span, …)
-             *        → absolute regex, then relative regex
-             *   4-5: full <li> text
-             *        → absolute regex, then relative regex
-             * ────────────────────────────────────────────────────────── */
             val cssDate = a.selectFirst(
                 ".playinfo span, .epl-date, .epdate, .date, .released, .published, .time"
             )?.text()?.trim()
@@ -184,9 +176,6 @@ class LMANIME : MainAPI() {
                 this.episode = epNum
 
                 if (!extractedDate.isNullOrBlank()) {
-                    // Choose the correct SimpleDateFormat pattern only for
-                    // absolute dates — skip addDate for relative ones (e.g.
-                    // "2 days ago"), which would fail to parse.
                     val addFormat = when {
                         fmtMonthDayYear.matches(extractedDate) -> "MMMM d, yyyy"
                         fmtDayMonthYear.matches(extractedDate) -> "d MMMM yyyy"
@@ -261,7 +250,7 @@ class LMANIME : MainAPI() {
     }
 
     /* ------------------------------------------------------------------ */
-    /* LOAD LINKS — unchanged                                            */
+    /* LOAD LINKS — with ok.ru branch added for OkRuExtractor             */
     /* ------------------------------------------------------------------ */
     override suspend fun loadLinks(
         data: String,
@@ -312,6 +301,11 @@ class LMANIME : MainAPI() {
                             .substringBefore("/").substringBefore(".")
                         if (id.isNotBlank())
                             iframeUrls.add("https://www.mp4upload.com/embed-$id.html")
+                    }
+                    /* NEW: pass ok.ru / odnoklassniki straight through so
+                       OkRuExtractor picks them up by mainUrl match */
+                    href.contains("ok.ru/") || href.contains("odnoklassniki.ru/") -> {
+                        iframeUrls.add(href)
                     }
                 }
             }
