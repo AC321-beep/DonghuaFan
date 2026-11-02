@@ -4,6 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.util.Locale
 
 class LMANIME : MainAPI() {
 
@@ -15,7 +16,7 @@ class LMANIME : MainAPI() {
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    /* ─── Date regexes (adopted from reference DonghuaStream impl) ─── */
+    /* ─── Date regexes ─── */
     private val dateRegex = Regex(
         """([a-zA-Z]{3,}\s+\d{1,2},\s+\d{4}|\d{1,2}\s+[a-zA-Z]{3,}\s+\d{4}|\d{4}-\d{2}-\d{2})"""
     )
@@ -29,7 +30,6 @@ class LMANIME : MainAPI() {
     override val mainPage = mainPageOf(
         "latest"                                 to "Latest Release",
         "anime/?status=&type=&order=popular"     to "Popular",
-        "anime/?status=&type=movie&order=update" to "Movies",
         "ongoing/"                               to "Ongoing",
         "upcoming/"                              to "Upcoming",
     )
@@ -218,39 +218,12 @@ class LMANIME : MainAPI() {
     }
 
     /* ------------------------------------------------------------------ */
-    /* MOVIE FALLBACK                                                     */
-    /* ------------------------------------------------------------------ */
-    private suspend fun loadAsMovie(
-        url: String,
-        document: Document,
-        tvType: TvType = TvType.Anime,
-    ): LoadResponse {
-        val title = document.selectFirst("h1.entry-title")?.text()?.trim()
-            ?: document.selectFirst("h1")?.text()?.trim()
-            ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
-            ?: "Unknown"
-
-        val poster = fixUrlNull(
-            document.selectFirst("meta[property=og:image]")?.attr("content")
-        )
-
-        val plot = document.selectFirst("meta[property=og:description]")?.attr("content")
-            ?: document.selectFirst("div.entry-content p")?.text()
-            ?: document.selectFirst("div.desc p")?.text()
-
-        val year = document.select(".single-info .spe span")
-            .firstOrNull { it.text().contains("Released", true) }?.text()
-            ?.let { t -> Regex("""\b((?:19|20)\d{2})\b""").find(t)?.value?.toIntOrNull() }
-
-        return newMovieLoadResponse(title, url, tvType, url) {
-            this.posterUrl = poster
-            this.plot      = plot
-            if (year != null) this.year = year
-        }
-    }
-
-    /* ------------------------------------------------------------------ */
-    /* LOAD LINKS — with ok.ru branch added for OkRuExtractor             */
+    /* LOAD LINKS                                                         */
+    /*                                                                    */
+    /*  LMANIME exposes per-language download blocks (div.soraddlx) and   */
+    /*  per-language mirrors (select.mirror option). Both carry the       */
+    /*  language label in the HTML, so we propagate it as a [Tag] on      */
+    /*  every emitted ExtractorLink.                                       */
     /* ------------------------------------------------------------------ */
     override suspend fun loadLinks(
         data: String,
@@ -258,27 +231,76 @@ class LMANIME : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val document   = app.get(data).document
-        val iframeUrls = linkedSetOf<String>()
-        val videoUrls  = linkedSetOf<String>()
-        var found      = false
+        val document = app.get(data).document
+        var found = false
 
-        fun collectFrom(doc: Document) {
+        /* ── 1. Language detection ─────────────────────────────────── */
+        fun detectLang(vararg sources: String?): String? {
+            val text = sources.filterNotNull().joinToString(" ").lowercase()
+            return when {
+                Regex("""\b(multi(sub)?|multilingual)\b""").containsMatchIn(text) -> "multi"
+                Regex("""\b(indonesian|indo|bahasa|ind)\b""").containsMatchIn(text) -> "ind"
+                Regex("""\b(portugu[eê]s|portuguese|por)\b""").containsMatchIn(text) -> "por"
+                Regex("""\b(espa[nñ]ol|spanish|spa)\b""").containsMatchIn(text) -> "spa"
+                Regex("""\b(ไทย|thai|tha)\b""").containsMatchIn(text) -> "tha"
+                Regex("""\b(t[uü]rk[cç]e|turkish|tur)\b""").containsMatchIn(text) -> "tur"
+                Regex("""(العَرَبِيَّة|عربي|arabic|ara)""").containsMatchIn(text) -> "ara"
+                Regex("""\b(english|eng)\b""").containsMatchIn(text) -> "eng"
+                else -> null
+            }
+        }
+
+        fun langTag(lang: String?): String? = when (lang) {
+            "multi" -> "[Multi]"
+            "ind"   -> "[Ind]"
+            "por"   -> "[Por]"
+            "spa"   -> "[Spa]"
+            "tha"   -> "[Thai]"
+            "tur"   -> "[Tur]"
+            "ara"   -> "[Ara]"
+            "eng"   -> "[Eng]"
+            else    -> null
+        }
+
+        /* ── 2. URL normalisation ──────────────────────────────────── */
+        fun normalize(raw: String): String {
+            val trimmed = raw.trim()
+            return when {
+                trimmed.startsWith("//")   -> "https:$trimmed"
+                trimmed.startsWith("/")    -> "$mainUrl$trimmed"
+                trimmed.startsWith("http") -> trimmed
+                trimmed.isBlank()          -> ""
+                else                       -> "https://$trimmed"
+            }
+        }
+
+        val skipPatterns = listOf(
+            "chatango", "google", "doubleclick", "adsystem",
+            "facebook.com/plugins", "googletag", "disqus", "onesignal",
+            "cloudfront.net", "21wiz.com",
+        )
+
+        /* ── 3. Collectors ─────────────────────────────────────────── */
+        val iframeEntries = mutableListOf<Pair<String, String?>>()
+        val videoUrls     = linkedSetOf<String>()
+        val seenKeys      = mutableSetOf<String>()
+
+        fun pushIframe(url: String, lang: String?) {
+            if (url.isBlank()) return
+            if (skipPatterns.any { url.contains(it, true) }) return
+            if (seenKeys.add(url.substringBefore("?"))) iframeEntries.add(url to lang)
+        }
+
+        fun collectFrom(doc: Document, parentLang: String? = null) {
+            /* Bare iframes */
             doc.select("iframe").forEach { iframe ->
-                val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }.trim()
+                val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
                 if (src.isBlank()) return@forEach
-                val fixed = when {
-                    src.startsWith("//") -> "https:$src"
-                    src.startsWith("/")  -> "$mainUrl$src"
-                    else                 -> src
-                }
-                val skip = listOf(
-                    "chatango", "google", "doubleclick", "adsystem",
-                    "facebook.com/plugins", "googletag", "disqus", "onesignal",
-                ).any { fixed.contains(it, true) }
-                if (!skip) iframeUrls.add(fixed)
+                val lang = detectLang(iframe.attr("title"), iframe.attr("data-lang")) ?: parentLang
+                pushIframe(normalize(src), lang)
             }
 
+            /* Direct <video> URLs (rare on LMANIME, but appears on mirrors) */
             doc.select("video, video source").forEach { el ->
                 val src = el.attr("src").trim()
                 if (src.isBlank()) return@forEach
@@ -288,24 +310,43 @@ class LMANIME : MainAPI() {
                 }
             }
 
-            doc.select("div.soraddlx a[href]").forEach { a ->
-                val href = a.attr("href").trim()
-                when {
-                    href.contains("morencius.com/file/") -> {
-                        val id = href.substringAfter("/file/")
-                            .substringBefore("/").substringBefore("?")
-                        if (id.isNotBlank()) iframeUrls.add("https://morencius.com/embed/$id")
-                    }
-                    href.contains("mp4upload.com/") && !href.contains("/embed-") -> {
-                        val id = href.substringAfter("mp4upload.com/")
-                            .substringBefore("/").substringBefore(".")
-                        if (id.isNotBlank())
-                            iframeUrls.add("https://www.mp4upload.com/embed-$id.html")
-                    }
-                    /* NEW: pass ok.ru / odnoklassniki straight through so
-                       OkRuExtractor picks them up by mainUrl match */
-                    href.contains("ok.ru/") || href.contains("odnoklassniki.ru/") -> {
-                        iframeUrls.add(href)
+            /* Download blocks — one .soraddlx per language.
+             *
+             *   <div class="soraddlx soradlg">
+             *     <div class="sorattlx"><h3>English</h3></div>
+             *     <div class="soraurlx">
+             *       <strong>DL</strong>
+             *       <a href="https://morencius.com/file/…">vidhide</a>
+             *       <a href="https://www.mp4upload.com/…">mp4upload</a>
+             *     </div>
+             *   </div>
+             */
+            doc.select("div.soraddlx").forEach { block ->
+                val heading = block.selectFirst(".sorattlx h3, .sorattlx")?.text()?.trim()
+                val lang = detectLang(heading) ?: parentLang
+
+                block.select(".soraurlx a[href]").forEach { a ->
+                    val href = a.attr("href").trim()
+                    when {
+                        href.contains("morencius.com/file/") -> {
+                            val id = href.substringAfter("/file/")
+                                .substringBefore("/").substringBefore("?")
+                            if (id.isNotBlank()) pushIframe("https://morencius.com/embed/$id", lang)
+                        }
+                        href.contains("mp4upload.com/") && !href.contains("/embed-") -> {
+                            val id = href.substringAfter("mp4upload.com/")
+                                .substringBefore("/").substringBefore(".")
+                            if (id.isNotBlank())
+                                pushIframe("https://www.mp4upload.com/embed-$id.html", lang)
+                        }
+                        href.contains("ok.ru/") || href.contains("odnoklassniki.ru/") -> {
+                            pushIframe(href, lang)
+                        }
+                        href.contains("wishfast") || href.contains("filemoon") ||
+                        href.contains("waaw.") || href.contains("d.tube") ||
+                        href.contains("rumble.com") -> {
+                            pushIframe(href, lang)
+                        }
                     }
                 }
             }
@@ -313,22 +354,55 @@ class LMANIME : MainAPI() {
 
         collectFrom(document)
 
-        document.select("select.mirror option")
-            .mapNotNull { it.attr("value").trim().takeIf { u -> u.startsWith("http") } }
-            .distinct()
-            .forEach { serverUrl ->
-                runCatching {
-                    collectFrom(app.get(serverUrl, referer = data).document)
-                }
-            }
-
-        for (iframeUrl in iframeUrls) {
-            val normalized = normalizeDailymotion(iframeUrl)
+        /* ── 4. Mirror pages (language from option label) ──────────── */
+        document.select("select.mirror option").forEach { option ->
+            val serverUrl = option.attr("value").trim()
+            if (!serverUrl.startsWith("http")) return@forEach
+            val optionLang = detectLang(option.text(), option.attr("data-lang"), option.attr("title"))
             runCatching {
-                if (loadExtractor(normalized, data, subtitleCallback, callback)) found = true
+                collectFrom(app.get(serverUrl, referer = data).document, optionLang)
             }
         }
 
+        /* ── 5. Locale-aware priority ──────────────────────────────── */
+        val userLang = Locale.getDefault().language
+        fun priority(lang: String?): Int = when {
+            lang == null     -> 0
+            lang == userLang -> 3
+            lang == "eng"    -> 2
+            lang == "multi"  -> 2
+            else             -> 1
+        }
+
+        val sortedIframes = iframeEntries.sortedByDescending { priority(it.second) }
+
+        /* ── 6. Emit via loadExtractor with [Lang] tag ─────────────── */
+        for ((url, lang) in sortedIframes) {
+            val normalized = normalizeDailymotion(url)
+            val tag = langTag(lang)
+            val wrapper: (ExtractorLink) -> Unit = { link ->
+                val newName   = if (tag != null && !link.name.contains(tag))   "${link.name} $tag"   else link.name
+                val newSource = if (tag != null && !link.source.contains(tag)) "${link.source} $tag" else link.source
+                callback(
+                    ExtractorLink(
+                        source        = newSource,
+                        name          = newName,
+                        url           = link.url,
+                        referer       = link.referer,
+                        quality       = link.quality,
+                        type          = link.type,
+                        headers       = link.headers,
+                        extractorData = link.extractorData,
+                    )
+                )
+                found = true
+            }
+            runCatching {
+                loadExtractor(normalized, data, subtitleCallback, wrapper)
+            }
+        }
+
+        /* ── 7. Direct .m3u8 / .mp4 ────────────────────────────────── */
         for (videoUrl in videoUrls) {
             val isHls = videoUrl.contains(".m3u8", true)
             callback(
@@ -342,6 +416,7 @@ class LMANIME : MainAPI() {
             found = true
         }
 
+        /* ── 8. Regex fallback ─────────────────────────────────────── */
         if (!found) {
             Regex("""https?://[^"'\s\\]+\.(?:m3u8|mp4)[^"'\s\\]*""")
                 .findAll(document.html())
@@ -362,9 +437,25 @@ class LMANIME : MainAPI() {
         return found
     }
 
-    private fun normalizeDailymotion(url: String): String =
+    /* ------------------------------------------------------------------ */
+    /* Dailymotion URL normalisation                                      */
+    /* ------------------------------------------------------------------ */
+    private fun normalizeDailymotion(url: String): String {
+        // dai.ly/<id> → dailymotion.com/video/<id>
         if (url.contains("dai.ly/")) {
             val id = url.substringAfter("dai.ly/").substringBefore("/").substringBefore("?")
-            "https://www.dailymotion.com/video/$id"
-        } else url
+            if (id.isNotBlank()) return "https://www.dailymotion.com/video/$id"
+        }
+        // geo.dailymotion.com/player/<...>.html?video=<id> → dailymotion.com/video/<id>
+        if (url.contains("geo.dailymotion.com")) {
+            val id = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(url)?.groupValues?.get(1)
+            if (!id.isNullOrBlank()) return "https://www.dailymotion.com/video/$id"
+        }
+        // dailymotion.com/embed/video/<id> → dailymotion.com/video/<id>
+        if (url.contains("dailymotion.com/embed/video/")) {
+            val id = url.substringAfter("/embed/video/").substringBefore("/").substringBefore("?")
+            if (id.isNotBlank()) return "https://www.dailymotion.com/video/$id"
+        }
+        return url
+    }
 }
