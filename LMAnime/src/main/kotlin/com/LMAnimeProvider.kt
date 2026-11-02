@@ -28,10 +28,10 @@ class LMANIME : MainAPI() {
     private val fmtIsoDate      = Regex("""^\d{4}-\d{2}-\d{2}$""")
 
     override val mainPage = mainPageOf(
-        "latest"                                 to "Latest Release",
-        "anime/?status=&type=&order=popular"     to "Popular",
-        "ongoing/"                               to "Ongoing",
-        "upcoming/"                              to "Upcoming",
+        "latest"                             to "Latest Release",
+        "anime/?status=&type=&order=popular" to "Popular",
+        "ongoing/"                           to "Ongoing",
+        "upcoming/"                          to "Upcoming",
     )
 
     /* ------------------------------------------------------------------ */
@@ -211,6 +211,38 @@ class LMANIME : MainAPI() {
             ?.let { t -> Regex("""\b((?:19|20)\d{2})\b""").find(t)?.value?.toIntOrNull() }
 
         return newTvSeriesLoadResponse(title, seriesUrl, TvType.Anime, episodes) {
+            this.posterUrl = poster
+            this.plot      = plot
+            if (year != null) this.year = year
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* MOVIE FALLBACK                                                     */
+    /* ------------------------------------------------------------------ */
+    private suspend fun loadAsMovie(
+        url: String,
+        document: Document,
+        tvType: TvType = TvType.Anime,
+    ): LoadResponse {
+        val title = document.selectFirst("h1.entry-title")?.text()?.trim()
+            ?: document.selectFirst("h1")?.text()?.trim()
+            ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
+            ?: "Unknown"
+
+        val poster = fixUrlNull(
+            document.selectFirst("meta[property=og:image]")?.attr("content")
+        )
+
+        val plot = document.selectFirst("meta[property=og:description]")?.attr("content")
+            ?: document.selectFirst("div.entry-content p")?.text()
+            ?: document.selectFirst("div.desc p")?.text()
+
+        val year = document.select(".single-info .spe span")
+            .firstOrNull { it.text().contains("Released", true) }?.text()
+            ?.let { t -> Regex("""\b((?:19|20)\d{2})\b""").find(t)?.value?.toIntOrNull() }
+
+        return newMovieLoadResponse(title, url, tvType, url) {
             this.posterUrl = poster
             this.plot      = plot
             if (year != null) this.year = year
@@ -439,19 +471,18 @@ class LMANIME : MainAPI() {
 
     /* ------------------------------------------------------------------ */
     /* Dailymotion URL normalisation                                      */
+    /*  Rewriting to the canonical form lets the built-in extractor handle */
+    /*  it without any custom extraction code.                             */
     /* ------------------------------------------------------------------ */
     private fun normalizeDailymotion(url: String): String {
-        // dai.ly/<id> → dailymotion.com/video/<id>
         if (url.contains("dai.ly/")) {
             val id = url.substringAfter("dai.ly/").substringBefore("/").substringBefore("?")
             if (id.isNotBlank()) return "https://www.dailymotion.com/video/$id"
         }
-        // geo.dailymotion.com/player/<...>.html?video=<id> → dailymotion.com/video/<id>
         if (url.contains("geo.dailymotion.com")) {
             val id = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(url)?.groupValues?.get(1)
             if (!id.isNullOrBlank()) return "https://www.dailymotion.com/video/$id"
         }
-        // dailymotion.com/embed/video/<id> → dailymotion.com/video/<id>
         if (url.contains("dailymotion.com/embed/video/")) {
             val id = url.substringAfter("/embed/video/").substringBefore("/").substringBefore("?")
             if (id.isNotBlank()) return "https://www.dailymotion.com/video/$id"
