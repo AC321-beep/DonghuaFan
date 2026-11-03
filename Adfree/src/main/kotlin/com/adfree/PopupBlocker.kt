@@ -134,7 +134,6 @@ object PopupBlocker {
         if (!installed.compareAndSet(false, true)) return
 
         debugLog("AdFree plugin booted. Firing initial startup burst.")
-        // Slight delay so other plugins finish their load() before we scan classloaders
         Handler(Looper.getMainLooper()).postDelayed({
             fireSniperBurst(app)
         }, 300L)
@@ -225,14 +224,13 @@ object PopupBlocker {
     @Volatile private var seqField: java.lang.reflect.Field? = null
     @Volatile private var appCtxField: java.lang.reflect.Field? = null
 
-    // NEW: single-flight burst — cancels any previous burst before starting a new one
     private val burstHandler = Handler(Looper.getMainLooper())
     @Volatile private var currentBurstTask: Runnable? = null
 
     private fun fireSniperBurst(app: Application) {
         if (!FilterStore.enabled || isAnnouncerDefeated) return
 
-        // FIX: cancel previous burst so startup + resume don't overlap
+        // Cancel any existing burst so startup + resume bursts don't overlap
         currentBurstTask?.let { burstHandler.removeCallbacks(it) }
 
         var attempts = 0
@@ -241,8 +239,7 @@ object PopupBlocker {
             override fun run() {
                 if (!FilterStore.enabled || isAnnouncerDefeated) return
 
-                // FIX: only re-scan classloaders on sparse attempts (0, 4, 8)
-                // This drops main-thread classloader scans from 10 → 3 per burst
+                // Re-scan classloader sparsely (attempts 0, 4, 8) to reduce main-thread jank
                 if (announcerClass == null && (attempts == 0 || attempts == 4 || attempts == 8)) {
                     announcerClass = findAnnouncerClass(app)
                     if (announcerClass != null) {
@@ -294,7 +291,6 @@ object PopupBlocker {
             if (dialog?.isShowing == true) {
                 dialog.dismiss()
                 currentField?.set(null, null)
-                // FIX: this used to be an unconditional Log.i — now gated by verbose
                 debugLog("Dismissed leaked AllForU popup.")
             }
 
