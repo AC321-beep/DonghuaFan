@@ -129,14 +129,14 @@ object PopupBlocker {
     // PUBLIC API
     // =================================================================
 
+    @Volatile private var hostApp: Application? = null
+
     fun install(context: Context) {
         val app = context.applicationContext as? Application ?: return
         if (!installed.compareAndSet(false, true)) return
 
-        debugLog("AdFree plugin booted. Firing initial startup burst.")
-        Handler(Looper.getMainLooper()).postDelayed({
-            fireSniperBurst(app)
-        }, 300L)
+        hostApp = app
+        startBackgroundScanner() // Starts the robust 10-second polling loop to beat cold boot races
 
         app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
             override fun onActivityResumed(activity: Activity) {
@@ -148,14 +148,19 @@ object PopupBlocker {
                 }
 
                 sweep(fm)
-                fireSniperBurst(activity.applicationContext as Application)
+                
+                // Zero-Flash execution: We run this synchronously right now. No Handler.post delay!
+                neutralizeAnnouncerSynchronously()
 
                 val appCtx = activity.applicationContext
                 ioExecutor.execute { rescanWatchers(appCtx) }
             }
 
+            override fun onActivityStarted(activity: Activity) {
+                if (FilterStore.enabled) neutralizeAnnouncerSynchronously()
+            }
+
             override fun onActivityCreated(a: Activity, b: Bundle?) {}
-            override fun onActivityStarted(a: Activity) {}
             override fun onActivityPaused(a: Activity) {}
             override fun onActivityStopped(a: Activity) {}
             override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
@@ -215,128 +220,98 @@ object PopupBlocker {
     }
 
     // =================================================================
-    // Announcer AlertDialog Blocker (Event-Driven Sniper Burst)
+    // Announcer AlertDialog Blocker (Zero-Flash Synchronous Sniper)
     // =================================================================
 
-    @Volatile private var isAnnouncerDefeated = false
     @Volatile private var announcerClass: Class<*>? = null
     @Volatile private var currentField: java.lang.reflect.Field? = null
     @Volatile private var seqField: java.lang.reflect.Field? = null
     @Volatile private var appCtxField: java.lang.reflect.Field? = null
 
-    private val burstHandler = Handler(Looper.getMainLooper())
-    @Volatile private var currentBurstTask: Runnable? = null
+    private val isSearching = AtomicBoolean(false)
 
-    private fun fireSniperBurst(app: Application) {
-        if (!FilterStore.enabled || isAnnouncerDefeated) return
-
-        // Cancel any existing burst so startup + resume bursts don't overlap
-        currentBurstTask?.let { burstHandler.removeCallbacks(it) }
-
-        var attempts = 0
-
-        val burstTask = object : Runnable {
-            override fun run() {
-                if (!FilterStore.enabled || isAnnouncerDefeated) return
-
-                // Re-scan classloader sparsely (attempts 0, 4, 8) to reduce main-thread jank
-                if (announcerClass == null && (attempts == 0 || attempts == 4 || attempts == 8)) {
-                    announcerClass = findAnnouncerClass(app)
-                    if (announcerClass != null) {
-                        try {
-                            currentField = announcerClass!!.getDeclaredField("current").apply { isAccessible = true }
-                            seqField = announcerClass!!.getDeclaredField("requestSeq").apply { isAccessible = true }
-                            appCtxField = announcerClass!!.getDeclaredField("appCtx").apply { isAccessible = true }
-                            debugLog("Cached Announcer reflection fields.")
-                        } catch (e: Throwable) {
-                            debugLog("Failed to cache fields: ${e.message}")
-                            announcerClass = null
-                        }
-                    }
-                }
-
-                if (announcerClass != null && neutralizeAnnouncer()) {
-                    isAnnouncerDefeated = true
-                    debugLog("Announcer permanently defeated. Shutting down all future sweeps.")
-                    currentBurstTask = null
-                    return
-                }
-
-                attempts++
-                if (attempts < 10) {
-                    burstHandler.postDelayed(this, 500L)
-                } else {
-                    debugLog("Announcer burst window expired. Will retry on next navigation.")
-                    currentBurstTask = null
-                }
+    // Decoupled Background Scanner: Handles cold-boot race conditions by polling for up to 10s.
+    // Because it runs strictly on ioExecutor, it causes 0 UI jank even when using getAllStackTraces().
+    private fun startBackgroundScanner() {
+        if (isSearching.getAndSet(true)) return
+        ioExecutor.execute {
+            var retries = 0
+            while (announcerClass == null && retries < 20) { // 20 retries * 500ms = 10 second window
+                hostApp?.let { findAndCacheAnnouncer(it) }
+                if (announcerClass != null) break
+                Thread.sleep(500)
+                retries++
             }
+            if (announcerClass == null) debugLog("Background scanner finished: Announcer not found.")
+            isSearching.set(false)
         }
-        currentBurstTask = burstTask
-        burstHandler.post(burstTask)
     }
 
-    private fun neutralizeAnnouncer(): Boolean {
+    private fun findAndCacheAnnouncer(app: Application) {
+        val loaders = mutableSetOf<ClassLoader>()
+        PopupBlocker::class.java.classLoader?.let { loaders.add(it) }
+        app.classLoader?.let { loaders.add(it) }
+
+        try {
+            val field = Application::class.java.getDeclaredField("mActivityLifecycleCallbacks")
+            field.isAccessible = true
+            val callbacks = field.get(app) as? java.util.ArrayList<*>
+            callbacks?.forEach { callback ->
+                callback?.javaClass?.classLoader?.let { loaders.add(it) }
+            }
+        } catch (_: Throwable) {}
+
+        try {
+            Thread.getAllStackTraces().keys.forEach { thread ->
+                thread.contextClassLoader?.let { loaders.add(it) }
+            }
+        } catch (_: Throwable) {}
+
+        for (loader in loaders) {
+            try {
+                val clazz = Class.forName("com.allforu.Announcer", false, loader)
+                currentField = clazz.getDeclaredField("current").apply { isAccessible = true }
+                seqField = clazz.getDeclaredField("requestSeq").apply { isAccessible = true }
+                appCtxField = clazz.getDeclaredField("appCtx").apply { isAccessible = true }
+                announcerClass = clazz
+                debugLog("Successfully found and cached Announcer class in background thread.")
+                
+                // Immediately enforce neutralization once found
+                Handler(Looper.getMainLooper()).post { neutralizeAnnouncerSynchronously() }
+                return
+            } catch (_: Throwable) {}
+        }
+    }
+
+    // Runs synchronously on main thread events (onResume/onStart) without any Handler delay.
+    // Because the reflection fields are already cached, this operation takes < 1ms to execute,
+    // beating the AllForU Handler queue and preventing the dialog flash.
+    private fun neutralizeAnnouncerSynchronously() {
+        if (announcerClass == null) return // Will retry when the background scanner finishes
+
         try {
             if (appCtxField?.get(null) != null) {
                 appCtxField?.set(null, null)
-                debugLog("Nullified Announcer appCtx.")
+                debugLog("Synchronously nullified Announcer appCtx.")
             }
 
             if (seqField?.getInt(null) != -1) {
                 seqField?.setInt(null, -1)
-                debugLog("Reset Announcer requestSeq.")
+                debugLog("Synchronously reset Announcer requestSeq.")
             }
 
             val dialog = currentField?.get(null) as? android.app.Dialog
             if (dialog?.isShowing == true) {
                 dialog.dismiss()
                 currentField?.set(null, null)
-                debugLog("Dismissed leaked AllForU popup.")
+                Log.e("AdFree", "Dismissed leaked AllForU popup.")
             }
-
-            return true
         } catch (e: Throwable) {
-            debugLog("Neutralization error, resetting cache: ${e.message}")
+            // Reached if reflection fails due to a CloudStream plugin hot-reload changing the classloader
+            debugLog("Synchronous neutralization error, resetting cache: ${e.message}")
             announcerClass = null
-            return false
+            startBackgroundScanner()
         }
-    }
-
-    private fun findAnnouncerClass(app: Application): Class<*>? {
-        val loaders = mutableSetOf<ClassLoader>()
-        PopupBlocker::class.java.classLoader?.let { loaders.add(it) }
-        app.classLoader?.let { loaders.add(it) }
-
-        var sniperSuccess = false
-        try {
-            val field = Application::class.java.getDeclaredField("mActivityLifecycleCallbacks")
-            field.isAccessible = true
-            val callbacks = field.get(app) as? java.util.ArrayList<*>
-            callbacks?.forEach { callback ->
-                callback?.javaClass?.classLoader?.let {
-                    loaders.add(it)
-                    sniperSuccess = true
-                }
-            }
-        } catch (e: Throwable) {
-            debugLog("Sniper reflection failed: ${e.message}")
-        }
-
-        if (!sniperSuccess) {
-            debugLog("Sniper failed, falling back to thread scan.")
-            try {
-                Thread.getAllStackTraces().keys.forEach { thread ->
-                    thread.contextClassLoader?.let { loaders.add(it) }
-                }
-            } catch (_: Throwable) {}
-        }
-
-        for (loader in loaders) {
-            try {
-                return Class.forName("com.allforu.Announcer", false, loader)
-            } catch (_: Throwable) {}
-        }
-        return null
     }
 
     // =================================================================
