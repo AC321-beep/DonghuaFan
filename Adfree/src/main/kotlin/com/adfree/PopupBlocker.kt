@@ -66,7 +66,7 @@ object PopupBlocker {
 
     private fun debugLog(msg: String) {
         if (FilterStore.verboseLogging) {
-            Log.i("AdFree", "[Verbose] $msg")
+            Log.e("AdFree", "[Verbose] $msg")
         }
     }
 
