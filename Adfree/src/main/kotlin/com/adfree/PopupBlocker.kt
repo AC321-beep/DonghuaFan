@@ -76,6 +76,11 @@ object PopupBlocker {
     private const val SCAN_DEADLINE_MS = 30_000L
     private const val DISCOVERY_BUDGET_MS = 15_000L
 
+    // Adaptive Phase B sleep thresholds
+    private const val SPIN_WINDOW_MS = 2_000L    // 0-2s: tight loop (no sleep)
+    private const val YIELD_WINDOW_MS = 5_000L   // 2-5s: Thread.yield() between ticks
+    // Beyond 5s: Thread.sleep(10) between ticks
+
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private val installed = AtomicBoolean(false)
 
@@ -155,7 +160,7 @@ object PopupBlocker {
     private val isSearching = AtomicBoolean(false)
 
     // =================================================================
-    // FIXED: SIGNATURE DISCOVERY
+    // SIGNATURE DISCOVERY
     // =================================================================
 
     private fun matchesAnnouncerSignature(cls: Class<*>): Boolean {
@@ -230,10 +235,6 @@ object PopupBlocker {
         return result
     }
 
-    /**
-     * FIXED: exclude CloudStream's main classloader (the 50K-class one).
-     * It's not a plugin — scanning it wastes 4-5 seconds and finds nothing useful.
-     */
     private fun enumeratePluginLoaders(app: Application): Set<ClassLoader> {
         val loaders = mutableSetOf<ClassLoader>()
         try {
@@ -241,7 +242,7 @@ object PopupBlocker {
             val cbs = field.get(app) as? ArrayList<*> ?: return loaders
             val ourLoader = PopupBlocker::class.java.classLoader
             val sysLoader = ClassLoader.getSystemClassLoader()
-            val appLoader = app.classLoader  // ← CloudStream main
+            val appLoader = app.classLoader
 
             for (cb in cbs) {
                 val loader = cb?.javaClass?.classLoader ?: continue
@@ -271,7 +272,6 @@ object PopupBlocker {
                     if (tryResolve(app, name)) resolvedCount++
                 }
 
-                // FIXED: skip full scan if all persisted targets already resolve
                 if (persisted.isNotEmpty() && resolvedCount == persisted.size) {
                     debugLog("Discovery: all ${resolvedCount} persisted target(s) resolved. Skipping full scan.")
                     discoveryDone.set(true)
@@ -321,7 +321,7 @@ object PopupBlocker {
     private fun tryResolve(app: Application, className: String): Boolean {
         try {
             val loaders = enumeratePluginLoaders(app).toMutableSet()
-            app.classLoader?.let { loaders.add(it) }  // Cheap: single-class lookup
+            app.classLoader?.let { loaders.add(it) }
             for (loader in loaders) {
                 try {
                     val cls = Class.forName(className, false, loader)
@@ -335,13 +335,6 @@ object PopupBlocker {
         return false
     }
 
-    /**
-     * FIXED: prefer Context/Application fields over Activity fields.
-     * Announcer has BOTH:
-     *   `static Activity activity`  ← display only, not a gate
-     *   `static Context appCtx`      ← real gate checked by showOnHome()
-     * The old code grabbed `activity` (wrong). Now we grab `appCtx` (correct).
-     */
     private fun cacheTargetState(cls: Class<*>, loader: ClassLoader) {
         val state = targetStates.getOrPut(cls.name) { TargetState(cls.name) }
         try {
@@ -354,19 +347,15 @@ object PopupBlocker {
                 if (!Modifier.isStatic(f.modifiers)) continue
                 val t = f.type
                 when {
-                    // Prefer Context/Application/ContextWrapper (NOT Activity)
                     Context::class.java.isAssignableFrom(t) && !Activity::class.java.isAssignableFrom(t) -> {
                         if (bestCtx == null) { f.isAccessible = true; bestCtx = f }
                     }
-                    // Activity-typed: hold as fallback only
                     Activity::class.java.isAssignableFrom(t) -> {
                         if (fallbackActivity == null) { f.isAccessible = true; fallbackActivity = f }
                     }
-                    // Dialog
                     android.app.Dialog::class.java.isAssignableFrom(t) -> {
                         if (bestDlg == null) { f.isAccessible = true; bestDlg = f }
                     }
-                    // Int (sequence)
                     t == Int::class.javaPrimitiveType -> {
                         if (bestSeq == null) { f.isAccessible = true; bestSeq = f }
                     }
@@ -385,7 +374,7 @@ object PopupBlocker {
     }
 
     // =================================================================
-    // FIXED: LAYER 1 — WindowManagerGlobal scan (catch-all for race window)
+    // LAYER 1 — WindowManagerGlobal scan
     // =================================================================
 
     private val ownDialogs: MutableSet<android.app.Dialog> =
@@ -520,7 +509,7 @@ object PopupBlocker {
 
                 sweep(fm)
                 neutralizeAllOnMainThread()
-                scanForForeignDialogs()   // ← FIXED: Layer 1 catch-all
+                scanForForeignDialogs()
                 startBackgroundScanner()
 
                 val appCtx = activity.applicationContext
@@ -536,14 +525,16 @@ object PopupBlocker {
     }
 
     // =================================================================
-    // TWO-PHASE SEVER SCANNER
+    // TWO-PHASE SEVER SCANNER (with adaptive sleep)
     // =================================================================
 
     private fun startBackgroundScanner() {
         if (isSearching.getAndSet(true)) return
         ioExecutor.execute {
-            val deadline = System.currentTimeMillis() + SCAN_DEADLINE_MS
+            val startTime = System.currentTimeMillis()
+            val deadline = startTime + SCAN_DEADLINE_MS
 
+            // ── PHASE A: resolve target classes ──────────────────────
             while (System.currentTimeMillis() < deadline) {
                 if (targetStates.values.any { it.cls != null }) break
                 if (discoveryDone.get() && targetStates.isEmpty()) {
@@ -551,14 +542,23 @@ object PopupBlocker {
                     isSearching.set(false)
                     return@execute
                 }
-                try { Thread.sleep(100L) } catch (_: InterruptedException) { return@execute }
+                try { Thread.sleep(100L) } catch (_: InterruptedException) {
+                    isSearching.set(false)
+                    return@execute
+                }
             }
 
             val active = targetStates.values.filter { it.cls != null }
             if (active.isEmpty()) { isSearching.set(false); return@execute }
-            debugLog("Phase A: ${active.size} target(s) resolved. Entering Phase B.")
+            debugLog("Phase A: ${active.size} target(s) resolved. Entering Phase B (adaptive).")
 
+            // ── PHASE B: adaptive-rate sever loop ────────────────────
+            // 0-2s:    tight loop, no sleep → ~2-5μs per tick (maximum poll rate)
+            // 2-5s:    Thread.yield() between ticks → ~50-200μs per tick
+            // 5s-30s:  Thread.sleep(10) → ~10ms per tick
+            var lastLoggedMilestone = -1
             while (System.currentTimeMillis() < deadline) {
+                // Sever all active targets
                 for (state in targetStates.values.filter { it.cls != null }) {
                     try {
                         if (state.ctxField?.get(null) != null) {
@@ -583,7 +583,41 @@ object PopupBlocker {
                         state.cachedLoader = null
                     }
                 }
-                try { Thread.sleep(1L) } catch (_: InterruptedException) { break }
+
+                // Adaptive sleep based on elapsed time
+                val elapsed = System.currentTimeMillis() - startTime
+                when {
+                    elapsed < SPIN_WINDOW_MS -> {
+                        // 0-2s: TIGHT LOOP. No sleep. Max poll rate (~200,000 ticks/sec).
+                        // The tick body is ~3 reflection calls (~3μs), so this uses
+                        // ~30-60% of one CPU core for 2s, then backs off.
+                        if (lastLoggedMilestone < 0) {
+                            debugLog("Phase B: entering SPIN mode (0-2s, max rate).")
+                            lastLoggedMilestone = 0
+                        }
+                    }
+                    elapsed < YIELD_WINDOW_MS -> {
+                        // 2-5s: yield between ticks. Gives other threads a chance
+                        // to run without adding meaningful delay to Phase B.
+                        // Effective tick rate: ~5,000-20,000/sec.
+                        if (lastLoggedMilestone < 1) {
+                            debugLog("Phase B: entering YIELD mode (2-5s).")
+                            lastLoggedMilestone = 1
+                        }
+                        Thread.yield()
+                    }
+                    else -> {
+                        // 5-30s: back off to 10ms sleep. Popup triggers are
+                        // essentially impossible after 5s, so this is just
+                        // a safety net for edge cases (slow device, thermal
+                        // throttling causing delayed plugin load).
+                        if (lastLoggedMilestone < 2) {
+                            debugLog("Phase B: entering SLEEP mode (5-30s, 10ms rate).")
+                            lastLoggedMilestone = 2
+                        }
+                        try { Thread.sleep(10L) } catch (_: InterruptedException) { break }
+                    }
+                }
             }
 
             debugLog("Phase B: window expired.")
