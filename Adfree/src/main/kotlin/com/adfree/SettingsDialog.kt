@@ -48,7 +48,6 @@ class SettingsDialog(
             setTextColor(Color.parseColor("#909090"))
         })
 
-        // --- Verbose Logging Toggle ---
         val logToggle = Switch(activity).apply {
             text = "Verbose debugging"
             isChecked = FilterStore.verboseLogging
@@ -63,7 +62,6 @@ class SettingsDialog(
             textSize = 12f
             setTextColor(Color.parseColor("#909090"))
         })
-        // -----------------------------------
 
         AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setView(ScrollView(activity).apply { addView(container) })
