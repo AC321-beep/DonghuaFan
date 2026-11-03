@@ -11,7 +11,6 @@ import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.lagradost.cloudstream3.utils.newSubtitleFile
 import com.lagradost.cloudstream3.extractors.ByseSX
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -519,10 +518,11 @@ class P2pstream : ExtractorApi() {
             for (i in 0 until subArr.length()) {
                 val subObj = subArr.optJSONObject(i) ?: continue
                 val subUrl = subObj.optString("file").ifBlank { subObj.optString("url") }.ifBlank { subObj.optString("src") }
-                if (subUrl.isNotBlank()) {
-                    val label = subObj.optString("label").ifBlank { "Sub" }
-                    subtitleCallback(newSubtitleFile(label, resolveUrl(subUrl, "$origin/", origin) ?: subUrl) { this.headers = headers })
-                }
+               if (subUrl.isNotBlank()) {
+    val label = subObj.optString("label").ifBlank { "Sub" }
+    val subResolved = resolveUrl(subUrl, "$origin/", origin) ?: subUrl
+    subtitleCallback(SubtitleFile(label, subResolved))
+}
             }
         }
 
