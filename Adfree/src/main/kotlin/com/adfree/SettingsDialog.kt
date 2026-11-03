@@ -48,10 +48,28 @@ class SettingsDialog(
             setTextColor(Color.parseColor("#909090"))
         })
 
+        // --- NEW: Verbose Logging Toggle ---
+        val logToggle = Switch(activity).apply {
+            text = "Verbose debugging"
+            isChecked = FilterStore.verboseLogging
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            setPadding(0, dp(16, activity), 0, dp(4, activity))
+        }
+        container.addView(logToggle)
+
+        container.addView(TextView(activity).apply {
+            text = "Check Logcat (tag: AdFree) for background scanning details."
+            textSize = 12f
+            setTextColor(Color.parseColor("#909090"))
+        })
+        // -----------------------------------
+
         AlertDialog.Builder(activity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
             .setView(ScrollView(activity).apply { addView(container) })
             .setPositiveButton("Save") { _, _ ->
                 FilterStore.enabled = toggle.isChecked
+                FilterStore.verboseLogging = logToggle.isChecked // Save logging state
 
                 if (toggle.isChecked) {
                     try { OptimizerPlugin.reSanitize(activity) } catch (_: Throwable) {}
