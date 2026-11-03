@@ -48,7 +48,7 @@ class SettingsDialog(
             setTextColor(Color.parseColor("#909090"))
         })
 
-        // --- NEW: Verbose Logging Toggle ---
+        // --- Verbose Logging Toggle ---
         val logToggle = Switch(activity).apply {
             text = "Verbose debugging"
             isChecked = FilterStore.verboseLogging
@@ -69,7 +69,7 @@ class SettingsDialog(
             .setView(ScrollView(activity).apply { addView(container) })
             .setPositiveButton("Save") { _, _ ->
                 FilterStore.enabled = toggle.isChecked
-                FilterStore.verboseLogging = logToggle.isChecked // Save logging state
+                FilterStore.verboseLogging = logToggle.isChecked
 
                 if (toggle.isChecked) {
                     try { OptimizerPlugin.reSanitize(activity) } catch (_: Throwable) {}
