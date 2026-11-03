@@ -76,10 +76,10 @@ object PopupBlocker {
     private const val SCAN_DEADLINE_MS = 30_000L
     private const val DISCOVERY_BUDGET_MS = 15_000L
 
-    // Adaptive Phase B sleep thresholds
-    private const val SPIN_WINDOW_MS = 2_000L    // 0-2s: tight loop (no sleep)
-    private const val YIELD_WINDOW_MS = 5_000L   // 2-5s: Thread.yield() between ticks
-    // Beyond 5s: Thread.sleep(10) between ticks
+    // Adaptive Phase B timing
+    private const val SPIN_WINDOW_MS = 2_000L      // 0-2s pre-catch: full spin
+    private const val YIELD_WINDOW_MS = 5_000L     // 2-5s pre-catch: yield
+    private const val QUIET_WINDOW_MS = 200L       // post-catch: 200ms quiet, then exit
 
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private val installed = AtomicBoolean(false)
@@ -510,7 +510,8 @@ object PopupBlocker {
                 sweep(fm)
                 neutralizeAllOnMainThread()
                 scanForForeignDialogs()
-                startBackgroundScanner()
+                // Phase B may have exited early — restart it on app resume
+                if (!isSearching.get()) startBackgroundScanner()
 
                 val appCtx = activity.applicationContext
                 ioExecutor.execute { rescanWatchers(appCtx) }
@@ -525,7 +526,7 @@ object PopupBlocker {
     }
 
     // =================================================================
-    // TWO-PHASE SEVER SCANNER (with adaptive sleep)
+    // TWO-PHASE SEVER SCANNER — with early-exit on confirmed defeat
     // =================================================================
 
     private fun startBackgroundScanner() {
@@ -550,24 +551,28 @@ object PopupBlocker {
 
             val active = targetStates.values.filter { it.cls != null }
             if (active.isEmpty()) { isSearching.set(false); return@execute }
-            debugLog("Phase A: ${active.size} target(s) resolved. Entering Phase B (adaptive).")
+            debugLog("Phase A: ${active.size} target(s) resolved. Entering Phase B.")
 
-            // ── PHASE B: adaptive-rate sever loop ────────────────────
-            // 0-2s:    tight loop, no sleep → ~2-5μs per tick (maximum poll rate)
-            // 2-5s:    Thread.yield() between ticks → ~50-200μs per tick
-            // 5s-30s:  Thread.sleep(10) → ~10ms per tick
-            var lastLoggedMilestone = -1
+            // ── PHASE B: adaptive sever loop with early exit ─────────
+            var everSevered = false
+            var lastSeverTime = 0L
+            var mode = "SPIN"
+            debugLog("Phase B: starting in SPIN mode (0-2s, max rate).")
+
             while (System.currentTimeMillis() < deadline) {
-                // Sever all active targets
+                var anySeveredThisTick = false
+
                 for (state in targetStates.values.filter { it.cls != null }) {
                     try {
                         if (state.ctxField?.get(null) != null) {
                             state.ctxField?.set(null, null)
+                            anySeveredThisTick = true
                             debugLog("Severed ${state.className} context (Gate 1).")
                         }
                         val seq = state.seqField?.getInt(null)
                         if (seq != null && seq != -1) {
                             state.seqField?.setInt(null, -1)
+                            anySeveredThisTick = true
                             debugLog("Severed ${state.className} sequence (Gate 2).")
                         }
                         val dlg = state.dlgField?.get(null) as? android.app.Dialog
@@ -576,6 +581,7 @@ object PopupBlocker {
                                 try { dlg.dismiss() } catch (_: Throwable) {}
                             }
                             state.dlgField?.set(null, null)
+                            anySeveredThisTick = true
                             debugLog("Dismissed ${state.className} leaked dialog.")
                         }
                     } catch (_: Throwable) {
@@ -584,48 +590,62 @@ object PopupBlocker {
                     }
                 }
 
-                // Adaptive sleep based on elapsed time
+                if (anySeveredThisTick) {
+                    everSevered = true
+                    lastSeverTime = System.currentTimeMillis()
+                }
+
+                // ── EARLY EXIT: after first catch + quiet window ─────
+                // 200ms quiet window catches any leaked dialog (appears within ~16ms)
+                // and any fast re-init. Slower re-inits are caught by fragment resume.
+                if (everSevered) {
+                    val quietElapsed = System.currentTimeMillis() - lastSeverTime
+                    if (quietElapsed > QUIET_WINDOW_MS) {
+                        debugLog("Phase B: confirmed defeated (${quietElapsed}ms quiet). Exiting early at T=${System.currentTimeMillis() - startTime}ms.")
+                        isSearching.set(false)
+                        return@execute
+                    }
+                    // Inside quiet window: cheap polling only
+                    try { Thread.sleep(10L) } catch (_: InterruptedException) { break }
+                    continue
+                }
+
+                // ── PRE-CATCH: adaptive rate based on elapsed ────────
                 val elapsed = System.currentTimeMillis() - startTime
                 when {
                     elapsed < SPIN_WINDOW_MS -> {
-                        // 0-2s: TIGHT LOOP. No sleep. Max poll rate (~200,000 ticks/sec).
-                        // The tick body is ~3 reflection calls (~3μs), so this uses
-                        // ~30-60% of one CPU core for 2s, then backs off.
-                        if (lastLoggedMilestone < 0) {
-                            debugLog("Phase B: entering SPIN mode (0-2s, max rate).")
-                            lastLoggedMilestone = 0
-                        }
+                        // Full spin, no sleep
                     }
                     elapsed < YIELD_WINDOW_MS -> {
-                        // 2-5s: yield between ticks. Gives other threads a chance
-                        // to run without adding meaningful delay to Phase B.
-                        // Effective tick rate: ~5,000-20,000/sec.
-                        if (lastLoggedMilestone < 1) {
-                            debugLog("Phase B: entering YIELD mode (2-5s).")
-                            lastLoggedMilestone = 1
+                        if (mode != "YIELD") {
+                            debugLog("Phase B: switching to YIELD mode (2-5s).")
+                            mode = "YIELD"
                         }
                         Thread.yield()
                     }
                     else -> {
-                        // 5-30s: back off to 10ms sleep. Popup triggers are
-                        // essentially impossible after 5s, so this is just
-                        // a safety net for edge cases (slow device, thermal
-                        // throttling causing delayed plugin load).
-                        if (lastLoggedMilestone < 2) {
-                            debugLog("Phase B: entering SLEEP mode (5-30s, 10ms rate).")
-                            lastLoggedMilestone = 2
+                        if (mode != "SLEEP") {
+                            debugLog("Phase B: switching to SLEEP mode (5-30s).")
+                            mode = "SLEEP"
                         }
                         try { Thread.sleep(10L) } catch (_: InterruptedException) { break }
                     }
                 }
             }
 
-            debugLog("Phase B: window expired.")
+            debugLog("Phase B: deadline expired (${System.currentTimeMillis() - startTime}ms).")
             isSearching.set(false)
         }
     }
 
-    private fun neutralizeAllOnMainThread() {
+    /**
+     * Cheap safety net for post-Phase-B re-inits.
+     * Called on every activity resume and every fragment resume.
+     * If the plugin has re-initialized (shouldn't happen for AllForU, but
+     * possible for future dynamic targets), this catches it before the next
+     * showOnHome opportunity.
+     */
+    private fun neutralizeOnMainThread() {
         for (state in targetStates.values) {
             if (state.cls == null) continue
             try {
@@ -651,6 +671,9 @@ object PopupBlocker {
         }
     }
 
+    // Keep the old name as an alias for compatibility
+    private fun neutralizeAllOnMainThread() = neutralizeOnMainThread()
+
     // =================================================================
     // Fragment Lifecycle Interception
     // =================================================================
@@ -670,6 +693,9 @@ object PopupBlocker {
         override fun onFragmentResumed(fm: FragmentManager, f: Fragment) {
             if (!FilterStore.enabled) return
             if (isTarget(f)) killFragment(f)
+            // NEW: safety net — catch re-inits after Phase B early-exited.
+            // ~3μs per call (3 reflection reads, most are no-ops).
+            neutralizeOnMainThread()
         }
     }
 
