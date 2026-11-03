@@ -17,9 +17,12 @@ class OptimizerPlugin : Plugin() {
             instance?.runSanitization(context)
         }
 
+        // Single logging function for the whole plugin.
+        // Uses Log.e internally so OEMs can't silently filter it.
+        // Gate is the verbose setting — nothing else.
         private fun debugLog(msg: String) {
             if (FilterStore.verboseLogging) {
-                Log.i("AdFree", "[Verbose - Optimizer] $msg")
+                Log.e("AdFree", "[Optimizer] $msg")
             }
         }
     }
@@ -28,43 +31,38 @@ class OptimizerPlugin : Plugin() {
         instance = this
         FilterStore.init(context)
 
-        // ONE-SHOT HEARTBEAT — fires once per plugin load, cannot flood.
-        // This is your only proof the plugin is alive when verbose is OFF.
-        Log.w("AdFree", "Plugin loaded")
-
-        debugLog("OptimizerPlugin loaded. Blocker Enabled: ${FilterStore.enabled}")
+        // ALL logging flows through debugLog(). Verbose OFF = silence.
+        debugLog("Plugin loaded. Blocker enabled: ${FilterStore.enabled}")
 
         if (FilterStore.enabled) {
             runSanitization(context)
         }
 
         PopupBlocker.install(context)
-        debugLog("PopupBlocker ActivityLifecycleCallbacks installed.")
+        debugLog("PopupBlocker installed.")
 
         openSettings = {
             try {
                 SettingsDialog(context) {
-                    debugLog("Settings dialog closed. State applied.")
+                    debugLog("Settings dialog closed.")
                 }.show()
             } catch (e: Throwable) {
-                // Real errors always visible — even with verbose off.
-                Log.e("AdFree", "Failed to open settings: ${e.message}")
+                debugLog("Failed to open settings: ${e.message}")
             }
         }
     }
 
     fun runSanitization(context: Context) {
         if (!FilterStore.enabled) {
-            debugLog("runSanitization aborted - Blocker is disabled.")
+            debugLog("runSanitization skipped (blocker disabled).")
             return
         }
-
         try {
-            debugLog("Initiating synchronous preference sanitization...")
-            val touchedFiles = PopupBlocker.sanitize(context)
-            debugLog("Sanitization complete. Touched $touchedFiles file(s).")
+            debugLog("Starting preference sanitization...")
+            val touched = PopupBlocker.sanitize(context)
+            debugLog("Sanitization done. Touched $touched file(s).")
         } catch (e: Throwable) {
-            Log.e("AdFree", "Sanitization failed: ${e.message}")
+            debugLog("Sanitization failed: ${e.message}")
         }
     }
 }
