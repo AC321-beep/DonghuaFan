@@ -47,17 +47,16 @@ object PopupBlocker {
 
     private const val TEN_YEARS_MS = 10L * 365 * 24 * 60 * 60 * 1000
     private const val NINE_YEARS_MS = 9L * 365 * 24 * 60 * 60 * 1000
-    // Leaves ~4.6 years of headroom before Int overflow on additions
     private const val SAFE_MAX_INT = 2_000_000_000
 
     private val ioExecutor = Executors.newSingleThreadExecutor()
 
     private object Patterns {
-        // Compound dialog/popup tags
         val tag = listOf(
             Regex("donat(e|ion)?[_.-]?(popup|dialog|banner|modal|prompt)", RegexOption.IGNORE_CASE),
             Regex("(promo|sponsor|support)[_.-]?(popup|dialog|banner|modal|prompt)", RegexOption.IGNORE_CASE),
-            Regex("(popup|dialog|banner|modal|prompt)[_.-]?(donat|promo|sponsor|support)", RegexOption.IGNORE_CASE)
+            Regex("(popup|dialog|banner|modal|prompt)[_.-]?(donat|promo|sponsor|support)", RegexOption.IGNORE_CASE),
+            Regex("allforu.*", RegexOption.IGNORE_CASE)
         )
 
         val cls = listOf(
@@ -65,33 +64,26 @@ object PopupBlocker {
             Regex("promo.?dialog",    RegexOption.IGNORE_CASE),
             Regex("popup.?dialog",    RegexOption.IGNORE_CASE),
             Regex("support.?dialog",  RegexOption.IGNORE_CASE),
-            Regex("sponsor.?dialog",  RegexOption.IGNORE_CASE)
+            Regex("sponsor.?dialog",  RegexOption.IGNORE_CASE),
+            Regex("allforu.*",        RegexOption.IGNORE_CASE)
         )
 
-        // Strictly enforced compound file naming (no optional trailing groups)
         val file = listOf(
             Regex("donat(e|ion)[_.-](popup|dialog|prefs|config|state)", RegexOption.IGNORE_CASE),
             Regex("(promo|sponsor|support)[_.-](popup|dialog|prefs|config|state)", RegexOption.IGNORE_CASE),
-            Regex("popup[_.-](donat|promo|sponsor|support|prefs|config|state)", RegexOption.IGNORE_CASE)
+            Regex("popup[_.-](donat|promo|sponsor|support|prefs|config|state)", RegexOption.IGNORE_CASE),
+            Regex("allforu.*", RegexOption.IGNORE_CASE)
         )
 
-        // Gate keys: at least one of these must exist in the file before it is
-        // watched or sanitized. Union of all patterns applyRules() can act on,
-        // plus the flagKey shapes it neutralizes.
         val key = listOf(
-            // donation_* compound forms
             Regex("donat(e|ion)[_.-](enabled|show|popup|dialog|cooldown|last)", RegexOption.IGNORE_CASE),
-            // flagKey shapes: show_donation, show_popup, popup_enabled, promo_enabled
             Regex("(show|popup|promo|sponsor|donation)[_.-](enabled|show|popup|dialog)", RegexOption.IGNORE_CASE),
             Regex("(enabled|show)[_.-](donat|popup|promo|sponsor)", RegexOption.IGNORE_CASE),
-            // gate keys
             Regex("last_shown",     RegexOption.IGNORE_CASE),
             Regex("last_popup",     RegexOption.IGNORE_CASE),
             Regex("next_show",      RegexOption.IGNORE_CASE),
             Regex("achieved_shown", RegexOption.IGNORE_CASE),
-            // scoped cooldowns
             Regex("(donat|popup|promo|sponsor).*cooldown|cooldown.*(donat|popup|promo|sponsor)", RegexOption.IGNORE_CASE),
-            // donation cache
             Regex("cached_(amount|goal|percent|supporters|month|currency)", RegexOption.IGNORE_CASE)
         )
 
@@ -142,6 +134,8 @@ object PopupBlocker {
                 }
 
                 sweep(fm)
+                blockAnnouncerDialog(activity) // Fast-fail reflection sweep
+
                 val appCtx = activity.applicationContext
                 ioExecutor.execute { rescanWatchers(appCtx) }
             }
@@ -162,10 +156,8 @@ object PopupBlocker {
 
     fun sanitize(context: Context): Int {
         if (!FilterStore.enabled) return 0
-
         val dir = File(context.applicationInfo.dataDir, "shared_prefs")
         if (!dir.isDirectory) return 0
-
         val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".xml") } ?: return 0
 
         var touched = 0
@@ -184,7 +176,6 @@ object PopupBlocker {
         ioExecutor.execute {
             val dir = File(appCtx.applicationInfo.dataDir, "shared_prefs")
             if (!dir.isDirectory) return@execute
-
             val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".xml") } ?: return@execute
 
             for (f in files) {
@@ -210,11 +201,57 @@ object PopupBlocker {
     }
 
     // =================================================================
+    // Announcer AlertDialog Blocker (Optimized)
+    // =================================================================
+
+    private fun blockAnnouncerDialog(activity: Activity) {
+        if (!FilterStore.enabled) return
+
+        // Scan standard and plugin classloaders
+        val loaders = listOfNotNull(
+            PopupBlocker::class.java.classLoader,
+            activity.classLoader,
+            Thread.currentThread().contextClassLoader
+        )
+
+        for (loader in loaders) {
+            try {
+                val clazz = Class.forName("com.allforu.Announcer", false, loader)
+                
+                // 1. Instantly kill the 12-attempt Handler retry loop by breaking the sequence matching
+                try {
+                    val seqField = clazz.getDeclaredField("requestSeq").apply { isAccessible = true }
+                    seqField.setInt(null, Int.MAX_VALUE)
+                } catch (_: Throwable) {}
+
+                // 2. Dismiss any dialog that managed to spawn before the sequence break
+                try {
+                    val currentField = clazz.getDeclaredField("current").apply { isAccessible = true }
+                    val dialog = currentField.get(null) as? android.app.Dialog
+                    if (dialog?.isShowing == true) {
+                        dialog.dismiss()
+                        Log.d("AdFree", "Dismissed AllForU Announcer programmatic dialog")
+                    }
+                } catch (_: Throwable) {}
+
+                // 3. Mark inited as true so the Announcer skips its own lifecycle registration
+                try {
+                    val initedField = clazz.getDeclaredField("inited").apply { isAccessible = true }
+                    initedField.setBoolean(null, true)
+                } catch (_: Throwable) {}
+
+                break // Exit loop once found and neutralized
+            } catch (_: Throwable) {
+                // Class not found in this loader, proceed to next
+            }
+        }
+    }
+
+    // =================================================================
     // Fragment Lifecycle Interception
     // =================================================================
 
     private val installed = AtomicBoolean(false)
-
     private val registeredFms: MutableSet<FragmentManager> =
         Collections.newSetFromMap(WeakHashMap<FragmentManager, Boolean>())
 
@@ -223,12 +260,10 @@ object PopupBlocker {
             if (!FilterStore.enabled) return
             if (isTarget(f)) killFragment(f)
         }
-
         override fun onFragmentCreated(fm: FragmentManager, f: Fragment, savedInstanceState: Bundle?) {
             if (!FilterStore.enabled) return
             if (isTarget(f)) killFragment(f)
         }
-
         override fun onFragmentResumed(fm: FragmentManager, f: Fragment) {
             if (!FilterStore.enabled) return
             if (isTarget(f)) killFragment(f)
@@ -248,7 +283,6 @@ object PopupBlocker {
 
     private fun isTarget(f: Fragment): Boolean {
         if (f !is DialogFragment) return false
-
         val tag = f.tag ?: ""
         val cls = f.javaClass.name
 
@@ -256,8 +290,7 @@ object PopupBlocker {
                       Patterns.cls.any { it.containsMatchIn(cls) }
         if (matched) return true
 
-        if (cls.contains("dialog", ignoreCase = true) ||
-            tag.contains("dialog", ignoreCase = true)) {
+        if (cls.contains("dialog", ignoreCase = true) || tag.contains("dialog", ignoreCase = true)) {
             Log.w("AdFree", "Unmatched dialog: tag=$tag class=$cls")
         }
         return false
@@ -275,18 +308,12 @@ object PopupBlocker {
 
     private val watched: MutableSet<SharedPreferences> =
         Collections.newSetFromMap(WeakHashMap<SharedPreferences, Boolean>())
-
     private val inspectedNames: MutableSet<String> = ConcurrentHashMap.newKeySet()
-
     private val writing = AtomicBoolean(false)
 
     private fun writeSelf(editor: SharedPreferences.Editor) {
         writing.set(true)
-        try {
-            editor.apply()
-        } finally {
-            writing.set(false)
-        }
+        try { editor.apply() } finally { writing.set(false) }
     }
 
     private fun isTargetKey(k: String): Boolean {
@@ -296,8 +323,6 @@ object PopupBlocker {
                Patterns.flagKey.any { it.containsMatchIn(k) }
     }
 
-    // Fast-path filter on key name first; offloads map read & sanitization to background thread
-    // WARNING: Must remain a top-level object property to prevent GC weak reference dropping
     private val listener = SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
         if (writing.get() || !FilterStore.enabled || key == null) return@OnSharedPreferenceChangeListener
         if (!isTargetKey(key)) return@OnSharedPreferenceChangeListener
@@ -312,8 +337,7 @@ object PopupBlocker {
         }
     }
 
-    private fun today(): String =
-        SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+    private fun today(): String = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
 
     private fun isProtectedFile(context: Context, name: String): Boolean {
         return name == "rebuild_preference" ||
@@ -386,69 +410,39 @@ object PopupBlocker {
 
         if (Patterns.gateKey.any { it.containsMatchIn(k) }) {
             when (v) {
-                is String -> if (v != today) {
-                    editor.putString(k, today); dirty = true
-                }
-                is Long -> if (v < minFutureLong) {
-                    editor.putLong(k, safeFutureLong); dirty = true
-                }
-                is Int -> if (v < SAFE_MAX_INT) {
-                    editor.putInt(k, SAFE_MAX_INT); dirty = true
-                }
+                is String -> if (v != today) { editor.putString(k, today); dirty = true }
+                is Long -> if (v < minFutureLong) { editor.putLong(k, safeFutureLong); dirty = true }
+                is Int -> if (v < SAFE_MAX_INT) { editor.putInt(k, SAFE_MAX_INT); dirty = true }
                 else -> {}
             }
         }
 
         if (Patterns.cooldown.containsMatchIn(k)) {
             when (v) {
-                is Long -> if (v < TEN_YEARS_MS) {
-                    editor.putLong(k, TEN_YEARS_MS); dirty = true
-                }
-                is Int -> if (v < SAFE_MAX_INT) {
-                    editor.putInt(k, SAFE_MAX_INT); dirty = true
-                }
+                is Long -> if (v < TEN_YEARS_MS) { editor.putLong(k, TEN_YEARS_MS); dirty = true }
+                is Int -> if (v < SAFE_MAX_INT) { editor.putInt(k, SAFE_MAX_INT); dirty = true }
                 else -> {}
             }
         }
 
         if (Patterns.cacheKey.any { it.containsMatchIn(k) }) {
             when (v) {
-                is Float -> if (v != 0f) {
-                    editor.putFloat(k, 0f); dirty = true
-                }
-                is Int -> if (v != 0) {
-                    editor.putInt(k, 0); dirty = true
-                }
-                is Long -> if (v != 0L) {
-                    editor.putLong(k, 0L); dirty = true
-                }
-                is String -> if (v.isNotEmpty()) {
-                    editor.putString(k, ""); dirty = true
-                }
-                is Boolean -> if (v) {
-                    editor.putBoolean(k, false); dirty = true
-                }
-                is Set<*> -> if (v.isNotEmpty()) {
-                    editor.putStringSet(k, emptySet<String>()); dirty = true
-                }
+                is Float -> if (v != 0f) { editor.putFloat(k, 0f); dirty = true }
+                is Int -> if (v != 0) { editor.putInt(k, 0); dirty = true }
+                is Long -> if (v != 0L) { editor.putLong(k, 0L); dirty = true }
+                is String -> if (v.isNotEmpty()) { editor.putString(k, ""); dirty = true }
+                is Boolean -> if (v) { editor.putBoolean(k, false); dirty = true }
+                is Set<*> -> if (v.isNotEmpty()) { editor.putStringSet(k, emptySet<String>()); dirty = true }
                 else -> {}
             }
         }
 
         if (Patterns.flagKey.any { it.containsMatchIn(k) }) {
             when (v) {
-                is Boolean -> if (v) {
-                    editor.putBoolean(k, false); dirty = true
-                }
-                is Int -> if (v != 0) {
-                    editor.putInt(k, 0); dirty = true
-                }
-                is Long -> if (v != 0L) {
-                    editor.putLong(k, 0L); dirty = true
-                }
-                is String -> if (v.equals("true", ignoreCase = true)) {
-                    editor.putString(k, "false"); dirty = true
-                }
+                is Boolean -> if (v) { editor.putBoolean(k, false); dirty = true }
+                is Int -> if (v != 0) { editor.putInt(k, 0); dirty = true }
+                is Long -> if (v != 0L) { editor.putLong(k, 0L); dirty = true }
+                is String -> if (v.equals("true", ignoreCase = true)) { editor.putString(k, "false"); dirty = true }
                 else -> {}
             }
         }
