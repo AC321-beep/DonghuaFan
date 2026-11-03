@@ -41,16 +41,11 @@ object FilterStore {
 
     var enabled: Boolean
         get() = prefs?.getBoolean(KEY_ENABLED, true) ?: true
-        set(v) {
-            prefs?.edit()?.putBoolean(KEY_ENABLED, v)?.apply()
-        }
+        set(v) { prefs?.edit()?.putBoolean(KEY_ENABLED, v)?.apply() }
 
-    // Verbose Logging Property
     var verboseLogging: Boolean
         get() = prefs?.getBoolean(KEY_VERBOSE, false) ?: false
-        set(v) {
-            prefs?.edit()?.putBoolean(KEY_VERBOSE, v)?.apply()
-        }
+        set(v) { prefs?.edit()?.putBoolean(KEY_VERBOSE, v)?.apply() }
 }
 
 object PopupBlocker {
@@ -61,7 +56,6 @@ object PopupBlocker {
 
     private val ioExecutor = Executors.newSingleThreadExecutor()
 
-    // Helper for debugging
     private fun debugLog(msg: String) {
         if (FilterStore.verboseLogging) {
             Log.d("AdFree", "[Verbose] $msg")
@@ -142,28 +136,21 @@ object PopupBlocker {
             override fun onActivityResumed(activity: Activity) {
                 if (!FilterStore.enabled) return
 
-                // FIXED: Start the watcher ONLY when the app is visible
-                startAnnouncerWatcher()
-
                 val fm = (activity as? FragmentActivity)?.supportFragmentManager ?: return
                 if (registeredFms.add(fm)) {
-                    try {
-                        fm.registerFragmentLifecycleCallbacks(callbacks, true)
-                    } catch (_: Throwable) {}
+                    try { fm.registerFragmentLifecycleCallbacks(callbacks, true) } catch (_: Throwable) {}
                 }
 
                 sweep(fm)
+                sweepProgrammaticPopups(activity) // Fire the short-lived event burst
+                
                 val appCtx = activity.applicationContext
                 ioExecutor.execute { rescanWatchers(appCtx) }
             }
 
-            override fun onActivityPaused(activity: Activity) {
-                // FIXED: Stop the watcher when the user leaves the app to save battery
-                stopAnnouncerWatcher()
-            }
-
             override fun onActivityCreated(a: Activity, b: Bundle?) {}
             override fun onActivityStarted(a: Activity) {}
+            override fun onActivityPaused(a: Activity) {}
             override fun onActivityStopped(a: Activity) {}
             override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
             override fun onActivityDestroyed(a: Activity) {}
@@ -222,109 +209,123 @@ object PopupBlocker {
     }
 
     // =================================================================
-    // Announcer AlertDialog Blocker (Continuous Deep-Scan Watcher)
+    // Announcer AlertDialog Blocker (Event-Driven Sniper Burst)
     // =================================================================
 
-    private val watchHandler = Handler(Looper.getMainLooper())
-    private var isWatching = false
-    private var announcerClass: Class<*>? = null
-    private var currentField: java.lang.reflect.Field? = null
-    private var seqField: java.lang.reflect.Field? = null
-    private var appCtxField: java.lang.reflect.Field? = null
-    private var attemptsToFindClass = 0
+    @Volatile private var isAnnouncerDefeated = false
+    @Volatile private var announcerClass: Class<*>? = null
+    @Volatile private var currentField: java.lang.reflect.Field? = null
+    @Volatile private var seqField: java.lang.reflect.Field? = null
+    @Volatile private var appCtxField: java.lang.reflect.Field? = null
 
-    private fun startAnnouncerWatcher() {
-        if (isWatching) return
-        isWatching = true
-        watchHandler.post(watcherTask)
-        debugLog("Announcer watcher loop started.")
-    }
+    private fun sweepProgrammaticPopups(activity: Activity) {
+        if (!FilterStore.enabled || isAnnouncerDefeated) return
 
-    private fun stopAnnouncerWatcher() {
-        if (!isWatching) return
-        isWatching = false
-        watchHandler.removeCallbacks(watcherTask)
-        // Reset the cache so we do a fresh scan if the plugin was unloaded while backgrounded
-        announcerClass = null
-        attemptsToFindClass = 0
-        debugLog("Announcer watcher loop stopped (App backgrounded).")
-    }
+        val app = activity.applicationContext as Application
+        val handler = Handler(Looper.getMainLooper())
+        var attempts = 0
 
-    private val watcherTask = object : Runnable {
-        override fun run() {
-            if (FilterStore.enabled) {
-                neutralizeAnnouncer()
-            }
-            // FIXED: Only re-queue if we are still supposed to be watching
-            if (isWatching) {
-                watchHandler.postDelayed(this, 300L)
-            }
-        }
-    }
+        val burstTask = object : Runnable {
+            override fun run() {
+                if (!FilterStore.enabled || isAnnouncerDefeated) return
 
-    private fun neutralizeAnnouncer() {
-        if (announcerClass == null) {
-            if (attemptsToFindClass % 10 == 0) {
-                debugLog("Scanning classloaders for com.allforu.Announcer... (Attempt $attemptsToFindClass)")
-                announcerClass = findAnnouncerClass()
-                if (announcerClass != null) {
-                    debugLog("Found Announcer class! Caching reflection fields.")
-                    try {
-                        currentField = announcerClass!!.getDeclaredField("current").apply { isAccessible = true }
-                        seqField = announcerClass!!.getDeclaredField("requestSeq").apply { isAccessible = true }
-                        appCtxField = announcerClass!!.getDeclaredField("appCtx").apply { isAccessible = true }
-                        debugLog("Successfully cached reflection fields.")
-                    } catch (e: Throwable) {
-                        debugLog("Failed to cache fields: ${e.message}")
-                    }
+                if (neutralizeAnnouncer(app)) {
+                    isAnnouncerDefeated = true
+                    debugLog("Announcer permanently defeated. Shutting down all future sweeps.")
+                    return
+                }
+
+                attempts++
+                // 6 attempts * 400ms = 2.4 second window per resume. 
+                // Decays naturally instead of running forever.
+                if (attempts < 6) { 
+                    handler.postDelayed(this, 400L)
+                } else {
+                    debugLog("Announcer burst window expired. Will retry on next navigation.")
                 }
             }
-            attemptsToFindClass++
-            if (announcerClass == null) return
+        }
+        handler.post(burstTask)
+    }
+
+    private fun neutralizeAnnouncer(app: Application): Boolean {
+        if (announcerClass == null) {
+            announcerClass = findAnnouncerClass(app) ?: return false
+            try {
+                currentField = announcerClass!!.getDeclaredField("current").apply { isAccessible = true }
+                seqField = announcerClass!!.getDeclaredField("requestSeq").apply { isAccessible = true }
+                appCtxField = announcerClass!!.getDeclaredField("appCtx").apply { isAccessible = true }
+                debugLog("Cached Announcer reflection fields.")
+            } catch (e: Throwable) {
+                debugLog("Failed to cache fields: ${e.message}")
+                announcerClass = null
+                return false
+            }
         }
 
         try {
-            var disrupted = false
-
-            // 1. Break the sequence tracker so its delayed retry loops instantly fail
-            if (seqField?.getInt(null) != -1) {
-                seqField?.setInt(null, -1)
-                disrupted = true
-            }
-
-            // 2. Erase its app context so the `showOnHome` trigger instantly aborts
+            // 1. Erase the context to permanently disable showOnHome() trigger conditions
             if (appCtxField?.get(null) != null) {
                 appCtxField?.set(null, null)
-                disrupted = true
+                debugLog("Nullified Announcer appCtx.")
             }
 
-            if (disrupted) {
-                debugLog("Nullified Announcer internal state (appCtx and requestSeq reset).")
+            // 2. Break the sequence tracker to instantly kill the delayed retry loop
+            if (seqField?.getInt(null) != -1) {
+                seqField?.setInt(null, -1)
+                debugLog("Reset Announcer requestSeq.")
             }
 
-            // 3. Aggressively dismiss any leaked dialog
+            // 3. Aggressively dismiss any active dialog that slipped through
             val dialog = currentField?.get(null) as? android.app.Dialog
             if (dialog?.isShowing == true) {
                 dialog.dismiss()
                 currentField?.set(null, null)
-                Log.d("AdFree", "Blocked AllForU programmatic popup (Dismissed active dialog)")
+                Log.d("AdFree", "Dismissed leaked AllForU popup.")
             }
+
+            // If we found the class and accessed fields successfully, we consider it defeated.
+            return true 
         } catch (e: Throwable) {
-            debugLog("Error neutralizing Announcer, resetting class cache: ${e.message}")
-            announcerClass = null // Reset cache if the plugin was unloaded
+            // Stale classloader (plugin reloaded) or reflection failure. Reset and retry.
+            debugLog("Neutralization error, resetting cache: ${e.message}")
+            announcerClass = null 
+            return false
         }
     }
 
-    private fun findAnnouncerClass(): Class<*>? {
+    private fun findAnnouncerClass(app: Application): Class<*>? {
         val loaders = mutableSetOf<ClassLoader>()
         PopupBlocker::class.java.classLoader?.let { loaders.add(it) }
-        Thread.currentThread().contextClassLoader?.let { loaders.add(it) }
-        
+        app.classLoader?.let { loaders.add(it) }
+
+        var sniperSuccess = false
+        // Sniper tactic: Pluck the exact isolated classloader directly from 
+        // Android's internal lifecycle callback array, avoiding heavy thread dumps.
         try {
-            Thread.getAllStackTraces().keys.forEach { thread ->
-                thread.contextClassLoader?.let { loaders.add(it) }
+            val field = Application::class.java.getDeclaredField("mActivityLifecycleCallbacks")
+            field.isAccessible = true
+            val callbacks = field.get(app) as? java.util.ArrayList<*>
+            callbacks?.forEach { callback ->
+                callback?.javaClass?.classLoader?.let { 
+                    loaders.add(it) 
+                    sniperSuccess = true
+                }
             }
-        } catch (_: Throwable) {}
+        } catch (e: Throwable) {
+            debugLog("Sniper reflection failed: ${e.message}")
+        }
+
+        // Fallback: If the sniper tactic failed (e.g., on modified OEM ROMs), 
+        // do a one-time heavy thread scan as a last resort.
+        if (!sniperSuccess) {
+            debugLog("Sniper failed, falling back to thread scan.")
+            try {
+                Thread.getAllStackTraces().keys.forEach { thread ->
+                    thread.contextClassLoader?.let { loaders.add(it) }
+                }
+            } catch (_: Throwable) {}
+        }
 
         for (loader in loaders) {
             try {
