@@ -85,9 +85,6 @@ object PopupBlocker {
         }
     }
 
-    // =================================================================
-    // GENERIC PATTERNS (FragmentManager + SharedPreferences)
-    // =================================================================
     private object Patterns {
         val tag = listOf(
             Regex("donat(e|ion)?[_.-]?(popup|dialog|banner|modal|prompt)", RegexOption.IGNORE_CASE),
@@ -143,10 +140,6 @@ object PopupBlocker {
         )
     }
 
-    // =================================================================
-    // DYNAMIC TARGET STATE
-    // =================================================================
-
     private class TargetState(val className: String) {
         @Volatile var cls: Class<*>? = null
         @Volatile var ctxField: Field? = null
@@ -162,46 +155,27 @@ object PopupBlocker {
     private val isSearching = AtomicBoolean(false)
 
     // =================================================================
-    // SIGNATURE DISCOVERY — "announcer-like" class detection
+    // FIXED: SIGNATURE DISCOVERY
     // =================================================================
 
-    /**
-     * A class matches the announcer signature if it declares:
-     *   - a static field of type Context (or subtype)
-     *   - a static field of type Dialog (or subtype)
-     * Optionally: a static int field (used for sequence tracking)
-     *
-     * This fingerprint is unique enough to avoid false positives.
-     * No class name is hardcoded — discovery is purely structural.
-     */
     private fun matchesAnnouncerSignature(cls: Class<*>): Boolean {
-        // Exclude framework, CloudStream core, and our own classloader
         val loader = cls.classLoader ?: return false
         if (loader === ClassLoader.getSystemClassLoader()) return false
         if (loader === PopupBlocker::class.java.classLoader) return false
+        hostApp?.classLoader?.let { if (loader === it) return false }
 
         var hasCtx = false
         var hasDlg = false
-        var hasInt = false
-
         for (f in cls.declaredFields) {
             if (!Modifier.isStatic(f.modifiers)) continue
             val t = f.type
             when {
                 Context::class.java.isAssignableFrom(t) -> hasCtx = true
                 android.app.Dialog::class.java.isAssignableFrom(t) -> hasDlg = true
-                t == Int::class.javaPrimitiveType -> hasInt = true
             }
         }
-
-        // Must have both a Context and a Dialog static field.
-        // Static int is nice-to-have (used for sequence) but not required.
         if (!hasCtx || !hasDlg) return false
 
-        // Cheap name filter to skip the 90% of classes that clearly aren't announcers.
-        // A class literally named "FooBar" won't be a promo popup.
-        // But: this is a FAST FILTER, not a hardcode — anything passing the
-        // structural signature survives even if the name doesn't match.
         val name = cls.simpleName.lowercase(Locale.US)
         val named = name.contains("announc") || name.contains("promo") ||
                     name.contains("popup") || name.contains("notice") ||
@@ -209,20 +183,16 @@ object PopupBlocker {
                     name.contains("support") || name.contains("welcome") ||
                     name.contains("reminder") || name.contains("message")
 
-        // Or the class declares a show-like method — even stronger signal
+        if (named) return true
+
         val hasShowMethod = cls.declaredMethods.any { m ->
             val mn = m.name.lowercase(Locale.US)
             (mn.startsWith("show") || mn == "display" || mn == "present") &&
             m.parameterCount <= 1
         }
-
-        return named || hasShowMethod
+        return hasShowMethod
     }
 
-    /**
-     * Enumerate all class names in a plugin classloader via DexPathList.
-     * Best-effort — falls back to empty list if the reflection is blocked.
-     */
     private fun enumerateClassNames(loader: ClassLoader): List<String> {
         val result = mutableListOf<String>()
         try {
@@ -246,7 +216,6 @@ object PopupBlocker {
                         (entries.nextElement() as? String)?.let { result.add(it) }
                     }
                 } catch (_: Throwable) {
-                    // Some Android versions block dexFile.entries(); try getClassNameList
                     try {
                         val dexFileField = elem.javaClass.getDeclaredField("dexFile").apply { isAccessible = true }
                         val dexFile = dexFileField.get(elem) ?: continue
@@ -262,8 +231,8 @@ object PopupBlocker {
     }
 
     /**
-     * Enumerate all plugin classloaders via Application.mActivityLifecycleCallbacks.
-     * Returns loaders that aren't CloudStream's own or the framework's.
+     * FIXED: exclude CloudStream's main classloader (the 50K-class one).
+     * It's not a plugin — scanning it wastes 4-5 seconds and finds nothing useful.
      */
     private fun enumeratePluginLoaders(app: Application): Set<ClassLoader> {
         val loaders = mutableSetOf<ClassLoader>()
@@ -272,9 +241,11 @@ object PopupBlocker {
             val cbs = field.get(app) as? ArrayList<*> ?: return loaders
             val ourLoader = PopupBlocker::class.java.classLoader
             val sysLoader = ClassLoader.getSystemClassLoader()
+            val appLoader = app.classLoader  // ← CloudStream main
+
             for (cb in cbs) {
                 val loader = cb?.javaClass?.classLoader ?: continue
-                if (loader === ourLoader || loader === sysLoader) continue
+                if (loader === ourLoader || loader === sysLoader || loader === appLoader) continue
                 if (loader.javaClass.name.contains("PathClassLoader") ||
                     loader.javaClass.name.contains("DexClassLoader")) {
                     loaders.add(loader)
@@ -284,11 +255,6 @@ object PopupBlocker {
         return loaders
     }
 
-    /**
-     * Background discovery. Runs once per process, persists results.
-     * Enumerates every plugin classloader, inspects every class for
-     * the announcer signature. Fully dynamic — no hardcoded class names.
-     */
     private fun startTargetDiscovery() {
         if (discoveryInProgress.getAndSet(true)) return
         ioExecutor.execute {
@@ -296,22 +262,29 @@ object PopupBlocker {
                 val app = hostApp ?: return@execute
                 val startTime = System.currentTimeMillis()
 
-                // Fast restart: verify persisted targets first
                 val persisted = FilterStore.loadDiscoveredTargets()
+                debugLog("Discovery: verifying ${persisted.size} persisted target(s).")
+
+                var resolvedCount = 0
                 for (name in persisted) {
                     if (System.currentTimeMillis() - startTime > DISCOVERY_BUDGET_MS) break
-                    tryResolve(app, name)
+                    if (tryResolve(app, name)) resolvedCount++
                 }
 
-                // Full scan for anything new
+                // FIXED: skip full scan if all persisted targets already resolve
+                if (persisted.isNotEmpty() && resolvedCount == persisted.size) {
+                    debugLog("Discovery: all ${resolvedCount} persisted target(s) resolved. Skipping full scan.")
+                    discoveryDone.set(true)
+                    return@execute
+                }
+
                 val pluginLoaders = enumeratePluginLoaders(app)
                 debugLog("Discovery: scanning ${pluginLoaders.size} plugin classloader(s).")
 
                 val foundNames = mutableSetOf<String>()
-
                 for (loader in pluginLoaders) {
                     if (System.currentTimeMillis() - startTime > DISCOVERY_BUDGET_MS) {
-                        debugLog("Discovery: budget exhausted, will resume next restart.")
+                        debugLog("Discovery: budget exhausted.")
                         break
                     }
                     val classNames = enumerateClassNames(loader)
@@ -330,13 +303,12 @@ object PopupBlocker {
                     }
                 }
 
-                // Persist for fast restart
                 if (foundNames.isNotEmpty()) {
                     val merged = persisted + foundNames
                     FilterStore.saveDiscoveredTargets(merged)
                     debugLog("Discovery: persisted ${merged.size} target(s).")
                 } else {
-                    debugLog("Discovery: no matches in this run.")
+                    debugLog("Discovery: no matches.")
                 }
 
                 discoveryDone.set(true)
@@ -346,44 +318,64 @@ object PopupBlocker {
         }
     }
 
-    private fun tryResolve(app: Application, className: String) {
+    private fun tryResolve(app: Application, className: String): Boolean {
         try {
             val loaders = enumeratePluginLoaders(app).toMutableSet()
-            app.classLoader?.let { loaders.add(it) }
+            app.classLoader?.let { loaders.add(it) }  // Cheap: single-class lookup
             for (loader in loaders) {
                 try {
                     val cls = Class.forName(className, false, loader)
                     if (matchesAnnouncerSignature(cls)) {
                         cacheTargetState(cls, loader)
-                        return
+                        return true
                     }
                 } catch (_: Throwable) {}
             }
         } catch (_: Throwable) {}
+        return false
     }
 
+    /**
+     * FIXED: prefer Context/Application fields over Activity fields.
+     * Announcer has BOTH:
+     *   `static Activity activity`  ← display only, not a gate
+     *   `static Context appCtx`      ← real gate checked by showOnHome()
+     * The old code grabbed `activity` (wrong). Now we grab `appCtx` (correct).
+     */
     private fun cacheTargetState(cls: Class<*>, loader: ClassLoader) {
         val state = targetStates.getOrPut(cls.name) { TargetState(cls.name) }
         try {
-            // Discover fields by signature, not by hardcoded name
+            var bestCtx: Field? = null
+            var fallbackActivity: Field? = null
+            var bestDlg: Field? = null
+            var bestSeq: Field? = null
+
             for (f in cls.declaredFields) {
                 if (!Modifier.isStatic(f.modifiers)) continue
                 val t = f.type
                 when {
-                    Context::class.java.isAssignableFrom(t) && state.ctxField == null -> {
-                        f.isAccessible = true
-                        state.ctxField = f
+                    // Prefer Context/Application/ContextWrapper (NOT Activity)
+                    Context::class.java.isAssignableFrom(t) && !Activity::class.java.isAssignableFrom(t) -> {
+                        if (bestCtx == null) { f.isAccessible = true; bestCtx = f }
                     }
-                    android.app.Dialog::class.java.isAssignableFrom(t) && state.dlgField == null -> {
-                        f.isAccessible = true
-                        state.dlgField = f
+                    // Activity-typed: hold as fallback only
+                    Activity::class.java.isAssignableFrom(t) -> {
+                        if (fallbackActivity == null) { f.isAccessible = true; fallbackActivity = f }
                     }
-                    t == Int::class.javaPrimitiveType && state.seqField == null -> {
-                        f.isAccessible = true
-                        state.seqField = f
+                    // Dialog
+                    android.app.Dialog::class.java.isAssignableFrom(t) -> {
+                        if (bestDlg == null) { f.isAccessible = true; bestDlg = f }
+                    }
+                    // Int (sequence)
+                    t == Int::class.javaPrimitiveType -> {
+                        if (bestSeq == null) { f.isAccessible = true; bestSeq = f }
                     }
                 }
             }
+
+            state.ctxField = bestCtx ?: fallbackActivity
+            state.dlgField = bestDlg
+            state.seqField = bestSeq
             state.cls = cls
             state.cachedLoader = loader
             debugLog("Cached ${cls.name} (ctx=${state.ctxField?.name} dlg=${state.dlgField?.name} seq=${state.seqField?.name})")
@@ -393,7 +385,7 @@ object PopupBlocker {
     }
 
     // =================================================================
-    // LAYER 1 — GENERIC ALERTDIALOG CATCHER (WindowManagerGlobal)
+    // FIXED: LAYER 1 — WindowManagerGlobal scan (catch-all for race window)
     // =================================================================
 
     private val ownDialogs: MutableSet<android.app.Dialog> =
@@ -514,11 +506,7 @@ object PopupBlocker {
         if (!installed.compareAndSet(false, true)) return
 
         hostApp = app
-
-        // Kick off dynamic discovery (one-time per process)
         startTargetDiscovery()
-
-        // Kick off the two-phase sever scanner (waits for discovery to yield targets)
         startBackgroundScanner()
 
         app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
@@ -532,8 +520,8 @@ object PopupBlocker {
 
                 sweep(fm)
                 neutralizeAllOnMainThread()
-                scanForForeignDialogs()   // Layer 1 catch-all
-                startBackgroundScanner()  // in case it gave up
+                scanForForeignDialogs()   // ← FIXED: Layer 1 catch-all
+                startBackgroundScanner()
 
                 val appCtx = activity.applicationContext
                 ioExecutor.execute { rescanWatchers(appCtx) }
@@ -548,7 +536,7 @@ object PopupBlocker {
     }
 
     // =================================================================
-    // TWO-PHASE SEVER SCANNER — operates on dynamically discovered targets
+    // TWO-PHASE SEVER SCANNER
     // =================================================================
 
     private fun startBackgroundScanner() {
@@ -556,11 +544,10 @@ object PopupBlocker {
         ioExecutor.execute {
             val deadline = System.currentTimeMillis() + SCAN_DEADLINE_MS
 
-            // PHASE A: wait until at least one target is resolved, or discovery gives up
             while (System.currentTimeMillis() < deadline) {
                 if (targetStates.values.any { it.cls != null }) break
                 if (discoveryDone.get() && targetStates.isEmpty()) {
-                    debugLog("No targets discovered — Layer 1 will handle any dialogs.")
+                    debugLog("No targets — Layer 1 will handle any dialogs.")
                     isSearching.set(false)
                     return@execute
                 }
@@ -571,16 +558,15 @@ object PopupBlocker {
             if (active.isEmpty()) { isSearching.set(false); return@execute }
             debugLog("Phase A: ${active.size} target(s) resolved. Entering Phase B.")
 
-            // PHASE B: tight sever loop across all discovered targets
             while (System.currentTimeMillis() < deadline) {
-                val nowActive = targetStates.values.filter { it.cls != null }
-                for (state in nowActive) {
+                for (state in targetStates.values.filter { it.cls != null }) {
                     try {
                         if (state.ctxField?.get(null) != null) {
                             state.ctxField?.set(null, null)
                             debugLog("Severed ${state.className} context (Gate 1).")
                         }
-                        if (state.seqField?.getInt(null) != null && state.seqField?.getInt(null) != -1) {
+                        val seq = state.seqField?.getInt(null)
+                        if (seq != null && seq != -1) {
                             state.seqField?.setInt(null, -1)
                             debugLog("Severed ${state.className} sequence (Gate 2).")
                         }
@@ -613,7 +599,8 @@ object PopupBlocker {
                     state.ctxField?.set(null, null)
                     debugLog("Nullified ${state.className} context (main).")
                 }
-                if (state.seqField?.getInt(null) != -1) {
+                val seq = state.seqField?.getInt(null)
+                if (seq != null && seq != -1) {
                     state.seqField?.setInt(null, -1)
                     debugLog("Reset ${state.className} sequence (main).")
                 }
@@ -631,7 +618,7 @@ object PopupBlocker {
     }
 
     // =================================================================
-    // FragmentLifecycleCallbacks (generic DialogFragment blocking)
+    // Fragment Lifecycle Interception
     // =================================================================
 
     private val registeredFms: MutableSet<FragmentManager> =
@@ -684,7 +671,7 @@ object PopupBlocker {
     }
 
     // =================================================================
-    // Preference Sanitizer (generic, unchanged)
+    // Preference Sanitizer
     // =================================================================
 
     private val watched: MutableSet<SharedPreferences> =
