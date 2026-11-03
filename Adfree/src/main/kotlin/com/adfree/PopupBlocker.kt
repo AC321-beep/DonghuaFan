@@ -12,6 +12,7 @@ import androidx.fragment.app.DialogFragment
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentActivity
 import androidx.fragment.app.FragmentManager
+import com.lagradost.cloudstream3.CommonActivity
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Collections
@@ -39,13 +40,20 @@ object FilterStore {
         }
     }
 
+    private fun ensurePrefs(): Boolean {
+        if (prefs != null) return true
+        val ctx = CommonActivity.activity ?: return false
+        init(ctx)
+        return prefs != null
+    }
+
     var enabled: Boolean
-        get() = prefs?.getBoolean(KEY_ENABLED, true) ?: true
-        set(v) { prefs?.edit()?.putBoolean(KEY_ENABLED, v)?.apply() }
+        get() = if (ensurePrefs()) prefs?.getBoolean(KEY_ENABLED, true) ?: true else true
+        set(v) { if (ensurePrefs()) prefs?.edit()?.putBoolean(KEY_ENABLED, v)?.apply() }
 
     var verboseLogging: Boolean
-        get() = prefs?.getBoolean(KEY_VERBOSE, false) ?: false
-        set(v) { prefs?.edit()?.putBoolean(KEY_VERBOSE, v)?.apply() }
+        get() = if (ensurePrefs()) prefs?.getBoolean(KEY_VERBOSE, false) ?: false else false
+        set(v) { if (ensurePrefs()) prefs?.edit()?.putBoolean(KEY_VERBOSE, v)?.apply() }
 }
 
 object PopupBlocker {
@@ -58,7 +66,7 @@ object PopupBlocker {
 
     private fun debugLog(msg: String) {
         if (FilterStore.verboseLogging) {
-            Log.d("AdFree", "[Verbose] $msg")
+            Log.i("AdFree", "[Verbose] $msg")
         }
     }
 
@@ -69,7 +77,6 @@ object PopupBlocker {
             Regex("(popup|dialog|banner|modal|prompt)[_.-]?(donat|promo|sponsor|support)", RegexOption.IGNORE_CASE),
             Regex("allforu.*", RegexOption.IGNORE_CASE)
         )
-
         val cls = listOf(
             Regex("donation.?dialog", RegexOption.IGNORE_CASE),
             Regex("promo.?dialog",    RegexOption.IGNORE_CASE),
@@ -78,14 +85,12 @@ object PopupBlocker {
             Regex("sponsor.?dialog",  RegexOption.IGNORE_CASE),
             Regex("allforu.*",        RegexOption.IGNORE_CASE)
         )
-
         val file = listOf(
             Regex("donat(e|ion)[_.-](popup|dialog|prefs|config|state)", RegexOption.IGNORE_CASE),
             Regex("(promo|sponsor|support)[_.-](popup|dialog|prefs|config|state)", RegexOption.IGNORE_CASE),
             Regex("popup[_.-](donat|promo|sponsor|support|prefs|config|state)", RegexOption.IGNORE_CASE),
             Regex("allforu.*", RegexOption.IGNORE_CASE)
         )
-
         val key = listOf(
             Regex("donat(e|ion)[_.-](enabled|show|popup|dialog|cooldown|last)", RegexOption.IGNORE_CASE),
             Regex("(show|popup|promo|sponsor|donation)[_.-](enabled|show|popup|dialog)", RegexOption.IGNORE_CASE),
@@ -97,7 +102,6 @@ object PopupBlocker {
             Regex("(donat|popup|promo|sponsor).*cooldown|cooldown.*(donat|popup|promo|sponsor)", RegexOption.IGNORE_CASE),
             Regex("cached_(amount|goal|percent|supporters|month|currency)", RegexOption.IGNORE_CASE)
         )
-
         val gateKey = listOf(
             Regex("last_shown",  RegexOption.IGNORE_CASE),
             Regex("last_popup",  RegexOption.IGNORE_CASE),
@@ -105,11 +109,9 @@ object PopupBlocker {
             Regex("shown_day",   RegexOption.IGNORE_CASE),
             Regex("shown_month", RegexOption.IGNORE_CASE)
         )
-
         val cacheKey = listOf(
             Regex("cached_(amount|goal|percent|supporters|month|currency)", RegexOption.IGNORE_CASE)
         )
-
         val flagKey = listOf(
             Regex("donation_enabled", RegexOption.IGNORE_CASE),
             Regex("show_donation",    RegexOption.IGNORE_CASE),
@@ -117,7 +119,6 @@ object PopupBlocker {
             Regex("promo_enabled",    RegexOption.IGNORE_CASE),
             Regex("show_popup",       RegexOption.IGNORE_CASE)
         )
-
         val cooldown = Regex(
             "(donat|popup|promo|sponsor).*cooldown|cooldown.*(donat|popup|promo|sponsor)",
             RegexOption.IGNORE_CASE
@@ -132,6 +133,12 @@ object PopupBlocker {
         val app = context.applicationContext as? Application ?: return
         if (!installed.compareAndSet(false, true)) return
 
+        debugLog("AdFree plugin booted. Firing initial startup burst.")
+        // Slight delay so other plugins finish their load() before we scan classloaders
+        Handler(Looper.getMainLooper()).postDelayed({
+            fireSniperBurst(app)
+        }, 300L)
+
         app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
             override fun onActivityResumed(activity: Activity) {
                 if (!FilterStore.enabled) return
@@ -142,8 +149,8 @@ object PopupBlocker {
                 }
 
                 sweep(fm)
-                sweepProgrammaticPopups(activity) // Fire the short-lived event burst
-                
+                fireSniperBurst(activity.applicationContext as Application)
+
                 val appCtx = activity.applicationContext
                 ioExecutor.execute { rescanWatchers(appCtx) }
             }
@@ -218,78 +225,83 @@ object PopupBlocker {
     @Volatile private var seqField: java.lang.reflect.Field? = null
     @Volatile private var appCtxField: java.lang.reflect.Field? = null
 
-    private fun sweepProgrammaticPopups(activity: Activity) {
+    // NEW: single-flight burst — cancels any previous burst before starting a new one
+    private val burstHandler = Handler(Looper.getMainLooper())
+    @Volatile private var currentBurstTask: Runnable? = null
+
+    private fun fireSniperBurst(app: Application) {
         if (!FilterStore.enabled || isAnnouncerDefeated) return
 
-        val app = activity.applicationContext as Application
-        val handler = Handler(Looper.getMainLooper())
+        // FIX: cancel previous burst so startup + resume don't overlap
+        currentBurstTask?.let { burstHandler.removeCallbacks(it) }
+
         var attempts = 0
 
         val burstTask = object : Runnable {
             override fun run() {
                 if (!FilterStore.enabled || isAnnouncerDefeated) return
 
-                if (neutralizeAnnouncer(app)) {
+                // FIX: only re-scan classloaders on sparse attempts (0, 4, 8)
+                // This drops main-thread classloader scans from 10 → 3 per burst
+                if (announcerClass == null && (attempts == 0 || attempts == 4 || attempts == 8)) {
+                    announcerClass = findAnnouncerClass(app)
+                    if (announcerClass != null) {
+                        try {
+                            currentField = announcerClass!!.getDeclaredField("current").apply { isAccessible = true }
+                            seqField = announcerClass!!.getDeclaredField("requestSeq").apply { isAccessible = true }
+                            appCtxField = announcerClass!!.getDeclaredField("appCtx").apply { isAccessible = true }
+                            debugLog("Cached Announcer reflection fields.")
+                        } catch (e: Throwable) {
+                            debugLog("Failed to cache fields: ${e.message}")
+                            announcerClass = null
+                        }
+                    }
+                }
+
+                if (announcerClass != null && neutralizeAnnouncer()) {
                     isAnnouncerDefeated = true
                     debugLog("Announcer permanently defeated. Shutting down all future sweeps.")
+                    currentBurstTask = null
                     return
                 }
 
                 attempts++
-                // 6 attempts * 400ms = 2.4 second window per resume. 
-                // Decays naturally instead of running forever.
-                if (attempts < 6) { 
-                    handler.postDelayed(this, 400L)
+                if (attempts < 10) {
+                    burstHandler.postDelayed(this, 500L)
                 } else {
                     debugLog("Announcer burst window expired. Will retry on next navigation.")
+                    currentBurstTask = null
                 }
             }
         }
-        handler.post(burstTask)
+        currentBurstTask = burstTask
+        burstHandler.post(burstTask)
     }
 
-    private fun neutralizeAnnouncer(app: Application): Boolean {
-        if (announcerClass == null) {
-            announcerClass = findAnnouncerClass(app) ?: return false
-            try {
-                currentField = announcerClass!!.getDeclaredField("current").apply { isAccessible = true }
-                seqField = announcerClass!!.getDeclaredField("requestSeq").apply { isAccessible = true }
-                appCtxField = announcerClass!!.getDeclaredField("appCtx").apply { isAccessible = true }
-                debugLog("Cached Announcer reflection fields.")
-            } catch (e: Throwable) {
-                debugLog("Failed to cache fields: ${e.message}")
-                announcerClass = null
-                return false
-            }
-        }
-
+    private fun neutralizeAnnouncer(): Boolean {
         try {
-            // 1. Erase the context to permanently disable showOnHome() trigger conditions
             if (appCtxField?.get(null) != null) {
                 appCtxField?.set(null, null)
                 debugLog("Nullified Announcer appCtx.")
             }
 
-            // 2. Break the sequence tracker to instantly kill the delayed retry loop
             if (seqField?.getInt(null) != -1) {
                 seqField?.setInt(null, -1)
                 debugLog("Reset Announcer requestSeq.")
             }
 
-            // 3. Aggressively dismiss any active dialog that slipped through
             val dialog = currentField?.get(null) as? android.app.Dialog
             if (dialog?.isShowing == true) {
                 dialog.dismiss()
                 currentField?.set(null, null)
-                Log.d("AdFree", "Dismissed leaked AllForU popup.")
+                // FIX: this used to be an unconditional Log.i — now gated by verbose
+                debugLog("Dismissed leaked AllForU popup.")
             }
 
-            // If we found the class and accessed fields successfully, we consider it defeated.
-            return true 
+            return true
         } catch (e: Throwable) {
-            // Stale classloader (plugin reloaded) or reflection failure. Reset and retry.
             debugLog("Neutralization error, resetting cache: ${e.message}")
-            announcerClass = null 
+            announcerClass = null
             return false
         }
     }
@@ -300,15 +312,13 @@ object PopupBlocker {
         app.classLoader?.let { loaders.add(it) }
 
         var sniperSuccess = false
-        // Sniper tactic: Pluck the exact isolated classloader directly from 
-        // Android's internal lifecycle callback array, avoiding heavy thread dumps.
         try {
             val field = Application::class.java.getDeclaredField("mActivityLifecycleCallbacks")
             field.isAccessible = true
             val callbacks = field.get(app) as? java.util.ArrayList<*>
             callbacks?.forEach { callback ->
-                callback?.javaClass?.classLoader?.let { 
-                    loaders.add(it) 
+                callback?.javaClass?.classLoader?.let {
+                    loaders.add(it)
                     sniperSuccess = true
                 }
             }
@@ -316,8 +326,6 @@ object PopupBlocker {
             debugLog("Sniper reflection failed: ${e.message}")
         }
 
-        // Fallback: If the sniper tactic failed (e.g., on modified OEM ROMs), 
-        // do a one-time heavy thread scan as a last resort.
         if (!sniperSuccess) {
             debugLog("Sniper failed, falling back to thread scan.")
             try {
@@ -373,11 +381,9 @@ object PopupBlocker {
         if (f !is DialogFragment) return false
         val tag = f.tag ?: ""
         val cls = f.javaClass.name
-
         val matched = Patterns.tag.any { it.containsMatchIn(tag) } ||
                       Patterns.cls.any { it.containsMatchIn(cls) }
         if (matched) return true
-
         if (cls.contains("dialog", ignoreCase = true) || tag.contains("dialog", ignoreCase = true)) {
             debugLog("Unmatched DialogFragment blocked: tag=$tag class=$cls")
         }
@@ -440,7 +446,6 @@ object PopupBlocker {
         if (!FilterStore.enabled) return
         val dir = File(context.applicationInfo.dataDir, "shared_prefs")
         if (!dir.isDirectory) return
-
         val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".xml") } ?: return
         for (f in files) {
             val name = f.nameWithoutExtension
@@ -455,17 +460,13 @@ object PopupBlocker {
         val name = file.nameWithoutExtension
         if (isProtectedFile(context, name)) return false
         if (!Patterns.file.any { it.containsMatchIn(name) }) return false
-
         val prefs = try {
             context.getSharedPreferences(name, Context.MODE_PRIVATE)
         } catch (_: Throwable) { return false }
-
         val all = try { prefs.all } catch (_: Throwable) { return false }
         if (all.isEmpty()) return false
-
         val hasPopupKeys = all.keys.any { k -> Patterns.key.any { it.containsMatchIn(k) } }
         if (!hasPopupKeys) return false
-
         if (watched.add(prefs)) {
             inspectedNames.add(name)
             try {
@@ -473,15 +474,12 @@ object PopupBlocker {
                 debugLog("Watching shared prefs file: $name")
             } catch (_: Throwable) {}
         }
-
         val editor = prefs.edit()
         var dirty = false
         val today = today()
-
         for ((k, v) in all) {
             if (applyRules(editor, k, v, today)) dirty = true
         }
-
         if (dirty) {
             debugLog("Sanitized shared prefs file on inspection: $name")
             writeSelf(editor)
@@ -508,7 +506,6 @@ object PopupBlocker {
                 else -> {}
             }
         }
-
         if (Patterns.cooldown.containsMatchIn(k)) {
             when (v) {
                 is Long -> if (v < TEN_YEARS_MS) { editor.putLong(k, TEN_YEARS_MS); dirty = true }
@@ -516,7 +513,6 @@ object PopupBlocker {
                 else -> {}
             }
         }
-
         if (Patterns.cacheKey.any { it.containsMatchIn(k) }) {
             when (v) {
                 is Float -> if (v != 0f) { editor.putFloat(k, 0f); dirty = true }
@@ -528,7 +524,6 @@ object PopupBlocker {
                 else -> {}
             }
         }
-
         if (Patterns.flagKey.any { it.containsMatchIn(k) }) {
             when (v) {
                 is Boolean -> if (v) { editor.putBoolean(k, false); dirty = true }
@@ -538,7 +533,6 @@ object PopupBlocker {
                 else -> {}
             }
         }
-
         return dirty
     }
 }
