@@ -205,16 +205,20 @@ class AnimekhorProvider : MainAPI() {
             if (!extractedIframeUrls.add(dedupUrl)) return
 
             try {
-                val isHandled = when {
-                    "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> { OkRuCustom().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
-                    "p2pstream" in finalUrl -> { P2pstream().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
-                    "upns.live" in finalUrl -> { UpnsLive().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
-                    "emturbovid" in finalUrl -> { Emturbovid().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
-                    "bysekoze.com" in finalUrl -> { Bysekoze().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
-                    "rumble.com" in finalUrl -> { Rumble().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
-                    "abyssplayer.com" in finalUrl -> { AbyssPlayer().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
-                    else -> false
-                }
+              val isHandled = when {
+    "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> { OkRuCustom().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
+    "p2pstream" in finalUrl -> { P2pstream().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
+    "upns.live" in finalUrl -> { UpnsLive().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
+    "emturbovid" in finalUrl -> { Emturbovid().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
+    "bysekoze.com" in finalUrl -> { Bysekoze().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
+    "rumble.com" in finalUrl -> { Rumble().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
+    "abyssplayer.com" in finalUrl -> { AbyssPlayer().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true }
+    "d.tube" in finalUrl -> {                                     // ← ADD
+        Dtube().getUrl(finalUrl, mainUrl)?.forEach(trackingCallback) // ← old signature
+        true
+    }
+    else -> false
+}
 
                 if (!isHandled) {
                     loadExtractor(finalUrl, referer = mainUrl, trackingSubtitleCallback, trackingCallback)
@@ -227,7 +231,9 @@ class AnimekhorProvider : MainAPI() {
         }
 
         val rawHtml = document.html()
-        val globalUrlRegex = Regex("""https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com|abyssplayer\.com|playhydrax\.com)[^"'\s<>]+""")
+       val globalUrlRegex = Regex(
+    """https?://(?:www\.)?(?:ok\.ru|odnoklassniki\.ru|emturbovid\.com|p2pstream\.vip|upns\.live|bysekoze\.com|abyssplayer\.com|playhydrax\.com|rumble\.com|d\.tube|vidara\.to)[^"'\s<>]+"""
+)
         val rawMatches = globalUrlRegex.findAll(rawHtml)
             .map { it.value.replace("\\/", "/") }
             .toList()
