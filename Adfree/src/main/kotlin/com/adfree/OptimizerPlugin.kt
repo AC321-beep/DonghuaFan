@@ -13,10 +13,10 @@ class OptimizerPlugin : Plugin() {
         private var instance: OptimizerPlugin? = null
 
         fun reSanitize(context: Context) {
+            debugLog("reSanitize() called from Settings")
             instance?.runSanitization(context)
         }
 
-        // Helper for debugging the plugin lifecycle
         private fun debugLog(msg: String) {
             if (FilterStore.verboseLogging) {
                 Log.i("AdFree", "[Verbose - Optimizer] $msg")
@@ -27,6 +27,10 @@ class OptimizerPlugin : Plugin() {
     override fun load(context: Context) {
         instance = this
         FilterStore.init(context)
+
+        // ONE-SHOT HEARTBEAT — fires once per plugin load, cannot flood.
+        // This is your only proof the plugin is alive when verbose is OFF.
+        Log.w("AdFree", "Plugin loaded")
 
         debugLog("OptimizerPlugin loaded. Blocker Enabled: ${FilterStore.enabled}")
 
@@ -43,6 +47,7 @@ class OptimizerPlugin : Plugin() {
                     debugLog("Settings dialog closed. State applied.")
                 }.show()
             } catch (e: Throwable) {
+                // Real errors always visible — even with verbose off.
                 Log.e("AdFree", "Failed to open settings: ${e.message}")
             }
         }
@@ -53,7 +58,7 @@ class OptimizerPlugin : Plugin() {
             debugLog("runSanitization aborted - Blocker is disabled.")
             return
         }
-        
+
         try {
             debugLog("Initiating synchronous preference sanitization...")
             val touchedFiles = PopupBlocker.sanitize(context)
