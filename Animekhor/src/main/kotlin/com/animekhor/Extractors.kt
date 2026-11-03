@@ -10,6 +10,7 @@ import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.extractors.ByseSX
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -66,6 +67,11 @@ private suspend fun manualJsUnpackExtraction(
             )
         }
     }
+}
+
+class Bysekoze : ByseSX() {
+    override val name = "VGPlayer"
+    override val mainUrl = "https://bysekoze.com"
 }
 
 class OkRuCustom : ExtractorApi() {
