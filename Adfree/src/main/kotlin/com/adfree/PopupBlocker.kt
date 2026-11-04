@@ -8,10 +8,14 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.view.View
+import android.view.ViewGroup
+import android.widget.TextView
 import androidx.fragment.app.DialogFragment
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentActivity
 import androidx.fragment.app.FragmentManager
+import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.CommonActivity
 import java.io.File
 import java.lang.reflect.Field
@@ -25,6 +29,7 @@ import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 object FilterStore {
     const val PREFS_NAME = "net_opt_config"
@@ -60,7 +65,10 @@ object FilterStore {
         set(v) { if (ensurePrefs()) prefs?.edit()?.putBoolean(KEY_VERBOSE, v)?.apply() }
 
     fun loadDiscoveredTargets(): Set<String> {
-        return if (ensurePrefs()) prefs?.getStringSet(KEY_DISCOVERED_TARGETS, emptySet()) ?: emptySet() else emptySet()
+        val defaultTargets = setOf("com.allforu.Announcer")
+        if (!ensurePrefs()) return defaultTargets
+        val stored = prefs?.getStringSet(KEY_DISCOVERED_TARGETS, null)
+        return if (stored.isNullOrEmpty()) defaultTargets else (stored + defaultTargets)
     }
 
     fun saveDiscoveredTargets(names: Set<String>) {
@@ -73,19 +81,24 @@ object PopupBlocker {
     private const val TEN_YEARS_MS = 10L * 365 * 24 * 60 * 60 * 1000
     private const val NINE_YEARS_MS = 9L * 365 * 24 * 60 * 60 * 1000
     private const val SAFE_MAX_INT = 2_000_000_000
-    private const val SCAN_DEADLINE_MS = 30_000L
+
     private const val DISCOVERY_BUDGET_MS = 15_000L
-
-    // Adaptive Phase B timing
-    private const val SPIN_WINDOW_MS = 2_000L      // 0-2s pre-catch: full spin
-    private const val YIELD_WINDOW_MS = 5_000L     // 2-5s pre-catch: yield
-    private const val WATCH_POLL_MS = 50L          // post-catch: 50ms poll until deadline
-
-    // Fast-path retry (matches old hardcoded version speed)
-    private const val FAST_RETRY_MS = 10L          // direct Class.forName retry, no enumeration
+    private const val SPIN_WINDOW_MS = 2_500L        // 0-2.5s after boost: 2ms spin
+    private const val ACTIVE_WATCH_WINDOW_MS = 15_000L // 2.5s-15s after boost: 25ms watch
+    private const val WATCH_FAST_MS = 25L            // active watch poll rate
+    private const val WATCH_IDLE_MS = 250L           // after 15s of calm: light 250ms poll
+    private const val LOADER_SWEEP_FAST_MS = 25L     // first 5s after boost: check new loaders
+    private const val LOADER_SWEEP_SLOW_MS = 500L    // steady state: check new loaders every 500ms
 
     private val ioExecutor = Executors.newSingleThreadExecutor()
+    private val scannerExecutor = Executors.newSingleThreadExecutor()
+    private val discoveryExecutor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
     private val installed = AtomicBoolean(false)
+
+    // Tracks foreground state and last navigation boost time so we never burn CPU in background
+    @Volatile private var appInForeground = true
+    private val lastBoostTimeMs = AtomicLong(0L)
 
     private fun debugLog(msg: String) {
         if (FilterStore.verboseLogging) {
@@ -146,9 +159,14 @@ object PopupBlocker {
             "(donat|popup|promo|sponsor).*cooldown|cooldown.*(donat|popup|promo|sponsor)",
             RegexOption.IGNORE_CASE
         )
+        val dialogText = listOf(
+            "AllForU", "allforu-goal.pages.dev",
+            "Monthly Support Goal", "Choose your donation option",
+            "Support AllForU", "PREMIUM STREAMING PLUGINS"
+        )
     }
 
-    private class TargetState(val className: String) {
+    private class TargetState(val key: String, val className: String) {
         @Volatile var cls: Class<*>? = null
         @Volatile var ctxField: Field? = null
         @Volatile var seqField: Field? = null
@@ -156,14 +174,19 @@ object PopupBlocker {
         @Volatile var cachedLoader: ClassLoader? = null
     }
 
+    // Keyed by "<loaderIdentity>:<className>" — one entry PER plugin ClassLoader
     private val targetStates = ConcurrentHashMap<String, TargetState>()
-    private val discoveryDone = AtomicBoolean(false)
+
+    // Tracks probed "<loaderIdentity>:<className>" pairs so non-AllForU plugins don't throw ClassNotFoundException forever
+    private val checkedPairs: MutableSet<String> =
+        Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+
     private val discoveryInProgress = AtomicBoolean(false)
     @Volatile private var hostApp: Application? = null
-    private val isSearching = AtomicBoolean(false)
+    private val scannerRunning = AtomicBoolean(false)
 
     // =================================================================
-    // SIGNATURE DISCOVERY
+    // SIGNATURE DISCOVERY & MULTI-SOURCE LOADER HARVESTING
     // =================================================================
 
     private fun matchesAnnouncerSignature(cls: Class<*>): Boolean {
@@ -193,12 +216,11 @@ object PopupBlocker {
 
         if (named) return true
 
-        val hasShowMethod = cls.declaredMethods.any { m ->
+        return cls.declaredMethods.any { m ->
             val mn = m.name.lowercase(Locale.US)
             (mn.startsWith("show") || mn == "display" || mn == "present") &&
             m.parameterCount <= 1
         }
-        return hasShowMethod
     }
 
     private fun enumerateClassNames(loader: ClassLoader): List<String> {
@@ -216,7 +238,6 @@ object PopupBlocker {
                 try {
                     val dexFileField = elem.javaClass.getDeclaredField("dexFile").apply { isAccessible = true }
                     val dexFile = dexFileField.get(elem) ?: continue
-
                     val entriesMethod = dexFile.javaClass.getDeclaredMethod("entries").apply { isAccessible = true }
                     @Suppress("UNCHECKED_CAST")
                     val entries = entriesMethod.invoke(dexFile) as? Enumeration<*> ?: continue
@@ -238,173 +259,119 @@ object PopupBlocker {
         return result
     }
 
+    /**
+     * Harvests plugin ClassLoaders from BOTH:
+     * 1. Application.mActivityLifecycleCallbacks (plugins that already called Announcer.init)
+     * 2. APIHolder.allProviders (all loaded CloudStream provider plugins, even before Announcer.init!)
+     */
     private fun enumeratePluginLoaders(app: Application): Set<ClassLoader> {
         val loaders = mutableSetOf<ClassLoader>()
+        val ourLoader = PopupBlocker::class.java.classLoader
+        val sysLoader = ClassLoader.getSystemClassLoader()
+        val appLoader = app.classLoader
+
+        fun addIfPluginLoader(loader: ClassLoader?) {
+            if (loader == null || loader === ourLoader || loader === sysLoader || loader === appLoader) return
+            val name = loader.javaClass.name
+            if (name.contains("PathClassLoader") || name.contains("DexClassLoader") || name.contains("InMemoryDexClassLoader")) {
+                loaders.add(loader)
+            }
+        }
+
+        // Source 1: ActivityLifecycleCallbacks
         try {
             val field = Application::class.java.getDeclaredField("mActivityLifecycleCallbacks").apply { isAccessible = true }
-            val cbs = field.get(app) as? ArrayList<*> ?: return loaders
-            val ourLoader = PopupBlocker::class.java.classLoader
-            val sysLoader = ClassLoader.getSystemClassLoader()
-            val appLoader = app.classLoader
-
-            for (cb in cbs) {
-                val loader = cb?.javaClass?.classLoader ?: continue
-                if (loader === ourLoader || loader === sysLoader || loader === appLoader) continue
-                if (loader.javaClass.name.contains("PathClassLoader") ||
-                    loader.javaClass.name.contains("DexClassLoader")) {
-                    loaders.add(loader)
+            val cbs = field.get(app) as? ArrayList<*>
+            if (cbs != null) {
+                val snapshot = synchronized(cbs) { ArrayList(cbs) }
+                for (cb in snapshot) {
+                    addIfPluginLoader(cb?.javaClass?.classLoader)
                 }
             }
         } catch (_: Throwable) {}
+
+        // Source 2: CloudStream's APIHolder.allProviders (catches plugins before Announcer.init runs!)
+        try {
+            val providers = synchronized(APIHolder.allProviders) { ArrayList(APIHolder.allProviders) }
+            for (api in providers) {
+                addIfPluginLoader(api.javaClass.classLoader)
+            }
+        } catch (_: Throwable) {}
+
         return loaders
     }
 
     /**
-     * SPEED-OPTIMIZED DISCOVERY.
-     *
-     * Two-phase design:
-     *   1. FAST PATH (10ms retry): direct Class.forName on persisted targets.
-     *      No enumeration overhead. Matches old hardcoded version's speed.
-     *   2. SLOW PATH (fallback): only runs if fast path fails within 2s.
-     *      Enumerates plugin loaders once, then retries persisted targets.
-     *
-     * This restores the old version's ~15ms detection latency while
-     * keeping dynamic discovery for repos beyond AllForU.
+     * Probes each (loader, className) pair ONCE.
+     * Avoids throwing ClassNotFoundException forever on non-AllForU plugins.
      */
-    private fun startTargetDiscovery() {
+    private fun resolveKnownTargetsAcrossLoaders(app: Application, targetNames: Set<String>): Int {
+        var newlyCached = 0
+        for (loader in enumeratePluginLoaders(app)) {
+            val loaderHash = System.identityHashCode(loader)
+            for (className in targetNames) {
+                val pairKey = "$loaderHash:$className"
+                if (!checkedPairs.add(pairKey)) continue
+                try {
+                    val cls = Class.forName(className, false, loader)
+                    if (matchesAnnouncerSignature(cls)) {
+                        cacheTargetState(cls, loader)
+                        newlyCached++
+                    }
+                } catch (_: ClassNotFoundException) {
+                    // Normal for non-AllForU plugins; pairKey stays in checkedPairs so we never re-throw
+                } catch (_: Throwable) {
+                    // Transient error — allow retry on next sweep
+                    checkedPairs.remove(pairKey)
+                }
+            }
+        }
+        return newlyCached
+    }
+
+    private fun startSlowTargetDiscovery() {
         if (discoveryInProgress.getAndSet(true)) return
-        ioExecutor.execute {
+        discoveryExecutor.execute {
             try {
                 val app = hostApp ?: return@execute
                 val startTime = System.currentTimeMillis()
-
-                val persisted = FilterStore.loadDiscoveredTargets()
-                debugLog("Discovery: verifying ${persisted.size} persisted target(s).")
-
+                val persisted = FilterStore.loadDiscoveredTargets().toMutableSet()
+                val enumeratedLoaders = mutableSetOf<ClassLoader>()
                 val foundNames = mutableSetOf<String>()
 
-                // ── PHASE 1: FAST PATH (10ms retry, no enumeration) ──
-                // Direct Class.forName against persisted targets.
-                // ~1ms per attempt when class absent — matches old hardcoded speed.
-                if (persisted.isNotEmpty()) {
-                    val fastPathDeadline = startTime + 2_000L  // spend max 2s in fast path
-                    while (System.currentTimeMillis() < fastPathDeadline) {
-                        var allResolved = true
-                        for (name in persisted) {
-                            if (name in foundNames) continue
-                            if (tryResolve(app, name)) {
-                                foundNames.add(name)
-                            } else {
-                                allResolved = false
-                            }
-                        }
-                        if (foundNames.size == persisted.size) {
-                            debugLog("Discovery: all ${persisted.size} persisted target(s) resolved via fast path. Skipping enumeration.")
-                            discoveryDone.set(true)
-                            return@execute
-                        }
-                        // Not all resolved yet — sleep briefly and retry
-                        try { Thread.sleep(FAST_RETRY_MS) } catch (_: InterruptedException) { break }
-                    }
-                    debugLog("Discovery: fast path incomplete after 2s, falling back to enumeration.")
-                }
-
-                // ── PHASE 2: SLOW PATH (enumeration fallback) ──
-                // Only runs if fast path failed. Enumerates plugin loaders.
-                val seenLoaders = mutableSetOf<ClassLoader>()
-                var attempt = 0
-
                 while (System.currentTimeMillis() - startTime < DISCOVERY_BUDGET_MS) {
-                    attempt++
-
-                    // Re-try persisted targets (loader may have appeared)
-                    for (name in persisted) {
-                        if (name in foundNames) continue
-                        if (tryResolve(app, name)) foundNames.add(name)
-                    }
-
-                    // Enumerate only new loaders
-                    val pluginLoaders = enumeratePluginLoaders(app)
-                    debugLog("Discovery: slow-path attempt $attempt, ${pluginLoaders.size} loader(s).")
-
-                    for (loader in pluginLoaders) {
-                        if (loader in seenLoaders) continue
-                        if (System.currentTimeMillis() - startTime > DISCOVERY_BUDGET_MS) break
-
-                        val classNames = enumerateClassNames(loader)
-                        if (classNames.isEmpty()) continue
-                        seenLoaders.add(loader)
-                        debugLog("Discovery: loader ${loader.javaClass.simpleName} has ${classNames.size} classes.")
-
-                        for (cn in classNames) {
+                    for (loader in enumeratePluginLoaders(app)) {
+                        if (!enumeratedLoaders.add(loader)) continue
+                        for (cn in enumerateClassNames(loader)) {
                             if (System.currentTimeMillis() - startTime > DISCOVERY_BUDGET_MS) break
                             try {
                                 val cls = Class.forName(cn, false, loader)
                                 if (matchesAnnouncerSignature(cls)) {
-                                    debugLog("Discovery: MATCH → $cn")
-                                    foundNames.add(cn)
+                                    if (foundNames.add(cn)) debugLog("Discovery: new signature -> $cn")
                                     cacheTargetState(cls, loader)
                                 }
                             } catch (_: Throwable) {}
                         }
                     }
-
-                    if (foundNames.isNotEmpty() && foundNames.size >= persisted.size) break
-
-                    val retryDelay = when {
-                        attempt <= 5 -> 100L
-                        attempt <= 10 -> 200L
-                        else -> 500L
+                    if (foundNames.isNotEmpty() && !persisted.containsAll(foundNames)) {
+                        persisted.addAll(foundNames)
+                        FilterStore.saveDiscoveredTargets(persisted)
                     }
-                    try { Thread.sleep(retryDelay) } catch (_: InterruptedException) { break }
+                    try { Thread.sleep(500L) } catch (_: InterruptedException) { break }
                 }
-
-                if (foundNames.isNotEmpty()) {
-                    val merged = persisted + foundNames
-                    FilterStore.saveDiscoveredTargets(merged)
-                    debugLog("Discovery: persisted ${merged.size} target(s) after $attempt slow attempt(s).")
-                } else {
-                    debugLog("Discovery: no matches after $attempt attempt(s). Gave up.")
-                }
-
-                discoveryDone.set(true)
             } finally {
                 discoveryInProgress.set(false)
             }
         }
     }
 
-    /**
-     * Try to resolve a persisted class name across available loaders.
-     * Cheap when class is absent (~1ms), expensive when found (~2ms + cache).
-     * No enumeration — direct Class.forName only.
-     */
-    private fun tryResolve(app: Application, className: String): Boolean {
-        try {
-            val loaders = mutableSetOf<ClassLoader>()
-            PopupBlocker::class.java.classLoader?.let { loaders.add(it) }
-            app.classLoader?.let { loaders.add(it) }
-            // Also try plugin loaders (cheap call, just reflection on callback list)
-            loaders.addAll(enumeratePluginLoaders(app))
-
-            for (loader in loaders) {
-                try {
-                    val cls = Class.forName(className, false, loader)
-                    if (matchesAnnouncerSignature(cls)) {
-                        cacheTargetState(cls, loader)
-                        return true
-                    }
-                } catch (_: Throwable) {}
-            }
-        } catch (_: Throwable) {}
-        return false
-    }
-
     private fun cacheTargetState(cls: Class<*>, loader: ClassLoader) {
-        val state = targetStates.getOrPut(cls.name) { TargetState(cls.name) }
+        val stateKey = "${System.identityHashCode(loader)}:${cls.name}"
+        val isNew = !targetStates.containsKey(stateKey)
+        val state = targetStates.getOrPut(stateKey) { TargetState(stateKey, cls.name) }
+
         try {
             var bestCtx: Field? = null
-            var fallbackActivity: Field? = null
             var bestDlg: Field? = null
             var bestSeq: Field? = null
 
@@ -415,9 +382,6 @@ object PopupBlocker {
                     Context::class.java.isAssignableFrom(t) && !Activity::class.java.isAssignableFrom(t) -> {
                         if (bestCtx == null) { f.isAccessible = true; bestCtx = f }
                     }
-                    Activity::class.java.isAssignableFrom(t) -> {
-                        if (fallbackActivity == null) { f.isAccessible = true; fallbackActivity = f }
-                    }
                     android.app.Dialog::class.java.isAssignableFrom(t) -> {
                         if (bestDlg == null) { f.isAccessible = true; bestDlg = f }
                     }
@@ -427,32 +391,54 @@ object PopupBlocker {
                 }
             }
 
-            state.ctxField = bestCtx ?: fallbackActivity
+            state.ctxField = bestCtx
             state.dlgField = bestDlg
             state.seqField = bestSeq
             state.cls = cls
             state.cachedLoader = loader
-            debugLog("Cached ${cls.name} (ctx=${state.ctxField?.name} dlg=${state.dlgField?.name} seq=${state.seqField?.name})")
 
-            // ── IMMEDIATE SEVER (Change 3) ──
-            // Fire a main-thread nullify right now — don't wait for Phase A → Phase B.
-            // Restores old hardcoded version's ~16ms class-found → sever latency.
-            Handler(Looper.getMainLooper()).post {
-                try {
-                    if (state.ctxField?.get(null) != null) {
-                        state.ctxField?.set(null, null)
-                        debugLog("Immediate sever: ${cls.name} context (post-cache).")
-                    }
-                    val seq = state.seqField?.getInt(null)
-                    if (seq != null && seq != -1) {
-                        state.seqField?.setInt(null, -1)
-                        debugLog("Immediate sever: ${cls.name} sequence (post-cache).")
-                    }
-                } catch (_: Throwable) {}
+            if (isNew) {
+                debugLog("Cached ${cls.name} in loader@${Integer.toHexString(System.identityHashCode(loader))} (total targets=${targetStates.size})")
             }
+
+            severTargetState(state)
         } catch (e: Throwable) {
             debugLog("Field discovery failed for ${cls.name}: ${e.message}")
         }
+    }
+
+    private fun severTargetState(state: TargetState): Boolean {
+        if (state.cls == null) return false
+        var severedAny = false
+        try {
+            if (state.ctxField?.get(null) != null) {
+                state.ctxField?.set(null, null)
+                severedAny = true
+                debugLog("Severed ${state.key} context (Gate 1).")
+            }
+            val seq = state.seqField?.getInt(null)
+            if (seq != null && seq > 0) {
+                state.seqField?.setInt(null, -999_999)
+                severedAny = true
+                debugLog("Severed ${state.key} active seq=$seq (Gate 2).")
+            }
+            val dlg = state.dlgField?.get(null) as? android.app.Dialog
+            if (dlg != null) {
+                state.dlgField?.set(null, null)
+                severedAny = true
+                mainHandler.post {
+                    try {
+                        if (dlg.isShowing) dlg.dismiss()
+                        debugLog("Dismissed ${state.key} leaked dialog.")
+                    } catch (_: Throwable) {}
+                }
+            }
+        } catch (_: Throwable) {
+            state.cls = null
+            state.cachedLoader = null
+            checkedPairs.remove(state.key) // Allow re-resolution if plugin hot-reloaded
+        }
+        return severedAny
     }
 
     // =================================================================
@@ -469,55 +455,53 @@ object PopupBlocker {
             val wmgClass = Class.forName("android.view.WindowManagerGlobal")
             val instanceField = wmgClass.getDeclaredField("mInstance").apply { isAccessible = true }
             val wmg = instanceField.get(null) ?: return
-
             val viewsField = wmgClass.getDeclaredField("mViews").apply { isAccessible = true }
             @Suppress("UNCHECKED_CAST")
-            val views = viewsField.get(wmg) as? ArrayList<android.view.View> ?: return
+            val views = viewsField.get(wmg) as? ArrayList<View> ?: return
 
             val snapshot = ArrayList(views)
-            val ourLoader = PopupBlocker::class.java.classLoader
-
-            for (view in snapshot) {
-                if (view.javaClass.simpleName != "DecorView") continue
-                try {
-                    val mWindowField = view.javaClass.getDeclaredField("mWindow").apply { isAccessible = true }
-                    val window = mWindowField.get(view) as? android.view.Window ?: continue
-                    val mCallbackField = android.view.Window::class.java
-                        .getDeclaredField("mCallback").apply { isAccessible = true }
-                    val callback = mCallbackField.get(window) ?: continue
-
-                    if (callback is android.app.Dialog && callback.isShowing) {
-                        if (ownDialogs.contains(callback)) continue
-                        if (isForeignDialog(callback, ourLoader)) {
-                            val name = callback.javaClass.name
-                            try {
-                                callback.dismiss()
-                                debugLog("Layer 1 dismissed foreign dialog: $name")
-                            } catch (_: Throwable) {}
-                        }
-                    }
-                } catch (_: Throwable) {}
+            for (decor in snapshot) {
+                if (containsBlockedPopupText(decor)) {
+                    dismissDecorDialog(decor)
+                }
             }
         } catch (_: Throwable) {}
     }
 
-    private fun isForeignDialog(dialog: android.app.Dialog, ourLoader: ClassLoader?): Boolean {
-        val root = dialog.window?.decorView ?: return false
-        return containsForeignPluginView(root, ourLoader)
-    }
-
-    private fun containsForeignPluginView(view: android.view.View, ourLoader: ClassLoader?): Boolean {
-        val loader = view.javaClass.classLoader
-        if (loader != null && loader !== ourLoader) {
-            val n = loader.javaClass.name
-            if (n == "dalvik.system.PathClassLoader" || n == "dalvik.system.DexClassLoader") return true
+    private fun containsBlockedPopupText(view: View): Boolean {
+        if (view is TextView) {
+            val text = view.text?.toString() ?: ""
+            if (text.isNotEmpty() && Patterns.dialogText.any { text.contains(it, ignoreCase = true) }) return true
         }
-        if (view is android.view.ViewGroup) {
+        if (view is ViewGroup) {
             for (i in 0 until view.childCount) {
-                if (containsForeignPluginView(view.getChildAt(i), ourLoader)) return true
+                val child = view.getChildAt(i) ?: continue
+                if (containsBlockedPopupText(child)) return true
             }
         }
         return false
+    }
+
+    private fun dismissDecorDialog(decor: View) {
+        try {
+            var cur: Class<*>? = decor.javaClass
+            var mWindowField: Field? = null
+            while (cur != null && mWindowField == null) {
+                mWindowField = try { cur.getDeclaredField("mWindow").apply { isAccessible = true } } catch (_: Throwable) { null }
+                cur = cur.superclass
+            }
+            val window = mWindowField?.get(decor) as? android.view.Window ?: return
+            val mCallbackField = android.view.Window::class.java.getDeclaredField("mCallback").apply { isAccessible = true }
+            val callback = mCallbackField.get(window)
+            if (callback is android.app.Dialog && !ownDialogs.contains(callback)) {
+                callback.dismiss()
+                debugLog("Layer 1 dismissed popup via text match.")
+            } else {
+                decor.visibility = View.GONE
+            }
+        } catch (_: Throwable) {
+            try { decor.visibility = View.GONE } catch (_: Throwable) {}
+        }
     }
 
     // =================================================================
@@ -577,11 +561,13 @@ object PopupBlocker {
         if (!installed.compareAndSet(false, true)) return
 
         hostApp = app
-        startTargetDiscovery()
-        startBackgroundScanner()
+        appInForeground = true
+        boostScannerWindow()
+        startSlowTargetDiscovery()
 
         app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
             override fun onActivityResumed(activity: Activity) {
+                appInForeground = true
                 if (!FilterStore.enabled) return
 
                 val fm = (activity as? FragmentActivity)?.supportFragmentManager ?: return
@@ -592,158 +578,104 @@ object PopupBlocker {
                 sweep(fm)
                 neutralizeAllOnMainThread()
                 scanForForeignDialogs()
-                if (!isSearching.get()) startBackgroundScanner()
+                boostScannerWindow()
 
                 val appCtx = activity.applicationContext
                 ioExecutor.execute { rescanWatchers(appCtx) }
             }
 
-            // ── Change 4: extra safety net at onActivityStarted (fires ~50-100ms before resume) ──
             override fun onActivityStarted(activity: Activity) {
+                appInForeground = true
                 if (!FilterStore.enabled) return
-                if (targetStates.values.any { it.cls != null }) {
-                    neutralizeOnMainThread()
+                neutralizeAllOnMainThread()
+            }
+
+            override fun onActivityStopped(activity: Activity) {
+                // If the foreground activity stopped, pause the background loop to save battery
+                if (CommonActivity.activity == null || CommonActivity.activity === activity) {
+                    appInForeground = false
                 }
             }
 
             override fun onActivityCreated(a: Activity, b: Bundle?) {}
             override fun onActivityPaused(a: Activity) {}
-            override fun onActivityStopped(a: Activity) {}
             override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
             override fun onActivityDestroyed(a: Activity) {}
         })
     }
 
     // =================================================================
-    // TWO-PHASE SEVER SCANNER — WATCH mode runs full 30s
+    // FOREGROUND-AWARE MULTI-LOADER SCANNER
     // =================================================================
 
+    private fun boostScannerWindow() {
+        lastBoostTimeMs.set(System.currentTimeMillis())
+        startBackgroundScanner()
+    }
+
     private fun startBackgroundScanner() {
-        if (isSearching.getAndSet(true)) return
-        ioExecutor.execute {
-            val startTime = System.currentTimeMillis()
-            val deadline = startTime + SCAN_DEADLINE_MS
-
-            // ── PHASE A: resolve target classes ──
-            // Change 5: 20ms poll (was 100ms) — matches old version's responsiveness.
-            while (System.currentTimeMillis() < deadline) {
-                if (targetStates.values.any { it.cls != null }) break
-                if (discoveryDone.get() && !discoveryInProgress.get() && targetStates.isEmpty()) {
-                    debugLog("No targets after discovery finished — Layer 1 will handle any dialogs.")
-                    isSearching.set(false)
-                    return@execute
-                }
-                try { Thread.sleep(20L) } catch (_: InterruptedException) {
-                    isSearching.set(false)
-                    return@execute
-                }
-            }
-
-            val active = targetStates.values.filter { it.cls != null }
-            if (active.isEmpty()) { isSearching.set(false); return@execute }
-            debugLog("Phase A: ${active.size} target(s) resolved. Entering Phase B.")
-
-            // ── PHASE B: adaptive sever loop ──
-            var everSevered = false
-            var mode = "SPIN"
-            debugLog("Phase B: starting in SPIN mode (0-2s, max rate).")
-
-            while (System.currentTimeMillis() < deadline) {
-                var anySeveredThisTick = false
-
-                for (state in targetStates.values.filter { it.cls != null }) {
-                    try {
-                        if (state.ctxField?.get(null) != null) {
-                            state.ctxField?.set(null, null)
-                            anySeveredThisTick = true
-                            debugLog("Severed ${state.className} context (Gate 1).")
-                        }
-                        val seq = state.seqField?.getInt(null)
-                        if (seq != null && seq != -1) {
-                            state.seqField?.setInt(null, -1)
-                            anySeveredThisTick = true
-                            debugLog("Severed ${state.className} sequence (Gate 2).")
-                        }
-                        val dlg = state.dlgField?.get(null) as? android.app.Dialog
-                        if (dlg?.isShowing == true) {
-                            Handler(Looper.getMainLooper()).post {
-                                try { dlg.dismiss() } catch (_: Throwable) {}
-                            }
-                            state.dlgField?.set(null, null)
-                            anySeveredThisTick = true
-                            debugLog("Dismissed ${state.className} leaked dialog.")
-                        }
-                    } catch (_: Throwable) {
-                        state.cls = null
-                        state.cachedLoader = null
-                    }
-                }
-
-                if (anySeveredThisTick) everSevered = true
-
-                // ── Adaptive pacing ──
-                if (everSevered) {
-                    if (mode != "WATCH") {
-                        debugLog("Phase B: entering WATCH mode (50ms poll until ${SCAN_DEADLINE_MS}ms).")
-                        mode = "WATCH"
-                    }
-                    try { Thread.sleep(WATCH_POLL_MS) } catch (_: InterruptedException) { break }
-                } else {
-                    val elapsed = System.currentTimeMillis() - startTime
-                    when {
-                        elapsed < SPIN_WINDOW_MS -> {
-                            // Full spin, no sleep
-                        }
-                        elapsed < YIELD_WINDOW_MS -> {
-                            if (mode != "YIELD") {
-                                debugLog("Phase B: switching to YIELD mode (2-5s).")
-                                mode = "YIELD"
-                            }
-                            Thread.yield()
-                        }
-                        else -> {
-                            if (mode != "SLEEP") {
-                                debugLog("Phase B: switching to SLEEP mode (5-30s).")
-                                mode = "SLEEP"
-                            }
-                            try { Thread.sleep(100L) } catch (_: InterruptedException) { break }
-                        }
-                    }
-                }
-            }
-
-            debugLog("Phase B: deadline expired (${System.currentTimeMillis() - startTime}ms).")
-            isSearching.set(false)
-        }
-    }
-
-    private fun neutralizeOnMainThread() {
-        for (state in targetStates.values) {
-            if (state.cls == null) continue
+        if (scannerRunning.getAndSet(true)) return
+        scannerExecutor.execute {
             try {
-                if (state.ctxField?.get(null) != null) {
-                    state.ctxField?.set(null, null)
-                    debugLog("Nullified ${state.className} context (main).")
+                val app = hostApp ?: return@execute
+                val knownNames = FilterStore.loadDiscoveredTargets()
+
+                debugLog("Scanner active (foreground-aware, multi-loader): $knownNames")
+                var lastLoaderSweep = 0L
+                var lastUiSweep = 0L
+
+                while (FilterStore.enabled && appInForeground) {
+                    val now = System.currentTimeMillis()
+                    val sinceBoost = now - lastBoostTimeMs.get()
+
+                    // Sweep for new plugin ClassLoaders (fast during first 5s of boost, then every 500ms)
+                    val loaderSweepInterval = if (sinceBoost < 5_000L) LOADER_SWEEP_FAST_MS else LOADER_SWEEP_SLOW_MS
+                    if (now - lastLoaderSweep >= loaderSweepInterval) {
+                        resolveKnownTargetsAcrossLoaders(app, knownNames)
+                        lastLoaderSweep = now
+                    }
+
+                    // Sever every cached target state across all plugin ClassLoaders
+                    var severedThisTick = false
+                    for (state in targetStates.values) {
+                        if (severTargetState(state)) severedThisTick = true
+                    }
+                    if (severedThisTick) {
+                        // Keep high-alert window active if a plugin just attempted a trigger
+                        lastBoostTimeMs.set(now)
+                    }
+
+                    // Layer 1 UI sweep during the active 10s boost window
+                    if (sinceBoost < 10_000L && now - lastUiSweep >= 250L) {
+                        lastUiSweep = now
+                        mainHandler.post { scanForForeignDialogs() }
+                    }
+
+                    // Three-gear pacing:
+                    // 1. 0 - 2.5s after navigation/boot: 2ms tight spin
+                    // 2. 2.5s - 15s after navigation/boot: 25ms active watch
+                    // 3. > 15s of calm (e.g. watching video / browsing): 250ms light heartbeat
+                    val sleepMs = when {
+                        sinceBoost < SPIN_WINDOW_MS -> 2L
+                        sinceBoost < ACTIVE_WATCH_WINDOW_MS -> WATCH_FAST_MS
+                        else -> WATCH_IDLE_MS
+                    }
+                    try { Thread.sleep(sleepMs) } catch (_: InterruptedException) { break }
                 }
-                val seq = state.seqField?.getInt(null)
-                if (seq != null && seq != -1) {
-                    state.seqField?.setInt(null, -1)
-                    debugLog("Reset ${state.className} sequence (main).")
-                }
-                val dlg = state.dlgField?.get(null) as? android.app.Dialog
-                if (dlg?.isShowing == true) {
-                    dlg.dismiss()
-                    state.dlgField?.set(null, null)
-                    debugLog("Dismissed ${state.className} dialog (main).")
-                }
-            } catch (_: Throwable) {
-                state.cls = null
-                state.cachedLoader = null
+
+                debugLog("Scanner paused (foreground=$appInForeground, enabled=${FilterStore.enabled}). Cached targets: ${targetStates.size}")
+            } finally {
+                scannerRunning.set(false)
             }
         }
     }
 
-    private fun neutralizeAllOnMainThread() = neutralizeOnMainThread()
+    private fun neutralizeAllOnMainThread() {
+        hostApp?.let { resolveKnownTargetsAcrossLoaders(it, FilterStore.loadDiscoveredTargets()) }
+        for (state in targetStates.values) {
+            severTargetState(state)
+        }
+    }
 
     // =================================================================
     // Fragment Lifecycle Interception
@@ -764,7 +696,9 @@ object PopupBlocker {
         override fun onFragmentResumed(fm: FragmentManager, f: Fragment) {
             if (!FilterStore.enabled) return
             if (isTarget(f)) killFragment(f)
-            neutralizeOnMainThread()
+            neutralizeAllOnMainThread()
+            scanForForeignDialogs()
+            boostScannerWindow()
         }
     }
 
@@ -787,7 +721,7 @@ object PopupBlocker {
                       Patterns.cls.any { it.containsMatchIn(cls) }
         if (matched) return true
         if (cls.contains("dialog", ignoreCase = true) || tag.contains("dialog", ignoreCase = true)) {
-            debugLog("Unmatched DialogFragment blocked: tag=$tag class=$cls")
+            debugLog("Unmatched DialogFragment: tag=$tag class=$cls")
         }
         return false
     }
