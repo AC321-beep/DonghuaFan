@@ -2,16 +2,17 @@ package com.lmanime
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 class LMANIME : MainAPI() {
 
@@ -40,6 +41,9 @@ class LMANIME : MainAPI() {
     private val epStripRegex = Regex("""\s+Episode\s+\d+.*$""", RegexOption.IGNORE_CASE)
     private val epBadgeRegex = Regex("""(?i)(eps?\.?\s*\d+|\d+)""")
 
+    /* ─── Dailymotion ID extraction — Donghuastream pattern ─── */
+    private val dmVideoIdRegex = Regex("""[?&]video=([a-zA-Z0-9_-]+)""")
+
     override val mainPage = mainPageOf(
         "latest"                             to "Latest Release",
         "anime/?status=&type=&order=popular" to "Popular",
@@ -47,7 +51,7 @@ class LMANIME : MainAPI() {
         "upcoming/"                          to "Upcoming",
     )
 
-    /* ─── Shared parsing helpers (used by loadSeries + loadAsMovie) ─── */
+    /* ─── Shared parsing helpers ─── */
     private fun extractTitle(vararg docs: Document): String =
         docs.asSequence().mapNotNull {
             it.selectFirst("h1.entry-title")?.text()?.trim()
@@ -277,10 +281,17 @@ class LMANIME : MainAPI() {
     ): Boolean {
         val document = app.get(data).document
 
-        /* Global dedup — only path that touches the caller's callback. */
-        val emittedUrls = ConcurrentHashMap.newKeySet<String>()
+        /* Thread-safe sinks (Donghuastream pattern) */
+        val found         = AtomicBoolean(false)
+        val callbackLock  = Any()
+        val subtitleLock  = Any()
+
         fun emit(link: ExtractorLink) {
-            if (emittedUrls.add(link.url)) callback(link)
+            found.set(true)
+            synchronized(callbackLock) { callback(link) }
+        }
+        fun emitSub(sub: SubtitleFile) {
+            synchronized(subtitleLock) { subtitleCallback(sub) }
         }
 
         /* ── Language detection (precompiled) ──────────────────────── */
@@ -359,7 +370,6 @@ class LMANIME : MainAPI() {
                 }
             }
 
-            /* Download blocks — one .soraddlx per language. */
             doc.select("div.soraddlx").forEach { block ->
                 val heading = block.selectFirst(".sorattlx h3, .sorattlx")?.text()?.trim()
                 val lang = detectLang(heading) ?: parentLang
@@ -393,10 +403,10 @@ class LMANIME : MainAPI() {
 
         collectFrom(document)
 
-        /* ── Mirror pages — PARALLEL ───────────────────────────────── */
+        /* ── Mirror pages — parallel (safe, pure network) ──────────── */
         coroutineScope {
             document.select("select.mirror option").map { option ->
-                async(Dispatchers.IO) {
+                async {
                     val serverUrl = option.attr("value").trim()
                     if (!serverUrl.startsWith("http")) return@async null
                     val optLang = detectLang(
@@ -410,7 +420,7 @@ class LMANIME : MainAPI() {
                 .forEach { (doc, lang) -> collectFrom(doc, lang) }
         }
 
-        /* ── Priority sort (user locale > English/Multi > rest) ────── */
+        /* ── Priority sort ─────────────────────────────────────────── */
         val userLang = Locale.getDefault().language
         fun priority(lang: String?): Int = when {
             lang == null     -> 0
@@ -421,7 +431,7 @@ class LMANIME : MainAPI() {
         }
         val sortedIframes = iframeEntries.sortedByDescending { priority(it.second) }
 
-        /* ── Dispatch — parallel with semaphore ────────────────────── */
+        /* ── Dispatch ──────────────────────────────────────────────── */
         suspend fun dispatch(url: String, lang: String?) {
             val tag = langTag(lang)
             val wrapped: (ExtractorLink) -> Unit = { link ->
@@ -441,25 +451,38 @@ class LMANIME : MainAPI() {
 
             when {
                 url.contains("morencius.com") ->
-                    VidHideExtractor().getUrl(url, data, subtitleCallback, wrapped)
+                    VidHideExtractor().getUrl(url, data, ::emitSub, wrapped)
                 url.contains("rumble.com") ->
-                    RumbleExtractor().getUrl(url, data, subtitleCallback, wrapped)
+                    RumbleExtractor().getUrl(url, data, ::emitSub, wrapped)
                 url.contains("ok.ru") || url.contains("odnoklassniki.ru") ->
-                    OkRuExtractor().getUrl(url, data, subtitleCallback, wrapped)
+                    OkRuExtractor().getUrl(url, data, ::emitSub, wrapped)
                 url.contains("mp4upload.com") ->
-                    Mp4UploadExtractor().getUrl(url, data, subtitleCallback, wrapped)
+                    Mp4UploadExtractor().getUrl(url, data, ::emitSub, wrapped)
                 else ->
-                    loadExtractor(url, data, subtitleCallback, wrapped)
+                    loadExtractor(url, data, ::emitSub, wrapped)
             }
         }
 
-        val gate = Semaphore(6)
+        /* Parallel dispatch — mirrors Donghuastream exactly:
+         *  - no explicit Dispatchers.IO
+         *  - per-task timeout
+         *  - synchronized callbacks
+         */
+        val semaphore = Semaphore(6)
         coroutineScope {
             sortedIframes.map { (url, lang) ->
-                async(Dispatchers.IO) {
-                    gate.withPermit {
-                        runCatching { dispatch(normalizeDailymotion(url), lang) }
-                            .onFailure { println("LMANIME: dispatch $url failed: ${it.message}") }
+                async {
+                    semaphore.withPermit {
+                        try {
+                            val normalised = normalizeDailymotion(url)
+                            withTimeoutOrNull(20_000L) {
+                                dispatch(normalised, lang)
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            println("LMANIME: dispatch $url failed: ${e.message}")
+                        }
                     }
                 }
             }.awaitAll()
@@ -476,8 +499,8 @@ class LMANIME : MainAPI() {
             ) { this.referer = data })
         }
 
-        /* ── Regex fallback (scripts/videos first, whole page last) ── */
-        if (emittedUrls.isEmpty()) {
+        /* ── Regex fallback (scoped first, whole page last) ────────── */
+        if (!found.get()) {
             val videoRegex = Regex("""https?://[^"'\s\\]+\.(?:m3u8|mp4)[^"'\s\\]*""")
             val scopedHtml = buildString {
                 document.select("script, video, video source, iframe").forEach {
@@ -499,25 +522,19 @@ class LMANIME : MainAPI() {
             }
         }
 
-        return emittedUrls.isNotEmpty()
+        return found.get()
     }
 
     /* ------------------------------------------------------------------ */
-    /* Dailymotion URL normalisation (pure string ops — no network)       */
+    /* Dailymotion URL normalisation — Donghuastream pattern             */
+    /*                                                                    */
+    /* Any Dailymotion URL that carries a `video=<id>` query param is    */
+    /* rewritten to the canonical /video/<id> path, which the built-in   */
+    /* Dailymotion extractor accepts. No other cases needed.             */
     /* ------------------------------------------------------------------ */
     private fun normalizeDailymotion(url: String): String {
-        if (url.contains("dai.ly/")) {
-            val id = url.substringAfter("dai.ly/").substringBefore("/").substringBefore("?")
-            if (id.isNotBlank()) return "https://www.dailymotion.com/video/$id"
-        }
-        if (url.contains("geo.dailymotion.com")) {
-            val id = Regex("""[?&]video=([a-zA-Z0-9]+)""").find(url)?.groupValues?.get(1)
-            if (!id.isNullOrBlank()) return "https://www.dailymotion.com/video/$id"
-        }
-        if (url.contains("dailymotion.com/embed/video/")) {
-            val id = url.substringAfter("/embed/video/").substringBefore("/").substringBefore("?")
-            if (id.isNotBlank()) return "https://www.dailymotion.com/video/$id"
-        }
-        return url
+        if (!url.contains("dailymotion", true)) return url
+        val id = dmVideoIdRegex.find(url)?.groupValues?.get(1) ?: return url
+        return "https://www.dailymotion.com/video/$id"
     }
 }
