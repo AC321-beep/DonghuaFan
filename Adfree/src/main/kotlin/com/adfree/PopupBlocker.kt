@@ -83,12 +83,19 @@ object PopupBlocker {
     private const val SAFE_MAX_INT = 2_000_000_000
 
     private const val DISCOVERY_BUDGET_MS = 15_000L
-    private const val SPIN_WINDOW_MS = 2_500L        // 0-2.5s after boost: 2ms spin
-    private const val ACTIVE_WATCH_WINDOW_MS = 15_000L // 2.5s-15s after boost: 25ms watch
-    private const val WATCH_FAST_MS = 25L            // active watch poll rate
-    private const val WATCH_IDLE_MS = 250L           // after 15s of calm: light 250ms poll
-    private const val LOADER_SWEEP_FAST_MS = 25L     // first 5s after boost: check new loaders
-    private const val LOADER_SWEEP_SLOW_MS = 500L    // steady state: check new loaders every 500ms
+    private const val SPIN_WINDOW_MS = 2_500L           // 0-2.5s after boost: 2ms spin
+    private const val ACTIVE_WATCH_WINDOW_MS = 15_000L  // 2.5s-15s after boost: 25ms watch
+    private const val WATCH_FAST_MS = 25L               // active watch poll rate
+    private const val WATCH_IDLE_MS = 250L              // after 15s of calm: light 250ms poll
+
+    // Change 3: Relaxed loader sweep pacing (50ms for first 2s, then 500ms)
+    private const val LOADER_SWEEP_FAST_MS = 50L
+    private const val LOADER_SWEEP_FAST_WINDOW_MS = 2_000L
+    private const val LOADER_SWEEP_SLOW_MS = 500L
+
+    // Change 2: Throttle Layer 1 UI scans to at most once every 200ms
+    private const val UI_SCAN_INTERVAL_MS = 200L
+    private val lastUiScanMs = AtomicLong(0L)
 
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private val scannerExecutor = Executors.newSingleThreadExecutor()
@@ -96,7 +103,6 @@ object PopupBlocker {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val installed = AtomicBoolean(false)
 
-    // Tracks foreground state and last navigation boost time so we never burn CPU in background
     @Volatile private var appInForeground = true
     private val lastBoostTimeMs = AtomicLong(0L)
 
@@ -177,7 +183,7 @@ object PopupBlocker {
     // Keyed by "<loaderIdentity>:<className>" — one entry PER plugin ClassLoader
     private val targetStates = ConcurrentHashMap<String, TargetState>()
 
-    // Tracks probed "<loaderIdentity>:<className>" pairs so non-AllForU plugins don't throw ClassNotFoundException forever
+    // Tracks probed "<loaderIdentity>:<className>" pairs so non-AllForU plugins are only checked once
     private val checkedPairs: MutableSet<String> =
         Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
@@ -260,9 +266,8 @@ object PopupBlocker {
     }
 
     /**
-     * Harvests plugin ClassLoaders from BOTH:
-     * 1. Application.mActivityLifecycleCallbacks (plugins that already called Announcer.init)
-     * 2. APIHolder.allProviders (all loaded CloudStream provider plugins, even before Announcer.init!)
+     * Runs strictly on background executors.
+     * Harvests plugin ClassLoaders from both Application.mActivityLifecycleCallbacks and APIHolder.allProviders.
      */
     private fun enumeratePluginLoaders(app: Application): Set<ClassLoader> {
         val loaders = mutableSetOf<ClassLoader>()
@@ -278,7 +283,6 @@ object PopupBlocker {
             }
         }
 
-        // Source 1: ActivityLifecycleCallbacks
         try {
             val field = Application::class.java.getDeclaredField("mActivityLifecycleCallbacks").apply { isAccessible = true }
             val cbs = field.get(app) as? ArrayList<*>
@@ -290,7 +294,6 @@ object PopupBlocker {
             }
         } catch (_: Throwable) {}
 
-        // Source 2: CloudStream's APIHolder.allProviders (catches plugins before Announcer.init runs!)
         try {
             val providers = synchronized(APIHolder.allProviders) { ArrayList(APIHolder.allProviders) }
             for (api in providers) {
@@ -301,10 +304,6 @@ object PopupBlocker {
         return loaders
     }
 
-    /**
-     * Probes each (loader, className) pair ONCE.
-     * Avoids throwing ClassNotFoundException forever on non-AllForU plugins.
-     */
     private fun resolveKnownTargetsAcrossLoaders(app: Application, targetNames: Set<String>): Int {
         var newlyCached = 0
         for (loader in enumeratePluginLoaders(app)) {
@@ -319,9 +318,8 @@ object PopupBlocker {
                         newlyCached++
                     }
                 } catch (_: ClassNotFoundException) {
-                    // Normal for non-AllForU plugins; pairKey stays in checkedPairs so we never re-throw
+                    // Normal for non-AllForU plugins; stays in checkedPairs so we never re-throw
                 } catch (_: Throwable) {
-                    // Transient error — allow retry on next sweep
                     checkedPairs.remove(pairKey)
                 }
             }
@@ -436,19 +434,30 @@ object PopupBlocker {
         } catch (_: Throwable) {
             state.cls = null
             state.cachedLoader = null
-            checkedPairs.remove(state.key) // Allow re-resolution if plugin hot-reloaded
+            checkedPairs.remove(state.key)
         }
         return severedAny
     }
 
     // =================================================================
-    // LAYER 1 — WindowManagerGlobal scan
+    // LAYER 1 — Throttled, Dialog-Only WindowManagerGlobal Scan
     // =================================================================
 
     private val ownDialogs: MutableSet<android.app.Dialog> =
         Collections.newSetFromMap(WeakHashMap())
 
     fun registerOwnDialog(dialog: android.app.Dialog) { ownDialogs.add(dialog) }
+
+    // Change 2: Throttled to once per 200ms and posted normally to mainHandler
+    private fun throttledScanForForeignDialogs() {
+        val now = System.currentTimeMillis()
+        val last = lastUiScanMs.get()
+        if (now - last < UI_SCAN_INTERVAL_MS) return
+        if (!lastUiScanMs.compareAndSet(last, now)) return
+        mainHandler.post {
+            scanForForeignDialogs()
+        }
+    }
 
     private fun scanForForeignDialogs() {
         try {
@@ -461,11 +470,37 @@ object PopupBlocker {
 
             val snapshot = ArrayList(views)
             for (decor in snapshot) {
+                // O(1) pre-filter: only walk the view tree if this DecorView belongs to a Dialog,
+                // completely skipping the main Activity's massive view hierarchy!
+                val dialog = extractDialogFromDecor(decor) ?: continue
+                if (!dialog.isShowing || ownDialogs.contains(dialog)) continue
+
                 if (containsBlockedPopupText(decor)) {
-                    dismissDecorDialog(decor)
+                    try {
+                        dialog.dismiss()
+                        debugLog("Layer 1 dismissed popup via text match.")
+                    } catch (_: Throwable) {
+                        try { decor.visibility = View.GONE } catch (_: Throwable) {}
+                    }
                 }
             }
         } catch (_: Throwable) {}
+    }
+
+    private fun extractDialogFromDecor(decor: View): android.app.Dialog? {
+        return try {
+            var cur: Class<*>? = decor.javaClass
+            var mWindowField: Field? = null
+            while (cur != null && mWindowField == null) {
+                mWindowField = try { cur.getDeclaredField("mWindow").apply { isAccessible = true } } catch (_: Throwable) { null }
+                cur = cur.superclass
+            }
+            val window = mWindowField?.get(decor) as? android.view.Window ?: return null
+            val mCallbackField = android.view.Window::class.java.getDeclaredField("mCallback").apply { isAccessible = true }
+            mCallbackField.get(window) as? android.app.Dialog
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     private fun containsBlockedPopupText(view: View): Boolean {
@@ -480,28 +515,6 @@ object PopupBlocker {
             }
         }
         return false
-    }
-
-    private fun dismissDecorDialog(decor: View) {
-        try {
-            var cur: Class<*>? = decor.javaClass
-            var mWindowField: Field? = null
-            while (cur != null && mWindowField == null) {
-                mWindowField = try { cur.getDeclaredField("mWindow").apply { isAccessible = true } } catch (_: Throwable) { null }
-                cur = cur.superclass
-            }
-            val window = mWindowField?.get(decor) as? android.view.Window ?: return
-            val mCallbackField = android.view.Window::class.java.getDeclaredField("mCallback").apply { isAccessible = true }
-            val callback = mCallbackField.get(window)
-            if (callback is android.app.Dialog && !ownDialogs.contains(callback)) {
-                callback.dismiss()
-                debugLog("Layer 1 dismissed popup via text match.")
-            } else {
-                decor.visibility = View.GONE
-            }
-        } catch (_: Throwable) {
-            try { decor.visibility = View.GONE } catch (_: Throwable) {}
-        }
     }
 
     // =================================================================
@@ -577,7 +590,7 @@ object PopupBlocker {
 
                 sweep(fm)
                 neutralizeAllOnMainThread()
-                scanForForeignDialogs()
+                throttledScanForForeignDialogs()
                 boostScannerWindow()
 
                 val appCtx = activity.applicationContext
@@ -591,7 +604,6 @@ object PopupBlocker {
             }
 
             override fun onActivityStopped(activity: Activity) {
-                // If the foreground activity stopped, pause the background loop to save battery
                 if (CommonActivity.activity == null || CommonActivity.activity === activity) {
                     appInForeground = false
                 }
@@ -622,14 +634,17 @@ object PopupBlocker {
 
                 debugLog("Scanner active (foreground-aware, multi-loader): $knownNames")
                 var lastLoaderSweep = 0L
-                var lastUiSweep = 0L
 
                 while (FilterStore.enabled && appInForeground) {
                     val now = System.currentTimeMillis()
                     val sinceBoost = now - lastBoostTimeMs.get()
 
-                    // Sweep for new plugin ClassLoaders (fast during first 5s of boost, then every 500ms)
-                    val loaderSweepInterval = if (sinceBoost < 5_000L) LOADER_SWEEP_FAST_MS else LOADER_SWEEP_SLOW_MS
+                    // Change 3: 50ms loader sweep during the first 2s of boost, then 500ms
+                    val loaderSweepInterval = if (sinceBoost < LOADER_SWEEP_FAST_WINDOW_MS) {
+                        LOADER_SWEEP_FAST_MS
+                    } else {
+                        LOADER_SWEEP_SLOW_MS
+                    }
                     if (now - lastLoaderSweep >= loaderSweepInterval) {
                         resolveKnownTargetsAcrossLoaders(app, knownNames)
                         lastLoaderSweep = now
@@ -641,20 +656,14 @@ object PopupBlocker {
                         if (severTargetState(state)) severedThisTick = true
                     }
                     if (severedThisTick) {
-                        // Keep high-alert window active if a plugin just attempted a trigger
                         lastBoostTimeMs.set(now)
                     }
 
-                    // Layer 1 UI sweep during the active 10s boost window
-                    if (sinceBoost < 10_000L && now - lastUiSweep >= 250L) {
-                        lastUiSweep = now
-                        mainHandler.post { scanForForeignDialogs() }
+                    // Throttled Layer 1 UI sweep during the active 10s boost window
+                    if (sinceBoost < 10_000L) {
+                        throttledScanForForeignDialogs()
                     }
 
-                    // Three-gear pacing:
-                    // 1. 0 - 2.5s after navigation/boot: 2ms tight spin
-                    // 2. 2.5s - 15s after navigation/boot: 25ms active watch
-                    // 3. > 15s of calm (e.g. watching video / browsing): 250ms light heartbeat
                     val sleepMs = when {
                         sinceBoost < SPIN_WINDOW_MS -> 2L
                         sinceBoost < ACTIVE_WATCH_WINDOW_MS -> WATCH_FAST_MS
@@ -670,8 +679,8 @@ object PopupBlocker {
         }
     }
 
+    // Change 1: Fast path only on main thread — reads already-cached targetStates without locking APIHolder
     private fun neutralizeAllOnMainThread() {
-        hostApp?.let { resolveKnownTargetsAcrossLoaders(it, FilterStore.loadDiscoveredTargets()) }
         for (state in targetStates.values) {
             severTargetState(state)
         }
@@ -697,7 +706,7 @@ object PopupBlocker {
             if (!FilterStore.enabled) return
             if (isTarget(f)) killFragment(f)
             neutralizeAllOnMainThread()
-            scanForForeignDialogs()
+            throttledScanForForeignDialogs()
             boostScannerWindow()
         }
     }
