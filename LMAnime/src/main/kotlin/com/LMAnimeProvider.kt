@@ -24,7 +24,7 @@ class LMANIME : MainAPI() {
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    /* ─── Date regexes (precompiled) ─── */
+    /* ─── Precompiled date regexes ─── */
     private val dateRegex = Regex(
         """([a-zA-Z]{3,}\s+\d{1,2},\s+\d{4}|\d{1,2}\s+[a-zA-Z]{3,}\s+\d{4}|\d{4}-\d{2}-\d{2})"""
     )
@@ -41,7 +41,7 @@ class LMANIME : MainAPI() {
     private val epStripRegex = Regex("""\s+Episode\s+\d+.*$""", RegexOption.IGNORE_CASE)
     private val epBadgeRegex = Regex("""(?i)(eps?\.?\s*\d+|\d+)""")
 
-    /* ─── Dailymotion ID extraction — Donghuastream pattern ─── */
+    /* ─── Dailymotion video id (Donghuastream pattern) ─── */
     private val dmVideoIdRegex = Regex("""[?&]video=([a-zA-Z0-9_-]+)""")
 
     override val mainPage = mainPageOf(
@@ -281,10 +281,10 @@ class LMANIME : MainAPI() {
     ): Boolean {
         val document = app.get(data).document
 
-        /* Thread-safe sinks (Donghuastream pattern) */
-        val found         = AtomicBoolean(false)
-        val callbackLock  = Any()
-        val subtitleLock  = Any()
+        /* Thread-safe sinks */
+        val found        = AtomicBoolean(false)
+        val callbackLock = Any()
+        val subtitleLock = Any()
 
         fun emit(link: ExtractorLink) {
             found.set(true)
@@ -293,6 +293,9 @@ class LMANIME : MainAPI() {
         fun emitSub(sub: SubtitleFile) {
             synchronized(subtitleLock) { subtitleCallback(sub) }
         }
+
+        /* Explicit lambda references — safer than ::emitSub */
+        val subtitleSink: (SubtitleFile) -> Unit = { sub -> emitSub(sub) }
 
         /* ── Language detection (precompiled) ──────────────────────── */
         val langMatchers: List<Pair<String, Regex>> = listOf(
@@ -403,7 +406,7 @@ class LMANIME : MainAPI() {
 
         collectFrom(document)
 
-        /* ── Mirror pages — parallel (safe, pure network) ──────────── */
+        /* ── Mirror pages — parallel (pure network, safe) ──────────── */
         coroutineScope {
             document.select("select.mirror option").map { option ->
                 async {
@@ -451,22 +454,26 @@ class LMANIME : MainAPI() {
 
             when {
                 url.contains("morencius.com") ->
-                    VidHideExtractor().getUrl(url, data, ::emitSub, wrapped)
+                    VidHideExtractor().getUrl(url, data, subtitleSink, wrapped)
+
                 url.contains("rumble.com") ->
-                    RumbleExtractor().getUrl(url, data, ::emitSub, wrapped)
+                    RumbleExtractor().getUrl(url, data, subtitleSink, wrapped)
+
                 url.contains("ok.ru") || url.contains("odnoklassniki.ru") ->
-                    OkRuExtractor().getUrl(url, data, ::emitSub, wrapped)
+                    OkRuExtractor().getUrl(url, data, subtitleSink, wrapped)
+
                 url.contains("mp4upload.com") ->
-                    Mp4UploadExtractor().getUrl(url, data, ::emitSub, wrapped)
+                    Mp4UploadExtractor().getUrl(url, data, subtitleSink, wrapped)
+
                 else ->
-                    loadExtractor(url, data, ::emitSub, wrapped)
+                    loadExtractor(url, data, subtitleSink, wrapped)
             }
         }
 
-        /* Parallel dispatch — mirrors Donghuastream exactly:
-         *  - no explicit Dispatchers.IO
+        /* Parallel dispatch — Donghuastream pattern:
+         *  - no explicit dispatcher
          *  - per-task timeout
-         *  - synchronized callbacks
+         *  - synchronized sinks above
          */
         val semaphore = Semaphore(6)
         coroutineScope {
@@ -499,7 +506,7 @@ class LMANIME : MainAPI() {
             ) { this.referer = data })
         }
 
-        /* ── Regex fallback (scoped first, whole page last) ────────── */
+        /* ── Regex fallback ────────────────────────────────────────── */
         if (!found.get()) {
             val videoRegex = Regex("""https?://[^"'\s\\]+\.(?:m3u8|mp4)[^"'\s\\]*""")
             val scopedHtml = buildString {
@@ -526,11 +533,7 @@ class LMANIME : MainAPI() {
     }
 
     /* ------------------------------------------------------------------ */
-    /* Dailymotion URL normalisation — Donghuastream pattern             */
-    /*                                                                    */
-    /* Any Dailymotion URL that carries a `video=<id>` query param is    */
-    /* rewritten to the canonical /video/<id> path, which the built-in   */
-    /* Dailymotion extractor accepts. No other cases needed.             */
+    /* Dailymotion normalisation — Donghuastream pattern                 */
     /* ------------------------------------------------------------------ */
     private fun normalizeDailymotion(url: String): String {
         if (!url.contains("dailymotion", true)) return url
