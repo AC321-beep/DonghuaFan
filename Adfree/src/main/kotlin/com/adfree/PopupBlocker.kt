@@ -256,6 +256,19 @@ object PopupBlocker {
         return loaders
     }
 
+    /**
+     * FIXED: retry loop instead of single-pass scan.
+     *
+     * The previous version scanned once and gave up. On cold start, AllForU's
+     * plugin classloader isn't registered yet — it appears ~200-500ms after
+     * CloudStream's initial plugin load. A single scan misses it.
+     *
+     * This version retries every 500ms until:
+     *   - A target is found, OR
+     *   - DISCOVERY_BUDGET_MS (15s) expires
+     *
+     * Fast path (persisted target resolves immediately) still exits in ~10ms.
+     */
     private fun startTargetDiscovery() {
         if (discoveryInProgress.getAndSet(true)) return
         ioExecutor.execute {
@@ -266,49 +279,78 @@ object PopupBlocker {
                 val persisted = FilterStore.loadDiscoveredTargets()
                 debugLog("Discovery: verifying ${persisted.size} persisted target(s).")
 
+                // ── First pass: verify persisted targets ──
                 var resolvedCount = 0
+                val foundNames = mutableSetOf<String>()
                 for (name in persisted) {
                     if (System.currentTimeMillis() - startTime > DISCOVERY_BUDGET_MS) break
-                    if (tryResolve(app, name)) resolvedCount++
+                    if (tryResolve(app, name)) {
+                        resolvedCount++
+                        foundNames.add(name)
+                    }
                 }
 
+                // Fast path: all persisted targets resolved → done in ~10ms
                 if (persisted.isNotEmpty() && resolvedCount == persisted.size) {
                     debugLog("Discovery: all ${resolvedCount} persisted target(s) resolved. Skipping full scan.")
                     discoveryDone.set(true)
                     return@execute
                 }
 
-                val pluginLoaders = enumeratePluginLoaders(app)
-                debugLog("Discovery: scanning ${pluginLoaders.size} plugin classloader(s).")
+                // ── Retry loop: catch late-loading plugins ──
+                // Reset count and retry everything, tracking which loaders we've scanned.
+                // New loaders get scanned; already-scanned loaders are skipped.
+                resolvedCount = foundNames.size
+                val seenLoaders = mutableSetOf<ClassLoader>()
+                var attempt = 0
 
-                val foundNames = mutableSetOf<String>()
-                for (loader in pluginLoaders) {
-                    if (System.currentTimeMillis() - startTime > DISCOVERY_BUDGET_MS) {
-                        debugLog("Discovery: budget exhausted.")
-                        break
+                while (System.currentTimeMillis() - startTime < DISCOVERY_BUDGET_MS) {
+                    attempt++
+
+                    // Re-try persisted targets (loader may have appeared)
+                    for (name in persisted) {
+                        if (name in foundNames) continue
+                        if (tryResolve(app, name)) foundNames.add(name)
                     }
-                    val classNames = enumerateClassNames(loader)
-                    debugLog("Discovery: loader ${loader.javaClass.simpleName} has ${classNames.size} classes.")
 
-                    for (cn in classNames) {
+                    // Scan any plugin loaders we haven't seen yet
+                    val pluginLoaders = enumeratePluginLoaders(app)
+                    debugLog("Discovery: attempt $attempt, ${pluginLoaders.size} loader(s).")
+
+                    for (loader in pluginLoaders) {
+                        if (loader in seenLoaders) continue
                         if (System.currentTimeMillis() - startTime > DISCOVERY_BUDGET_MS) break
-                        try {
-                            val cls = Class.forName(cn, false, loader)
-                            if (matchesAnnouncerSignature(cls)) {
-                                debugLog("Discovery: MATCH → $cn")
-                                foundNames.add(cn)
-                                cacheTargetState(cls, loader)
-                            }
-                        } catch (_: Throwable) {}
+
+                        val classNames = enumerateClassNames(loader)
+                        if (classNames.isEmpty()) continue  // retry next attempt
+                        seenLoaders.add(loader)
+                        debugLog("Discovery: loader ${loader.javaClass.simpleName} has ${classNames.size} classes.")
+
+                        for (cn in classNames) {
+                            if (System.currentTimeMillis() - startTime > DISCOVERY_BUDGET_MS) break
+                            try {
+                                val cls = Class.forName(cn, false, loader)
+                                if (matchesAnnouncerSignature(cls)) {
+                                    debugLog("Discovery: MATCH → $cn")
+                                    foundNames.add(cn)
+                                    cacheTargetState(cls, loader)
+                                }
+                            } catch (_: Throwable) {}
+                        }
                     }
+
+                    if (foundNames.isNotEmpty()) break
+
+                    // No match yet — plugin loaders still registering.
+                    try { Thread.sleep(500L) } catch (_: InterruptedException) { break }
                 }
 
                 if (foundNames.isNotEmpty()) {
                     val merged = persisted + foundNames
                     FilterStore.saveDiscoveredTargets(merged)
-                    debugLog("Discovery: persisted ${merged.size} target(s).")
+                    debugLog("Discovery: persisted ${merged.size} target(s) after $attempt attempt(s).")
                 } else {
-                    debugLog("Discovery: no matches.")
+                    debugLog("Discovery: no matches after $attempt attempt(s). Gave up.")
                 }
 
                 discoveryDone.set(true)
@@ -526,7 +568,7 @@ object PopupBlocker {
     }
 
     // =================================================================
-    // TWO-PHASE SEVER SCANNER — with early-exit on confirmed defeat
+    // TWO-PHASE SEVER SCANNER
     // =================================================================
 
     private fun startBackgroundScanner() {
@@ -536,10 +578,12 @@ object PopupBlocker {
             val deadline = startTime + SCAN_DEADLINE_MS
 
             // ── PHASE A: resolve target classes ──────────────────────
+            // FIXED: only give up if discovery FINISHED AND found nothing.
+            // If discovery is still retrying, keep waiting.
             while (System.currentTimeMillis() < deadline) {
                 if (targetStates.values.any { it.cls != null }) break
-                if (discoveryDone.get() && targetStates.isEmpty()) {
-                    debugLog("No targets — Layer 1 will handle any dialogs.")
+                if (discoveryDone.get() && !discoveryInProgress.get() && targetStates.isEmpty()) {
+                    debugLog("No targets after discovery finished — Layer 1 will handle any dialogs.")
                     isSearching.set(false)
                     return@execute
                 }
@@ -596,8 +640,6 @@ object PopupBlocker {
                 }
 
                 // ── EARLY EXIT: after first catch + quiet window ─────
-                // 200ms quiet window catches any leaked dialog (appears within ~16ms)
-                // and any fast re-init. Slower re-inits are caught by fragment resume.
                 if (everSevered) {
                     val quietElapsed = System.currentTimeMillis() - lastSeverTime
                     if (quietElapsed > QUIET_WINDOW_MS) {
@@ -605,7 +647,6 @@ object PopupBlocker {
                         isSearching.set(false)
                         return@execute
                     }
-                    // Inside quiet window: cheap polling only
                     try { Thread.sleep(10L) } catch (_: InterruptedException) { break }
                     continue
                 }
@@ -638,13 +679,6 @@ object PopupBlocker {
         }
     }
 
-    /**
-     * Cheap safety net for post-Phase-B re-inits.
-     * Called on every activity resume and every fragment resume.
-     * If the plugin has re-initialized (shouldn't happen for AllForU, but
-     * possible for future dynamic targets), this catches it before the next
-     * showOnHome opportunity.
-     */
     private fun neutralizeOnMainThread() {
         for (state in targetStates.values) {
             if (state.cls == null) continue
@@ -671,7 +705,6 @@ object PopupBlocker {
         }
     }
 
-    // Keep the old name as an alias for compatibility
     private fun neutralizeAllOnMainThread() = neutralizeOnMainThread()
 
     // =================================================================
@@ -693,8 +726,7 @@ object PopupBlocker {
         override fun onFragmentResumed(fm: FragmentManager, f: Fragment) {
             if (!FilterStore.enabled) return
             if (isTarget(f)) killFragment(f)
-            // NEW: safety net — catch re-inits after Phase B early-exited.
-            // ~3μs per call (3 reflection reads, most are no-ops).
+            // Safety net — catch re-inits after Phase B early-exited.
             neutralizeOnMainThread()
         }
     }
