@@ -79,7 +79,7 @@ object PopupBlocker {
     // Adaptive Phase B timing
     private const val SPIN_WINDOW_MS = 2_000L      // 0-2s pre-catch: full spin
     private const val YIELD_WINDOW_MS = 5_000L     // 2-5s pre-catch: yield
-    private const val QUIET_WINDOW_MS = 200L       // post-catch: 200ms quiet, then exit
+    private const val WATCH_POLL_MS = 50L          // post-catch: 50ms poll until deadline
 
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private val installed = AtomicBoolean(false)
@@ -256,19 +256,6 @@ object PopupBlocker {
         return loaders
     }
 
-    /**
-     * FIXED: retry loop instead of single-pass scan.
-     *
-     * The previous version scanned once and gave up. On cold start, AllForU's
-     * plugin classloader isn't registered yet — it appears ~200-500ms after
-     * CloudStream's initial plugin load. A single scan misses it.
-     *
-     * This version retries every 500ms until:
-     *   - A target is found, OR
-     *   - DISCOVERY_BUDGET_MS (15s) expires
-     *
-     * Fast path (persisted target resolves immediately) still exits in ~10ms.
-     */
     private fun startTargetDiscovery() {
         if (discoveryInProgress.getAndSet(true)) return
         ioExecutor.execute {
@@ -298,9 +285,6 @@ object PopupBlocker {
                 }
 
                 // ── Retry loop: catch late-loading plugins ──
-                // Reset count and retry everything, tracking which loaders we've scanned.
-                // New loaders get scanned; already-scanned loaders are skipped.
-                resolvedCount = foundNames.size
                 val seenLoaders = mutableSetOf<ClassLoader>()
                 var attempt = 0
 
@@ -322,7 +306,7 @@ object PopupBlocker {
                         if (System.currentTimeMillis() - startTime > DISCOVERY_BUDGET_MS) break
 
                         val classNames = enumerateClassNames(loader)
-                        if (classNames.isEmpty()) continue  // retry next attempt
+                        if (classNames.isEmpty()) continue
                         seenLoaders.add(loader)
                         debugLog("Discovery: loader ${loader.javaClass.simpleName} has ${classNames.size} classes.")
 
@@ -341,8 +325,16 @@ object PopupBlocker {
 
                     if (foundNames.isNotEmpty()) break
 
-                    // No match yet — plugin loaders still registering.
-                    try { Thread.sleep(500L) } catch (_: InterruptedException) { break }
+                    // Ramped retry: faster at first, slower later
+                    val retryDelay = when (attempt) {
+                        1 -> 100L
+                        2 -> 150L
+                        3 -> 150L
+                        4 -> 200L
+                        5 -> 250L
+                        else -> 500L
+                    }
+                    try { Thread.sleep(retryDelay) } catch (_: InterruptedException) { break }
                 }
 
                 if (foundNames.isNotEmpty()) {
@@ -552,7 +544,6 @@ object PopupBlocker {
                 sweep(fm)
                 neutralizeAllOnMainThread()
                 scanForForeignDialogs()
-                // Phase B may have exited early — restart it on app resume
                 if (!isSearching.get()) startBackgroundScanner()
 
                 val appCtx = activity.applicationContext
@@ -568,7 +559,7 @@ object PopupBlocker {
     }
 
     // =================================================================
-    // TWO-PHASE SEVER SCANNER
+    // TWO-PHASE SEVER SCANNER — WATCH mode runs full 30s
     // =================================================================
 
     private fun startBackgroundScanner() {
@@ -577,9 +568,7 @@ object PopupBlocker {
             val startTime = System.currentTimeMillis()
             val deadline = startTime + SCAN_DEADLINE_MS
 
-            // ── PHASE A: resolve target classes ──────────────────────
-            // FIXED: only give up if discovery FINISHED AND found nothing.
-            // If discovery is still retrying, keep waiting.
+            // ── PHASE A: resolve target classes ──
             while (System.currentTimeMillis() < deadline) {
                 if (targetStates.values.any { it.cls != null }) break
                 if (discoveryDone.get() && !discoveryInProgress.get() && targetStates.isEmpty()) {
@@ -597,9 +586,15 @@ object PopupBlocker {
             if (active.isEmpty()) { isSearching.set(false); return@execute }
             debugLog("Phase A: ${active.size} target(s) resolved. Entering Phase B.")
 
-            // ── PHASE B: adaptive sever loop with early exit ─────────
+            // ── PHASE B: adaptive sever loop ──
+            // Pre-catch:  SPIN (0-2s) → YIELD (2-5s) → SLEEP (5-30s)
+            // Post-catch: WATCH (50ms poll, runs until deadline)
+            //
+            // WATCH mode never exits early because Announcer.init() re-sets
+            // appCtx = context on EVERY call (the `inited` guard is *after*
+            // the assignment in bytecode). Any showOnHome() after our sever
+            // re-arms the gate, so we must keep watching.
             var everSevered = false
-            var lastSeverTime = 0L
             var mode = "SPIN"
             debugLog("Phase B: starting in SPIN mode (0-2s, max rate).")
 
@@ -634,42 +629,38 @@ object PopupBlocker {
                     }
                 }
 
-                if (anySeveredThisTick) {
-                    everSevered = true
-                    lastSeverTime = System.currentTimeMillis()
-                }
+                if (anySeveredThisTick) everSevered = true
 
-                // ── EARLY EXIT: after first catch + quiet window ─────
+                // ── Adaptive pacing ──
                 if (everSevered) {
-                    val quietElapsed = System.currentTimeMillis() - lastSeverTime
-                    if (quietElapsed > QUIET_WINDOW_MS) {
-                        debugLog("Phase B: confirmed defeated (${quietElapsed}ms quiet). Exiting early at T=${System.currentTimeMillis() - startTime}ms.")
-                        isSearching.set(false)
-                        return@execute
+                    // WATCH mode: continuous 50ms poll until deadline.
+                    // Catches Announcer.init() re-arming appCtx mid-session.
+                    if (mode != "WATCH") {
+                        debugLog("Phase B: entering WATCH mode (50ms poll until ${SCAN_DEADLINE_MS}ms).")
+                        mode = "WATCH"
                     }
-                    try { Thread.sleep(10L) } catch (_: InterruptedException) { break }
-                    continue
-                }
-
-                // ── PRE-CATCH: adaptive rate based on elapsed ────────
-                val elapsed = System.currentTimeMillis() - startTime
-                when {
-                    elapsed < SPIN_WINDOW_MS -> {
-                        // Full spin, no sleep
-                    }
-                    elapsed < YIELD_WINDOW_MS -> {
-                        if (mode != "YIELD") {
-                            debugLog("Phase B: switching to YIELD mode (2-5s).")
-                            mode = "YIELD"
+                    try { Thread.sleep(WATCH_POLL_MS) } catch (_: InterruptedException) { break }
+                } else {
+                    // Pre-catch: escalate aggressively
+                    val elapsed = System.currentTimeMillis() - startTime
+                    when {
+                        elapsed < SPIN_WINDOW_MS -> {
+                            // Full spin, no sleep
                         }
-                        Thread.yield()
-                    }
-                    else -> {
-                        if (mode != "SLEEP") {
-                            debugLog("Phase B: switching to SLEEP mode (5-30s).")
-                            mode = "SLEEP"
+                        elapsed < YIELD_WINDOW_MS -> {
+                            if (mode != "YIELD") {
+                                debugLog("Phase B: switching to YIELD mode (2-5s).")
+                                mode = "YIELD"
+                            }
+                            Thread.yield()
                         }
-                        try { Thread.sleep(10L) } catch (_: InterruptedException) { break }
+                        else -> {
+                            if (mode != "SLEEP") {
+                                debugLog("Phase B: switching to SLEEP mode (5-30s).")
+                                mode = "SLEEP"
+                            }
+                            try { Thread.sleep(100L) } catch (_: InterruptedException) { break }
+                        }
                     }
                 }
             }
@@ -726,7 +717,6 @@ object PopupBlocker {
         override fun onFragmentResumed(fm: FragmentManager, f: Fragment) {
             if (!FilterStore.enabled) return
             if (isTarget(f)) killFragment(f)
-            // Safety net — catch re-inits after Phase B early-exited.
             neutralizeOnMainThread()
         }
     }
