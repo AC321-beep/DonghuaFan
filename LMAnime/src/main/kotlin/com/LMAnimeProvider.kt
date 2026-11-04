@@ -2,9 +2,16 @@ package com.lmanime
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 class LMANIME : MainAPI() {
 
@@ -16,7 +23,7 @@ class LMANIME : MainAPI() {
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    /* ─── Date regexes ─── */
+    /* ─── Date regexes (precompiled) ─── */
     private val dateRegex = Regex(
         """([a-zA-Z]{3,}\s+\d{1,2},\s+\d{4}|\d{1,2}\s+[a-zA-Z]{3,}\s+\d{4}|\d{4}-\d{2}-\d{2})"""
     )
@@ -27,12 +34,45 @@ class LMANIME : MainAPI() {
     private val fmtDayMonthYear = Regex("""^\d{1,2}\s+[A-Za-z]+\s+\d{4}$""")
     private val fmtIsoDate      = Regex("""^\d{4}-\d{2}-\d{2}$""")
 
+    private val epNumRegex   = Regex("""(?:\bepisode|\beps?\.?)\s*[-:]?\s*(\d+)""", RegexOption.IGNORE_CASE)
+    private val epBracketNum = Regex("""[\[\(](\d{1,4})[\]\)]""")
+    private val yearRegex    = Regex("""\b((?:19|20)\d{2})\b""")
+    private val epStripRegex = Regex("""\s+Episode\s+\d+.*$""", RegexOption.IGNORE_CASE)
+    private val epBadgeRegex = Regex("""(?i)(eps?\.?\s*\d+|\d+)""")
+
     override val mainPage = mainPageOf(
         "latest"                             to "Latest Release",
         "anime/?status=&type=&order=popular" to "Popular",
         "ongoing/"                           to "Ongoing",
         "upcoming/"                          to "Upcoming",
     )
+
+    /* ─── Shared parsing helpers (used by loadSeries + loadAsMovie) ─── */
+    private fun extractTitle(vararg docs: Document): String =
+        docs.asSequence().mapNotNull {
+            it.selectFirst("h1.entry-title")?.text()?.trim()
+                ?: it.selectFirst("h1")?.text()?.trim()
+                ?: it.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
+        }.firstOrNull { it.isNotBlank() } ?: "Unknown"
+
+    private fun extractPoster(vararg docs: Document): String? =
+        docs.asSequence()
+            .mapNotNull { it.selectFirst("meta[property=og:image]")?.attr("content") }
+            .firstOrNull()
+            ?.let { fixUrlNull(it) }
+
+    private fun extractPlot(vararg docs: Document): String? =
+        docs.asSequence().mapNotNull { d ->
+            d.selectFirst("div.desc.mindes")?.ownText()?.trim()?.takeIf { it.isNotBlank() }
+                ?: d.selectFirst("div.desc p")?.text()?.trim()
+                ?: d.selectFirst("meta[property=og:description]")?.attr("content")
+        }.firstOrNull()
+
+    private fun extractYear(vararg docs: Document): Int? =
+        docs.asSequence()
+            .flatMap { it.select(".single-info .spe span").asSequence() }
+            .firstOrNull { it.text().contains("Released", true) }?.text()
+            ?.let { yearRegex.find(it)?.value?.toIntOrNull() }
 
     /* ------------------------------------------------------------------ */
     /* MAIN PAGE                                                          */
@@ -64,16 +104,16 @@ class LMANIME : MainAPI() {
             val own = el.ownText().trim()
             if (own.isNotEmpty()) own
             else el.selectFirst("h2")?.text()
-                ?.replace(Regex("""\s+Episode\s+\d+.*$""", RegexOption.IGNORE_CASE), "")
+                ?.replace(epStripRegex, "")
                 ?.trim()
         } ?: anchor.attr("title")
-            .replace(Regex("""\s+Episode\s+\d+.*$""", RegexOption.IGNORE_CASE), "")
+            .replace(epStripRegex, "")
             .trim()
 
         if (seriesName.isEmpty()) return null
 
         val epBadge = selectFirst("span.epx")?.text()?.trim()
-            ?.takeIf { it.isNotEmpty() && it.matches(Regex("""(?i)(eps?\.?\s*\d+|\d+)""")) }
+            ?.takeIf { it.isNotEmpty() && it.matches(epBadgeRegex) }
         val fullTitle = if (epBadge != null && !seriesName.contains(epBadge, true))
             "$seriesName $epBadge" else seriesName
 
@@ -139,7 +179,9 @@ class LMANIME : MainAPI() {
         episodeUrl: String,
         episodeDoc: Document,
     ): LoadResponse {
-        val seriesDoc = runCatching { app.get(seriesUrl).document }.getOrNull() ?: episodeDoc
+        val seriesDoc = runCatching { app.get(seriesUrl).document }
+            .onFailure { println("LMANIME: series fetch $seriesUrl failed: ${it.message}") }
+            .getOrNull() ?: episodeDoc
 
         var links = episodeDoc.select("#singlepisode .episodelist ul li a")
         if (links.size < 5) {
@@ -154,8 +196,8 @@ class LMANIME : MainAPI() {
                 ?: a.selectFirst(".playinfo h3")?.text()?.trim()
                 ?: a.attr("title").trim()
 
-            val epNum = Regex("""Episode\s+(\d+)""", RegexOption.IGNORE_CASE)
-                .find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
+            val epNum = epNumRegex.find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
+                ?: epBracketNum.find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
 
             val cssDate = a.selectFirst(
                 ".playinfo span, .epl-date, .epdate, .date, .released, .published, .time"
@@ -192,23 +234,10 @@ class LMANIME : MainAPI() {
 
         if (episodes.isEmpty()) return loadAsMovie(episodeUrl, episodeDoc, TvType.Anime)
 
-        val title = seriesDoc.selectFirst("h1.entry-title")?.text()?.trim()
-            ?: seriesDoc.selectFirst("h1")?.text()?.trim()
-            ?: episodeDoc.selectFirst("#singlepisode .headlist .det h2")?.text()?.trim()
-            ?: "Unknown"
-
-        val poster = fixUrlNull(
-            episodeDoc.selectFirst("meta[property=og:image]")?.attr("content")
-                ?: seriesDoc.selectFirst("meta[property=og:image]")?.attr("content")
-        )
-
-        val plot = seriesDoc.selectFirst("div.desc.mindes")?.ownText()?.trim()?.takeIf { it.isNotBlank() }
-            ?: seriesDoc.selectFirst("div.desc p")?.text()?.trim()
-            ?: episodeDoc.selectFirst("meta[property=og:description]")?.attr("content")
-
-        val year = (seriesDoc.select(".single-info .spe span") + episodeDoc.select(".single-info .spe span"))
-            .firstOrNull { it.text().contains("Released", true) }?.text()
-            ?.let { t -> Regex("""\b((?:19|20)\d{2})\b""").find(t)?.value?.toIntOrNull() }
+        val title  = extractTitle(seriesDoc, episodeDoc)
+        val poster = extractPoster(episodeDoc, seriesDoc)
+        val plot   = extractPlot(seriesDoc, episodeDoc)
+        val year   = extractYear(seriesDoc, episodeDoc)
 
         return newTvSeriesLoadResponse(title, seriesUrl, TvType.Anime, episodes) {
             this.posterUrl = poster
@@ -225,22 +254,10 @@ class LMANIME : MainAPI() {
         document: Document,
         tvType: TvType = TvType.Anime,
     ): LoadResponse {
-        val title = document.selectFirst("h1.entry-title")?.text()?.trim()
-            ?: document.selectFirst("h1")?.text()?.trim()
-            ?: document.selectFirst("meta[property=og:title]")?.attr("content")?.trim()
-            ?: "Unknown"
-
-        val poster = fixUrlNull(
-            document.selectFirst("meta[property=og:image]")?.attr("content")
-        )
-
-        val plot = document.selectFirst("meta[property=og:description]")?.attr("content")
-            ?: document.selectFirst("div.entry-content p")?.text()
-            ?: document.selectFirst("div.desc p")?.text()
-
-        val year = document.select(".single-info .spe span")
-            .firstOrNull { it.text().contains("Released", true) }?.text()
-            ?.let { t -> Regex("""\b((?:19|20)\d{2})\b""").find(t)?.value?.toIntOrNull() }
+        val title  = extractTitle(document)
+        val poster = extractPoster(document)
+        val plot   = extractPlot(document)
+        val year   = extractYear(document)
 
         return newMovieLoadResponse(title, url, tvType, url) {
             this.posterUrl = poster
@@ -251,11 +268,6 @@ class LMANIME : MainAPI() {
 
     /* ------------------------------------------------------------------ */
     /* LOAD LINKS                                                         */
-    /*                                                                    */
-    /*  LMANIME exposes per-language download blocks (div.soraddlx) and   */
-    /*  per-language mirrors (select.mirror option). Both carry the       */
-    /*  language label in the HTML, so we propagate it as a [Tag] on      */
-    /*  every emitted ExtractorLink.                                       */
     /* ------------------------------------------------------------------ */
     override suspend fun loadLinks(
         data: String,
@@ -264,22 +276,29 @@ class LMANIME : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         val document = app.get(data).document
-        var found = false
 
-        /* ── 1. Language detection ─────────────────────────────────── */
+        /* Global dedup — only path that touches the caller's callback. */
+        val emittedUrls = ConcurrentHashMap.newKeySet<String>()
+        fun emit(link: ExtractorLink) {
+            if (emittedUrls.add(link.url)) callback(link)
+        }
+
+        /* ── Language detection (precompiled) ──────────────────────── */
+        val langMatchers: List<Pair<String, Regex>> = listOf(
+            "multi" to Regex("""\b(multi(sub)?|multilingual)\b"""),
+            "ind"   to Regex("""\b(indonesian|indo|bahasa|ind)\b"""),
+            "por"   to Regex("""\b(portugu[eê]s|portuguese|por)\b"""),
+            "spa"   to Regex("""\b(espa[nñ]ol|spanish|spa)\b"""),
+            "tha"   to Regex("""\b(ไทย|thai|tha)\b"""),
+            "tur"   to Regex("""\b(t[uü]rk[cç]e|turkish|tur)\b"""),
+            "ara"   to Regex("""(العَرَبِيَّة|عربي|arabic|ara)"""),
+            "eng"   to Regex("""\b(english|eng)\b"""),
+        )
+
         fun detectLang(vararg sources: String?): String? {
             val text = sources.filterNotNull().joinToString(" ").lowercase()
-            return when {
-                Regex("""\b(multi(sub)?|multilingual)\b""").containsMatchIn(text) -> "multi"
-                Regex("""\b(indonesian|indo|bahasa|ind)\b""").containsMatchIn(text) -> "ind"
-                Regex("""\b(portugu[eê]s|portuguese|por)\b""").containsMatchIn(text) -> "por"
-                Regex("""\b(espa[nñ]ol|spanish|spa)\b""").containsMatchIn(text) -> "spa"
-                Regex("""\b(ไทย|thai|tha)\b""").containsMatchIn(text) -> "tha"
-                Regex("""\b(t[uü]rk[cç]e|turkish|tur)\b""").containsMatchIn(text) -> "tur"
-                Regex("""(العَرَبِيَّة|عربي|arabic|ara)""").containsMatchIn(text) -> "ara"
-                Regex("""\b(english|eng)\b""").containsMatchIn(text) -> "eng"
-                else -> null
-            }
+            if (text.isEmpty()) return null
+            return langMatchers.firstOrNull { it.second.containsMatchIn(text) }?.first
         }
 
         fun langTag(lang: String?): String? = when (lang) {
@@ -294,15 +313,15 @@ class LMANIME : MainAPI() {
             else    -> null
         }
 
-        /* ── 2. URL normalisation ──────────────────────────────────── */
+        /* ── URL normalisation ──────────────────────────────────────── */
         fun normalize(raw: String): String {
-            val trimmed = raw.trim()
+            val t = raw.trim()
             return when {
-                trimmed.startsWith("//")   -> "https:$trimmed"
-                trimmed.startsWith("/")    -> "$mainUrl$trimmed"
-                trimmed.startsWith("http") -> trimmed
-                trimmed.isBlank()          -> ""
-                else                       -> "https://$trimmed"
+                t.isBlank()          -> ""
+                t.startsWith("//")   -> "https:$t"
+                t.startsWith("/")    -> "$mainUrl$t"
+                t.startsWith("http") -> t
+                else                 -> "https://$t"
             }
         }
 
@@ -312,7 +331,7 @@ class LMANIME : MainAPI() {
             "cloudfront.net", "21wiz.com",
         )
 
-        /* ── 3. Collectors ─────────────────────────────────────────── */
+        /* ── Collectors ─────────────────────────────────────────────── */
         val iframeEntries = mutableListOf<Pair<String, String?>>()
         val videoUrls     = linkedSetOf<String>()
         val seenKeys      = mutableSetOf<String>()
@@ -324,7 +343,6 @@ class LMANIME : MainAPI() {
         }
 
         fun collectFrom(doc: Document, parentLang: String? = null) {
-            /* Bare iframes */
             doc.select("iframe").forEach { iframe ->
                 val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
                 if (src.isBlank()) return@forEach
@@ -332,7 +350,6 @@ class LMANIME : MainAPI() {
                 pushIframe(normalize(src), lang)
             }
 
-            /* Direct <video> URLs (rare on LMANIME, but appears on mirrors) */
             doc.select("video, video source").forEach { el ->
                 val src = el.attr("src").trim()
                 if (src.isBlank()) return@forEach
@@ -342,17 +359,7 @@ class LMANIME : MainAPI() {
                 }
             }
 
-            /* Download blocks — one .soraddlx per language.
-             *
-             *   <div class="soraddlx soradlg">
-             *     <div class="sorattlx"><h3>English</h3></div>
-             *     <div class="soraurlx">
-             *       <strong>DL</strong>
-             *       <a href="https://morencius.com/file/…">vidhide</a>
-             *       <a href="https://www.mp4upload.com/…">mp4upload</a>
-             *     </div>
-             *   </div>
-             */
+            /* Download blocks — one .soraddlx per language. */
             doc.select("div.soraddlx").forEach { block ->
                 val heading = block.selectFirst(".sorattlx h3, .sorattlx")?.text()?.trim()
                 val lang = detectLang(heading) ?: parentLang
@@ -386,17 +393,24 @@ class LMANIME : MainAPI() {
 
         collectFrom(document)
 
-        /* ── 4. Mirror pages (language from option label) ──────────── */
-        document.select("select.mirror option").forEach { option ->
-            val serverUrl = option.attr("value").trim()
-            if (!serverUrl.startsWith("http")) return@forEach
-            val optionLang = detectLang(option.text(), option.attr("data-lang"), option.attr("title"))
-            runCatching {
-                collectFrom(app.get(serverUrl, referer = data).document, optionLang)
-            }
+        /* ── Mirror pages — PARALLEL ───────────────────────────────── */
+        coroutineScope {
+            document.select("select.mirror option").map { option ->
+                async(Dispatchers.IO) {
+                    val serverUrl = option.attr("value").trim()
+                    if (!serverUrl.startsWith("http")) return@async null
+                    val optLang = detectLang(
+                        option.text(), option.attr("data-lang"), option.attr("title")
+                    )
+                    runCatching { app.get(serverUrl, referer = data).document }
+                        .onFailure { println("LMANIME: mirror $serverUrl failed: ${it.message}") }
+                        .getOrNull()?.let { it to optLang }
+                }
+            }.awaitAll().filterNotNull()
+                .forEach { (doc, lang) -> collectFrom(doc, lang) }
         }
 
-        /* ── 5. Locale-aware priority ──────────────────────────────── */
+        /* ── Priority sort (user locale > English/Multi > rest) ────── */
         val userLang = Locale.getDefault().language
         fun priority(lang: String?): Int = when {
             lang == null     -> 0
@@ -405,93 +419,91 @@ class LMANIME : MainAPI() {
             lang == "multi"  -> 2
             else             -> 1
         }
-
         val sortedIframes = iframeEntries.sortedByDescending { priority(it.second) }
 
-       /* ── 6. Dispatch to custom extractor, fall back to loadExtractor ─ */
-suspend fun dispatch(url: String, lang: String?) {
-    val tag = langTag(lang)
-    val wrapped: (ExtractorLink) -> Unit = { link ->
-        val newName   = if (tag != null && !link.name.contains(tag))   "${link.name} $tag"   else link.name
-        val newSource = if (tag != null && !link.source.contains(tag)) "${link.source} $tag" else link.source
-        callback(
-            ExtractorLink(
-                source        = newSource,
-                name          = newName,
-                url           = link.url,
-                referer       = link.referer,
-                quality       = link.quality,
-                type          = link.type,
-                headers       = link.headers,
-                extractorData = link.extractorData,
-            )
-        )
-        found = true
-    }
+        /* ── Dispatch — parallel with semaphore ────────────────────── */
+        suspend fun dispatch(url: String, lang: String?) {
+            val tag = langTag(lang)
+            val wrapped: (ExtractorLink) -> Unit = { link ->
+                val newName   = if (tag != null && !link.name.contains(tag))   "${link.name} $tag"   else link.name
+                val newSource = if (tag != null && !link.source.contains(tag)) "${link.source} $tag" else link.source
+                emit(ExtractorLink(
+                    source        = newSource,
+                    name          = newName,
+                    url           = link.url,
+                    referer       = link.referer,
+                    quality       = link.quality,
+                    type          = link.type,
+                    headers       = link.headers,
+                    extractorData = link.extractorData,
+                ))
+            }
 
-    when {
-        url.contains("morencius.com") ->
-            VidHideExtractor().getUrl(url, data, subtitleCallback, wrapped)
+            when {
+                url.contains("morencius.com") ->
+                    VidHideExtractor().getUrl(url, data, subtitleCallback, wrapped)
+                url.contains("rumble.com") ->
+                    RumbleExtractor().getUrl(url, data, subtitleCallback, wrapped)
+                url.contains("ok.ru") || url.contains("odnoklassniki.ru") ->
+                    OkRuExtractor().getUrl(url, data, subtitleCallback, wrapped)
+                url.contains("mp4upload.com") ->
+                    Mp4UploadExtractor().getUrl(url, data, subtitleCallback, wrapped)
+                else ->
+                    loadExtractor(url, data, subtitleCallback, wrapped)
+            }
+        }
 
-        url.contains("rumble.com") ->
-            RumbleExtractor().getUrl(url, data, subtitleCallback, wrapped)
+        val gate = Semaphore(6)
+        coroutineScope {
+            sortedIframes.map { (url, lang) ->
+                async(Dispatchers.IO) {
+                    gate.withPermit {
+                        runCatching { dispatch(normalizeDailymotion(url), lang) }
+                            .onFailure { println("LMANIME: dispatch $url failed: ${it.message}") }
+                    }
+                }
+            }.awaitAll()
+        }
 
-        url.contains("ok.ru") || url.contains("odnoklassniki.ru") ->
-            OkRuExtractor().getUrl(url, data, subtitleCallback, wrapped)
-
-        url.contains("mp4upload.com") ->
-            Mp4UploadExtractor().getUrl(url, data, subtitleCallback, wrapped)
-
-        else ->
-            // Built-in extractors (Dailymotion, Filesim, StreamWish, …)
-            loadExtractor(url, data, subtitleCallback, wrapped)
-    }
-}
-
-for ((url, lang) in sortedIframes) {
-    val normalized = normalizeDailymotion(url)
-    runCatching { dispatch(normalized, lang) }
-}
-
-        /* ── 7. Direct .m3u8 / .mp4 ────────────────────────────────── */
+        /* ── Direct .m3u8 / .mp4 ───────────────────────────────────── */
         for (videoUrl in videoUrls) {
             val isHls = videoUrl.contains(".m3u8", true)
-            callback(
-                newExtractorLink(
+            emit(newExtractorLink(
+                source = this.name,
+                name   = this.name,
+                url    = videoUrl,
+                type   = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+            ) { this.referer = data })
+        }
+
+        /* ── Regex fallback (scripts/videos first, whole page last) ── */
+        if (emittedUrls.isEmpty()) {
+            val videoRegex = Regex("""https?://[^"'\s\\]+\.(?:m3u8|mp4)[^"'\s\\]*""")
+            val scopedHtml = buildString {
+                document.select("script, video, video source, iframe").forEach {
+                    appendLine(it.data().ifBlank { it.outerHtml() })
+                }
+            }
+            val haystack = if (scopedHtml.contains(".mp4", true) || scopedHtml.contains(".m3u8", true))
+                scopedHtml else document.html()
+
+            videoRegex.findAll(haystack).forEach { m ->
+                val clean = m.value.replace("\\/", "/")
+                val isHls = clean.contains(".m3u8", true)
+                emit(newExtractorLink(
                     source = this.name,
                     name   = this.name,
-                    url    = videoUrl,
+                    url    = clean,
                     type   = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                ) { this.referer = data }
-            )
-            found = true
+                ) { this.referer = data })
+            }
         }
 
-        /* ── 8. Regex fallback ─────────────────────────────────────── */
-        if (!found) {
-            Regex("""https?://[^"'\s\\]+\.(?:m3u8|mp4)[^"'\s\\]*""")
-                .findAll(document.html())
-                .forEach { m ->
-                    val isHls = m.value.contains(".m3u8", true)
-                    callback(
-                        newExtractorLink(
-                            source = this.name,
-                            name   = this.name,
-                            url    = m.value.replace("\\/", "/"),
-                            type   = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                        ) { this.referer = data }
-                    )
-                    found = true
-                }
-        }
-
-        return found
+        return emittedUrls.isNotEmpty()
     }
 
     /* ------------------------------------------------------------------ */
-    /* Dailymotion URL normalisation                                      */
-    /*  Rewriting to the canonical form lets the built-in extractor handle */
-    /*  it without any custom extraction code.                             */
+    /* Dailymotion URL normalisation (pure string ops — no network)       */
     /* ------------------------------------------------------------------ */
     private fun normalizeDailymotion(url: String): String {
         if (url.contains("dai.ly/")) {
