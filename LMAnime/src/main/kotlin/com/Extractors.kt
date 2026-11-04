@@ -8,7 +8,7 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.withTimeoutOrNull
 
 /* ==========================================================================
- * VidHide / Morencius — built-in VidHidePro subclass (unchanged)
+ * VidHide / Morencius — unchanged
  * ========================================================================== */
 class VidHideExtractor : VidHidePro() {
     override val name    = "VidHide"
@@ -16,7 +16,7 @@ class VidHideExtractor : VidHidePro() {
 }
 
 /* ==========================================================================
- * Rumble — referer behaviour preserved exactly as your working version
+ * Rumble — original behaviour preserved (direct-video referer = url)
  * ========================================================================== */
 class RumbleExtractor : ExtractorApi() {
     override val name            = "Rumble"
@@ -121,7 +121,7 @@ class RumbleExtractor : ExtractorApi() {
 }
 
 /* ==========================================================================
- * OkRu — INFER_TYPE preserved (valid, per Cloudstream docs)
+ * OkRu — INFER_TYPE preserved (valid per Cloudstream docs)
  * ========================================================================== */
 class OkRuExtractor : ExtractorApi() {
     override val name = "OkRu"
@@ -238,17 +238,12 @@ class OkRuExtractor : ExtractorApi() {
 }
 
 /* ==========================================================================
- * Mp4Upload — mainUrl scheme preserved; only fix = timeout on app.get
+ * Mp4Upload — ORIGINAL logic restored (no timeout, runCatching)
  * ========================================================================== */
 class Mp4UploadExtractor : ExtractorApi() {
     override val name            = "Mp4Upload"
     override val mainUrl         = "mp4upload.com"
     override val requiresReferer = false
-
-    companion object {
-        private const val FETCH_TIMEOUT_MS = 12_000L
-        private val RE_MP4 = Regex("""(https?://[^"'\s]+\.mp4[^"'\s]*)""")
-    }
 
     override suspend fun getUrl(
         url: String, referer: String?,
@@ -264,17 +259,9 @@ class Mp4UploadExtractor : ExtractorApi() {
         if (id.isBlank()) return
 
         val embedUrl = "https://www.mp4upload.com/embed-$id.html"
+        val html = runCatching { app.get(embedUrl).text }.getOrNull() ?: return
 
-        /* Only genuine change: bound the fetch so a hung embed can't
-         * block the whole loadLinks coroutine indefinitely. */
-        val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-            try { app.get(embedUrl).text }
-            catch (e: Exception) {
-                println("Mp4Upload: fetch $embedUrl failed: ${e.message}"); null
-            }
-        } ?: return
-
-        RE_MP4.find(html)?.let { m ->
+        Regex("""(https?://[^"'\s]+\.mp4[^"'\s]*)""").find(html)?.let { m ->
             callback(
                 newExtractorLink(name, name, m.groupValues[1], ExtractorLinkType.VIDEO) {
                     this.referer = embedUrl
