@@ -6,10 +6,9 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.VidHidePro
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.withTimeoutOrNull
-import org.json.JSONObject
 
 /* ==========================================================================
- * VidHide / Morencius — built-in VidHidePro subclass
+ * VidHide / Morencius — built-in VidHidePro subclass (unchanged)
  * ========================================================================== */
 class VidHideExtractor : VidHidePro() {
     override val name    = "VidHide"
@@ -17,7 +16,7 @@ class VidHideExtractor : VidHidePro() {
 }
 
 /* ==========================================================================
- * Rumble 
+ * Rumble — referer behaviour preserved exactly as your working version
  * ========================================================================== */
 class RumbleExtractor : ExtractorApi() {
     override val name            = "Rumble"
@@ -50,7 +49,10 @@ class RumbleExtractor : ExtractorApi() {
         }
 
         val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-            try { app.get(url, referer = referer ?: mainUrl).text } catch (_: Exception) { null }
+            try { app.get(url, referer = referer ?: mainUrl).text }
+            catch (e: Exception) {
+                println("Rumble: fetch $url failed: ${e.message}"); null
+            }
         } ?: return
 
         val afterMp4   = html.substringAfter("{\"mp4", "")
@@ -119,7 +121,7 @@ class RumbleExtractor : ExtractorApi() {
 }
 
 /* ==========================================================================
- * OkRu 
+ * OkRu — INFER_TYPE preserved (valid, per Cloudstream docs)
  * ========================================================================== */
 class OkRuExtractor : ExtractorApi() {
     override val name = "OkRu"
@@ -129,7 +131,7 @@ class OkRuExtractor : ExtractorApi() {
     companion object {
         private const val FETCH_TIMEOUT_MS = 12_000L
 
-        private val RE_VIDEO_ID = Regex("""/video(?:embed)?/(\d+)""")
+        private val RE_VIDEO_ID  = Regex("""/video(?:embed)?/(\d+)""")
         private val RE_MID_PARAM = Regex("""[?&]mid=(\d+)""")
 
         private val QUALITY_MAP = mapOf(
@@ -159,28 +161,27 @@ class OkRuExtractor : ExtractorApi() {
             val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id"
 
             val json = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-                try {
-                    app.post(apiUrl).parsedSafe<OkRuResponse>()
-                } catch (e: Exception) {
-                    null
+                try { app.post(apiUrl).parsedSafe<OkRuResponse>() }
+                catch (e: Exception) {
+                    println("OkRu: post $apiUrl failed: ${e.message}"); null
                 }
             } ?: return
 
             json.videos?.forEach { video ->
-                val qName = video.name?.lowercase() ?: ""
+                val qName  = video.name?.lowercase() ?: ""
                 val vidUrl = video.url ?: ""
-
                 if (vidUrl.isBlank() || vidUrl.contains("usr_login")) return@forEach
 
                 val qualityValue = QUALITY_MAP[qName] ?: Qualities.Unknown.value
-                val displayLabel = if (qualityValue != Qualities.Unknown.value) "MP4 ${qualityValue}p" else "MP4 $qName"
+                val displayLabel = if (qualityValue != Qualities.Unknown.value)
+                    "MP4 ${qualityValue}p" else "MP4 $qName"
 
                 callback(
                     newExtractorLink(
-                        name = "${this.name} MP4",
+                        name   = "${this.name} MP4",
                         source = "${this.name} $displayLabel",
-                        url = vidUrl.replace("\\u0026", "&").replace("\\/", "/"),
-                        type = INFER_TYPE
+                        url    = vidUrl.replace("\\u0026", "&").replace("\\/", "/"),
+                        type   = INFER_TYPE,
                     ) {
                         this.referer = "https://ok.ru/"
                         this.quality = qualityValue
@@ -194,11 +195,8 @@ class OkRuExtractor : ExtractorApi() {
             if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
                 val cleanHls = hlsUrl.replace("\\u0026", "&").replace("\\/", "/")
                 val hlsLinks = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-                    try {
-                        M3u8Helper.generateM3u8("$name HLS", cleanHls, url)
-                    } catch (e: Exception) {
-                        emptyList()
-                    }
+                    try { M3u8Helper.generateM3u8("$name HLS", cleanHls, url) }
+                    catch (_: Exception) { emptyList() }
                 } ?: emptyList()
 
                 if (hlsLinks.isNotEmpty()) {
@@ -212,16 +210,16 @@ class OkRuExtractor : ExtractorApi() {
                 if (dashUrl.isNotBlank() && !dashUrl.contains("usr_login")) {
                     callback(
                         newExtractorLink(
-                            name = "$name DASH",
+                            name   = "$name DASH",
                             source = "$name DASH",
-                            url = dashUrl.replace("\\u0026", "&").replace("\\/", "/"),
-                            type = ExtractorLinkType.DASH
+                            url    = dashUrl.replace("\\u0026", "&").replace("\\/", "/"),
+                            type   = ExtractorLinkType.DASH,
                         ) { this.referer = "https://ok.ru/" }
                     )
                 }
             }
         } catch (e: Exception) {
-            // swallow
+            println("OkRu: getUrl($url) failed: ${e.message}")
         }
     }
 
@@ -240,12 +238,17 @@ class OkRuExtractor : ExtractorApi() {
 }
 
 /* ==========================================================================
- * Mp4Upload
+ * Mp4Upload — mainUrl scheme preserved; only fix = timeout on app.get
  * ========================================================================== */
 class Mp4UploadExtractor : ExtractorApi() {
     override val name            = "Mp4Upload"
     override val mainUrl         = "mp4upload.com"
     override val requiresReferer = false
+
+    companion object {
+        private const val FETCH_TIMEOUT_MS = 12_000L
+        private val RE_MP4 = Regex("""(https?://[^"'\s]+\.mp4[^"'\s]*)""")
+    }
 
     override suspend fun getUrl(
         url: String, referer: String?,
@@ -261,9 +264,17 @@ class Mp4UploadExtractor : ExtractorApi() {
         if (id.isBlank()) return
 
         val embedUrl = "https://www.mp4upload.com/embed-$id.html"
-        val html = runCatching { app.get(embedUrl).text }.getOrNull() ?: return
 
-        Regex("""(https?://[^"'\s]+\.mp4[^"'\s]*)""").find(html)?.let { m ->
+        /* Only genuine change: bound the fetch so a hung embed can't
+         * block the whole loadLinks coroutine indefinitely. */
+        val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+            try { app.get(embedUrl).text }
+            catch (e: Exception) {
+                println("Mp4Upload: fetch $embedUrl failed: ${e.message}"); null
+            }
+        } ?: return
+
+        RE_MP4.find(html)?.let { m ->
             callback(
                 newExtractorLink(name, name, m.groupValues[1], ExtractorLinkType.VIDEO) {
                     this.referer = embedUrl
