@@ -11,8 +11,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -21,10 +23,12 @@ class LMANIME : MainAPI() {
 
     companion object {
         private const val TAG = "LMANIME"
-        private const val DM_RESOLVE_TIMEOUT_MS = 10_000L
 
         // LMANIME's site-wide Dailymotion player id
         private const val DM_PLAYER_ID = "xofxc"
+
+        private const val USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
     }
 
     override var mainUrl  = "https://lmanime.com"
@@ -34,6 +38,13 @@ class LMANIME : MainAPI() {
     override val hasQuickSearch     = true
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
+
+    private val posterHeaders by lazy {
+        mapOf(
+            "Referer" to "$mainUrl/",
+            "User-Agent" to USER_AGENT
+        )
+    }
 
     private val dateRegex = Regex(
         """([a-zA-Z]{3,}\s+\d{1,2},\s+\d{4}|\d{1,2}\s+[a-zA-Z]{3,}\s+\d{4}|\d{4}-\d{2}-\d{2})"""
@@ -51,10 +62,8 @@ class LMANIME : MainAPI() {
     private val epStripRegex = Regex("""\s+Episode\s+\d+.*$""", RegexOption.IGNORE_CASE)
     private val epBadgeRegex = Regex("""(?i)(eps?\.?\s*\d+|\d+)""")
 
-    private val dmVideoIdRegex    = Regex("""[?&]video=([a-zA-Z0-9_-]+)""")
-    private val dmEmbedPathRegex  = Regex("""/(?:embed/)?video/([a-zA-Z0-9_-]+)""")
-    private val dmManifestIdRegex = Regex("""manifest/video/([a-zA-Z0-9]+)\.m3u8""")
-    private val dmConfigIdRegex   = Regex(""""criticalMetadata"\s*:\s*\{[^}]*?"id"\s*:\s*"([a-zA-Z0-9]+)"""")
+    private val dmVideoIdRegex   = Regex("""[?&]video=([a-zA-Z0-9_-]+)""")
+    private val dmEmbedPathRegex = Regex("""/(?:embed/)?video/([a-zA-Z0-9_-]+)""")
 
     override val mainPage = mainPageOf(
         "latest"                             to "Latest Release",
@@ -136,13 +145,14 @@ class LMANIME : MainAPI() {
 
         return newAnimeSearchResponse(fullTitle, href, tvType) {
             this.posterUrl = poster
+            this.posterHeaders = this@LMANIME.posterHeaders
         }
     }
 
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val encoded = java.net.URLEncoder.encode(query, "UTF-8")
+        val encoded = URLEncoder.encode(query, "UTF-8")
         val doc = app.get("$mainUrl/?s=$encoded").document
         return doc.select("article.bs").mapNotNull { it.toSearchResult() }
     }
@@ -222,7 +232,7 @@ class LMANIME : MainAPI() {
                         fmtMonthDayYear.matches(extractedDate) -> "MMMM d, yyyy"
                         fmtDayMonthYear.matches(extractedDate) -> "d MMMM yyyy"
                         fmtIsoDate.matches(extractedDate)      -> "yyyy-MM-dd"
-                        else                                    -> null
+                        else                                   -> null
                     }
                     if (addFormat != null) {
                         this.addDate(extractedDate, format = addFormat)
@@ -240,8 +250,9 @@ class LMANIME : MainAPI() {
         val year   = extractYear(seriesDoc, episodeDoc)
 
         return newTvSeriesLoadResponse(title, seriesUrl, TvType.Anime, episodes) {
-            this.posterUrl = poster
-            this.plot      = plot
+            this.posterUrl     = poster
+            this.posterHeaders = this@LMANIME.posterHeaders
+            this.plot          = plot
             if (year != null) this.year = year
         }
     }
@@ -257,8 +268,9 @@ class LMANIME : MainAPI() {
         val year   = extractYear(document)
 
         return newMovieLoadResponse(title, url, tvType, url) {
-            this.posterUrl = poster
-            this.plot      = plot
+            this.posterUrl     = poster
+            this.posterHeaders = this@LMANIME.posterHeaders
+            this.plot          = plot
             if (year != null) this.year = year
         }
     }
@@ -343,7 +355,7 @@ class LMANIME : MainAPI() {
 
         val iframeEntries = mutableListOf<Pair<String, String?>>()
         val videoUrls     = linkedSetOf<String>()
-        val seenKeys      = mutableSetOf<String>()
+        val keyToIndex    = mutableMapOf<String, Int>()
 
         fun pushIframe(url: String, lang: String?) {
             if (url.isBlank()) return
@@ -354,15 +366,29 @@ class LMANIME : MainAPI() {
             val key = dmVideoIdRegex.find(url)?.groupValues?.get(1)
                 ?: dmEmbedPathRegex.find(url)?.groupValues?.get(1)
                 ?: url.substringBefore("?").substringBefore("#")
-            if (seenKeys.add(key)) {
+
+            val existingIdx = keyToIndex[key]
+            if (existingIdx == null) {
                 Log.e(TAG, "  + iframe  lang=$lang  url=$url")
+                keyToIndex[key] = iframeEntries.size
                 iframeEntries.add(url to lang)
             } else {
-                Log.e(TAG, "  ↺ iframe dedupe  key=$key")
+                // Upgrade language if main doc recorded null and mirror knows the language
+                val (existingUrl, existingLang) = iframeEntries[existingIdx]
+                if (existingLang == null && lang != null) {
+                    Log.e(TAG, "  ↻ iframe lang upgraded  key=$key  null → $lang")
+                    iframeEntries[existingIdx] = existingUrl to lang
+                } else {
+                    Log.e(TAG, "  ↺ iframe dedupe  key=$key")
+                }
             }
         }
 
-        fun collectFrom(doc: Document, parentLang: String? = null) {
+        fun collectFrom(
+            doc: Document,
+            parentLang: String? = null,
+            includeDownloads: Boolean = true,
+        ) {
             doc.select("iframe").forEach { iframe ->
                 val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
                 if (src.isBlank()) return@forEach
@@ -380,39 +406,50 @@ class LMANIME : MainAPI() {
                 }
             }
 
+            if (!includeDownloads) return
+
             doc.select("div.soraddlx").forEach { block ->
                 val heading = block.selectFirst(".sorattlx h3, .sorattlx")?.text()?.trim()
-                val lang = detectLang(heading) ?: parentLang
-                Log.e(TAG, "  dl block  heading='$heading'  lang=$lang")
+                val blockLang = detectLang(heading)
+                Log.e(TAG, "  dl block  heading='$heading'  lang=$blockLang")
 
                 block.select(".soraurlx a[href]").forEach { a ->
                     val href = a.attr("href").trim()
+                    val linkLang = detectLang(a.text(), a.attr("title")) ?: blockLang ?: parentLang
                     when {
                         href.contains("morencius.com/file/") -> {
                             val id = href.substringAfter("/file/")
                                 .substringBefore("/").substringBefore("?")
-                            if (id.isNotBlank()) pushIframe("https://morencius.com/embed/$id", lang)
+                            if (id.isNotBlank()) pushIframe("https://morencius.com/embed/$id", linkLang)
                         }
                         href.contains("mp4upload.com/") && !href.contains("/embed-") -> {
                             val id = href.substringAfter("mp4upload.com/")
                                 .substringBefore("/").substringBefore(".")
                             if (id.isNotBlank())
-                                pushIframe("https://www.mp4upload.com/embed-$id.html", lang)
+                                pushIframe("https://www.mp4upload.com/embed-$id.html", linkLang)
                         }
                         href.contains("ok.ru/") || href.contains("odnoklassniki.ru/") -> {
-                            pushIframe(href, lang)
+                            pushIframe(href, linkLang)
                         }
                         href.contains("wishfast") || href.contains("filemoon") ||
                         href.contains("waaw.") || href.contains("d.tube") ||
-                        href.contains("rumble.com") -> {
-                            pushIframe(href, lang)
+                        href.contains("rumble.com") || href.contains("dailymotion.com") -> {
+                            pushIframe(href, linkLang)
                         }
                     }
                 }
             }
         }
 
-        collectFrom(document)
+        // Detect default active mirror language on the main document
+        val defaultMirrorOpt = document.selectFirst(
+            "select.mirror option[selected], select.mirror option[value^=http]"
+        )
+        val mainDocLang = defaultMirrorOpt?.let {
+            detectLang(it.text(), it.attr("data-lang"), it.attr("title"))
+        }
+
+        collectFrom(document, parentLang = mainDocLang, includeDownloads = true)
         Log.e(TAG, "after main doc → iframes=${iframeEntries.size}  videoUrls=${videoUrls.size}")
 
         coroutineScope {
@@ -435,7 +472,7 @@ class LMANIME : MainAPI() {
                     }
                 }
             }.awaitAll().filterNotNull()
-                .forEach { (doc, lang) -> collectFrom(doc, lang) }
+                .forEach { (doc, lang) -> collectFrom(doc, lang, includeDownloads = false) }
         }
         Log.e(TAG, "after mirrors → iframes=${iframeEntries.size}")
 
@@ -471,13 +508,16 @@ class LMANIME : MainAPI() {
             }
 
             when {
-                url.contains("morencius.com") ->
+                url.contains("dailymotion.com", true) ->
+                    extractDailymotion(url, data, subtitleSink, wrapped)
+
+                url.contains("morencius.com", true) ->
                     VidHideExtractor().getUrl(url, data, subtitleSink, wrapped)
 
-                url.contains("rumble.com") ->
+                url.contains("rumble.com", true) ->
                     RumbleExtractor().getUrl(url, data, subtitleSink, wrapped)
 
-                url.contains("ok.ru") || url.contains("odnoklassniki.ru") ->
+                url.contains("ok.ru", true) || url.contains("odnoklassniki.ru", true) ->
                     OkRuExtractor().getUrl(url, data, subtitleSink, wrapped)
 
                 else -> {
@@ -487,32 +527,13 @@ class LMANIME : MainAPI() {
             }
         }
 
-        val prepared = coroutineScope {
-            val gate = Semaphore(4)
-            sortedIframes.map { (url, lang) ->
-                async {
-                    gate.withPermit {
-                        try {
-                            val n = normalizeDailymotion(url)
-                            if (n != url) Log.e(TAG, "  dm normalise: $url  →  $n")
-                            n to lang
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            Log.e(TAG, "  dm normalise FAIL: $url  ${e.message}")
-                            url to lang
-                        }
-                    }
-                }
-            }.awaitAll()
-        }
-
         fun isCustom(url: String): Boolean =
-            url.contains("morencius.com") ||
-            url.contains("rumble.com") ||
-            url.contains("ok.ru") || url.contains("odnoklassniki.ru")
+            url.contains("dailymotion.com", true) ||
+            url.contains("morencius.com", true) ||
+            url.contains("rumble.com", true) ||
+            url.contains("ok.ru", true) || url.contains("odnoklassniki.ru", true)
 
-        val (customSources, builtinSources) = prepared.partition { (url, _) -> isCustom(url) }
+        val (customSources, builtinSources) = sortedIframes.partition { (url, _) -> isCustom(url) }
         Log.e(TAG, "partition → custom=${customSources.size}  builtin=${builtinSources.size}")
         Log.e(TAG, "  custom:  ${customSources.map { it.first }}")
         Log.e(TAG, "  builtin: ${builtinSources.map { it.first }}")
@@ -593,80 +614,143 @@ class LMANIME : MainAPI() {
         return found.get()
     }
 
-    private suspend fun normalizeDailymotion(url: String): String {
-        if (!url.contains("dailymotion", true)) return url
+    private suspend fun extractDailymotion(
+        url: String,
+        episodeReferer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ) {
+        val videoId = dmVideoIdRegex.find(url)?.groupValues?.get(1)
+            ?: dmEmbedPathRegex.find(url)?.groupValues?.get(1)
 
-        Log.e(TAG, "  dm  input=$url")
-
-        // Case 1 — id in query string
-        dmVideoIdRegex.find(url)?.groupValues?.get(1)?.let { id ->
-            if (id.startsWith("k", ignoreCase = true)) {
-                resolveAccessId(url, id)?.let { return it }
-            }
-            Log.e(TAG, "  dm  id from query=$id")
-            return "https://www.dailymotion.com/video/$id"
+        if (videoId.isNullOrBlank()) {
+            Log.e(TAG, "  dm  could not parse videoId from $url → fallback to loadExtractor")
+            loadExtractor(url, episodeReferer, subtitleCallback, callback)
+            return
         }
 
-        // Case 1.5 — /embed/video/<id> or /video/<id>
-        dmEmbedPathRegex.find(url)?.groupValues?.get(1)?.let { id ->
-            if (id.startsWith("k", ignoreCase = true)) {
-                resolveAccessId(url, id)?.let { return it }
-            }
-            Log.e(TAG, "  dm  id from path=$id  (stripping query/embed)")
-            return "https://www.dailymotion.com/video/$id"
+        val playerReferer = "https://geo.dailymotion.com/player/$DM_PLAYER_ID.html?video=$videoId"
+        val encodedEmbedder = URLEncoder.encode(episodeReferer, "UTF-8")
+        val metadataUrl = "https://www.dailymotion.com/player/metadata/video/$videoId" +
+            "?embedder=$encodedEmbedder&app=com.dailymotion.neon&locale=en_US&is_native_app=0"
+
+        val headers = mapOf(
+            "Referer" to playerReferer,
+            "Origin"  to "https://geo.dailymotion.com",
+        )
+        val cookies = mapOf(
+            "ff"            to "off",
+            "family_filter" to "off",
+        )
+
+        val responseText = runCatching {
+            app.get(metadataUrl, headers = headers, cookies = cookies).text
+        }.onFailure {
+            Log.e(TAG, "  dm [$videoId] metadata HTTP fail: ${it.message}")
+        }.getOrNull() ?: return
+
+        val json = runCatching { JSONObject(responseText) }.getOrNull()
+        if (json == null) {
+            Log.e(TAG, "  dm [$videoId] invalid metadata JSON (len=${responseText.length})")
+            return
         }
 
-        // Case 2 — geo player shell (no ?video=)
-        if (url.contains("geo.dailymotion.com", true) && url.contains("/player/")) {
-            Log.e(TAG, "  dm  player shell — fetching HTML")
-            val html = withTimeoutOrNull(DM_RESOLVE_TIMEOUT_MS) {
-                runCatching { app.get(url).text }
-                    .onFailure { Log.e(TAG, "  dm  shell fetch FAIL: ${it.message}") }
-                    .getOrNull()
-            }
+        // Log explicit Dailymotion API errors (e.g., DM005 Content deleted / DM007 Embed restricted)
+        json.optJSONObject("error")?.let { err ->
+            val code    = err.optString("code", "unknown")
+            val title   = err.optString("title", "")
+            val message = err.optString("message", err.optString("raw_message", ""))
+            Log.e(TAG, "  dm [$videoId] unavailable on Dailymotion → code=$code title='$title' msg='$message'")
+            return
+        }
 
-            if (html != null) {
-                Log.e(TAG, "  dm  shell html len=${html.length}")
-                val id = dmManifestIdRegex.find(html)?.groupValues?.get(1)
-                    ?: dmConfigIdRegex.find(html)?.groupValues?.get(1)
-
-                if (!id.isNullOrBlank()) {
-                    Log.e(TAG, "  dm  id from shell=$id")
-                    return "https://www.dailymotion.com/video/$id"
-                } else {
-                    Log.e(TAG, "  dm  shell — no id found in HTML (regex missed)")
+        // Extract subtitles
+        json.optJSONObject("subtitles")?.optJSONObject("data")?.let { subsData ->
+            val subKeys = subsData.keys()
+            while (subKeys.hasNext()) {
+                val key = subKeys.next()
+                val subObj = subsData.optJSONObject(key) ?: continue
+                val label = subObj.optString("label").ifBlank { key }
+                val urls = subObj.optJSONArray("urls") ?: continue
+                for (i in 0 until urls.length()) {
+                    val subUrl = urls.optString(i)
+                    if (subUrl.isNotBlank()) {
+                        subtitleCallback(newSubtitleFile(label, subUrl))
+                    }
                 }
             }
         }
 
-        Log.e(TAG, "  dm  unchanged (no rewrite possible)")
-        return url
-    }
-
-    private suspend fun resolveAccessId(url: String, accessId: String): String? {
-        val fetchUrl = "https://geo.dailymotion.com/player/$DM_PLAYER_ID.html?video=$accessId"
-        Log.e(TAG, "  dm  access_id=$accessId  → fetch $fetchUrl")
-
-        val html = runCatching { app.get(fetchUrl).text }
-            .onFailure { Log.e(TAG, "  dm  resolve fetch FAIL: ${it.message}") }
-            .getOrNull()
-
-        // <500 chars = error page, not player HTML
-        if (html == null || html.length < 500) {
-            Log.e(TAG, "  dm  access_id $accessId → fetch returned ${html?.length ?: 0} chars (too short)")
-            return null
-        }
-        Log.e(TAG, "  dm  resolve html len=${html.length}")
-
-        val realId = dmManifestIdRegex.find(html)?.groupValues?.get(1)
-            ?: dmConfigIdRegex.find(html)?.groupValues?.get(1)
-
-        if (!realId.isNullOrBlank() && realId != accessId) {
-            Log.e(TAG, "  dm  access_id $accessId → real id $realId")
-            return "https://www.dailymotion.com/video/$realId"
+        // Extract HLS / MP4 streams from qualities object
+        val qualities = json.optJSONObject("qualities")
+        if (qualities == null) {
+            Log.e(TAG, "  dm [$videoId] no 'qualities' object in metadata")
+            return
         }
 
-        Log.e(TAG, "  dm  access_id $accessId → no real id; fallback to /video/$accessId")
-        return null
+        val streamUrls = linkedSetOf<Pair<String, String>>() // url to qualityKey
+        val preferredOrder = listOf("auto", "1080", "720", "480", "380", "240")
+        for (qKey in preferredOrder) {
+            val arr = qualities.optJSONArray(qKey) ?: continue
+            for (i in 0 until arr.length()) {
+                val item = arr.optJSONObject(i) ?: continue
+                val streamUrl = item.optString("url")
+                if (streamUrl.isNotBlank()) {
+                    streamUrls.add(streamUrl to qKey)
+                }
+            }
+        }
+
+        if (streamUrls.isEmpty()) {
+            Log.e(TAG, "  dm [$videoId] qualities object had 0 stream URLs")
+            return
+        }
+
+        var emittedAny = false
+        for ((streamUrl, qKey) in streamUrls) {
+            if (streamUrl.contains(".m3u8", true)) {
+                val generated = runCatching {
+                    M3u8Helper.generateM3u8(
+                        "Dailymotion",
+                        streamUrl,
+                        "https://geo.dailymotion.com/",
+                        headers = mapOf("Origin" to "https://geo.dailymotion.com"),
+                    )
+                }.getOrNull().orEmpty()
+
+                if (generated.isNotEmpty()) {
+                    generated.forEach { callback(it) }
+                    emittedAny = true
+                } else {
+                    callback(
+                        newExtractorLink(
+                            source = "Dailymotion",
+                            name   = "Dailymotion",
+                            url    = streamUrl,
+                            type   = ExtractorLinkType.M3U8,
+                        ) {
+                            this.referer = "https://geo.dailymotion.com/"
+                            this.quality = getQualityFromName(qKey)
+                        }
+                    )
+                    emittedAny = true
+                }
+                // If "auto" master playlist succeeded, no need to fetch redundant sub-manifests
+                if (qKey == "auto" && emittedAny) break
+            } else {
+                callback(
+                    newExtractorLink(
+                        source = "Dailymotion",
+                        name   = "Dailymotion",
+                        url    = streamUrl,
+                        type   = ExtractorLinkType.VIDEO,
+                    ) {
+                        this.referer = "https://geo.dailymotion.com/"
+                        this.quality = getQualityFromName(qKey)
+                    }
+                )
+                emittedAny = true
+            }
+        }
     }
 }
