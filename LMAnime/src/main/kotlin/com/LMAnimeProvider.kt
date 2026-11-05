@@ -680,31 +680,49 @@ class LMANIME : MainAPI() {
             }
         }
 
-        val qualities = json.optJSONObject("qualities")
+              val qualities = json.optJSONObject("qualities")
         if (qualities == null) {
             Log.e(TAG, "  dm [$videoId] no 'qualities' object in metadata")
             return
         }
 
-        // Only parse the "auto" master playlist to ensure full audio+video multiplexing
-        val autoArr = qualities.optJSONArray("auto")
-        var masterUrl: String? = null
-        if (autoArr != null) {
-            for (i in 0 until autoArr.length()) {
-                val item = autoArr.optJSONObject(i) ?: continue
-                val streamUrl = item.optString("url")
-                if (streamUrl.isNotBlank() && streamUrl.contains(".m3u8", true)) {
-                    masterUrl = streamUrl
-                    break
-                }
-            }
-        }
+        // Get master URL from 'auto' array
+        val masterUrl = qualities.optJSONArray("auto")
+            ?.optJSONObject(0)?.optString("url")
+            ?.takeIf { it.isNotBlank() && it.contains(".m3u8", true) }
 
-        // Fallback to manifest direct URL if auto array is missing
         if (masterUrl == null) {
-            masterUrl = "https://www.dailymotion.com/cdn/manifest/video/$videoId.m3u8"
+            Log.e(TAG, "  dm [$videoId] no auto/master manifest")
+            return
         }
 
+        // Fetch master once to check whether audio is a separate rendition.
+        // Old DM: muxed variants → M3u8Helper split preserves A/V.
+        // New DM: EXT-X-MEDIA:TYPE=AUDIO → variants are video-only;
+        //         splitting would strip audio. Must emit raw master only.
+        val masterText = runCatching { app.get(masterUrl).text }.getOrNull()
+        val hasSeparateAudio = masterText?.contains(
+            "EXT-X-MEDIA:TYPE=AUDIO", ignoreCase = true
+        ) == true
+        Log.e(TAG, "  dm [$videoId] master hasSeparateAudio=$hasSeparateAudio")
+
+        if (hasSeparateAudio) {
+            // New DM — raw master only; ExoPlayer negotiates A+V+ABR
+            callback(
+                newExtractorLink(
+                    source = "Dailymotion",
+                    name   = "Dailymotion",
+                    url    = masterUrl,
+                    type   = ExtractorLinkType.M3U8,
+                ) {
+                    this.referer = "https://geo.dailymotion.com/"
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+            return
+        }
+
+        // Old DM — M3u8Helper split is safe (variants carry audio)
         val generated = runCatching {
             M3u8Helper.generateM3u8(
                 "Dailymotion",
@@ -725,6 +743,7 @@ class LMANIME : MainAPI() {
                     type   = ExtractorLinkType.M3U8,
                 ) {
                     this.referer = "https://geo.dailymotion.com/"
+                    this.quality = Qualities.Unknown.value
                 }
             )
         }
