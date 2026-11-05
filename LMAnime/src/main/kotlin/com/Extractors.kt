@@ -12,7 +12,7 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 
 /* ==========================================================================
- * VidHide / Morencius 
+ * VidHide / Morencius
  * ========================================================================== */
 class VidHideExtractor : VidHidePro() {
     override val name    = "VidHide"
@@ -20,7 +20,7 @@ class VidHideExtractor : VidHidePro() {
 }
 
 /* ==========================================================================
- * Rumble 
+ * Rumble
  * ========================================================================== */
 class RumbleExtractor : ExtractorApi() {
     override val name            = "Rumble"
@@ -125,6 +125,9 @@ class RumbleExtractor : ExtractorApi() {
     }
 }
 
+/* ==========================================================================
+ * OkRu — connection-reset resistant (Semaphore 5 + retry)
+ * ========================================================================== */
 class OkRuExtractor : ExtractorApi() {
     override val name = "OkRu"
     override val mainUrl = "https://ok.ru"
@@ -256,11 +259,6 @@ class OkRuExtractor : ExtractorApi() {
     )
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    private data class OkRuVideo(
-        val name: String? = null,
-        val url: String? = null,
-    )
-}
     private data class OkRuVideo(
         val name: String? = null,
         val url: String? = null,
