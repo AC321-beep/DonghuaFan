@@ -12,7 +12,7 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 
 /* ==========================================================================
- * VidHide / Morencius — unchanged
+ * VidHide / Morencius 
  * ========================================================================== */
 class VidHideExtractor : VidHidePro() {
     override val name    = "VidHide"
@@ -20,7 +20,7 @@ class VidHideExtractor : VidHidePro() {
 }
 
 /* ==========================================================================
- * Rumble — original behaviour preserved
+ * Rumble 
  * ========================================================================== */
 class RumbleExtractor : ExtractorApi() {
     override val name            = "Rumble"
@@ -125,9 +125,6 @@ class RumbleExtractor : ExtractorApi() {
     }
 }
 
-/* ==========================================================================
- * OkRu — connection-reset resistant (Semaphore 2 + retry)
- * ========================================================================== */
 class OkRuExtractor : ExtractorApi() {
     override val name = "OkRu"
     override val mainUrl = "https://ok.ru"
@@ -136,10 +133,10 @@ class OkRuExtractor : ExtractorApi() {
     companion object {
         private const val TAG = "LMANIME/OkRu"
         private const val FETCH_TIMEOUT_MS = 8_000L
+        private const val RETRY_DELAY_MS = 500L
 
-        /* ok.ru resets connections when >2 metadata POSTs fire at once.
-         * Serialise across all OkRuExtractor instances. */
-        private val API_SEM = Semaphore(2)
+        // Cap concurrent metadata POSTs; retry heals the occasional reset
+        private val API_SEM = Semaphore(5)
 
         private val RE_VIDEO_ID  = Regex("""/video(?:embed)?/(\d+)""")
         private val RE_MID_PARAM = Regex("""[?&]mid=(\d+)""")
@@ -170,8 +167,9 @@ class OkRuExtractor : ExtractorApi() {
 
             val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id"
 
-            val json = API_SEM.withPermit { fetchMetadataWithRetry(apiUrl) } ?: return
+            val json = fetchMetadataWithRetry(apiUrl) ?: return
 
+            // Per-quality MP4
             json.videos?.forEach { video ->
                 val qName  = video.name?.lowercase() ?: ""
                 val vidUrl = video.url ?: ""
@@ -194,62 +192,60 @@ class OkRuExtractor : ExtractorApi() {
                 )
             }
 
+            // HLS — always emit when available
             val hlsUrl = json.hlsManifestUrl.orEmpty()
-            var hlsSucceeded = false
-
             if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
                 val cleanHls = hlsUrl.replace("\\u0026", "&").replace("\\/", "/")
                 val hlsLinks = withTimeoutOrNull(FETCH_TIMEOUT_MS * 2) {
                     try { M3u8Helper.generateM3u8("$name HLS", cleanHls, url) }
                     catch (_: Exception) { emptyList() }
                 } ?: emptyList()
-
-                if (hlsLinks.isNotEmpty()) {
-                    hlsLinks.forEach(callback)
-                    hlsSucceeded = true
-                }
+                hlsLinks.forEach(callback)
             }
 
-            if (!hlsSucceeded) {
-                val dashUrl = json.dashManifestUrl.orEmpty()
-                if (dashUrl.isNotBlank() && !dashUrl.contains("usr_login")) {
-                    callback(
-                        newExtractorLink(
-                            name   = "$name DASH",
-                            source = "$name DASH",
-                            url    = dashUrl.replace("\\u0026", "&").replace("\\/", "/"),
-                            type   = ExtractorLinkType.DASH,
-                        ) { this.referer = "https://ok.ru/" }
-                    )
-                }
+            // DASH — always emit alongside HLS, not as fallback
+            val dashUrl = json.dashManifestUrl.orEmpty()
+            if (dashUrl.isNotBlank() && !dashUrl.contains("usr_login")) {
+                callback(
+                    newExtractorLink(
+                        name   = "$name DASH",
+                        source = "$name DASH",
+                        url    = dashUrl.replace("\\u0026", "&").replace("\\/", "/"),
+                        type   = ExtractorLinkType.DASH,
+                    ) { this.referer = "https://ok.ru/" }
+                )
             }
         } catch (e: Exception) {
             Log.e(TAG, "getUrl($url) failed: ${e.message}")
         }
     }
 
-    /** One retry with 500 ms backoff — heals transient "Connection reset". */
+    // Permit held only during the request; backoff sleeps outside the semaphore
     private suspend fun fetchMetadataWithRetry(apiUrl: String): OkRuResponse? {
-        try {
-            val first = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-                app.post(apiUrl).parsedSafe<OkRuResponse>()
+        val first = try {
+            API_SEM.withPermit {
+                withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                    app.post(apiUrl).parsedSafe<OkRuResponse>()
+                }
             }
-            if (first != null) return first
-            Log.e(TAG, "post $apiUrl attempt 1 returned null")
         } catch (e: Exception) {
             Log.e(TAG, "post $apiUrl attempt 1 failed: ${e.message}")
+            null
         }
+        if (first != null) return first
 
-        delay(500)
+        delay(RETRY_DELAY_MS)
 
-        try {
-            return withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-                app.post(apiUrl).parsedSafe<OkRuResponse>()
+        return try {
+            API_SEM.withPermit {
+                withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                    app.post(apiUrl).parsedSafe<OkRuResponse>()
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "post $apiUrl attempt 2 failed: ${e.message}")
+            null
         }
-        return null
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -260,6 +256,11 @@ class OkRuExtractor : ExtractorApi() {
     )
 
     @JsonIgnoreProperties(ignoreUnknown = true)
+    private data class OkRuVideo(
+        val name: String? = null,
+        val url: String? = null,
+    )
+}
     private data class OkRuVideo(
         val name: String? = null,
         val url: String? = null,
