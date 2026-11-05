@@ -729,3 +729,4 @@ class LMANIME : MainAPI() {
             )
         }
     }
+}
