@@ -22,6 +22,9 @@ class LMANIME : MainAPI() {
     companion object {
         private const val TAG = "LMANIME"
         private const val DM_RESOLVE_TIMEOUT_MS = 10_000L
+
+        // LMANIME's site-wide Dailymotion player id
+        private const val DM_PLAYER_ID = "xofxc"
     }
 
     override var mainUrl  = "https://lmanime.com"
@@ -32,7 +35,6 @@ class LMANIME : MainAPI() {
     override val hasDownloadSupport = false
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    /* ─── Precompiled date regexes ─── */
     private val dateRegex = Regex(
         """([a-zA-Z]{3,}\s+\d{1,2},\s+\d{4}|\d{1,2}\s+[a-zA-Z]{3,}\s+\d{4}|\d{4}-\d{2}-\d{2})"""
     )
@@ -49,7 +51,6 @@ class LMANIME : MainAPI() {
     private val epStripRegex = Regex("""\s+Episode\s+\d+.*$""", RegexOption.IGNORE_CASE)
     private val epBadgeRegex = Regex("""(?i)(eps?\.?\s*\d+|\d+)""")
 
-    /* ─── Dailymotion helpers ─── */
     private val dmVideoIdRegex    = Regex("""[?&]video=([a-zA-Z0-9_-]+)""")
     private val dmEmbedPathRegex  = Regex("""/(?:embed/)?video/([a-zA-Z0-9_-]+)""")
     private val dmManifestIdRegex = Regex("""manifest/video/([a-zA-Z0-9]+)\.m3u8""")
@@ -62,7 +63,6 @@ class LMANIME : MainAPI() {
         "upcoming/"                          to "Upcoming",
     )
 
-    /* ─── Shared parsing helpers ─── */
     private fun extractTitle(vararg docs: Document): String =
         docs.asSequence().mapNotNull {
             it.selectFirst("h1.entry-title")?.text()?.trim()
@@ -89,9 +89,6 @@ class LMANIME : MainAPI() {
             .firstOrNull { it.text().contains("Released", true) }?.text()
             ?.let { yearRegex.find(it)?.value?.toIntOrNull() }
 
-    /* ------------------------------------------------------------------ */
-    /* MAIN PAGE                                                          */
-    /* ------------------------------------------------------------------ */
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = when {
             request.data == "latest" ->
@@ -108,9 +105,6 @@ class LMANIME : MainAPI() {
         return newHomePageResponse(request.name, items)
     }
 
-    /* ------------------------------------------------------------------ */
-    /* CARD PARSER                                                        */
-    /* ------------------------------------------------------------------ */
     private fun Element.toSearchResult(): SearchResponse? {
         val anchor = selectFirst("a[itemprop=url]") ?: return null
         val tt     = selectFirst("div.tt")
@@ -145,9 +139,6 @@ class LMANIME : MainAPI() {
         }
     }
 
-    /* ------------------------------------------------------------------ */
-    /* SEARCH                                                             */
-    /* ------------------------------------------------------------------ */
     override suspend fun quickSearch(query: String): List<SearchResponse> = search(query)
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -156,9 +147,6 @@ class LMANIME : MainAPI() {
         return doc.select("article.bs").mapNotNull { it.toSearchResult() }
     }
 
-    /* ------------------------------------------------------------------ */
-    /* LOAD                                                               */
-    /* ------------------------------------------------------------------ */
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
 
@@ -186,9 +174,6 @@ class LMANIME : MainAPI() {
         return loadAsMovie(url, document, TvType.Anime)
     }
 
-    /* ------------------------------------------------------------------ */
-    /* SERIES LOADER                                                      */
-    /* ------------------------------------------------------------------ */
     private suspend fun loadSeries(
         seriesUrl: String,
         episodeUrl: String,
@@ -261,9 +246,6 @@ class LMANIME : MainAPI() {
         }
     }
 
-    /* ------------------------------------------------------------------ */
-    /* MOVIE FALLBACK                                                     */
-    /* ------------------------------------------------------------------ */
     private suspend fun loadAsMovie(
         url: String,
         document: Document,
@@ -281,9 +263,6 @@ class LMANIME : MainAPI() {
         }
     }
 
-    /* ------------------------------------------------------------------ */
-    /* LOAD LINKS                                                         */
-    /* ------------------------------------------------------------------ */
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -614,19 +593,6 @@ class LMANIME : MainAPI() {
         return found.get()
     }
 
-    /* ------------------------------------------------------------------ */
-    /* Dailymotion URL normalisation                                      */
-    /*                                                                    */
-    /* 1.   ?video=<id>                     → /video/<id>                 */
-    /* 1.5  /embed/video/<id>, /video/<id>  → /video/<id>                 */
-    /* 2.   geo…/player/…html               → fetch, resolve id           */
-    /* 3.   Anything else                   → unchanged                   */
-    /*                                                                    */
-    /* For k-prefixed ids (access_ids) the built-in extractor's metadata  */
-    /* API rejects them. resolveAccessId() fetches the embed HTML and     */
-    /* pulls the real x-prefix video id from __PLAYER_CONFIG__ so the     */
-    /* built-in extractor can resolve it cleanly.                         */
-    /* ------------------------------------------------------------------ */
     private suspend fun normalizeDailymotion(url: String): String {
         if (!url.contains("dailymotion", true)) return url
 
@@ -677,24 +643,17 @@ class LMANIME : MainAPI() {
         return url
     }
 
-    /**
-     * k-prefixed Dailymotion ids are access_ids. The metadata API sometimes
-     * rejects them. This fetches the embed page HTML and pulls the real video
-     * id from __PLAYER_CONFIG__ (manifest URL or criticalMetadata.id).
-     *
-     * Returns "/video/<real_id>" if a different real id was found.
-     * Returns null otherwise — caller falls back to /video/<access_id>.
-     */
     private suspend fun resolveAccessId(url: String, accessId: String): String? {
-        Log.e(TAG, "  dm  access_id=$accessId  → fetching HTML to resolve")
+        val fetchUrl = "https://geo.dailymotion.com/player/$DM_PLAYER_ID.html?video=$accessId"
+        Log.e(TAG, "  dm  access_id=$accessId  → fetch $fetchUrl")
 
-        val html = withTimeoutOrNull(DM_RESOLVE_TIMEOUT_MS) {
-            runCatching { app.get(url).text }
-                .onFailure { Log.e(TAG, "  dm  resolve fetch FAIL: ${it.message}") }
-                .getOrNull()
-        }
-        if (html == null) {
-            Log.e(TAG, "  dm  access_id $accessId → fetch returned null/timeout")
+        val html = runCatching { app.get(fetchUrl).text }
+            .onFailure { Log.e(TAG, "  dm  resolve fetch FAIL: ${it.message}") }
+            .getOrNull()
+
+        // <500 chars = error page, not player HTML
+        if (html == null || html.length < 500) {
+            Log.e(TAG, "  dm  access_id $accessId → fetch returned ${html?.length ?: 0} chars (too short)")
             return null
         }
         Log.e(TAG, "  dm  resolve html len=${html.length}")
@@ -707,7 +666,7 @@ class LMANIME : MainAPI() {
             return "https://www.dailymotion.com/video/$realId"
         }
 
-        Log.e(TAG, "  dm  access_id $accessId → real id not found (or same)")
+        Log.e(TAG, "  dm  access_id $accessId → no real id; fallback to /video/$accessId")
         return null
     }
 }
