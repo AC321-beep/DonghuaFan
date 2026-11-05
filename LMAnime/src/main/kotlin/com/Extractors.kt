@@ -6,6 +6,9 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.VidHidePro
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 
 /* ==========================================================================
@@ -17,7 +20,7 @@ class VidHideExtractor : VidHidePro() {
 }
 
 /* ==========================================================================
- * Rumble — original behaviour preserved (direct-video referer = url)
+ * Rumble — original behaviour preserved
  * ========================================================================== */
 class RumbleExtractor : ExtractorApi() {
     override val name            = "Rumble"
@@ -123,7 +126,7 @@ class RumbleExtractor : ExtractorApi() {
 }
 
 /* ==========================================================================
- * OkRu — INFER_TYPE preserved
+ * OkRu — connection-reset resistant (Semaphore 2 + retry)
  * ========================================================================== */
 class OkRuExtractor : ExtractorApi() {
     override val name = "OkRu"
@@ -132,7 +135,11 @@ class OkRuExtractor : ExtractorApi() {
 
     companion object {
         private const val TAG = "LMANIME/OkRu"
-        private const val FETCH_TIMEOUT_MS = 12_000L
+        private const val FETCH_TIMEOUT_MS = 8_000L
+
+        /* ok.ru resets connections when >2 metadata POSTs fire at once.
+         * Serialise across all OkRuExtractor instances. */
+        private val API_SEM = Semaphore(2)
 
         private val RE_VIDEO_ID  = Regex("""/video(?:embed)?/(\d+)""")
         private val RE_MID_PARAM = Regex("""[?&]mid=(\d+)""")
@@ -163,12 +170,7 @@ class OkRuExtractor : ExtractorApi() {
 
             val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id"
 
-            val json = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-                try { app.post(apiUrl).parsedSafe<OkRuResponse>() }
-                catch (e: Exception) {
-                    Log.e(TAG, "post $apiUrl failed: ${e.message}"); null
-                }
-            } ?: return
+            val json = API_SEM.withPermit { fetchMetadataWithRetry(apiUrl) } ?: return
 
             json.videos?.forEach { video ->
                 val qName  = video.name?.lowercase() ?: ""
@@ -197,7 +199,7 @@ class OkRuExtractor : ExtractorApi() {
 
             if (hlsUrl.isNotBlank() && !hlsUrl.contains("usr_login")) {
                 val cleanHls = hlsUrl.replace("\\u0026", "&").replace("\\/", "/")
-                val hlsLinks = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                val hlsLinks = withTimeoutOrNull(FETCH_TIMEOUT_MS * 2) {
                     try { M3u8Helper.generateM3u8("$name HLS", cleanHls, url) }
                     catch (_: Exception) { emptyList() }
                 } ?: emptyList()
@@ -224,6 +226,30 @@ class OkRuExtractor : ExtractorApi() {
         } catch (e: Exception) {
             Log.e(TAG, "getUrl($url) failed: ${e.message}")
         }
+    }
+
+    /** One retry with 500 ms backoff — heals transient "Connection reset". */
+    private suspend fun fetchMetadataWithRetry(apiUrl: String): OkRuResponse? {
+        try {
+            val first = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                app.post(apiUrl).parsedSafe<OkRuResponse>()
+            }
+            if (first != null) return first
+            Log.e(TAG, "post $apiUrl attempt 1 returned null")
+        } catch (e: Exception) {
+            Log.e(TAG, "post $apiUrl attempt 1 failed: ${e.message}")
+        }
+
+        delay(500)
+
+        try {
+            return withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                app.post(apiUrl).parsedSafe<OkRuResponse>()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "post $apiUrl attempt 2 failed: ${e.message}")
+        }
+        return null
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
