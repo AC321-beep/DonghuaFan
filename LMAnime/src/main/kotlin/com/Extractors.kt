@@ -237,36 +237,4 @@ class OkRuExtractor : ExtractorApi() {
     )
 }
 
-/* ==========================================================================
- * Mp4Upload — ORIGINAL logic restored (no timeout, runCatching)
- * ========================================================================== */
-class Mp4UploadExtractor : ExtractorApi() {
-    override val name            = "Mp4Upload"
-    override val mainUrl         = "mp4upload.com"
-    override val requiresReferer = false
 
-    override suspend fun getUrl(
-        url: String, referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-    ) {
-        val id = when {
-            url.contains("/embed-") ->
-                url.substringAfter("/embed-").substringBefore(".").substringBefore("/")
-            else ->
-                url.substringAfterLast("/").substringBefore(".").substringBefore("?")
-        }
-        if (id.isBlank()) return
-
-        val embedUrl = "https://www.mp4upload.com/embed-$id.html"
-        val html = runCatching { app.get(embedUrl).text }.getOrNull() ?: return
-
-        Regex("""(https?://[^"'\s]+\.mp4[^"'\s]*)""").find(html)?.let { m ->
-            callback(
-                newExtractorLink(name, name, m.groupValues[1], ExtractorLinkType.VIDEO) {
-                    this.referer = embedUrl
-                }
-            )
-        }
-    }
-}
