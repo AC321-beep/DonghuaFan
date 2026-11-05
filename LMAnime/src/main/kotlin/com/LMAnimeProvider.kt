@@ -1,6 +1,5 @@
 package com.lmanime
 
-import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.CancellationException
@@ -22,8 +21,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 class LMANIME : MainAPI() {
 
     companion object {
-        private const val TAG = "LMANIME"
-
         // LMANIME's site-wide Dailymotion player id
         private const val DM_PLAYER_ID = "xofxc"
 
@@ -190,7 +187,6 @@ class LMANIME : MainAPI() {
         episodeDoc: Document,
     ): LoadResponse {
         val seriesDoc = runCatching { app.get(seriesUrl).document }
-            .onFailure { Log.e(TAG, "series fetch $seriesUrl failed: ${it.message}") }
             .getOrNull() ?: episodeDoc
 
         var links = episodeDoc.select("#singlepisode .episodelist ul li a")
@@ -281,10 +277,7 @@ class LMANIME : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        Log.e(TAG, "═══ loadLinks START  data=$data")
-
         val document = app.get(data).document
-        Log.e(TAG, "episode page fetched, html size=${document.html().length}")
 
         val found        = AtomicBoolean(false)
         val callbackLock = Any()
@@ -292,16 +285,11 @@ class LMANIME : MainAPI() {
         val emittedUrls  = ConcurrentHashMap.newKeySet<String>()
 
         fun emit(link: ExtractorLink) {
-            if (!emittedUrls.add(link.url)) {
-                Log.e(TAG, "  ↺ duplicate skipped: ${link.url.take(100)}")
-                return
-            }
-            Log.e(TAG, "  ✓ EMIT  name='${link.name}'  source='${link.source}'  type=${link.type}  url=${link.url.take(110)}")
+            if (!emittedUrls.add(link.url)) return
             found.set(true)
             synchronized(callbackLock) { callback(link) }
         }
         fun emitSub(sub: SubtitleFile) {
-            Log.e(TAG, "  ▸ SUBTITLE  lang=${sub.lang}  url=${sub.url.take(100)}")
             synchronized(subtitleLock) { subtitleCallback(sub) }
         }
 
@@ -359,27 +347,20 @@ class LMANIME : MainAPI() {
 
         fun pushIframe(url: String, lang: String?) {
             if (url.isBlank()) return
-            if (skipPatterns.any { url.contains(it, true) }) {
-                Log.e(TAG, "  ✗ skipped (ad pattern): $url")
-                return
-            }
+            if (skipPatterns.any { url.contains(it, true) }) return
+
             val key = dmVideoIdRegex.find(url)?.groupValues?.get(1)
                 ?: dmEmbedPathRegex.find(url)?.groupValues?.get(1)
                 ?: url.substringBefore("?").substringBefore("#")
 
             val existingIdx = keyToIndex[key]
             if (existingIdx == null) {
-                Log.e(TAG, "  + iframe  lang=$lang  url=$url")
                 keyToIndex[key] = iframeEntries.size
                 iframeEntries.add(url to lang)
             } else {
-                // Upgrade language if main doc recorded null and mirror knows the language
                 val (existingUrl, existingLang) = iframeEntries[existingIdx]
                 if (existingLang == null && lang != null) {
-                    Log.e(TAG, "  ↻ iframe lang upgraded  key=$key  null → $lang")
                     iframeEntries[existingIdx] = existingUrl to lang
-                } else {
-                    Log.e(TAG, "  ↺ iframe dedupe  key=$key")
                 }
             }
         }
@@ -401,7 +382,6 @@ class LMANIME : MainAPI() {
                 if (src.isBlank()) return@forEach
                 val fixed = fixUrl(src)
                 if (fixed.contains(".m3u8", true) || fixed.contains(".mp4", true)) {
-                    Log.e(TAG, "  + direct video  url=$fixed")
                     videoUrls.add(fixed)
                 }
             }
@@ -411,7 +391,6 @@ class LMANIME : MainAPI() {
             doc.select("div.soraddlx").forEach { block ->
                 val heading = block.selectFirst(".sorattlx h3, .sorattlx")?.text()?.trim()
                 val blockLang = detectLang(heading)
-                Log.e(TAG, "  dl block  heading='$heading'  lang=$blockLang")
 
                 block.select(".soraurlx a[href]").forEach { a ->
                     val href = a.attr("href").trim()
@@ -450,7 +429,6 @@ class LMANIME : MainAPI() {
         }
 
         collectFrom(document, parentLang = mainDocLang, includeDownloads = true)
-        Log.e(TAG, "after main doc → iframes=${iframeEntries.size}  videoUrls=${videoUrls.size}")
 
         coroutineScope {
             val mirrorGate = Semaphore(4)
@@ -459,22 +437,16 @@ class LMANIME : MainAPI() {
                     mirrorGate.withPermit {
                         val serverUrl = option.attr("value").trim()
                         if (!serverUrl.startsWith("http")) return@withPermit null
-                        Log.e(TAG, "mirror fetch: $serverUrl")
                         val optLang = detectLang(
                             option.text(), option.attr("data-lang"), option.attr("title")
                         )
                         runCatching { app.get(serverUrl, referer = data).document }
-                            .onSuccess {
-                                Log.e(TAG, "  mirror OK: $serverUrl  (iframes=${it.select("iframe").size})")
-                            }
-                            .onFailure { Log.e(TAG, "  mirror FAIL: $serverUrl  ${it.message}") }
                             .getOrNull()?.let { it to optLang }
                     }
                 }
             }.awaitAll().filterNotNull()
                 .forEach { (doc, lang) -> collectFrom(doc, lang, includeDownloads = false) }
         }
-        Log.e(TAG, "after mirrors → iframes=${iframeEntries.size}")
 
         val userLang = Locale.getDefault().language
         fun priority(lang: String?): Int = when {
@@ -485,10 +457,6 @@ class LMANIME : MainAPI() {
             else             -> 1
         }
         val sortedIframes = iframeEntries.sortedByDescending { priority(it.second) }
-        Log.e(TAG, "sorted iframes (${sortedIframes.size}):")
-        sortedIframes.forEachIndexed { i, (u, l) ->
-            Log.e(TAG, "  [$i] lang=$l  url=$u")
-        }
 
         suspend fun dispatch(url: String, lang: String?) {
             val tag = langTag(lang)
@@ -520,10 +488,8 @@ class LMANIME : MainAPI() {
                 url.contains("ok.ru", true) || url.contains("odnoklassniki.ru", true) ->
                     OkRuExtractor().getUrl(url, data, subtitleSink, wrapped)
 
-                else -> {
-                    Log.e(TAG, "  routing to loadExtractor (built-in): $url")
+                else ->
                     loadExtractor(url, data, subtitleSink, wrapped)
-                }
             }
         }
 
@@ -534,46 +500,33 @@ class LMANIME : MainAPI() {
             url.contains("ok.ru", true) || url.contains("odnoklassniki.ru", true)
 
         val (customSources, builtinSources) = sortedIframes.partition { (url, _) -> isCustom(url) }
-        Log.e(TAG, "partition → custom=${customSources.size}  builtin=${builtinSources.size}")
-        Log.e(TAG, "  custom:  ${customSources.map { it.first }}")
-        Log.e(TAG, "  builtin: ${builtinSources.map { it.first }}")
 
         coroutineScope {
             launch {
-                Log.e(TAG, "▶ PHASE 1 (custom parallel) start")
                 val gate = Semaphore(4)
                 customSources.map { (url, lang) ->
                     async {
                         gate.withPermit {
-                            Log.e(TAG, "  custom→ $url  (lang=$lang)")
                             try {
                                 withTimeoutOrNull(20_000L) { dispatch(url, lang) }
-                                    ?: Log.e(TAG, "  custom TIMEOUT: $url")
                             } catch (e: CancellationException) {
                                 throw e
-                            } catch (e: Exception) {
-                                Log.e(TAG, "  custom FAIL: $url  ${e.message}")
+                            } catch (_: Exception) {
                             }
                         }
                     }
                 }.awaitAll()
-                Log.e(TAG, "▶ PHASE 1 done. found=${found.get()}")
             }
 
             launch {
-                Log.e(TAG, "▶ PHASE 2 (built-in sequential) start")
                 for ((url, lang) in builtinSources) {
-                    Log.e(TAG, "  builtin→ $url  (lang=$lang)")
                     try {
                         withTimeoutOrNull(20_000L) { dispatch(url, lang) }
-                            ?: Log.e(TAG, "  builtin TIMEOUT: $url")
                     } catch (e: CancellationException) {
                         throw e
-                    } catch (e: Exception) {
-                        Log.e(TAG, "  builtin FAIL: $url  ${e.message}")
+                    } catch (_: Exception) {
                     }
                 }
-                Log.e(TAG, "▶ PHASE 2 done. found=${found.get()}")
             }
         }
 
@@ -588,7 +541,6 @@ class LMANIME : MainAPI() {
         }
 
         if (!found.get()) {
-            Log.e(TAG, "no links yet → running regex fallback")
             val videoRegex = Regex("""https?://[^"'\s\\]+\.(?:m3u8|mp4)[^"'\s\\]*""")
             val scopedHtml = buildString {
                 document.select("script, video, video source, iframe").forEach {
@@ -610,11 +562,10 @@ class LMANIME : MainAPI() {
             }
         }
 
-        Log.e(TAG, "═══ loadLinks END  found=${found.get()}  emitted=${emittedUrls.size}")
         return found.get()
     }
 
-   private suspend fun extractDailymotion(
+    private suspend fun extractDailymotion(
         url: String,
         episodeReferer: String,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -624,7 +575,6 @@ class LMANIME : MainAPI() {
             ?: dmEmbedPathRegex.find(url)?.groupValues?.get(1)
 
         if (videoId.isNullOrBlank()) {
-            Log.e(TAG, "  dm  could not parse videoId from $url → fallback to loadExtractor")
             loadExtractor(url, episodeReferer, subtitleCallback, callback)
             return
         }
@@ -645,23 +595,11 @@ class LMANIME : MainAPI() {
 
         val responseText = runCatching {
             app.get(metadataUrl, headers = headers, cookies = cookies).text
-        }.onFailure {
-            Log.e(TAG, "  dm [$videoId] metadata HTTP fail: ${it.message}")
         }.getOrNull() ?: return
 
-        val json = runCatching { JSONObject(responseText) }.getOrNull()
-        if (json == null) {
-            Log.e(TAG, "  dm [$videoId] invalid metadata JSON (len=${responseText.length})")
-            return
-        }
+        val json = runCatching { JSONObject(responseText) }.getOrNull() ?: return
 
-        json.optJSONObject("error")?.let { err ->
-            val code    = err.optString("code", "unknown")
-            val title   = err.optString("title", "")
-            val message = err.optString("message", err.optString("raw_message", ""))
-            Log.e(TAG, "  dm [$videoId] unavailable on Dailymotion → code=$code title='$title' msg='$message'")
-            return
-        }
+        if (json.optJSONObject("error") != null) return
 
         // Extract subtitles
         json.optJSONObject("subtitles")?.optJSONObject("data")?.let { subsData ->
@@ -680,21 +618,13 @@ class LMANIME : MainAPI() {
             }
         }
 
-              val qualities = json.optJSONObject("qualities")
-        if (qualities == null) {
-            Log.e(TAG, "  dm [$videoId] no 'qualities' object in metadata")
-            return
-        }
+        val qualities = json.optJSONObject("qualities") ?: return
 
         // Get master URL from 'auto' array
         val masterUrl = qualities.optJSONArray("auto")
             ?.optJSONObject(0)?.optString("url")
             ?.takeIf { it.isNotBlank() && it.contains(".m3u8", true) }
-
-        if (masterUrl == null) {
-            Log.e(TAG, "  dm [$videoId] no auto/master manifest")
-            return
-        }
+            ?: return
 
         // Fetch master once to check whether audio is a separate rendition.
         // Old DM: muxed variants → M3u8Helper split preserves A/V.
@@ -704,7 +634,6 @@ class LMANIME : MainAPI() {
         val hasSeparateAudio = masterText?.contains(
             "EXT-X-MEDIA:TYPE=AUDIO", ignoreCase = true
         ) == true
-        Log.e(TAG, "  dm [$videoId] master hasSeparateAudio=$hasSeparateAudio")
 
         if (hasSeparateAudio) {
             // New DM — raw master only; ExoPlayer negotiates A+V+ABR
