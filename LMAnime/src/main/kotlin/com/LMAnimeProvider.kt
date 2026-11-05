@@ -614,7 +614,7 @@ class LMANIME : MainAPI() {
         return found.get()
     }
 
-    private suspend fun extractDailymotion(
+   private suspend fun extractDailymotion(
         url: String,
         episodeReferer: String,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -655,7 +655,6 @@ class LMANIME : MainAPI() {
             return
         }
 
-        // Log explicit Dailymotion API errors (e.g., DM005 Content deleted / DM007 Embed restricted)
         json.optJSONObject("error")?.let { err ->
             val code    = err.optString("code", "unknown")
             val title   = err.optString("title", "")
@@ -681,76 +680,52 @@ class LMANIME : MainAPI() {
             }
         }
 
-        // Extract HLS / MP4 streams from qualities object
         val qualities = json.optJSONObject("qualities")
         if (qualities == null) {
             Log.e(TAG, "  dm [$videoId] no 'qualities' object in metadata")
             return
         }
 
-        val streamUrls = linkedSetOf<Pair<String, String>>() // url to qualityKey
-        val preferredOrder = listOf("auto", "1080", "720", "480", "380", "240")
-        for (qKey in preferredOrder) {
-            val arr = qualities.optJSONArray(qKey) ?: continue
-            for (i in 0 until arr.length()) {
-                val item = arr.optJSONObject(i) ?: continue
+        // Only parse the "auto" master playlist to ensure full audio+video multiplexing
+        val autoArr = qualities.optJSONArray("auto")
+        var masterUrl: String? = null
+        if (autoArr != null) {
+            for (i in 0 until autoArr.length()) {
+                val item = autoArr.optJSONObject(i) ?: continue
                 val streamUrl = item.optString("url")
-                if (streamUrl.isNotBlank()) {
-                    streamUrls.add(streamUrl to qKey)
+                if (streamUrl.isNotBlank() && streamUrl.contains(".m3u8", true)) {
+                    masterUrl = streamUrl
+                    break
                 }
             }
         }
 
-        if (streamUrls.isEmpty()) {
-            Log.e(TAG, "  dm [$videoId] qualities object had 0 stream URLs")
-            return
+        // Fallback to manifest direct URL if auto array is missing
+        if (masterUrl == null) {
+            masterUrl = "https://www.dailymotion.com/cdn/manifest/video/$videoId.m3u8"
         }
 
-        var emittedAny = false
-        for ((streamUrl, qKey) in streamUrls) {
-            if (streamUrl.contains(".m3u8", true)) {
-                val generated = runCatching {
-                    M3u8Helper.generateM3u8(
-                        "Dailymotion",
-                        streamUrl,
-                        "https://geo.dailymotion.com/",
-                        headers = mapOf("Origin" to "https://geo.dailymotion.com"),
-                    )
-                }.getOrNull().orEmpty()
+        val generated = runCatching {
+            M3u8Helper.generateM3u8(
+                "Dailymotion",
+                masterUrl,
+                "https://geo.dailymotion.com/",
+                headers = mapOf("Origin" to "https://geo.dailymotion.com"),
+            )
+        }.getOrNull().orEmpty()
 
-                if (generated.isNotEmpty()) {
-                    generated.forEach { callback(it) }
-                    emittedAny = true
-                } else {
-                    callback(
-                        newExtractorLink(
-                            source = "Dailymotion",
-                            name   = "Dailymotion",
-                            url    = streamUrl,
-                            type   = ExtractorLinkType.M3U8,
-                        ) {
-                            this.referer = "https://geo.dailymotion.com/"
-                            this.quality = getQualityFromName(qKey)
-                        }
-                    )
-                    emittedAny = true
+        if (generated.isNotEmpty()) {
+            generated.forEach { callback(it) }
+        } else {
+            callback(
+                newExtractorLink(
+                    source = "Dailymotion",
+                    name   = "Dailymotion",
+                    url    = masterUrl,
+                    type   = ExtractorLinkType.M3U8,
+                ) {
+                    this.referer = "https://geo.dailymotion.com/"
                 }
-                // If "auto" master playlist succeeded, no need to fetch redundant sub-manifests
-                if (qKey == "auto" && emittedAny) break
-            } else {
-                callback(
-                    newExtractorLink(
-                        source = "Dailymotion",
-                        name   = "Dailymotion",
-                        url    = streamUrl,
-                        type   = ExtractorLinkType.VIDEO,
-                    ) {
-                        this.referer = "https://geo.dailymotion.com/"
-                        this.quality = getQualityFromName(qKey)
-                    }
-                )
-                emittedAny = true
-            }
+            )
         }
     }
-}
