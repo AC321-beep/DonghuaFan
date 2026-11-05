@@ -53,11 +53,13 @@ class LMANIME : MainAPI() {
     private val fmtDayMonthYear = Regex("""^\d{1,2}\s+[A-Za-z]+\s+\d{4}$""")
     private val fmtIsoDate      = Regex("""^\d{4}-\d{2}-\d{2}$""")
 
-    private val epNumRegex   = Regex("""(?:\bepisode|\beps?\.?)\s*[-:]?\s*(\d+)""", RegexOption.IGNORE_CASE)
-    private val epBracketNum = Regex("""[\[\(](\d{1,4})[\]\)]""")
-    private val yearRegex    = Regex("""\b((?:19|20)\d{2})\b""")
-    private val epStripRegex = Regex("""\s+Episode\s+\d+.*$""", RegexOption.IGNORE_CASE)
-    private val epBadgeRegex = Regex("""(?i)(eps?\.?\s*\d+|\d+)""")
+    private val epNumRegex      = Regex("""(?:\bepisode|\beps?\.?)\s*[-:]?\s*(\d+)""", RegexOption.IGNORE_CASE)
+    private val leadingNumRegex = Regex("""^(\d{1,4})\b""")
+    private val epBracketNum    = Regex("""[\[\(](\d{1,4})[\]\)]""")
+    private val epUrlNum        = Regex("""-episode-(\d+)""", RegexOption.IGNORE_CASE)
+    private val yearRegex       = Regex("""\b((?:19|20)\d{2})\b""")
+    private val epStripRegex    = Regex("""\s+Episode\s+\d+.*$""", RegexOption.IGNORE_CASE)
+    private val epBadgeRegex    = Regex("""(?i)(eps?\.?\s*\d+|\d+)""")
 
     private val dmVideoIdRegex   = Regex("""[?&]video=([a-zA-Z0-9_-]+)""")
     private val dmEmbedPathRegex = Regex("""/(?:embed/)?video/([a-zA-Z0-9_-]+)""")
@@ -78,20 +80,26 @@ class LMANIME : MainAPI() {
 
     private fun extractPoster(vararg docs: Document): String? =
         docs.asSequence()
-            .mapNotNull { it.selectFirst("meta[property=og:image]")?.attr("content") }
+            .mapNotNull {
+                it.selectFirst(".bigcontent .thumb img, .single-info .thumb img")?.let { img ->
+                    img.attr("data-src").ifEmpty { img.attr("src") }
+                }?.takeIf { s -> s.isNotBlank() && !s.startsWith("data:") }
+                    ?: it.selectFirst("meta[property=og:image]")?.attr("content")
+            }
             .firstOrNull()
             ?.let { fixUrlNull(it) }
 
     private fun extractPlot(vararg docs: Document): String? =
         docs.asSequence().mapNotNull { d ->
             d.selectFirst("div.desc.mindes")?.ownText()?.trim()?.takeIf { it.isNotBlank() }
-                ?: d.selectFirst("div.desc p")?.text()?.trim()
+                ?: d.selectFirst(".bixbox.synp .entry-content")?.text()?.trim()?.takeIf { it.isNotBlank() }
+                ?: d.selectFirst("div.desc p")?.text()?.trim()?.takeIf { it.isNotBlank() }
                 ?: d.selectFirst("meta[property=og:description]")?.attr("content")
         }.firstOrNull()
 
     private fun extractYear(vararg docs: Document): Int? =
         docs.asSequence()
-            .flatMap { it.select(".single-info .spe span").asSequence() }
+            .flatMap { it.select(".single-info .spe span, .bigcontent .infox .spe span").asSequence() }
             .firstOrNull { it.text().contains("Released", true) }?.text()
             ?.let { yearRegex.find(it)?.value?.toIntOrNull() }
 
@@ -107,7 +115,15 @@ class LMANIME : MainAPI() {
             }
         }
         val document = app.get(url).document
-        val items = document.select("article.bs").mapNotNull { it.toSearchResult() }
+
+        // Scope "latest" on page 1 to the Latest Release box so Completed/Recommendation boxes aren't mixed in
+        val container = if (request.data == "latest" && page == 1) {
+            document.selectFirst("div.bixbox:has(.latesthome)") ?: document
+        } else {
+            document
+        }
+
+        val items = container.select("article.bs").mapNotNull { it.toSearchResult() }
         return newHomePageResponse(request.name, items)
     }
 
@@ -122,19 +138,28 @@ class LMANIME : MainAPI() {
                 ?.replace(epStripRegex, "")
                 ?.trim()
         } ?: anchor.attr("title")
+            .ifEmpty { anchor.attr("oldtitle") }
             .replace(epStripRegex, "")
             .trim()
 
         if (seriesName.isEmpty()) return null
 
         val epBadge = selectFirst("span.epx")?.text()?.trim()
-            ?.takeIf { it.isNotEmpty() && it.matches(epBadgeRegex) }
+            ?.takeIf {
+                it.isNotEmpty() &&
+                !it.equals("Ongoing", true) &&
+                !it.equals("Completed", true) &&
+                epBadgeRegex.containsMatchIn(it)
+            }
         val fullTitle = if (epBadge != null && !seriesName.contains(epBadge, true))
             "$seriesName $epBadge" else seriesName
 
-        val href   = fixUrl(anchor.attr("href"))
-        val poster = selectFirst("img")?.let {
-            fixUrlNull(it.attr("data-src").ifEmpty { it.attr("src") })
+        val href = fixUrl(anchor.attr("href"))
+        val poster = selectFirst("img[data-src], img[src]")?.let { img ->
+            val raw = img.attr("data-src").takeIf { it.isNotBlank() && !it.startsWith("data:") }
+                ?: img.attr("src").takeIf { it.isNotBlank() && !it.startsWith("data:") }
+                ?: selectFirst("noscript img")?.attr("src")
+            fixUrlNull(raw)
         }
 
         val typeText = selectFirst("div.typez")?.text()?.trim()
@@ -157,7 +182,7 @@ class LMANIME : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val document = app.get(url).document
 
-        val pageType = document.select(".single-info .spe span")
+        val pageType = document.select(".single-info .spe span, .bigcontent .infox .spe span")
             .firstOrNull { it.text().contains("Type:", true) }
             ?.text()?.substringAfter(":")?.trim()
 
@@ -170,15 +195,23 @@ class LMANIME : MainAPI() {
 
         if (isEpisodePage) {
             val seriesUrl = document
-                .selectFirst("#singlepisode .headlist .det h2 a")
+                .selectFirst(
+                    "#singlepisode .headlist .det h2 a, " +
+                    "#singlepisode .headlist .det h3 a, " +
+                    ".naveps .nvsc a, " +
+                    ".navepsx .nvsc a"
+                )
                 ?.attr("href")
                 ?.let { fixUrl(it) }
                 ?.takeIf { it.isNotBlank() && !it.contains("-episode-", true) }
 
-            if (seriesUrl != null) return loadSeries(seriesUrl, url, document)
+            if (seriesUrl != null) {
+                return loadSeries(seriesUrl, url, document)
+            }
         }
 
-        return loadAsMovie(url, document, TvType.Anime)
+        // Series page (from Popular / Ongoing / Upcoming) or episode page without a separate series link
+        return loadSeries(url, url, document)
     }
 
     private suspend fun loadSeries(
@@ -186,23 +219,46 @@ class LMANIME : MainAPI() {
         episodeUrl: String,
         episodeDoc: Document,
     ): LoadResponse {
-        val seriesDoc = runCatching { app.get(seriesUrl).document }
-            .getOrNull() ?: episodeDoc
+        val seriesDoc = if (seriesUrl != episodeUrl) {
+            runCatching { app.get(seriesUrl).document }.getOrNull() ?: episodeDoc
+        } else {
+            episodeDoc
+        }
 
         var links = episodeDoc.select("#singlepisode .episodelist ul li a")
-        if (links.size < 5) {
-            links = seriesDoc.select("div.bxcl ul li a, #episodelist ul li a, a[href*='-episode-']")
+        if (links.size < 2) {
+            links = seriesDoc.select(
+                "div.bxcl ul li a, " +
+                ".eplister ul li a, " +
+                ".epcheck .eplister ul li a, " +
+                "#episodelist ul li a, " +
+                "#singlepisode .episodelist ul li a"
+            )
+        }
+        // Scoped fallback to .postbody so #sidebar "Latest Post" links from other shows are never included
+        if (links.isEmpty()) {
+            links = seriesDoc.select(".postbody a[href*='-episode-']")
         }
 
         val episodes = links.mapNotNull { a ->
             val href = fixUrl(a.attr("href")).takeIf { it.isNotBlank() } ?: return@mapNotNull null
             if (!href.contains("-episode-", true)) return@mapNotNull null
 
-            val epTitle = a.selectFirst("h3")?.text()?.trim()
-                ?: a.selectFirst(".playinfo h3")?.text()?.trim()
-                ?: a.attr("title").trim()
+            val epTitle = a.selectFirst("h3, h4")?.text()?.trim()
+                ?: a.selectFirst(".playinfo h3, .playinfo h4")?.text()?.trim()
+                ?: a.selectFirst(".epl-title")?.text()?.trim()
+                ?: a.selectFirst(".epl-num")?.text()?.trim()
+                ?: a.attr("title").ifBlank { a.text() }.trim()
 
-            val epNum = epNumRegex.find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
+            val epNum = a.selectFirst(".epl-num")?.text()?.trim()
+                ?.let {
+                    epNumRegex.find(it)?.groupValues?.get(1)?.toIntOrNull()
+                        ?: leadingNumRegex.find(it)?.groupValues?.get(1)?.toIntOrNull()
+                        ?: epBracketNum.find(it)?.groupValues?.get(1)?.toIntOrNull()
+                        ?: it.toIntOrNull()
+                }
+                ?: epNumRegex.find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
+                ?: epUrlNum.find(href)?.groupValues?.get(1)?.toIntOrNull()
                 ?: epBracketNum.find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
 
             val cssDate = a.selectFirst(
@@ -237,11 +293,12 @@ class LMANIME : MainAPI() {
                 }
             }
         }.distinctBy { it.data }
+            .sortedBy { it.episode ?: Int.MAX_VALUE }
 
         if (episodes.isEmpty()) return loadAsMovie(episodeUrl, episodeDoc, TvType.Anime)
 
-        val title  = extractTitle(seriesDoc, episodeDoc)
-        val poster = extractPoster(episodeDoc, seriesDoc)
+        val title  = extractTitle(seriesDoc, episodeDoc).replace(epStripRegex, "").trim()
+        val poster = extractPoster(seriesDoc, episodeDoc)
         val plot   = extractPlot(seriesDoc, episodeDoc)
         val year   = extractYear(seriesDoc, episodeDoc)
 
@@ -420,7 +477,6 @@ class LMANIME : MainAPI() {
             }
         }
 
-        // Detect default active mirror language on the main document
         val defaultMirrorOpt = document.selectFirst(
             "select.mirror option[selected], select.mirror option[value^=http]"
         )
@@ -627,8 +683,8 @@ class LMANIME : MainAPI() {
             ?: return
 
         // Fetch master once to check whether audio is a separate rendition.
-        // Old DM: muxed variants → M3u8Helper split preserves A/V.
-        // New DM: EXT-X-MEDIA:TYPE=AUDIO → variants are video-only;
+        // Old DM: muxed variants -> M3u8Helper split preserves A/V.
+        // New DM: EXT-X-MEDIA:TYPE=AUDIO -> variants are video-only;
         //         splitting would strip audio. Must emit raw master only.
         val masterText = runCatching { app.get(masterUrl).text }.getOrNull()
         val hasSeparateAudio = masterText?.contains(
@@ -636,7 +692,6 @@ class LMANIME : MainAPI() {
         ) == true
 
         if (hasSeparateAudio) {
-            // New DM — raw master only; ExoPlayer negotiates A+V+ABR
             callback(
                 newExtractorLink(
                     source = "Dailymotion",
@@ -651,7 +706,6 @@ class LMANIME : MainAPI() {
             return
         }
 
-        // Old DM — M3u8Helper split is safe (variants carry audio)
         val generated = runCatching {
             M3u8Helper.generateM3u8(
                 "Dailymotion",
