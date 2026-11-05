@@ -1,6 +1,5 @@
 package com.lmanime
 
-import android.util.Log
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
@@ -28,7 +27,6 @@ class RumbleExtractor : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
-        private const val TAG = "LMANIME/Rumble"
         private const val FETCH_TIMEOUT_MS = 12_000L
         private const val SPLIT_TIMEOUT_MS = 2_500L
 
@@ -55,9 +53,7 @@ class RumbleExtractor : ExtractorApi() {
 
         val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
             try { app.get(url, referer = referer ?: mainUrl).text }
-            catch (e: Exception) {
-                Log.e(TAG, "fetch $url failed: ${e.message}"); null
-            }
+            catch (_: Exception) { null }
         } ?: return
 
         val afterMp4   = html.substringAfter("{\"mp4", "")
@@ -134,7 +130,6 @@ class OkRuExtractor : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
-        private const val TAG = "LMANIME/OkRu"
         private const val FETCH_TIMEOUT_MS = 8_000L
         private const val RETRY_DELAY_MS = 500L
 
@@ -205,21 +200,8 @@ class OkRuExtractor : ExtractorApi() {
                 } ?: emptyList()
                 hlsLinks.forEach(callback)
             }
-
-            // DASH — always emit alongside HLS, not as fallback
-            val dashUrl = json.dashManifestUrl.orEmpty()
-            if (dashUrl.isNotBlank() && !dashUrl.contains("usr_login")) {
-                callback(
-                    newExtractorLink(
-                        name   = "$name DASH",
-                        source = "$name DASH",
-                        url    = dashUrl.replace("\\u0026", "&").replace("\\/", "/"),
-                        type   = ExtractorLinkType.DASH,
-                    ) { this.referer = "https://ok.ru/" }
-                )
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "getUrl($url) failed: ${e.message}")
+        } catch (_: Exception) {
+            // swallow
         }
     }
 
@@ -231,8 +213,7 @@ class OkRuExtractor : ExtractorApi() {
                     app.post(apiUrl).parsedSafe<OkRuResponse>()
                 }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "post $apiUrl attempt 1 failed: ${e.message}")
+        } catch (_: Exception) {
             null
         }
         if (first != null) return first
@@ -245,8 +226,7 @@ class OkRuExtractor : ExtractorApi() {
                     app.post(apiUrl).parsedSafe<OkRuResponse>()
                 }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "post $apiUrl attempt 2 failed: ${e.message}")
+        } catch (_: Exception) {
             null
         }
     }
@@ -255,7 +235,6 @@ class OkRuExtractor : ExtractorApi() {
     private data class OkRuResponse(
         val videos: List<OkRuVideo>? = null,
         val hlsManifestUrl: String? = null,
-        val dashManifestUrl: String? = null,
     )
 
     @JsonIgnoreProperties(ignoreUnknown = true)
