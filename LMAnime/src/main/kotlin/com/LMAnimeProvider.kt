@@ -16,6 +16,7 @@ import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 class LMANIME : MainAPI() {
@@ -65,10 +66,10 @@ class LMANIME : MainAPI() {
     private val dmEmbedPathRegex = Regex("""/(?:embed/)?video/([a-zA-Z0-9_-]+)""")
 
     override val mainPage = mainPageOf(
-        "latest"                             to "Latest Release",
-        "anime/?status=&type=&order=popular" to "Popular",
-        "ongoing/"                           to "Ongoing",
-        "upcoming/"                          to "Upcoming",
+        "latest"                                     to "Latest Release",
+        "anime/?status=&type=&order=popular"         to "Popular",
+        "ongoing/"                                   to "Ongoing",
+        "anime/?status=completed&type=&order=update" to "Completed Series",
     )
 
     private fun extractTitle(vararg docs: Document): String =
@@ -114,17 +115,48 @@ class LMANIME : MainAPI() {
                 if (page > 1) "$mainUrl/$base/page/$page/" else "$mainUrl/$base/"
             }
         }
-        val document = app.get(url).document
 
-        // Scope "latest" on page 1 to the Latest Release box so Completed/Recommendation boxes aren't mixed in
-        val container = if (request.data == "latest" && page == 1) {
-            document.selectFirst("div.bixbox:has(.latesthome)") ?: document
-        } else {
-            document
+        // Cache for 10 minutes to make tab-switching instant
+        val document = app.get(
+            url,
+            cacheTime = 10,
+            cacheUnit = TimeUnit.MINUTES,
+        ).document
+
+        // Extract Latest, Completed, and Recommendation tabs from the single root homepage fetch
+        if (request.data == "latest" && page == 1) {
+            val homeLists = mutableListOf<HomePageList>()
+
+            // 1. Latest Releases
+            document.selectFirst("div.bixbox:has(.latesthome)")?.let { container ->
+                val items = container.select("article.bs").mapNotNull { it.toSearchResult() }
+                if (items.isNotEmpty()) homeLists.add(HomePageList(request.name, items))
+            }
+
+            // 2. Completed Series
+            document.selectFirst("div.bixbox:has(h3:contains(Completed))")?.let { container ->
+                val items = container.select("article.bs").mapNotNull { it.toSearchResult() }
+                if (items.isNotEmpty()) homeLists.add(HomePageList("Completed Series", items))
+            }
+
+            // 3. Recommended Genres (Crime, Magic, Mythology, Reincarnation, Space)
+            document.select("div.tab-pane").forEach { tab ->
+                val tabId = tab.id()
+                val genreName = document.selectFirst(".nav-tabs a[href='#$tabId']")?.text() ?: "Recommended"
+                val items = tab.select("article.bs").mapNotNull { it.toSearchResult() }
+                if (items.isNotEmpty()) {
+                    homeLists.add(HomePageList(genreName, items))
+                }
+            }
+
+            if (homeLists.isNotEmpty()) {
+                return newHomePageResponse(homeLists, hasNext = true)
+            }
         }
 
-        val items = container.select("article.bs").mapNotNull { it.toSearchResult() }
-        return newHomePageResponse(request.name, items)
+        // For page 2+ or dedicated tabs (Popular, Ongoing, Completed), parse as normal
+        val items = document.select("article.bs").mapNotNull { it.toSearchResult() }
+        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
@@ -175,12 +207,12 @@ class LMANIME : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query, "UTF-8")
-        val doc = app.get("$mainUrl/?s=$encoded").document
+        val doc = app.get("$mainUrl/?s=$encoded", cacheTime = 5, cacheUnit = TimeUnit.MINUTES).document
         return doc.select("article.bs").mapNotNull { it.toSearchResult() }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val document = app.get(url).document
+        val document = app.get(url, cacheTime = 5, cacheUnit = TimeUnit.MINUTES).document
 
         val pageType = document.select(".single-info .spe span, .bigcontent .infox .spe span")
             .firstOrNull { it.text().contains("Type:", true) }
@@ -210,7 +242,7 @@ class LMANIME : MainAPI() {
             }
         }
 
-        // Series page (from Popular / Ongoing / Upcoming) or episode page without a separate series link
+        // Series page (from Popular / Ongoing / Completed) or episode page without a separate series link
         return loadSeries(url, url, document)
     }
 
@@ -220,7 +252,7 @@ class LMANIME : MainAPI() {
         episodeDoc: Document,
     ): LoadResponse {
         val seriesDoc = if (seriesUrl != episodeUrl) {
-            runCatching { app.get(seriesUrl).document }.getOrNull() ?: episodeDoc
+            runCatching { app.get(seriesUrl, cacheTime = 5, cacheUnit = TimeUnit.MINUTES).document }.getOrNull() ?: episodeDoc
         } else {
             episodeDoc
         }
@@ -334,7 +366,7 @@ class LMANIME : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val document = app.get(data).document
+        val document = app.get(data, cacheTime = 2, cacheUnit = TimeUnit.MINUTES).document
 
         val found        = AtomicBoolean(false)
         val callbackLock = Any()
@@ -496,7 +528,7 @@ class LMANIME : MainAPI() {
                         val optLang = detectLang(
                             option.text(), option.attr("data-lang"), option.attr("title")
                         )
-                        runCatching { app.get(serverUrl, referer = data).document }
+                        runCatching { app.get(serverUrl, referer = data, cacheTime = 2, cacheUnit = TimeUnit.MINUTES).document }
                             .getOrNull()?.let { it to optLang }
                     }
                 }
@@ -686,7 +718,7 @@ class LMANIME : MainAPI() {
         // Old DM: muxed variants -> M3u8Helper split preserves A/V.
         // New DM: EXT-X-MEDIA:TYPE=AUDIO -> variants are video-only;
         //         splitting would strip audio. Must emit raw master only.
-        val masterText = runCatching { app.get(masterUrl).text }.getOrNull()
+        val masterText = runCatching { app.get(masterUrl, cacheTime = 30, cacheUnit = TimeUnit.MINUTES).text }.getOrNull()
         val hasSeparateAudio = masterText?.contains(
             "EXT-X-MEDIA:TYPE=AUDIO", ignoreCase = true
         ) == true
