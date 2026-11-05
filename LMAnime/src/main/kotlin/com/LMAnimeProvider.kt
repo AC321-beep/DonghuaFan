@@ -50,6 +50,8 @@ class LMANIME : MainAPI() {
 
     /* ─── Dailymotion helpers ─── */
     private val dmVideoIdRegex    = Regex("""[?&]video=([a-zA-Z0-9_-]+)""")
+    /* Matches both /video/<id> and /embed/video/<id> — used for canonical rewrite + dedup */
+    private val dmEmbedPathRegex  = Regex("""/(?:embed/)?video/([a-zA-Z0-9_-]+)""")
     private val dmManifestIdRegex = Regex("""manifest/video/([a-zA-Z0-9]+)\.m3u8""")
     private val dmConfigIdRegex   = Regex(""""criticalMetadata"\s*:\s*\{[^}]*?"id"\s*:\s*"([a-zA-Z0-9]+)"""")
 
@@ -315,16 +317,16 @@ class LMANIME : MainAPI() {
 
         val subtitleSink: (SubtitleFile) -> Unit = { sub -> emitSub(sub) }
 
-        /* ── Language detection ─── */
+        /* ── Language detection (Portugués with é now matched) ─── */
         val langMatchers: List<Pair<String, Regex>> = listOf(
-            "multi" to Regex("""\b(multi(sub)?|multilingual)\b"""),
-            "ind"   to Regex("""\b(indonesian|indo|bahasa|ind)\b"""),
-            "por"   to Regex("""\b(portugu[eê]s|portuguese|por)\b"""),
-            "spa"   to Regex("""\b(espa[nñ]ol|spanish|spa)\b"""),
-            "tha"   to Regex("""\b(ไทย|thai|tha)\b"""),
-            "tur"   to Regex("""\b(t[uü]rk[cç]e|turkish|tur)\b"""),
-            "ara"   to Regex("""(العَرَبِيَّة|عربي|arabic|ara)"""),
-            "eng"   to Regex("""\b(english|eng)\b"""),
+            "multi" to Regex("""\b(multi(sub)?|multilingual)\b""", RegexOption.IGNORE_CASE),
+            "ind"   to Regex("""\b(indonesian|indo|bahasa|ind)\b""", RegexOption.IGNORE_CASE),
+            "por"   to Regex("""\b(portugu[eêéë]s|portuguese|por)\b""", RegexOption.IGNORE_CASE),
+            "spa"   to Regex("""\b(espa[nñ]ol|spanish|spa)\b""", RegexOption.IGNORE_CASE),
+            "tha"   to Regex("""\b(ไทย|thai|tha)\b""", RegexOption.IGNORE_CASE),
+            "tur"   to Regex("""\b(t[uü]rk[cç]e|turkish|tur)\b""", RegexOption.IGNORE_CASE),
+            "ara"   to Regex("""(العَرَبِيَّة|عربي|arabic|ara)""", RegexOption.IGNORE_CASE),
+            "eng"   to Regex("""\b(english|eng)\b""", RegexOption.IGNORE_CASE),
         )
 
         fun detectLang(vararg sources: String?): String? {
@@ -373,7 +375,10 @@ class LMANIME : MainAPI() {
                 Log.e(TAG, "  ✗ skipped (ad pattern): $url")
                 return
             }
+            /* Dedup on video ID when present — catches same video served via
+             * different Dailymotion URL forms (embed/video vs /video vs geo player). */
             val key = dmVideoIdRegex.find(url)?.groupValues?.get(1)
+                ?: dmEmbedPathRegex.find(url)?.groupValues?.get(1)
                 ?: url.substringBefore("?").substringBefore("#")
             if (seenKeys.add(key)) {
                 Log.e(TAG, "  + iframe  lang=$lang  url=$url")
@@ -436,22 +441,25 @@ class LMANIME : MainAPI() {
         collectFrom(document)
         Log.e(TAG, "after main doc → iframes=${iframeEntries.size}  videoUrls=${videoUrls.size}")
 
-        /* ── Mirror pages — parallel (pure network) ─── */
+        /* ── Mirror pages — bounded parallel (Semaphore 4) ─── */
         coroutineScope {
+            val mirrorGate = Semaphore(4)
             document.select("select.mirror option").map { option ->
                 async {
-                    val serverUrl = option.attr("value").trim()
-                    if (!serverUrl.startsWith("http")) return@async null
-                    Log.e(TAG, "mirror fetch: $serverUrl")
-                    val optLang = detectLang(
-                        option.text(), option.attr("data-lang"), option.attr("title")
-                    )
-                    runCatching { app.get(serverUrl, referer = data).document }
-                        .onSuccess {
-                            Log.e(TAG, "  mirror OK: $serverUrl  (iframes=${it.select("iframe").size})")
-                        }
-                        .onFailure { Log.e(TAG, "  mirror FAIL: $serverUrl  ${it.message}") }
-                        .getOrNull()?.let { it to optLang }
+                    mirrorGate.withPermit {
+                        val serverUrl = option.attr("value").trim()
+                        if (!serverUrl.startsWith("http")) return@withPermit null
+                        Log.e(TAG, "mirror fetch: $serverUrl")
+                        val optLang = detectLang(
+                            option.text(), option.attr("data-lang"), option.attr("title")
+                        )
+                        runCatching { app.get(serverUrl, referer = data).document }
+                            .onSuccess {
+                                Log.e(TAG, "  mirror OK: $serverUrl  (iframes=${it.select("iframe").size})")
+                            }
+                            .onFailure { Log.e(TAG, "  mirror FAIL: $serverUrl  ${it.message}") }
+                            .getOrNull()?.let { it to optLang }
+                    }
                 }
             }.awaitAll().filterNotNull()
                 .forEach { (doc, lang) -> collectFrom(doc, lang) }
@@ -501,10 +509,7 @@ class LMANIME : MainAPI() {
                 url.contains("ok.ru") || url.contains("odnoklassniki.ru") ->
                     OkRuExtractor().getUrl(url, data, subtitleSink, wrapped)
 
-                /* mp4upload.com → falls through to loadExtractor below.
-                 * Cloudstream ships a built-in Mp4Upload extractor
-                 * (requiresReferer = true) that handles the embed page,
-                 * UA/Referer headers, and URL selection correctly. */
+                /* mp4upload.com, dailymotion.com, and anything else → built-in via loadExtractor */
 
                 else -> {
                     Log.e(TAG, "  routing to loadExtractor (built-in): $url")
@@ -535,9 +540,9 @@ class LMANIME : MainAPI() {
         }
 
         /* ── Partition: custom (parallel-safe) vs built-in (sequential) ───
-         * mp4upload.com is INTENTIONALLY excluded from `custom` so it routes
-         * through the sequential loadExtractor phase — the built-in extractor
-         * shares state with other built-ins and must not be called in parallel.
+         * Dailymotion + Mp4Upload are INTENTIONALLY excluded from `custom`
+         * because the built-in extractors share registry state and must not
+         * be invoked in parallel.
          */
         fun isCustom(url: String): Boolean =
             url.contains("morencius.com") ||
@@ -573,8 +578,7 @@ class LMANIME : MainAPI() {
                 Log.e(TAG, "▶ PHASE 1 done. found=${found.get()}")
             }
 
-            /* Phase 2 — built-in via loadExtractor, sequential
-             * (includes mp4upload.com now) */
+            /* Phase 2 — built-in via loadExtractor, sequential */
             launch {
                 Log.e(TAG, "▶ PHASE 2 (built-in sequential) start")
                 for ((url, lang) in builtinSources) {
@@ -634,22 +638,30 @@ class LMANIME : MainAPI() {
     /* ------------------------------------------------------------------ */
     /* Dailymotion URL normalisation (suspend — may fetch player shell)   */
     /*                                                                    */
-    /* 1. ?video=<id>            → /video/<id>                            */
-    /* 2. geo…/player/…html       → fetch, extract id, rewrite            */
-    /* 3. Anything else           → unchanged                             */
+    /* 1.   ?video=<id>                → /video/<id>                      */
+    /* 1.5  /embed/video/<id>  or  /video/<id>  → /video/<id>             */
+    /*      (strips query params like ?queue-enable=false)                */
+    /* 2.   geo…/player/…html          → fetch, extract id, /video/<id>   */
+    /* 3.   Anything else              → unchanged                        */
     /* ------------------------------------------------------------------ */
     private suspend fun normalizeDailymotion(url: String): String {
         if (!url.contains("dailymotion", true)) return url
 
         Log.e(TAG, "  dm  input=$url")
 
-        // Case 1 — id in query
+        // Case 1 — id in query string
         dmVideoIdRegex.find(url)?.groupValues?.get(1)?.let { id ->
             Log.e(TAG, "  dm  id from query=$id")
             return "https://www.dailymotion.com/video/$id"
         }
 
-        // Case 2 — player shell
+        // Case 1.5 — /embed/video/<id> or /video/<id> (strips query params)
+        dmEmbedPathRegex.find(url)?.groupValues?.get(1)?.let { id ->
+            Log.e(TAG, "  dm  id from path=$id  (stripping query/embed)")
+            return "https://www.dailymotion.com/video/$id"
+        }
+
+        // Case 2 — player shell (fetch HTML to extract id from __PLAYER_CONFIG__)
         if (url.contains("geo.dailymotion.com", true) && url.contains("/player/")) {
             Log.e(TAG, "  dm  player shell — fetching HTML")
             val html = runCatching { app.get(url).text }
