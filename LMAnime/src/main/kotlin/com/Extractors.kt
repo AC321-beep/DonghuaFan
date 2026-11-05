@@ -1,5 +1,6 @@
 package com.lmanime
 
+import android.util.Log
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
@@ -24,6 +25,7 @@ class RumbleExtractor : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
+        private const val TAG = "LMANIME/Rumble"
         private const val FETCH_TIMEOUT_MS = 12_000L
         private const val SPLIT_TIMEOUT_MS = 2_500L
 
@@ -51,7 +53,7 @@ class RumbleExtractor : ExtractorApi() {
         val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
             try { app.get(url, referer = referer ?: mainUrl).text }
             catch (e: Exception) {
-                println("Rumble: fetch $url failed: ${e.message}"); null
+                Log.e(TAG, "fetch $url failed: ${e.message}"); null
             }
         } ?: return
 
@@ -121,7 +123,7 @@ class RumbleExtractor : ExtractorApi() {
 }
 
 /* ==========================================================================
- * OkRu — INFER_TYPE preserved (valid per Cloudstream docs)
+ * OkRu — INFER_TYPE preserved
  * ========================================================================== */
 class OkRuExtractor : ExtractorApi() {
     override val name = "OkRu"
@@ -129,6 +131,7 @@ class OkRuExtractor : ExtractorApi() {
     override val requiresReferer = false
 
     companion object {
+        private const val TAG = "LMANIME/OkRu"
         private const val FETCH_TIMEOUT_MS = 12_000L
 
         private val RE_VIDEO_ID  = Regex("""/video(?:embed)?/(\d+)""")
@@ -163,7 +166,7 @@ class OkRuExtractor : ExtractorApi() {
             val json = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
                 try { app.post(apiUrl).parsedSafe<OkRuResponse>() }
                 catch (e: Exception) {
-                    println("OkRu: post $apiUrl failed: ${e.message}"); null
+                    Log.e(TAG, "post $apiUrl failed: ${e.message}"); null
                 }
             } ?: return
 
@@ -219,7 +222,7 @@ class OkRuExtractor : ExtractorApi() {
                 }
             }
         } catch (e: Exception) {
-            println("OkRu: getUrl($url) failed: ${e.message}")
+            Log.e(TAG, "getUrl($url) failed: ${e.message}")
         }
     }
 
@@ -236,5 +239,3 @@ class OkRuExtractor : ExtractorApi() {
         val url: String? = null,
     )
 }
-
-
