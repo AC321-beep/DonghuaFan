@@ -494,14 +494,22 @@ class LMANIME : MainAPI() {
             when {
                 url.contains("morencius.com") ->
                     VidHideExtractor().getUrl(url, data, subtitleSink, wrapped)
+
                 url.contains("rumble.com") ->
                     RumbleExtractor().getUrl(url, data, subtitleSink, wrapped)
+
                 url.contains("ok.ru") || url.contains("odnoklassniki.ru") ->
                     OkRuExtractor().getUrl(url, data, subtitleSink, wrapped)
-                url.contains("mp4upload.com") ->
-                    Mp4UploadExtractor().getUrl(url, data, subtitleSink, wrapped)
-                else ->
+
+                /* mp4upload.com → falls through to loadExtractor below.
+                 * Cloudstream ships a built-in Mp4Upload extractor
+                 * (requiresReferer = true) that handles the embed page,
+                 * UA/Referer headers, and URL selection correctly. */
+
+                else -> {
+                    Log.e(TAG, "  routing to loadExtractor (built-in): $url")
                     loadExtractor(url, data, subtitleSink, wrapped)
+                }
             }
         }
 
@@ -526,15 +534,20 @@ class LMANIME : MainAPI() {
             }.awaitAll()
         }
 
-        /* ── Partition: custom (parallel-safe) vs built-in (sequential) ─── */
+        /* ── Partition: custom (parallel-safe) vs built-in (sequential) ───
+         * mp4upload.com is INTENTIONALLY excluded from `custom` so it routes
+         * through the sequential loadExtractor phase — the built-in extractor
+         * shares state with other built-ins and must not be called in parallel.
+         */
         fun isCustom(url: String): Boolean =
             url.contains("morencius.com") ||
             url.contains("rumble.com") ||
-            url.contains("ok.ru") || url.contains("odnoklassniki.ru") ||
-            url.contains("mp4upload.com")
+            url.contains("ok.ru") || url.contains("odnoklassniki.ru")
 
         val (customSources, builtinSources) = prepared.partition { (url, _) -> isCustom(url) }
         Log.e(TAG, "partition → custom=${customSources.size}  builtin=${builtinSources.size}")
+        Log.e(TAG, "  custom:  ${customSources.map { it.first }}")
+        Log.e(TAG, "  builtin: ${builtinSources.map { it.first }}")
 
         /* ── PHASES 1 + 2 — run concurrently ─── */
         coroutineScope {
@@ -560,7 +573,8 @@ class LMANIME : MainAPI() {
                 Log.e(TAG, "▶ PHASE 1 done. found=${found.get()}")
             }
 
-            /* Phase 2 — built-in via loadExtractor, sequential */
+            /* Phase 2 — built-in via loadExtractor, sequential
+             * (includes mp4upload.com now) */
             launch {
                 Log.e(TAG, "▶ PHASE 2 (built-in sequential) start")
                 for ((url, lang) in builtinSources) {
