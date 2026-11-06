@@ -8,6 +8,8 @@ import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.extractors.Filesim
+import com.lagradost.cloudstream3.extractors.StreamWishExtractor
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorApi
@@ -1110,4 +1112,20 @@ class AbyssPlayer : ExtractorApi() {
             }
         }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  THIN SUBCLASSES — Animexin strategy (domain swap only, logic inherited)
+// ════════════════════════════════════════════════════════════════════════════
+
+/** SW-ADS + SW download mirrors on naruldonghua → StreamWish family host. */
+class Hlswish : StreamWishExtractor() {
+    override val name = "HlsWish"
+    override val mainUrl = "https://hlswish.com"
+}
+
+/** FM download mirror on naruldonghua → FileMoon family host. */
+class FileMoonTo : Filesim() {
+    override val name = "FileMoon"
+    override val mainUrl = "https://filemoon.to"
 }
