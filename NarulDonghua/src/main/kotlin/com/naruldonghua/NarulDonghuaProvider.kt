@@ -390,13 +390,11 @@ class NarulDonghuaProvider : MainAPI() {
             }
 
             // ── FIXED: scan ALL iframes on the nested page, not just the first ──
-            // Previously, `selectFirst(...)` would return an ad's iframe; the real
-            // DM iframe (often the 2nd one) was never seen → "some mirrors work,
-            // some don't".
+            // Previously selectFirst(...) could return an ad iframe; the real DM
+            // iframe (often the 2nd one) was never reached.
             if (!url.startsWith(mainUrl, true)) {
                 val nestedUrls = mutableSetOf<String>()
                 fetch(url, timeoutMs = 10_000L)?.let { page ->
-                    // meta refresh (usually the sole redirect on mirror landing pages)
                     page.selectFirst("meta[http-equiv=refresh]")?.attr("content")
                         ?.let { content ->
                             val u = content.substringAfter("url=", "")
@@ -405,7 +403,6 @@ class NarulDonghuaProvider : MainAPI() {
                             if (u.isNotBlank() && !isJunkOrAdUrl(u)) nestedUrls.add(u)
                         }
 
-                    // every iframe (ads are filtered by isJunkOrAdUrl)
                     page.select("iframe").forEach { iframe ->
                         val src = sequenceOf(
                             iframe.attr("data-litespeed-src"),
@@ -420,9 +417,7 @@ class NarulDonghuaProvider : MainAPI() {
                         if (!src.isNullOrBlank()) nestedUrls.add(src)
                     }
                 }
-                nestedUrls.forEach { nested ->
-                    resolve(nested, label, depth + 1)
-                }
+                nestedUrls.forEach { nested -> resolve(nested, label, depth + 1) }
             }
         }
 
@@ -461,7 +456,7 @@ class NarulDonghuaProvider : MainAPI() {
 
         // ── FIXED: widen raw-URL filter to include canonical DM URL shapes ──
         // `/video/`, `/player/`, `/swf/`, `dai.ly/` were previously missed when
-        // they appeared as inline JS strings rather than <iframe src>.
+        // they appeared as inline JS strings rather than as <iframe src>.
         val htmlUnescaped = doc.html().replace("\\/", "/").replace("\\\"", "\"").replace("&amp;", "&")
         RE_RAW_URL.findAll(htmlUnescaped)
             .map { it.value.trimEnd('"', '\'', ')', ';', ',') }
@@ -470,4 +465,254 @@ class NarulDonghuaProvider : MainAPI() {
                     isByseUrl(u) || u.contains("p2pstream.vip", true) ||
                     u.contains("abysplayserver.com", true) || u.contains("abyssplayer.com", true) ||
                     u.contains("abyysplayer.com", true) || u.contains("playhydrax.com", true) ||
-                    u.contains("short.icu/", true) || u.contains("short.ink/
+                    u.contains("short.icu/", true) || u.contains("short.ink/", true) ||
+                    u.contains("rumble.com/embed/", true) ||
+                    u.contains("dailymotion.com/embed/", true) ||
+                    u.contains("dailymotion.com/video/", true) ||
+                    u.contains("dailymotion.com/player/", true) ||
+                    u.contains("dailymotion.com/swf/", true) ||
+                    u.contains("dai.ly/", true) ||
+                    u.contains("ok.ru/videoembed/", true) ||
+                    u.contains("youtube.com/embed/", true) || u.contains("youtu.be/", true) ||
+                    (u.contains("geo.dailymotion.com/player", true) && u.contains("video=", true))
+                )
+            }.distinct().forEach { u -> tasks.add(u to "Raw") }
+
+        Log.e(TAG, "Total tasks to resolve: ${tasks.size}")
+
+        // ── FIXED: bounded concurrency (Semaphore(4)) ─────────────────────────
+        // Unbounded fan-out triggered DM 429 rate limits when an episode page
+        // exposed 6–10 mirrors at once.
+        coroutineScope {
+            val gate = Semaphore(4)
+            tasks.map { (url, label) ->
+                async {
+                    gate.withPermit {
+                        try {
+                            withTimeoutOrNull(25_000L) { resolve(url, label) }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            null
+                        }
+                    }
+                }
+            }.awaitAll()
+        }
+
+        Log.e(TAG, "=== loadLinks END total links=${emittedLinks.size}")
+        return emittedLinks.isNotEmpty()
+    }
+
+    private fun isByseUrl(url: String): Boolean = BYSE_DOMAINS.any { url.contains(it, true) }
+
+    private fun buildVisitKey(url: String): String {
+        val clean = url.replace("&amp;", "&").trimEnd('/')
+
+        // Canonicalize any Dailymotion variant to a single key by video ID
+        if (clean.contains("dailymotion", true) || clean.contains("dai.ly", true)) {
+            val vid = dmVideoIdRegex.find(clean)?.groupValues?.getOrNull(1)
+                ?: dmEmbedPathRegex.find(clean)?.groupValues?.getOrNull(1)
+                ?: daiLyPathRegex.find(clean)?.groupValues?.getOrNull(1)
+            if (vid != null) return "dm:$vid"
+        }
+
+        // Preserve #id vs #id&dl=1 for Plex
+        if (clean.contains("p2pstream.vip", true)) return clean
+
+        val base = clean.substringBefore('#')
+        val hash = clean.substringAfter('#', "")
+        return if (hash.isNotBlank() && !hash.startsWith("?")) "$base#$hash" else base
+    }
+
+    private suspend fun resolveRedirectUrl(shortUrl: String): String? {
+        return try {
+            val resp = withTimeoutOrNull(8_000L) { app.get(shortUrl, headers = defaultHeaders, allowRedirects = false) }
+            val loc = resp?.headers?.get("location") ?: resp?.headers?.get("Location")
+            if (!loc.isNullOrBlank()) return normalizeUrl(loc)
+
+            val fullResp = withTimeoutOrNull(8_000L) { app.get(shortUrl, headers = defaultHeaders, allowRedirects = true) } ?: return null
+            if (fullResp.url != shortUrl && !fullResp.url.contains("short.icu", true) && !fullResp.url.contains("short.ink", true))
+                return fullResp.url
+
+            val html = fullResp.text
+            RE_JS_REDIRECT.find(html)?.groupValues?.getOrNull(1) ?: Jsoup.parse(html).selectFirst("iframe[src]")?.attr("src")
+        } catch (_: Exception) { null }
+    }
+
+    private fun isDailymotionUrl(url: String) =
+        url.contains("dailymotion.com", true) || url.contains("dai.ly", true)
+
+    private fun normalizeDailymotionUrl(url: String): String {
+        val videoId = dmVideoIdRegex.find(url)?.groupValues?.getOrNull(1)
+            ?: dmEmbedPathRegex.find(url)?.groupValues?.getOrNull(1)
+            ?: daiLyPathRegex.find(url)?.groupValues?.getOrNull(1)
+        return if (videoId != null) "https://www.dailymotion.com/video/$videoId" else url
+    }
+
+    /**
+     * Direct Dailymotion extractor — mirrors LMANIME's proven implementation.
+     *
+     * 1. Parses video ID from any DM URL shape (embed / video / geo-wrapper / dai.ly).
+     * 2. Hits the official metadata API (`/player/metadata/video/{id}`) with the
+     *    DM player Referer + Origin + family-filter cookies.
+     * 3. Reads subtitles directly from `subtitles.data[].urls[]`.
+     * 4. Reads master m3u8 from `qualities.auto[0].url`.
+     * 5. Audio-aware: if master contains `EXT-X-MEDIA:TYPE=AUDIO` (or the master
+     *    fetch failed), emit raw master — splitting would strip audio.
+     * Falls back to CloudStream's built-in extractor on API failure.
+     */
+    private suspend fun extractDailymotion(
+        url: String,
+        episodeReferer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ) {
+        val videoId = dmVideoIdRegex.find(url)?.groupValues?.getOrNull(1)
+            ?: dmEmbedPathRegex.find(url)?.groupValues?.getOrNull(1)
+            ?: daiLyPathRegex.find(url)?.groupValues?.getOrNull(1)
+
+        // FIXED: internal fallback uses original URL + episodeReferer (LMANIME-proven),
+        // not normalizeDailymotionUrl + hard-coded dailymotion.com referer.
+        if (videoId.isNullOrBlank()) {
+            runCatching { loadExtractor(url, episodeReferer, subtitleCallback, callback) }
+            return
+        }
+
+        // FIXED: always use the site-wide Dailymotion player ID (xofxc).
+        // Dynamic extraction from geo URLs was rejected by DM for some videos.
+        val playerReferer   = "https://geo.dailymotion.com/player/$DEFAULT_DM_PLAYER_ID.html?video=$videoId"
+        val encodedEmbedder = URLEncoder.encode(episodeReferer, "UTF-8")
+        val metadataUrl = "https://www.dailymotion.com/player/metadata/video/$videoId" +
+            "?embedder=$encodedEmbedder&app=com.dailymotion.neon&locale=en_US&is_native_app=0"
+
+        val headers = mapOf(
+            "Referer" to playerReferer,
+            "Origin"  to "https://geo.dailymotion.com",
+        )
+        val cookies = mapOf(
+            "ff"            to "off",
+            "family_filter" to "off",
+        )
+
+        val responseText = runCatching {
+            withTimeoutOrNull(15_000L) {
+                app.get(metadataUrl, headers = headers, cookies = cookies).text
+            }
+        }.getOrNull() ?: run {
+            runCatching { loadExtractor(url, episodeReferer, subtitleCallback, callback) }
+            return
+        }
+
+        val json = runCatching { JSONObject(responseText) }.getOrNull() ?: return
+
+        if (json.optJSONObject("error") != null) {
+            runCatching { loadExtractor(url, episodeReferer, subtitleCallback, callback) }
+            return
+        }
+
+        // ── Subtitles ─────────────────────────────────────────────────────────
+        json.optJSONObject("subtitles")?.optJSONObject("data")?.let { subsData ->
+            val subKeys = subsData.keys()
+            while (subKeys.hasNext()) {
+                val key    = subKeys.next()
+                val subObj = subsData.optJSONObject(key) ?: continue
+                val label  = subObj.optString("label").ifBlank { key }
+                val urls   = subObj.optJSONArray("urls") ?: continue
+                for (i in 0 until urls.length()) {
+                    val subUrl = urls.optString(i)
+                    if (subUrl.isNotBlank()) {
+                        subtitleCallback(newSubtitleFile(label, subUrl))
+                    }
+                }
+            }
+        }
+
+        // ── Master manifest ───────────────────────────────────────────────────
+        val qualities = json.optJSONObject("qualities") ?: return
+        val masterUrl = qualities.optJSONArray("auto")
+            ?.optJSONObject(0)?.optString("url")
+            ?.takeIf { it.isNotBlank() && it.contains(".m3u8", true) }
+            ?: return
+
+        // ── Audio-awareness check ─────────────────────────────────────────────
+        // FIXED: treat a failed master fetch as "unknown → don't split", so we
+        // never strip audio for a separate-rendition master we couldn't inspect.
+        val masterText = runCatching {
+            app.get(masterUrl, cacheTime = 30, cacheUnit = TimeUnit.MINUTES).text
+        }.getOrNull()
+        val hasSeparateAudio = masterText.isNullOrEmpty() ||
+            masterText.contains("EXT-X-MEDIA:TYPE=AUDIO", ignoreCase = true)
+
+        if (hasSeparateAudio) {
+            callback(newExtractorLink("Dailymotion", "Dailymotion", masterUrl, ExtractorLinkType.M3U8) {
+                this.referer = "https://geo.dailymotion.com/"
+                this.quality = Qualities.Unknown.value
+            })
+            return
+        }
+
+        val generated = runCatching {
+            M3u8Helper.generateM3u8(
+                "Dailymotion",
+                masterUrl,
+                "https://geo.dailymotion.com/",
+                headers = mapOf("Origin" to "https://geo.dailymotion.com"),
+            )
+        }.getOrNull().orEmpty()
+
+        if (generated.isNotEmpty()) {
+            generated.forEach { callback(it) }
+        } else {
+            callback(newExtractorLink("Dailymotion", "Dailymotion", masterUrl, ExtractorLinkType.M3U8) {
+                this.referer = "https://geo.dailymotion.com/"
+                this.quality = Qualities.Unknown.value
+            })
+        }
+    }
+
+    private fun decodeServerValue(raw: String): String? {
+        val s = raw.trim()
+        if (s.isEmpty()) return null
+        return when {
+            s.startsWith("http", true) || s.startsWith("//") -> s
+            s.contains("<iframe", true) -> extractIframeSrc(s)
+            else -> runCatching {
+                val decoded = String(Base64.decode(s.filterNot { it.isWhitespace() }, Base64.DEFAULT), Charsets.UTF_8).trim()
+                when {
+                    decoded.contains("<iframe", true) -> extractIframeSrc(decoded)
+                    decoded.startsWith("http", true) || decoded.startsWith("//") -> decoded
+                    else -> RE_HTTP_URL.find(decoded)?.value
+                }
+            }.getOrNull()
+        }
+    }
+
+    private fun extractIframeSrc(html: String): String? =
+        Jsoup.parse(html).selectFirst("iframe[src], iframe[data-src], iframe[data-litespeed-src]")?.let {
+            it.attr("data-litespeed-src").ifEmpty { it.attr("data-src") }.ifEmpty { it.attr("src") }
+        }?.takeIf { it.isNotBlank() }
+
+    private fun isJunkOrAdUrl(url: String): Boolean {
+        val lower = url.lowercase().trim()
+        if (lower.isEmpty() || lower.contains("\\\"") || lower.contains("\"%3a")) return true
+        if (STATIC_ASSET_EXT.containsMatchIn(lower)) return true
+        if (lower.contains("/wp-content/") || lower.contains("/wp-json/") || lower.contains("/wp-includes/")) return true
+        if (lower.contains("/embed/#?secret=")) return true
+        if (lower == "https://player.vimeo.com" || lower == "https://player.vimeo.com/") return true
+        if (lower == "https://geo.dailymotion.com/player" || lower == "https://geo.dailymotion.com/player/") return true
+        return AD_DOMAINS.any { lower.contains(it) }
+    }
+
+    private fun normalizeUrl(raw: String): String? {
+        val s = raw.trim().replace("\\/", "/").replace("\\\"", "").replace("&amp;", "&").trim('"', '\'', ' ')
+        if (s.isBlank() || s.startsWith("about:") || s.startsWith("data:") || s.startsWith("javascript:")) return null
+        return when {
+            s.startsWith("//")   -> "https:$s"
+            s.startsWith("/")    -> "$mainUrl$s"
+            s.startsWith("http") -> s
+            s.contains('.') && !s.contains(' ') -> "https://$s"
+            else -> null
+        }
+    }
+}
