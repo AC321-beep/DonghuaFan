@@ -30,11 +30,22 @@ class AnimekhorProvider : MainAPI() {
         const val PAGE_FETCH_TIMEOUT_MS = 15_000L
     }
 
+    // Restored browser headers to mimic real navigation
+    private val browserHeaders = mapOf(
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language" to "en-US,en;q=0.5",
+        "Connection" to "keep-alive",
+        "Upgrade-Insecure-Requests" to "1",
+        "Sec-Fetch-Dest" to "document",
+        "Sec-Fetch-Mode" to "navigate",
+        "Sec-Fetch-Site" to "same-origin"
+    )
+
     private val defaultHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         "Referer" to mainUrl,
         "Origin" to mainUrl
-    )
+    ) + browserHeaders
 
     private val cardSelector = "div.listupd > article, div.bsx"
 
@@ -91,7 +102,6 @@ class AnimekhorProvider : MainAPI() {
             null
         } ?: return null
 
-        // 🔍 DEBUG LOG: Inspect initial HTTP request
         Log.e("Animekhor/Provider", "🌐 Initial Fetch: ${response.code} for $url")
         if (response.code !in 200..299 || isCfChallenge(response.text)) {
             Log.e("Animekhor/Provider", "🛑 Blocked/Challenge Body Snippet: ${response.text.take(300)}")
@@ -99,6 +109,11 @@ class AnimekhorProvider : MainAPI() {
 
         if (response.code in 200..299 && !isCfChallenge(response.text)) {
             return response.document
+        }
+
+        // If it's a 520, 522, or 524 (Cloudflare origin error), solving won't help.
+        if (response.code == 520 || response.code == 522 || response.code == 524) {
+            return null
         }
 
         if (!isCfChallenge(response.text) && response.code !in 200..299) {
@@ -240,7 +255,7 @@ class AnimekhorProvider : MainAPI() {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    //  Extractor orchestration — unchanged, only initial fetch CF-aware
+    //  Extractor orchestration
     // ─────────────────────────────────────────────────────────────────────
 
     override suspend fun loadLinks(
