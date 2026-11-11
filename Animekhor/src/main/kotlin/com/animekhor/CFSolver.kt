@@ -3,6 +3,7 @@ package com.animekhor
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Dialog
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.http.SslError
 import android.os.Handler
@@ -11,6 +12,9 @@ import android.util.Log
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.SslErrorHandler
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -51,16 +55,12 @@ private fun isCfChallengeHtml(html: String): Boolean {
             l.contains("ray id")
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  CFState — shared per-host solver state
-// ─────────────────────────────────────────────────────────────────────────────
 object CFState {
     var userAgent: String = ""
     private val userAgents = ConcurrentHashMap<String, String>()
     private val solving = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
     private val solvedHtmlCache = ConcurrentHashMap<String, Pair<Long, String>>()
 
-    // Failure cooldown — prevents WebView thrash when solving keeps failing
     private const val DEFAULT_COOLDOWN_MS = 5 * 60_000L
     private val failedUntil = ConcurrentHashMap<String, Long>()
 
@@ -86,7 +86,8 @@ object CFState {
     fun getSolvedHtml(url: String): String? {
         val entry = solvedHtmlCache[url] ?: return null
         if (System.currentTimeMillis() - entry.first > 30_000L) {
-            solvedHtmlCache.remove(url); return null
+            solvedHtmlCache.remove(url)
+            return null
         }
         return entry.second
     }
@@ -120,21 +121,6 @@ object CFState {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  CFInterceptor — RESTORED verbatim from com.Animexin
-//
-//  Usage: add this to any OkHttpClient.Builder that should carry the solved
-//  cf_clearance cookie + spoofed browser headers automatically, e.g.:
-//
-//      private val appHttp by lazy {
-//          OkHttpClient.Builder()
-//              .addInterceptor(CFInterceptor())
-//              .build()
-//      }
-//
-//  If your Cloudstream host already registers it somewhere (global config,
-//  custom base plugin, or reflection), no action is needed here.
-// ─────────────────────────────────────────────────────────────────────────────
 class CFInterceptor : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
         val original = chain.request()
@@ -143,11 +129,8 @@ class CFInterceptor : Interceptor {
 
         val ua = CFState.userAgentFor(host) ?: SAFE_FALLBACK_UA
         builder.header("User-Agent", ua)
-
-        // Prevent Android from leaking app package name to Cloudflare WAF
         builder.removeHeader("X-Requested-With")
 
-        // Safely merge OkHttp-injected cookies with WebView-solved cookies
         val existing = original.header("Cookie")
         val managed = CookieManager.getInstance().getCookie(original.url.toString())
         val merged = listOfNotNull(existing, managed).filter { it.isNotEmpty() }.joinToString("; ")
@@ -167,9 +150,6 @@ class CFInterceptor : Interceptor {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  CFSolver — silent 1×1 WebView first, interactive dialog fallback
-// ─────────────────────────────────────────────────────────────────────────────
 class CFSolver(private val url: String) {
 
     private fun log(msg: String) = Log.e("Animekhor/CFSolver", msg)
@@ -335,9 +315,18 @@ class CFSolver(private val url: String) {
                 }
 
                 webView.webViewClient = object : WebViewClient() {
-                    override fun onPageStarted(view: WebView?, startedUrl: String?, favicon: android.graphics.Bitmap?) {
+                    override fun onPageStarted(view: WebView?, startedUrl: String?, favicon: Bitmap?) {
                         super.onPageStarted(view, startedUrl, favicon)
                         view?.evaluateJavascript(SPOOF_JS, null)
+                    }
+
+                    override fun onReceivedHttpError(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                        errorResponse: WebResourceResponse?
+                    ) {
+                        super.onReceivedHttpError(view, request, errorResponse)
+                        Log.e("Animekhor/CFSolver", "❌ [Silent] HTTP Error: ${errorResponse?.statusCode} @ ${request?.url}")
                     }
 
                     override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: SslError?) {
@@ -350,6 +339,7 @@ class CFSolver(private val url: String) {
                         if (currentUrl == "about:blank" || done.get()) return
                         val cookies = cookieManager.getCookie(currentUrl) ?: ""
                         val title = view?.title ?: ""
+                        Log.e("Animekhor/CFSolver", "🔍 [Silent] Page Finished: title='$title', URL=$currentUrl")
                         if (!isChallengeOrErrorTitle(title) ||
                             (cookies.contains("cf_clearance") && !title.equals("Loading...", true))
                         ) {
@@ -372,6 +362,9 @@ class CFSolver(private val url: String) {
         var dialog: Dialog? = null
         var web: WebView? = null
         val ua = resolveWebViewUa(activity, host)
+        
+        Log.e("Animekhor/CFSolver", "🔍 Dialog starting. Host: $host, UA: $ua")
+
         val cookieManager = CookieManager.getInstance()
         cookieManager.setAcceptCookie(true)
 
@@ -408,7 +401,7 @@ class CFSolver(private val url: String) {
             setPadding(50, 50, 50, 30)
         }
         val status = TextView(activity).apply {
-            text = "If a Cloudflare checkbox appears, tap it. When the site loads, tap “Continue”."
+            text = "Loading..."
             setTextColor(Color.parseColor("#A0A0A0"))
             textSize = 13f
             setPadding(50, 0, 50, 30)
@@ -468,9 +461,26 @@ class CFSolver(private val url: String) {
         }
 
         webView.webViewClient = object : WebViewClient() {
-            override fun onPageStarted(view: WebView?, startedUrl: String?, favicon: android.graphics.Bitmap?) {
+            override fun onPageStarted(view: WebView?, startedUrl: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, startedUrl, favicon)
+                Log.e("Animekhor/CFSolver", "🔍 [Dialog] Page Started: $startedUrl")
                 view?.evaluateJavascript(SPOOF_JS, null)
+            }
+
+            override fun onReceivedHttpError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                errorResponse: WebResourceResponse?
+            ) {
+                super.onReceivedHttpError(view, request, errorResponse)
+                Log.e("Animekhor/CFSolver", "❌ [Dialog] HTTP Error: ${errorResponse?.statusCode} ${errorResponse?.reasonPhrase} @ ${request?.url}")
+                
+                if (errorResponse?.statusCode == 403) {
+                    Handler(Looper.getMainLooper()).post {
+                        status.text = "Cloudflare blocked the WebView (403 Forbidden). Try again later."
+                        status.setTextColor(Color.parseColor("#E04040"))
+                    }
+                }
             }
 
             override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: SslError?) {
@@ -481,8 +491,12 @@ class CFSolver(private val url: String) {
             override fun onPageFinished(view: WebView?, loadedUrl: String?) {
                 val currentUrl = loadedUrl ?: url
                 if (currentUrl == "about:blank" || resolved.get()) return
+                
                 val cookies = cookieManager.getCookie(currentUrl) ?: ""
                 val title = view?.title ?: ""
+                
+                Log.e("Animekhor/CFSolver", "🔍 [Dialog] Page Finished: title='$title', URL=$currentUrl, Cookies=${cookies.take(150)}")
+
                 val titleLooksClean =
                     !isChallengeOrErrorTitle(title) ||
                     (cookies.contains("cf_clearance") && !title.equals("Loading...", true))
@@ -506,7 +520,7 @@ class CFSolver(private val url: String) {
                         }
                     }, 1200)
                 } else {
-                    status.text = "Waiting for Cloudflare… tap the checkbox if shown."
+                    status.text = "Waiting for Cloudflare… (Title: $title)"
                     status.setTextColor(Color.parseColor("#A0A0A0"))
                 }
             }
