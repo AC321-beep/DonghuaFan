@@ -200,14 +200,15 @@ class AnimekhorProvider : MainAPI() {
                 this.plot = description
             }
         } else {
-            var epListElements = document.select(".episodelist li, .eplister li")
-            if (epListElements.isEmpty()) {
-                val epPage = document.selectFirst(".episodelist li > a, .eplister li > a")?.attr("href") ?: ""
-                if (epPage.isNotBlank()) {
-                    epListElements = fetchDocument(epPage)?.select(".episodelist li, .eplister li")
-                        ?: emptyList<Element>()
-                }
-            }
+            var epListElements: List<Element> = document.select(".episodelist li, .eplister li")
+if (epListElements.isEmpty()) {
+    val epPage = document.selectFirst(".episodelist li > a, .eplister li > a")?.attr("href") ?: ""
+    if (epPage.isNotBlank()) {
+        epListElements = fetchDocument(epPage)
+            ?.select(".episodelist li, .eplister li")
+            ?: emptyList()
+    }
+}
 
             val episodes = epListElements.mapNotNull { info ->
                 val href = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
