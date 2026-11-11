@@ -1,6 +1,7 @@
 package com.animekhor
 
 import android.util.Base64
+import android.util.Log
 import android.webkit.CookieManager
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -63,31 +64,23 @@ class AnimekhorProvider : MainAPI() {
                 (l.contains("cloudflare") && l.contains("ray id"))
     }
 
-    /** Merges base headers with the solved per-host UA + cached cookies. */
     private fun cfHeaders(url: String, base: Map<String, String> = defaultHeaders): Map<String, String> {
         val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
         val cfUa: String? = CFState.userAgentFor(host)
         val cookies: String = try { CookieManager.getInstance().getCookie(url) ?: "" } catch (_: Exception) { "" }
 
-        // mutableMapOf avoids buildMap's K/V inference failure on captured nullable values.
         val merged: MutableMap<String, String> = base.toMutableMap()
         if (cfUa != null && cfUa.isNotBlank()) merged["User-Agent"] = cfUa
         if (cookies.isNotBlank()) merged["Cookie"] = cookies
         return merged
     }
 
-    /**
-     * CF-aware fetch:
-     *   1. cached solved HTML (≤ 30 s)
-     *   2. regular app.get with UA/cookie injection
-     *   3. if a CF challenge is detected → CFSolver(url).solve() → re-read cache
-     */
     private suspend fun fetchDocument(
         url: String,
         headers: Map<String, String> = defaultHeaders
     ): Document? {
         CFState.getSolvedHtml(url)?.let { html ->
-            if (html.length > 500) return Jsoup.parse(html, url)
+            if (html.length > 500 && !isCfChallenge(html)) return Jsoup.parse(html, url)
         }
 
         val response = try {
@@ -98,6 +91,12 @@ class AnimekhorProvider : MainAPI() {
             null
         } ?: return null
 
+        // 🔍 DEBUG LOG: Inspect initial HTTP request
+        Log.e("Animekhor/Provider", "🌐 Initial Fetch: ${response.code} for $url")
+        if (response.code !in 200..299 || isCfChallenge(response.text)) {
+            Log.e("Animekhor/Provider", "🛑 Blocked/Challenge Body Snippet: ${response.text.take(300)}")
+        }
+
         if (response.code in 200..299 && !isCfChallenge(response.text)) {
             return response.document
         }
@@ -105,6 +104,10 @@ class AnimekhorProvider : MainAPI() {
         if (!isCfChallenge(response.text) && response.code !in 200..299) {
             return null
         }
+
+        if (CommonActivity.activity == null) return null
+        val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
+        if (CFState.isInCooldown(host)) return null
 
         val solved: Boolean = try {
             CFSolver(url).solve()
@@ -116,7 +119,7 @@ class AnimekhorProvider : MainAPI() {
 
         if (solved) {
             CFState.getSolvedHtml(url)?.let { html ->
-                if (html.length > 500) return Jsoup.parse(html, url)
+                if (html.length > 500 && !isCfChallenge(html)) return Jsoup.parse(html, url)
             }
         }
         return null
@@ -201,14 +204,14 @@ class AnimekhorProvider : MainAPI() {
             }
         } else {
             var epListElements: List<Element> = document.select(".episodelist li, .eplister li")
-if (epListElements.isEmpty()) {
-    val epPage = document.selectFirst(".episodelist li > a, .eplister li > a")?.attr("href") ?: ""
-    if (epPage.isNotBlank()) {
-        epListElements = fetchDocument(epPage)
-            ?.select(".episodelist li, .eplister li")
-            ?: emptyList()
-    }
-}
+            if (epListElements.isEmpty()) {
+                val epPage = document.selectFirst(".episodelist li > a, .eplister li > a")?.attr("href") ?: ""
+                if (epPage.isNotBlank()) {
+                    epListElements = fetchDocument(epPage)
+                        ?.select(".episodelist li, .eplister li")
+                        ?: emptyList()
+                }
+            }
 
             val episodes = epListElements.mapNotNull { info ->
                 val href = info.selectFirst("a")?.attr("href") ?: return@mapNotNull null
