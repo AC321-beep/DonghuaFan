@@ -12,7 +12,6 @@ import android.util.Log
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.SslErrorHandler
-import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -39,9 +38,11 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
+// Standard Chrome UA to bypass WAF rules blocking OEM WebViews (like Vivo/Oppo)
 private const val SAFE_FALLBACK_UA =
-    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
+// Expanded to explicitly catch Cloudflare WAF blocks (403) and Origin errors (520)
 private fun isCfChallengeHtml(html: String): Boolean {
     if (html.length > 10_000) return false
     val l = html.lowercase()
@@ -52,7 +53,9 @@ private fun isCfChallengeHtml(html: String): Boolean {
             l.contains("/cdn-cgi/challenge-platform/") ||
             l.contains("<title>attention required") ||
             l.contains("verifying you are human") ||
-            l.contains("ray id")
+            l.contains("ray id") ||
+            l.contains("403 forbidden") ||
+            l.contains("error code: 520")
 }
 
 object CFState {
@@ -170,14 +173,8 @@ class CFSolver(private val url: String) {
     """.trimIndent()
 
     private fun resolveWebViewUa(activity: Activity, host: String): String {
-        CFState.userAgentFor(host)?.takeIf { it.isNotBlank() }?.let { return it }
-        val defaultUa = runCatching {
-            WebSettings.getDefaultUserAgent(activity)
-                .replace("; wv", "")
-                .replace(Regex("""Version/\d+\.\d+\s*"""), "")
-        }.getOrNull() ?: SAFE_FALLBACK_UA
-        CFState.setUserAgent(host, defaultUa)
-        return defaultUa
+        // FORCE standard UA to bypass OEM WAF blocks
+        return SAFE_FALLBACK_UA
     }
 
     private fun isChallengeOrErrorTitle(title: String): Boolean {
@@ -426,7 +423,7 @@ class CFSolver(private val url: String) {
                             w.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
                             finish(true)
                         } else {
-                            status.text = "Still on the Cloudflare page — solve it first."
+                            status.text = "Still blocked (403 Forbidden). Please wait or turn off VPN."
                             status.setTextColor(Color.parseColor("#E04040"))
                         }
                     }
@@ -477,7 +474,7 @@ class CFSolver(private val url: String) {
                 
                 if (errorResponse?.statusCode == 403) {
                     Handler(Looper.getMainLooper()).post {
-                        status.text = "Cloudflare blocked the WebView (403 Forbidden). Try again later."
+                        status.text = "Cloudflare blocked the WebView (403 Forbidden). Try turning off VPN."
                         status.setTextColor(Color.parseColor("#E04040"))
                     }
                 }
@@ -513,8 +510,9 @@ class CFSolver(private val url: String) {
                                     view.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
                                     finish(true)
                                 } else {
-                                    status.text = "Challenge still active — tap the checkbox, then Continue."
-                                    status.setTextColor(Color.parseColor("#E0A020"))
+                                    status.text = "Challenge still active or blocked (403)."
+                                    status.setTextColor(Color.parseColor("#E04040"))
+                                    finish(false)
                                 }
                             }
                         }
