@@ -30,7 +30,7 @@ class AnimekhorProvider : MainAPI() {
         const val PAGE_FETCH_TIMEOUT_MS = 15_000L
     }
 
-    // Restored browser headers to mimic real navigation
+    // Browser headers to mimic real navigation
     private val browserHeaders = mapOf(
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "en-US,en;q=0.5",
@@ -41,8 +41,9 @@ class AnimekhorProvider : MainAPI() {
         "Sec-Fetch-Site" to "same-origin"
     )
 
+    // Aligned with SAFE_FALLBACK_UA so persisted cf_clearance cookies match the User-Agent
     private val defaultHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+        "User-Agent" to SAFE_FALLBACK_UA,
         "Referer" to mainUrl,
         "Origin" to mainUrl
     ) + browserHeaders
@@ -63,17 +64,7 @@ class AnimekhorProvider : MainAPI() {
     //  Cloudflare helpers
     // ─────────────────────────────────────────────────────────────────────
 
-    private fun isCfChallenge(html: String): Boolean {
-        if (html.length > 10_000) return false
-        val l = html.lowercase()
-        return l.contains("just a moment") ||
-                l.contains("checking your browser") ||
-                l.contains("please wait while we verify") ||
-                l.contains("cf-browser-verification") ||
-                l.contains("/cdn-cgi/challenge-platform/") ||
-                l.contains("<title>attention required") ||
-                (l.contains("cloudflare") && l.contains("ray id"))
-    }
+    private fun isCfChallenge(html: String): Boolean = isCfChallengeHtml(html)
 
     private fun cfHeaders(url: String, base: Map<String, String> = defaultHeaders): Map<String, String> {
         val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
@@ -81,8 +72,10 @@ class AnimekhorProvider : MainAPI() {
         val cookies: String = try { CookieManager.getInstance().getCookie(url) ?: "" } catch (_: Exception) { "" }
 
         val merged: MutableMap<String, String> = base.toMutableMap()
-        if (cfUa != null && cfUa.isNotBlank()) merged["User-Agent"] = cfUa
-        if (cookies.isNotBlank()) merged["Cookie"] = cookies
+        if (!cfUa.isNullOrBlank()) merged["User-Agent"] = cfUa
+        if (cookies.isNotBlank()) {
+            merged["Cookie"] = CFState.mergeCookies(base["Cookie"], cookies)
+        }
         return merged
     }
 
@@ -95,7 +88,9 @@ class AnimekhorProvider : MainAPI() {
         }
 
         val response = try {
-            app.get(url, headers = cfHeaders(url, headers))
+            withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
+                app.get(url, headers = cfHeaders(url, headers))
+            }
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
@@ -136,6 +131,22 @@ class AnimekhorProvider : MainAPI() {
             CFState.getSolvedHtml(url)?.let { html ->
                 if (html.length > 500 && !isCfChallenge(html)) return Jsoup.parse(html, url)
             }
+
+            // Fallback: when another concurrent request solved the challenge for the same host
+            // (or the WebView redirected), re-fetch with the newly stored cf_clearance cookie.
+            val retryResponse = try {
+                withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
+                    app.get(url, headers = cfHeaders(url, headers))
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
+
+            if (retryResponse != null && retryResponse.code in 200..299 && !isCfChallenge(retryResponse.text)) {
+                return retryResponse.document
+            }
         }
         return null
     }
@@ -148,17 +159,15 @@ class AnimekhorProvider : MainAPI() {
         val url = "$mainUrl/${request.data}&page=$page"
 
         val home: List<SearchResponse> = try {
-            withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
-                fetchDocument(url)
-                    ?.select(cardSelector)
-                    ?.mapNotNull { it.toSearchResult() }
-                    ?.distinctBy { it.url }
-            }
+            fetchDocument(url)
+                ?.select(cardSelector)
+                ?.mapNotNull { it.toSearchResult() }
+                ?.distinctBy { it.url }
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
             null
-        } ?: emptyList<SearchResponse>()
+        } ?: emptyList()
 
         return newHomePageResponse(request.name, home)
     }
@@ -171,7 +180,9 @@ class AnimekhorProvider : MainAPI() {
 
         val posterUrl = fixUrlNull(
             this.selectFirst("img")?.let { img ->
-                img.attr("data-src").ifEmpty { img.attr("src") }.ifEmpty { img.attr("data-lazy-src") }
+                img.attr("data-src")
+                    .ifEmpty { img.attr("data-lazy-src") }
+                    .ifEmpty { img.attr("src") }
             }
         )
 
@@ -187,11 +198,11 @@ class AnimekhorProvider : MainAPI() {
                         fetchDocument("$mainUrl/?s=$encoded&page=$page")
                             ?.select(cardSelector)
                             ?.mapNotNull { it.toSearchResult() }
-                            ?: emptyList<SearchResponse>()
+                            ?: emptyList()
                     } catch (e: CancellationException) {
                         throw e
                     } catch (_: Exception) {
-                        emptyList<SearchResponse>()
+                        emptyList()
                     }
                 }
             }.awaitAll().flatten()
@@ -220,7 +231,7 @@ class AnimekhorProvider : MainAPI() {
         } else {
             var epListElements: List<Element> = document.select(".episodelist li, .eplister li")
             if (epListElements.isEmpty()) {
-                val epPage = document.selectFirst(".episodelist li > a, .eplister li > a")?.attr("href") ?: ""
+                val epPage = document.selectFirst(".episodelist a, .eplister a")?.attr("href") ?: ""
                 if (epPage.isNotBlank()) {
                     epListElements = fetchDocument(epPage)
                         ?.select(".episodelist li, .eplister li")
@@ -265,7 +276,7 @@ class AnimekhorProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val document = try {
-            withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) { fetchDocument(data) }
+            fetchDocument(data)
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
@@ -292,7 +303,7 @@ class AnimekhorProvider : MainAPI() {
 
             if (finalUrl.contains("ok.ru") || finalUrl.contains("odnoklassniki.ru")) {
                 val okId = Regex("""/video(?:embed)?/(\d+)""").find(finalUrl)?.groupValues?.get(1)
-                    ?: finalUrl.substringAfterLast("/")
+                    ?: finalUrl.substringBefore("?").substringAfterLast("/")
                 finalUrl = "https://ok.ru/videoembed/$okId"
             }
 
@@ -300,7 +311,8 @@ class AnimekhorProvider : MainAPI() {
                 finalUrl = finalUrl.replace("playhydrax.com", "abyssplayer.com")
             }
 
-            val dedupUrl = finalUrl.substringBefore("?")
+            // Preserve query string when it holds the video ID (e.g., abyssplayer.com/?v=...)
+            val dedupUrl = if ("?v=" in finalUrl || "?id=" in finalUrl) finalUrl else finalUrl.substringBefore("?")
             if (!extractedIframeUrls.add(dedupUrl)) return
 
             try {
@@ -358,46 +370,51 @@ class AnimekhorProvider : MainAPI() {
             .select("#embed_holder iframe, .playerx iframe, .video-content iframe")
             .mapNotNull { iframe ->
                 val src = iframe.attr("src")
+                    .ifBlank { iframe.attr("data-src") }
+                    .ifBlank { iframe.attr("data-lazy-src") }
                 if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) src else null
             }
 
         coroutineScope {
-            rawMatches.map { cleanUrl ->
-                async { invokeExtractor(cleanUrl, "Raw Source") }
-            }.awaitAll()
-
-            serverElements.map { server ->
-                async {
-                    val rawData = server.attr("value")
-                        .ifBlank { server.attr("data-em").ifBlank { server.attr("data-embed") } }
-                        .trim()
-                    if (rawData.isBlank()) return@async
-
-                    val iframeSrc: String = when {
-                        rawData.startsWith("http") || rawData.startsWith("//") -> rawData
-                        rawData.startsWith("<iframe", ignoreCase = true) ->
-                            Jsoup.parse(rawData).selectFirst("iframe")?.attr("src") ?: ""
-                        else -> try {
-                            val decoded = String(Base64.decode(rawData, Base64.DEFAULT))
-                            if (decoded.contains("<iframe", ignoreCase = true))
-                                Jsoup.parse(decoded).selectFirst("iframe")?.attr("src") ?: decoded
-                            else decoded
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (_: Exception) {
-                            ""
-                        }
-                    }
-
-                    if (iframeSrc.isNotBlank()) invokeExtractor(iframeSrc, server.text().trim())
+            val jobs = buildList {
+                rawMatches.forEach { cleanUrl ->
+                    add(async { invokeExtractor(cleanUrl, "Raw Source") })
                 }
-            }.awaitAll()
 
-            directIframeSrcs.map { src ->
-                async { invokeExtractor(src, "Direct Server") }
-            }.awaitAll()
+                serverElements.forEach { server ->
+                    add(async {
+                        val rawData = server.attr("value")
+                            .ifBlank { server.attr("data-em").ifBlank { server.attr("data-embed") } }
+                            .trim()
+                        if (rawData.isBlank()) return@async
+
+                        val iframeSrc: String = when {
+                            rawData.startsWith("http") || rawData.startsWith("//") -> rawData
+                            rawData.startsWith("<iframe", ignoreCase = true) ->
+                                Jsoup.parse(rawData).selectFirst("iframe")?.attr("src") ?: ""
+                            else -> try {
+                                val decoded = String(Base64.decode(rawData, Base64.DEFAULT))
+                                if (decoded.contains("<iframe", ignoreCase = true))
+                                    Jsoup.parse(decoded).selectFirst("iframe")?.attr("src") ?: decoded
+                                else decoded
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                ""
+                            }
+                        }
+
+                        if (iframeSrc.isNotBlank()) invokeExtractor(iframeSrc, server.text().trim())
+                    })
+                }
+
+                directIframeSrcs.forEach { src ->
+                    add(async { invokeExtractor(src, "Direct Server") })
+                }
+            }
+            jobs.awaitAll()
         }
 
-        return true
+        return yieldedStreamUrls.isNotEmpty()
     }
 }
