@@ -30,21 +30,22 @@ class AnimekhorProvider : MainAPI() {
         const val PAGE_FETCH_TIMEOUT_MS = 15_000L
     }
 
-    // Do NOT send "Origin" on GET document navigations (triggers LiteSpeed WAF 403)
+    // Matches the working browser navigation headers from /2.headers
     private val browserHeaders = mapOf(
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language" to "en-US,en;q=0.5",
+        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language" to "en-US,en;q=0.9",
         "Upgrade-Insecure-Requests" to "1",
         "Sec-Fetch-Dest" to "document",
         "Sec-Fetch-Mode" to "navigate",
-        "Sec-Fetch-Site" to "none",
+        "Sec-Fetch-Site" to "same-origin",
         "Sec-Fetch-User" to "?1"
     )
 
-    private val defaultHeaders = mapOf(
-        "User-Agent" to SAFE_FALLBACK_UA,
-        "Referer" to "$mainUrl/"
-    ) + browserHeaders
+    private val defaultHeaders: Map<String, String>
+        get() = mapOf(
+            "User-Agent" to CFState.getBrowserUserAgent(),
+            "Referer" to "$mainUrl/"
+        ) + browserHeaders
 
     private val cardSelector = "div.listupd > article, div.bsx"
 
@@ -59,18 +60,18 @@ class AnimekhorProvider : MainAPI() {
     )
 
     // ─────────────────────────────────────────────────────────────────────
-    //  Cloudflare helpers
+    //  Cloudflare / Bot Verification helpers
     // ─────────────────────────────────────────────────────────────────────
 
     private fun isCfChallenge(html: String): Boolean = isCfChallengeHtml(html)
 
     private fun cfHeaders(url: String, base: Map<String, String> = defaultHeaders): Map<String, String> {
         val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
-        val cfUa: String? = CFState.userAgentFor(host)
+        val cfUa: String = CFState.userAgentFor(host) ?: CFState.getBrowserUserAgent()
         val cookies: String = try { CookieManager.getInstance().getCookie(url) ?: "" } catch (_: Exception) { "" }
 
         val merged: MutableMap<String, String> = base.toMutableMap()
-        if (!cfUa.isNullOrBlank()) merged["User-Agent"] = cfUa
+        merged["User-Agent"] = cfUa
         if (cookies.isNotBlank()) {
             merged["Cookie"] = CFState.mergeCookies(base["Cookie"], cookies)
         }
@@ -82,11 +83,18 @@ class AnimekhorProvider : MainAPI() {
         headers: Map<String, String> = defaultHeaders
     ): Document? {
         val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
-        // Guard against Ultima or external plugins passing non-AnimeKhor URLs (e.g. simkl.com)
+        // Ignore foreign URLs passed by meta-providers like Ultima (e.g. simkl.com)
         if (!host.contains("animekhor", ignoreCase = true)) {
-            Log.w("Animekhor/Provider", "⏭ Skipping foreign host URL: $url")
             return null
         }
+
+        CFState.getSolvedHtml(url)?.let { html ->
+            if (html.length > 500 && !isCfChallenge(html)) return Jsoup.parse(html, url)
+        }
+
+        // If another coroutine is already solving a challenge for this host, wait for it
+        // instead of firing concurrent unauthenticated requests that trigger 403 rate limits.
+        CFState.awaitOngoingSolve(host)
 
         CFState.getSolvedHtml(url)?.let { html ->
             if (html.length > 500 && !isCfChallenge(html)) return Jsoup.parse(html, url)
@@ -104,21 +112,22 @@ class AnimekhorProvider : MainAPI() {
 
         Log.e("Animekhor/Provider", "🌐 Initial Fetch: ${response.code} for $url")
 
-        // Never trigger CFSolver on HTTP 200..299
-        if (response.code in 200..299) {
+        // HTTP 200 with real content returns immediately
+        if (response.code in 200..299 && !isCfChallenge(response.text)) {
             return response.document
         }
 
-        // Only trigger CFSolver if it is a genuine Cloudflare challenge (not a static LiteSpeed 403 or 5xx error)
+        // Only trigger CFSolver if it is a genuine Cloudflare / Bot Verification challenge
+        // on 403/429/503. Static LiteSpeed 403 blocks or 520/522/524 origin errors return null.
         if (response.code !in listOf(403, 429, 503) || !isCfChallenge(response.text)) {
             Log.e(
                 "Animekhor/Provider",
-                "🛑 Server/WAF Error (${response.code}, not a CF challenge) for $url: ${response.text.take(200)}"
+                "🛑 Non-challenge response (${response.code}) for $url: ${response.text.take(200)}"
             )
             return null
         }
 
-        Log.e("Animekhor/Provider", "🛑 CF Challenge Body Snippet: ${response.text.take(300)}")
+        Log.e("Animekhor/Provider", "🛑 Challenge Body Snippet: ${response.text.take(300)}")
 
         if (CommonActivity.activity == null) return null
         if (CFState.isInCooldown(host)) return null
@@ -146,7 +155,7 @@ class AnimekhorProvider : MainAPI() {
                 null
             }
 
-            if (retryResponse != null && retryResponse.code in 200..299) {
+            if (retryResponse != null && retryResponse.code in 200..299 && !isCfChallenge(retryResponse.text)) {
                 return retryResponse.document
             }
         }
@@ -180,7 +189,10 @@ class AnimekhorProvider : MainAPI() {
 
     private fun Element.toSearchResult(): SearchResponse? {
         val linkElement = this.selectFirst("a") ?: return null
-        val title = linkElement.attr("title").ifEmpty { this.selectFirst(".tt")?.text() ?: "" }
+        val title = linkElement.attr("title")
+            .ifEmpty { this.selectFirst(".eggtitle")?.text() ?: "" }
+            .ifEmpty { this.selectFirst(".tt")?.ownText() ?: "" }
+            .ifEmpty { this.selectFirst(".tt")?.text() ?: "" }
             .takeIf { it.isNotBlank() } ?: return null
         val href = fixUrlNull(linkElement.attr("href")) ?: return null
 
@@ -222,11 +234,14 @@ class AnimekhorProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         if (!url.contains("animekhor", ignoreCase = true)) {
-            throw ErrorLoadingException("Unsupported URL for AnimeKhor: $url")
+            throw ErrorLoadingException("Unsupported URL: $url")
         }
         val document = fetchDocument(url) ?: throw ErrorLoadingException("Failed to load $url")
         val title = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
-        val poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim() ?: ""
+        val poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: document.selectFirst(".thumbook .thumb img, .thumb img")?.attr("src")?.trim()
+            ?: ""
         val description = document.selectFirst("div.entry-content")?.text()?.trim()
         val type = document.selectFirst(".spe")?.text()
         val tvtag = if (type?.contains("Movie", ignoreCase = true) == true) TvType.Movie else TvType.TvSeries
@@ -240,8 +255,11 @@ class AnimekhorProvider : MainAPI() {
         } else {
             var epListElements: List<Element> = document.select(".episodelist li, .eplister li")
             if (epListElements.isEmpty()) {
-                val epPage = document.selectFirst(".episodelist a, .eplister a")?.attr("href") ?: ""
-                if (epPage.isNotBlank()) {
+                // If user clicked an episode card from the home page, locate the parent series "/anime/..." link
+                val epPage = document.selectFirst(
+                    ".nvsc a[href*='/anime/'], .allc a[href*='/anime/'], .breadcrumb a[href*='/anime/'], .ts-breadcrumb a[href*='/anime/'], .episodelist a, .eplister a"
+                )?.attr("href") ?: ""
+                if (epPage.isNotBlank() && epPage != url) {
                     epListElements = fetchDocument(epPage)
                         ?.select(".episodelist li, .eplister li")
                         ?: emptyList()
@@ -265,7 +283,15 @@ class AnimekhorProvider : MainAPI() {
                         this.description = dateText
                     }
                 }
-            }.distinctBy { it.data }.reversed()
+            }.distinctBy { it.data }.reversed().ifEmpty {
+                // Fallback if the page is a direct single-episode post with no series episode list
+                listOf(
+                    newEpisode(url) {
+                        this.name = title.ifEmpty { "Episode 1" }
+                        this.posterUrl = poster
+                    }
+                )
+            }
 
             return newTvSeriesLoadResponse(title, url, TvType.Anime, episodes) {
                 this.posterUrl = poster
