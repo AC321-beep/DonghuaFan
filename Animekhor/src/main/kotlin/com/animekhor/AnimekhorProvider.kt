@@ -30,22 +30,20 @@ class AnimekhorProvider : MainAPI() {
         const val PAGE_FETCH_TIMEOUT_MS = 15_000L
     }
 
-    // Browser headers to mimic real navigation
+    // Do NOT send "Origin" on GET document navigations (triggers LiteSpeed WAF 403)
     private val browserHeaders = mapOf(
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language" to "en-US,en;q=0.5",
-        "Connection" to "keep-alive",
         "Upgrade-Insecure-Requests" to "1",
         "Sec-Fetch-Dest" to "document",
         "Sec-Fetch-Mode" to "navigate",
-        "Sec-Fetch-Site" to "same-origin"
+        "Sec-Fetch-Site" to "none",
+        "Sec-Fetch-User" to "?1"
     )
 
-    // Aligned with SAFE_FALLBACK_UA so persisted cf_clearance cookies match the User-Agent
     private val defaultHeaders = mapOf(
         "User-Agent" to SAFE_FALLBACK_UA,
-        "Referer" to mainUrl,
-        "Origin" to mainUrl
+        "Referer" to "$mainUrl/"
     ) + browserHeaders
 
     private val cardSelector = "div.listupd > article, div.bsx"
@@ -83,6 +81,13 @@ class AnimekhorProvider : MainAPI() {
         url: String,
         headers: Map<String, String> = defaultHeaders
     ): Document? {
+        val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
+        // Guard against Ultima or external plugins passing non-AnimeKhor URLs (e.g. simkl.com)
+        if (!host.contains("animekhor", ignoreCase = true)) {
+            Log.w("Animekhor/Provider", "⏭ Skipping foreign host URL: $url")
+            return null
+        }
+
         CFState.getSolvedHtml(url)?.let { html ->
             if (html.length > 500 && !isCfChallenge(html)) return Jsoup.parse(html, url)
         }
@@ -98,25 +103,24 @@ class AnimekhorProvider : MainAPI() {
         } ?: return null
 
         Log.e("Animekhor/Provider", "🌐 Initial Fetch: ${response.code} for $url")
-        if (response.code !in 200..299 || isCfChallenge(response.text)) {
-            Log.e("Animekhor/Provider", "🛑 Blocked/Challenge Body Snippet: ${response.text.take(300)}")
-        }
 
-        if (response.code in 200..299 && !isCfChallenge(response.text)) {
+        // Never trigger CFSolver on HTTP 200..299
+        if (response.code in 200..299) {
             return response.document
         }
 
-        // If it's a 520, 522, or 524 (Cloudflare origin error), solving won't help.
-        if (response.code == 520 || response.code == 522 || response.code == 524) {
+        // Only trigger CFSolver if it is a genuine Cloudflare challenge (not a static LiteSpeed 403 or 5xx error)
+        if (response.code !in listOf(403, 429, 503) || !isCfChallenge(response.text)) {
+            Log.e(
+                "Animekhor/Provider",
+                "🛑 Server/WAF Error (${response.code}, not a CF challenge) for $url: ${response.text.take(200)}"
+            )
             return null
         }
 
-        if (!isCfChallenge(response.text) && response.code !in 200..299) {
-            return null
-        }
+        Log.e("Animekhor/Provider", "🛑 CF Challenge Body Snippet: ${response.text.take(300)}")
 
         if (CommonActivity.activity == null) return null
-        val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
         if (CFState.isInCooldown(host)) return null
 
         val solved: Boolean = try {
@@ -132,8 +136,6 @@ class AnimekhorProvider : MainAPI() {
                 if (html.length > 500 && !isCfChallenge(html)) return Jsoup.parse(html, url)
             }
 
-            // Fallback: when another concurrent request solved the challenge for the same host
-            // (or the WebView redirected), re-fetch with the newly stored cf_clearance cookie.
             val retryResponse = try {
                 withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
                     app.get(url, headers = cfHeaders(url, headers))
@@ -144,7 +146,7 @@ class AnimekhorProvider : MainAPI() {
                 null
             }
 
-            if (retryResponse != null && retryResponse.code in 200..299 && !isCfChallenge(retryResponse.text)) {
+            if (retryResponse != null && retryResponse.code in 200..299) {
                 return retryResponse.document
             }
         }
@@ -156,7 +158,11 @@ class AnimekhorProvider : MainAPI() {
     // ─────────────────────────────────────────────────────────────────────
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = "$mainUrl/${request.data}&page=$page"
+        val url = if (page <= 1) {
+            "$mainUrl/${request.data}"
+        } else {
+            "$mainUrl/${request.data}&page=$page"
+        }
 
         val home: List<SearchResponse> = try {
             fetchDocument(url)
@@ -215,7 +221,10 @@ class AnimekhorProvider : MainAPI() {
     // ─────────────────────────────────────────────────────────────────────
 
     override suspend fun load(url: String): LoadResponse {
-        val document = fetchDocument(url) ?: throw Exception("Failed to load $url")
+        if (!url.contains("animekhor", ignoreCase = true)) {
+            throw ErrorLoadingException("Unsupported URL for AnimeKhor: $url")
+        }
+        val document = fetchDocument(url) ?: throw ErrorLoadingException("Failed to load $url")
         val title = document.selectFirst("h1.entry-title")?.text()?.trim() ?: ""
         val poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim() ?: ""
         val description = document.selectFirst("div.entry-content")?.text()?.trim()
@@ -311,7 +320,6 @@ class AnimekhorProvider : MainAPI() {
                 finalUrl = finalUrl.replace("playhydrax.com", "abyssplayer.com")
             }
 
-            // Preserve query string when it holds the video ID (e.g., abyssplayer.com/?v=...)
             val dedupUrl = if ("?v=" in finalUrl || "?id=" in finalUrl) finalUrl else finalUrl.substringBefore("?")
             if (!extractedIframeUrls.add(dedupUrl)) return
 
