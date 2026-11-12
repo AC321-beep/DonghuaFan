@@ -30,7 +30,6 @@ class AnimekhorProvider : MainAPI() {
         const val PAGE_FETCH_TIMEOUT_MS = 15_000L
     }
 
-    // Matches the working browser navigation headers from /2.headers
     private val browserHeaders = mapOf(
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
         "Accept-Language" to "en-US,en;q=0.9",
@@ -59,10 +58,6 @@ class AnimekhorProvider : MainAPI() {
         "anime/?status=completed&order=update" to "Completed"
     )
 
-    // ─────────────────────────────────────────────────────────────────────
-    //  Cloudflare / Bot Verification helpers
-    // ─────────────────────────────────────────────────────────────────────
-
     private fun isCfChallenge(html: String): Boolean = isCfChallengeHtml(html)
 
     private fun cfHeaders(url: String, base: Map<String, String> = defaultHeaders): Map<String, String> {
@@ -83,7 +78,6 @@ class AnimekhorProvider : MainAPI() {
         headers: Map<String, String> = defaultHeaders
     ): Document? {
         val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
-        // Ignore foreign URLs passed by meta-providers like Ultima (e.g. simkl.com)
         if (!host.contains("animekhor", ignoreCase = true)) {
             return null
         }
@@ -92,8 +86,6 @@ class AnimekhorProvider : MainAPI() {
             if (html.length > 500 && !isCfChallenge(html)) return Jsoup.parse(html, url)
         }
 
-        // If another coroutine is already solving a challenge for this host, wait for it
-        // instead of firing concurrent unauthenticated requests that trigger 403 rate limits.
         CFState.awaitOngoingSolve(host)
 
         CFState.getSolvedHtml(url)?.let { html ->
@@ -112,13 +104,10 @@ class AnimekhorProvider : MainAPI() {
 
         Log.e("Animekhor/Provider", "🌐 Initial Fetch: ${response.code} for $url")
 
-        // HTTP 200 with real content returns immediately
         if (response.code in 200..299 && !isCfChallenge(response.text)) {
             return response.document
         }
 
-        // Only trigger CFSolver if it is a genuine Cloudflare / Bot Verification challenge
-        // on 403/429/503. Static LiteSpeed 403 blocks or 520/522/524 origin errors return null.
         if (response.code !in listOf(403, 429, 503) || !isCfChallenge(response.text)) {
             Log.e(
                 "Animekhor/Provider",
@@ -132,8 +121,14 @@ class AnimekhorProvider : MainAPI() {
         if (CommonActivity.activity == null) return null
         if (CFState.isInCooldown(host)) return null
 
+        // NEW: Skip the silent solver if this is a human-only challenge (reCAPTCHA)
+        val isHumanCaptcha = isHumanOnlyChallenge(response.text)
+        if (isHumanCaptcha) {
+            Log.e("Animekhor/Provider", "🧩 reCAPTCHA detected — skipping silent solver")
+        }
+
         val solved: Boolean = try {
-            CFSolver(url).solve()
+            CFSolver(url, skipSilent = isHumanCaptcha).solve()
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
@@ -161,10 +156,6 @@ class AnimekhorProvider : MainAPI() {
         }
         return null
     }
-
-    // ─────────────────────────────────────────────────────────────────────
-    //  Home / Search
-    // ─────────────────────────────────────────────────────────────────────
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page <= 1) {
@@ -228,10 +219,6 @@ class AnimekhorProvider : MainAPI() {
         return results.distinctBy { it.url }
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    //  Detail
-    // ─────────────────────────────────────────────────────────────────────
-
     override suspend fun load(url: String): LoadResponse {
         if (!url.contains("animekhor", ignoreCase = true)) {
             throw ErrorLoadingException("Unsupported URL: $url")
@@ -255,7 +242,6 @@ class AnimekhorProvider : MainAPI() {
         } else {
             var epListElements: List<Element> = document.select(".episodelist li, .eplister li")
             if (epListElements.isEmpty()) {
-                // If user clicked an episode card from the home page, locate the parent series "/anime/..." link
                 val epPage = document.selectFirst(
                     ".nvsc a[href*='/anime/'], .allc a[href*='/anime/'], .breadcrumb a[href*='/anime/'], .ts-breadcrumb a[href*='/anime/'], .episodelist a, .eplister a"
                 )?.attr("href") ?: ""
@@ -284,7 +270,6 @@ class AnimekhorProvider : MainAPI() {
                     }
                 }
             }.distinctBy { it.data }.reversed().ifEmpty {
-                // Fallback if the page is a direct single-episode post with no series episode list
                 listOf(
                     newEpisode(url) {
                         this.name = title.ifEmpty { "Episode 1" }
@@ -299,10 +284,6 @@ class AnimekhorProvider : MainAPI() {
             }
         }
     }
-
-    // ─────────────────────────────────────────────────────────────────────
-    //  Extractor orchestration
-    // ─────────────────────────────────────────────────────────────────────
 
     override suspend fun loadLinks(
         data: String,
@@ -333,8 +314,11 @@ class AnimekhorProvider : MainAPI() {
             var finalUrl = iframeUrl.trim()
 
             if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
-            else if (finalUrl.startsWith("/")) finalUrl = "https://ok.ru$finalUrl"
-            else if (!finalUrl.startsWith("http")) finalUrl = "https://$finalUrl"
+            else if (finalUrl.startsWith("/")) {
+                // Resolve relative paths against the episode page URL, not hardcoded ok.ru
+                val base = try { URI(data).let { "${it.scheme}://${it.host}" } } catch (_: Exception) { mainUrl }
+                finalUrl = "$base$finalUrl"
+            } else if (!finalUrl.startsWith("http")) finalUrl = "https://$finalUrl"
 
             if (finalUrl.contains("ok.ru") || finalUrl.contains("odnoklassniki.ru")) {
                 val okId = Regex("""/video(?:embed)?/(\d+)""").find(finalUrl)?.groupValues?.get(1)
@@ -346,6 +330,7 @@ class AnimekhorProvider : MainAPI() {
                 finalUrl = finalUrl.replace("playhydrax.com", "abyssplayer.com")
             }
 
+            // Deduplicate by full URL if query parameters are present to avoid dropping valid embeds
             val dedupUrl = if ("?v=" in finalUrl || "?id=" in finalUrl) finalUrl else finalUrl.substringBefore("?")
             if (!extractedIframeUrls.add(dedupUrl)) return
 
@@ -384,7 +369,7 @@ class AnimekhorProvider : MainAPI() {
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
-                // one bad extractor doesn't kill the rest
+                // Isolate individual extractor failures
             }
         }
 
