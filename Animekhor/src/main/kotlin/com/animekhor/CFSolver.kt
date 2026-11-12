@@ -38,16 +38,16 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
-// Standard Chrome UA shared across provider and WebView solver
 const val SAFE_FALLBACK_UA =
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
-// Catches Cloudflare challenges (including >10KB Turnstile pages) while ignoring valid site HTML
+// Only returns true when the HTML contains an actual Cloudflare JS/Turnstile challenge.
+// Static LiteSpeed 403 pages ("<title> 403 Forbidden") return false so CFSolver is not triggered.
 fun isCfChallengeHtml(html: String): Boolean {
-    if (html.isBlank()) return true
+    if (html.isBlank()) return false
     val l = html.lowercase()
 
-    // Real AnimeKhor DOM markers mean the page is already solved
+    // Real site content is never a challenge
     if (l.contains("class=\"listupd\"") ||
         l.contains("class=\"entry-title\"") ||
         l.contains("class=\"eplister\"") ||
@@ -56,25 +56,20 @@ fun isCfChallengeHtml(html: String): Boolean {
         return false
     }
 
-    // Explicit Cloudflare challenge markers (can appear in >10KB documents)
-    if (l.contains("/cdn-cgi/challenge-platform/") ||
-        l.contains("cf-browser-verification") ||
-        l.contains("cf-turnstile") ||
-        l.contains("<title>just a moment") ||
-        l.contains("<title>attention required") ||
-        l.contains("verifying you are human") ||
-        l.contains("checking your browser") ||
-        l.contains("please wait while we verify")
-    ) {
-        return true
+    // Static LiteSpeed 403 Forbidden page (has no Cloudflare widget; WebView cannot solve an IP/WAF block)
+    if (l.contains("<title> 403 forbidden") || l.contains("proudly powered by litespeed")) {
+        return false
     }
 
-    if (html.length > 25_000) return false
-
-    return l.contains("just a moment") ||
-            (l.contains("cloudflare") && l.contains("ray id")) ||
-            l.contains("403 forbidden") ||
-            l.contains("error code: 520")
+    // Must contain explicit Cloudflare challenge markers
+    return l.contains("/cdn-cgi/challenge-platform/") ||
+            l.contains("cf-browser-verification") ||
+            l.contains("cf-turnstile") ||
+            l.contains("<title>just a moment") ||
+            l.contains("<title>attention required") ||
+            l.contains("verifying you are human") ||
+            l.contains("checking your browser") ||
+            l.contains("please wait while we verify")
 }
 
 object CFState {
@@ -182,11 +177,10 @@ class CFInterceptor : Interceptor {
 
         builder.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
         builder.header("Accept-Language", "en-US,en;q=0.5")
-        builder.header("Connection", "keep-alive")
         builder.header("Upgrade-Insecure-Requests", "1")
         builder.header("Sec-Fetch-Dest", "document")
         builder.header("Sec-Fetch-Mode", "navigate")
-        builder.header("Sec-Fetch-Site", "same-origin")
+        builder.header("Sec-Fetch-Site", "none")
 
         return chain.proceed(builder.build())
     }
@@ -226,13 +220,7 @@ class CFSolver(private val url: String) {
                 t.contains("security check") ||
                 t.contains("one more step") ||
                 t.contains("verify you are human") ||
-                t.contains("403 forbidden") ||
-                t.contains("429 too many requests") ||
-                t.contains("error 404") ||
-                t.contains("404 not found") ||
-                t.contains("page not found") ||
-                t.contains("this page does not exist") ||
-                t.contains("access denied")
+                t.contains("403 forbidden")
     }
 
     private fun decodeJsHtml(rawJsResult: String?): String? {
@@ -245,6 +233,7 @@ class CFSolver(private val url: String) {
         if (activity.isFinishing || activity.isDestroyed) return false
 
         val host = runCatching { URI(url).host }.getOrNull() ?: return false
+        if (!host.contains("animekhor", ignoreCase = true)) return false
 
         if (CFState.isInCooldown(host)) {
             log("⏸ CF solve skipped for $host (cooldown active)")
@@ -342,12 +331,16 @@ class CFSolver(private val url: String) {
                         ) { raw ->
                             if (done.get()) return@evaluateJavascript
                             val html = decodeJsHtml(raw)
-                            if (!html.isNullOrBlank() && html.length > 500 && !isCfChallengeHtml(html)) {
+                            val title = webView.title.orEmpty()
+                            if (!html.isNullOrBlank() &&
+                                html.length > 500 &&
+                                !isChallengeOrErrorTitle(title) &&
+                                !isCfChallengeHtml(html)
+                            ) {
                                 CFState.storeSolvedHtml(url, html)
                                 webView.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
                                 destroyWebView(true)
                             } else {
-                                // Keep polling while the 10s silent window is still active
                                 pollRunnable?.let { handler.removeCallbacks(it) }
                                 pollRunnable = Runnable { captureHtmlAndCleanup() }.also {
                                     handler.postDelayed(it, 1000L)
@@ -483,12 +476,17 @@ class CFSolver(private val url: String) {
                         "(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();"
                     ) { raw ->
                         val html = decodeJsHtml(raw)
-                        if (!html.isNullOrBlank() && !isCfChallengeHtml(html)) {
+                        val title = w.title.orEmpty()
+                        if (!html.isNullOrBlank() &&
+                            html.length > 500 &&
+                            !isChallengeOrErrorTitle(title) &&
+                            !isCfChallengeHtml(html)
+                        ) {
                             CFState.storeSolvedHtml(url, html)
                             w.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
                             finish(true)
                         } else {
-                            status.text = "Still blocked (403 Forbidden). Please wait or turn off VPN."
+                            status.text = "Still blocked or verifying. Please wait or check your VPN/DNS."
                             status.setTextColor(Color.parseColor("#E04040"))
                         }
                     }
@@ -568,12 +566,15 @@ class CFSolver(private val url: String) {
                             ) { raw ->
                                 if (resolved.get()) return@evaluateJavascript
                                 val html = decodeJsHtml(raw)
-                                if (!html.isNullOrBlank() && !isCfChallengeHtml(html)) {
+                                if (!html.isNullOrBlank() &&
+                                    html.length > 500 &&
+                                    !isChallengeOrErrorTitle(view.title.orEmpty()) &&
+                                    !isCfChallengeHtml(html)
+                                ) {
                                     CFState.storeSolvedHtml(url, html)
                                     view.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
                                     finish(true)
                                 } else {
-                                    // Do NOT call finish(false) here—keep dialog open for user interaction
                                     status.text = "Please complete the verification below, then tap Continue."
                                     status.setTextColor(Color.parseColor("#A0A0A0"))
                                 }
