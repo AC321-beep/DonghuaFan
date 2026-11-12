@@ -42,7 +42,7 @@ import kotlin.coroutines.resume
 const val SAFE_FALLBACK_UA =
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
-// Returns true when the HTML contains genuine AnimeKhor DOM markers (from animekhorz.txt)
+// Returns true when the HTML contains genuine AnimeKhor DOM markers
 fun isRealSiteHtml(html: String): Boolean {
     val l = html.lowercase()
     return l.contains("class=\"listupd") ||
@@ -54,14 +54,13 @@ fun isRealSiteHtml(html: String): Boolean {
 }
 
 // Returns true ONLY for active Cloudflare or Hostinger/LiteSpeed Bot Verification challenges.
-// Static LiteSpeed 403 pages ("<title> 403 Forbidden") return false so CFSolver is not triggered.
 fun isCfChallengeHtml(html: String): Boolean {
     if (html.isBlank()) return false
     if (isRealSiteHtml(html)) return false
 
     val l = html.lowercase()
 
-    // Static LiteSpeed 403 Forbidden page (has no interactive widget; WebView cannot solve an IP/WAF block)
+    // Static LiteSpeed 403 Forbidden page (WebView cannot solve an IP/WAF block)
     if (l.contains("<title> 403 forbidden") || l.contains("proudly powered by litespeed")) {
         return false
     }
@@ -78,6 +77,15 @@ fun isCfChallengeHtml(html: String): Boolean {
             l.contains("please wait while we verify")
 }
 
+// NEW: Detects if the challenge requires human interaction (reCAPTCHA)
+fun isHumanOnlyChallenge(html: String): Boolean {
+    val l = html.lowercase()
+    return l.contains("<title>bot verification") ||
+            l.contains("h-captcha") || l.contains("hcaptcha") ||
+            l.contains("turnstile") || l.contains("g-recaptcha") || l.contains("recaptcha") ||
+            (l.contains("captcha") && !l.contains("cf_chl_opt"))
+}
+
 object CFState {
     @Volatile
     var userAgent: String = ""
@@ -91,11 +99,6 @@ object CFState {
 
     val solverScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    /**
-     * Builds a standard Chrome Reduced User-Agent that preserves the device's real WebView
-     * Chrome version (so Sec-CH-UA and TLS JA3/JA4 fingerprints match) while stripping
-     * WebView "; wv" markers and OEM model names (Vivo/Oppo/Xiaomi) that trigger WAF blocks.
-     */
     fun getBrowserUserAgent(context: Context? = CommonActivity.activity): String {
         if (userAgent.isNotBlank()) return userAgent
         val rawUa = runCatching {
@@ -222,10 +225,14 @@ class CFInterceptor : Interceptor {
     }
 }
 
-class CFSolver(private val url: String) {
+class CFSolver(
+    private val url: String,
+    private val skipSilent: Boolean = false
+) {
 
     private fun log(msg: String) = Log.e("Animekhor/CFSolver", msg)
 
+    // UPDATED: Added strict mobile fingerprinting and background touch simulation
     private val SPOOF_JS = """
         (function(){
             try {
@@ -233,10 +240,36 @@ class CFSolver(private val url: String) {
                 if (!window.chrome.runtime) window.chrome.runtime = {};
                 if (!window.chrome.runtime.id) window.chrome.runtime.id = 'a1b2c3d4e5f678901234567890123456';
                 if (!window.chrome.app) window.chrome.app = { isInstalled: false };
+                
                 Object.defineProperty(navigator, 'webdriver', { get: () => false });
                 Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
                 Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                Object.defineProperty(navigator, 'platform', { get: () => 'Linux armv8l' });
+                Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 5 });
+                
+                // Touch simulation to improve risk score
+                if (!window.__touchSimActive) {
+                    window.__touchSimActive = true;
+                    setInterval(function() {
+                        try {
+                            var x = Math.random() * window.innerWidth;
+                            var y = Math.random() * window.innerHeight;
+                            var touch = new Touch({
+                                identifier: Date.now(),
+                                target: document.body,
+                                clientX: x, clientY: y,
+                                pageX: x, pageY: y,
+                                screenX: x, screenY: y
+                            });
+                            var evt = new TouchEvent('touchmove', {
+                                bubbles: true, cancelable: true,
+                                touches: [touch], targetTouches: [touch], changedTouches: [touch]
+                            });
+                            document.body.dispatchEvent(evt);
+                        } catch(e) {}
+                    }, 1500);
+                }
             } catch(_) {}
         })();
     """.trimIndent()
@@ -291,7 +324,8 @@ class CFSolver(private val url: String) {
         log("🛡 Starting CF solve for $host")
         CFState.solverScope.launch {
             try {
-                val silentSuccess = attemptSilentResolution(activity, host)
+                val silentSuccess = if (skipSilent) false else attemptSilentResolution(activity, host)
+                
                 if (silentSuccess) {
                     log("✅ Silent CF solve success for $host!")
                     CFState.clearFailure(host)
@@ -454,6 +488,7 @@ class CFSolver(private val url: String) {
         var dialog: Dialog? = null
         var web: WebView? = null
         val ua = resolveWebViewUa(activity, host)
+        var isWarmupPhase = true
 
         Log.e("Animekhor/CFSolver", "🔍 Dialog starting. Host: $host, UA: $ua")
 
@@ -499,7 +534,7 @@ class CFSolver(private val url: String) {
             setPadding(50, 50, 50, 30)
         }
         val status = TextView(activity).apply {
-            text = "Loading..."
+            text = "Warming up session..."
             setTextColor(Color.parseColor("#A0A0A0"))
             textSize = 13f
             setPadding(50, 0, 50, 30)
@@ -590,6 +625,26 @@ class CFSolver(private val url: String) {
                 val currentUrl = loadedUrl ?: url
                 if (currentUrl == "about:blank" || resolved.get()) return
 
+                // WARM-UP PHASE: Simulate human browsing before hitting the target
+                if (isWarmupPhase) {
+                    if (currentUrl == "https://animekhor.org" || currentUrl == "https://animekhor.org/") {
+                        status.text = "Warming up session..."
+                        view?.evaluateJavascript("window.scrollBy(0, 600);", null)
+                        handler.postDelayed({
+                            if (!resolved.get()) {
+                                isWarmupPhase = false
+                                status.text = "Loading verification..."
+                                view?.loadUrl(url, webViewHeaders)
+                            }
+                        }, 1500L)
+                    } else {
+                        // If the homepage redirects or fails, proceed to target
+                        isWarmupPhase = false
+                        view?.loadUrl(url, webViewHeaders)
+                    }
+                    return
+                }
+
                 val cookies = cookieManager.getCookie(currentUrl) ?: ""
                 val title = view?.title ?: ""
 
@@ -626,7 +681,7 @@ class CFSolver(private val url: String) {
                         }
                     }.also { handler.postDelayed(it, 1200L) }
                 } else {
-                    status.text = "Please complete the verification below… (Title: $title)"
+                    status.text = "Please complete the verification below…"
                     status.setTextColor(Color.parseColor("#A0A0A0"))
                 }
             }
@@ -640,13 +695,15 @@ class CFSolver(private val url: String) {
         dialog.setContentView(layout)
         dialog.setOnDismissListener { if (!resolved.get()) finish(false) }
         dialog.show()
-        webView.loadUrl(url, webViewHeaders)
+        
+        // Start with the homepage to build session trust
+        webView.loadUrl("https://animekhor.org/", webViewHeaders)
 
         timeoutRunnable = Runnable {
             if (!resolved.get()) {
                 log("⏱ Interactive solve timed out for $host")
                 finish(false)
             }
-        }.also { handler.postDelayed(it, 60_000L) }
+        }.also { handler.postDelayed(it, 90_000L) } // Extended to 90s to account for warm-up + solving time
     }
 }
