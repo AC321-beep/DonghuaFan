@@ -3,6 +3,7 @@ package com.animekhor
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Dialog
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.http.SslError
@@ -39,32 +40,37 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
 const val SAFE_FALLBACK_UA =
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
-// Only returns true when the HTML contains an actual Cloudflare JS/Turnstile challenge.
+// Returns true when the HTML contains genuine AnimeKhor DOM markers (from animekhorz.txt)
+fun isRealSiteHtml(html: String): Boolean {
+    val l = html.lowercase()
+    return l.contains("class=\"listupd") ||
+            l.contains("class=\"entry-title\"") ||
+            l.contains("class=\"eplister\"") ||
+            l.contains("id=\"embed_holder\"") ||
+            l.contains("class=\"bsx\"") ||
+            l.contains("const ts_config")
+}
+
+// Returns true ONLY for active Cloudflare or Hostinger/LiteSpeed Bot Verification challenges.
 // Static LiteSpeed 403 pages ("<title> 403 Forbidden") return false so CFSolver is not triggered.
 fun isCfChallengeHtml(html: String): Boolean {
     if (html.isBlank()) return false
+    if (isRealSiteHtml(html)) return false
+
     val l = html.lowercase()
 
-    // Real site content is never a challenge
-    if (l.contains("class=\"listupd\"") ||
-        l.contains("class=\"entry-title\"") ||
-        l.contains("class=\"eplister\"") ||
-        l.contains("id=\"embed_holder\"")
-    ) {
-        return false
-    }
-
-    // Static LiteSpeed 403 Forbidden page (has no Cloudflare widget; WebView cannot solve an IP/WAF block)
+    // Static LiteSpeed 403 Forbidden page (has no interactive widget; WebView cannot solve an IP/WAF block)
     if (l.contains("<title> 403 forbidden") || l.contains("proudly powered by litespeed")) {
         return false
     }
 
-    // Must contain explicit Cloudflare challenge markers
-    return l.contains("/cdn-cgi/challenge-platform/") ||
+    return l.contains("<title>bot verification") ||
+            l.contains("/cdn-cgi/challenge-platform/") ||
             l.contains("cf-browser-verification") ||
             l.contains("cf-turnstile") ||
+            l.contains("g-recaptcha") ||
             l.contains("<title>just a moment") ||
             l.contains("<title>attention required") ||
             l.contains("verifying you are human") ||
@@ -74,16 +80,41 @@ fun isCfChallengeHtml(html: String): Boolean {
 
 object CFState {
     @Volatile
-    var userAgent: String = SAFE_FALLBACK_UA
+    var userAgent: String = ""
     private val userAgents = ConcurrentHashMap<String, String>()
     private val solving = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
     private val solvedHtmlCache = ConcurrentHashMap<String, Pair<Long, String>>()
 
-    private const val DEFAULT_COOLDOWN_MS = 5 * 60_000L
+    private const val DEFAULT_COOLDOWN_MS = 3 * 60_000L
     private const val HTML_CACHE_TTL_MS = 30_000L
     private val failedUntil = ConcurrentHashMap<String, Long>()
 
     val solverScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    /**
+     * Builds a standard Chrome Reduced User-Agent that preserves the device's real WebView
+     * Chrome version (so Sec-CH-UA and TLS JA3/JA4 fingerprints match) while stripping
+     * WebView "; wv" markers and OEM model names (Vivo/Oppo/Xiaomi) that trigger WAF blocks.
+     */
+    fun getBrowserUserAgent(context: Context? = CommonActivity.activity): String {
+        if (userAgent.isNotBlank()) return userAgent
+        val rawUa = runCatching {
+            if (context != null) WebSettings.getDefaultUserAgent(context) else null
+        }.getOrNull()
+
+        if (!rawUa.isNullOrBlank()) {
+            val cleaned = rawUa
+                .replace(Regex("""\(Linux;\s*Android[^)]+\)"""), "(Linux; Android 10; K)")
+                .replace(Regex("""Version/\d+\.\d+\s*"""), "")
+                .replace("; wv", "")
+                .trim()
+            if (cleaned.contains("Chrome/")) {
+                userAgent = cleaned
+                return cleaned
+            }
+        }
+        return SAFE_FALLBACK_UA
+    }
 
     fun userAgentFor(host: String): String? = userAgents[host] ?: userAgent.takeIf { it.isNotBlank() }
 
@@ -129,6 +160,10 @@ object CFState {
         return entry.second
     }
 
+    suspend fun awaitOngoingSolve(host: String) {
+        solving[host]?.await()
+    }
+
     fun beginSolve(host: String): Pair<CompletableDeferred<Boolean>, Boolean> {
         val fresh = CompletableDeferred<Boolean>()
         val existing = solving.putIfAbsent(host, fresh)
@@ -164,7 +199,7 @@ class CFInterceptor : Interceptor {
         val host = original.url.host
         val builder = original.newBuilder()
 
-        val ua = CFState.userAgentFor(host) ?: SAFE_FALLBACK_UA
+        val ua = CFState.userAgentFor(host) ?: CFState.getBrowserUserAgent()
         builder.header("User-Agent", ua)
         builder.removeHeader("X-Requested-With")
 
@@ -175,12 +210,13 @@ class CFInterceptor : Interceptor {
             builder.header("Cookie", merged)
         }
 
-        builder.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-        builder.header("Accept-Language", "en-US,en;q=0.5")
+        builder.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+        builder.header("Accept-Language", "en-US,en;q=0.9")
         builder.header("Upgrade-Insecure-Requests", "1")
         builder.header("Sec-Fetch-Dest", "document")
         builder.header("Sec-Fetch-Mode", "navigate")
-        builder.header("Sec-Fetch-Site", "none")
+        builder.header("Sec-Fetch-Site", "same-origin")
+        builder.header("Sec-Fetch-User", "?1")
 
         return chain.proceed(builder.build())
     }
@@ -197,7 +233,7 @@ class CFSolver(private val url: String) {
                 if (!window.chrome.runtime) window.chrome.runtime = {};
                 if (!window.chrome.runtime.id) window.chrome.runtime.id = 'a1b2c3d4e5f678901234567890123456';
                 if (!window.chrome.app) window.chrome.app = { isInstalled: false };
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'webdriver', { get: () => false });
                 Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
                 Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
@@ -206,13 +242,19 @@ class CFSolver(private val url: String) {
     """.trimIndent()
 
     private fun resolveWebViewUa(activity: Activity, host: String): String {
-        return SAFE_FALLBACK_UA
+        return CFState.userAgentFor(host) ?: CFState.getBrowserUserAgent(activity)
     }
+
+    private val webViewHeaders = mapOf(
+        "Referer" to "https://www.google.com/",
+        "Accept-Language" to "en-US,en;q=0.9"
+    )
 
     private fun isChallengeOrErrorTitle(title: String): Boolean {
         val t = title.lowercase().trim()
         return t.isBlank() || t == "about:blank" || t == "loading..." || t == "loading" ||
                 t.startsWith("loading...") ||
+                t.contains("bot verification") ||
                 t.contains("please wait") ||
                 t.contains("just a moment") ||
                 t.contains("attention required") ||
@@ -258,7 +300,7 @@ class CFSolver(private val url: String) {
                     log("❌ Silent solve failed for $host. Opening interactive dialog.")
                     withContext(Dispatchers.Main) {
                         runCatching {
-                            Toast.makeText(activity, "Bypassing Cloudflare…", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(activity, "Verifying browser…", Toast.LENGTH_SHORT).show()
                         }
                     }
                     showDialog(activity, host, deferred)
@@ -335,7 +377,8 @@ class CFSolver(private val url: String) {
                             if (!html.isNullOrBlank() &&
                                 html.length > 500 &&
                                 !isChallengeOrErrorTitle(title) &&
-                                !isCfChallengeHtml(html)
+                                !isCfChallengeHtml(html) &&
+                                isRealSiteHtml(html)
                             ) {
                                 CFState.storeSolvedHtml(url, html)
                                 webView.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
@@ -390,10 +433,10 @@ class CFSolver(private val url: String) {
                 }
 
                 cont.invokeOnCancellation { destroyWebView(false) }
-                timeoutRunnable = Runnable { destroyWebView(false) }.also { handler.postDelayed(it, 10_000L) }
+                timeoutRunnable = Runnable { destroyWebView(false) }.also { handler.postDelayed(it, 15_000L) }
 
                 decor.addView(webView)
-                webView.loadUrl(url)
+                webView.loadUrl(url, webViewHeaders)
             }
         }
 
@@ -486,7 +529,7 @@ class CFSolver(private val url: String) {
                             w.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
                             finish(true)
                         } else {
-                            status.text = "Still blocked or verifying. Please wait or check your VPN/DNS."
+                            status.text = "Please complete the verification checkbox first, then tap Continue."
                             status.setTextColor(Color.parseColor("#E04040"))
                         }
                     }
@@ -569,20 +612,21 @@ class CFSolver(private val url: String) {
                                 if (!html.isNullOrBlank() &&
                                     html.length > 500 &&
                                     !isChallengeOrErrorTitle(view.title.orEmpty()) &&
-                                    !isCfChallengeHtml(html)
+                                    !isCfChallengeHtml(html) &&
+                                    isRealSiteHtml(html)
                                 ) {
                                     CFState.storeSolvedHtml(url, html)
                                     view.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
                                     finish(true)
                                 } else {
-                                    status.text = "Please complete the verification below, then tap Continue."
+                                    status.text = "Please complete the verification checkbox below, then tap Continue."
                                     status.setTextColor(Color.parseColor("#A0A0A0"))
                                 }
                             }
                         }
                     }.also { handler.postDelayed(it, 1200L) }
                 } else {
-                    status.text = "Waiting for Cloudflare… (Title: $title)"
+                    status.text = "Please complete the verification below… (Title: $title)"
                     status.setTextColor(Color.parseColor("#A0A0A0"))
                 }
             }
@@ -596,7 +640,7 @@ class CFSolver(private val url: String) {
         dialog.setContentView(layout)
         dialog.setOnDismissListener { if (!resolved.get()) finish(false) }
         dialog.show()
-        webView.loadUrl(url)
+        webView.loadUrl(url, webViewHeaders)
 
         timeoutRunnable = Runnable {
             if (!resolved.get()) {
