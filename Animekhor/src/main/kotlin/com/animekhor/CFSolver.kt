@@ -38,33 +38,54 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
-// Standard Chrome UA to bypass WAF rules blocking OEM WebViews (like Vivo/Oppo)
-private const val SAFE_FALLBACK_UA =
+// Standard Chrome UA shared across provider and WebView solver
+const val SAFE_FALLBACK_UA =
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
-// Expanded to explicitly catch Cloudflare WAF blocks (403) and Origin errors (520)
-private fun isCfChallengeHtml(html: String): Boolean {
-    if (html.length > 10_000) return false
+// Catches Cloudflare challenges (including >10KB Turnstile pages) while ignoring valid site HTML
+fun isCfChallengeHtml(html: String): Boolean {
+    if (html.isBlank()) return true
     val l = html.lowercase()
+
+    // Real AnimeKhor DOM markers mean the page is already solved
+    if (l.contains("class=\"listupd\"") ||
+        l.contains("class=\"entry-title\"") ||
+        l.contains("class=\"eplister\"") ||
+        l.contains("id=\"embed_holder\"")
+    ) {
+        return false
+    }
+
+    // Explicit Cloudflare challenge markers (can appear in >10KB documents)
+    if (l.contains("/cdn-cgi/challenge-platform/") ||
+        l.contains("cf-browser-verification") ||
+        l.contains("cf-turnstile") ||
+        l.contains("<title>just a moment") ||
+        l.contains("<title>attention required") ||
+        l.contains("verifying you are human") ||
+        l.contains("checking your browser") ||
+        l.contains("please wait while we verify")
+    ) {
+        return true
+    }
+
+    if (html.length > 25_000) return false
+
     return l.contains("just a moment") ||
-            l.contains("checking your browser") ||
-            l.contains("please wait while we verify") ||
-            l.contains("cf-browser-verification") ||
-            l.contains("/cdn-cgi/challenge-platform/") ||
-            l.contains("<title>attention required") ||
-            l.contains("verifying you are human") ||
-            l.contains("ray id") ||
+            (l.contains("cloudflare") && l.contains("ray id")) ||
             l.contains("403 forbidden") ||
             l.contains("error code: 520")
 }
 
 object CFState {
-    var userAgent: String = ""
+    @Volatile
+    var userAgent: String = SAFE_FALLBACK_UA
     private val userAgents = ConcurrentHashMap<String, String>()
     private val solving = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
     private val solvedHtmlCache = ConcurrentHashMap<String, Pair<Long, String>>()
 
     private const val DEFAULT_COOLDOWN_MS = 5 * 60_000L
+    private const val HTML_CACHE_TTL_MS = 30_000L
     private val failedUntil = ConcurrentHashMap<String, Long>()
 
     val solverScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -74,21 +95,39 @@ object CFState {
     fun setUserAgent(host: String, ua: String) {
         if (ua.isNotBlank()) {
             userAgents[host] = ua
-            if (userAgent.isBlank()) userAgent = ua
+            userAgent = ua
         }
+    }
+
+    fun mergeCookies(existingCookieHeader: String?, managedCookieHeader: String?): String {
+        val cookieMap = LinkedHashMap<String, String>()
+        listOfNotNull(existingCookieHeader, managedCookieHeader).forEach { header ->
+            header.split(";").forEach { pair ->
+                val trimmed = pair.trim()
+                val eqIdx = trimmed.indexOf('=')
+                if (eqIdx > 0) {
+                    val key = trimmed.substring(0, eqIdx).trim()
+                    val value = trimmed.substring(eqIdx + 1).trim()
+                    if (key.isNotEmpty()) cookieMap[key] = value
+                }
+            }
+        }
+        return cookieMap.entries.joinToString("; ") { "${it.key}=${it.value}" }
     }
 
     fun storeSolvedHtml(url: String, html: String) {
         if (html.length <= 200) return
+        val now = System.currentTimeMillis()
+        solvedHtmlCache.entries.removeIf { now - it.value.first > HTML_CACHE_TTL_MS }
         if (solvedHtmlCache.size >= 32) {
-            solvedHtmlCache.keys.firstOrNull()?.let { solvedHtmlCache.remove(it) }
+            solvedHtmlCache.minByOrNull { it.value.first }?.key?.let { solvedHtmlCache.remove(it) }
         }
-        solvedHtmlCache[url] = System.currentTimeMillis() to html
+        solvedHtmlCache[url] = now to html
     }
 
     fun getSolvedHtml(url: String): String? {
         val entry = solvedHtmlCache[url] ?: return null
-        if (System.currentTimeMillis() - entry.first > 30_000L) {
+        if (System.currentTimeMillis() - entry.first > HTML_CACHE_TTL_MS) {
             solvedHtmlCache.remove(url)
             return null
         }
@@ -135,8 +174,8 @@ class CFInterceptor : Interceptor {
         builder.removeHeader("X-Requested-With")
 
         val existing = original.header("Cookie")
-        val managed = CookieManager.getInstance().getCookie(original.url.toString())
-        val merged = listOfNotNull(existing, managed).filter { it.isNotEmpty() }.joinToString("; ")
+        val managed = runCatching { CookieManager.getInstance().getCookie(original.url.toString()) }.getOrNull()
+        val merged = CFState.mergeCookies(existing, managed)
         if (merged.isNotEmpty()) {
             builder.header("Cookie", merged)
         }
@@ -173,7 +212,6 @@ class CFSolver(private val url: String) {
     """.trimIndent()
 
     private fun resolveWebViewUa(activity: Activity, host: String): String {
-        // FORCE standard UA to bypass OEM WAF blocks
         return SAFE_FALLBACK_UA
     }
 
@@ -250,12 +288,14 @@ class CFSolver(private val url: String) {
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun attemptSilentResolution(activity: Activity, host: String): Boolean =
         withContext(Dispatchers.Main) {
+            if (activity.isFinishing || activity.isDestroyed) return@withContext false
             val decor = activity.window?.decorView as? ViewGroup ?: return@withContext false
 
             suspendCancellableCoroutine { cont ->
                 val done = AtomicBoolean(false)
                 val handler = Handler(Looper.getMainLooper())
                 var timeoutRunnable: Runnable? = null
+                var pollRunnable: Runnable? = null
                 val ua = resolveWebViewUa(activity, host)
                 val cookieManager = CookieManager.getInstance()
                 cookieManager.setAcceptCookie(true)
@@ -280,11 +320,12 @@ class CFSolver(private val url: String) {
                 fun destroyWebView(success: Boolean) {
                     if (!done.compareAndSet(false, true)) return
                     timeoutRunnable?.let { handler.removeCallbacks(it) }
+                    pollRunnable?.let { handler.removeCallbacks(it) }
                     if (success) {
                         CFState.setUserAgent(host, ua)
                         runCatching { cookieManager.flush() }
                     }
-                    Handler(Looper.getMainLooper()).post {
+                    handler.post {
                         runCatching { decor.removeView(webView) }
                         runCatching { webView.stopLoading() }
                         runCatching { webView.loadUrl("about:blank") }
@@ -299,13 +340,18 @@ class CFSolver(private val url: String) {
                         webView.evaluateJavascript(
                             "(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();"
                         ) { raw ->
+                            if (done.get()) return@evaluateJavascript
                             val html = decodeJsHtml(raw)
-                            if (!html.isNullOrBlank() && !isCfChallengeHtml(html)) {
+                            if (!html.isNullOrBlank() && html.length > 500 && !isCfChallengeHtml(html)) {
                                 CFState.storeSolvedHtml(url, html)
                                 webView.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
                                 destroyWebView(true)
                             } else {
-                                destroyWebView(false)
+                                // Keep polling while the 10s silent window is still active
+                                pollRunnable?.let { handler.removeCallbacks(it) }
+                                pollRunnable = Runnable { captureHtmlAndCleanup() }.also {
+                                    handler.postDelayed(it, 1000L)
+                                }
                             }
                         }
                     }.onFailure { destroyWebView(false) }
@@ -323,7 +369,9 @@ class CFSolver(private val url: String) {
                         errorResponse: WebResourceResponse?
                     ) {
                         super.onReceivedHttpError(view, request, errorResponse)
-                        Log.e("Animekhor/CFSolver", "❌ [Silent] HTTP Error: ${errorResponse?.statusCode} @ ${request?.url}")
+                        if (request?.isForMainFrame == true) {
+                            Log.e("Animekhor/CFSolver", "❌ [Silent] HTTP Error: ${errorResponse?.statusCode} @ ${request.url}")
+                        }
                     }
 
                     override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: SslError?) {
@@ -340,7 +388,10 @@ class CFSolver(private val url: String) {
                         if (!isChallengeOrErrorTitle(title) ||
                             (cookies.contains("cf_clearance") && !title.equals("Loading...", true))
                         ) {
-                            handler.postDelayed({ captureHtmlAndCleanup() }, 1200)
+                            pollRunnable?.let { handler.removeCallbacks(it) }
+                            pollRunnable = Runnable { captureHtmlAndCleanup() }.also {
+                                handler.postDelayed(it, 1200L)
+                            }
                         }
                     }
                 }
@@ -355,11 +406,19 @@ class CFSolver(private val url: String) {
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun showDialog(activity: Activity, host: String, deferred: CompletableDeferred<Boolean>) {
+        if (activity.isFinishing || activity.isDestroyed) {
+            CFState.endSolve(host, deferred)
+            return
+        }
+
         val resolved = AtomicBoolean(false)
+        val handler = Handler(Looper.getMainLooper())
+        var timeoutRunnable: Runnable? = null
+        var checkRunnable: Runnable? = null
         var dialog: Dialog? = null
         var web: WebView? = null
         val ua = resolveWebViewUa(activity, host)
-        
+
         Log.e("Animekhor/CFSolver", "🔍 Dialog starting. Host: $host, UA: $ua")
 
         val cookieManager = CookieManager.getInstance()
@@ -367,6 +426,8 @@ class CFSolver(private val url: String) {
 
         fun finish(success: Boolean) {
             if (!resolved.compareAndSet(false, true)) return
+            timeoutRunnable?.let { handler.removeCallbacks(it) }
+            checkRunnable?.let { handler.removeCallbacks(it) }
             if (success) {
                 CFState.setUserAgent(host, ua)
                 CFState.clearFailure(host)
@@ -377,9 +438,13 @@ class CFSolver(private val url: String) {
             log(if (success) "✅ Interactive CF solve success!" else "❌ Interactive CF solve failed.")
             runCatching { if (!deferred.isCompleted) deferred.complete(success) }
             CFState.endSolve(host, deferred)
-            Handler(Looper.getMainLooper()).post {
-                runCatching { web?.stopLoading() }
-                runCatching { web?.destroy() }
+            handler.post {
+                runCatching {
+                    (web?.parent as? ViewGroup)?.removeView(web)
+                    web?.stopLoading()
+                    web?.loadUrl("about:blank")
+                    web?.destroy()
+                }
                 web = null
                 runCatching { dialog?.dismiss() }
             }
@@ -470,13 +535,8 @@ class CFSolver(private val url: String) {
                 errorResponse: WebResourceResponse?
             ) {
                 super.onReceivedHttpError(view, request, errorResponse)
-                Log.e("Animekhor/CFSolver", "❌ [Dialog] HTTP Error: ${errorResponse?.statusCode} ${errorResponse?.reasonPhrase} @ ${request?.url}")
-                
-                if (errorResponse?.statusCode == 403) {
-                    Handler(Looper.getMainLooper()).post {
-                        status.text = "Cloudflare blocked the WebView (403 Forbidden). Try turning off VPN."
-                        status.setTextColor(Color.parseColor("#E04040"))
-                    }
+                if (request?.isForMainFrame == true) {
+                    Log.e("Animekhor/CFSolver", "❌ [Dialog] HTTP Error: ${errorResponse?.statusCode} ${errorResponse?.reasonPhrase} @ ${request.url}")
                 }
             }
 
@@ -488,10 +548,10 @@ class CFSolver(private val url: String) {
             override fun onPageFinished(view: WebView?, loadedUrl: String?) {
                 val currentUrl = loadedUrl ?: url
                 if (currentUrl == "about:blank" || resolved.get()) return
-                
+
                 val cookies = cookieManager.getCookie(currentUrl) ?: ""
                 val title = view?.title ?: ""
-                
+
                 Log.e("Animekhor/CFSolver", "🔍 [Dialog] Page Finished: title='$title', URL=$currentUrl, Cookies=${cookies.take(150)}")
 
                 val titleLooksClean =
@@ -499,24 +559,27 @@ class CFSolver(private val url: String) {
                     (cookies.contains("cf_clearance") && !title.equals("Loading...", true))
 
                 if (titleLooksClean) {
-                    Handler(Looper.getMainLooper()).postDelayed({
+                    checkRunnable?.let { handler.removeCallbacks(it) }
+                    checkRunnable = Runnable {
+                        if (resolved.get()) return@Runnable
                         runCatching {
                             view?.evaluateJavascript(
                                 "(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();"
                             ) { raw ->
+                                if (resolved.get()) return@evaluateJavascript
                                 val html = decodeJsHtml(raw)
                                 if (!html.isNullOrBlank() && !isCfChallengeHtml(html)) {
                                     CFState.storeSolvedHtml(url, html)
                                     view.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
                                     finish(true)
                                 } else {
-                                    status.text = "Challenge still active or blocked (403)."
-                                    status.setTextColor(Color.parseColor("#E04040"))
-                                    finish(false)
+                                    // Do NOT call finish(false) here—keep dialog open for user interaction
+                                    status.text = "Please complete the verification below, then tap Continue."
+                                    status.setTextColor(Color.parseColor("#A0A0A0"))
                                 }
                             }
                         }
-                    }, 1200)
+                    }.also { handler.postDelayed(it, 1200L) }
                 } else {
                     status.text = "Waiting for Cloudflare… (Title: $title)"
                     status.setTextColor(Color.parseColor("#A0A0A0"))
@@ -534,11 +597,11 @@ class CFSolver(private val url: String) {
         dialog.show()
         webView.loadUrl(url)
 
-        Handler(Looper.getMainLooper()).postDelayed({
+        timeoutRunnable = Runnable {
             if (!resolved.get()) {
                 log("⏱ Interactive solve timed out for $host")
                 finish(false)
             }
-        }, 60_000L)
+        }.also { handler.postDelayed(it, 60_000L) }
     }
 }
