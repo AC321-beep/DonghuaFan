@@ -29,7 +29,9 @@ object ReelFrenCfState {
     val solverScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     fun userAgentFor(host: String): String? = userAgents[host]
-    fun setUserAgent(host: String, ua: String) { if (ua.isNotBlank()) userAgents[host] = ua }
+    fun setUserAgent(host: String, ua: String) {
+        if (ua.isNotBlank()) userAgents[host] = ua
+    }
 
     fun beginSolve(host: String): Pair<CompletableDeferred<Boolean>, Boolean> {
         val fresh = CompletableDeferred<Boolean>()
@@ -62,7 +64,8 @@ object ReelFrenCloudflare {
     private fun isChallengeOrErrorTitle(title: String): Boolean {
         val t = title.lowercase().trim()
         return t.isBlank() || t == "about:blank" ||
-               t.contains("just a moment") || t.contains("attention required") ||
+               t.contains("just a moment") ||
+               t.contains("attention required") ||
                t.contains("checking your browser")
     }
 
@@ -90,13 +93,13 @@ object ReelFrenCloudflare {
     }
 
     private fun persistCookie(url: String, host: String) {
-        runCatching {
-            val cookie = CookieManager.getInstance().getCookie(url) ?: return@runCatching
+        try {
+            val cookie = CookieManager.getInstance().getCookie(url) ?: return
             if (cookie.contains("cf_clearance")) {
                 ReelFrenStore.saveCookie(host, cookie)
                 ReelFrenStore.setUserAgent(host, ReelFrenCfState.userAgentFor(host) ?: "")
             }
-        }
+        } catch (_: Exception) {}
     }
 
     suspend fun solve(url: String, forceInteractive: Boolean = false): Boolean {
@@ -116,7 +119,8 @@ object ReelFrenCloudflare {
             try {
                 val act = activity()
                 if (act == null || act.isFinishing || act.isDestroyed) {
-                    deferred.complete(false); return@launch
+                    deferred.complete(false)
+                    return@launch
                 }
                 val silent = if (!forceInteractive) attemptSilent(act, url, host) else false
                 if (silent) {
@@ -137,81 +141,137 @@ object ReelFrenCloudflare {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun attemptSilent(activity: Activity, url: String, host: String): Boolean =
-        withContext(Dispatchers.Main) {
-            val decor = activity.window?.decorView as? ViewGroup ?: return@withContext false
-            suspendCancellableCoroutine { cont ->
-                val done = AtomicBoolean(false)
-                val handler = Handler(Looper.getMainLooper())
-                val ua = resolveWebViewUa(activity, host)
-                val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
+    private suspend fun attemptSilent(
+        activity: Activity,
+        url: String,
+        host: String
+    ): Boolean = withContext(Dispatchers.Main) {
+        val decor = activity.window?.decorView as? ViewGroup ?: return@withContext false
+        suspendCancellableCoroutine { cont ->
+            val done = AtomicBoolean(false)
+            val handler = Handler(Looper.getMainLooper())
+            val ua = resolveWebViewUa(activity, host)
+            val cookies = CookieManager.getInstance()
+            cookies.setAcceptCookie(true)
 
-                val web = WebView(activity).apply {
-                    layoutParams = ViewGroup.LayoutParams(1, 1)
-                    translationX = 20_000f
-                    alpha = 0f
-                    settings.apply {
-                        javaScriptEnabled = true; domStorageEnabled = true
-                        databaseEnabled = true; userAgentString = ua
-                    }
-                }
-                cookies.setAcceptThirdPartyCookies(web, true)
-
-                fun finish(success: Boolean) {
-                    if (!done.compareAndSet(false, true)) return
-                    if (success) {
-                        ReelFrenCfState.setUserAgent(host, ua)
-                        persistCookie(url, host)
-                        runCatching { cookies.flush() }
-                    }
-                    runCatching {
-                        decor.removeView(web); web.stopLoading()
-                        web.loadUrl("about:blank"); web.destroy()
-                    }
-                    if (cont.isActive) cont.resume(success)
-                }
-
-                web.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                        if (done.get() || loadedUrl == "about:blank") return
-                        val c = cookies.getCookie(loadedUrl ?: url) ?: ""
-                        val t = view?.title ?: ""
-                        if (c.contains("cf_clearance") && !isChallengeOrErrorTitle(t)) finish(true)
-                    }
-                }
-
-                cont.invokeOnCancellation { finish(false) }
-                handler.postDelayed({ finish(false) }, 12_000L)
-                decor.addView(web)
-                web.loadUrl(url)
+            val web = WebView(activity)
+            web.layoutParams = ViewGroup.LayoutParams(1, 1)
+            web.translationX = 20_000f
+            web.alpha = 0f
+            web.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                databaseEnabled = true
+                userAgentString = ua
             }
+            cookies.setAcceptThirdPartyCookies(web, true)
+
+            fun finish(success: Boolean) {
+                if (!done.compareAndSet(false, true)) return
+                if (success) {
+                    ReelFrenCfState.setUserAgent(host, ua)
+                    persistCookie(url, host)
+                    try { cookies.flush() } catch (_: Exception) {}
+                }
+                try { decor.removeView(web) } catch (_: Exception) {}
+                try { web.stopLoading() } catch (_: Exception) {}
+                try { web.loadUrl("about:blank") } catch (_: Exception) {}
+                try { web.destroy() } catch (_: Exception) {}
+                if (cont.isActive) cont.resume(success)
+            }
+
+            web.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView?, loadedUrl: String?) {
+                    if (done.get() || loadedUrl == "about:blank") return
+                    val c = cookies.getCookie(loadedUrl ?: url) ?: ""
+                    val t = view?.title ?: ""
+                    if (c.contains("cf_clearance") && !isChallengeOrErrorTitle(t)) finish(true)
+                }
+            }
+
+            cont.invokeOnCancellation { finish(false) }
+            handler.postDelayed({ finish(false) }, 12_000L)
+            decor.addView(web)
+            web.loadUrl(url)
         }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun showInteractiveDialog(
-        activity: Activity, url: String, host: String,
+        activity: Activity,
+        url: String,
+        host: String,
         deferred: CompletableDeferred<Boolean>
     ) {
         val resolved = AtomicBoolean(false)
-        var dialog: Dialog? = null
-        var web: WebView? = null
+        var webRef: WebView? = null
+        var dialogRef: Dialog? = null
         val ua = resolveWebViewUa(activity, host)
-        val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
+        val cookies = CookieManager.getInstance()
+        cookies.setAcceptCookie(true)
 
-        fun dispose() { runCatching { web?.stopLoading(); web?.destroy() }; web = null }
+        fun dispose() {
+            try { webRef?.stopLoading() } catch (_: Exception) {}
+            try { webRef?.destroy() } catch (_: Exception) {}
+            webRef = null
+        }
 
         fun finish(success: Boolean) {
             if (!resolved.compareAndSet(false, true)) return
             if (success) {
                 ReelFrenCfState.setUserAgent(host, ua)
                 persistCookie(url, host)
-                runCatching { cookies.flush() }
+                try { cookies.flush() } catch (_: Exception) {}
             }
             log(if (success) "Dialog solve success" else "Dialog solve failed")
             if (!deferred.isCompleted) deferred.complete(success)
             ReelFrenCfState.endSolve(host, deferred)
-            Handler(Looper.getMainLooper()).post { dispose(); runCatching { dialog?.dismiss() } }
+            Handler(Looper.getMainLooper()).post {
+                dispose()
+                try { dialogRef?.dismiss() } catch (_: Exception) {}
+            }
         }
 
-        dialog = Dialog(activity)
-        val layout = LinearLayout(activity
+        val dlg = Dialog(activity)
+        dialogRef = dlg
+
+        val layout = LinearLayout(activity)
+        layout.orientation = LinearLayout.VERTICAL
+        layout.setBackgroundColor(Color.parseColor("#0A0C12"))
+
+        val header = TextView(activity)
+        header.text = "Verifying you are human..."
+        header.setTextColor(Color.WHITE)
+        header.textSize = 15f
+        header.setPadding(50, 50, 50, 50)
+        layout.addView(header)
+
+        val wv = WebView(activity)
+        webRef = wv
+        cookies.setAcceptThirdPartyCookies(wv, true)
+        wv.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            databaseEnabled = true
+            userAgentString = ua
+        }
+        wv.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, loadedUrl: String?) {
+                if (resolved.get() || loadedUrl == "about:blank") return
+                val c = cookies.getCookie(loadedUrl ?: url) ?: ""
+                val t = view?.title ?: ""
+                if (c.contains("cf_clearance") && !isChallengeOrErrorTitle(t)) {
+                    Handler(Looper.getMainLooper()).postDelayed({ finish(true) }, 800L)
+                }
+            }
+        }
+        layout.addView(
+            wv,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1200)
+        )
+        dlg.setContentView(layout)
+        dlg.setOnDismissListener { finish(false) }
+        dlg.show()
+        wv.loadUrl(url)
+    }
+}
