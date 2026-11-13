@@ -30,9 +30,11 @@ data class VideoEntry(val episode: Int, val duration: Int, val vid: String, val 
 // ── Config ───────────────────────────────────────────────────────────────────
 object ReelFrenConfig {
     const val REEL_SITE = "https://reelfren.net"
-    const val DEFAULT_API_BASE = "https://api.dramafren.org"
+    // FIX: API lives under /api/* on the same host as the site.
+    // Using api.dramafren.org is wrong: cf_clearance is host-scoped
+    // and the .org host rejects the .net cookie.
+    const val DEFAULT_API_BASE = "https://reelfren.net"
 }
-
 // ── JSON parser ──────────────────────────────────────────────────────────────
 object ReelFrenParse {
 
@@ -243,17 +245,24 @@ object ReelFrenClient {
         return headers
     }
 
-    suspend fun get(url: String): String? {
-        val first = runCatching {
-            app.get(url, headers = headers(url), interceptor = cfKiller).text
-        }.getOrNull()
+   suspend fun get(url: String): String? {
+    val first = runCatching {
+        app.get(url, headers = headers(url), interceptor = cfKiller).text
+    }.getOrNull()
 
-        if (first != null && !ReelFrenCloudflare.isChallengeBody(first)) return first
+    if (first != null && !ReelFrenCloudflare.isChallengeBody(first)) return first
 
-        if (!ReelFrenCloudflare.solve(url)) return null
+    // FIX: solve on the site root when the failing URL is on the same host.
+    // HTML pages reliably trigger the CF interstitial; API endpoints sometimes don't.
+    val targetHost = ReelFrenCloudflare.hostOf(url)
+    val solveUrl = if (targetHost == ReelFrenCloudflare.hostOf(ReelFrenConfig.REEL_SITE))
+        ReelFrenConfig.REEL_SITE
+    else url
 
-        return runCatching { app.get(url, headers = headers(url)).text }.getOrNull()
-    }
+    if (!ReelFrenCloudflare.solve(solveUrl)) return null
+
+    return runCatching { app.get(url, headers = headers(url)).text }.getOrNull()
+}
 
     suspend fun home(slug: String, category: String = "", page: Int = 1): List<HomeItem> =
         get(homeUrl(slug, category, page))?.let(ReelFrenParse::homeItems) ?: emptyList()
