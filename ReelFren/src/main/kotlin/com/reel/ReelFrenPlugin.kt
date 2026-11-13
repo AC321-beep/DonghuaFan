@@ -10,18 +10,13 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class ReelFrenPlugin : Plugin() {
     override fun load(context: Context) {
-        // Initialize your existing stores
         ReelFrenStore.init(context)
         ReelFrenCloudflare.init(context)
-        
-        // Pass context to the provider so the filter works
         Reelfren.setContext(context)
 
-        // Register the provider and extractor
         registerMainAPI(Reelfren())
         registerExtractorAPI(ReelFrenDirectLinkExtractor())
 
-        // ── SETTINGS DIALOG ──────────────────────────────────────────────────
         openSettings = {
             val activity = CommonActivity.activity
             if (activity == null) {
@@ -29,20 +24,67 @@ class ReelFrenPlugin : Plugin() {
                 return@Plugin
             }
 
-            // The exact same map used in Reelfren.kt
+            // The default 10 providers that will be pre-checked
+            val defaultEnabledSlugs = setOf(
+                "dramabox", "reelshort", "wetv", "happyshort", "shorten",
+                "dramawave", "shortmax", "netshort", "pinedrama", "vigloo"
+            )
+
             val providersMap = linkedMapOf(
+                "Anamana"         to "anamana",
+                "AniBoy"          to "aniboy",
+                "Melolo"          to "melolo",
+                "Sereal+"         to "sereal",
                 "PineDrama"       to "pinedrama",
                 "Shorten"         to "shorten",
                 "HappyShort"      to "happyshort",
                 "Vigloo"          to "vigloo",
+                "Vigloo 2"        to "vigloo2",
+                "RapidTV"         to "rapidtv",
+                "RapidTV 2"       to "rapidtv2",
+                "RaptDrama"       to "raptdrama",
+                "CubeTV"          to "cubetv",
+                "JoyReels"        to "joyreels",
+                "AnyReel"         to "anyreel",
+                "Shortical"       to "shortical",
+                "StoReel"         to "storeel",
+                "LoveShots"       to "loveshots",
+                "MomeShort"       to "momeshort",
+                "MoreShort"       to "moreshort",
+                "ToonShort"       to "toonshort",
+                "SixthShort"      to "sixthshort",
+                "SoReel"          to "soreel",
+                "StoryGo"         to "storygo",
+                "MiniShort"       to "minishort",
+                "WinkNovel"       to "winknovel",
+                "My Muse"         to "mymuse",
+                "SarosTV"         to "sarostv",
+                "ReelAI"          to "reelai",
+                "Reelife"         to "reelife",
                 "ReelShort"       to "reelshort",
+                "ReelShort 2"     to "reelshort2",
                 "DramaBox"        to "dramabox",
+                "DramaWave"       to "dramawave",
+                "DramaNova"       to "dramanova",
+                "KalosTV"         to "kalostv",
+                "VibeShort"       to "vibeshort",
+                "FreeReels"       to "freereels",
                 "WeTV"            to "wetv",
-                "MovieBox"        to "moviebox",
+                "StoryReel"       to "storyreel",
                 "MovieBox Shorts" to "movieboxshorts",
+                "BonusTV"         to "bonustv",
+                "MoboReels"       to "moboreels",
+                "NetShort"        to "netshort",
+                "MyDrama"         to "mydrama",
+                "FlareFlow"       to "flareflow",
+                "PlayLet"         to "playlet",
                 "ShortMax"        to "shortmax",
                 "FlexTV"          to "flextv",
+                "FlexTV 2"        to "flextv2",
+                "CandyJar"        to "candyjar",
+                "BlinkDrama"      to "blinkdrama",
                 "iQIYI"           to "iqiyi",
+                "MovieBox"        to "moviebox",
                 "FilmBox"         to "filmbox"
             )
 
@@ -51,9 +93,10 @@ class ReelFrenPlugin : Plugin() {
             
             val prefs = context.getSharedPreferences("reelfren_prefs", Context.MODE_PRIVATE)
             
-            // Read current states (default to true)
+            // Apply the 10 defaults here
             val checkedStates = BooleanArray(providerNames.size) { index ->
-                prefs.getBoolean("provider_${providerSlugs[index]}", true)
+                val slug = providerSlugs[index]
+                prefs.getBoolean("provider_$slug", defaultEnabledSlugs.contains(slug))
             }
 
             activity.runOnUiThread {
@@ -70,7 +113,6 @@ class ReelFrenPlugin : Plugin() {
                         editor.apply()
                         
                         Toast.makeText(activity, "Providers updated! Restart extension to apply.", Toast.LENGTH_LONG).show()
-                        // CloudStream automatically reloads the extension when settings are closed
                     }
                     .setNegativeButton("Cancel", null)
                     .show()
