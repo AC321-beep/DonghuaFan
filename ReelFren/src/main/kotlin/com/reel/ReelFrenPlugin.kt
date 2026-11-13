@@ -1,8 +1,9 @@
 package com.reel
 
+import android.app.AlertDialog
 import android.content.Context
+import android.content.DialogInterface
 import android.widget.Toast
-import androidx.appcompat.app.AlertDialog
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
@@ -21,7 +22,8 @@ class ReelFrenPlugin : Plugin() {
             val activity = CommonActivity.activity
             if (activity == null) {
                 Toast.makeText(context, "Cannot open settings right now", Toast.LENGTH_SHORT).show()
-                return@Plugin
+                // FIX 1: Cannot use return@Plugin. Use return@load instead.
+                return@load 
             }
 
             // The default 10 providers that will be pre-checked
@@ -93,27 +95,27 @@ class ReelFrenPlugin : Plugin() {
             
             val prefs = context.getSharedPreferences("reelfren_prefs", Context.MODE_PRIVATE)
             
-            // Apply the 10 defaults here
             val checkedStates = BooleanArray(providerNames.size) { index ->
                 val slug = providerSlugs[index]
                 prefs.getBoolean("provider_$slug", defaultEnabledSlugs.contains(slug))
             }
 
             activity.runOnUiThread {
+                // FIX 2: Use android.app.AlertDialog
                 AlertDialog.Builder(activity)
                     .setTitle("Select Providers")
-                    .setMultiChoiceItems(providerNames, checkedStates) { _, which, isChecked ->
+                    // FIX 3: Explicitly cast lambdas to DialogInterface listeners
+                    .setMultiChoiceItems(providerNames, checkedStates, DialogInterface.OnMultiChoiceClickListener { _, which, isChecked ->
                         checkedStates[which] = isChecked
-                    }
-                    .setPositiveButton("Save") { _, _ ->
+                    })
+                    .setPositiveButton("Save", DialogInterface.OnClickListener { _, _ ->
                         val editor = prefs.edit()
                         for (i in providerNames.indices) {
                             editor.putBoolean("provider_${providerSlugs[i]}", checkedStates[i])
                         }
                         editor.apply()
-                        
                         Toast.makeText(activity, "Providers updated! Restart extension to apply.", Toast.LENGTH_LONG).show()
-                    }
+                    })
                     .setNegativeButton("Cancel", null)
                     .show()
             }
