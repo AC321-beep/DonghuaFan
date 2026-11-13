@@ -34,7 +34,6 @@ class Reelfren : MainAPI() {
 
     private val seenIds = ConcurrentHashMap<String, MutableSet<String>>()
 
-    // FIX #2: `mainPage` is a property in this API, not a function.
     override val mainPage: List<MainPageData> =
         providersMap.map { (display, slug) -> slug to display }
             .let { mainPageOf(*it.toTypedArray()) }
@@ -119,11 +118,14 @@ class Reelfren : MainAPI() {
 
         val playback = ReelFrenClient.playback(slug, id, episode) ?: return false
 
-        // FIX #3: use the SubtitleFile constructor directly.
-        // The `newSubtitleFile(...)` helper in this version takes a suspend initializer
-        // as its 3rd argument — passing a String there causes the type mismatch.
+        // FIX: build the SubtitleFile via `newSubtitleFile(lang, label) { url = ... }`
+        // because SubtitleFile's 3rd positional arg is `headers`, not `url`.
         playback.subtitles.forEach { sub ->
-            subtitleCallback(SubtitleFile(sub.lang, sub.label, sub.url))
+            subtitleCallback(
+                newSubtitleFile(sub.lang, sub.label) {
+                    this.url = sub.url
+                }
+            )
         }
 
         var emitted = false
