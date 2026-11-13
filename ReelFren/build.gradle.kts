@@ -1,6 +1,6 @@
 cloudstream {
-    description = "Watch short dramas from ReelFren.net (PineDrama, Shorten, DramaBox, WeTV, iQIYI, ...)"
-    authors = listOf("your-handle")
+    description = "Watch short dramas from ReelFren (PineDrama, Shorten, DramaBox, WeTV, iQIYI etc.)"
+    authors = listOf("AC321-beep")
     status = 1
     tvTypes = listOf("TvSeries", "Movie", "AsianDrama")
     language = "en"
