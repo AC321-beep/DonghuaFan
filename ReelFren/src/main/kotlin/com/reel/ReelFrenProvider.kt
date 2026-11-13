@@ -1,6 +1,7 @@
 package com.reel
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.ExtractorLink
 import java.util.concurrent.ConcurrentHashMap
 
 class Reelfren : MainAPI() {
@@ -37,7 +38,8 @@ class Reelfren : MainAPI() {
         providersMap.map { (display, slug) -> slug to display }
             .let { mainPageOf(*it.toTypedArray()) }
 
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+    // FIX: must be `suspend` and return `HomePageResponse?`
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val slug = request.data
         val items = mutableListOf<SearchResponse>()
 
@@ -51,7 +53,7 @@ class Reelfren : MainAPI() {
         return newHomePageResponse(request, items, hasNext = items.isNotEmpty())
     }
 
-    override suspend fun search(query: String): List<SearchResponse> {
+    override suspend fun search(query: String): List<SearchResponse>? {
         val term = query.trim()
         if (term.isEmpty()) return emptyList()
 
@@ -99,6 +101,7 @@ class Reelfren : MainAPI() {
         }
     }
 
+    // FIX: signature stays `suspend`; types match base class exactly
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -110,11 +113,14 @@ class Reelfren : MainAPI() {
 
         val playback = ReelFrenClient.playback(slug, id, episode) ?: return false
 
+        // FIX: wrap strings with newSubtitleFile() — the callback expects a SubtitleFile,
+        // not three strings.
         playback.subtitles.forEach { sub ->
             subtitleCallback(newSubtitleFile(sub.lang, sub.label, sub.url))
         }
 
         var emitted = false
+        // ReelFrenDirectLink.build() is now `suspend` — safe to call here
         playback.qualities.forEach { q ->
             ReelFrenDirectLink.build(q)?.let { callback(it); emitted = true }
         }
