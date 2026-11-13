@@ -34,11 +34,11 @@ class Reelfren : MainAPI() {
 
     private val seenIds = ConcurrentHashMap<String, MutableSet<String>>()
 
-    override fun getMainPage(): List<MainPageData> =
+    // FIX #2: `mainPage` is a property in this API, not a function.
+    override val mainPage: List<MainPageData> =
         providersMap.map { (display, slug) -> slug to display }
             .let { mainPageOf(*it.toTypedArray()) }
 
-    // FIX: must be `suspend` and return `HomePageResponse?`
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val slug = request.data
         val items = mutableListOf<SearchResponse>()
@@ -81,7 +81,9 @@ class Reelfren : MainAPI() {
 
         return if (info.episodes > 1) {
             newTvSeriesLoadResponse(
-                name = info.title, url = url, type = TvType.TvSeries,
+                name = info.title,
+                url = url,
+                type = TvType.TvSeries,
                 episodes = info.videos.map { v ->
                     newEpisode(v.vid) {
                         name = "Episode ${v.episode}"
@@ -94,14 +96,18 @@ class Reelfren : MainAPI() {
                 this.plot = plot
             }
         } else {
-            newMovieLoadResponse(info.title, url, TvType.Movie, url) {
+            newMovieLoadResponse(
+                name = info.title,
+                url = url,
+                type = TvType.Movie,
+                dataUrl = url
+            ) {
                 posterUrl = cover
                 this.plot = plot
             }
         }
     }
 
-    // FIX: signature stays `suspend`; types match base class exactly
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -113,16 +119,19 @@ class Reelfren : MainAPI() {
 
         val playback = ReelFrenClient.playback(slug, id, episode) ?: return false
 
-        // FIX: wrap strings with newSubtitleFile() — the callback expects a SubtitleFile,
-        // not three strings.
+        // FIX #3: use the SubtitleFile constructor directly.
+        // The `newSubtitleFile(...)` helper in this version takes a suspend initializer
+        // as its 3rd argument — passing a String there causes the type mismatch.
         playback.subtitles.forEach { sub ->
-            subtitleCallback(newSubtitleFile(sub.lang, sub.label, sub.url))
+            subtitleCallback(SubtitleFile(sub.lang, sub.label, sub.url))
         }
 
         var emitted = false
-        // ReelFrenDirectLink.build() is now `suspend` — safe to call here
         playback.qualities.forEach { q ->
-            ReelFrenDirectLink.build(q)?.let { callback(it); emitted = true }
+            ReelFrenDirectLink.build(q)?.let {
+                callback(it)
+                emitted = true
+            }
         }
         return emitted
     }
