@@ -227,10 +227,6 @@ object ReelFrenClient {
     fun searchUrl(slug: String, term: String) =
         "${apiBase()}/api/search?q=${query(term)}&provider=${query(slug)}"
 
-    /**
-     * Persisted cf_clearance cookie + its matching UA are injected here.
-     * Mismatching either invalidates the cookie, forcing a re-solve.
-     */
     fun headers(url: String): Map<String, String> {
         val host = ReelFrenCloudflare.hostOf(url)
         val savedCookie = ReelFrenStore.cookie(host)
