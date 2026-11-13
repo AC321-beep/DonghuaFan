@@ -99,10 +99,6 @@ object ReelFrenCloudflare {
         }
     }
 
-    /**
-     * Obtain a valid cf_clearance cookie for the host of [url].
-     * Returns true when the cookie is set (cached or freshly solved).
-     */
     suspend fun solve(url: String, forceInteractive: Boolean = false): Boolean {
         val host = hostOf(url)
         if (host.isBlank()) return false
@@ -218,36 +214,4 @@ object ReelFrenCloudflare {
         }
 
         dialog = Dialog(activity)
-        val layout = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#0A0C12"))
-        }
-        layout.addView(TextView(activity).apply {
-            text = "Verifying you are human…"
-            setTextColor(Color.WHITE); textSize = 15f; setPadding(50, 50, 50, 50)
-        })
-
-        val wv = WebView(activity)
-        web = wv
-        cookies.setAcceptThirdPartyCookies(wv, true)
-        wv.settings.apply {
-            javaScriptEnabled = true; domStorageEnabled = true
-            databaseEnabled = true; userAgentString = ua
-        }
-        wv.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                if (resolved.get() || loadedUrl == "about:blank") return
-                val c = cookies.getCookie(loadedUrl ?: url) ?: ""
-                val t = view?.title ?: ""
-                if (c.contains("cf_clearance") && !isChallengeOrErrorTitle(t)) {
-                    Handler(Looper.getMainLooper()).postDelayed({ finish(true) }, 800L)
-                }
-            }
-        }
-        layout.addView(wv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1200))
-        dialog.setContentView(layout)
-        dialog.setOnDismissListener { finish(false) }
-        dialog.show()
-        wv.loadUrl(url)
-    }
-}
+        val layout = LinearLayout(activity
