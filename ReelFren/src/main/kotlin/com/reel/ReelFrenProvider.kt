@@ -1,8 +1,7 @@
 package com.reel
 
+import android.content.Context
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.settings.CheckBoxSetting
-import com.lagradost.cloudstream3.settings.Settings
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import java.util.concurrent.ConcurrentHashMap
 
@@ -18,7 +17,18 @@ class Reelfren : MainAPI() {
     override val getMainPageTimeoutMs = 240_000L
     override val supportedTypes = setOf(TvType.TvSeries, TvType.Movie, TvType.AsianDrama)
 
-    // Your existing provider map
+    // ── 1. SharedPreferences Helper ─────────────────────────────────────────
+    // We use a companion object so the plugin can pass the context to us.
+    companion object {
+        private var appContext: Context? = null
+        fun setContext(context: Context) {
+            appContext = context.applicationContext
+        }
+        private fun getPrefs(): android.content.SharedPreferences? {
+            return appContext?.getSharedPreferences("reelfren_prefs", Context.MODE_PRIVATE)
+        }
+    }
+
     private val providersMap: LinkedHashMap<String, String> = linkedMapOf(
         "PineDrama"       to "pinedrama",
         "Shorten"         to "shorten",
@@ -37,25 +47,13 @@ class Reelfren : MainAPI() {
 
     private val seenIds = ConcurrentHashMap<String, MutableSet<String>>()
 
-    // ── 1. ADD SETTINGS FOR CHECKBOXES ──────────────────────────────────────
-    override val settings: List<Settings> by lazy {
-        providersMap.map { (display, slug) ->
-            CheckBoxSetting(
-                name = "Show $display",
-                key = "provider_$slug",
-                default = true // Default all to ON
-            )
-        }
-    }
-
-    // ── 2. FILTER HOMEPAGE TABS DYNAMICALLY ─────────────────────────────────
+    // ── 2. Dynamically Build MainPage from Preferences ─────────────────────
     override val mainPage: List<MainPageData>
         get() {
-            val prefs = getPluginPreferences()
-            // Only keep providers that are checked in settings
+            val prefs = getPrefs()
             val enabledProviders = providersMap.filter { (_, slug) ->
-                prefs.getBoolean("provider_$slug", true)
-            }.ifEmpty { providersMap } // Fallback if user disables everything
+                prefs?.getBoolean("provider_$slug", true) ?: true
+            }.ifEmpty { providersMap } // Fallback to all if empty
 
             return enabledProviders.map { (display, slug) -> slug to display }
                 .let { mainPageOf(*it.toTypedArray()) }
@@ -75,18 +73,17 @@ class Reelfren : MainAPI() {
         return newHomePageResponse(request, items, hasNext = items.isNotEmpty())
     }
 
-    // ── 3. FILTER SEARCH RESULTS ───────────────────────────────────────────
+    // ── 3. Filter Search Based on Preferences ─────────────────────────────
     override suspend fun search(query: String): List<SearchResponse>? {
         val term = query.trim()
         if (term.isEmpty()) return emptyList()
 
         val results = LinkedHashMap<String, SearchResponse>()
         val deadline = System.currentTimeMillis() + 45_000L
-        val prefs = getPluginPreferences()
+        val prefs = getPrefs()
 
-        // Only search through enabled providers
         val enabledSlugs = providersMap.values.filter { slug ->
-            prefs.getBoolean("provider_$slug", true)
+            prefs?.getBoolean("provider_$slug", true) ?: true
         }.ifEmpty { providersMap.values }
 
         for (slug in enabledSlugs) {
@@ -114,9 +111,7 @@ class Reelfren : MainAPI() {
                 url = url,
                 type = TvType.TvSeries,
                 episodes = info.videos.map { v ->
-                    // ── 4. PLAYBACK BUG FIX HERE ────────────────────────────
-                    // Pass the full URL instead of just v.vid, so loadLinks
-                    // can parse the slug, id, and episode number correctly.
+                    // ── PLAYBACK BUG FIX ────────────────────────────────────
                     newEpisode(ReelFrenUrl.episode(slug, id, v.episode)) {
                         name = "Episode ${v.episode}"
                         episode = v.episode
@@ -146,7 +141,6 @@ class Reelfren : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // This will now correctly parse "https://reelfren.net/watch/slug/id?ep=1"
         val (slug, id, episode) = ReelFrenUrl.parse(data)
         if (slug.isEmpty() || id.isEmpty()) return false
 
