@@ -8,13 +8,9 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
-/**
- * Turns a ReelFren QualityEntry into an ExtractorLink.
- * Headers include the persisted cf_clearance cookie and its matching UA;
- * without them the CDN returns 403.
- */
 object ReelFrenDirectLink {
-    fun build(q: QualityEntry): ExtractorLink? {
+    // FIX: `newExtractorLink` is suspend, so the caller must be suspend too
+    suspend fun build(q: QualityEntry): ExtractorLink? {
         if (q.url.isEmpty()) return null
         val type = when {
             q.format.equals("hls",  true) || q.url.contains(".m3u8", true) -> ExtractorLinkType.M3U8
@@ -32,12 +28,10 @@ object ReelFrenDirectLink {
     }
 }
 
-/**
- * Fallback extractor for redirect-based links.
- * Add new providers (filemoon, streamtape, …) as additional ExtractorApi classes here.
- */
 class ReelFrenDirectLinkExtractor : ExtractorApi() {
     override val name = "ReelFrenDirect"
+    // FIX: ExtractorApi.mainUrl is abstract and must be overridden
+    override val mainUrl = ReelFrenConfig.REEL_SITE
     override val requiresReferer = true
 
     override suspend fun getUrl(
@@ -56,6 +50,6 @@ class ReelFrenDirectLinkExtractor : ExtractorApi() {
             this.referer = referer ?: ReelFrenConfig.REEL_SITE
             this.quality = Qualities.Unknown.value
             this.headers = ReelFrenClient.headers(resolved)
-        } ?: return)
+        })
     }
 }
