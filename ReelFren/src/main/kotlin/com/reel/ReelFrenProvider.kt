@@ -17,8 +17,6 @@ class Reelfren : MainAPI() {
     override val getMainPageTimeoutMs = 240_000L
     override val supportedTypes = setOf(TvType.TvSeries, TvType.Movie, TvType.AsianDrama)
 
-    // ── 1. SharedPreferences Helper ─────────────────────────────────────────
-    // We use a companion object so the plugin can pass the context to us.
     companion object {
         private var appContext: Context? = null
         fun setContext(context: Context) {
@@ -29,31 +27,80 @@ class Reelfren : MainAPI() {
         }
     }
 
-    private val providersMap: LinkedHashMap<String, String> = linkedMapOf(
+    // ── DEFAULT 10 PROVIDERS ────────────────────────────────────────────────
+    private val defaultEnabledSlugs = setOf(
+        "dramabox", "reelshort", "wetv", "happyshort", "shorten",
+        "dramawave", "shortmax", "netshort", "pinedrama", "vigloo"
+    )
+
+    val providersMap: LinkedHashMap<String, String> = linkedMapOf(
+        "Anamana"         to "anamana",
+        "AniBoy"          to "aniboy",
+        "Melolo"          to "melolo",
+        "Sereal+"         to "sereal",
         "PineDrama"       to "pinedrama",
         "Shorten"         to "shorten",
         "HappyShort"      to "happyshort",
         "Vigloo"          to "vigloo",
+        "Vigloo 2"        to "vigloo2",
+        "RapidTV"         to "rapidtv",
+        "RapidTV 2"       to "rapidtv2",
+        "RaptDrama"       to "raptdrama",
+        "CubeTV"          to "cubetv",
+        "JoyReels"        to "joyreels",
+        "AnyReel"         to "anyreel",
+        "Shortical"       to "shortical",
+        "StoReel"         to "storeel",
+        "LoveShots"       to "loveshots",
+        "MomeShort"       to "momeshort",
+        "MoreShort"       to "moreshort",
+        "ToonShort"       to "toonshort",
+        "SixthShort"      to "sixthshort",
+        "SoReel"          to "soreel",
+        "StoryGo"         to "storygo",
+        "MiniShort"       to "minishort",
+        "WinkNovel"       to "winknovel",
+        "My Muse"         to "mymuse",
+        "SarosTV"         to "sarostv",
+        "ReelAI"          to "reelai",
+        "Reelife"         to "reelife",
         "ReelShort"       to "reelshort",
+        "ReelShort 2"     to "reelshort2",
         "DramaBox"        to "dramabox",
+        "DramaWave"       to "dramawave",
+        "DramaNova"       to "dramanova",
+        "KalosTV"         to "kalostv",
+        "VibeShort"       to "vibeshort",
+        "FreeReels"       to "freereels",
         "WeTV"            to "wetv",
-        "MovieBox"        to "moviebox",
+        "StoryReel"       to "storyreel",
         "MovieBox Shorts" to "movieboxshorts",
+        "BonusTV"         to "bonustv",
+        "MoboReels"       to "moboreels",
+        "NetShort"        to "netshort",
+        "MyDrama"         to "mydrama",
+        "FlareFlow"       to "flareflow",
+        "PlayLet"         to "playlet",
         "ShortMax"        to "shortmax",
         "FlexTV"          to "flextv",
+        "FlexTV 2"        to "flextv2",
+        "CandyJar"        to "candyjar",
+        "BlinkDrama"      to "blinkdrama",
         "iQIYI"           to "iqiyi",
+        "MovieBox"        to "moviebox",
         "FilmBox"         to "filmbox"
     )
 
     private val seenIds = ConcurrentHashMap<String, MutableSet<String>>()
 
-    // ── 2. Dynamically Build MainPage from Preferences ─────────────────────
     override val mainPage: List<MainPageData>
         get() {
             val prefs = getPrefs()
+            // Check prefs, fallback to the default 10 list
             val enabledProviders = providersMap.filter { (_, slug) ->
-                prefs?.getBoolean("provider_$slug", true) ?: true
-            }.ifEmpty { providersMap } // Fallback to all if empty
+                prefs?.getBoolean("provider_$slug", defaultEnabledSlugs.contains(slug)) 
+                    ?: defaultEnabledSlugs.contains(slug)
+            }.ifEmpty { providersMap }
 
             return enabledProviders.map { (display, slug) -> slug to display }
                 .let { mainPageOf(*it.toTypedArray()) }
@@ -73,7 +120,6 @@ class Reelfren : MainAPI() {
         return newHomePageResponse(request, items, hasNext = items.isNotEmpty())
     }
 
-    // ── 3. Filter Search Based on Preferences ─────────────────────────────
     override suspend fun search(query: String): List<SearchResponse>? {
         val term = query.trim()
         if (term.isEmpty()) return emptyList()
@@ -82,8 +128,10 @@ class Reelfren : MainAPI() {
         val deadline = System.currentTimeMillis() + 45_000L
         val prefs = getPrefs()
 
+        // Check prefs, fallback to the default 10 list
         val enabledSlugs = providersMap.values.filter { slug ->
-            prefs?.getBoolean("provider_$slug", true) ?: true
+            prefs?.getBoolean("provider_$slug", defaultEnabledSlugs.contains(slug)) 
+                ?: defaultEnabledSlugs.contains(slug)
         }.ifEmpty { providersMap.values }
 
         for (slug in enabledSlugs) {
@@ -111,7 +159,6 @@ class Reelfren : MainAPI() {
                 url = url,
                 type = TvType.TvSeries,
                 episodes = info.videos.map { v ->
-                    // ── PLAYBACK BUG FIX ────────────────────────────────────
                     newEpisode(ReelFrenUrl.episode(slug, id, v.episode)) {
                         name = "Episode ${v.episode}"
                         episode = v.episode
