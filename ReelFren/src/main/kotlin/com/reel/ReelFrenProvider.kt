@@ -1,6 +1,8 @@
 package com.reel
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.settings.CheckBoxSetting
+import com.lagradost.cloudstream3.settings.Settings
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import java.util.concurrent.ConcurrentHashMap
 
@@ -16,6 +18,7 @@ class Reelfren : MainAPI() {
     override val getMainPageTimeoutMs = 240_000L
     override val supportedTypes = setOf(TvType.TvSeries, TvType.Movie, TvType.AsianDrama)
 
+    // Your existing provider map
     private val providersMap: LinkedHashMap<String, String> = linkedMapOf(
         "PineDrama"       to "pinedrama",
         "Shorten"         to "shorten",
@@ -34,9 +37,29 @@ class Reelfren : MainAPI() {
 
     private val seenIds = ConcurrentHashMap<String, MutableSet<String>>()
 
-    override val mainPage: List<MainPageData> =
-        providersMap.map { (display, slug) -> slug to display }
-            .let { mainPageOf(*it.toTypedArray()) }
+    // ── 1. ADD SETTINGS FOR CHECKBOXES ──────────────────────────────────────
+    override val settings: List<Settings> by lazy {
+        providersMap.map { (display, slug) ->
+            CheckBoxSetting(
+                name = "Show $display",
+                key = "provider_$slug",
+                default = true // Default all to ON
+            )
+        }
+    }
+
+    // ── 2. FILTER HOMEPAGE TABS DYNAMICALLY ─────────────────────────────────
+    override val mainPage: List<MainPageData>
+        get() {
+            val prefs = getPluginPreferences()
+            // Only keep providers that are checked in settings
+            val enabledProviders = providersMap.filter { (_, slug) ->
+                prefs.getBoolean("provider_$slug", true)
+            }.ifEmpty { providersMap } // Fallback if user disables everything
+
+            return enabledProviders.map { (display, slug) -> slug to display }
+                .let { mainPageOf(*it.toTypedArray()) }
+        }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val slug = request.data
@@ -52,14 +75,21 @@ class Reelfren : MainAPI() {
         return newHomePageResponse(request, items, hasNext = items.isNotEmpty())
     }
 
+    // ── 3. FILTER SEARCH RESULTS ───────────────────────────────────────────
     override suspend fun search(query: String): List<SearchResponse>? {
         val term = query.trim()
         if (term.isEmpty()) return emptyList()
 
         val results = LinkedHashMap<String, SearchResponse>()
         val deadline = System.currentTimeMillis() + 45_000L
+        val prefs = getPluginPreferences()
 
-        for (slug in providersMap.values) {
+        // Only search through enabled providers
+        val enabledSlugs = providersMap.values.filter { slug ->
+            prefs.getBoolean("provider_$slug", true)
+        }.ifEmpty { providersMap.values }
+
+        for (slug in enabledSlugs) {
             if (System.currentTimeMillis() > deadline) break
             runCatching {
                 ReelFrenClient.search(slug, term).forEach { item ->
@@ -84,7 +114,10 @@ class Reelfren : MainAPI() {
                 url = url,
                 type = TvType.TvSeries,
                 episodes = info.videos.map { v ->
-                    newEpisode(v.vid) {
+                    // ── 4. PLAYBACK BUG FIX HERE ────────────────────────────
+                    // Pass the full URL instead of just v.vid, so loadLinks
+                    // can parse the slug, id, and episode number correctly.
+                    newEpisode(ReelFrenUrl.episode(slug, id, v.episode)) {
                         name = "Episode ${v.episode}"
                         episode = v.episode
                         posterUrl = cover
@@ -113,13 +146,12 @@ class Reelfren : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // This will now correctly parse "https://reelfren.net/watch/slug/id?ep=1"
         val (slug, id, episode) = ReelFrenUrl.parse(data)
         if (slug.isEmpty() || id.isEmpty()) return false
 
         val playback = ReelFrenClient.playback(slug, id, episode) ?: return false
 
-        // FIX: build the SubtitleFile via `newSubtitleFile(lang, label) { url = ... }`
-        // because SubtitleFile's 3rd positional arg is `headers`, not `url`.
         playback.subtitles.forEach { sub ->
             subtitleCallback(
                 newSubtitleFile(sub.lang, sub.label) {
