@@ -34,6 +34,8 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.Interceptor
+import okhttp3.Response
 import org.json.JSONTokener
 import java.io.ByteArrayInputStream
 import java.net.URI
@@ -137,6 +139,8 @@ object CFState {
     private const val HTML_CACHE_TTL_MS = 45_000L
     private val failedUntil = ConcurrentHashMap<String, Long>()
 
+    @Volatile private var prewarmStarted = false
+
     val solverScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private fun normalizeUrl(url: String): String = url.trim().trimEnd('/')
@@ -154,6 +158,13 @@ object CFState {
     suspend fun <T> withColdStartLock(host: String, block: suspend () -> T): T {
         val mutex = coldStartLocks.getOrPut(host.lowercase()) { Mutex() }
         return mutex.withLock { block() }
+    }
+
+    // Retained for binary/source compatibility if called from AnimekhorProvider.init or Plugin
+    fun prewarmIfNeeded() {
+        if (prewarmStarted) return
+        prewarmStarted = true
+        runCatching { getBrowserUserAgent() }
     }
 
     fun getBrowserUserAgent(context: Context? = CommonActivity.activity): String {
@@ -340,6 +351,31 @@ object CFState {
         }
 }
 
+class CFInterceptor : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val original = chain.request()
+        val host = original.url.host
+        val builder = original.newBuilder()
+
+        val ua = CFState.userAgentFor(host) ?: CFState.getBrowserUserAgent()
+        builder.header("User-Agent", ua)
+        builder.removeHeader("X-Requested-With")
+
+        val existing = original.header("Cookie")
+        val managed = CFState.extractAllCookies(host, original.url.toString())
+        val merged = CFState.mergeCookies(existing, managed)
+        if (merged.isNotEmpty()) {
+            builder.header("Cookie", merged)
+        }
+
+        builder.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+        builder.header("Accept-Language", "en-US,en;q=0.9")
+        builder.header("Upgrade-Insecure-Requests", "1")
+
+        return chain.proceed(builder.build())
+    }
+}
+
 class CFSolver(
     private val url: String,
     private val skipSilent: Boolean = false,
@@ -414,7 +450,6 @@ class CFSolver(
                     CFState.markHostVerified(host)
                     deferred.complete(true)
                 } else if (isPrewarm) {
-                    // Never pop up an interactive dialog over the user's screen during background pre-warm
                     log("⏭ Pre-warm silent solve did not complete; skipping interactive dialog.")
                     deferred.complete(false)
                 } else {
@@ -497,12 +532,6 @@ class CFSolver(
                     if (cont.isActive) cont.resume(success)
                 }
 
-                fun scheduleNextPoll(delayMs: Long = 1000L) {
-                    if (done.get()) return
-                    pollRunnable?.let { handler.removeCallbacks(it) }
-                    pollRunnable = Runnable { poll() }.also { handler.postDelayed(it, delayMs) }
-                }
-
                 fun poll() {
                     if (done.get()) return
                     tick++
@@ -517,8 +546,6 @@ class CFSolver(
                         "🔍 [Silent] tick#$tick title='$title' cookieLen=${rawCookie.length} hasClearance=$hasClearance"
                     )
 
-                    // Inspect the DOM whenever the title is clean OR cf_clearance is present.
-                    // Does NOT require hasClearance=true when the real page has already loaded.
                     if (!onChallenge || hasClearance) {
                         runCatching {
                             webView.evaluateJavascript(
@@ -541,8 +568,9 @@ class CFSolver(
                                     CFState.storeSolvedHtml(url, html)
                                     webView.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
                                     destroyWebView(true)
-                                } else {
-                                    scheduleNextPoll(1000L)
+                                } else if (!done.get()) {
+                                    pollRunnable?.let { handler.removeCallbacks(it) }
+                                    pollRunnable = Runnable { poll() }.also { handler.postDelayed(it, 1000L) }
                                 }
                             }
                         }.onFailure { destroyWebView(false) }
@@ -554,7 +582,8 @@ class CFSolver(
                         pressTabThenSpace(webView, handler)
                     }
 
-                    scheduleNextPoll(1000L)
+                    pollRunnable?.let { handler.removeCallbacks(it) }
+                    pollRunnable = Runnable { poll() }.also { handler.postDelayed(it, 1000L) }
                 }
 
                 webView.webViewClient = object : WebViewClient() {
@@ -581,7 +610,8 @@ class CFSolver(
                         val currentUrl = loadedUrl ?: url
                         if (currentUrl == "about:blank" || done.get()) return
                         Log.e("Animekhor/CFSolver", "🔍 [Silent] Page Finished: URL=$currentUrl")
-                        scheduleNextPoll(400L)
+                        pollRunnable?.let { handler.removeCallbacks(it) }
+                        pollRunnable = Runnable { poll() }.also { handler.postDelayed(it, 400L) }
                     }
                 }
 
@@ -714,12 +744,6 @@ class CFSolver(
                     mediaPlaybackRequiresUserGesture = false
                 }
 
-                fun scheduleNextCheck(delayMs: Long = 1000L) {
-                    if (resolved.get()) return
-                    checkRunnable?.let { handler.removeCallbacks(it) }
-                    checkRunnable = Runnable { poll() }.also { handler.postDelayed(it, delayMs) }
-                }
-
                 fun poll() {
                     if (resolved.get()) return
                     tick++
@@ -733,7 +757,6 @@ class CFSolver(
                         "🔍 [Dialog] tick#$tick title='$title' cookieLen=${rawCookie.length} hasClearance=$hasClearance"
                     )
 
-                    // Auto-close as soon as the real site DOM is present, without requiring cf_clearance
                     if (!onChallenge || hasClearance) {
                         webView.evaluateJavascript(
                             "(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();"
@@ -747,10 +770,11 @@ class CFSolver(
                                 CFState.storeSolvedHtml(url, html)
                                 webView.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
                                 finish(true)
-                            } else {
+                            } else if (!resolved.get()) {
                                 status.text = "Complete the verification below, then tap Continue."
                                 status.setTextColor(Color.parseColor("#A0A0A0"))
-                                scheduleNextCheck(1000L)
+                                checkRunnable?.let { handler.removeCallbacks(it) }
+                                checkRunnable = Runnable { poll() }.also { handler.postDelayed(it, 1000L) }
                             }
                         }
                         return
@@ -761,7 +785,8 @@ class CFSolver(
                         pressTabThenSpace(webView, handler)
                     }
 
-                    scheduleNextCheck(1000L)
+                    checkRunnable?.let { handler.removeCallbacks(it) }
+                    checkRunnable = Runnable { poll() }.also { handler.postDelayed(it, 1000L) }
                 }
 
                 webView.webViewClient = object : WebViewClient() {
@@ -782,7 +807,8 @@ class CFSolver(
                     override fun onPageFinished(view: WebView?, loadedUrl: String?) {
                         val currentUrl = loadedUrl ?: url
                         if (currentUrl == "about:blank" || resolved.get()) return
-                        scheduleNextCheck(500L)
+                        checkRunnable?.let { handler.removeCallbacks(it) }
+                        checkRunnable = Runnable { poll() }.also { handler.postDelayed(it, 500L) }
                     }
                 }
 
