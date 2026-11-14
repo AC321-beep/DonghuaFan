@@ -65,7 +65,7 @@ class Reelfren : MainAPI() {
         ReelFrenLog.d("Main/search", "ENTRY query='$term'")
 
         val results = ConcurrentHashMap<String, SearchResponse>()
-        val deadline = System.currentTimeMillis() + 45_000L
+        val deadline = System.currentTimeMillis() + 60_000L
         val enabledSlugs = ReelFrenStore.enabledProviders().values.toList()
         val semaphore = Semaphore(4)
 
@@ -176,7 +176,7 @@ class Reelfren : MainAPI() {
             "${item.title} [NEW]"
         }
 
-        return if (item.episodes > 1) {
+        return if (item.episodes != 1) {
             newTvSeriesSearchResponse(displayTitle, url, TvType.TvSeries) {
                 this.posterUrl = poster
                 this.posterHeaders = imgHeaders
