@@ -21,13 +21,15 @@ class Reelfren : MainAPI() {
         private var appContext: Context? = null
         fun setContext(context: Context) {
             appContext = context.applicationContext
+            ReelFrenCfLog.d("Main/ctx", "setContext(${context.applicationContext})")
         }
         private fun getPrefs(): android.content.SharedPreferences? {
-            return appContext?.getSharedPreferences("reelfren_prefs", Context.MODE_PRIVATE)
+            val p = appContext?.getSharedPreferences("reelfren_prefs", Context.MODE_PRIVATE)
+            ReelFrenCfLog.d("Main/prefs", "getPrefs() -> ${if (p == null) "NULL" else "ok"}")
+            return p
         }
     }
 
-    // ── DEFAULT 10 PROVIDERS ────────────────────────────────────────────────
     private val defaultEnabledSlugs = setOf(
         "dramabox", "reelshort", "wetv", "happyshort", "shorten",
         "dramawave", "shortmax", "netshort", "pinedrama", "vigloo"
@@ -96,62 +98,87 @@ class Reelfren : MainAPI() {
     override val mainPage: List<MainPageData>
         get() {
             val prefs = getPrefs()
-            // Check prefs, fallback to the default 10 list
             val enabledProviders = providersMap.filter { (_, slug) ->
-                prefs?.getBoolean("provider_$slug", defaultEnabledSlugs.contains(slug)) 
+                prefs?.getBoolean("provider_$slug", defaultEnabledSlugs.contains(slug))
                     ?: defaultEnabledSlugs.contains(slug)
             }.ifEmpty { providersMap }
 
-            return enabledProviders.map { (display, slug) -> slug to display }
+            ReelFrenCfLog.d("Main/mainPage",
+                "getter: prefs=${prefs != null} enabledSlugs=${enabledProviders.values.toList()}")
+
+            val result = enabledProviders.map { (display, slug) -> slug to display }
                 .let { mainPageOf(*it.toTypedArray()) }
+            ReelFrenCfLog.d("Main/mainPage", "returning ${result.size} pages")
+            return result
         }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val slug = request.data
+        ReelFrenCfLog.d("Main/getMainPage", "ENTRY page=$page slug=$slug name=${request.name}")
         val items = mutableListOf<SearchResponse>()
 
-        runCatching {
+        try {
+            ReelFrenCfLog.d("Main/getMainPage", "calling ReelFrenClient.home($slug, page=$page)")
             val homeItems = ReelFrenClient.home(slug, page = page)
+            ReelFrenCfLog.d("Main/getMainPage", "ReelFrenClient.home returned size=${homeItems.size}")
             val seen = seenIds.getOrPut(slug) { mutableSetOf() }
             homeItems.filter { it.id !in seen }.forEach { item ->
                 toCard(slug, item)?.let { items.add(it); seen.add(item.id) }
             }
+            ReelFrenCfLog.d("Main/getMainPage",
+                "filtered items=${items.size} seen=${seen.size}")
+        } catch (e: Exception) {
+            ReelFrenCfLog.t("Main/getMainPage", e)
         }
-        return newHomePageResponse(request, items, hasNext = items.isNotEmpty())
+
+        val resp = newHomePageResponse(request, items, hasNext = items.isNotEmpty())
+        ReelFrenCfLog.d("Main/getMainPage", "EXIT slug=$slug items=${items.size}")
+        return resp
     }
 
     override suspend fun search(query: String): List<SearchResponse>? {
         val term = query.trim()
+        ReelFrenCfLog.d("Main/search", "ENTRY query='$term'")
         if (term.isEmpty()) return emptyList()
 
         val results = LinkedHashMap<String, SearchResponse>()
         val deadline = System.currentTimeMillis() + 45_000L
         val prefs = getPrefs()
 
-        // Check prefs, fallback to the default 10 list
         val enabledSlugs = providersMap.values.filter { slug ->
-            prefs?.getBoolean("provider_$slug", defaultEnabledSlugs.contains(slug)) 
+            prefs?.getBoolean("provider_$slug", defaultEnabledSlugs.contains(slug))
                 ?: defaultEnabledSlugs.contains(slug)
         }.ifEmpty { providersMap.values }
 
         for (slug in enabledSlugs) {
-            if (System.currentTimeMillis() > deadline) break
+            if (System.currentTimeMillis() > deadline) {
+                ReelFrenCfLog.d("Main/search", "deadline hit before slug=$slug")
+                break
+            }
             runCatching {
+                ReelFrenCfLog.d("Main/search", "querying slug=$slug")
                 ReelFrenClient.search(slug, term).forEach { item ->
                     toCard(slug, item)?.let { results[it.url] = it }
                 }
-            }
+            }.onFailure { ReelFrenCfLog.t("Main/search", it) }
         }
+        ReelFrenCfLog.d("Main/search", "EXIT results=${results.size}")
         return results.values.take(60)
     }
 
     override suspend fun load(url: String): LoadResponse? {
+        ReelFrenCfLog.d("Main/load", "ENTRY url=$url")
         val (slug, id, _) = ReelFrenUrl.parse(url)
+        ReelFrenCfLog.d("Main/load", "parsed slug=$slug id=$id")
         if (slug.isEmpty() || id.isEmpty()) return null
 
-        val info = ReelFrenClient.detail(slug, id) ?: return null
+        val info = ReelFrenClient.detail(slug, id) ?: run {
+            ReelFrenCfLog.d("Main/load", "detail NULL -> return null")
+            return null
+        }
         val cover = ReelFrenClient.absUrl(info.cover).ifEmpty { null }
         val plot = info.intro.takeIf { it.isNotEmpty() }
+        ReelFrenCfLog.d("Main/load", "detail title='${info.title}' episodes=${info.episodes} videos=${info.videos.size}")
 
         return if (info.episodes > 1) {
             newTvSeriesLoadResponse(
@@ -188,16 +215,20 @@ class Reelfren : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        ReelFrenCfLog.d("Main/loadLinks", "ENTRY data=$data isCasting=$isCasting")
         val (slug, id, episode) = ReelFrenUrl.parse(data)
         if (slug.isEmpty() || id.isEmpty()) return false
 
-        val playback = ReelFrenClient.playback(slug, id, episode) ?: return false
+        val playback = ReelFrenClient.playback(slug, id, episode) ?: run {
+            ReelFrenCfLog.d("Main/loadLinks", "playback NULL -> false")
+            return false
+        }
+        ReelFrenCfLog.d("Main/loadLinks",
+            "playback subs=${playback.subtitles.size} quals=${playback.qualities.size}")
 
         playback.subtitles.forEach { sub ->
             subtitleCallback(
-                newSubtitleFile(sub.lang, sub.label) {
-                    this.url = sub.url
-                }
+                newSubtitleFile(sub.lang, sub.label) { this.url = sub.url }
             )
         }
 
@@ -208,6 +239,7 @@ class Reelfren : MainAPI() {
                 emitted = true
             }
         }
+        ReelFrenCfLog.d("Main/loadLinks", "EXIT emitted=$emitted")
         return emitted
     }
 
