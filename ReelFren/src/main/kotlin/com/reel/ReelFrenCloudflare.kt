@@ -5,320 +5,459 @@ import android.app.Activity
 import android.app.Dialog
 import android.content.Context
 import android.content.ContextWrapper
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
+import android.os.SystemClock
+import android.view.MotionEvent
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.lagradost.cloudstream3.CommonActivity
 import kotlinx.coroutines.*
+import okhttp3.Headers
 import java.net.URI
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
-// ── Centralised logger ──────────────────────────────────────────────────────
-object ReelFrenCfLog {
-    private const val TAG = "ReelFren/CF"
-    fun d(scope: String, msg: String) {
-        val t = Thread.currentThread().name
-        Log.e(TAG, "[$scope][$t] $msg")
-    }
-    fun t(scope: String, e: Throwable) {
-        Log.e(TAG, "[$scope] THROWABLE ${e.javaClass.simpleName}: ${e.message}", e)
-    }
-}
+// ── In-Flight Coalescing State with Escalation Support ───────────────────────
+class SolveSession(
+    val deferred: CompletableDeferred<Boolean> = CompletableDeferred(),
+    val allowInteractive: AtomicBoolean = AtomicBoolean(false),
+    @Volatile var abortSilent: (() -> Unit)? = null
+)
 
-// ── Shared state ────────────────────────────────────────────────────────────
 object ReelFrenCfState {
-    private val userAgents = ConcurrentHashMap<String, String>()
-    private val solving    = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
+    private val solving = ConcurrentHashMap<String, SolveSession>()
     val solverScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    fun userAgentFor(host: String): String? {
-        val v = userAgents[host]
-        ReelFrenCfLog.d("State/UA", "userAgentFor($host) -> ${if (v == null) "null" else "len=${v.length}"}")
-        return v
-    }
-
-    fun setUserAgent(host: String, ua: String) {
-        if (ua.isNotBlank()) {
-            userAgents[host] = ua
-            ReelFrenCfLog.d("State/UA", "setUserAgent($host) -> ${ua.take(80)}")
+    /**
+     * Coalesces concurrent solves for the same host. If a background pre-warm
+     * started with `allowInteractive = false` and a foreground request joins
+     * with `interactiveAllowed = true`, the running session is upgraded in-place
+     * so it will not return `false` without showing the interactive dialog if needed.
+     */
+    fun beginSolve(
+        host: String,
+        interactiveAllowed: Boolean,
+        forceInteractive: Boolean
+    ): Pair<SolveSession, Boolean> {
+        val fresh = SolveSession(allowInteractive = AtomicBoolean(interactiveAllowed))
+        val existing = solving.putIfAbsent(host, fresh)
+        return if (existing == null) {
+            fresh to true
+        } else {
+            if (interactiveAllowed) {
+                existing.allowInteractive.set(true)
+            }
+            if (forceInteractive) {
+                existing.abortSilent?.invoke()
+            }
+            existing to false
         }
     }
 
-    fun beginSolve(host: String): Pair<CompletableDeferred<Boolean>, Boolean> {
-        val fresh = CompletableDeferred<Boolean>()
-        val existing = solving.putIfAbsent(host, fresh)
-        val isOwner = existing == null
-        ReelFrenCfLog.d("State/solve", "beginSolve($host) isOwner=$isOwner existing=${existing != null}")
-        return if (isOwner) fresh to true else existing to false
-    }
-
-    fun endSolve(host: String, deferred: CompletableDeferred<Boolean>) {
-        ReelFrenCfLog.d("State/solve", "endSolve($host) wasCompleted=${deferred.isCompleted}")
-        if (!deferred.isCompleted) deferred.complete(false)
-        solving.remove(host, deferred)
+    fun endSolve(host: String, session: SolveSession) {
+        if (!session.deferred.isCompleted) session.deferred.complete(false)
+        solving.remove(host, session)
     }
 }
 
-// ── Solver ──────────────────────────────────────────────────────────────────
+// ── Cloudflare Solver ────────────────────────────────────────────────────────
 object ReelFrenCloudflare {
 
-    @Volatile private var appContext: Context? = null
-    fun init(ctx: Context) {
-        appContext = ctx.applicationContext
-        ReelFrenCfLog.d("init", "appContext=${ctx.applicationContext}")
-    }
+    private val clearanceRegex = Regex("(?:^|;\\s*)cf_clearance=([^;]+)")
+    private const val WEBDRIVER_PATCH_JS =
+        "(function(){try{Object.defineProperty(navigator,'webdriver',{get:()=>undefined})}catch(e){}})();"
 
     fun hostOf(url: String): String =
-        runCatching { URI(url).host }.getOrNull()?.lowercase() ?: ""
+        runCatching { URI(url).host }.getOrNull()?.lowercase(Locale.ROOT) ?: ""
 
-    fun isChallengeBody(body: String): Boolean {
-        val lower = body.lowercase()
-        val hit = lower.contains("just a moment") ||
-                  lower.contains("checking your browser") ||
-                  lower.contains("cf-challenge") ||
-                  lower.contains("attention required")
-        ReelFrenCfLog.d("body", "isChallengeBody len=${body.length} hit=$hit")
-        return hit
+    fun extractClearanceToken(cookieHeader: String?): String =
+        cookieHeader?.let { clearanceRegex.find(it)?.groupValues?.getOrNull(1) }.orEmpty()
+
+    fun isChallengeResponse(code: Int, headers: Headers?, body: String): Boolean {
+        if (headers?.get("cf-mitigated")?.equals("challenge", ignoreCase = true) == true) {
+            return true
+        }
+        val trimmed = body.trimStart()
+        if (code in 200..299 && (trimmed.startsWith("{") || trimmed.startsWith("["))) {
+            return false
+        }
+        if (code == 403 || code == 503 || code == 429) {
+            if (headers?.get("server")?.contains("cloudflare", ignoreCase = true) == true) {
+                return true
+            }
+        }
+        return isChallengeBody(trimmed)
     }
 
-    private fun isChallengeOrErrorTitle(title: String): Boolean {
-        val t = title.lowercase().trim()
-        return t.isBlank() || t == "about:blank" ||
+    fun isChallengeBody(body: String): Boolean {
+        if (body.isEmpty()) return false
+        val firstChar = body[0]
+        if (firstChar == '{' || firstChar == '[') return false
+        val sample = if (body.length > 6000) body.substring(0, 6000) else body
+        val lower = sample.lowercase(Locale.ROOT)
+        return lower.contains("just a moment") ||
+               lower.contains("checking your browser") ||
+               lower.contains("cf-challenge") ||
+               lower.contains("_cf_chl_opt") ||
+               lower.contains("cf-turnstile") ||
+               lower.contains("attention required")
+    }
+
+    private fun isChallengeOrBlankTitle(title: String?): Boolean {
+        val t = title?.lowercase(Locale.ROOT)?.trim().orEmpty()
+        return t.isEmpty() ||
+               t == "about:blank" ||
                t.contains("just a moment") ||
                t.contains("attention required") ||
-               t.contains("checking your browser")
+               t.contains("checking your browser") ||
+               t.contains("security check")
     }
 
     private fun activity(): Activity? {
-        CommonActivity.activity?.let {
-            ReelFrenCfLog.d("activity", "found via CommonActivity: $it")
-            return it
-        }
-        var ctx: Context? = appContext
+        CommonActivity.activity?.let { return it }
+        var ctx: Context? = ReelFrenStore.appContext
         var depth = 0
         while (ctx != null && depth < 12) {
-            if (ctx is Activity) {
-                ReelFrenCfLog.d("activity", "found via ContextWrapper depth=$depth: $ctx")
-                return ctx
-            }
+            if (ctx is Activity) return ctx
             ctx = (ctx as? ContextWrapper)?.baseContext
             depth++
         }
-        ReelFrenCfLog.d("activity", "returning NULL")
         return null
     }
 
     private fun resolveWebViewUa(activity: Activity, host: String): String {
-        ReelFrenCfState.userAgentFor(host)?.takeIf { it.isNotBlank() }?.let {
-            ReelFrenCfLog.d("UA", "resolveWebViewUa($host): using cached len=${it.length}")
-            return it
-        }
+        val existing = ReelFrenStore.userAgent(host)
+        if (existing.isNotBlank() && existing != ReelFrenClient.FALLBACK_UA) return existing
         val ua = runCatching {
-            WebSettings.getDefaultUserAgent(activity).replace("; wv", "")
-        }.getOrNull() ?: ReelFrenClient.UA
-        ReelFrenCfLog.d("UA", "resolveWebViewUa($host): default len=${ua.length} value=${ua.take(80)}")
-        ReelFrenCfState.setUserAgent(host, ua)
+            WebSettings.getDefaultUserAgent(activity).replace("; wv", "").trim()
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: ReelFrenStore.defaultSystemUa
+        ReelFrenStore.setUserAgent(host, ua)
         return ua
     }
 
-    private fun persistCookie(url: String, host: String) {
-        try {
-            val cookie = CookieManager.getInstance().getCookie(url)
-            if (cookie == null) {
-                ReelFrenCfLog.d("cookie", "persistCookie($url): no cookie")
-                return
+    private fun scrubStaleClearance(url: String, host: String) {
+        ReelFrenStore.saveCookie(host, "")
+        runCatching {
+            val cm = CookieManager.getInstance()
+            val origins = listOf(url, "https://$host", "https://$host/")
+            for (origin in origins) {
+                for (path in listOf("/", "/api")) {
+                    cm.setCookie(origin, "cf_clearance=; Max-Age=0; Path=$path")
+                    cm.setCookie(origin, "cf_clearance=; Max-Age=0; Domain=$host; Path=$path")
+                    cm.setCookie(origin, "cf_clearance=; Max-Age=0; Domain=.$host; Path=$path")
+                }
             }
-            ReelFrenCfLog.d("cookie", "persistCookie($url): len=${cookie.length} hasCf=${cookie.contains("cf_clearance")}")
-            if (cookie.contains("cf_clearance")) {
+            cm.flush()
+        }.onFailure { ReelFrenLog.t("CF/scrub", it) }
+    }
+
+    private fun persistCookie(url: String, host: String, ua: String) {
+        try {
+            val cm = CookieManager.getInstance()
+            val cookie = cm.getCookie(url) ?: cm.getCookie("https://$host") ?: return
+            if (extractClearanceToken(cookie).isNotEmpty()) {
                 ReelFrenStore.saveCookie(host, cookie)
-                ReelFrenStore.setUserAgent(host, ReelFrenCfState.userAgentFor(host) ?: "")
-                ReelFrenCfLog.d("cookie", "persistCookie: SAVED cookie for $host")
+                ReelFrenStore.setUserAgent(host, ua)
+                cm.flush()
+                ReelFrenLog.d("CF/cookie", "Persisted cf_clearance for $host (len=${cookie.length})")
             }
         } catch (e: Exception) {
-            ReelFrenCfLog.t("cookie", e)
+            ReelFrenLog.t("CF/cookie", e)
         }
     }
 
-    suspend fun solve(url: String, forceInteractive: Boolean = false): Boolean {
+    private fun simulateTouchTap(web: WebView, x: Float, y: Float) {
+        runCatching {
+            val downTime = SystemClock.uptimeMillis()
+            val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, y, 0)
+            val up = MotionEvent.obtain(downTime, downTime + 65L, MotionEvent.ACTION_UP, x, y, 0)
+            web.dispatchTouchEvent(down)
+            web.dispatchTouchEvent(up)
+            down.recycle()
+            up.recycle()
+        }
+    }
+
+    fun prewarmIfNeeded() {
+        val host = hostOf(ReelFrenConfig.REEL_SITE)
+        if (extractClearanceToken(ReelFrenStore.cookie(host)).isNotEmpty()) return
+        ReelFrenCfState.solverScope.launch {
+            delay(1_500L)
+            runCatching {
+                solve(ReelFrenConfig.REEL_SITE, silentOnly = true)
+            }.onFailure { ReelFrenLog.t("CF/prewarm", it) }
+        }
+    }
+
+    suspend fun solve(
+        url: String,
+        invalidatedCookie: String? = null,
+        forceInteractive: Boolean = false,
+        silentOnly: Boolean = false
+    ): Boolean {
         val host = hostOf(url)
-        ReelFrenCfLog.d("solve", "ENTRY url=$url host=$host forceInteractive=$forceInteractive")
-        if (host.isBlank()) {
-            ReelFrenCfLog.d("solve", "blank host -> return false")
-            return false
+        if (host.isBlank()) return false
+
+        val (session, isOwner) = ReelFrenCfState.beginSolve(
+            host = host,
+            interactiveAllowed = !silentOnly,
+            forceInteractive = forceInteractive
+        )
+        if (!isOwner) {
+            ReelFrenLog.d("CF/solve", "Joined in-flight solve for $host (escalatedInteractive=${!silentOnly})")
+            return session.deferred.await()
         }
 
-        val saved = ReelFrenStore.cookie(host)
-        ReelFrenCfLog.d("solve", "storedCookieLen=${saved.length} hasCf=${saved.contains("cf_clearance")}")
-
-        if (saved.contains("cf_clearance") && !forceInteractive) {
-            ReelFrenCfLog.d("solve", "SHORT-CIRCUIT on stored cookie for $host -> returning true")
+        val currentCookie = ReelFrenStore.cookie(host)
+        val staleToken = extractClearanceToken(invalidatedCookie)
+        val currentToken = extractClearanceToken(currentCookie)
+        if (!forceInteractive && currentToken.isNotEmpty() && currentToken != staleToken) {
+            ReelFrenLog.d("CF/solve", "Fresh clearance already in store for $host -> short-circuit")
+            session.deferred.complete(true)
+            ReelFrenCfState.endSolve(host, session)
             return true
         }
 
-        val (deferred, isOwner) = ReelFrenCfState.beginSolve(host)
-        if (!isOwner) {
-            ReelFrenCfLog.d("solve", "REUSE in-flight solve for $host -> awaiting")
-            val r = deferred.await()
-            ReelFrenCfLog.d("solve", "REUSED solve completed for $host result=$r")
-            return r
-        }
-
-        ReelFrenCfLog.d("solve", "OWNER launched coroutine for $host")
         ReelFrenCfState.solverScope.launch {
             try {
                 val act = activity()
-                ReelFrenCfLog.d("solve",
-                    "coroutine: act=$act finishing=${act?.isFinishing} " +
-                    "destroyed=${act?.isDestroyed} hasFocus=${act?.hasWindowFocus()}")
                 if (act == null || act.isFinishing || act.isDestroyed) {
-                    ReelFrenCfLog.d("solve", "coroutine: activity unusable -> complete(false)")
-                    deferred.complete(false)
+                    session.deferred.complete(false)
                     return@launch
                 }
 
-                val silent = if (!forceInteractive) {
-                    ReelFrenCfLog.d("solve", "coroutine: attempting silent")
-                    attemptSilent(act, url, host)
+                if (invalidatedCookie != null || forceInteractive) {
+                    scrubStaleClearance(url, host)
+                }
+
+                val silentSuccess = if (!forceInteractive) {
+                    attemptSilent(act, url, host, staleToken, session)
                 } else {
-                    ReelFrenCfLog.d("solve", "coroutine: forceInteractive, skip silent")
                     false
                 }
-                ReelFrenCfLog.d("solve", "coroutine: silent=$silent")
 
-                if (silent) {
-                    ReelFrenCfLog.d("solve", "coroutine: silent SUCCESS -> complete(true)")
-                    deferred.complete(true)
+                if (silentSuccess) {
+                    session.deferred.complete(true)
+                } else if (!session.allowInteractive.get()) {
+                    ReelFrenLog.d("CF/solve", "Background pre-warm ended without foreground demand -> skipping dialog")
+                    session.deferred.complete(false)
                 } else {
-                    ReelFrenCfLog.d("solve", "coroutine: silent FAILED -> showInteractiveDialog")
-                    showInteractiveDialog(act, url, host, deferred)
-                    ReelFrenCfLog.d("solve", "coroutine: showInteractiveDialog returned")
+                    showInteractiveDialog(act, url, host, staleToken, session)
                 }
+            } catch (ce: CancellationException) {
+                if (!session.deferred.isCompleted) session.deferred.complete(false)
+                throw ce
             } catch (e: Exception) {
-                ReelFrenCfLog.t("solve", e)
-                if (!deferred.isCompleted) deferred.complete(false)
+                ReelFrenLog.t("CF/solve", e)
+                if (!session.deferred.isCompleted) session.deferred.complete(false)
             } finally {
-                ReelFrenCfLog.d("solve", "coroutine: finally isCompleted=${deferred.isCompleted}")
-                if (deferred.isCompleted) ReelFrenCfState.endSolve(host, deferred)
+                if (session.deferred.isCompleted) {
+                    ReelFrenCfState.endSolve(host, session)
+                }
             }
         }
 
-        ReelFrenCfLog.d("solve", "OWNER awaiting deferred for $host")
-        val r = deferred.await()
-        ReelFrenCfLog.d("solve", "OWNER deferred.await() returned $r for $host")
-        return r
+        return session.deferred.await()
     }
 
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun attemptSilent(
         activity: Activity,
         url: String,
-        host: String
-    ): Boolean = withContext(Dispatchers.Main) {
-        ReelFrenCfLog.d("silent", "ENTRY activity=$activity url=$url host=$host")
-        val decor = activity.window?.decorView as? ViewGroup
-        if (decor == null) {
-            ReelFrenCfLog.d("silent", "decorView null -> false")
-            return@withContext false
-        }
-        suspendCancellableCoroutine { cont ->
+        host: String,
+        rejectedToken: String,
+        session: SolveSession
+    ): Boolean {
+        val decor = activity.window?.decorView as? ViewGroup ?: return false
+
+        return suspendCancellableCoroutine { cont ->
             val done = AtomicBoolean(false)
             val handler = Handler(Looper.getMainLooper())
             val ua = resolveWebViewUa(activity, host)
-            val cookies = CookieManager.getInstance()
-            cookies.setAcceptCookie(true)
+            val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
+            @Volatile var mainFrameError: String? = null
 
-            val web = WebView(activity)
-            ReelFrenCfLog.d("silent", "WebView created")
-            web.layoutParams = ViewGroup.LayoutParams(1, 1)
-            web.translationX = 20_000f
-            web.alpha = 0f
-            web.settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                databaseEnabled = true
-                userAgentString = ua
+            val container = FrameLayout(activity).apply {
+                layoutParams = ViewGroup.LayoutParams(380, 680)
+                alpha = 0.05f
+                translationZ = -100f
+                isClickable = false
+                isFocusable = false
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+            }
+
+            val web = WebView(activity).apply {
+                layoutParams = FrameLayout.LayoutParams(380, 680)
+                setLayerType(View.LAYER_TYPE_HARDWARE, null)
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    loadsImagesAutomatically = true
+                    javaScriptCanOpenWindowsAutomatically = true
+                    mediaPlaybackRequiresUserGesture = false
+                    cacheMode = WebSettings.LOAD_DEFAULT
+                    userAgentString = ua
+                }
+                webChromeClient = WebChromeClient()
             }
             cookies.setAcceptThirdPartyCookies(web, true)
+            container.addView(web)
 
             fun finish(success: Boolean) {
-                if (!done.compareAndSet(false, true)) {
-                    ReelFrenCfLog.d("silent", "finish($success) called again, ignored")
-                    return
-                }
-                ReelFrenCfLog.d("silent", "finish(success=$success)")
+                if (!done.compareAndSet(false, true)) return
+                session.abortSilent = null
+                handler.removeCallbacksAndMessages(null)
+                ReelFrenLog.d("CF/silent", "finish(success=$success) for $host")
+
                 if (success) {
-                    ReelFrenCfState.setUserAgent(host, ua)
-                    persistCookie(url, host)
-                    try { cookies.flush() } catch (e: Exception) { ReelFrenCfLog.t("silent", e) }
+                    persistCookie(url, host, ua)
                 }
-                try { decor.removeView(web) } catch (e: Exception) { ReelFrenCfLog.d("silent", "removeView threw: ${e.message}") }
-                try { web.stopLoading() } catch (_: Exception) {}
-                try { web.loadUrl("about:blank") } catch (_: Exception) {}
-                try { web.destroy() } catch (_: Exception) {}
+                runCatching { web.stopLoading() }
+                runCatching { web.loadUrl("about:blank") }
+                runCatching { container.removeView(web) }
+                runCatching { decor.removeView(container) }
+                runCatching { web.destroy() }
+
                 if (cont.isActive) cont.resume(success)
             }
 
-            web.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                    if (done.get() || loadedUrl == "about:blank") {
-                        ReelFrenCfLog.d("silent", "onPageFinished ignored done=${done.get()} url=$loadedUrl")
-                        return
-                    }
-                    val c = cookies.getCookie(loadedUrl ?: url) ?: ""
-                    val t = view?.title ?: ""
-                    ReelFrenCfLog.d("silent",
-                        "onPageFinished url=$loadedUrl title='$t' cookieLen=${c.length} hasCf=${c.contains("cf_clearance")}")
-                    if (c.contains("cf_clearance") && !isChallengeOrErrorTitle(t)) {
-                        ReelFrenCfLog.d("silent", "onPageFinished success criteria met -> finish(true)")
-                        finish(true)
+            session.abortSilent = {
+                handler.post { finish(false) }
+            }
+
+            fun checkAndAutoInteract(tick: Int) {
+                if (done.get()) return
+                val rawCookie = cookies.getCookie(url) ?: cookies.getCookie("https://$host").orEmpty()
+                val token = extractClearanceToken(rawCookie)
+                val title = web.title.orEmpty()
+
+                ReelFrenLog.d("CF/silent-poll", "tick#$tick title='$title' cookieLen=${rawCookie.length} hasCf=${token.isNotEmpty()}")
+
+                if (token.isNotEmpty() && (rejectedToken.isEmpty() || token != rejectedToken) && !isChallengeOrBlankTitle(title)) {
+                    finish(true)
+                    return
+                }
+
+                if (tick >= 4 && tick % 4 == 0) {
+                    val locateJs = """
+                        (function() {
+                            function find(root) {
+                                if (!root) return null;
+                                var direct = root.querySelector('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, #turnstile-wrapper');
+                                if (direct) return direct;
+                                var hosts = root.querySelectorAll('*');
+                                for (var i = 0; i < hosts.length; i++) {
+                                    if (hosts[i].shadowRoot) {
+                                        var hit = find(hosts[i].shadowRoot);
+                                        if (hit) return hit;
+                                    }
+                                }
+                                return null;
+                            }
+                            var el = find(document);
+                            if (!el) return '';
+                            var r = el.getBoundingClientRect();
+                            if (r.width <= 0 || r.height <= 0) return '';
+                            return (r.left + 28) + ',' + (r.top + (r.height / 2));
+                        })();
+                    """.trimIndent()
+                    web.evaluateJavascript(locateJs) { res ->
+                        if (done.get()) return@evaluateJavascript
+                        val coords = res?.trim('"').orEmpty()
+                        val parts = coords.split(",")
+                        val cx = parts.getOrNull(0)?.toFloatOrNull() ?: 65f
+                        val cy = parts.getOrNull(1)?.toFloatOrNull() ?: 290f
+                        ReelFrenLog.d("CF/silent-tap", "Dispatching tap at ($cx, $cy) [found=${coords.isNotEmpty()}]")
+                        simulateTouchTap(web, cx, cy)
                     }
                 }
             }
 
-            // Diagnostic poll — logs cookie state every 500 ms, also completes if criteria met
-            // (catches "onPageFinished fired before cookie arrived" case).
+            web.webViewClient = object : WebViewClient() {
+                override fun onPageStarted(view: WebView?, loadedUrl: String?, favicon: Bitmap?) {
+                    if (done.get() || loadedUrl == null || loadedUrl == "about:blank") return
+                    view?.evaluateJavascript(WEBDRIVER_PATCH_JS, null)
+                }
+
+                override fun onPageCommitVisible(view: WebView?, loadedUrl: String?) {
+                    if (done.get() || loadedUrl == null || loadedUrl == "about:blank") return
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        view?.evaluateJavascript(WEBDRIVER_PATCH_JS, null)
+                    }
+                }
+
+                override fun onPageFinished(view: WebView?, loadedUrl: String?) {
+                    if (done.get() || loadedUrl == "about:blank") return
+                    checkAndAutoInteract(0)
+                }
+
+                override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                    if (request?.isForMainFrame == true) {
+                        mainFrameError = "${error?.errorCode}: ${error?.description}"
+                        ReelFrenLog.d("CF/silent", "Main-frame network error: $mainFrameError")
+                    }
+                }
+
+                override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
+                    val code = errorResponse?.statusCode ?: 0
+                    if (request?.isForMainFrame == true && code in 500..599 && code != 503) {
+                        ReelFrenLog.d("CF/silent", "Main-frame HTTP $code -> aborting silent")
+                        finish(false)
+                    }
+                }
+            }
+
+            val startMs = SystemClock.uptimeMillis()
             val pollRunnable = object : Runnable {
-                var count = 0
+                var ticks = 0
                 override fun run() {
                     if (done.get()) return
-                    count++
-                    val c = cookies.getCookie(url) ?: ""
-                    val t = web.title ?: ""
-                    ReelFrenCfLog.d("silent-poll",
-                        "tick#$count title='$t' cookieLen=${c.length} hasCf=${c.contains("cf_clearance")}")
-                    if (c.contains("cf_clearance") && !isChallengeOrErrorTitle(t)) {
-                        ReelFrenCfLog.d("silent-poll", "success criteria met in poll -> finish(true)")
-                        finish(true)
+                    ticks++
+                    checkAndAutoInteract(ticks)
+                    if (done.get()) return
+
+                    val elapsed = SystemClock.uptimeMillis() - startMs
+
+                    if (mainFrameError != null && !isChallengeOrBlankTitle(web.title)) {
+                        finish(false)
                         return
                     }
-                    if (count < 24) handler.postDelayed(this, 500L)
+
+                    if (elapsed >= 25_000L) {
+                        finish(false)
+                        return
+                    }
+
+                    val nextDelay = if (elapsed < 8_000L) 500L else 1_000L
+                    handler.postDelayed(this, nextDelay)
                 }
             }
 
-            cont.invokeOnCancellation {
-                ReelFrenCfLog.d("silent", "coroutine CANCELLED")
-                finish(false)
-            }
-            handler.postDelayed({
-                ReelFrenCfLog.d("silent", "12s timer fired done=${done.get()}")
-                finish(false)
-            }, 12_000L)
-            decor.addView(web)
-            ReelFrenCfLog.d("silent", "loadUrl($url)")
+            cont.invokeOnCancellation { finish(false) }
+
+            decor.addView(container)
+            web.onResume()
+            web.resumeTimers()
             web.loadUrl(url)
             handler.postDelayed(pollRunnable, 500L)
-        }.also {
-            ReelFrenCfLog.d("silent", "EXIT result=$it")
         }
     }
 
@@ -327,126 +466,109 @@ object ReelFrenCloudflare {
         activity: Activity,
         url: String,
         host: String,
-        deferred: CompletableDeferred<Boolean>
+        rejectedToken: String,
+        session: SolveSession
     ) {
-        ReelFrenCfLog.d("dialog",
-            "ENTRY activity=$activity finishing=${activity.isFinishing} " +
-            "destroyed=${activity.isDestroyed} hasFocus=${activity.hasWindowFocus()} url=$url")
         val resolved = AtomicBoolean(false)
+        val handler = Handler(Looper.getMainLooper())
         var webRef: WebView? = null
+        var layoutRef: LinearLayout? = null
         var dialogRef: Dialog? = null
         val ua = resolveWebViewUa(activity, host)
-        val cookies = CookieManager.getInstance()
-        cookies.setAcceptCookie(true)
-
-        fun dispose() {
-            ReelFrenCfLog.d("dialog", "dispose()")
-            try { webRef?.stopLoading() } catch (_: Exception) {}
-            try { webRef?.destroy() } catch (_: Exception) {}
-            webRef = null
-        }
+        val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
 
         fun finish(success: Boolean) {
-            if (!resolved.compareAndSet(false, true)) {
-                ReelFrenCfLog.d("dialog", "finish($success) called again, ignored")
-                return
-            }
-            ReelFrenCfLog.d("dialog", "finish(success=$success)")
+            if (!resolved.compareAndSet(false, true)) return
+            handler.removeCallbacksAndMessages(null)
+            ReelFrenLog.d("CF/dialog", "finish(success=$success) for $host")
+
             if (success) {
-                ReelFrenCfState.setUserAgent(host, ua)
-                persistCookie(url, host)
-                try { cookies.flush() } catch (e: Exception) { ReelFrenCfLog.t("dialog", e) }
+                persistCookie(url, host, ua)
             }
-            if (!deferred.isCompleted) deferred.complete(success)
-            ReelFrenCfState.endSolve(host, deferred)
-            Handler(Looper.getMainLooper()).post {
-                dispose()
-                try { dialogRef?.dismiss() } catch (e: Exception) { ReelFrenCfLog.t("dialog", e) }
+            if (!session.deferred.isCompleted) session.deferred.complete(success)
+            ReelFrenCfState.endSolve(host, session)
+
+            handler.post {
+                runCatching { webRef?.stopLoading() }
+                runCatching { webRef?.loadUrl("about:blank") }
+                runCatching { layoutRef?.removeView(webRef) }
+                runCatching { webRef?.destroy() }
+                webRef = null
+                runCatching { dialogRef?.dismiss() }
+                dialogRef = null
             }
         }
 
         try {
             val dlg = Dialog(activity)
             dialogRef = dlg
-            ReelFrenCfLog.d("dialog", "Dialog constructed")
 
-            val layout = LinearLayout(activity)
-            layout.orientation = LinearLayout.VERTICAL
-            layout.setBackgroundColor(Color.parseColor("#0A0C12"))
+            val layout = LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundColor(Color.parseColor("#0A0C12"))
+            }
+            layoutRef = layout
 
-            val header = TextView(activity)
-            header.text = "Verifying you are human..."
-            header.setTextColor(Color.WHITE)
-            header.textSize = 15f
-            header.setPadding(50, 50, 50, 50)
+            val header = TextView(activity).apply {
+                text = "Verifying you are human..."
+                setTextColor(Color.WHITE)
+                textSize = 15f
+                setPadding(50, 40, 50, 40)
+            }
             layout.addView(header)
 
-            val wv = WebView(activity)
+            val wv = WebView(activity).apply {
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    userAgentString = ua
+                }
+                webChromeClient = WebChromeClient()
+            }
             webRef = wv
             cookies.setAcceptThirdPartyCookies(wv, true)
-            wv.settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                databaseEnabled = true
-                userAgentString = ua
+
+            fun checkSolved(): Boolean {
+                val rawCookie = cookies.getCookie(url) ?: cookies.getCookie("https://$host").orEmpty()
+                val token = extractClearanceToken(rawCookie)
+                return token.isNotEmpty() &&
+                       (rejectedToken.isEmpty() || token != rejectedToken) &&
+                       !isChallengeOrBlankTitle(wv.title)
             }
+
             wv.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                    if (resolved.get() || loadedUrl == "about:blank") {
-                        ReelFrenCfLog.d("dialog", "onPageFinished ignored resolved=${resolved.get()} url=$loadedUrl")
-                        return
-                    }
-                    val c = cookies.getCookie(loadedUrl ?: url) ?: ""
-                    val t = view?.title ?: ""
-                    ReelFrenCfLog.d("dialog",
-                        "onPageFinished url=$loadedUrl title='$t' cookieLen=${c.length} hasCf=${c.contains("cf_clearance")}")
-                    if (c.contains("cf_clearance") && !isChallengeOrErrorTitle(t)) {
-                        ReelFrenCfLog.d("dialog", "success criteria met -> scheduling finish(true) in 800 ms")
-                        Handler(Looper.getMainLooper()).postDelayed({ finish(true) }, 800L)
+                    if (resolved.get() || loadedUrl == "about:blank") return
+                    if (checkSolved()) {
+                        handler.postDelayed({ finish(true) }, 500L)
                     }
                 }
             }
-            layout.addView(
-                wv,
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1200)
-            )
+
+            layout.addView(wv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1200))
             dlg.setContentView(layout)
-            dlg.setOnDismissListener {
-                ReelFrenCfLog.d("dialog", "OnDismiss fired")
-                finish(false)
-            }
-
-            ReelFrenCfLog.d("dialog", "calling dlg.show()")
+            dlg.setOnDismissListener { finish(false) }
             dlg.show()
-            ReelFrenCfLog.d("dialog",
-                "dlg.show() returned isShowing=${dlg.isShowing} activityFocus=${activity.hasWindowFocus()}")
 
-            // Diagnostic watchdog — logs dialog state + cookie state every 2 s.
-            val handler = Handler(Looper.getMainLooper())
             val watchdog = object : Runnable {
                 var count = 0
                 override fun run() {
                     if (resolved.get()) return
                     count++
-                    val c = cookies.getCookie(url) ?: ""
-                    val t = wv.title ?: ""
-                    ReelFrenCfLog.d("dialog-watchdog",
-                        "tick#$count isShowing=${dlg.isShowing} focus=${activity.hasWindowFocus()} " +
-                        "title='$t' cookieLen=${c.length} hasCf=${c.contains("cf_clearance")}")
-                    if (c.contains("cf_clearance") && !isChallengeOrErrorTitle(t)) {
-                        ReelFrenCfLog.d("dialog-watchdog", "success criteria met -> finish(true)")
+                    if (checkSolved()) {
                         finish(true)
                         return
                     }
-                    if (count < 60) handler.postDelayed(this, 2_000L)
+                    if (count < 45) handler.postDelayed(this, 1_500L) else finish(false)
                 }
             }
-            handler.postDelayed(watchdog, 2_000L)
-
-            ReelFrenCfLog.d("dialog", "loadUrl($url)")
+            handler.postDelayed(watchdog, 1_500L)
+            wv.onResume()
+            wv.resumeTimers()
             wv.loadUrl(url)
         } catch (e: Exception) {
-            ReelFrenCfLog.t("dialog", e)
+            ReelFrenLog.t("CF/dialog", e)
             finish(false)
         }
     }
