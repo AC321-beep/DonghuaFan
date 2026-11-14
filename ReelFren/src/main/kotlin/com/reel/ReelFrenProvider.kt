@@ -1,8 +1,13 @@
 package com.reel
 
-import android.content.Context
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.util.concurrent.ConcurrentHashMap
 
 class Reelfren : MainAPI() {
@@ -17,170 +22,90 @@ class Reelfren : MainAPI() {
     override val getMainPageTimeoutMs = 240_000L
     override val supportedTypes = setOf(TvType.TvSeries, TvType.Movie, TvType.AsianDrama)
 
-    companion object {
-        private var appContext: Context? = null
-        fun setContext(context: Context) {
-            appContext = context.applicationContext
-            ReelFrenCfLog.d("Main/ctx", "setContext(${context.applicationContext})")
-        }
-        private fun getPrefs(): android.content.SharedPreferences? {
-            val p = appContext?.getSharedPreferences("reelfren_prefs", Context.MODE_PRIVATE)
-            ReelFrenCfLog.d("Main/prefs", "getPrefs() -> ${if (p == null) "NULL" else "ok"}")
-            return p
-        }
-    }
-
-    private val defaultEnabledSlugs = setOf(
-        "dramabox", "reelshort", "wetv", "happyshort", "shorten",
-        "dramawave", "shortmax", "netshort", "pinedrama", "vigloo"
-    )
-
-    val providersMap: LinkedHashMap<String, String> = linkedMapOf(
-        "Anamana"         to "anamana",
-        "AniBoy"          to "aniboy",
-        "Melolo"          to "melolo",
-        "Sereal+"         to "sereal",
-        "PineDrama"       to "pinedrama",
-        "Shorten"         to "shorten",
-        "HappyShort"      to "happyshort",
-        "Vigloo"          to "vigloo",
-        "Vigloo 2"        to "vigloo2",
-        "RapidTV"         to "rapidtv",
-        "RapidTV 2"       to "rapidtv2",
-        "RaptDrama"       to "raptdrama",
-        "CubeTV"          to "cubetv",
-        "JoyReels"        to "joyreels",
-        "AnyReel"         to "anyreel",
-        "Shortical"       to "shortical",
-        "StoReel"         to "storeel",
-        "LoveShots"       to "loveshots",
-        "MomeShort"       to "momeshort",
-        "MoreShort"       to "moreshort",
-        "ToonShort"       to "toonshort",
-        "SixthShort"      to "sixthshort",
-        "SoReel"          to "soreel",
-        "StoryGo"         to "storygo",
-        "MiniShort"       to "minishort",
-        "WinkNovel"       to "winknovel",
-        "My Muse"         to "mymuse",
-        "SarosTV"         to "sarostv",
-        "ReelAI"          to "reelai",
-        "Reelife"         to "reelife",
-        "ReelShort"       to "reelshort",
-        "ReelShort 2"     to "reelshort2",
-        "DramaBox"        to "dramabox",
-        "DramaWave"       to "dramawave",
-        "DramaNova"       to "dramanova",
-        "KalosTV"         to "kalostv",
-        "VibeShort"       to "vibeshort",
-        "FreeReels"       to "freereels",
-        "WeTV"            to "wetv",
-        "StoryReel"       to "storyreel",
-        "MovieBox Shorts" to "movieboxshorts",
-        "BonusTV"         to "bonustv",
-        "MoboReels"       to "moboreels",
-        "NetShort"        to "netshort",
-        "MyDrama"         to "mydrama",
-        "FlareFlow"       to "flareflow",
-        "PlayLet"         to "playlet",
-        "ShortMax"        to "shortmax",
-        "FlexTV"          to "flextv",
-        "FlexTV 2"        to "flextv2",
-        "CandyJar"        to "candyjar",
-        "BlinkDrama"      to "blinkdrama",
-        "iQIYI"           to "iqiyi",
-        "MovieBox"        to "moviebox",
-        "FilmBox"         to "filmbox"
-    )
-
     private val seenIds = ConcurrentHashMap<String, MutableSet<String>>()
 
     override val mainPage: List<MainPageData>
         get() {
-            val prefs = getPrefs()
-            val enabledProviders = providersMap.filter { (_, slug) ->
-                prefs?.getBoolean("provider_$slug", defaultEnabledSlugs.contains(slug))
-                    ?: defaultEnabledSlugs.contains(slug)
-            }.ifEmpty { providersMap }
-
-            ReelFrenCfLog.d("Main/mainPage",
-                "getter: prefs=${prefs != null} enabledSlugs=${enabledProviders.values.toList()}")
-
-            val result = enabledProviders.map { (display, slug) -> slug to display }
+            val enabled = ReelFrenStore.enabledProviders()
+            ReelFrenLog.d("Main/mainPage", "returning ${enabled.size} enabled pages")
+            return enabled.map { (display, slug) -> slug to display }
                 .let { mainPageOf(*it.toTypedArray()) }
-            ReelFrenCfLog.d("Main/mainPage", "returning ${result.size} pages")
-            return result
         }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val slug = request.data
-        ReelFrenCfLog.d("Main/getMainPage", "ENTRY page=$page slug=$slug name=${request.name}")
+        ReelFrenLog.d("Main/getMainPage", "ENTRY page=$page slug=$slug name=${request.name}")
         val items = mutableListOf<SearchResponse>()
+        var rawCount = 0
+
+        val seen = seenIds.getOrPut(slug) { ConcurrentHashMap.newKeySet() }
+        if (page <= 1) seen.clear()
 
         try {
-            ReelFrenCfLog.d("Main/getMainPage", "calling ReelFrenClient.home($slug, page=$page)")
             val homeItems = ReelFrenClient.home(slug, page = page)
-            ReelFrenCfLog.d("Main/getMainPage", "ReelFrenClient.home returned size=${homeItems.size}")
-            val seen = seenIds.getOrPut(slug) { mutableSetOf() }
-            homeItems.filter { it.id !in seen }.forEach { item ->
-                toCard(slug, item)?.let { items.add(it); seen.add(item.id) }
+            rawCount = homeItems.size
+            for (item in homeItems) {
+                if (seen.add(item.id)) {
+                    toCard(slug, item)?.let { items.add(it) }
+                }
             }
-            ReelFrenCfLog.d("Main/getMainPage",
-                "filtered items=${items.size} seen=${seen.size}")
+            ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=$rawCount added=${items.size}")
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (e: Exception) {
-            ReelFrenCfLog.t("Main/getMainPage", e)
+            ReelFrenLog.t("Main/getMainPage", e)
         }
 
-        val resp = newHomePageResponse(request, items, hasNext = items.isNotEmpty())
-        ReelFrenCfLog.d("Main/getMainPage", "EXIT slug=$slug items=${items.size}")
-        return resp
+        return newHomePageResponse(request, items, hasNext = rawCount > 0)
     }
 
     override suspend fun search(query: String): List<SearchResponse>? {
         val term = query.trim()
-        ReelFrenCfLog.d("Main/search", "ENTRY query='$term'")
         if (term.isEmpty()) return emptyList()
+        ReelFrenLog.d("Main/search", "ENTRY query='$term'")
 
-        val results = LinkedHashMap<String, SearchResponse>()
+        val results = ConcurrentHashMap<String, SearchResponse>()
         val deadline = System.currentTimeMillis() + 45_000L
-        val prefs = getPrefs()
+        val enabledSlugs = ReelFrenStore.enabledProviders().values.toList()
+        val semaphore = Semaphore(4)
 
-        val enabledSlugs = providersMap.values.filter { slug ->
-            prefs?.getBoolean("provider_$slug", defaultEnabledSlugs.contains(slug))
-                ?: defaultEnabledSlugs.contains(slug)
-        }.ifEmpty { providersMap.values }
-
-        for (slug in enabledSlugs) {
-            if (System.currentTimeMillis() > deadline) {
-                ReelFrenCfLog.d("Main/search", "deadline hit before slug=$slug")
-                break
-            }
-            runCatching {
-                ReelFrenCfLog.d("Main/search", "querying slug=$slug")
-                ReelFrenClient.search(slug, term).forEach { item ->
-                    toCard(slug, item)?.let { results[it.url] = it }
+        coroutineScope {
+            enabledSlugs.map { slug ->
+                async {
+                    if (System.currentTimeMillis() > deadline) return@async
+                    semaphore.withPermit {
+                        if (System.currentTimeMillis() > deadline) return@withPermit
+                        try {
+                            ReelFrenClient.search(slug, term).forEach { item ->
+                                toCard(slug, item)?.let { card ->
+                                    results.putIfAbsent(card.url, card)
+                                }
+                            }
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (e: Exception) {
+                            ReelFrenLog.t("Main/search", e)
+                        }
+                    }
                 }
-            }.onFailure { ReelFrenCfLog.t("Main/search", it) }
+            }.awaitAll()
         }
-        ReelFrenCfLog.d("Main/search", "EXIT results=${results.size}")
+
+        ReelFrenLog.d("Main/search", "EXIT results=${results.size}")
         return results.values.take(60)
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        ReelFrenCfLog.d("Main/load", "ENTRY url=$url")
+        ReelFrenLog.d("Main/load", "ENTRY url=$url")
         val (slug, id, _) = ReelFrenUrl.parse(url)
-        ReelFrenCfLog.d("Main/load", "parsed slug=$slug id=$id")
         if (slug.isEmpty() || id.isEmpty()) return null
 
-        val info = ReelFrenClient.detail(slug, id) ?: run {
-            ReelFrenCfLog.d("Main/load", "detail NULL -> return null")
-            return null
-        }
+        val info = ReelFrenClient.detail(slug, id) ?: return null
         val cover = ReelFrenClient.absUrl(info.cover).ifEmpty { null }
+        val imgHeaders = ReelFrenClient.posterHeaders(cover)
         val plot = info.intro.takeIf { it.isNotEmpty() }
-        ReelFrenCfLog.d("Main/load", "detail title='${info.title}' episodes=${info.episodes} videos=${info.videos.size}")
 
-        return if (info.episodes > 1) {
+        return if (info.videos.size > 1 || info.episodes > 1) {
             newTvSeriesLoadResponse(
                 name = info.title,
                 url = url,
@@ -194,6 +119,7 @@ class Reelfren : MainAPI() {
                 }
             ) {
                 posterUrl = cover
+                posterHeaders = imgHeaders
                 this.plot = plot
             }
         } else {
@@ -204,6 +130,7 @@ class Reelfren : MainAPI() {
                 dataUrl = url
             ) {
                 posterUrl = cover
+                posterHeaders = imgHeaders
                 this.plot = plot
             }
         }
@@ -215,16 +142,11 @@ class Reelfren : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        ReelFrenCfLog.d("Main/loadLinks", "ENTRY data=$data isCasting=$isCasting")
+        ReelFrenLog.d("Main/loadLinks", "ENTRY data=$data isCasting=$isCasting")
         val (slug, id, episode) = ReelFrenUrl.parse(data)
         if (slug.isEmpty() || id.isEmpty()) return false
 
-        val playback = ReelFrenClient.playback(slug, id, episode) ?: run {
-            ReelFrenCfLog.d("Main/loadLinks", "playback NULL -> false")
-            return false
-        }
-        ReelFrenCfLog.d("Main/loadLinks",
-            "playback subs=${playback.subtitles.size} quals=${playback.qualities.size}")
+        val playback = ReelFrenClient.playback(slug, id, episode) ?: return false
 
         playback.subtitles.forEach { sub ->
             subtitleCallback(
@@ -239,7 +161,7 @@ class Reelfren : MainAPI() {
                 emitted = true
             }
         }
-        ReelFrenCfLog.d("Main/loadLinks", "EXIT emitted=$emitted")
+        ReelFrenLog.d("Main/loadLinks", "EXIT emitted=$emitted")
         return emitted
     }
 
@@ -247,14 +169,23 @@ class Reelfren : MainAPI() {
         if (item.id.isEmpty() || item.title.isEmpty()) return null
         val url = ReelFrenUrl.page(slug, item.id)
         val poster = ReelFrenClient.absUrl(item.cover).ifEmpty { null }
-        val displayTitle = if (item.episodes > 0)
+        val imgHeaders = ReelFrenClient.posterHeaders(poster)
+        val displayTitle = if (item.episodes > 0) {
             "${item.title} [${item.episodes} EP]"
-        else
+        } else {
             "${item.title} [NEW]"
+        }
 
-        return if (item.episodes > 1)
-            newTvSeriesSearchResponse(displayTitle, url, TvType.TvSeries) { posterUrl = poster }
-        else
-            newMovieSearchResponse(displayTitle, url, TvType.Movie) { posterUrl = poster }
+        return if (item.episodes > 1) {
+            newTvSeriesSearchResponse(displayTitle, url, TvType.TvSeries) {
+                this.posterUrl = poster
+                this.posterHeaders = imgHeaders
+            }
+        } else {
+            newMovieSearchResponse(displayTitle, url, TvType.Movie) {
+                this.posterUrl = poster
+                this.posterHeaders = imgHeaders
+            }
+        }
     }
 }
