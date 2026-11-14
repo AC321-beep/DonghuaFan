@@ -1,6 +1,5 @@
 package com.donghuastream
 
-import android.util.Base64
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.SubtitleFile
@@ -8,6 +7,7 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
 
 class Rumble : ExtractorApi() {
     override var name = "Rumble"
@@ -23,9 +23,13 @@ class Rumble : ExtractorApi() {
         )
         private val RE_QUALITY_H = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""")
         private val RE_QUALITY_BRACE = Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
+        private val RE_JSON_CONFIG =
+            Regex("""Rumble\("play",\s*\{(.*?)\}\)""", RegexOption.DOT_MATCHES_ALL)
 
-        private val JUNK_KEYWORDS = listOf("/assets/", "loop", "preview", "tracker", "thumb")
-        private val HARD_JUNK = listOf("/assets/", "tracker", "thumb")
+        private val JUNK_KEYWORDS =
+            listOf("/assets/", "loop", "preview", "tracker", "thumb", ".tar")
+        private val HARD_JUNK =
+            listOf("/assets/", "tracker", "thumb", ".tar")
     }
 
     override suspend fun getUrl(
@@ -34,7 +38,7 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Fast path
+        // Fast path — direct file
         if (url.endsWith(".mp4", ignoreCase = true) || url.endsWith(".m3u8", ignoreCase = true)) {
             val linkType = if (url.endsWith(".m3u8", ignoreCase = true))
                 ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
@@ -43,16 +47,53 @@ class Rumble : ExtractorApi() {
         }
 
         val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-            try { app.get(url, referer = referer ?: mainUrl).text } catch (e: Exception) { null }
+            try { app.get(url, referer = referer ?: mainUrl).text }
+            catch (e: Exception) { null }
         } ?: return
 
+        // 1. API path — extract videoId from Rumble("play", {...}) config block
+        val configMatch = RE_JSON_CONFIG.find(html)
+        if (configMatch != null) {
+            val jsonBody = "{" + configMatch.groupValues[1] + "}"
+            try {
+                val jsonObj = JSONObject(jsonBody)
+                val videoId = jsonObj.optJSONObject("video")?.optString("id")?.takeIf { it.isNotBlank() }
+                    ?: (jsonObj.opt("video") as? String)?.takeIf { it.isNotBlank() }
+
+                if (!videoId.isNullOrBlank()) {
+                    val apiUrls = listOf(
+                        "https://rumble.com/embedJS/u4/?ifr=0&dref=&request=video&ver=2&v=$videoId",
+                        "https://rumble.com/embedJS/u3/?request=video&v=$videoId"
+                    )
+                    for (apiUrl in apiUrls) {
+                        val apiResponse = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                            runCatching { app.get(apiUrl, referer = url).text }.getOrNull()
+                        } ?: continue
+                        if (extractFromScriptData(apiResponse, url, callback)) return
+                    }
+                    // Both API endpoints emitted nothing — fall through to HTML scrape
+                }
+            } catch (e: Exception) {
+                // Malformed JSON — fall through
+            }
+        }
+
+        // 2. Fallback — scrape the inline data block from the HTML
         val afterMp4 = html.substringAfter("{\"mp4", "")
         val scriptData = if (afterMp4.isEmpty()) html else afterMp4.substringBefore("\"evt\":{")
+        extractFromScriptData(scriptData, url, callback)
+    }
 
+    /** Returns true if at least one link was emitted via [callback]. */
+    private suspend fun extractFromScriptData(
+        scriptData: String,
+        url: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
         val scrapedUrls = LinkedHashSet<String>()
         var emitted = false
 
-        // ===================== PASS 1 — strict =====================
+        // PASS 1 — strict (rumble.com only, full junk filter)
         RE_VIDEO_URL.findAll(scriptData).forEach { match ->
             val cleanUrl = match.value.replace("\\/", "/")
 
@@ -65,7 +106,7 @@ class Rumble : ExtractorApi() {
             }
         }
 
-        // ===================== PASS 2 — trailer fallback =====================
+        // PASS 2 — trailer fallback (only if strict pass emitted nothing)
         if (!emitted) {
             RE_VIDEO_URL.findAll(scriptData).forEach { match ->
                 val cleanUrl = match.value.replace("\\/", "/")
@@ -73,10 +114,13 @@ class Rumble : ExtractorApi() {
                 if (HARD_JUNK.any { cleanUrl.contains(it, ignoreCase = true) }) return@forEach
 
                 if (scrapedUrls.add(cleanUrl)) {
+                    emitted = true
                     emitOne(cleanUrl, match, scriptData, url, "$name Trailer", callback)
                 }
             }
         }
+
+        return emitted
     }
 
     private suspend fun emitOne(
