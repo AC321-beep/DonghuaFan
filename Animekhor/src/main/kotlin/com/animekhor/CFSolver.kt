@@ -11,7 +11,6 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.KeyEvent
-import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.SslErrorHandler
@@ -32,8 +31,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONTokener
+import java.io.ByteArrayInputStream
 import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -52,39 +54,75 @@ fun isRealSiteHtml(html: String): Boolean {
             l.contains("const ts_config")
 }
 
+// Checks positive challenge markers BEFORE static 403 footers so LiteSpeed CAPTCHA pages aren't skipped.
 fun isCfChallengeHtml(html: String): Boolean {
     if (html.isBlank()) return false
     if (isRealSiteHtml(html)) return false
 
     val l = html.lowercase()
-    if (l.contains("<title> 403 forbidden") || l.contains("proudly powered by litespeed")) {
-        return false
-    }
 
-    return l.contains("<title>bot verification") ||
+    val hasChallengeMarker = l.contains("<title>bot verification") ||
             l.contains("/cdn-cgi/challenge-platform/") ||
             l.contains("cf-browser-verification") ||
             l.contains("cf-turnstile") ||
+            l.contains("challenges.cloudflare.com") ||
             l.contains("g-recaptcha") ||
+            l.contains("h-captcha") ||
             l.contains("<title>just a moment") ||
             l.contains("<title>attention required") ||
             l.contains("verifying you are human") ||
             l.contains("checking your browser") ||
-            l.contains("please wait while we verify")
+            l.contains("please wait while we verify") ||
+            l.contains("cf_chl_opt")
+
+    if (hasChallengeMarker) return true
+
+    if (l.contains("<title> 403 forbidden") ||
+        l.contains("<title>403 forbidden") ||
+        l.contains("proudly powered by litespeed")
+    ) {
+        return false
+    }
+
+    return false
 }
 
+// Excludes Cloudflare Turnstile (which can auto-resolve or use Tab+Space in silent mode)
+// so only true human-interactive CAPTCHAs skip the silent solver.
 fun isHumanOnlyChallenge(html: String): Boolean {
     val l = html.lowercase()
     return l.contains("<title>bot verification") ||
             l.contains("h-captcha") || l.contains("hcaptcha") ||
-            l.contains("turnstile") || l.contains("g-recaptcha") || l.contains("recaptcha") ||
-            (l.contains("captcha") && !l.contains("cf_chl_opt"))
+            l.contains("g-recaptcha") || l.contains("recaptcha/api.js") ||
+            (l.contains("captcha") && !l.contains("cf_chl_opt") && !l.contains("turnstile"))
 }
 
-/** Decodes the JSON-encoded string returned by evaluateJavascript() into a plain Kotlin String. */
 internal fun decodeJsHtml(rawJsResult: String?): String? {
     if (rawJsResult.isNullOrBlank() || rawJsResult == "null") return null
     return runCatching { JSONTokener(rawJsResult).nextValue() as? String }.getOrNull()
+}
+
+// Blocks third-party ad/tracker subresources in background WebViews to prevent SSL -107 errors
+// and NetdClient socket spam while keeping challenge providers intact.
+internal fun shouldAllowBackgroundWebResource(req: WebResourceRequest?): Boolean {
+    if (req == null) return true
+    if (req.isForMainFrame) return true
+    val urlStr = req.url?.toString()?.lowercase() ?: return true
+    val host = req.url?.host?.lowercase() ?: return true
+
+    if (urlStr.endsWith(".jpg") || urlStr.endsWith(".jpeg") || urlStr.endsWith(".png") ||
+        urlStr.endsWith(".gif") || urlStr.endsWith(".webp") || urlStr.endsWith(".woff2") ||
+        urlStr.endsWith(".woff") || urlStr.endsWith(".ttf")
+    ) {
+        return false
+    }
+
+    return host.contains("animekhor") ||
+            host.contains("cloudflare") ||
+            host.contains("google") ||
+            host.contains("gstatic") ||
+            host.contains("hcaptcha") ||
+            host.contains("recaptcha")
 }
 
 object CFState {
@@ -92,15 +130,31 @@ object CFState {
     private val userAgents = ConcurrentHashMap<String, String>()
     private val solving = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
     private val solvedHtmlCache = ConcurrentHashMap<String, Pair<Long, String>>()
+    private val verifiedHosts = ConcurrentHashMap.newKeySet<String>()
+    private val coldStartLocks = ConcurrentHashMap<String, Mutex>()
 
-    private const val DEFAULT_COOLDOWN_MS = 3 * 60_000L
-    private const val HTML_CACHE_TTL_MS = 30_000L
+    private const val DEFAULT_COOLDOWN_MS = 90_000L
+    private const val HTML_CACHE_TTL_MS = 45_000L
     private val failedUntil = ConcurrentHashMap<String, Long>()
 
-    // NEW: pre-warm guard
-    @Volatile private var prewarmStarted = false
-
     val solverScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
+    private fun normalizeUrl(url: String): String = url.trim().trimEnd('/')
+
+    fun isHostVerified(host: String): Boolean = verifiedHosts.contains(host.lowercase())
+
+    fun markHostVerified(host: String) {
+        if (host.isNotBlank()) verifiedHosts.add(host.lowercase())
+    }
+
+    fun markHostUnverified(host: String) {
+        if (host.isNotBlank()) verifiedHosts.remove(host.lowercase())
+    }
+
+    suspend fun <T> withColdStartLock(host: String, block: suspend () -> T): T {
+        val mutex = coldStartLocks.getOrPut(host.lowercase()) { Mutex() }
+        return mutex.withLock { block() }
+    }
 
     fun getBrowserUserAgent(context: Context? = CommonActivity.activity): String {
         if (userAgent.isNotBlank()) return userAgent
@@ -147,13 +201,11 @@ object CFState {
         return cookieMap.entries.joinToString("; ") { "${it.key}=${it.value}" }
     }
 
-    // NEW: partition-aware cookie extraction. Cloudflare now issues cf_clearance
-    // as a Partitioned cookie; getCookie(single-url) sometimes returns empty.
     fun extractAllCookies(host: String, url: String): String {
         val cm = CookieManager.getInstance()
         val sources = listOfNotNull(
             runCatching { cm.getCookie("https://$host/") }.getOrNull(),
-            runCatching { cm.getCookie("https://$host/api") }.getOrNull(),
+            runCatching { cm.getCookie("https://$host/anime/") }.getOrNull(),
             runCatching { cm.getCookie(url) }.getOrNull()
         ).filter { it.isNotBlank() }
         return mergeCookies(sources.joinToString("; "), null)
@@ -161,18 +213,20 @@ object CFState {
 
     fun storeSolvedHtml(url: String, html: String) {
         if (html.length <= 200) return
+        val key = normalizeUrl(url)
         val now = System.currentTimeMillis()
         solvedHtmlCache.entries.removeIf { now - it.value.first > HTML_CACHE_TTL_MS }
         if (solvedHtmlCache.size >= 32) {
             solvedHtmlCache.minByOrNull { it.value.first }?.key?.let { solvedHtmlCache.remove(it) }
         }
-        solvedHtmlCache[url] = now to html
+        solvedHtmlCache[key] = now to html
     }
 
     fun getSolvedHtml(url: String): String? {
-        val entry = solvedHtmlCache[url] ?: return null
+        val key = normalizeUrl(url)
+        val entry = solvedHtmlCache[key] ?: return null
         if (System.currentTimeMillis() - entry.first > HTML_CACHE_TTL_MS) {
-            solvedHtmlCache.remove(url)
+            solvedHtmlCache.remove(key)
             return null
         }
         return entry.second
@@ -210,44 +264,7 @@ object CFState {
         failedUntil.remove(host)
     }
 
-    // NEW: pre-warm — starts a silent solve in the background if no valid cookie
-    // exists. Safe to call multiple times; only the first invocation does anything.
-    fun prewarmIfNeeded() {
-        if (prewarmStarted) return
-        prewarmStarted = true
-
-        solverScope.launch {
-            try {
-                val host = "animekhor.org"
-                val cookie = extractAllCookies(host, "https://$host/")
-                if (cookie.contains("cf_clearance")) {
-                    Log.e("Animekhor/Prewarm", "Cookie already present, skipping")
-                    return@launch
-                }
-                // Wait up to 15s for an activity
-                val deadline = System.currentTimeMillis() + 15_000L
-                while (System.currentTimeMillis() < deadline) {
-                    val act = CommonActivity.activity
-                    if (act != null && !act.isFinishing && !act.isDestroyed) break
-                    kotlinx.coroutines.delay(500L)
-                }
-                val act = CommonActivity.activity ?: return@launch
-                if (act.isFinishing || act.isDestroyed) return@launch
-
-                Log.e("Animekhor/Prewarm", "Starting background pre-warm")
-                CFSolver("https://$host/", skipSilent = false, isPrewarm = true).solve()
-            } catch (e: Exception) {
-                Log.e("Animekhor/Prewarm", "Failed: ${e.message}")
-            }
-        }
-    }
-
-    /**
-     * NEW: WebView-as-transport fallback.
-     * Loads [url] in a fresh WebView and grabs the resulting HTML via JS.
-     * Used when the cookie was never issued but the WebView can still reach the site.
-     * Returns null on any failure (challenge still visible, timeout, etc.).
-     */
+    @SuppressLint("SetJavaScriptEnabled")
     suspend fun fetchViaWebView(activity: Activity, url: String): String? =
         withContext(Dispatchers.Main) {
             if (activity.isFinishing || activity.isDestroyed) return@withContext null
@@ -262,13 +279,13 @@ object CFState {
                 val webView = WebView(activity).apply {
                     layoutParams = ViewGroup.LayoutParams(1, 1)
                     alpha = 0.01f
-                    isFocusable = true
-                    isFocusableInTouchMode = true
                     settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         @Suppress("DEPRECATION")
                         databaseEnabled = true
+                        loadsImagesAutomatically = false
+                        blockNetworkImage = true
                         userAgentString = ua
                     }
                 }
@@ -279,14 +296,21 @@ object CFState {
                     handler.removeCallbacksAndMessages(null)
                     handler.post {
                         runCatching { decor.removeView(webView) }
+                        runCatching { webView.stopLoading() }
                         runCatching { webView.destroy() }
                     }
                     if (cont.isActive) cont.resume(html)
                 }
 
                 webView.webViewClient = object : WebViewClient() {
-                    override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: SslError?) {
-                        if (e?.primaryError == SslError.SSL_UNTRUSTED) h?.proceed() else h?.cancel()
+                    override fun shouldInterceptRequest(
+                        view: WebView?,
+                        request: WebResourceRequest?
+                    ): WebResourceResponse? {
+                        if (!shouldAllowBackgroundWebResource(request)) {
+                            return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
+                        }
+                        return super.shouldInterceptRequest(view, request)
                     }
 
                     override fun onPageFinished(view: WebView?, loadedUrl: String?) {
@@ -305,12 +329,12 @@ object CFState {
                     }
                 }
 
+                cont.invokeOnCancellation { finish(null) }
                 handler.postDelayed({ finish(null) }, 10_000L)
 
                 decor.addView(webView)
                 webView.onResume()
                 webView.resumeTimers()
-                webView.onWindowFocusChanged(true)
                 webView.loadUrl(url)
             }
         }
@@ -319,7 +343,7 @@ object CFState {
 class CFSolver(
     private val url: String,
     private val skipSilent: Boolean = false,
-    private val isPrewarm: Boolean = false  // NEW: pre-warm failures shouldn't trigger cooldown
+    private val isPrewarm: Boolean = false
 ) {
 
     private fun log(msg: String) = Log.e("Animekhor/CFSolver", msg)
@@ -329,7 +353,6 @@ class CFSolver(
     }
 
     private val webViewHeaders = mapOf(
-        "Referer" to "https://www.google.com/",
         "Accept-Language" to "en-US,en;q=0.9"
     )
 
@@ -348,24 +371,15 @@ class CFSolver(
                 t.contains("403 forbidden")
     }
 
-    /**
-     * NEW: Send a Tab+Space key press into the WebView. Cloudflare Turnstile
-     * rejects synthetic mouse/touch events but accepts keyboard focus + activation.
-     * This is the primary solving mechanism; coordinate-based taps are removed.
-     */
     private fun pressTabThenSpace(web: WebView, handler: Handler) {
         runCatching {
-            val tabDown = KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_TAB)
-            val tabUp = KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_TAB)
-            web.dispatchKeyEvent(tabDown)
-            web.dispatchKeyEvent(tabUp)
+            web.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_TAB))
+            web.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_TAB))
 
             handler.postDelayed({
                 runCatching {
-                    val spaceDown = KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_SPACE)
-                    val spaceUp = KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_SPACE)
-                    web.dispatchKeyEvent(spaceDown)
-                    web.dispatchKeyEvent(spaceUp)
+                    web.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_SPACE))
+                    web.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_SPACE))
                 }
             }, 200L)
         }
@@ -397,7 +411,12 @@ class CFSolver(
                 if (silentSuccess) {
                     log("✅ Silent CF solve success for $host!")
                     CFState.clearFailure(host)
+                    CFState.markHostVerified(host)
                     deferred.complete(true)
+                } else if (isPrewarm) {
+                    // Never pop up an interactive dialog over the user's screen during background pre-warm
+                    log("⏭ Pre-warm silent solve did not complete; skipping interactive dialog.")
+                    deferred.complete(false)
                 } else {
                     log("❌ Silent solve failed for $host. Opening interactive dialog.")
                     withContext(Dispatchers.Main) {
@@ -405,14 +424,21 @@ class CFSolver(
                             Toast.makeText(activity, "Verifying browser…", Toast.LENGTH_SHORT).show()
                         }
                     }
-                    showDialog(activity, host, deferred)
+                    val dialogSuccess = awaitDialogResolution(activity, host)
+                    if (dialogSuccess) {
+                        CFState.clearFailure(host)
+                        CFState.markHostVerified(host)
+                    } else {
+                        CFState.markFailure(host)
+                    }
+                    deferred.complete(dialogSuccess)
                 }
             } catch (e: Exception) {
                 log("❌ CF Solver failed: ${e.message}")
                 if (!isPrewarm) CFState.markFailure(host)
                 runCatching { if (!deferred.isCompleted) deferred.complete(false) }
             } finally {
-                if (deferred.isCompleted) CFState.endSolve(host, deferred)
+                CFState.endSolve(host, deferred)
             }
         }
         return deferred.await()
@@ -434,9 +460,6 @@ class CFSolver(
                 val cookieManager = CookieManager.getInstance()
                 cookieManager.setAcceptCookie(true)
 
-                // CHANGED: 380×680 physical px fits a real ~138dp column but the CSS
-                // viewport stays large enough for Turnstile; alpha=0.01f keeps hwui
-                // rendering it (0f can trigger the 5-second JS throttle).
                 val webView = WebView(activity).apply {
                     layoutParams = ViewGroup.LayoutParams(380, 680)
                     alpha = 0.01f
@@ -447,6 +470,8 @@ class CFSolver(
                         domStorageEnabled = true
                         @Suppress("DEPRECATION")
                         databaseEnabled = true
+                        loadsImagesAutomatically = false
+                        blockNetworkImage = true
                         useWideViewPort = true
                         loadWithOverviewMode = true
                         mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
@@ -472,35 +497,12 @@ class CFSolver(
                     if (cont.isActive) cont.resume(success)
                 }
 
-                fun captureHtmlAndCleanup() {
+                fun scheduleNextPoll(delayMs: Long = 1000L) {
                     if (done.get()) return
-                    runCatching {
-                        webView.evaluateJavascript(
-                            "(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();"
-                        ) { raw ->
-                            if (done.get()) return@evaluateJavascript
-                            val html = decodeJsHtml(raw)
-                            val title = webView.title.orEmpty()
-                            if (!html.isNullOrBlank() &&
-                                html.length > 500 &&
-                                !isChallengeOrErrorTitle(title) &&
-                                !isCfChallengeHtml(html) &&
-                                isRealSiteHtml(html)
-                            ) {
-                                CFState.storeSolvedHtml(url, html)
-                                webView.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
-                                destroyWebView(true)
-                            } else {
-                                pollRunnable?.let { handler.removeCallbacks(it) }
-                                pollRunnable = Runnable { captureHtmlAndCleanup() }.also {
-                                    handler.postDelayed(it, 1000L)
-                                }
-                            }
-                        }
-                    }.onFailure { destroyWebView(false) }
+                    pollRunnable?.let { handler.removeCallbacks(it) }
+                    pollRunnable = Runnable { poll() }.also { handler.postDelayed(it, delayMs) }
                 }
 
-                // NEW: unified poll — checks title + partitioned cookies, presses Tab+Space when needed
                 fun poll() {
                     if (done.get()) return
                     tick++
@@ -515,25 +517,55 @@ class CFSolver(
                         "🔍 [Silent] tick#$tick title='$title' cookieLen=${rawCookie.length} hasClearance=$hasClearance"
                     )
 
-                    if (hasClearance && !onChallenge) {
-                        captureHtmlAndCleanup()
+                    // Inspect the DOM whenever the title is clean OR cf_clearance is present.
+                    // Does NOT require hasClearance=true when the real page has already loaded.
+                    if (!onChallenge || hasClearance) {
+                        runCatching {
+                            webView.evaluateJavascript(
+                                "(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();"
+                            ) { raw ->
+                                if (done.get()) return@evaluateJavascript
+                                val html = decodeJsHtml(raw).orEmpty()
+
+                                if (isHumanOnlyChallenge(html)) {
+                                    Log.e("Animekhor/CFSolver", "🧩 [Silent] Human CAPTCHA detected in DOM — escalating immediately")
+                                    destroyWebView(false)
+                                    return@evaluateJavascript
+                                }
+
+                                if (html.length > 500 &&
+                                    !isChallengeOrErrorTitle(webView.title.orEmpty()) &&
+                                    !isCfChallengeHtml(html) &&
+                                    isRealSiteHtml(html)
+                                ) {
+                                    CFState.storeSolvedHtml(url, html)
+                                    webView.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
+                                    destroyWebView(true)
+                                } else {
+                                    scheduleNextPoll(1000L)
+                                }
+                            }
+                        }.onFailure { destroyWebView(false) }
                         return
                     }
 
-                    // Press Tab+Space every 4 ticks (≈4s) while on a challenge page,
-                    // starting at tick #4 so Turnstile has rendered first.
-                    if (onChallenge && tick >= 4 && tick % 4 == 0) {
-                        Log.e("Animekhor/CFSolver", "⌨️ [Silent] Tab+Space press (attempt ${tick / 4})")
+                    if (tick >= 3 && tick % 3 == 0) {
+                        Log.e("Animekhor/CFSolver", "⌨️ [Silent] Tab+Space press (attempt ${tick / 3})")
                         pressTabThenSpace(webView, handler)
                     }
 
-                    pollRunnable = Runnable { poll() }.also { handler.postDelayed(it, 1000L) }
+                    scheduleNextPoll(1000L)
                 }
 
                 webView.webViewClient = object : WebViewClient() {
-                    override fun onPageStarted(view: WebView?, startedUrl: String?, favicon: Bitmap?) {
-                        super.onPageStarted(view, startedUrl, favicon)
-                        // CHANGED: SPOOF_JS removed entirely
+                    override fun shouldInterceptRequest(
+                        view: WebView?,
+                        request: WebResourceRequest?
+                    ): WebResourceResponse? {
+                        if (!shouldAllowBackgroundWebResource(request)) {
+                            return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
+                        }
+                        return super.shouldInterceptRequest(view, request)
                     }
 
                     override fun onReceivedHttpError(
@@ -545,267 +577,233 @@ class CFSolver(
                         }
                     }
 
-                    override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: SslError?) {
-                        if (e?.primaryError == SslError.SSL_UNTRUSTED) h?.proceed() else h?.cancel()
-                    }
-
                     override fun onPageFinished(view: WebView?, loadedUrl: String?) {
                         val currentUrl = loadedUrl ?: url
                         if (currentUrl == "about:blank" || done.get()) return
                         Log.e("Animekhor/CFSolver", "🔍 [Silent] Page Finished: URL=$currentUrl")
-                        // Start the polling loop on the first page finish
-                        if (pollRunnable == null) {
-                            pollRunnable = Runnable { poll() }.also { handler.postDelayed(it, 500L) }
-                        }
+                        scheduleNextPoll(400L)
                     }
                 }
 
                 cont.invokeOnCancellation { destroyWebView(false) }
-                timeoutRunnable = Runnable { destroyWebView(false) }.also { handler.postDelayed(it, 15_000L) }
+                timeoutRunnable = Runnable { destroyWebView(false) }.also { handler.postDelayed(it, 12_000L) }
 
                 decor.addView(webView)
                 webView.onResume()
                 webView.resumeTimers()
-                webView.onWindowFocusChanged(true)  // NEW: give WebView focus for key events
+                webView.onWindowFocusChanged(true)
                 webView.requestFocus()
                 webView.loadUrl(url, webViewHeaders)
             }
         }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun showDialog(activity: Activity, host: String, deferred: CompletableDeferred<Boolean>) {
-        if (activity.isFinishing || activity.isDestroyed) {
-            CFState.endSolve(host, deferred)
-            return
-        }
+    private suspend fun awaitDialogResolution(activity: Activity, host: String): Boolean =
+        withContext(Dispatchers.Main) {
+            if (activity.isFinishing || activity.isDestroyed) return@withContext false
 
-        val resolved = AtomicBoolean(false)
-        val handler = Handler(Looper.getMainLooper())
-        var timeoutRunnable: Runnable? = null
-        var checkRunnable: Runnable? = null
-        var dialog: Dialog? = null
-        var web: WebView? = null
-        val ua = resolveWebViewUa(activity, host)
-        var tick = 0
-        var isWarmupPhase = true
+            suspendCancellableCoroutine { cont ->
+                val resolved = AtomicBoolean(false)
+                val handler = Handler(Looper.getMainLooper())
+                var timeoutRunnable: Runnable? = null
+                var checkRunnable: Runnable? = null
+                var dialog: Dialog? = null
+                var web: WebView? = null
+                val ua = resolveWebViewUa(activity, host)
+                var tick = 0
 
-        Log.e("Animekhor/CFSolver", "🔍 Dialog starting. Host: $host")
+                Log.e("Animekhor/CFSolver", "🔍 Dialog starting. Host: $host")
 
-        val cookieManager = CookieManager.getInstance()
-        cookieManager.setAcceptCookie(true)
+                val cookieManager = CookieManager.getInstance()
+                cookieManager.setAcceptCookie(true)
 
-        fun finish(success: Boolean) {
-            if (!resolved.compareAndSet(false, true)) return
-            timeoutRunnable?.let { handler.removeCallbacks(it) }
-            checkRunnable?.let { handler.removeCallbacks(it) }
-            if (success) {
-                CFState.setUserAgent(host, ua)
-                CFState.clearFailure(host)
-                runCatching { cookieManager.flush() }
-            } else {
-                CFState.markFailure(host)
-            }
-            log(if (success) "✅ Interactive CF solve success!" else "❌ Interactive CF solve failed.")
-            runCatching { if (!deferred.isCompleted) deferred.complete(success) }
-            CFState.endSolve(host, deferred)
-            handler.post {
-                runCatching {
-                    (web?.parent as? ViewGroup)?.removeView(web)
-                    web?.stopLoading()
-                    web?.loadUrl("about:blank")
-                    web?.destroy()
+                fun finish(success: Boolean) {
+                    if (!resolved.compareAndSet(false, true)) return
+                    timeoutRunnable?.let { handler.removeCallbacks(it) }
+                    checkRunnable?.let { handler.removeCallbacks(it) }
+                    if (success) {
+                        CFState.setUserAgent(host, ua)
+                        runCatching { cookieManager.flush() }
+                    }
+                    log(if (success) "✅ Interactive CF solve success!" else "❌ Interactive CF solve failed.")
+                    handler.post {
+                        runCatching {
+                            (web?.parent as? ViewGroup)?.removeView(web)
+                            web?.stopLoading()
+                            web?.loadUrl("about:blank")
+                            web?.destroy()
+                        }
+                        web = null
+                        runCatching { dialog?.dismiss() }
+                    }
+                    if (cont.isActive) cont.resume(success)
                 }
-                web = null
-                runCatching { dialog?.dismiss() }
-            }
-        }
 
-        dialog = Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
-        val layout = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#0A0C12"))
-        }
+                dialog = Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+                val layout = LinearLayout(activity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setBackgroundColor(Color.parseColor("#0A0C12"))
+                }
 
-        val header = TextView(activity).apply {
-            text = "Verifying you are human…"
-            setTextColor(Color.WHITE)
-            textSize = 18f
-            setPadding(50, 50, 50, 30)
-        }
-        val status = TextView(activity).apply {
-            text = "Warming up session..."
-            setTextColor(Color.parseColor("#A0A0A0"))
-            textSize = 13f
-            setPadding(50, 0, 50, 30)
-        }
+                val header = TextView(activity).apply {
+                    text = "Verifying you are human…"
+                    setTextColor(Color.WHITE)
+                    textSize = 18f
+                    setPadding(50, 50, 50, 20)
+                }
+                val status = TextView(activity).apply {
+                    text = "Complete the verification below — this window will close automatically."
+                    setTextColor(Color.parseColor("#A0A0A0"))
+                    textSize = 13f
+                    setPadding(50, 0, 50, 30)
+                }
 
-        val buttonRow = LinearLayout(activity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(50, 10, 50, 40)
-        }
-        val continueBtn = Button(activity).apply {
-            text = "Continue"
-            setBackgroundColor(Color.parseColor("#0C70DE"))
-            setTextColor(Color.WHITE)
-            setOnClickListener {
-                web?.let { w ->
-                    w.evaluateJavascript(
-                        "(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();"
-                    ) { raw ->
-                        val html = decodeJsHtml(raw)
-                        val title = w.title.orEmpty()
-                        if (!html.isNullOrBlank() && html.length > 500 &&
-                            !isChallengeOrErrorTitle(title) && !isCfChallengeHtml(html)
-                        ) {
-                            CFState.storeSolvedHtml(url, html)
-                            w.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
-                            finish(true)
-                        } else {
-                            status.text = "Please complete the verification first, then tap Continue."
-                            status.setTextColor(Color.parseColor("#E04040"))
+                val buttonRow = LinearLayout(activity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    setPadding(50, 10, 50, 40)
+                }
+                val continueBtn = Button(activity).apply {
+                    text = "Continue"
+                    setBackgroundColor(Color.parseColor("#0C70DE"))
+                    setTextColor(Color.WHITE)
+                    setOnClickListener {
+                        web?.let { w ->
+                            w.evaluateJavascript(
+                                "(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();"
+                            ) { raw ->
+                                val html = decodeJsHtml(raw)
+                                val title = w.title.orEmpty()
+                                if (!html.isNullOrBlank() && html.length > 500 &&
+                                    !isChallengeOrErrorTitle(title) && !isCfChallengeHtml(html)
+                                ) {
+                                    CFState.storeSolvedHtml(url, html)
+                                    w.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
+                                    finish(true)
+                                } else {
+                                    status.text = "Please complete the verification first, then tap Continue."
+                                    status.setTextColor(Color.parseColor("#E04040"))
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
-        val cancelBtn = Button(activity).apply {
-            text = "Cancel"
-            setBackgroundColor(Color.parseColor("#333333"))
-            setTextColor(Color.WHITE)
-            setOnClickListener { finish(false) }
-        }
-        buttonRow.addView(continueBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        buttonRow.addView(Space(activity), LinearLayout.LayoutParams(20, 1))
-        buttonRow.addView(cancelBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-
-        val webView = WebView(activity)
-        web = webView
-        cookieManager.setAcceptThirdPartyCookies(webView, true)
-        webView.settings.apply {
-            javaScriptEnabled = true
-            domStorageEnabled = true
-            @Suppress("DEPRECATION")
-            databaseEnabled = true
-            useWideViewPort = true
-            loadWithOverviewMode = true
-            loadsImagesAutomatically = true
-            blockNetworkImage = false
-            mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-            userAgentString = ua
-            mediaPlaybackRequiresUserGesture = false
-        }
-
-        // NEW: dialog poll — same Tab+Space strategy, user can also click manually
-        fun poll() {
-            if (resolved.get()) return
-            tick++
-            val rawCookie = CFState.extractAllCookies(host, webView.url ?: url)
-            val hasClearance = rawCookie.contains("cf_clearance")
-            val title = webView.title.orEmpty()
-            val onChallenge = isChallengeOrErrorTitle(title)
-
-            Log.e(
-                "Animekhor/CFSolver",
-                "🔍 [Dialog] tick#$tick title='$title' cookieLen=${rawCookie.length} hasClearance=$hasClearance"
-            )
-
-            if (hasClearance && !onChallenge && !isWarmupPhase) {
-                webView.evaluateJavascript(
-                    "(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();"
-                ) { raw ->
-                    if (resolved.get()) return@evaluateJavascript
-                    val html = decodeJsHtml(raw)
-                    if (!html.isNullOrBlank() && html.length > 500 &&
-                        !isChallengeOrErrorTitle(webView.title.orEmpty()) &&
-                        !isCfChallengeHtml(html) && isRealSiteHtml(html)
-                    ) {
-                        CFState.storeSolvedHtml(url, html)
-                        webView.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
-                        finish(true)
-                    } else {
-                        status.text = "Complete the checkbox, then tap Continue."
-                        status.setTextColor(Color.parseColor("#A0A0A0"))
-                    }
+                val cancelBtn = Button(activity).apply {
+                    text = "Cancel"
+                    setBackgroundColor(Color.parseColor("#333333"))
+                    setTextColor(Color.WHITE)
+                    setOnClickListener { finish(false) }
                 }
-                return
-            }
+                buttonRow.addView(continueBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                buttonRow.addView(Space(activity), LinearLayout.LayoutParams(20, 1))
+                buttonRow.addView(cancelBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
-            // Press Tab+Space every 4 ticks while on a challenge page (after warm-up)
-            if (!isWarmupPhase && onChallenge && tick >= 4 && tick % 4 == 0) {
-                Log.e("Animekhor/CFSolver", "⌨️ [Dialog] Tab+Space press (attempt ${tick / 4})")
-                pressTabThenSpace(webView, handler)
-            }
-
-            checkRunnable = Runnable { poll() }.also { handler.postDelayed(it, 1000L) }
-        }
-
-        webView.webViewClient = object : WebViewClient() {
-            override fun onPageStarted(view: WebView?, startedUrl: String?, favicon: Bitmap?) {
-                super.onPageStarted(view, startedUrl, favicon)
-                Log.e("Animekhor/CFSolver", "🔍 [Dialog] Page Started: $startedUrl")
-                // CHANGED: SPOOF_JS removed
-            }
-
-            override fun onReceivedHttpError(
-                view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?
-            ) {
-                super.onReceivedHttpError(view, request, errorResponse)
-                if (request?.isForMainFrame == true) {
-                    Log.e("Animekhor/CFSolver", "❌ [Dialog] HTTP ${errorResponse?.statusCode} @ ${request.url}")
+                val webView = WebView(activity)
+                web = webView
+                cookieManager.setAcceptThirdPartyCookies(webView, true)
+                webView.settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    @Suppress("DEPRECATION")
+                    databaseEnabled = true
+                    useWideViewPort = true
+                    loadWithOverviewMode = true
+                    loadsImagesAutomatically = true
+                    blockNetworkImage = false
+                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    userAgentString = ua
+                    mediaPlaybackRequiresUserGesture = false
                 }
-            }
 
-            override fun onReceivedSslError(v: WebView?, h: SslErrorHandler?, e: SslError?) {
-                if (e?.primaryError == SslError.SSL_UNTRUSTED) h?.proceed() else h?.cancel()
-            }
+                fun scheduleNextCheck(delayMs: Long = 1000L) {
+                    if (resolved.get()) return
+                    checkRunnable?.let { handler.removeCallbacks(it) }
+                    checkRunnable = Runnable { poll() }.also { handler.postDelayed(it, delayMs) }
+                }
 
-            override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                val currentUrl = loadedUrl ?: url
-                if (currentUrl == "about:blank" || resolved.get()) return
+                fun poll() {
+                    if (resolved.get()) return
+                    tick++
+                    val rawCookie = CFState.extractAllCookies(host, webView.url ?: url)
+                    val hasClearance = rawCookie.contains("cf_clearance")
+                    val title = webView.title.orEmpty()
+                    val onChallenge = isChallengeOrErrorTitle(title)
 
-                if (isWarmupPhase) {
-                    if (currentUrl == "https://animekhor.org" || currentUrl == "https://animekhor.org/") {
-                        status.text = "Warming up session..."
-                        view?.evaluateJavascript("window.scrollBy(0, 600);", null)
-                        handler.postDelayed({
-                            if (!resolved.get()) {
-                                isWarmupPhase = false
-                                status.text = "Loading verification..."
-                                tick = 0  // reset so Tab+Space starts fresh
-                                view?.loadUrl(url, webViewHeaders)
+                    Log.e(
+                        "Animekhor/CFSolver",
+                        "🔍 [Dialog] tick#$tick title='$title' cookieLen=${rawCookie.length} hasClearance=$hasClearance"
+                    )
+
+                    // Auto-close as soon as the real site DOM is present, without requiring cf_clearance
+                    if (!onChallenge || hasClearance) {
+                        webView.evaluateJavascript(
+                            "(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();"
+                        ) { raw ->
+                            if (resolved.get()) return@evaluateJavascript
+                            val html = decodeJsHtml(raw)
+                            if (!html.isNullOrBlank() && html.length > 500 &&
+                                !isChallengeOrErrorTitle(webView.title.orEmpty()) &&
+                                !isCfChallengeHtml(html) && isRealSiteHtml(html)
+                            ) {
+                                CFState.storeSolvedHtml(url, html)
+                                webView.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
+                                finish(true)
+                            } else {
+                                status.text = "Complete the verification below, then tap Continue."
+                                status.setTextColor(Color.parseColor("#A0A0A0"))
+                                scheduleNextCheck(1000L)
                             }
-                        }, 1500L)
-                    } else {
-                        isWarmupPhase = false
-                        tick = 0
-                        view?.loadUrl(url, webViewHeaders)
+                        }
+                        return
                     }
-                    return
+
+                    if (tick >= 4 && tick % 4 == 0) {
+                        Log.e("Animekhor/CFSolver", "⌨️ [Dialog] Tab+Space press (attempt ${tick / 4})")
+                        pressTabThenSpace(webView, handler)
+                    }
+
+                    scheduleNextCheck(1000L)
                 }
 
-                // Start poll loop on first non-warmup page finish
-                if (checkRunnable == null) {
-                    checkRunnable = Runnable { poll() }.also { handler.postDelayed(it, 500L) }
+                webView.webViewClient = object : WebViewClient() {
+                    override fun onPageStarted(view: WebView?, startedUrl: String?, favicon: Bitmap?) {
+                        super.onPageStarted(view, startedUrl, favicon)
+                        Log.e("Animekhor/CFSolver", "🔍 [Dialog] Page Started: $startedUrl")
+                    }
+
+                    override fun onReceivedHttpError(
+                        view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?
+                    ) {
+                        super.onReceivedHttpError(view, request, errorResponse)
+                        if (request?.isForMainFrame == true) {
+                            Log.e("Animekhor/CFSolver", "❌ [Dialog] HTTP ${errorResponse?.statusCode} @ ${request.url}")
+                        }
+                    }
+
+                    override fun onPageFinished(view: WebView?, loadedUrl: String?) {
+                        val currentUrl = loadedUrl ?: url
+                        if (currentUrl == "about:blank" || resolved.get()) return
+                        scheduleNextCheck(500L)
+                    }
                 }
+
+                layout.addView(header)
+                layout.addView(status)
+                layout.addView(webView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+                layout.addView(buttonRow)
+
+                dialog.setContentView(layout)
+                dialog.setOnDismissListener { if (!resolved.get()) finish(false) }
+                cont.invokeOnCancellation { finish(false) }
+
+                dialog.show()
+                webView.loadUrl(url, webViewHeaders)
+
+                timeoutRunnable = Runnable {
+                    if (!resolved.get()) {
+                        log("⏱ Interactive solve timed out for $host")
+                        finish(false)
+                    }
+                }.also { handler.postDelayed(it, 90_000L) }
             }
         }
-
-        layout.addView(header)
-        layout.addView(status)
-        layout.addView(webView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        layout.addView(buttonRow)
-
-        dialog.setContentView(layout)
-        dialog.setOnDismissListener { if (!resolved.get()) finish(false) }
-        dialog.show()
-
-        webView.loadUrl("https://animekhor.org/", webViewHeaders)
-
-        timeoutRunnable = Runnable {
-            if (!resolved.get()) {
-                log("⏱ Interactive solve timed out for $host")
-                finish(false)
-            }
-        }.also { handler.postDelayed(it, 90_000L) }
-    }
 }
