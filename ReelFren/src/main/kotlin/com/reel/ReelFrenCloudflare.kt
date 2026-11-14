@@ -5,11 +5,13 @@ import android.app.Activity
 import android.app.Dialog
 import android.content.Context
 import android.content.ContextWrapper
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.http.SslError
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -34,6 +36,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
+// ── In-Flight Coalescing State ───────────────────────────────────────────────
 class SolveSession(
     val deferred: CompletableDeferred<Boolean> = CompletableDeferred(),
     val allowInteractive: AtomicBoolean = AtomicBoolean(false),
@@ -79,9 +82,25 @@ object ReelFrenCfState {
     }
 }
 
+// ── Cloudflare Solver ────────────────────────────────────────────────────────
 object ReelFrenCloudflare {
 
     private val clearanceRegex = Regex("(?:^|;\\s*)cf_clearance=([^;]+)")
+
+    // Captures closed Shadow DOM roots created by Cloudflare Turnstile
+    private const val SHADOW_HOOK_JS = """
+        (function() {
+            if (!Element.prototype.__cfOrigAttachShadow) {
+                Element.prototype.__cfOrigAttachShadow = Element.prototype.attachShadow;
+                Element.prototype.attachShadow = function(init) {
+                    var sr = this.__cfOrigAttachShadow.call(this, init);
+                    window.__cfLastShadowHost = this;
+                    window.__cfLastShadowRoot = sr;
+                    return sr;
+                };
+            }
+        })();
+    """
 
     fun hostOf(url: String): String =
         runCatching { URI(url).host }.getOrNull()?.lowercase(Locale.ROOT) ?: ""
@@ -228,15 +247,43 @@ object ReelFrenCloudflare {
         }
     }
 
-    private fun simulateTouchTap(web: WebView, x: Float, y: Float) {
+    /**
+     * Dispatches a realistic touchscreen finger tap with a 65ms real looper delay
+     * between ACTION_DOWN and ACTION_UP so JS pointerdown -> pointerup timing is non-zero.
+     */
+    private fun simulateTouchTap(web: WebView, handler: Handler, x: Float, y: Float) {
         runCatching {
             val downTime = SystemClock.uptimeMillis()
-            val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, y, 0)
-            val up = MotionEvent.obtain(downTime, downTime + 65L, MotionEvent.ACTION_UP, x, y, 0)
+            val props = arrayOf(MotionEvent.PointerProperties().apply {
+                id = 0
+                toolType = MotionEvent.TOOL_TYPE_FINGER
+            })
+            val coords = arrayOf(MotionEvent.PointerCoords().apply {
+                this.x = x
+                this.y = y
+                pressure = 1.0f
+                size = 1.0f
+            })
+            val down = MotionEvent.obtain(
+                downTime, downTime, MotionEvent.ACTION_DOWN,
+                1, props, coords, 0, 0, 1.0f, 1.0f,
+                0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+            )
             web.dispatchTouchEvent(down)
-            web.dispatchTouchEvent(up)
             down.recycle()
-            up.recycle()
+
+            handler.postDelayed({
+                runCatching {
+                    val upTime = SystemClock.uptimeMillis()
+                    val up = MotionEvent.obtain(
+                        downTime, upTime, MotionEvent.ACTION_UP,
+                        1, props, coords, 0, 0, 1.0f, 1.0f,
+                        0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+                    )
+                    web.dispatchTouchEvent(up)
+                    up.recycle()
+                }
+            }, 65L)
         }
     }
 
@@ -365,10 +412,12 @@ object ReelFrenCloudflare {
             val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
             var mainFrameError: String? = null
 
+            // Use MATCH_PARENT x 1200 (identical to the Dialog) so CSS window.innerWidth
+            // is a full ~360-412dp mobile viewport instead of a tiny 138dp column.
             val container = object : FrameLayout(activity) {
                 override fun dispatchTouchEvent(ev: MotionEvent?): Boolean = false
             }.apply {
-                layoutParams = ViewGroup.LayoutParams(380, 680)
+                layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1200)
                 alpha = 0.01f
                 isClickable = false
                 isFocusable = false
@@ -376,7 +425,7 @@ object ReelFrenCloudflare {
             }
 
             val web = WebView(activity).apply {
-                layoutParams = FrameLayout.LayoutParams(380, 680)
+                layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1200)
                 settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
@@ -432,32 +481,56 @@ object ReelFrenCloudflare {
                     return
                 }
 
+                // Locate Turnstile checkbox in CSS space and convert to physical View pixels via devicePixelRatio
                 if (tick >= 4 && tick % 4 == 0 && isChallengeOrBlankTitle(title)) {
                     val locateJs = """
                         (function() {
-                            var sel = 'iframe[src*="challenges.cloudflare.com"], [id^="cf-chl-widget"], #turnstile-wrapper, .cf-turnstile, #challenge-stage, .cb-c';
-                            var el = document.querySelector(sel);
-                            if (el) {
+                            var dpr = window.devicePixelRatio || 1;
+                            function toPhys(el, tag) {
+                                if (!el || !el.getBoundingClientRect) return '';
                                 var r = el.getBoundingClientRect();
-                                if (r.width > 0 && r.height > 0) {
-                                    return (r.left + 28) + ',' + (r.top + Math.min(32, r.height / 2));
-                                }
+                                if (r.width < 180 || r.height < 40) return '';
+                                var px = Math.round((r.left + 28) * dpr);
+                                var py = Math.round((r.top + (r.height / 2)) * dpr);
+                                return px + ',' + py + ',' + tag + '(' + Math.round(r.left) + ',' + Math.round(r.top) + ',' + Math.round(r.width) + 'x' + Math.round(r.height) + ',dpr=' + dpr + ')';
                             }
-                            if (document.title && document.title.toLowerCase().indexOf('just a moment') !== -1) {
-                                return '65,290';
+                            if (window.__cfLastShadowRoot) {
+                                var sf = window.__cfLastShadowRoot.querySelector('iframe');
+                                var c1 = toPhys(sf, 'shadow-iframe');
+                                if (c1) return c1;
+                            }
+                            if (window.__cfLastShadowHost) {
+                                var c2 = toPhys(window.__cfLastShadowHost, 'shadow-host');
+                                if (c2) return c2;
+                            }
+                            var sel = 'iframe[src*="challenges.cloudflare.com"], [id^="cf-chl-widget"], #turnstile-wrapper, .cf-turnstile, #challenge-stage, .cb-c';
+                            var c3 = toPhys(document.querySelector(sel), 'selector');
+                            if (c3) return c3;
+
+                            var all = document.querySelectorAll('div, iframe');
+                            for (var i = 0; i < all.length; i++) {
+                                var r = all[i].getBoundingClientRect();
+                                if (r.width >= 240 && r.width <= 360 && r.height >= 50 && r.height <= 85 && r.top >= 40) {
+                                    var c4 = toPhys(all[i], 'geom');
+                                    if (c4) return c4;
+                                }
                             }
                             return '';
                         })();
                     """.trimIndent()
                     web.evaluateJavascript(locateJs) { res ->
                         if (done.get() || settling.get()) return@evaluateJavascript
-                        val coords = res?.trim('"').orEmpty()
-                        if (coords.isEmpty()) return@evaluateJavascript
-                        val parts = coords.split(",")
+                        val raw = res?.trim('"').orEmpty()
+                        if (raw.isEmpty()) {
+                            ReelFrenLog.d("CF/silent-tap", "Turnstile box not rendered yet at tick#$tick")
+                            return@evaluateJavascript
+                        }
+                        val parts = raw.split(",")
                         val cx = parts.getOrNull(0)?.toFloatOrNull() ?: return@evaluateJavascript
                         val cy = parts.getOrNull(1)?.toFloatOrNull() ?: return@evaluateJavascript
-                        ReelFrenLog.d("CF/silent-tap", "Dispatching tap at ($cx, $cy)")
-                        simulateTouchTap(web, cx, cy)
+                        val info = parts.drop(2).joinToString(",")
+                        ReelFrenLog.d("CF/silent-tap", "Dispatching tap at physical ($cx, $cy) [$info]")
+                        simulateTouchTap(web, handler, cx, cy)
                     }
                 }
             }
@@ -465,6 +538,11 @@ object ReelFrenCloudflare {
             web.webViewClient = object : WebViewClient() {
                 override fun onReceivedSslError(view: WebView?, sslHandler: SslErrorHandler?, error: SslError?) {
                     handleSslError(host, sslHandler, error)
+                }
+
+                override fun onPageStarted(view: WebView?, loadedUrl: String?, favicon: Bitmap?) {
+                    if (done.get() || loadedUrl == null || loadedUrl == "about:blank") return
+                    view?.evaluateJavascript(SHADOW_HOOK_JS, null)
                 }
 
                 override fun onPageFinished(view: WebView?, loadedUrl: String?) {
