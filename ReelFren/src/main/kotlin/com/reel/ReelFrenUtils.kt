@@ -2,19 +2,24 @@ package com.reel
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
+import android.webkit.WebSettings
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import kotlinx.coroutines.CancellationException
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
-// ── Debug Logger ─────────────────────────────────────────────────────────────
-object ReelFrenDebugLog {
+// ── Unified Logger ───────────────────────────────────────────────────────────
+object ReelFrenLog {
     private const val TAG = "ReelFren/CF"
     fun d(scope: String, msg: String) {
-        android.util.Log.e(TAG, "[$scope][${Thread.currentThread().name}] $msg")
+        Log.e(TAG, "[$scope][${Thread.currentThread().name}] $msg")
     }
     fun t(scope: String, e: Throwable) {
-        android.util.Log.e(TAG, "[$scope][${Thread.currentThread().name}] THROWABLE: ${e.message}", e)
+        Log.e(TAG, "[$scope][${Thread.currentThread().name}] ${e.javaClass.simpleName}: ${e.message}", e)
     }
 }
 
@@ -37,43 +42,116 @@ data class QualityEntry(val label: String, val url: String, val format: String)
 data class SubtitleEntry(val label: String, val lang: String, val url: String)
 data class VideoEntry(val episode: Int, val duration: Int, val vid: String, val available: Boolean)
 
-// ── Config ───────────────────────────────────────────────────────────────────
+// ── Config & Provider Registry ───────────────────────────────────────────────
 object ReelFrenConfig {
     const val REEL_SITE = "https://reelfren.net"
     const val DEFAULT_API_BASE = "https://reelfren.net"
+
+    val DEFAULT_ENABLED_SLUGS = setOf(
+        "dramabox", "reelshort", "wetv", "happyshort", "shorten",
+        "dramawave", "shortmax", "netshort", "pinedrama", "vigloo"
+    )
+
+    val PROVIDERS_MAP: LinkedHashMap<String, String> = linkedMapOf(
+        "Anamana"         to "anamana",
+        "AniBoy"          to "aniboy",
+        "Melolo"          to "melolo",
+        "Sereal+"         to "sereal",
+        "PineDrama"       to "pinedrama",
+        "Shorten"         to "shorten",
+        "HappyShort"      to "happyshort",
+        "Vigloo"          to "vigloo",
+        "Vigloo 2"        to "vigloo2",
+        "RapidTV"         to "rapidtv",
+        "RapidTV 2"       to "rapidtv2",
+        "RaptDrama"       to "raptdrama",
+        "CubeTV"          to "cubetv",
+        "JoyReels"        to "joyreels",
+        "AnyReel"         to "anyreel",
+        "Shortical"       to "shortical",
+        "StoReel"         to "storeel",
+        "LoveShots"       to "loveshots",
+        "MomeShort"       to "momeshort",
+        "MoreShort"       to "moreshort",
+        "ToonShort"       to "toonshort",
+        "SixthShort"      to "sixthshort",
+        "SoReel"          to "soreel",
+        "StoryGo"         to "storygo",
+        "MiniShort"       to "minishort",
+        "WinkNovel"       to "winknovel",
+        "My Muse"         to "mymuse",
+        "SarosTV"         to "sarostv",
+        "ReelAI"          to "reelai",
+        "Reelife"         to "reelife",
+        "ReelShort"       to "reelshort",
+        "ReelShort 2"     to "reelshort2",
+        "DramaBox"        to "dramabox",
+        "DramaWave"       to "dramawave",
+        "DramaNova"       to "dramanova",
+        "KalosTV"         to "kalostv",
+        "VibeShort"       to "vibeshort",
+        "FreeReels"       to "freereels",
+        "WeTV"            to "wetv",
+        "StoryReel"       to "storyreel",
+        "MovieBox Shorts" to "movieboxshorts",
+        "BonusTV"         to "bonustv",
+        "MoboReels"       to "moboreels",
+        "NetShort"        to "netshort",
+        "MyDrama"         to "mydrama",
+        "FlareFlow"       to "flareflow",
+        "PlayLet"         to "playlet",
+        "ShortMax"        to "shortmax",
+        "FlexTV"          to "flextv",
+        "FlexTV 2"        to "flextv2",
+        "CandyJar"        to "candyjar",
+        "BlinkDrama"      to "blinkdrama",
+        "iQIYI"           to "iqiyi",
+        "MovieBox"        to "moviebox",
+        "FilmBox"         to "filmbox"
+    )
 }
 
-// ── JSON parser ──────────────────────────────────────────────────────────────
+// ── JSON Parser ──────────────────────────────────────────────────────────────
 object ReelFrenParse {
 
     fun homeItems(body: String): List<HomeItem> {
-        ReelFrenDebugLog.d("Parse.homeItems", "Parsing body len=${body.length}")
         val root = runCatching { JSONObject(body) }.getOrNull() ?: run {
-            ReelFrenDebugLog.d("Parse.homeItems", "JSONObject failed -> return emptyList")
+            ReelFrenLog.d("Parse.homeItems", "Invalid JSON (len=${body.length})")
             return emptyList()
         }
+        val dataObj = root.optJSONObject("data")
         val arr = root.optJSONArray("data")
-            ?: root.optJSONObject("data")?.optJSONArray("items")
+            ?: dataObj?.optJSONArray("items")
+            ?: dataObj?.optJSONArray("list")
+            ?: dataObj?.optJSONArray("results")
+            ?: root.optJSONArray("items")
+            ?: root.optJSONArray("list")
             ?: run {
-                ReelFrenDebugLog.d("Parse.homeItems", "No data array/items found -> return emptyList")
+                ReelFrenLog.d("Parse.homeItems", "No items array (len=${body.length}): ${body.take(180)}")
                 return emptyList()
             }
-        val result = (0 until arr.length()).mapNotNull { i ->
+
+        return (0 until arr.length()).mapNotNull { i ->
             val o = arr.optJSONObject(i) ?: return@mapNotNull null
-            val id = clean(o, "id"); val title = clean(o, "title")
+            val id = clean(o, "id")
+            val title = clean(o, "title")
             if (id.isEmpty() || title.isEmpty()) null
-            else HomeItem(id, clean(o, "provider"), title, clean(o, "cover"),
-                          clean(o, "intro"), o.optInt("episodes"))
+            else HomeItem(
+                id = id,
+                provider = clean(o, "provider"),
+                title = title,
+                cover = clean(o, "cover"),
+                intro = clean(o, "intro"),
+                episodes = o.optInt("episodes")
+            )
         }
-        ReelFrenDebugLog.d("Parse.homeItems", "Parsed ${result.size} items")
-        return result
     }
 
     fun detail(body: String): DetailInfo? {
-        ReelFrenDebugLog.d("Parse.detail", "Parsing body len=${body.length}")
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
         val o = root.optJSONObject("detail") ?: root.optJSONObject("data") ?: root
-        val id = clean(o, "id"); val title = clean(o, "title")
+        val id = clean(o, "id")
+        val title = clean(o, "title")
         if (id.isEmpty() || title.isEmpty()) return null
 
         val videos = mutableListOf<VideoEntry>()
@@ -81,18 +159,25 @@ object ReelFrenParse {
             for (i in 0 until arr.length()) {
                 val v = arr.optJSONObject(i) ?: continue
                 videos += VideoEntry(
-                    v.optInt("episode", i + 1), v.optInt("duration"),
-                    clean(v, "vid"), v.optBoolean("available", true)
+                    episode = v.optInt("episode", i + 1),
+                    duration = v.optInt("duration"),
+                    vid = clean(v, "vid"),
+                    available = v.optBoolean("available", true)
                 )
             }
         }
-        return DetailInfo(id, clean(o, "provider"), title, clean(o, "cover"),
-            clean(o, "intro"), o.optInt("episodes", videos.size),
-            videos.sortedBy { it.episode })
+        return DetailInfo(
+            id = id,
+            provider = clean(o, "provider"),
+            title = title,
+            cover = clean(o, "cover"),
+            intro = clean(o, "intro"),
+            episodes = o.optInt("episodes", videos.size),
+            videos = videos.sortedBy { it.episode }
+        )
     }
 
     fun playback(body: String): PlaybackInfo? {
-        ReelFrenDebugLog.d("Parse.playback", "Parsing body len=${body.length}")
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
         val o = root.optJSONObject("data") ?: root.optJSONObject("playback") ?: root
 
@@ -100,97 +185,166 @@ object ReelFrenParse {
         o.optJSONArray("qualityList")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val q = arr.optJSONObject(i) ?: continue
-                val url = clean(q, "url"); if (url.isEmpty()) continue
+                val url = clean(q, "url")
+                if (url.isEmpty()) continue
                 qualities += QualityEntry(
-                    clean(q, "label").ifEmpty { "Auto" }, url, clean(q, "format"))
+                    label = clean(q, "label").ifEmpty { "Auto" },
+                    url = url,
+                    format = clean(q, "format")
+                )
             }
         }
         val direct = clean(o, "videoUrl")
         if (direct.isNotEmpty() && qualities.none { it.url == direct }) {
-            val fmt = when {
-                direct.contains(".m3u8", true) -> "hls"
-                direct.contains(".mpd",  true) -> "dash"
-                else -> "video"
-            }
-            qualities.add(0, QualityEntry("Auto", direct, fmt))
+            qualities.add(0, QualityEntry("Auto", direct, ReelFrenQuality.inferFormat(direct)))
         }
-        if (qualities.isEmpty()) {
-            ReelFrenDebugLog.d("Parse.playback", "No qualities found -> return null")
-            return null
-        }
+        if (qualities.isEmpty()) return null
 
         val subs = mutableListOf<SubtitleEntry>()
         o.optJSONArray("subtitles")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val s = arr.optJSONObject(i) ?: continue
-                val u = clean(s, "url"); if (u.isEmpty()) continue
+                val u = clean(s, "url")
+                if (u.isEmpty()) continue
                 subs += SubtitleEntry(clean(s, "label"), clean(s, "srclang"), u)
             }
         }
         return PlaybackInfo(
-            clean(o, "title"), o.optInt("episodeNumber", 1),
-            o.optInt("totalEpisodes", 1), o.optBoolean("locked"),
-            qualities, subs, clean(o, "sourceServer").ifEmpty { "1" }
+            title = clean(o, "title"),
+            episodeNumber = o.optInt("episodeNumber", 1),
+            totalEpisodes = o.optInt("totalEpisodes", 1),
+            locked = o.optBoolean("locked"),
+            qualities = qualities,
+            subtitles = subs,
+            server = clean(o, "sourceServer").ifEmpty { "1" }
         )
     }
 
     private fun clean(o: JSONObject, key: String, fallback: String = ""): String {
         val v = o.optString(key, fallback).trim()
-        return if (v == "null") fallback else v
+        return if (v.equals("null", ignoreCase = true)) fallback else v
     }
 }
 
-// ── Persistence ──────────────────────────────────────────────────────────────
+// ── Unified Persistence & State ──────────────────────────────────────────────
 object ReelFrenStore {
-    @Volatile private var prefs: SharedPreferences? = null
+    @Volatile var appContext: Context? = null
+        private set
+    @Volatile var defaultSystemUa: String = ReelFrenClient.FALLBACK_UA
+        private set
+
+    @Volatile private var storePrefs: SharedPreferences? = null
+    @Volatile private var providerPrefs: SharedPreferences? = null
+
+    private val memoryUa = ConcurrentHashMap<String, String>()
+    private val memoryCookies = ConcurrentHashMap<String, String>()
+
     fun init(ctx: Context) {
-        prefs = ctx.applicationContext.getSharedPreferences("reelfren_store", Context.MODE_PRIVATE)
-        ReelFrenDebugLog.d("Store", "init() called")
+        val app = ctx.applicationContext
+        appContext = app
+        storePrefs = app.getSharedPreferences("reelfren_store", Context.MODE_PRIVATE)
+        providerPrefs = app.getSharedPreferences("reelfren_prefs", Context.MODE_PRIVATE)
+
+        runCatching {
+            WebSettings.getDefaultUserAgent(app).replace("; wv", "").trim()
+        }.getOrNull()?.takeIf { it.isNotBlank() }?.let { ua ->
+            defaultSystemUa = ua
+        }
+        ReelFrenLog.d("Store", "init() defaultUa=${defaultSystemUa.take(70)}")
+    }
+
+    fun isProviderEnabled(slug: String): Boolean {
+        val default = ReelFrenConfig.DEFAULT_ENABLED_SLUGS.contains(slug)
+        return providerPrefs?.getBoolean("provider_$slug", default) ?: default
+    }
+
+    fun setProviderEnabled(editor: SharedPreferences.Editor, slug: String, enabled: Boolean) {
+        editor.putBoolean("provider_$slug", enabled)
+    }
+
+    fun providerPrefsEditor(): SharedPreferences.Editor? = providerPrefs?.edit()
+
+    fun enabledProviders(): Map<String, String> {
+        return ReelFrenConfig.PROVIDERS_MAP.filter { (_, slug) ->
+            isProviderEnabled(slug)
+        }.ifEmpty { ReelFrenConfig.PROVIDERS_MAP }
     }
 
     fun apiBase(): String {
-        val raw = prefs?.getString("api_base", ReelFrenConfig.DEFAULT_API_BASE).orEmpty()
+        val raw = storePrefs?.getString("api_base", ReelFrenConfig.DEFAULT_API_BASE).orEmpty()
         val clean = raw.trim().trimEnd('/')
-        return if (clean.startsWith("https://") || clean.startsWith("http://"))
-            clean else ReelFrenConfig.DEFAULT_API_BASE
-    }
-    fun setApiBase(v: String) {
-        val clean = v.trim().trimEnd('/')
-        if (!clean.startsWith("https://") && !clean.startsWith("http://")) return
-        prefs?.edit()?.putString("api_base", clean)?.apply()
+        return if (clean.startsWith("https://") || clean.startsWith("http://")) {
+            clean
+        } else {
+            ReelFrenConfig.DEFAULT_API_BASE
+        }
     }
 
     fun cookie(host: String): String {
-        val c = if (host.isBlank()) "" else prefs?.getString(key("cookie", host), "").orEmpty()
-        return c
+        if (host.isBlank()) return ""
+        val norm = host.lowercase(Locale.ROOT)
+        memoryCookies[norm]?.let { return it }
+        val saved = storePrefs?.getString(key("cookie", norm), "").orEmpty()
+        if (saved.isNotEmpty()) memoryCookies[norm] = saved
+        return saved
     }
-    
-    // FIX: Allow saving empty cookie strings to wipe out stale cookies
+
     fun saveCookie(host: String, cookie: String) {
         if (host.isBlank()) return
-        ReelFrenDebugLog.d("Store", "saveCookie($host) -> len=${cookie.length}")
-        prefs?.edit()?.putString(key("cookie", host), cookie)?.apply()
+        val norm = host.lowercase(Locale.ROOT)
+        if (cookie.isBlank()) {
+            memoryCookies.remove(norm)
+        } else {
+            memoryCookies[norm] = cookie
+        }
+        storePrefs?.edit()?.putString(key("cookie", norm), cookie)?.apply()
+        ReelFrenLog.d("Store", "saveCookie($norm) len=${cookie.length}")
+    }
+
+    fun userAgent(host: String): String {
+        if (host.isBlank()) return defaultSystemUa
+        val norm = host.lowercase(Locale.ROOT)
+        memoryUa[norm]?.let { return it }
+        val saved = storePrefs?.getString(key("ua", norm), null)?.takeIf { it.isNotBlank() }
+        if (saved != null) {
+            memoryUa[norm] = saved
+            return saved
+        }
+        return defaultSystemUa
     }
 
     fun setUserAgent(host: String, ua: String) {
         if (host.isBlank() || ua.isBlank()) return
-        prefs?.edit()?.putString(key("ua", host), ua)?.apply()
+        val norm = host.lowercase(Locale.ROOT)
+        memoryUa[norm] = ua
+        storePrefs?.edit()?.putString(key("ua", norm), ua)?.apply()
     }
-    fun userAgent(host: String): String? = prefs?.getString(key("ua", host), null)
 
-    private fun key(type: String, host: String) = "${type}_${host.lowercase(Locale.ROOT)}"
+    private fun key(type: String, host: String) = "${type}_$host"
 }
 
-// ── Quality mapping ──────────────────────────────────────────────────────────
+// ── Quality & Stream Format Mapping ──────────────────────────────────────────
 object ReelFrenQuality {
     private val heavy = Regex("(?i)\\b(h\\.?26[56]|hevc|x\\.?26[56]|av1)\\b")
+    private val resRegex = Regex("(?i)(\\d{3,4})\\s*p\\b")
 
     fun label(raw: String) = raw.trim().ifEmpty { "Auto" }
 
+    fun inferFormat(url: String): String = when {
+        url.contains(".m3u8", ignoreCase = true) -> "hls"
+        url.contains(".mpd", ignoreCase = true)  -> "dash"
+        else -> "video"
+    }
+
+    fun linkType(url: String, format: String = ""): ExtractorLinkType = when {
+        format.equals("hls", ignoreCase = true) || url.contains(".m3u8", ignoreCase = true) -> ExtractorLinkType.M3U8
+        format.equals("dash", ignoreCase = true) || url.contains(".mpd", ignoreCase = true) -> ExtractorLinkType.DASH
+        else -> ExtractorLinkType.VIDEO
+    }
+
     fun of(label: String): Int {
         val lower = label.lowercase(Locale.ROOT)
-        val match = Regex("(?i)(\\d{3,4})\\s*p\\b").find(label)
-        val base = match?.groupValues?.getOrNull(1)?.toIntOrNull() ?: when {
+        val base = resRegex.find(label)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: when {
             lower.contains("2160") || lower.contains("4k") || lower.contains("uhd") -> 2160
             lower.contains("1080") -> 1080
             lower.contains("720")  -> 720
@@ -200,13 +354,20 @@ object ReelFrenQuality {
         }
         return if (heavy.containsMatchIn(label)) demote(base) else base
     }
+
     private fun demote(q: Int) = when {
-        q >= 2160 -> 1080; q >= 1080 -> 720; q >= 720 -> 480; else -> 360
+        q >= 2160 -> 1080
+        q >= 1080 -> 720
+        q >= 720  -> 480
+        else      -> 360
     }
 }
 
-// ── URL parsing ──────────────────────────────────────────────────────────────
+// ── URL Parsing ──────────────────────────────────────────────────────────────
 object ReelFrenUrl {
+    private val pathRegex = Regex("/(?:drama|watch)/([^/?#|]+)/([^/?#|]+)")
+    private val epRegex = Regex("[?&]ep=(\\d+)")
+
     fun page(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/$slug/$id"
     fun episode(slug: String, id: String, ep: Int) = "${ReelFrenConfig.REEL_SITE}/watch/$slug/$id?ep=$ep"
 
@@ -214,33 +375,35 @@ object ReelFrenUrl {
         val input = raw?.trim().orEmpty()
         if (input.isEmpty()) return Triple("", "", 1)
 
-        Regex("/(?:drama|watch)/([^/?#|]+)/([^/?#|]+)").find(input)?.let { m ->
+        pathRegex.find(input)?.let { m ->
             val slug = m.groupValues[1].trim().lowercase(Locale.ROOT)
             val id   = m.groupValues[2].trim()
-            val ep   = Regex("[?&]ep=(\\d+)").find(input)
-                ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
+            val ep   = epRegex.find(input)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
             if (slug.isNotEmpty() && id.isNotEmpty()) return Triple(slug, id, ep)
         }
 
         val body = input.substringAfter("://", input)
-            .substringAfter("/", "").substringBefore("?").substringBefore("#")
+            .substringAfter("/", "")
+            .substringBefore("?")
+            .substringBefore("#")
         val parts = body.split("|")
         val slug = parts.getOrNull(0)?.trim()?.lowercase(Locale.ROOT).orEmpty()
         val id   = parts.getOrNull(1)?.trim().orEmpty()
         val ep   = parts.getOrNull(2)?.trim()?.toIntOrNull() ?: 1
-        return if (slug.isNotEmpty() && id.isNotEmpty()) Triple(slug, id, ep)
-        else Triple("", "", 1)
+        return if (slug.isNotEmpty() && id.isNotEmpty()) Triple(slug, id, ep) else Triple("", "", 1)
     }
 }
 
-// ── HTTP client ──────────────────────────────────────────────────────────────
+// ── HTTP Client ──────────────────────────────────────────────────────────────
 object ReelFrenClient {
 
-    const val UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 " +
-                   "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    const val FALLBACK_UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 " +
+                            "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
-    fun apiBase() = ReelFrenStore.apiBase()
-    fun query(v: String) = URLEncoder.encode(v, "UTF-8")
+    private val siteHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.REEL_SITE) }
+
+    private fun apiBase() = ReelFrenStore.apiBase()
+    private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
 
     fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
         val p = mutableListOf("provider=${query(slug)}", "lang=en")
@@ -249,107 +412,131 @@ object ReelFrenClient {
         if (off > 0) p += "offset=$off"
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
+
     fun detailUrl(slug: String, id: String) =
         "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}"
+
     fun videoUrl(slug: String, id: String, ep: Int) =
         "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep"
+
     fun searchUrl(slug: String, term: String) =
         "${apiBase()}/api/search?q=${query(term)}&provider=${query(slug)}"
 
     fun headers(url: String): Map<String, String> {
         val host = ReelFrenCloudflare.hostOf(url)
         val savedCookie = ReelFrenStore.cookie(host)
-        val savedUa = ReelFrenStore.userAgent(host) ?: UA
+        val savedUa = ReelFrenStore.userAgent(host)
 
-        val headers = linkedMapOf(
+        val map = linkedMapOf(
             "User-Agent"      to savedUa,
-            "Accept"          to "application/json, text/html, */*",
+            "Accept"          to "application/json, text/plain, */*",
             "Accept-Language" to "en-US,en;q=0.9",
             "Origin"          to ReelFrenConfig.REEL_SITE,
             "Referer"         to "${ReelFrenConfig.REEL_SITE}/"
         )
-        if (savedCookie.isNotBlank()) headers["Cookie"] = savedCookie
-        return headers
+        if (savedCookie.isNotBlank()) map["Cookie"] = savedCookie
+        return map
+    }
+
+    /**
+     * Only attaches ReelFren headers/cookies if the poster is hosted on reelfren.net,
+     * avoiding per-card map allocations and cookie leakage to external image CDNs.
+     */
+    fun posterHeaders(posterUrl: String?): Map<String, String>? {
+        if (posterUrl.isNullOrEmpty()) return null
+        val host = ReelFrenCloudflare.hostOf(posterUrl)
+        return if (host == siteHost) headers(posterUrl) else null
     }
 
     suspend fun get(url: String): String? {
-        ReelFrenDebugLog.d("Client.get", "ENTRY url=$url")
-        
-        // FIX 1: Removed cfKiller. It causes 60-second freezes.
-        ReelFrenDebugLog.d("Client.get", "Starting first attempt...")
-        val first = runCatching {
-            app.get(url, headers = headers(url)).text
-        }.onFailure { 
-            ReelFrenDebugLog.t("Client.get", it) 
-        }.getOrNull()
-
-        ReelFrenDebugLog.d("Client.get", "First attempt returned. bodyLen=${first?.length} isChallenge=${first?.let { ReelFrenCloudflare.isChallengeBody(it) }}")
-
-        if (first != null && !ReelFrenCloudflare.isChallengeBody(first)) {
-            ReelFrenDebugLog.d("Client.get", "First attempt is NOT a challenge. Returning success.")
-            return first
-        }
-
         val targetHost = ReelFrenCloudflare.hostOf(url)
-        val solveUrl = if (targetHost == ReelFrenCloudflare.hostOf(ReelFrenConfig.REEL_SITE))
-            ReelFrenConfig.REEL_SITE
-        else url
+        val initialCookie = ReelFrenStore.cookie(targetHost)
 
-        // FIX 2: Wipe the stale cookie so solve() actually opens the WebView
-        ReelFrenDebugLog.d("Client.get", "Wiping stale cookie for $targetHost to force solve()")
-        ReelFrenStore.saveCookie(targetHost, "")
+        val firstResp = try {
+            app.get(url, headers = headers(url), timeout = 20L)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            ReelFrenLog.t("Client.get", e)
+            null
+        }
 
-        ReelFrenDebugLog.d("Client.get", "Calling ReelFrenCloudflare.solve(solveUrl=$solveUrl)...")
-        val solved = ReelFrenCloudflare.solve(solveUrl)
-        ReelFrenDebugLog.d("Client.get", "solve() returned $solved")
-
-        if (!solved) {
-            ReelFrenDebugLog.d("Client.get", "solve() failed. Returning null.")
+        if (firstResp == null) {
+            ReelFrenLog.d("Client.get", "Network failure (null response) for $url")
             return null
         }
 
-        ReelFrenDebugLog.d("Client.get", "Starting retry attempt...")
-        val retry = runCatching { 
-            app.get(url, headers = headers(url)).text 
-        }.onFailure { 
-            ReelFrenDebugLog.t("Client.get", it) 
-        }.getOrNull()
-        
-        ReelFrenDebugLog.d("Client.get", "Retry returned. bodyLen=${retry?.length} isChallenge=${retry?.let { ReelFrenCloudflare.isChallengeBody(it) }}")
-        
-        // FIX 3: If retry is still a challenge, return null (prevent parsing HTML as JSON)
-        if (retry != null && ReelFrenCloudflare.isChallengeBody(retry)) {
-            ReelFrenDebugLog.d("Client.get", "Retry STILL challenged -> returning null")
+        if (!ReelFrenCloudflare.isChallengeResponse(firstResp.code, firstResp.headers, firstResp.text)) {
+            return firstResp.text
+        }
+
+        ReelFrenLog.d("Client.get", "Challenge detected (HTTP ${firstResp.code}, len=${firstResp.text.length}) on $url")
+
+        val latestCookie = ReelFrenStore.cookie(targetHost)
+        if (latestCookie.isNotBlank() && latestCookie != initialCookie && latestCookie.contains("cf_clearance")) {
+            val quickRetry = try {
+                app.get(url, headers = headers(url), timeout = 20L)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
+            if (quickRetry != null && !ReelFrenCloudflare.isChallengeResponse(quickRetry.code, quickRetry.headers, quickRetry.text)) {
+                return quickRetry.text
+            }
+        }
+
+        val solveUrl = if (targetHost == siteHost) ReelFrenConfig.REEL_SITE else url
+
+        val solved = ReelFrenCloudflare.solve(solveUrl, invalidatedCookie = initialCookie)
+        if (!solved) return null
+
+        val retryResp = try {
+            app.get(url, headers = headers(url), timeout = 20L)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            ReelFrenLog.t("Client.get/retry", e)
             return null
         }
-        
-        return retry
+
+        if (ReelFrenCloudflare.isChallengeResponse(retryResp.code, retryResp.headers, retryResp.text)) {
+            ReelFrenLog.d("Client.get", "Still challenged after solve -> forcing interactive dialog")
+            val interactiveSolved = ReelFrenCloudflare.solve(
+                solveUrl,
+                invalidatedCookie = ReelFrenStore.cookie(targetHost),
+                forceInteractive = true
+            )
+            if (!interactiveSolved) return null
+
+            val finalResp = try {
+                app.get(url, headers = headers(url), timeout = 20L)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                return null
+            }
+            return if (ReelFrenCloudflare.isChallengeResponse(finalResp.code, finalResp.headers, finalResp.text)) {
+                null
+            } else {
+                finalResp.text
+            }
+        }
+
+        return retryResp.text
     }
 
-    suspend fun home(slug: String, category: String = "", page: Int = 1): List<HomeItem> {
-        ReelFrenDebugLog.d("Client.home", "ENTRY slug=$slug page=$page")
-        val body = get(homeUrl(slug, category, page))
-        ReelFrenDebugLog.d("Client.home", "get() returned bodyLen=${body?.length}")
-        return body?.let(ReelFrenParse::homeItems) ?: emptyList()
-    }
+    suspend fun home(slug: String, category: String = "", page: Int = 1): List<HomeItem> =
+        get(homeUrl(slug, category, page))?.let(ReelFrenParse::homeItems) ?: emptyList()
 
-    suspend fun detail(slug: String, id: String): DetailInfo? {
-        ReelFrenDebugLog.d("Client.detail", "ENTRY slug=$slug id=$id")
-        val body = get(detailUrl(slug, id))
-        return body?.let(ReelFrenParse::detail)
-    }
+    suspend fun detail(slug: String, id: String): DetailInfo? =
+        get(detailUrl(slug, id))?.let(ReelFrenParse::detail)
 
-    suspend fun playback(slug: String, id: String, ep: Int): PlaybackInfo? {
-        ReelFrenDebugLog.d("Client.playback", "ENTRY slug=$slug id=$id ep=$ep")
-        val body = get(videoUrl(slug, id, ep))
-        return body?.let(ReelFrenParse::playback)
-    }
+    suspend fun playback(slug: String, id: String, ep: Int): PlaybackInfo? =
+        get(videoUrl(slug, id, ep))?.let(ReelFrenParse::playback)
 
-    suspend fun search(slug: String, term: String): List<HomeItem> {
-        ReelFrenDebugLog.d("Client.search", "ENTRY slug=$slug term=$term")
-        val body = get(searchUrl(slug, term))
-        return body?.let(ReelFrenParse::homeItems) ?: emptyList()
-    }
+    suspend fun search(slug: String, term: String): List<HomeItem> =
+        get(searchUrl(slug, term))?.let(ReelFrenParse::homeItems) ?: emptyList()
 
     fun absUrl(value: String): String {
         val clean = value.trim()
