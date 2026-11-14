@@ -28,6 +28,12 @@ class AnimekhorProvider : MainAPI() {
 
     private companion object {
         const val PAGE_FETCH_TIMEOUT_MS = 15_000L
+        const val SOLVE_WAIT_TIMEOUT_MS = 90_000L  // NEW: matches dialog timeout
+    }
+
+    // NEW: kick off pre-warm as soon as the provider class is instantiated
+    init {
+        runCatching { CFState.prewarmIfNeeded() }
     }
 
     private val browserHeaders = mapOf(
@@ -63,7 +69,8 @@ class AnimekhorProvider : MainAPI() {
     private fun cfHeaders(url: String, base: Map<String, String> = defaultHeaders): Map<String, String> {
         val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
         val cfUa: String = CFState.userAgentFor(host) ?: CFState.getBrowserUserAgent()
-        val cookies: String = try { CookieManager.getInstance().getCookie(url) ?: "" } catch (_: Exception) { "" }
+        // CHANGED: use partition-aware cookie merging instead of single getCookie()
+        val cookies: String = CFState.extractAllCookies(host, url)
 
         val merged: MutableMap<String, String> = base.toMutableMap()
         merged["User-Agent"] = cfUa
@@ -79,15 +86,20 @@ class AnimekhorProvider : MainAPI() {
     ): Document? {
         val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
         if (!host.contains("animekhor", ignoreCase = true)) {
+            Log.d("Animekhor/Provider", "⏭ Skip non-animekhor URL: $url")
             return null
         }
 
+        // Cache check #1 (before waiting for ongoing solve)
         CFState.getSolvedHtml(url)?.let { html ->
             if (html.length > 500 && !isCfChallenge(html)) return Jsoup.parse(html, url)
         }
 
-        CFState.awaitOngoingSolve(host)
+        // CHANGED: wrap awaitOngoingSolve in a timeout so a stuck solve doesn't hang the provider forever
+        withTimeoutOrNull(SOLVE_WAIT_TIMEOUT_MS) { CFState.awaitOngoingSolve(host) }
+            ?: Log.d("Animekhor/Provider", "⏱ awaitOngoingSolve timed out for $host")
 
+        // Cache check #2 (after solve completed)
         CFState.getSolvedHtml(url)?.let { html ->
             if (html.length > 500 && !isCfChallenge(html)) return Jsoup.parse(html, url)
         }
@@ -100,7 +112,10 @@ class AnimekhorProvider : MainAPI() {
             throw e
         } catch (_: Exception) {
             null
-        } ?: return null
+        } ?: run {
+            Log.d("Animekhor/Provider", "⏱ Fetch timeout/error for $url")
+            return null
+        }
 
         Log.e("Animekhor/Provider", "🌐 Initial Fetch: ${response.code} for $url")
 
@@ -118,10 +133,15 @@ class AnimekhorProvider : MainAPI() {
 
         Log.e("Animekhor/Provider", "🛑 Challenge Body Snippet: ${response.text.take(300)}")
 
-        if (CommonActivity.activity == null) return null
-        if (CFState.isInCooldown(host)) return null
+        if (CommonActivity.activity == null) {
+            Log.d("Animekhor/Provider", "🛑 No activity — cannot open WebView for $url")
+            return null
+        }
+        if (CFState.isInCooldown(host)) {
+            Log.d("Animekhor/Provider", "⏸ Host $host in cooldown — skipping solve")
+            return null
+        }
 
-        // NEW: Skip the silent solver if this is a human-only challenge (reCAPTCHA)
         val isHumanCaptcha = isHumanOnlyChallenge(response.text)
         if (isHumanCaptcha) {
             Log.e("Animekhor/Provider", "🧩 reCAPTCHA detected — skipping silent solver")
@@ -136,6 +156,7 @@ class AnimekhorProvider : MainAPI() {
         }
 
         if (solved) {
+            // Cache check #3 (post-solve)
             CFState.getSolvedHtml(url)?.let { html ->
                 if (html.length > 500 && !isCfChallenge(html)) return Jsoup.parse(html, url)
             }
@@ -152,6 +173,18 @@ class AnimekhorProvider : MainAPI() {
 
             if (retryResponse != null && retryResponse.code in 200..299 && !isCfChallenge(retryResponse.text)) {
                 return retryResponse.document
+            }
+
+            // NEW: WebView-as-transport fallback — if the WebView solved CF but didn't issue
+            // a reusable cookie, load the target through the WebView itself and extract the HTML.
+            Log.d("Animekhor/Provider", "🔄 Retry failed — trying WebView transport for $url")
+            val act = CommonActivity.activity
+            if (act != null && !act.isFinishing && !act.isDestroyed) {
+                val html = CFState.fetchViaWebView(act, url)
+                if (!html.isNullOrBlank() && html.length > 500 && !isCfChallenge(html)) {
+                    Log.e("Animekhor/Provider", "✅ WebView transport succeeded (${html.length} bytes)")
+                    return Jsoup.parse(html, url)
+                }
             }
         }
         return null
@@ -200,23 +233,34 @@ class AnimekhorProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = URLEncoder.encode(query, "UTF-8")
-        val results: List<SearchResponse> = coroutineScope {
-            (1..2).map { page ->
-                async {
-                    try {
-                        fetchDocument("$mainUrl/?s=$encoded&page=$page")
-                            ?.select(cardSelector)
-                            ?.mapNotNull { it.toSearchResult() }
-                            ?: emptyList()
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (_: Exception) {
-                        emptyList()
-                    }
-                }
-            }.awaitAll().flatten()
+
+        // CHANGED: fetch page 1 first, only fetch page 2 if page 1 looks full.
+        // Saves a wasted request (and one full CF challenge when cold) on short queries.
+        val page1Results = try {
+            fetchDocument("$mainUrl/?s=$encoded&page=1")
+                ?.select(cardSelector)
+                ?.mapNotNull { it.toSearchResult() }
+                ?: emptyList()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            emptyList()
         }
-        return results.distinctBy { it.url }
+
+        val page2Results = if (page1Results.size >= 10) {
+            try {
+                fetchDocument("$mainUrl/?s=$encoded&page=2")
+                    ?.select(cardSelector)
+                    ?.mapNotNull { it.toSearchResult() }
+                    ?: emptyList()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                emptyList()
+            }
+        } else emptyList()
+
+        return (page1Results + page2Results).distinctBy { it.url }
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -315,7 +359,6 @@ class AnimekhorProvider : MainAPI() {
 
             if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
             else if (finalUrl.startsWith("/")) {
-                // Resolve relative paths against the episode page URL, not hardcoded ok.ru
                 val base = try { URI(data).let { "${it.scheme}://${it.host}" } } catch (_: Exception) { mainUrl }
                 finalUrl = "$base$finalUrl"
             } else if (!finalUrl.startsWith("http")) finalUrl = "https://$finalUrl"
@@ -330,7 +373,6 @@ class AnimekhorProvider : MainAPI() {
                 finalUrl = finalUrl.replace("playhydrax.com", "abyssplayer.com")
             }
 
-            // Deduplicate by full URL if query parameters are present to avoid dropping valid embeds
             val dedupUrl = if ("?v=" in finalUrl || "?id=" in finalUrl) finalUrl else finalUrl.substringBefore("?")
             if (!extractedIframeUrls.add(dedupUrl)) return
 
@@ -369,7 +411,6 @@ class AnimekhorProvider : MainAPI() {
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Exception) {
-                // Isolate individual extractor failures
             }
         }
 
