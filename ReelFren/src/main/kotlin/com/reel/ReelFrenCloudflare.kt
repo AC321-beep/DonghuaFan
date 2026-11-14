@@ -34,7 +34,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
-// ── In-Flight Coalescing State with Escalation Support ───────────────────────
+// ── In-Flight Coalescing State ───────────────────────────────────────────────
 class SolveSession(
     val deferred: CompletableDeferred<Boolean> = CompletableDeferred(),
     val allowInteractive: AtomicBoolean = AtomicBoolean(false),
@@ -45,35 +45,38 @@ object ReelFrenCfState {
     private val solving = ConcurrentHashMap<String, SolveSession>()
     val solverScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    /**
-     * Coalesces concurrent solves for the same host. If a background pre-warm
-     * started with `allowInteractive = false` and a foreground request joins
-     * with `interactiveAllowed = true`, the running session is upgraded in-place
-     * so it will not return `false` without showing the interactive dialog if needed.
-     */
     fun beginSolve(
         host: String,
         interactiveAllowed: Boolean,
         forceInteractive: Boolean
     ): Pair<SolveSession, Boolean> {
-        val fresh = SolveSession(allowInteractive = AtomicBoolean(interactiveAllowed))
-        val existing = solving.putIfAbsent(host, fresh)
-        return if (existing == null) {
-            fresh to true
-        } else {
+        while (true) {
+            val fresh = SolveSession(allowInteractive = AtomicBoolean(interactiveAllowed))
+            val existing = solving.putIfAbsent(host, fresh)
+            if (existing == null) return fresh to true
+
+            if (existing.deferred.isCompleted) {
+                if (solving.replace(host, existing, fresh)) {
+                    return fresh to true
+                }
+                continue
+            }
+
             if (interactiveAllowed) {
                 existing.allowInteractive.set(true)
             }
             if (forceInteractive) {
                 existing.abortSilent?.invoke()
             }
-            existing to false
+            return existing to false
         }
     }
 
-    fun endSolve(host: String, session: SolveSession) {
-        if (!session.deferred.isCompleted) session.deferred.complete(false)
+    fun completeAndEndSolve(host: String, session: SolveSession, result: Boolean) {
         solving.remove(host, session)
+        if (!session.deferred.isCompleted) {
+            session.deferred.complete(result)
+        }
     }
 }
 
@@ -98,7 +101,7 @@ object ReelFrenCloudflare {
         if (code in 200..299 && (trimmed.startsWith("{") || trimmed.startsWith("["))) {
             return false
         }
-        if (code == 403 || code == 503 || code == 429) {
+        if (code == 403 || code == 503) {
             if (headers?.get("server")?.contains("cloudflare", ignoreCase = true) == true) {
                 return true
             }
@@ -175,6 +178,7 @@ object ReelFrenCloudflare {
             if (extractClearanceToken(cookie).isNotEmpty()) {
                 ReelFrenStore.saveCookie(host, cookie)
                 ReelFrenStore.setUserAgent(host, ua)
+                ReelFrenStore.recordPrewarmResult(true)
                 cm.flush()
                 ReelFrenLog.d("CF/cookie", "Persisted cf_clearance for $host (len=${cookie.length})")
             }
@@ -198,11 +202,34 @@ object ReelFrenCloudflare {
     fun prewarmIfNeeded() {
         val host = hostOf(ReelFrenConfig.REEL_SITE)
         if (extractClearanceToken(ReelFrenStore.cookie(host)).isNotEmpty()) return
+        if (ReelFrenStore.shouldSkipPrewarm()) return
+
         ReelFrenCfState.solverScope.launch {
-            delay(1_500L)
+            val deadline = SystemClock.uptimeMillis() + 20_000L
+            while (SystemClock.uptimeMillis() < deadline) {
+                val act = activity()
+                if (act != null && !act.isFinishing && !act.isDestroyed && act.window?.decorView != null) {
+                    break
+                }
+                delay(500L)
+            }
+            val readyAct = activity()
+            if (readyAct == null || readyAct.isFinishing || readyAct.isDestroyed || readyAct.window?.decorView == null) {
+                ReelFrenLog.d("CF/prewarm", "Activity not ready within 20s -> skipping pre-warm")
+                ReelFrenStore.recordPrewarmResult(false)
+                return@launch
+            }
+            delay(500L)
+            if (extractClearanceToken(ReelFrenStore.cookie(host)).isNotEmpty()) return@launch
+
             runCatching {
-                solve(ReelFrenConfig.REEL_SITE, silentOnly = true)
-            }.onFailure { ReelFrenLog.t("CF/prewarm", it) }
+                val ok = solve(ReelFrenConfig.REEL_SITE, silentOnly = true)
+                ReelFrenStore.recordPrewarmResult(ok)
+            }.onFailure {
+                if (it is CancellationException) throw it
+                ReelFrenLog.t("CF/prewarm", it)
+                ReelFrenStore.recordPrewarmResult(false)
+            }
         }
     }
 
@@ -221,7 +248,7 @@ object ReelFrenCloudflare {
             forceInteractive = forceInteractive
         )
         if (!isOwner) {
-            ReelFrenLog.d("CF/solve", "Joined in-flight solve for $host (escalatedInteractive=${!silentOnly})")
+            ReelFrenLog.d("CF/solve", "Joined in-flight solve for $host (interactiveAllowed=${!silentOnly})")
             return session.deferred.await()
         }
 
@@ -230,8 +257,7 @@ object ReelFrenCloudflare {
         val currentToken = extractClearanceToken(currentCookie)
         if (!forceInteractive && currentToken.isNotEmpty() && currentToken != staleToken) {
             ReelFrenLog.d("CF/solve", "Fresh clearance already in store for $host -> short-circuit")
-            session.deferred.complete(true)
-            ReelFrenCfState.endSolve(host, session)
+            ReelFrenCfState.completeAndEndSolve(host, session, true)
             return true
         }
 
@@ -239,7 +265,7 @@ object ReelFrenCloudflare {
             try {
                 val act = activity()
                 if (act == null || act.isFinishing || act.isDestroyed) {
-                    session.deferred.complete(false)
+                    ReelFrenCfState.completeAndEndSolve(host, session, false)
                     return@launch
                 }
 
@@ -254,23 +280,17 @@ object ReelFrenCloudflare {
                 }
 
                 if (silentSuccess) {
-                    session.deferred.complete(true)
+                    ReelFrenCfState.completeAndEndSolve(host, session, true)
                 } else if (!session.allowInteractive.get()) {
                     ReelFrenLog.d("CF/solve", "Background pre-warm ended without foreground demand -> skipping dialog")
-                    session.deferred.complete(false)
+                    ReelFrenCfState.completeAndEndSolve(host, session, false)
                 } else {
                     showInteractiveDialog(act, url, host, staleToken, session)
                 }
-            } catch (ce: CancellationException) {
-                if (!session.deferred.isCompleted) session.deferred.complete(false)
-                throw ce
-            } catch (e: Exception) {
-                ReelFrenLog.t("CF/solve", e)
-                if (!session.deferred.isCompleted) session.deferred.complete(false)
-            } finally {
-                if (session.deferred.isCompleted) {
-                    ReelFrenCfState.endSolve(host, session)
-                }
+            } catch (t: Throwable) {
+                ReelFrenCfState.completeAndEndSolve(host, session, false)
+                if (t is CancellationException) throw t
+                ReelFrenLog.t("CF/solve", t)
             }
         }
 
@@ -382,10 +402,11 @@ object ReelFrenCloudflare {
                     web.evaluateJavascript(locateJs) { res ->
                         if (done.get()) return@evaluateJavascript
                         val coords = res?.trim('"').orEmpty()
+                        if (coords.isEmpty()) return@evaluateJavascript
                         val parts = coords.split(",")
-                        val cx = parts.getOrNull(0)?.toFloatOrNull() ?: 65f
-                        val cy = parts.getOrNull(1)?.toFloatOrNull() ?: 290f
-                        ReelFrenLog.d("CF/silent-tap", "Dispatching tap at ($cx, $cy) [found=${coords.isNotEmpty()}]")
+                        val cx = parts.getOrNull(0)?.toFloatOrNull() ?: return@evaluateJavascript
+                        val cy = parts.getOrNull(1)?.toFloatOrNull() ?: return@evaluateJavascript
+                        ReelFrenLog.d("CF/silent-tap", "Dispatching tap at ($cx, $cy)")
                         simulateTouchTap(web, cx, cy)
                     }
                 }
@@ -485,8 +506,7 @@ object ReelFrenCloudflare {
             if (success) {
                 persistCookie(url, host, ua)
             }
-            if (!session.deferred.isCompleted) session.deferred.complete(success)
-            ReelFrenCfState.endSolve(host, session)
+            ReelFrenCfState.completeAndEndSolve(host, session, success)
 
             handler.post {
                 runCatching { webRef?.stopLoading() }
@@ -542,6 +562,21 @@ object ReelFrenCloudflare {
                     if (resolved.get() || loadedUrl == "about:blank") return
                     if (checkSolved()) {
                         handler.postDelayed({ finish(true) }, 500L)
+                    }
+                }
+
+                override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                    if (request?.isForMainFrame == true && request.url?.host?.contains("cloudflare", true) != true) {
+                        ReelFrenLog.d("CF/dialog", "Main-frame error (${error?.errorCode}) -> finish(false)")
+                        finish(false)
+                    }
+                }
+
+                override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
+                    val code = errorResponse?.statusCode ?: 0
+                    if (request?.isForMainFrame == true && code in 500..599 && code != 503) {
+                        ReelFrenLog.d("CF/dialog", "Main-frame HTTP $code -> finish(false)")
+                        finish(false)
                     }
                 }
             }
