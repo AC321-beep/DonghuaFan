@@ -18,7 +18,7 @@ class ReelFrenPlugin : Plugin() {
 
         openSettings = {
             val activity = CommonActivity.activity
-            if (activity != null && !activity.isFinishing) {
+            if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
                 val providerNames = ReelFrenConfig.PROVIDERS_MAP.keys.toTypedArray()
                 val providerSlugs = ReelFrenConfig.PROVIDERS_MAP.values.toTypedArray()
 
@@ -27,6 +27,7 @@ class ReelFrenPlugin : Plugin() {
                 }
 
                 activity.runOnUiThread {
+                    if (activity.isFinishing || activity.isDestroyed) return@runOnUiThread
                     AlertDialog.Builder(activity)
                         .setTitle("Select Providers")
                         .setMultiChoiceItems(providerNames, checkedStates) { _, which, isChecked ->
