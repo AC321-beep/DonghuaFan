@@ -6,8 +6,8 @@ import com.lagradost.cloudstream3.extractors.Filesim
 import com.lagradost.cloudstream3.extractors.StreamSB
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
 import com.lagradost.cloudstream3.utils.*
-import org.json.JSONObject
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
 
 class FileMoonSx : Filesim() {
     override val name = "FileMoonSx"
@@ -191,7 +191,7 @@ class Rumble : ExtractorApi() {
         private const val SPLIT_TIMEOUT_MS = 2_500L
 
         private val RE_VIDEO_URL = Regex(
-            """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>]+\.(?:mp4|m3u8)[^"'\s<>]*"""
+            """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>‘’“”]+\.(?:mp4|m3u8)[^"'\s<>‘’“”]*"""
         )
         private val RE_QUALITY_H = Regex("""(?:\\"h\\"|"h")\s*:\s*(\d{3,4})""")
         private val RE_QUALITY_BRACE = Regex("""(?:\\"|")(\d{3,4})(?:\\"|")\s*:\s*\{""")
@@ -199,9 +199,9 @@ class Rumble : ExtractorApi() {
             Regex("""Rumble\("play",\s*\{(.*?)\}\)""", RegexOption.DOT_MATCHES_ALL)
 
         private val JUNK_KEYWORDS =
-            listOf("/assets/", "loop", "preview", "tracker", "thumb", ".tar?")
+            listOf("/assets/", "loop", "preview", "tracker", "thumb", ".tar")
         private val HARD_JUNK =
-            listOf("/assets/", "tracker", "thumb", ".tar?")
+            listOf("/assets/", "tracker", "thumb", ".tar")
     }
 
     override suspend fun getUrl(
@@ -228,15 +228,19 @@ class Rumble : ExtractorApi() {
         if (configMatch != null) {
             val jsonBody = "{" + configMatch.groupValues[1] + "}"
             try {
-                val videoId = JSONObject(jsonBody).optJSONObject("video")?.optString("id")
+                val jsonObj = JSONObject(jsonBody)
+                val videoId = jsonObj.optJSONObject("video")?.optString("id")?.takeIf { it.isNotBlank() }
+                    ?: (jsonObj.opt("video") as? String)?.takeIf { it.isNotBlank() }
+
                 if (!videoId.isNullOrBlank()) {
                     val apiUrls = listOf(
                         "https://rumble.com/embedJS/u4/?ifr=0&dref=&request=video&ver=2&v=$videoId",
                         "https://rumble.com/embedJS/u3/?request=video&v=$videoId"
                     )
                     for (apiUrl in apiUrls) {
-                        val apiResponse = runCatching { app.get(apiUrl).text }.getOrNull()
-                            ?: continue
+                        val apiResponse = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                            runCatching { app.get(apiUrl, referer = url).text }.getOrNull()
+                        } ?: continue
                         if (extractFromScriptData(apiResponse, url, callback)) return
                     }
                     // Both API endpoints emitted nothing — fall through to HTML scrape
@@ -323,6 +327,8 @@ class Rumble : ExtractorApi() {
             val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull()
                 ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
 
+            // Label carries the resolution — leave quality at Unknown so
+            // CloudStream doesn't append "360p" a second time in the picker.
             val displayLabel = if (qMatch != null)
                 "$labelBase ${qMatch.groupValues[1]}p"
             else
