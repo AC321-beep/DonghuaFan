@@ -16,10 +16,10 @@ import java.util.concurrent.ConcurrentHashMap
 object ReelFrenLog {
     private const val TAG = "ReelFren/CF"
     fun d(scope: String, msg: String) {
-        Log.e(TAG, "[$scope][${Thread.currentThread().name}] $msg")
+        Log.e(TAG, "[$scope][${Thread.currentThread().name}]$msg")
     }
     fun t(scope: String, e: Throwable) {
-        Log.e(TAG, "[$scope][${Thread.currentThread().name}] ${e.javaClass.simpleName}: ${e.message}", e)
+        Log.e(TAG, "[$scope][${Thread.currentThread().name}] ${e.javaClass.simpleName}:${e.message}", e)
     }
 }
 
@@ -119,6 +119,11 @@ object ReelFrenParse {
             ReelFrenLog.d("Parse.homeItems", "Invalid JSON (len=${body.length})")
             return emptyList()
         }
+        val status = root.optInt("status", 200)
+        if (status >= 400 || root.has("error")) {
+            ReelFrenLog.d("Parse.homeItems", "Upstream API error (status=$status, title='${root.optString("title")}')")
+            return emptyList()
+        }
         val dataObj = root.optJSONObject("data")
         val arr = root.optJSONArray("data")
             ?: dataObj?.optJSONArray("items")
@@ -127,7 +132,7 @@ object ReelFrenParse {
             ?: root.optJSONArray("items")
             ?: root.optJSONArray("list")
             ?: run {
-                ReelFrenLog.d("Parse.homeItems", "No items array (len=${body.length}): ${body.take(180)}")
+                ReelFrenLog.d("Parse.homeItems", "No items array (len=${body.length}):${body.take(180)}")
                 return emptyList()
             }
 
@@ -238,6 +243,10 @@ object ReelFrenStore {
 
     private val memoryUa = ConcurrentHashMap<String, String>()
     private val memoryCookies = ConcurrentHashMap<String, String>()
+    private val wvVersionRegex = Regex("""Version/\d+\.\d+\s*""")
+
+    fun normalizeUa(rawUa: String): String =
+        rawUa.replace("; wv", "").replace(wvVersionRegex, "").trim()
 
     fun init(ctx: Context) {
         val app = ctx.applicationContext
@@ -246,11 +255,11 @@ object ReelFrenStore {
         providerPrefs = app.getSharedPreferences("reelfren_prefs", Context.MODE_PRIVATE)
 
         runCatching {
-            WebSettings.getDefaultUserAgent(app).replace("; wv", "").trim()
+            normalizeUa(WebSettings.getDefaultUserAgent(app))
         }.getOrNull()?.takeIf { it.isNotBlank() }?.let { ua ->
             defaultSystemUa = ua
         }
-        ReelFrenLog.d("Store", "init() defaultUa=${defaultSystemUa.take(70)}")
+        ReelFrenLog.d("Store", "init() defaultUa=${defaultSystemUa.take(80)}")
     }
 
     fun isProviderEnabled(slug: String): Boolean {
@@ -307,8 +316,9 @@ object ReelFrenStore {
         memoryUa[norm]?.let { return it }
         val saved = storePrefs?.getString(key("ua", norm), null)?.takeIf { it.isNotBlank() }
         if (saved != null) {
-            memoryUa[norm] = saved
-            return saved
+            val cleaned = normalizeUa(saved)
+            memoryUa[norm] = cleaned
+            return cleaned
         }
         return defaultSystemUa
     }
@@ -316,8 +326,9 @@ object ReelFrenStore {
     fun setUserAgent(host: String, ua: String) {
         if (host.isBlank() || ua.isBlank()) return
         val norm = host.lowercase(Locale.ROOT)
-        memoryUa[norm] = ua
-        storePrefs?.edit()?.putString(key("ua", norm), ua)?.apply()
+        val cleaned = normalizeUa(ua)
+        memoryUa[norm] = cleaned
+        storePrefs?.edit()?.putString(key("ua", norm), cleaned)?.apply()
     }
 
     fun shouldSkipPrewarm(): Boolean {
@@ -325,7 +336,7 @@ object ReelFrenStore {
         val failCount = storePrefs?.getInt("prewarm_fail_count", 0) ?: 0
         if (lastFail == 0L || failCount <= 0) return false
         val shift = (failCount - 1).coerceIn(0, 6)
-        val cooldown = 60_000L * (1L shl shift) // 1m, 2m, 4m, 8m, 16m, 32m, 64m
+        val cooldown = 60_000L * (1L shl shift)
         return (System.currentTimeMillis() - lastFail) < cooldown
     }
 
@@ -488,7 +499,7 @@ object ReelFrenClient {
             return firstResp.text
         }
 
-        ReelFrenLog.d("Client.get", "Challenge detected (HTTP ${firstResp.code}, len=${firstResp.text.length}) on $url")
+        ReelFrenLog.d("Client.get", "Challenge detected (HTTP ${firstResp.code}, len=${firstResp.text.length}) on$url")
 
         val latestCookie = ReelFrenStore.cookie(targetHost)
         if (latestCookie.isNotBlank() && latestCookie != initialCookie && latestCookie.contains("cf_clearance")) {
