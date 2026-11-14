@@ -320,6 +320,28 @@ object ReelFrenStore {
         storePrefs?.edit()?.putString(key("ua", norm), ua)?.apply()
     }
 
+    fun shouldSkipPrewarm(): Boolean {
+        val lastFail = storePrefs?.getLong("prewarm_last_fail", 0L) ?: 0L
+        val failCount = storePrefs?.getInt("prewarm_fail_count", 0) ?: 0
+        if (lastFail == 0L || failCount <= 0) return false
+        val shift = (failCount - 1).coerceIn(0, 6)
+        val cooldown = 60_000L * (1L shl shift) // 1m, 2m, 4m, 8m, 16m, 32m, 64m
+        return (System.currentTimeMillis() - lastFail) < cooldown
+    }
+
+    fun recordPrewarmResult(success: Boolean) {
+        val editor = storePrefs?.edit() ?: return
+        if (success) {
+            editor.putLong("prewarm_last_fail", 0L)
+            editor.putInt("prewarm_fail_count", 0)
+        } else {
+            val count = (storePrefs?.getInt("prewarm_fail_count", 0) ?: 0) + 1
+            editor.putLong("prewarm_last_fail", System.currentTimeMillis())
+            editor.putInt("prewarm_fail_count", count)
+        }
+        editor.apply()
+    }
+
     private fun key(type: String, host: String) = "${type}_$host"
 }
 
@@ -438,14 +460,10 @@ object ReelFrenClient {
         return map
     }
 
-    /**
-     * Only attaches ReelFren headers/cookies if the poster is hosted on reelfren.net,
-     * avoiding per-card map allocations and cookie leakage to external image CDNs.
-     */
     fun posterHeaders(posterUrl: String?): Map<String, String>? {
         if (posterUrl.isNullOrEmpty()) return null
         val host = ReelFrenCloudflare.hostOf(posterUrl)
-        return if (host == siteHost) headers(posterUrl) else null
+        return if (host == siteHost || host.endsWith(".$siteHost")) headers(posterUrl) else null
     }
 
     suspend fun get(url: String): String? {
