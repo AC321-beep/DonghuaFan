@@ -222,12 +222,13 @@ object ReelFrenCloudflare {
             delay(500L)
             if (extractClearanceToken(ReelFrenStore.cookie(host)).isNotEmpty()) return@launch
 
-            runCatching {
+            try {
                 val ok = solve(ReelFrenConfig.REEL_SITE, silentOnly = true)
                 ReelFrenStore.recordPrewarmResult(ok)
-            }.onFailure {
-                if (it is CancellationException) throw it
-                ReelFrenLog.t("CF/prewarm", it)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                ReelFrenLog.t("CF/prewarm", t)
                 ReelFrenStore.recordPrewarmResult(false)
             }
         }
@@ -490,6 +491,11 @@ object ReelFrenCloudflare {
         rejectedToken: String,
         session: SolveSession
     ) {
+        if (activity.isFinishing || activity.isDestroyed) {
+            ReelFrenCfState.completeAndEndSolve(host, session, false)
+            return
+        }
+
         val resolved = AtomicBoolean(false)
         val handler = Handler(Looper.getMainLooper())
         var webRef: WebView? = null
