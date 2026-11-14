@@ -313,7 +313,7 @@ object ReelFrenCloudflare {
             val handler = Handler(Looper.getMainLooper())
             val ua = resolveWebViewUa(activity, host)
             val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
-            @Volatile var mainFrameError: String? = null
+            var mainFrameError: String? = null
 
             val container = FrameLayout(activity).apply {
                 layoutParams = ViewGroup.LayoutParams(380, 680)
