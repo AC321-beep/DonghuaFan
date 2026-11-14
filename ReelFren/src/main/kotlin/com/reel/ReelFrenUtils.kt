@@ -3,7 +3,6 @@ package com.reel
 import android.content.Context
 import android.content.SharedPreferences
 import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.network.CloudflareKiller
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Locale
@@ -152,10 +151,8 @@ object ReelFrenStore {
     fun apiBase(): String {
         val raw = prefs?.getString("api_base", ReelFrenConfig.DEFAULT_API_BASE).orEmpty()
         val clean = raw.trim().trimEnd('/')
-        val base = if (clean.startsWith("https://") || clean.startsWith("http://"))
+        return if (clean.startsWith("https://") || clean.startsWith("http://"))
             clean else ReelFrenConfig.DEFAULT_API_BASE
-        ReelFrenDebugLog.d("Store", "apiBase() -> $base")
-        return base
     }
     fun setApiBase(v: String) {
         val clean = v.trim().trimEnd('/')
@@ -165,12 +162,12 @@ object ReelFrenStore {
 
     fun cookie(host: String): String {
         val c = if (host.isBlank()) "" else prefs?.getString(key("cookie", host), "").orEmpty()
-        ReelFrenDebugLog.d("Store", "cookie($host) -> len=${c.length} hasCf=${c.contains("cf_clearance")}")
         return c
     }
     
+    // FIX: Allow saving empty cookie strings to wipe out stale cookies
     fun saveCookie(host: String, cookie: String) {
-        if (host.isBlank() || cookie.isBlank()) return
+        if (host.isBlank()) return
         ReelFrenDebugLog.d("Store", "saveCookie($host) -> len=${cookie.length}")
         prefs?.edit()?.putString(key("cookie", host), cookie)?.apply()
     }
@@ -179,11 +176,7 @@ object ReelFrenStore {
         if (host.isBlank() || ua.isBlank()) return
         prefs?.edit()?.putString(key("ua", host), ua)?.apply()
     }
-    fun userAgent(host: String): String? {
-        val ua = prefs?.getString(key("ua", host), null)
-        ReelFrenDebugLog.d("Store", "userAgent($host) -> ${if (ua == null) "null" else "len=${ua.length}"}")
-        return ua
-    }
+    fun userAgent(host: String): String? = prefs?.getString(key("ua", host), null)
 
     private fun key(type: String, host: String) = "${type}_${host.lowercase(Locale.ROOT)}"
 }
@@ -245,7 +238,6 @@ object ReelFrenClient {
 
     const val UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 " +
                    "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-    private val cfKiller by lazy { CloudflareKiller() }
 
     fun apiBase() = ReelFrenStore.apiBase()
     fun query(v: String) = URLEncoder.encode(v, "UTF-8")
@@ -283,9 +275,10 @@ object ReelFrenClient {
     suspend fun get(url: String): String? {
         ReelFrenDebugLog.d("Client.get", "ENTRY url=$url")
         
-        ReelFrenDebugLog.d("Client.get", "Starting first attempt WITH cfKiller...")
+        // FIX 1: Removed cfKiller. It causes 60-second freezes.
+        ReelFrenDebugLog.d("Client.get", "Starting first attempt...")
         val first = runCatching {
-            app.get(url, headers = headers(url), interceptor = cfKiller).text
+            app.get(url, headers = headers(url)).text
         }.onFailure { 
             ReelFrenDebugLog.t("Client.get", it) 
         }.getOrNull()
@@ -302,6 +295,10 @@ object ReelFrenClient {
             ReelFrenConfig.REEL_SITE
         else url
 
+        // FIX 2: Wipe the stale cookie so solve() actually opens the WebView
+        ReelFrenDebugLog.d("Client.get", "Wiping stale cookie for $targetHost to force solve()")
+        ReelFrenStore.saveCookie(targetHost, "")
+
         ReelFrenDebugLog.d("Client.get", "Calling ReelFrenCloudflare.solve(solveUrl=$solveUrl)...")
         val solved = ReelFrenCloudflare.solve(solveUrl)
         ReelFrenDebugLog.d("Client.get", "solve() returned $solved")
@@ -311,7 +308,7 @@ object ReelFrenClient {
             return null
         }
 
-        ReelFrenDebugLog.d("Client.get", "Starting retry attempt (NO cfKiller)...")
+        ReelFrenDebugLog.d("Client.get", "Starting retry attempt...")
         val retry = runCatching { 
             app.get(url, headers = headers(url)).text 
         }.onFailure { 
@@ -319,6 +316,13 @@ object ReelFrenClient {
         }.getOrNull()
         
         ReelFrenDebugLog.d("Client.get", "Retry returned. bodyLen=${retry?.length} isChallenge=${retry?.let { ReelFrenCloudflare.isChallengeBody(it) }}")
+        
+        // FIX 3: If retry is still a challenge, return null (prevent parsing HTML as JSON)
+        if (retry != null && ReelFrenCloudflare.isChallengeBody(retry)) {
+            ReelFrenDebugLog.d("Client.get", "Retry STILL challenged -> returning null")
+            return null
+        }
+        
         return retry
     }
 
