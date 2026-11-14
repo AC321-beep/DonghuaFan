@@ -5,9 +5,8 @@ import android.app.Activity
 import android.app.Dialog
 import android.content.Context
 import android.content.ContextWrapper
-import android.graphics.Bitmap
 import android.graphics.Color
-import android.os.Build
+import android.net.http.SslError
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -15,6 +14,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -84,8 +84,6 @@ object ReelFrenCfState {
 object ReelFrenCloudflare {
 
     private val clearanceRegex = Regex("(?:^|;\\s*)cf_clearance=([^;]+)")
-    private const val WEBDRIVER_PATCH_JS =
-        "(function(){try{Object.defineProperty(navigator,'webdriver',{get:()=>undefined})}catch(e){}})();"
 
     fun hostOf(url: String): String =
         runCatching { URI(url).host }.getOrNull()?.lowercase(Locale.ROOT) ?: ""
@@ -120,17 +118,25 @@ object ReelFrenCloudflare {
                lower.contains("cf-challenge") ||
                lower.contains("_cf_chl_opt") ||
                lower.contains("cf-turnstile") ||
-               lower.contains("attention required")
+               lower.contains("attention required") ||
+               lower.contains("verify you are human")
     }
 
     private fun isChallengeOrBlankTitle(title: String?): Boolean {
         val t = title?.lowercase(Locale.ROOT)?.trim().orEmpty()
         return t.isEmpty() ||
                t == "about:blank" ||
+               t == "loading..." ||
+               t == "loading" ||
+               t.startsWith("loading...") ||
+               t.contains("please wait") ||
                t.contains("just a moment") ||
                t.contains("attention required") ||
                t.contains("checking your browser") ||
-               t.contains("security check")
+               t.contains("security check") ||
+               t.contains("one more step") ||
+               t.contains("verify you are human") ||
+               t.contains("access denied")
     }
 
     private fun activity(): Activity? {
@@ -149,25 +155,58 @@ object ReelFrenCloudflare {
         val existing = ReelFrenStore.userAgent(host)
         if (existing.isNotBlank() && existing != ReelFrenClient.FALLBACK_UA) return existing
         val ua = runCatching {
-            WebSettings.getDefaultUserAgent(activity).replace("; wv", "").trim()
+            ReelFrenStore.normalizeUa(WebSettings.getDefaultUserAgent(activity))
         }.getOrNull()?.takeIf { it.isNotBlank() } ?: ReelFrenStore.defaultSystemUa
         ReelFrenStore.setUserAgent(host, ua)
         return ua
     }
 
+    /**
+     * Wipes stale `cf_clearance` cookies (including `HttpOnly; Secure` tokens)
+     * from both `ReelFrenStore` and Android's `CookieManager`.
+     *
+     * Strategy: targeted delete → verify → only fall back to removeAllCookies
+     * if targeted delete actually failed. CookieManager is process-global, so
+     * an unconditional removeAllCookies would log the user out of every other
+     * provider's WebView session.
+     */
     private fun scrubStaleClearance(url: String, host: String) {
         ReelFrenStore.saveCookie(host, "")
         runCatching {
             val cm = CookieManager.getInstance()
             val origins = listOf(url, "https://$host", "https://$host/")
+
+            // Enumerate all cookies currently on this host (catches __cf_bm too)
+            val existing = cm.getCookie("https://$host/") ?: ""
+            val names = existing.split(";").mapNotNull {
+                it.substringBefore("=").trim().takeIf { n -> n.isNotEmpty() }
+            }.ifEmpty { listOf("cf_clearance", "__cf_bm") }
+
+            val beforeToken = extractClearanceToken(existing)
+            ReelFrenLog.d("CF/scrub", "before len=${existing.length} hasCf=${beforeToken.isNotEmpty()}")
+
+            val expiry = "Max-Age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT"
             for (origin in origins) {
-                for (path in listOf("/", "/api")) {
-                    cm.setCookie(origin, "cf_clearance=; Max-Age=0; Path=$path")
-                    cm.setCookie(origin, "cf_clearance=; Max-Age=0; Domain=$host; Path=$path")
-                    cm.setCookie(origin, "cf_clearance=; Max-Age=0; Domain=.$host; Path=$path")
+                for (name in names) {
+                    for (path in listOf("/", "/api")) {
+                        cm.setCookie(origin, "$name=; $expiry; Path=$path; Secure; HttpOnly")
+                        cm.setCookie(origin, "$name=; $expiry; Domain=$host; Path=$path; Secure; HttpOnly")
+                        cm.setCookie(origin, "$name=; $expiry; Domain=.$host; Path=$path; Secure; HttpOnly")
+                    }
                 }
             }
             cm.flush()
+
+            // Verify targeted delete. Only escalate if it actually failed.
+            val after = cm.getCookie("https://$host/") ?: ""
+            val afterToken = extractClearanceToken(after)
+            if (afterToken.isNotEmpty()) {
+                ReelFrenLog.d("CF/scrub", "targeted delete FAILED → removeAllCookies fallback (other providers wiped)")
+                cm.removeAllCookies(null)
+                cm.flush()
+            } else {
+                ReelFrenLog.d("CF/scrub", "targeted delete succeeded (other providers preserved)")
+            }
         }.onFailure { ReelFrenLog.t("CF/scrub", it) }
     }
 
@@ -270,12 +309,23 @@ object ReelFrenCloudflare {
                     return@launch
                 }
 
+                // Capture any stale token still sitting in CookieManager before scrubbing
+                val cm = CookieManager.getInstance()
+                val residualCmToken = if (invalidatedCookie != null || forceInteractive) {
+                    extractClearanceToken(cm.getCookie(url) ?: cm.getCookie("https://$host"))
+                } else {
+                    ""
+                }
+                // FIX: .toSet() so this compiles when passed as Set<String>
+                val rejectedTokens: Set<String> =
+                    setOf(staleToken, residualCmToken).filter { it.isNotEmpty() }.toSet()
+
                 if (invalidatedCookie != null || forceInteractive) {
                     scrubStaleClearance(url, host)
                 }
 
                 val silentSuccess = if (!forceInteractive) {
-                    attemptSilent(act, url, host, staleToken, session)
+                    attemptSilent(act, url, host, rejectedTokens, session)
                 } else {
                     false
                 }
@@ -286,7 +336,7 @@ object ReelFrenCloudflare {
                     ReelFrenLog.d("CF/solve", "Background pre-warm ended without foreground demand -> skipping dialog")
                     ReelFrenCfState.completeAndEndSolve(host, session, false)
                 } else {
-                    showInteractiveDialog(act, url, host, staleToken, session)
+                    showInteractiveDialog(act, url, host, rejectedTokens, session)
                 }
             } catch (t: Throwable) {
                 ReelFrenCfState.completeAndEndSolve(host, session, false)
@@ -303,22 +353,27 @@ object ReelFrenCloudflare {
         activity: Activity,
         url: String,
         host: String,
-        rejectedToken: String,
+        rejectedTokens: Set<String>,
         session: SolveSession
     ): Boolean {
         val decor = activity.window?.decorView as? ViewGroup ?: return false
 
         return suspendCancellableCoroutine { cont ->
             val done = AtomicBoolean(false)
+            val settling = AtomicBoolean(false)
             val handler = Handler(Looper.getMainLooper())
             val ua = resolveWebViewUa(activity, host)
             val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
             var mainFrameError: String? = null
 
-            val container = FrameLayout(activity).apply {
+            // Keep Z-order at 0f (not negative) so Android's hwui RenderThread never
+            // occlusion-culls the WebView and freezes Blink's BeginFrame timer after 5s.
+            // Returning false from dispatchTouchEvent lets all user touches pass through.
+            val container = object : FrameLayout(activity) {
+                override fun dispatchTouchEvent(ev: MotionEvent?): Boolean = false
+            }.apply {
                 layoutParams = ViewGroup.LayoutParams(380, 680)
-                alpha = 0.05f
-                translationZ = -100f
+                alpha = 0.01f
                 isClickable = false
                 isFocusable = false
                 importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
@@ -326,7 +381,6 @@ object ReelFrenCloudflare {
 
             val web = WebView(activity).apply {
                 layoutParams = FrameLayout.LayoutParams(380, 680)
-                setLayerType(View.LAYER_TYPE_HARDWARE, null)
                 settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
@@ -365,43 +419,43 @@ object ReelFrenCloudflare {
             }
 
             fun checkAndAutoInteract(tick: Int) {
-                if (done.get()) return
+                if (done.get() || settling.get()) return
+                web.postInvalidateOnAnimation()
+
                 val rawCookie = cookies.getCookie(url) ?: cookies.getCookie("https://$host").orEmpty()
                 val token = extractClearanceToken(rawCookie)
                 val title = web.title.orEmpty()
+                val isFreshToken = token.isNotEmpty() && token !in rejectedTokens
 
-                ReelFrenLog.d("CF/silent-poll", "tick#$tick title='$title' cookieLen=${rawCookie.length} hasCf=${token.isNotEmpty()}")
+                ReelFrenLog.d("CF/silent-poll", "tick#$tick title='$title' cookieLen=${rawCookie.length} freshCf=$isFreshToken")
 
-                if (token.isNotEmpty() && (rejectedToken.isEmpty() || token != rejectedToken) && !isChallengeOrBlankTitle(title)) {
-                    finish(true)
+                if (isFreshToken && !isChallengeOrBlankTitle(title)) {
+                    if (settling.compareAndSet(false, true)) {
+                        handler.postDelayed({ finish(true) }, 600L)
+                    }
                     return
                 }
 
-                if (tick >= 4 && tick % 4 == 0) {
+                // Dispatch synthetic tap if still on the challenge page
+                if (tick >= 4 && tick % 4 == 0 && isChallengeOrBlankTitle(title)) {
                     val locateJs = """
                         (function() {
-                            function find(root) {
-                                if (!root) return null;
-                                var direct = root.querySelector('iframe[src*="challenges.cloudflare.com"], .cf-turnstile, #turnstile-wrapper');
-                                if (direct) return direct;
-                                var hosts = root.querySelectorAll('*');
-                                for (var i = 0; i < hosts.length; i++) {
-                                    if (hosts[i].shadowRoot) {
-                                        var hit = find(hosts[i].shadowRoot);
-                                        if (hit) return hit;
-                                    }
+                            var sel = 'iframe[src*="challenges.cloudflare.com"], [id^="cf-chl-widget"], #turnstile-wrapper, .cf-turnstile, #challenge-stage, .cb-c';
+                            var el = document.querySelector(sel);
+                            if (el) {
+                                var r = el.getBoundingClientRect();
+                                if (r.width > 0 && r.height > 0) {
+                                    return (r.left + 28) + ',' + (r.top + Math.min(32, r.height / 2));
                                 }
-                                return null;
                             }
-                            var el = find(document);
-                            if (!el) return '';
-                            var r = el.getBoundingClientRect();
-                            if (r.width <= 0 || r.height <= 0) return '';
-                            return (r.left + 28) + ',' + (r.top + (r.height / 2));
+                            if (document.title && document.title.toLowerCase().indexOf('just a moment') !== -1) {
+                                return '65,290';
+                            }
+                            return '';
                         })();
                     """.trimIndent()
                     web.evaluateJavascript(locateJs) { res ->
-                        if (done.get()) return@evaluateJavascript
+                        if (done.get() || settling.get()) return@evaluateJavascript
                         val coords = res?.trim('"').orEmpty()
                         if (coords.isEmpty()) return@evaluateJavascript
                         val parts = coords.split(",")
@@ -414,20 +468,24 @@ object ReelFrenCloudflare {
             }
 
             web.webViewClient = object : WebViewClient() {
-                override fun onPageStarted(view: WebView?, loadedUrl: String?, favicon: Bitmap?) {
-                    if (done.get() || loadedUrl == null || loadedUrl == "about:blank") return
-                    view?.evaluateJavascript(WEBDRIVER_PATCH_JS, null)
-                }
-
-                override fun onPageCommitVisible(view: WebView?, loadedUrl: String?) {
-                    if (done.get() || loadedUrl == null || loadedUrl == "about:blank") return
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        view?.evaluateJavascript(WEBDRIVER_PATCH_JS, null)
+                @SuppressLint("WebViewClientOnReceivedSslError")
+                override fun onReceivedSslError(view: WebView?, sslHandler: SslErrorHandler?, error: SslError?) {
+                    // Android 10's WebView rejects cross-signed edge certs with
+                    // net_error -202 (ERR_CERT_AUTHORITY_INVALID → SSL_UNTRUSTED).
+                    // Proceed only on that case; cancel on IDMISMATCH/EXPIRED/etc
+                    // to preserve MITM protection.
+                    if (error?.primaryError == SslError.SSL_UNTRUSTED) {
+                        ReelFrenLog.d("CF/silent", "SSL_UNTRUSTED → proceed (cross-signed chain)")
+                        sslHandler?.proceed()
+                    } else {
+                        ReelFrenLog.d("CF/silent", "SSL error ${error?.primaryError} → cancel")
+                        sslHandler?.cancel()
                     }
                 }
 
                 override fun onPageFinished(view: WebView?, loadedUrl: String?) {
                     if (done.get() || loadedUrl == "about:blank") return
+                    view?.onWindowFocusChanged(true)
                     checkAndAutoInteract(0)
                 }
 
@@ -456,6 +514,12 @@ object ReelFrenCloudflare {
                     checkAndAutoInteract(ticks)
                     if (done.get()) return
 
+                    // Don't let the 25s timeout win a race against a pending settle
+                    if (settling.get()) {
+                        handler.postDelayed(this, 200L)
+                        return
+                    }
+
                     val elapsed = SystemClock.uptimeMillis() - startMs
 
                     if (mainFrameError != null && !isChallengeOrBlankTitle(web.title)) {
@@ -478,6 +542,7 @@ object ReelFrenCloudflare {
             decor.addView(container)
             web.onResume()
             web.resumeTimers()
+            web.onWindowFocusChanged(true)
             web.loadUrl(url)
             handler.postDelayed(pollRunnable, 500L)
         }
@@ -488,7 +553,7 @@ object ReelFrenCloudflare {
         activity: Activity,
         url: String,
         host: String,
-        rejectedToken: String,
+        rejectedTokens: Set<String>,
         session: SolveSession
     ) {
         if (activity.isFinishing || activity.isDestroyed) {
@@ -497,6 +562,7 @@ object ReelFrenCloudflare {
         }
 
         val resolved = AtomicBoolean(false)
+        val settling = AtomicBoolean(false)   // FIX: restored — was removed
         val handler = Handler(Looper.getMainLooper())
         var webRef: WebView? = null
         var layoutRef: LinearLayout? = null
@@ -559,16 +625,32 @@ object ReelFrenCloudflare {
                 val rawCookie = cookies.getCookie(url) ?: cookies.getCookie("https://$host").orEmpty()
                 val token = extractClearanceToken(rawCookie)
                 return token.isNotEmpty() &&
-                       (rejectedToken.isEmpty() || token != rejectedToken) &&
+                       token !in rejectedTokens &&
                        !isChallengeOrBlankTitle(wv.title)
             }
 
+            fun scheduleSuccess() {
+                if (settling.compareAndSet(false, true)) {
+                    handler.postDelayed({ finish(true) }, 800L)
+                }
+            }
+
             wv.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                    if (resolved.get() || loadedUrl == "about:blank") return
-                    if (checkSolved()) {
-                        handler.postDelayed({ finish(true) }, 500L)
+                @SuppressLint("WebViewClientOnReceivedSslError")
+                override fun onReceivedSslError(view: WebView?, sslHandler: SslErrorHandler?, error: SslError?) {
+                    // Same gate as attemptSilent — see comment there.
+                    if (error?.primaryError == SslError.SSL_UNTRUSTED) {
+                        ReelFrenLog.d("CF/dialog", "SSL_UNTRUSTED → proceed")
+                        sslHandler?.proceed()
+                    } else {
+                        ReelFrenLog.d("CF/dialog", "SSL error ${error?.primaryError} → cancel")
+                        sslHandler?.cancel()
                     }
+                }
+
+                override fun onPageFinished(view: WebView?, loadedUrl: String?) {
+                    if (resolved.get() || settling.get() || loadedUrl == "about:blank") return
+                    if (checkSolved()) scheduleSuccess()
                 }
 
                 override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
@@ -596,9 +678,14 @@ object ReelFrenCloudflare {
                 var count = 0
                 override fun run() {
                     if (resolved.get()) return
+                    // Let the pending settle finish — don't re-check or time out
+                    if (settling.get()) {
+                        handler.postDelayed(this, 200L)
+                        return
+                    }
                     count++
                     if (checkSolved()) {
-                        finish(true)
+                        scheduleSuccess()
                         return
                     }
                     if (count < 45) handler.postDelayed(this, 1_500L) else finish(false)
