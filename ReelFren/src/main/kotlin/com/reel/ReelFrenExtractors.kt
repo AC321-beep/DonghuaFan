@@ -6,6 +6,7 @@ import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.CancellationException
 
 object ReelFrenDirectLink {
     suspend fun build(q: QualityEntry): ExtractorLink? {
@@ -35,7 +36,13 @@ class ReelFrenDirectLinkExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val resolved = runCatching { app.get(url, referer = referer).url }.getOrDefault(url)
+        val resolved = try {
+            app.get(url, referer = referer).url
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            url
+        }
         val type = ReelFrenQuality.linkType(resolved)
         callback(
             newExtractorLink(name, name, resolved, type) {
