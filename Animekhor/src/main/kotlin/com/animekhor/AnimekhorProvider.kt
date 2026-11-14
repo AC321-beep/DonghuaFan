@@ -9,8 +9,6 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -30,8 +28,6 @@ class AnimekhorProvider : MainAPI() {
     private companion object {
         const val PAGE_FETCH_TIMEOUT_MS = 15_000L
         const val SOLVE_WAIT_TIMEOUT_MS = 90_000L
-        // Paces concurrent category fetches to prevent triggering LiteSpeed/CF rate limits
-        private val requestSemaphore = Semaphore(3)
     }
 
     private val browserHeaders = mapOf(
@@ -63,6 +59,9 @@ class AnimekhorProvider : MainAPI() {
     )
 
     private fun isCfChallenge(html: String): Boolean = isCfChallengeHtml(html)
+
+    private fun isValidSiteHtml(html: String): Boolean =
+        html.length > 500 && !isCfChallenge(html) && isRealSiteHtml(html)
 
     private fun cfHeaders(url: String, base: Map<String, String> = defaultHeaders): Map<String, String> {
         val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
@@ -98,28 +97,28 @@ class AnimekhorProvider : MainAPI() {
 
         // Cache check #1
         CFState.getSolvedHtml(url)?.let { html ->
-            if (html.length > 500 && !isCfChallenge(html)) return Jsoup.parse(html, url)
+            if (isValidSiteHtml(html)) return Jsoup.parse(html, url)
         }
 
         withTimeoutOrNull(SOLVE_WAIT_TIMEOUT_MS) { CFState.awaitOngoingSolve(host) }
 
         // Cache check #2
         CFState.getSolvedHtml(url)?.let { html ->
-            if (html.length > 500 && !isCfChallenge(html)) return Jsoup.parse(html, url)
+            if (isValidSiteHtml(html)) return Jsoup.parse(html, url)
         }
 
-        // Cold-start gate: serialize the very first request on startup so 7 mainPage categories
-        // don't fire simultaneously before we know if the host requires verification.
+        // Cold-start gate: serialize only when the host is unverified or its 30-min TTL expired.
+        // Once verified, requests execute in full parallel without semaphore throttling.
         val response = if (!CFState.isHostVerified(host)) {
             val (res, cachedDoc) = CFState.withColdStartLock(host) {
                 withTimeoutOrNull(SOLVE_WAIT_TIMEOUT_MS) { CFState.awaitOngoingSolve(host) }
                 CFState.getSolvedHtml(url)?.let { html ->
-                    if (html.length > 500 && !isCfChallenge(html)) {
+                    if (isValidSiteHtml(html)) {
                         return@withColdStartLock null to Jsoup.parse(html, url)
                     }
                 }
-                val r = requestSemaphore.withPermit { executeGet(url, headers) }
-                if (r != null && r.code in 200..299 && !isCfChallenge(r.text)) {
+                val r = executeGet(url, headers)
+                if (r != null && r.code in 200..299 && isValidSiteHtml(r.text)) {
                     CFState.markHostVerified(host)
                 }
                 r to null
@@ -127,27 +126,31 @@ class AnimekhorProvider : MainAPI() {
             if (cachedDoc != null) return cachedDoc
             res
         } else {
-            requestSemaphore.withPermit { executeGet(url, headers) }
+            executeGet(url, headers)
         } ?: return null
 
-        Log.e("Animekhor/Provider", "🌐 Initial Fetch: ${response.code} for $url")
+        Log.d("Animekhor/Provider", "🌐 Initial Fetch: ${response.code} for $url")
 
-        if (response.code in 200..299 && !isCfChallenge(response.text)) {
+        if (response.code in 200..299 && isValidSiteHtml(response.text)) {
             CFState.markHostVerified(host)
             return response.document
         }
 
-        val challengeDetected = isCfChallenge(response.text)
+        // Trigger solver on explicit CF/LiteSpeed challenges OR silent 200 OK interstitials
+        // that lack real AnimeKhor DOM markers.
+        val challengeDetected = isCfChallenge(response.text) ||
+                (response.code in 200..299 && response.text.isNotBlank() && !isRealSiteHtml(response.text))
+
         if (!challengeDetected) {
             Log.e(
                 "Animekhor/Provider",
-                "🛑 Non-challenge response (${response.code}) for $url: ${response.text.take(200)}"
+                "🛑 Non-challenge error (${response.code}) for $url: ${response.text.take(200)}"
             )
             return null
         }
 
         CFState.markHostUnverified(host)
-        Log.e("Animekhor/Provider", "🛑 Challenge Body Snippet: ${response.text.take(300)}")
+        Log.w("Animekhor/Provider", "🛡 Challenge/Interstitial (${response.code}) for $url: ${response.text.take(250)}")
 
         if (CommonActivity.activity == null || CFState.isInCooldown(host)) {
             return null
@@ -155,7 +158,7 @@ class AnimekhorProvider : MainAPI() {
 
         val isHumanCaptcha = isHumanOnlyChallenge(response.text)
         if (isHumanCaptcha) {
-            Log.e("Animekhor/Provider", "🧩 Interactive CAPTCHA detected — skipping silent solver")
+            Log.w("Animekhor/Provider", "🧩 Interactive CAPTCHA detected — skipping silent solver")
         }
 
         val solved: Boolean = try {
@@ -167,25 +170,20 @@ class AnimekhorProvider : MainAPI() {
         }
 
         if (solved) {
-            CFState.markHostVerified(host)
-
             CFState.getSolvedHtml(url)?.let { html ->
-                if (html.length > 500 && !isCfChallenge(html)) return Jsoup.parse(html, url)
+                if (isValidSiteHtml(html)) return Jsoup.parse(html, url)
             }
 
-            val retryResponse = requestSemaphore.withPermit {
-                executeGet(url, headers)
-            }
-
-            if (retryResponse != null && retryResponse.code in 200..299 && !isCfChallenge(retryResponse.text)) {
+            val retryResponse = executeGet(url, headers)
+            if (retryResponse != null && retryResponse.code in 200..299 && isValidSiteHtml(retryResponse.text)) {
                 return retryResponse.document
             }
 
             val act = CommonActivity.activity
             if (act != null && !act.isFinishing && !act.isDestroyed) {
                 val html = CFState.fetchViaWebView(act, url)
-                if (!html.isNullOrBlank() && html.length > 500 && !isCfChallenge(html)) {
-                    Log.e("Animekhor/Provider", "✅ WebView transport succeeded (${html.length} bytes)")
+                if (!html.isNullOrBlank() && isValidSiteHtml(html)) {
+                    Log.d("Animekhor/Provider", "✅ WebView transport succeeded (${html.length} bytes)")
                     return Jsoup.parse(html, url)
                 }
             }
