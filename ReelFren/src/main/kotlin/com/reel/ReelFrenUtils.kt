@@ -7,6 +7,7 @@ import android.webkit.WebSettings
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import kotlinx.coroutines.CancellationException
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Locale
@@ -114,6 +115,22 @@ object ReelFrenConfig {
 // ── JSON Parser ──────────────────────────────────────────────────────────────
 object ReelFrenParse {
 
+    private val SUB_ARRAY_KEYS = arrayOf(
+        "subtitles", "subtitleList", "subs", "tracks", "captions", "captionList"
+    )
+    private val SUB_DIRECT_KEYS = arrayOf(
+        "subtitleUrl", "subUrl", "subtitle", "vtt", "srt", "captionUrl", "webvtt"
+    )
+    private val SUB_URL_KEYS = arrayOf(
+        "url", "src", "file", "subUrl", "subtitleUrl", "vtt", "srt", "link", "path", "webvtt"
+    )
+    private val SUB_LANG_KEYS = arrayOf(
+        "lang", "srclang", "srcLang", "language", "code", "locale", "langCode", "iso"
+    )
+    private val SUB_LABEL_KEYS = arrayOf(
+        "label", "name", "title", "display", "langName", "language"
+    )
+
     fun homeItems(body: String): List<HomeItem> {
         val root = runCatching { JSONObject(body) }.getOrNull() ?: run {
             ReelFrenLog.d("Parse.homeItems", "Invalid JSON (len=${body.length})")
@@ -187,47 +204,153 @@ object ReelFrenParse {
         val o = root.optJSONObject("data") ?: root.optJSONObject("playback") ?: root
 
         val qualities = mutableListOf<QualityEntry>()
-        o.optJSONArray("qualityList")?.let { arr ->
+        val subs = mutableListOf<SubtitleEntry>()
+
+        val qArr = o.optJSONArray("qualityList")
+            ?: o.optJSONArray("qualities")
+            ?: o.optJSONArray("sources")
+
+        qArr?.let { arr ->
             for (i in 0 until arr.length()) {
                 val q = arr.optJSONObject(i) ?: continue
-                val url = clean(q, "url")
-                if (url.isEmpty()) continue
-                qualities += QualityEntry(
-                    label = clean(q, "label").ifEmpty { "Auto" },
-                    url = url,
-                    format = clean(q, "format")
-                )
+                val url = firstNonEmpty(q, "url", "src", "file", "videoUrl")
+                if (url.isNotEmpty()) {
+                    qualities += QualityEntry(
+                        label = firstNonEmpty(q, "label", "quality", "name").ifEmpty { "Auto" },
+                        url = url,
+                        format = clean(q, "format")
+                    )
+                }
+                collectSubtitlesFromNode(q, subs)
             }
         }
-        val direct = clean(o, "videoUrl")
+
+        val direct = firstNonEmpty(o, "videoUrl", "url", "streamUrl", "playUrl", "m3u8")
         if (direct.isNotEmpty() && qualities.none { it.url == direct }) {
             qualities.add(0, QualityEntry("Auto", direct, ReelFrenQuality.inferFormat(direct)))
         }
         if (qualities.isEmpty()) return null
 
-        val subs = mutableListOf<SubtitleEntry>()
-        o.optJSONArray("subtitles")?.let { arr ->
-            for (i in 0 until arr.length()) {
-                val s = arr.optJSONObject(i) ?: continue
-                val u = clean(s, "url")
-                if (u.isEmpty()) continue
-                subs += SubtitleEntry(clean(s, "label"), clean(s, "srclang"), u)
-            }
+        collectSubtitlesFromNode(o, subs)
+        if (o !== root) {
+            collectSubtitlesFromNode(root, subs)
         }
+
+        val dedupedSubs = subs.distinctBy { "${it.lang.lowercase(Locale.ROOT)}|${it.url}" }
+
         return PlaybackInfo(
             title = clean(o, "title"),
             episodeNumber = o.optInt("episodeNumber", 1),
             totalEpisodes = o.optInt("totalEpisodes", 1),
             locked = o.optBoolean("locked"),
             qualities = qualities,
-            subtitles = subs,
+            subtitles = dedupedSubs,
             server = clean(o, "sourceServer").ifEmpty { "1" }
         )
     }
 
+    private fun collectSubtitlesFromNode(node: JSONObject, out: MutableList<SubtitleEntry>) {
+        // 1. Check standard subtitle array keys
+        for (key in SUB_ARRAY_KEYS) {
+            node.optJSONArray(key)?.let { arr ->
+                parseSubtitleArray(arr, out)
+            }
+            // Handle object-style subtitle maps (e.g., {"en": "https://...", "id": "https://..."})
+            node.optJSONObject(key)?.let { obj ->
+                parseSubtitleObjectOrMap(obj, out)
+            }
+        }
+
+        // 2. Check single subtitle object or direct URL strings
+        node.optJSONObject("subtitle")?.let { obj ->
+            parseSubtitleObjectOrMap(obj, out)
+        }
+        val fallbackLang = firstNonEmpty(node, "lang", "language", "srclang").ifEmpty { "en" }
+        for (key in SUB_DIRECT_KEYS) {
+            if (node.optJSONObject(key) != null || node.optJSONArray(key) != null) continue
+            val directUrl = clean(node, key)
+            if (looksLikeSubtitleUrl(directUrl)) {
+                out += SubtitleEntry(
+                    label = clean(node, "subtitleLabel").ifEmpty { fallbackLang },
+                    lang = fallbackLang,
+                    url = directUrl
+                )
+            }
+        }
+    }
+
+    private fun parseSubtitleArray(arr: JSONArray, out: MutableList<SubtitleEntry>) {
+        for (i in 0 until arr.length()) {
+            val s = arr.optJSONObject(i)
+            if (s != null) {
+                parseSingleSubtitleObject(s)?.let { out += it }
+            } else {
+                val rawUrl = arr.optString(i, "").trim()
+                if (looksLikeSubtitleUrl(rawUrl)) {
+                    out += SubtitleEntry(label = "English", lang = "en", url = rawUrl)
+                }
+            }
+        }
+    }
+
+    private fun parseSubtitleObjectOrMap(obj: JSONObject, out: MutableList<SubtitleEntry>) {
+        parseSingleSubtitleObject(obj)?.let {
+            out += it
+            return
+        }
+        val keys = obj.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            val nestedObj = obj.optJSONObject(k)
+            if (nestedObj != null) {
+                val entry = parseSingleSubtitleObject(nestedObj, defaultLang = k)
+                if (entry != null) out += entry
+            } else {
+                val rawUrl = clean(obj, k)
+                if (looksLikeSubtitleUrl(rawUrl)) {
+                    out += SubtitleEntry(label = k, lang = k, url = rawUrl)
+                }
+            }
+        }
+    }
+
+    private fun parseSingleSubtitleObject(s: JSONObject, defaultLang: String = ""): SubtitleEntry? {
+        val kind = firstNonEmpty(s, "kind", "type").lowercase(Locale.ROOT)
+        if (kind == "thumbnails" || kind == "chapters" || kind == "metadata") return null
+
+        val u = firstNonEmpty(s, *SUB_URL_KEYS)
+        if (!looksLikeSubtitleUrl(u)) return null
+
+        val lang = firstNonEmpty(s, *SUB_LANG_KEYS).ifEmpty { defaultLang }
+        val label = firstNonEmpty(s, *SUB_LABEL_KEYS).ifEmpty { lang }
+        return SubtitleEntry(label = label, lang = lang, url = u)
+    }
+
+    private fun looksLikeSubtitleUrl(u: String): Boolean {
+        val trimmed = u.trim()
+        if (trimmed.isEmpty()) return false
+        val lower = trimmed.lowercase(Locale.ROOT)
+        if (lower == "null" || lower == "none" || lower == "false" || lower == "0" || lower == "#" || lower == "hardcoded") {
+            return false
+        }
+        return lower.startsWith("http://") ||
+               lower.startsWith("https://") ||
+               lower.startsWith("//") ||
+               lower.startsWith("/") ||
+               lower.startsWith("data:")
+    }
+
+    private fun firstNonEmpty(o: JSONObject, vararg keys: String): String {
+        for (k in keys) {
+            val v = clean(o, k)
+            if (v.isNotEmpty()) return v
+        }
+        return ""
+    }
+
     private fun clean(o: JSONObject, key: String, fallback: String = ""): String {
         val v = o.optString(key, fallback).trim()
-        return if (v.equals("null", ignoreCase = true)) fallback else v
+        return if (v.equals("null", ignoreCase = true) || v.equals("undefined", ignoreCase = true)) fallback else v
     }
 }
 
@@ -244,6 +367,7 @@ object ReelFrenStore {
     private val memoryUa = ConcurrentHashMap<String, String>()
     private val memoryCookies = ConcurrentHashMap<String, String>()
     private val wvVersionRegex = Regex("""Version/\d+\.\d+\s*""")
+    private val rootDomain by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.REEL_SITE) }
 
     fun normalizeUa(rawUa: String): String =
         rawUa.replace("; wv", "").replace(wvVersionRegex, "").trim()
@@ -294,8 +418,15 @@ object ReelFrenStore {
         val norm = host.lowercase(Locale.ROOT)
         memoryCookies[norm]?.let { return it }
         val saved = storePrefs?.getString(key("cookie", norm), "").orEmpty()
-        if (saved.isNotEmpty()) memoryCookies[norm] = saved
-        return saved
+        if (saved.isNotEmpty()) {
+            memoryCookies[norm] = saved
+            return saved
+        }
+        // Share cf_clearance across *.reelfren.net subdomains (e.g. api.reelfren.net, proxy.reelfren.net)
+        if (norm != rootDomain && norm.endsWith(".$rootDomain")) {
+            return cookie(rootDomain)
+        }
+        return ""
     }
 
     fun saveCookie(host: String, cookie: String) {
@@ -319,6 +450,9 @@ object ReelFrenStore {
             val cleaned = normalizeUa(saved)
             memoryUa[norm] = cleaned
             return cleaned
+        }
+        if (norm != rootDomain && norm.endsWith(".$rootDomain")) {
+            return userAgent(rootDomain)
         }
         return defaultSystemUa
     }
@@ -438,43 +572,65 @@ object ReelFrenClient {
     private fun apiBase() = ReelFrenStore.apiBase()
     private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
 
+    private fun isSiteDomain(host: String): Boolean =
+        host.isNotEmpty() && (host == siteHost || host.endsWith(".$siteHost"))
+
     fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
-        val p = mutableListOf("provider=${query(slug)}", "lang=en")
-        if (category.isNotEmpty()) p += "category=${query(category)}"
+        val p = mutableListOf("lang=en")
+        
+        // Handle global tabs vs specific providers
+        val isGlobal = slug == "all_dramas" || slug == "anime"
+        if (!isGlobal && slug.isNotEmpty()) {
+            p += "provider=${query(slug)}"
+        }
+        
+        val finalCategory = when (slug) {
+            "all_dramas" -> "drama"
+            "anime" -> "anime"
+            else -> category
+        }
+        
+        if (finalCategory.isNotEmpty()) p += "category=${query(finalCategory)}"
+        
         val off = page - 1
         if (off > 0) p += "offset=$off"
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
     fun detailUrl(slug: String, id: String) =
-        "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}"
+        "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
 
     fun videoUrl(slug: String, id: String, ep: Int) =
-        "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep"
+        "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&lang=en"
 
     fun searchUrl(slug: String, term: String) =
-        "${apiBase()}/api/search?q=${query(term)}&provider=${query(slug)}"
+        "${apiBase()}/api/search?q=${query(term)}&provider=${query(slug)}&lang=en"
 
     fun headers(url: String): Map<String, String> {
         val host = ReelFrenCloudflare.hostOf(url)
-        val savedCookie = ReelFrenStore.cookie(host)
         val savedUa = ReelFrenStore.userAgent(host)
 
         val map = linkedMapOf(
             "User-Agent"      to savedUa,
             "Accept"          to "application/json, text/plain, */*",
-            "Accept-Language" to "en-US,en;q=0.9",
-            "Origin"          to ReelFrenConfig.REEL_SITE,
-            "Referer"         to "${ReelFrenConfig.REEL_SITE}/"
+            "Accept-Language" to "en-US,en;q=0.9"
         )
-        if (savedCookie.isNotBlank()) map["Cookie"] = savedCookie
+        // Scoped to reelfren.net and subdomains to prevent CDN hotlink blocks
+        if (isSiteDomain(host)) {
+            map["Origin"] = ReelFrenConfig.REEL_SITE
+            map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
+            val savedCookie = ReelFrenStore.cookie(host)
+            if (savedCookie.isNotBlank()) {
+                map["Cookie"] = savedCookie
+            }
+        }
         return map
     }
 
     fun posterHeaders(posterUrl: String?): Map<String, String>? {
         if (posterUrl.isNullOrEmpty()) return null
         val host = ReelFrenCloudflare.hostOf(posterUrl)
-        return if (host == siteHost || host.endsWith(".$siteHost")) headers(posterUrl) else null
+        return if (isSiteDomain(host)) headers(posterUrl) else null
     }
 
     suspend fun get(url: String): String? {
@@ -499,7 +655,7 @@ object ReelFrenClient {
             return firstResp.text
         }
 
-        ReelFrenLog.d("Client.get", "Challenge detected (HTTP ${firstResp.code}, len=${firstResp.text.length}) on$url")
+        ReelFrenLog.d("Client.get", "Challenge detected (HTTP ${firstResp.code}, len=${firstResp.text.length}) on $url")
 
         val latestCookie = ReelFrenStore.cookie(targetHost)
         if (latestCookie.isNotBlank() && latestCookie != initialCookie && latestCookie.contains("cf_clearance")) {
@@ -515,7 +671,7 @@ object ReelFrenClient {
             }
         }
 
-        val solveUrl = if (targetHost == siteHost) ReelFrenConfig.REEL_SITE else url
+        val solveUrl = if (isSiteDomain(targetHost)) ReelFrenConfig.REEL_SITE else url
 
         val solved = ReelFrenCloudflare.solve(solveUrl, invalidatedCookie = initialCookie)
         if (!solved) return null
