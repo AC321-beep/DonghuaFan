@@ -85,6 +85,7 @@ object ReelFrenCfState {
 // ── Cloudflare Solver ────────────────────────────────────────────────────────
 object ReelFrenCloudflare {
 
+    private const val SILENT_TIMEOUT_MS = 30_000L
     private val clearanceRegex = Regex("(?:^|;\\s*)cf_clearance=([^;]+)")
 
     // Captures closed Shadow DOM roots created by Cloudflare Turnstile
@@ -412,8 +413,6 @@ object ReelFrenCloudflare {
             val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
             var mainFrameError: String? = null
 
-            // Use MATCH_PARENT x 1200 (identical to the Dialog) so CSS window.innerWidth
-            // is a full ~360-412dp mobile viewport instead of a tiny 138dp column.
             val container = object : FrameLayout(activity) {
                 override fun dispatchTouchEvent(ev: MotionEvent?): Boolean = false
             }.apply {
@@ -481,7 +480,6 @@ object ReelFrenCloudflare {
                     return
                 }
 
-                // Locate Turnstile checkbox in CSS space and convert to physical View pixels via devicePixelRatio
                 if (tick >= 4 && tick % 4 == 0 && isChallengeOrBlankTitle(title)) {
                     val locateJs = """
                         (function() {
@@ -542,6 +540,7 @@ object ReelFrenCloudflare {
 
                 override fun onPageStarted(view: WebView?, loadedUrl: String?, favicon: Bitmap?) {
                     if (done.get() || loadedUrl == null || loadedUrl == "about:blank") return
+                    mainFrameError = null // Reset transient errors on redirect
                     view?.evaluateJavascript(SHADOW_HOOK_JS, null)
                 }
 
@@ -583,12 +582,12 @@ object ReelFrenCloudflare {
                         return
                     }
 
-                    if (elapsed >= 25_000L) {
+                    if (elapsed >= SILENT_TIMEOUT_MS) {
                         finish(false)
                         return
                     }
 
-                    val nextDelay = if (elapsed < 8_000L) 500L else 1_000L
+                    val nextDelay = if (elapsed < 10_000L) 500L else 1_000L
                     handler.postDelayed(this, nextDelay)
                 }
             }
