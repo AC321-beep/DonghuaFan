@@ -29,10 +29,9 @@ class Reelfren : MainAPI() {
             val enabled = ReelFrenStore.enabledProviders()
             ReelFrenLog.d("Main/mainPage", "returning ${enabled.size} enabled pages")
             
-            // Restore original mapping: slug (data) to display (name)
+            // Only "All Dramas" as a global tab
             val globalPages = listOf(
-                "all_dramas" to "All Dramas",
-                "anime" to "Anime"
+                "all_dramas" to "All Dramas"
             )
             
             val providerPages = enabled.map { (display, slug) -> slug to display }
@@ -42,7 +41,6 @@ class Reelfren : MainAPI() {
         }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        // request.data will now correctly be "all_dramas" or "dramawave" (lowercase)
         val slug = request.data
         ReelFrenLog.d("Main/getMainPage", "ENTRY page=$page slug=$slug name=${request.name}")
         val items = mutableListOf<SearchResponse>()
@@ -52,11 +50,13 @@ class Reelfren : MainAPI() {
         if (page <= 1) seen.clear()
 
         try {
+            // Default behavior for "All Dramas" and individual providers
             val homeItems = ReelFrenClient.home(slug, page = page)
             rawCount = homeItems.size
             for (item in homeItems) {
                 if (seen.add(item.id)) {
-                    toCard(slug, item)?.let { items.add(it) }
+                    val actualSlug = item.provider.ifEmpty { slug }
+                    toCard(actualSlug, item)?.let { items.add(it) }
                 }
             }
             ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=$rawCount added=${items.size}")
