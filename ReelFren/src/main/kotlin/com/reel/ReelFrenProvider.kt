@@ -28,8 +28,17 @@ class Reelfren : MainAPI() {
         get() {
             val enabled = ReelFrenStore.enabledProviders()
             ReelFrenLog.d("Main/mainPage", "returning ${enabled.size} enabled pages")
-            return enabled.map { (display, slug) -> slug to display }
-                .let { mainPageOf(*it.toTypedArray()) }
+            
+            // Add Global tabs at the top
+            val globalPages = listOf(
+                "All Dramas" to "all_dramas",
+                "Anime" to "anime"
+            )
+            
+            val providerPages = enabled.map { (display, slug) -> display to slug }
+            val allPages = globalPages + providerPages
+            
+            return mainPageOf(*allPages.toTypedArray())
         }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
@@ -147,9 +156,11 @@ class Reelfren : MainAPI() {
         if (slug.isEmpty() || id.isEmpty()) return false
 
         val playback = ReelFrenClient.playback(slug, id, episode) ?: return false
+        ReelFrenLog.d(
+            "Main/loadLinks",
+            "Parsed playback qualities=${playback.qualities.size} rawSubs=${playback.subtitles.size}"
+        )
 
-        // CHANGED: unified extractor — filters placeholders, resolves relative URLs,
-        // normalises lang codes, dedupes, and pulls HLS-embedded subtitles too.
         try {
             ReelFrenSubtitles.emit(
                 entries   = playback.subtitles,
