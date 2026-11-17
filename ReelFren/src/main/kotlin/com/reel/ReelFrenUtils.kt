@@ -138,7 +138,8 @@ object ReelFrenParse {
         }
         val status = root.optInt("status", 200)
         if (status >= 400 || root.has("error")) {
-            ReelFrenLog.d("Parse.homeItems", "Upstream API error (status=$status, title='${root.optString("title")}')")
+            // ADDED: body is logged to show exactly why the API rejected the request
+            ReelFrenLog.d("Parse.homeItems", "Upstream API error (status=$status, title='${root.optString("title")}', body='${body.take(200)}')")
             return emptyList()
         }
         val dataObj = root.optJSONObject("data")
@@ -250,18 +251,15 @@ object ReelFrenParse {
     }
 
     private fun collectSubtitlesFromNode(node: JSONObject, out: MutableList<SubtitleEntry>) {
-        // 1. Check standard subtitle array keys
         for (key in SUB_ARRAY_KEYS) {
             node.optJSONArray(key)?.let { arr ->
                 parseSubtitleArray(arr, out)
             }
-            // Handle object-style subtitle maps (e.g., {"en": "https://...", "id": "https://..."})
             node.optJSONObject(key)?.let { obj ->
                 parseSubtitleObjectOrMap(obj, out)
             }
         }
 
-        // 2. Check single subtitle object or direct URL strings
         node.optJSONObject("subtitle")?.let { obj ->
             parseSubtitleObjectOrMap(obj, out)
         }
@@ -422,7 +420,6 @@ object ReelFrenStore {
             memoryCookies[norm] = saved
             return saved
         }
-        // Share cf_clearance across *.reelfren.net subdomains (e.g. api.reelfren.net, proxy.reelfren.net)
         if (norm != rootDomain && norm.endsWith(".$rootDomain")) {
             return cookie(rootDomain)
         }
@@ -576,13 +573,16 @@ object ReelFrenClient {
         host.isNotEmpty() && (host == siteHost || host.endsWith(".$siteHost"))
 
     fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
-        val p = mutableListOf("lang=en")
+        val p = mutableListOf<String>()
         
-        // Handle global tabs vs specific providers
         val isGlobal = slug == "all_dramas" || slug == "anime"
+        
+        // Keep 'provider' first if it exists, to prevent API rejection
         if (!isGlobal && slug.isNotEmpty()) {
             p += "provider=${query(slug)}"
         }
+        
+        p += "lang=en"
         
         val finalCategory = when (slug) {
             "all_dramas" -> "drama"
@@ -594,6 +594,7 @@ object ReelFrenClient {
         
         val off = page - 1
         if (off > 0) p += "offset=$off"
+        
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
@@ -615,7 +616,6 @@ object ReelFrenClient {
             "Accept"          to "application/json, text/plain, */*",
             "Accept-Language" to "en-US,en;q=0.9"
         )
-        // Scoped to reelfren.net and subdomains to prevent CDN hotlink blocks
         if (isSiteDomain(host)) {
             map["Origin"] = ReelFrenConfig.REEL_SITE
             map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
