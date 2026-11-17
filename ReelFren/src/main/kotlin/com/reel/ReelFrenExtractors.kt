@@ -61,12 +61,11 @@ object ReelFrenSubtitles {
             val resolved = resolveUrl(entry.url) ?: continue
             if (!seenUrls.add(resolved)) continue
 
+            // Cloudstream uses the 'lang' parameter as the display name in the player
             val displayLabel = resolveDisplayLabel(entry.lang, entry.label)
             
-            // FIXED: Pass 'url' as the second parameter, set 'name' inside the builder
             callback(
                 newSubtitleFile(lang = displayLabel, url = resolved) {
-                    this.name = entry.label.takeIf { it.isNotBlank() }
                     this.headers = ReelFrenClient.headers(resolved)
                 }
             )
@@ -220,9 +219,7 @@ object ReelFrenSubtitles {
                 abs
             }
 
-            // FIXED: Pass 'url' as the second parameter, set 'name' inside the builder
             result += newSubtitleFile(lang = displayLabel, url = finalSubUrl) {
-                this.name = rawName.takeIf { it.isNotBlank() }
                 this.headers = ReelFrenClient.headers(finalSubUrl)
             }
         }
