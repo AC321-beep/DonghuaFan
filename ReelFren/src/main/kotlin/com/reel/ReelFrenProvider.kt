@@ -148,10 +148,18 @@ class Reelfren : MainAPI() {
 
         val playback = ReelFrenClient.playback(slug, id, episode) ?: return false
 
-        playback.subtitles.forEach { sub ->
-            subtitleCallback(
-                newSubtitleFile(sub.lang, sub.label) { this.url = sub.url }
+        // CHANGED: unified extractor — filters placeholders, resolves relative URLs,
+        // normalises lang codes, dedupes, and pulls HLS-embedded subtitles too.
+        try {
+            ReelFrenSubtitles.emit(
+                entries   = playback.subtitles,
+                qualities = playback.qualities,
+                callback  = subtitleCallback
             )
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            ReelFrenLog.t("Main/loadLinks/subtitles", e)
         }
 
         var emitted = false
