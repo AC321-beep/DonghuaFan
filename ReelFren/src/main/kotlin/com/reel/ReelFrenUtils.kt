@@ -125,7 +125,7 @@ object ReelFrenParse {
         "url", "src", "file", "subUrl", "subtitleUrl", "vtt", "srt", "link", "path", "webvtt"
     )
     private val SUB_LANG_KEYS = arrayOf(
-        "lang", "srclang", "srcLang", "language", "code", "locale", "langCode", "iso"
+        "lang", "srclang", "srcLang", "language", "code", "locale", "langCode", "iso", "languageCode", "language_code", "lang_code"
     )
     private val SUB_LABEL_KEYS = arrayOf(
         "label", "name", "title", "display", "langName", "language"
@@ -341,7 +341,6 @@ object ReelFrenParse {
 
     private fun guessLangFromUrl(url: String): String {
         val filename = url.substringAfterLast('/').substringBefore('?')
-        // Look for common patterns like _en, -en, .en., /en/
         val match = Regex("(?:^|[._-])(en|es|pt|id|ar|fr|de|it|ru|zh|ja|ko|hi|vi|th|ms|tr)(?:[._-]|$)", RegexOption.IGNORE_CASE).find(filename)
         if (match != null) {
             val code = match.groupValues[1].lowercase()
@@ -352,7 +351,6 @@ object ReelFrenParse {
                 else -> code
             }
         }
-        // Try matching full language names
         val lowerUrl = url.lowercase()
         val langs = listOf("english" to "en", "spanish" to "es", "indonesian" to "id", "portuguese" to "pt", "arabic" to "ar", "french" to "fr", "german" to "de", "japanese" to "ja", "korean" to "ko", "chinese" to "zh")
         for ((name, code) in langs) {
@@ -600,7 +598,6 @@ object ReelFrenClient {
         
         val isGlobal = slug == "all_dramas"
         
-        // Keep 'provider' first if it exists, to prevent API rejection
         if (!isGlobal && slug.isNotEmpty()) {
             p += "provider=${query(slug)}"
         }
@@ -619,7 +616,7 @@ object ReelFrenClient {
         "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
 
     fun videoUrl(slug: String, id: String, ep: Int) =
-        "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&lang=en"
+        "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep"
 
     fun searchUrl(slug: String, term: String) =
         "${apiBase()}/api/search?q=${query(term)}&provider=${query(slug)}&lang=en"
