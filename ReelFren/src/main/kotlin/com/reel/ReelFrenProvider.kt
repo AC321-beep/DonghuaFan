@@ -29,19 +29,20 @@ class Reelfren : MainAPI() {
             val enabled = ReelFrenStore.enabledProviders()
             ReelFrenLog.d("Main/mainPage", "returning ${enabled.size} enabled pages")
             
-            // Add Global tabs at the top
+            // Restore original mapping: slug (data) to display (name)
             val globalPages = listOf(
-                "All Dramas" to "all_dramas",
-                "Anime" to "anime"
+                "all_dramas" to "All Dramas",
+                "anime" to "Anime"
             )
             
-            val providerPages = enabled.map { (display, slug) -> display to slug }
+            val providerPages = enabled.map { (display, slug) -> slug to display }
             val allPages = globalPages + providerPages
             
             return mainPageOf(*allPages.toTypedArray())
         }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
+        // request.data will now correctly be "all_dramas" or "dramawave" (lowercase)
         val slug = request.data
         ReelFrenLog.d("Main/getMainPage", "ENTRY page=$page slug=$slug name=${request.name}")
         val items = mutableListOf<SearchResponse>()
@@ -186,7 +187,10 @@ class Reelfren : MainAPI() {
 
     private fun toCard(slug: String, item: HomeItem): SearchResponse? {
         if (item.id.isEmpty() || item.title.isEmpty()) return null
-        val url = ReelFrenUrl.page(slug, item.id)
+        
+        // Use the item's specific provider if it exists (crucial for Global tabs like "All Dramas")
+        val actualSlug = item.provider.ifEmpty { slug }
+        val url = ReelFrenUrl.page(actualSlug, item.id)
         val poster = ReelFrenClient.absUrl(item.cover).ifEmpty { null }
         val imgHeaders = ReelFrenClient.posterHeaders(poster)
         val displayTitle = if (item.episodes > 0) {
