@@ -138,7 +138,6 @@ object ReelFrenParse {
         }
         val status = root.optInt("status", 200)
         if (status >= 400 || root.has("error")) {
-            // ADDED: body is logged to show exactly why the API rejected the request
             ReelFrenLog.d("Parse.homeItems", "Upstream API error (status=$status, title='${root.optString("title")}', body='${body.take(200)}')")
             return emptyList()
         }
@@ -285,7 +284,9 @@ object ReelFrenParse {
             } else {
                 val rawUrl = arr.optString(i, "").trim()
                 if (looksLikeSubtitleUrl(rawUrl)) {
-                    out += SubtitleEntry(label = "English", lang = "en", url = rawUrl)
+                    val guessedLang = guessLangFromUrl(rawUrl)
+                    val label = if (guessedLang == "und") "Subtitle ${i + 1}" else guessedLang.uppercase()
+                    out += SubtitleEntry(label = label, lang = guessedLang, url = rawUrl)
                 }
             }
         }
@@ -336,6 +337,28 @@ object ReelFrenParse {
                lower.startsWith("//") ||
                lower.startsWith("/") ||
                lower.startsWith("data:")
+    }
+
+    private fun guessLangFromUrl(url: String): String {
+        val filename = url.substringAfterLast('/').substringBefore('?')
+        // Look for common patterns like _en, -en, .en., /en/
+        val match = Regex("(?:^|[._-])(en|es|pt|id|ar|fr|de|it|ru|zh|ja|ko|hi|vi|th|ms|tr)(?:[._-]|$)", RegexOption.IGNORE_CASE).find(filename)
+        if (match != null) {
+            val code = match.groupValues[1].lowercase()
+            return when (code) {
+                "jp" -> "ja"
+                "kr" -> "ko"
+                "in" -> "id"
+                else -> code
+            }
+        }
+        // Try matching full language names
+        val lowerUrl = url.lowercase()
+        val langs = listOf("english" to "en", "spanish" to "es", "indonesian" to "id", "portuguese" to "pt", "arabic" to "ar", "french" to "fr", "german" to "de", "japanese" to "ja", "korean" to "ko", "chinese" to "zh")
+        for ((name, code) in langs) {
+            if (lowerUrl.contains(name)) return code
+        }
+        return "und"
     }
 
     private fun firstNonEmpty(o: JSONObject, vararg keys: String): String {
@@ -575,7 +598,7 @@ object ReelFrenClient {
     fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
         val p = mutableListOf<String>()
         
-        val isGlobal = slug == "all_dramas" || slug == "anime"
+        val isGlobal = slug == "all_dramas"
         
         // Keep 'provider' first if it exists, to prevent API rejection
         if (!isGlobal && slug.isNotEmpty()) {
@@ -584,13 +607,7 @@ object ReelFrenClient {
         
         p += "lang=en"
         
-        val finalCategory = when (slug) {
-            "all_dramas" -> "drama"
-            "anime" -> "anime"
-            else -> category
-        }
-        
-        if (finalCategory.isNotEmpty()) p += "category=${query(finalCategory)}"
+        if (category.isNotEmpty()) p += "category=${query(category)}"
         
         val off = page - 1
         if (off > 0) p += "offset=$off"
