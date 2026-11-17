@@ -12,7 +12,7 @@ import java.net.URI
 import java.util.Locale
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Video link builder (unchanged)
+// Video link builder 
 // ─────────────────────────────────────────────────────────────────────────────
 object ReelFrenDirectLink {
     suspend fun build(q: QualityEntry): ExtractorLink? {
@@ -63,10 +63,10 @@ object ReelFrenSubtitles {
 
             val displayLabel = resolveDisplayLabel(entry.lang, entry.label)
             
-            // Correct Cloudstream usage: lang is display name, name is suffix, url set in builder
+            // FIXED: Pass 'url' as the second parameter, set 'name' inside the builder
             callback(
-                newSubtitleFile(lang = displayLabel, name = entry.label) {
-                    this.url = resolved
+                newSubtitleFile(lang = displayLabel, url = resolved) {
+                    this.name = entry.label.takeIf { it.isNotBlank() }
                     this.headers = ReelFrenClient.headers(resolved)
                 }
             )
@@ -220,8 +220,9 @@ object ReelFrenSubtitles {
                 abs
             }
 
-            result += newSubtitleFile(lang = displayLabel, name = rawName) {
-                this.url = finalSubUrl
+            // FIXED: Pass 'url' as the second parameter, set 'name' inside the builder
+            result += newSubtitleFile(lang = displayLabel, url = finalSubUrl) {
+                this.name = rawName.takeIf { it.isNotBlank() }
                 this.headers = ReelFrenClient.headers(finalSubUrl)
             }
         }
