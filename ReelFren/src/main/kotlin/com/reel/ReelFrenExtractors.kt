@@ -12,7 +12,7 @@ import java.net.URI
 import java.util.Locale
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Video link builder 
+// Video link builder
 // ─────────────────────────────────────────────────────────────────────────────
 object ReelFrenDirectLink {
     suspend fun build(q: QualityEntry): ExtractorLink? {
@@ -61,7 +61,6 @@ object ReelFrenSubtitles {
             val resolved = resolveUrl(entry.url) ?: continue
             if (!seenUrls.add(resolved)) continue
 
-            // Cloudstream uses the 'lang' parameter as the display name in the player
             val displayLabel = resolveDisplayLabel(entry.lang, entry.label)
             
             callback(
@@ -124,7 +123,7 @@ object ReelFrenSubtitles {
             cleanLabel.isNotEmpty() && !cleanLabel.equals(rawLang.trim(), ignoreCase = true) && cleanLabel.length > 3 -> cleanLabel
             mappedName != "Unknown" -> mappedName
             cleanLabel.isNotEmpty() -> cleanLabel
-            else -> "English"
+            else -> "Unknown" // FIXED: No longer hardcoding to "English"
         }
     }
 
@@ -227,9 +226,9 @@ object ReelFrenSubtitles {
     }
 
     /**
-     * Unwraps an HLS subtitle media playlist (.m3u8) into its underlying .vtt/.srt URL
-     * when it references a single subtitle file. If it is multi-segment, returns null so
-     * ExoPlayer's native HLS media source handles the embedded #EXT-X-MEDIA track directly.
+     * Handles HLS subtitle playlists.
+     * If single segment: returns the direct .vtt/.srt URL.
+     * If multi-segment: downloads all chunks and merges them into a base64 data URL so ExoPlayer can read them.
      */
     private suspend fun resolveSubtitleM3u8ToDirectFile(subM3u8Url: String): String? {
         val subManifest = try {
@@ -246,8 +245,27 @@ object ReelFrenSubtitles {
             .filter { it.isNotEmpty() && !it.startsWith("#") }
             .toList()
 
+        if (segments.isEmpty()) return null
+
         if (segments.size == 1) {
             return resolveRelativeUrl(subM3u8Url, segments[0]).ifBlank { null }
+        }
+
+        // Multi-segment subtitle: download and merge into a single data URL
+        val sb = StringBuilder()
+        for (seg in segments) {
+            val segUrl = resolveRelativeUrl(subM3u8Url, seg)
+            try {
+                val chunk = app.get(segUrl, headers = ReelFrenClient.headers(segUrl)).text
+                sb.append(chunk).append("\n")
+            } catch (_: Exception) {
+                // Ignore single chunk failures to salvage the rest
+            }
+        }
+
+        if (sb.isNotEmpty()) {
+            val base64 = android.util.Base64.encodeToString(sb.toString().toByteArray(), android.util.Base64.NO_WRAP)
+            return "data:text/plain;base64,$base64"
         }
         return null
     }
