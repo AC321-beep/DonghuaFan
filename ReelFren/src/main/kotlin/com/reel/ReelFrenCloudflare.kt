@@ -85,6 +85,8 @@ object ReelFrenCfState {
 object ReelFrenCloudflare {
 
     private val clearanceRegex = Regex("(?:^|;\\s*)cf_clearance=([^;]+)")
+    private const val WEBDRIVER_PATCH_JS =
+        "(function(){try{Object.defineProperty(navigator,'webdriver',{get:()=>undefined})}catch(e){}})();"
 
     private const val SHADOW_HOOK_JS = """
         (function() {
@@ -198,13 +200,24 @@ object ReelFrenCloudflare {
             for (origin in origins) {
                 for (name in cookieNames) {
                     for (path in listOf("/", "/api")) {
-                        cm.setCookie(origin, "$name=; $expireAttrs; Path=$path; Secure; HttpOnly")
-                        cm.setCookie(origin, "$name=; $expireAttrs; Domain=$host; Path=$path; Secure; HttpOnly")
-                        cm.setCookie(origin, "$name=; $expireAttrs; Domain=.$host; Path=$path; Secure; HttpOnly")
-                        cm.setCookie(origin, "$name=; $expireAttrs; Path=$path; Secure")
-                        cm.setCookie(origin, "$name=; $expireAttrs; Domain=$host; Path=$path; Secure")
-                        cm.setCookie(origin, "$name=; $expireAttrs; Domain=.$host; Path=$path; Secure")
-                        cm.setCookie(origin, "$name=; $expireAttrs; Path=$path")
+                        val attrsList = listOf(
+                            "$expireAttrs; Path=$path; Secure; HttpOnly",
+                            "$expireAttrs; Domain=$host; Path=$path; Secure; HttpOnly",
+                            "$expireAttrs; Domain=.$host; Path=$path; Secure; HttpOnly",
+                            "$expireAttrs; Path=$path; Secure; HttpOnly; Partitioned",
+                            "$expireAttrs; Domain=$host; Path=$path; Secure; HttpOnly; Partitioned",
+                            "$expireAttrs; Domain=.$host; Path=$path; Secure; HttpOnly; Partitioned",
+                            "$expireAttrs; Path=$path; Secure",
+                            "$expireAttrs; Domain=$host; Path=$path; Secure",
+                            "$expireAttrs; Domain=.$host; Path=$path; Secure",
+                            "$expireAttrs; Path=$path; Secure; Partitioned",
+                            "$expireAttrs; Domain=$host; Path=$path; Secure; Partitioned",
+                            "$expireAttrs; Domain=.$host; Path=$path; Secure; Partitioned",
+                            "$expireAttrs; Path=$path"
+                        )
+                        for (attrs in attrsList) {
+                            cm.setCookie(origin, "$name=; $attrs")
+                        }
                     }
                 }
             }
@@ -300,72 +313,74 @@ object ReelFrenCloudflare {
         val act = activity() ?: return null
         if (act.isFinishing || act.isDestroyed) return null
         
-        return suspendCancellableCoroutine { cont ->
-            val handler = Handler(Looper.getMainLooper())
-            val done = AtomicBoolean(false)
-            val decor = act.window?.decorView as? ViewGroup
-            
-            if (decor == null) {
-                if (cont.isActive) cont.resume(null)
-                return@suspendCancellableCoroutine
-            }
-            
-            val container = object : FrameLayout(act) {
-                override fun dispatchTouchEvent(ev: MotionEvent?): Boolean = false
-            }.apply {
-                layoutParams = ViewGroup.LayoutParams(380, 680)
-                alpha = 0.01f
-                isClickable = false
-                isFocusable = false
-                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
-            }
-
-            val web = WebView(act).apply {
-                layoutParams = FrameLayout.LayoutParams(380, 680)
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    userAgentString = ReelFrenStore.userAgent(hostOf(url))
+        return withContext(Dispatchers.Main) {
+            suspendCancellableCoroutine { cont ->
+                val handler = Handler(Looper.getMainLooper())
+                val done = AtomicBoolean(false)
+                val decor = act.window?.decorView as? ViewGroup
+                
+                if (decor == null) {
+                    if (cont.isActive) cont.resume(null)
+                    return@suspendCancellableCoroutine
                 }
-            }
-            
-            fun finish(result: String?) {
-                if (!done.compareAndSet(false, true)) return
-                handler.removeCallbacksAndMessages(null)
-                runCatching { web.stopLoading() }
-                runCatching { web.loadUrl("about:blank") }
-                runCatching { container.removeView(web) }
-                runCatching { decor.removeView(container) }
-                runCatching { web.destroy() }
-                if (cont.isActive) cont.resume(result)
-            }
-            
-            web.webViewClient = object : WebViewClient() {
-                override fun onReceivedSslError(view: WebView?, sslHandler: SslErrorHandler?, error: SslError?) {
-                    handleSslError(hostOf(url), sslHandler, error)
+                
+                val container = object : FrameLayout(act) {
+                    override fun dispatchTouchEvent(ev: MotionEvent?): Boolean = false
+                }.apply {
+                    layoutParams = ViewGroup.LayoutParams(380, 680)
+                    alpha = 0.01f
+                    isClickable = false
+                    isFocusable = false
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
                 }
 
-                override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                    if (done.get() || loadedUrl == "about:blank") return
-                    view?.evaluateJavascript("(function(){ return document.body ? (document.body.innerText || document.body.textContent || '') : ''; })();") { res ->
-                        if (done.get()) return@evaluateJavascript
-                        val jsonText = runCatching {
-                            org.json.JSONTokener(res ?: "").nextValue() as? String
-                        }.getOrNull()?.trim().orEmpty()
-                        if (jsonText.startsWith("{") || jsonText.startsWith("[")) {
-                            finish(jsonText)
-                        } else {
-                            finish(null)
+                val web = WebView(act).apply {
+                    layoutParams = FrameLayout.LayoutParams(380, 680)
+                    settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        userAgentString = ReelFrenStore.userAgent(hostOf(url))
+                    }
+                }
+                
+                fun finish(result: String?) {
+                    if (!done.compareAndSet(false, true)) return
+                    handler.removeCallbacksAndMessages(null)
+                    runCatching { web.stopLoading() }
+                    runCatching { web.loadUrl("about:blank") }
+                    runCatching { container.removeView(web) }
+                    runCatching { decor.removeView(container) }
+                    runCatching { web.destroy() }
+                    if (cont.isActive) cont.resume(result)
+                }
+                
+                web.webViewClient = object : WebViewClient() {
+                    override fun onReceivedSslError(view: WebView?, sslHandler: SslErrorHandler?, error: SslError?) {
+                        handleSslError(hostOf(url), sslHandler, error)
+                    }
+
+                    override fun onPageFinished(view: WebView?, loadedUrl: String?) {
+                        if (done.get() || loadedUrl == "about:blank") return
+                        view?.evaluateJavascript("(function(){ return document.body ? (document.body.innerText || document.body.textContent || '') : ''; })();") { res ->
+                            if (done.get()) return@evaluateJavascript
+                            val jsonText = runCatching {
+                                org.json.JSONTokener(res ?: "").nextValue() as? String
+                            }.getOrNull()?.trim().orEmpty()
+                            if (jsonText.startsWith("{") || jsonText.startsWith("[")) {
+                                finish(jsonText)
+                            } else {
+                                finish(null)
+                            }
                         }
                     }
                 }
+                
+                cont.invokeOnCancellation { finish(null) }
+                handler.postDelayed({ finish(null) }, 25_000L)
+                
+                decor.addView(container)
+                web.loadUrl(url)
             }
-            
-            cont.invokeOnCancellation { finish(null) }
-            handler.postDelayed({ finish(null) }, 25_000L)
-            
-            decor.addView(container)
-            web.loadUrl(url)
         }
     }
 
