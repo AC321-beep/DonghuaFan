@@ -511,6 +511,7 @@ object ReelFrenStore {
     private fun key(type: String, host: String) = "${type}_$host"
 }
 
+// ── Quality & Stream Format Mapping ──────────────────────────────────────────
 object ReelFrenQuality {
     private val heavy = Regex("(?i)\\b(h\\.?26[56]|hevc|x\\.?26[56]|av1)\\b")
     private val resRegex = Regex("(?i)(\\d{3,4})\\s*p\\b")
@@ -550,6 +551,7 @@ object ReelFrenQuality {
     }
 }
 
+// ── URL Parsing ──────────────────────────────────────────────────────────────
 object ReelFrenUrl {
     private val pathRegex = Regex("/(?:drama|watch)/([^/?#|]+)/([^/?#|]+)")
     private val epRegex = Regex("[?&]ep=(\\d+)")
@@ -580,6 +582,7 @@ object ReelFrenUrl {
     }
 }
 
+// ── HTTP Client ──────────────────────────────────────────────────────────────
 object ReelFrenClient {
 
     const val FALLBACK_UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 " +
@@ -661,8 +664,9 @@ object ReelFrenClient {
             }
         }
 
+        ReelFrenLog.d("Client.get", "Attempting WebView intercept fetch for: $url")
         var jsonText = try {
-            ReelFrenCloudflare.fetchViaWebViewAsPage(url)
+            ReelFrenCloudflare.fetchViaWebViewIntercept(url)
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
@@ -679,6 +683,8 @@ object ReelFrenClient {
         ReelFrenLog.d("Client.get", "Challenge detected on $url")
         
         val initialCookie = ReelFrenStore.cookie(targetHost)
+        // Solve on the root site so Cloudflare sets the cf_clearance at the root path, 
+        // avoiding path-locked clearance tokens.
         val solveUrl = ReelFrenConfig.REEL_SITE
         val solved = ReelFrenCloudflare.solve(solveUrl, invalidatedCookie = initialCookie)
         
@@ -688,7 +694,7 @@ object ReelFrenClient {
         }
 
         jsonText = try {
-            ReelFrenCloudflare.fetchViaWebViewAsPage(url)
+            ReelFrenCloudflare.fetchViaWebViewIntercept(url)
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
@@ -699,7 +705,7 @@ object ReelFrenClient {
         val isStillChallenged = jsonText.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(200, null, jsonText)
         
         if (isStillChallenged) {
-            ReelFrenLog.d("Client.get", "WebView fetch failed even after solve. Forcing interactive dialog.")
+            ReelFrenLog.d("Client.get", "WebView intercept fetch failed even after solve. Forcing interactive dialog.")
             
             val forcedInteractiveSolved = ReelFrenCloudflare.solve(
                 solveUrl,
@@ -710,7 +716,7 @@ object ReelFrenClient {
             if (!forcedInteractiveSolved) return null
             
             jsonText = try {
-                ReelFrenCloudflare.fetchViaWebViewAsPage(url)
+                ReelFrenCloudflare.fetchViaWebViewIntercept(url)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
