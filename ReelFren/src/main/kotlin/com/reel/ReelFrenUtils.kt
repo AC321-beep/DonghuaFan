@@ -13,6 +13,7 @@ import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
+// ── Unified Logger ───────────────────────────────────────────────────────────
 object ReelFrenLog {
     private const val TAG = "ReelFren/CF"
     fun d(scope: String, msg: String) {
@@ -23,6 +24,7 @@ object ReelFrenLog {
     }
 }
 
+// ── Models ───────────────────────────────────────────────────────────────────
 data class DetailInfo(
     val id: String, val provider: String, val title: String,
     val cover: String, val intro: String, val episodes: Int,
@@ -41,6 +43,7 @@ data class QualityEntry(val label: String, val url: String, val format: String)
 data class SubtitleEntry(val label: String, val lang: String, val url: String)
 data class VideoEntry(val episode: Int, val duration: Int, val vid: String, val available: Boolean)
 
+// ── Config & Provider Registry ───────────────────────────────────────────────
 object ReelFrenConfig {
     const val REEL_SITE = "https://reelfren.net"
     const val DEFAULT_API_BASE = "https://reelfren.net"
@@ -109,6 +112,7 @@ object ReelFrenConfig {
     )
 }
 
+// ── JSON Parser ──────────────────────────────────────────────────────────────
 object ReelFrenParse {
 
     private val SUB_ARRAY_KEYS = arrayOf(
@@ -375,6 +379,7 @@ object ReelFrenParse {
     }
 }
 
+// ── Unified Persistence & State ──────────────────────────────────────────────
 object ReelFrenStore {
     @Volatile var appContext: Context? = null
         private set
