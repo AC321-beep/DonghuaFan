@@ -307,13 +307,13 @@ object ReelFrenCloudflare {
         }
     }
 
-    suspend fun fetchViaWebViewAsPage(url: String): String? {
+    suspend fun fetchViaWebViewIntercept(url: String): String? {
         val act = activity() ?: run {
-            ReelFrenLog.d("CF/webview-page", "activity null")
+            ReelFrenLog.d("CF/webview-intercept", "activity null")
             return null
         }
         if (act.isFinishing || act.isDestroyed) {
-            ReelFrenLog.d("CF/webview-page", "activity finishing/destroyed")
+            ReelFrenLog.d("CF/webview-intercept", "activity finishing/destroyed")
             return null
         }
         
@@ -324,7 +324,7 @@ object ReelFrenCloudflare {
                 val decor = act.window?.decorView as? ViewGroup
                 
                 if (decor == null) {
-                    ReelFrenLog.d("CF/webview-page", "decor null")
+                    ReelFrenLog.d("CF/webview-intercept", "decor null")
                     if (cont.isActive) cont.resume(null)
                     return@suspendCancellableCoroutine
                 }
@@ -348,6 +348,8 @@ object ReelFrenCloudflare {
                     }
                 }
                 
+                var interceptedJson: String? = null
+
                 fun finish(result: String?) {
                     if (!done.compareAndSet(false, true)) return
                     handler.removeCallbacksAndMessages(null)
@@ -364,28 +366,42 @@ object ReelFrenCloudflare {
                         handleSslError(hostOf(url), sslHandler, error)
                     }
 
+                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                        val reqUrl = request?.url?.toString() ?: return super.shouldInterceptRequest(view, request)
+                        
+                        // Only intercept the specific API URL we are trying to fetch
+                        if (reqUrl == url) {
+                            try {
+                                // Execute the network call directly from within the WebView's context via OkHttp 
+                                // using the cookies that the WebView's CookieManager holds.
+                                // BUT wait, OkHttp triggers the JA3 mismatch!
+                                // Instead, we let the WebView make the request natively, but intercept the result.
+                                // Android doesn't let us read the body in shouldInterceptRequest natively.
+                            } catch (e: Exception) {
+                                ReelFrenLog.t("CF/webview-intercept", e)
+                            }
+                        }
+                        return super.shouldInterceptRequest(view, request)
+                    }
+                    
                     override fun onPageFinished(view: WebView?, loadedUrl: String?) {
                         if (done.get() || loadedUrl == "about:blank") return
-                        if (loadedUrl?.contains("/api/") == true) return
                         
-                        val js = """
-                            (function() {
-                                if (window.__rfXhrFired) return;
-                                window.__rfXhrFired = true;
-                                var xhr = new XMLHttpRequest();
-                                xhr.open('GET', '$url', true);
-                                xhr.withCredentials = true;
-                                xhr.setRequestHeader('Accept', 'application/json, text/plain, */*');
-                                xhr.onload = function() {
-                                    window.__rfData = { status: xhr.status, text: xhr.responseText };
-                                };
-                                xhr.onerror = function() {
-                                    window.__rfData = { status: 500, text: '' };
-                                };
-                                xhr.send();
-                            })();
-                        """.trimIndent()
-                        view?.evaluateJavascript(js, null)
+                        // We load the root site, then use a hidden iframe to trigger the API request. 
+                        // Then we read the iframe's content. This mimics native browser navigation perfectly.
+                        if (loadedUrl?.contains("/api/") == false) {
+                            val js = """
+                                (function() {
+                                    if(document.getElementById('rf_api_frame')) return;
+                                    var iframe = document.createElement('iframe');
+                                    iframe.id = 'rf_api_frame';
+                                    iframe.src = '$url';
+                                    iframe.style.display = 'none';
+                                    document.body.appendChild(iframe);
+                                })();
+                            """.trimIndent()
+                            view?.evaluateJavascript(js, null)
+                        }
                     }
                 }
                 
@@ -393,29 +409,32 @@ object ReelFrenCloudflare {
                 val pollRunnable = object : Runnable {
                     override fun run() {
                         if (done.get()) return
-                        web.evaluateJavascript("(function(){ return window.__rfData ? JSON.stringify(window.__rfData) : ''; })();") { res ->
+                        // Poll the contents of the hidden iframe
+                        web.evaluateJavascript("""
+                            (function(){ 
+                                var frame = document.getElementById('rf_api_frame');
+                                if (!frame || !frame.contentDocument || !frame.contentDocument.body) return '';
+                                return frame.contentDocument.body.innerText || frame.contentDocument.body.textContent || ''; 
+                            })();
+                        """.trimIndent()) { res ->
                             if (done.get()) return@evaluateJavascript
                             val raw = runCatching { org.json.JSONTokener(res ?: "").nextValue() as? String }.getOrNull()?.trim().orEmpty()
                             
                             if (raw.isNotEmpty()) {
-                                val obj = runCatching { org.json.JSONObject(raw) }.getOrNull()
-                                if (obj != null) {
-                                    val status = obj.optInt("status", 0)
-                                    val text = obj.optString("text", "")
-                                    ReelFrenLog.d("CF/webview-page", "XHR status=$status len=${text.length}")
-                                    
-                                    if (status in 200..299 && (text.startsWith("{") || text.startsWith("["))) {
-                                        finish(text)
-                                    } else {
-                                        finish(null)
-                                    }
+                                ReelFrenLog.d("CF/webview-intercept", "Iframe load successful, len=${raw.length}")
+                                if (raw.startsWith("{") || raw.startsWith("[")) {
+                                    finish(raw)
+                                    return@evaluateJavascript
+                                } else if (isChallengeResponse(200, null, raw)) {
+                                    ReelFrenLog.d("CF/webview-intercept", "Iframe hit CF challenge")
+                                    finish(null)
                                     return@evaluateJavascript
                                 }
                             }
                         }
                         
                         if (SystemClock.uptimeMillis() - startMs >= 25_000L) {
-                            ReelFrenLog.d("CF/webview-page", "XHR polling timed out")
+                            ReelFrenLog.d("CF/webview-intercept", "Iframe polling timed out")
                             finish(null)
                             return
                         }
@@ -424,8 +443,9 @@ object ReelFrenCloudflare {
                 }
                 
                 cont.invokeOnCancellation { finish(null) }
-                ReelFrenLog.d("CF/webview-page", "loading site root, will XHR $url after")
+                ReelFrenLog.d("CF/webview-intercept", "Loading root site to inject API iframe")
                 decor.addView(container)
+                // Load the root site. The onPageFinished will inject the API iframe.
                 web.loadUrl(ReelFrenConfig.REEL_SITE)
                 handler.postDelayed(pollRunnable, 1_500L)
             }
