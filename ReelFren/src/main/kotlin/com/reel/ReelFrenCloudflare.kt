@@ -362,7 +362,7 @@ object ReelFrenCloudflare {
             }
             
             cont.invokeOnCancellation { finish(null) }
-            handler.postDelayed({ finish(null) }, 10_000L)
+            handler.postDelayed({ finish(null) }, 25_000L)
             
             decor.addView(container)
             web.loadUrl(url)
