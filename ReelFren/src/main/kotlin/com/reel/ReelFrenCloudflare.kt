@@ -85,8 +85,6 @@ object ReelFrenCfState {
 object ReelFrenCloudflare {
 
     private val clearanceRegex = Regex("(?:^|;\\s*)cf_clearance=([^;]+)")
-    private const val WEBDRIVER_PATCH_JS =
-        "(function(){try{Object.defineProperty(navigator,'webdriver',{get:()=>undefined})}catch(e){}})();"
 
     private const val SHADOW_HOOK_JS = """
         (function() {
@@ -504,7 +502,6 @@ object ReelFrenCloudflare {
         return suspendCancellableCoroutine { cont ->
             val done = AtomicBoolean(false)
             val settling = AtomicBoolean(false)
-            var freshTokenCount = 0
             val handler = Handler(Looper.getMainLooper())
             val ua = resolveWebViewUa(activity, host)
             val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
@@ -576,18 +573,7 @@ object ReelFrenCloudflare {
                             handler.postDelayed({ finish(true) }, 800L)
                         }
                         return
-                    } else {
-                        freshTokenCount++
-                        if (freshTokenCount >= 4) {
-                            ReelFrenLog.d("CF/silent", "Forcing success due to stable fresh token despite title='$title'")
-                            if (settling.compareAndSet(false, true)) {
-                                finish(true)
-                            }
-                            return
-                        }
                     }
-                } else {
-                    freshTokenCount = 0
                 }
 
                 if (tick >= 4 && tick % 4 == 0 && isChallengeOrBlankTitle(title)) {
@@ -650,7 +636,6 @@ object ReelFrenCloudflare {
 
                 override fun onPageStarted(view: WebView?, loadedUrl: String?, favicon: Bitmap?) {
                     if (done.get() || loadedUrl == null || loadedUrl == "about:blank") return
-                    mainFrameError = null
                     view?.evaluateJavascript(SHADOW_HOOK_JS, null)
                 }
 
@@ -728,7 +713,6 @@ object ReelFrenCloudflare {
 
         val resolved = AtomicBoolean(false)
         val settling = AtomicBoolean(false)
-        var freshTokenCount = 0
         val handler = Handler(Looper.getMainLooper())
         var webRef: WebView? = null
         var layoutRef: LinearLayout? = null
@@ -811,18 +795,7 @@ object ReelFrenCloudflare {
                             handler.postDelayed({ finish(true) }, 800L)
                         }
                         return
-                    } else {
-                        freshTokenCount++
-                        if (freshTokenCount >= 4) {
-                            ReelFrenLog.d("CF/dialog", "Forcing success due to stable fresh token despite title='$title'")
-                            if (settling.compareAndSet(false, true)) {
-                                finish(true)
-                            }
-                            return
-                        }
                     }
-                } else {
-                    freshTokenCount = 0
                 }
 
                 if (tick >= 4 && tick % 4 == 0 && isChallengeOrBlankTitle(title)) {
