@@ -511,6 +511,7 @@ object ReelFrenStore {
     private fun key(type: String, host: String) = "${type}_$host"
 }
 
+// ── Quality & Stream Format Mapping ──────────────────────────────────────────
 object ReelFrenQuality {
     private val heavy = Regex("(?i)\\b(h\\.?26[56]|hevc|x\\.?26[56]|av1)\\b")
     private val resRegex = Regex("(?i)(\\d{3,4})\\s*p\\b")
@@ -550,6 +551,7 @@ object ReelFrenQuality {
     }
 }
 
+// ── URL Parsing ──────────────────────────────────────────────────────────────
 object ReelFrenUrl {
     private val pathRegex = Regex("/(?:drama|watch)/([^/?#|]+)/([^/?#|]+)")
     private val epRegex = Regex("[?&]ep=(\\d+)")
@@ -580,6 +582,7 @@ object ReelFrenUrl {
     }
 }
 
+// ── HTTP Client ──────────────────────────────────────────────────────────────
 object ReelFrenClient {
 
     const val FALLBACK_UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 " +
@@ -680,9 +683,8 @@ object ReelFrenClient {
         ReelFrenLog.d("Client.get", "Challenge detected on $url")
         
         val initialCookie = ReelFrenStore.cookie(targetHost)
-        // MUST solve on the root site so Turnstile functions correctly and sets domain-scoped cookies.
-        val solveUrl = ReelFrenConfig.REEL_SITE
-        val solved = ReelFrenCloudflare.solve(solveUrl, invalidatedCookie = initialCookie)
+        // Solve on the specific API URL with injected Accept headers
+        val solved = ReelFrenCloudflare.solve(url, invalidatedCookie = initialCookie)
         
         if (!solved) {
             ReelFrenLog.d("Client.get", "Solve failed (dismissed or timed out). Returning null.")
@@ -704,7 +706,7 @@ object ReelFrenClient {
             ReelFrenLog.d("Client.get", "WebView fetch failed even after solve. Forcing interactive dialog.")
             
             val forcedInteractiveSolved = ReelFrenCloudflare.solve(
-                solveUrl,
+                url,
                 invalidatedCookie = ReelFrenStore.cookie(targetHost),
                 forceInteractive = true
             )
