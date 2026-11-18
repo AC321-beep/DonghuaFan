@@ -366,29 +366,72 @@ object ReelFrenCloudflare {
 
                     override fun onPageFinished(view: WebView?, loadedUrl: String?) {
                         if (done.get() || loadedUrl == "about:blank") return
-                        view?.evaluateJavascript("(function(){ return document.body ? (document.body.innerText || document.body.textContent || '') : ''; })();") { res ->
+                        if (loadedUrl?.contains("/api/") == true) return
+                        
+                        val js = """
+                            (function() {
+                                if (window.__rfXhrFired) return;
+                                window.__rfXhrFired = true;
+                                var xhr = new XMLHttpRequest();
+                                xhr.open('GET', '$url', true);
+                                xhr.withCredentials = true;
+                                xhr.setRequestHeader('Accept', 'application/json, text/plain, */*');
+                                xhr.onload = function() {
+                                    window.__rfData = { status: xhr.status, text: xhr.responseText };
+                                };
+                                xhr.onerror = function() {
+                                    window.__rfData = { status: 500, text: '' };
+                                };
+                                xhr.send();
+                            })();
+                        """.trimIndent()
+                        view?.evaluateJavascript(js, null)
+                    }
+                }
+                
+                val startMs = SystemClock.uptimeMillis()
+                val pollRunnable = object : Runnable {
+                    override fun run() {
+                        if (done.get()) return
+                        web.evaluateJavascript("(function(){ return window.__rfData ? JSON.stringify(window.__rfData) : ''; })();") { res ->
                             if (done.get()) return@evaluateJavascript
-                            val jsonText = runCatching {
-                                org.json.JSONTokener(res ?: "").nextValue() as? String
-                            }.getOrNull()?.trim().orEmpty()
+                            val raw = runCatching { org.json.JSONTokener(res ?: "").nextValue() as? String }.getOrNull()?.trim().orEmpty()
                             
-                            if (jsonText.startsWith("{") || jsonText.startsWith("[")) {
-                                finish(jsonText)
-                            } else {
-                                finish(null)
+                            if (raw.isNotEmpty()) {
+                                val obj = runCatching { org.json.JSONObject(raw) }.getOrNull()
+                                if (obj != null) {
+                                    val status = obj.optInt("status", 0)
+                                    val text = obj.optString("text", "")
+                                    ReelFrenLog.d("CF/webview-page", "XHR status=$status len=${text.length}")
+                                    
+                                    if (status in 200..299 && (text.startsWith("{") || text.startsWith("["))) {
+                                        finish(text)
+                                    } else {
+                                        finish(null)
+                                    }
+                                    return@evaluateJavascript
+                                }
                             }
                         }
+                        
+                        if (SystemClock.uptimeMillis() - startMs >= 25_000L) {
+                            ReelFrenLog.d("CF/webview-page", "XHR polling timed out")
+                            finish(null)
+                            return
+                        }
+                        handler.postDelayed(this, 1_000L)
                     }
                 }
                 
                 cont.invokeOnCancellation { finish(null) }
-                handler.postDelayed({ finish(null) }, 25_000L)
-                
+                ReelFrenLog.d("CF/webview-page", "loading site root, will XHR $url after")
                 decor.addView(container)
-                web.loadUrl(url)
+                web.loadUrl(ReelFrenConfig.REEL_SITE)
+                handler.postDelayed(pollRunnable, 1_500L)
             }
         }
     }
+
 
     fun prewarmIfNeeded() {
         val host = hostOf(ReelFrenConfig.REEL_SITE)
@@ -469,7 +512,7 @@ object ReelFrenCloudflare {
                 }
                 val rejectedTokens = setOf(staleToken, residualCmToken).filter { it.isNotEmpty() }.toSet()
 
-                if (invalidatedCookie != null || forceInteractive) {
+                if (invalidatedCookie != null) {
                     scrubStaleClearance(url, host)
                 }
 
@@ -510,6 +553,7 @@ object ReelFrenCloudflare {
         return suspendCancellableCoroutine { cont ->
             val done = AtomicBoolean(false)
             val settling = AtomicBoolean(false)
+            var freshTokenCount = 0
             val handler = Handler(Looper.getMainLooper())
             val ua = resolveWebViewUa(activity, host)
             val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
@@ -581,7 +625,18 @@ object ReelFrenCloudflare {
                             handler.postDelayed({ finish(true) }, 800L)
                         }
                         return
+                    } else {
+                        freshTokenCount++
+                        if (freshTokenCount >= 4) {
+                            ReelFrenLog.d("CF/silent", "Forcing success due to stable fresh token despite title='$title'")
+                            if (settling.compareAndSet(false, true)) {
+                                finish(true)
+                            }
+                            return
+                        }
                     }
+                } else {
+                    freshTokenCount = 0
                 }
 
                 if (tick >= 4 && tick % 4 == 0 && isChallengeOrBlankTitle(title)) {
@@ -722,6 +777,7 @@ object ReelFrenCloudflare {
 
         val resolved = AtomicBoolean(false)
         val settling = AtomicBoolean(false)
+        var freshTokenCount = 0
         val handler = Handler(Looper.getMainLooper())
         var webRef: WebView? = null
         var layoutRef: LinearLayout? = null
@@ -787,13 +843,31 @@ object ReelFrenCloudflare {
             fun checkAndAutoInteract(tick: Int) {
                 if (resolved.get() || settling.get()) return
 
+                val rawCookie = cookies.getCookie(url) ?: cookies.getCookie("https://$host").orEmpty()
+                val token = extractClearanceToken(rawCookie)
                 val title = wv.title.orEmpty()
-                
-                if (!isChallengeOrBlankTitle(title)) {
-                    if (settling.compareAndSet(false, true)) {
-                        handler.postDelayed({ finish(true) }, 800L)
+                val isFreshToken = token.isNotEmpty() && token !in rejectedTokens
+
+                ReelFrenLog.d("CF/dialog-poll", "tick#$tick title='$title' cookieLen=${rawCookie.length} freshCf=$isFreshToken")
+
+                if (isFreshToken) {
+                    if (!isChallengeOrBlankTitle(title)) {
+                        if (settling.compareAndSet(false, true)) {
+                            handler.postDelayed({ finish(true) }, 800L)
+                        }
+                        return
+                    } else {
+                        freshTokenCount++
+                        if (freshTokenCount >= 4) {
+                            ReelFrenLog.d("CF/dialog", "Forcing success due to stable fresh token despite title='$title'")
+                            if (settling.compareAndSet(false, true)) {
+                                finish(true)
+                            }
+                            return
+                        }
                     }
-                    return
+                } else {
+                    freshTokenCount = 0
                 }
 
                 if (tick >= 4 && tick % 4 == 0 && isChallengeOrBlankTitle(title)) {
