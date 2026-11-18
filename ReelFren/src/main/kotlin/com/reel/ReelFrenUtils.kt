@@ -13,7 +13,6 @@ import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
-// ── Unified Logger ───────────────────────────────────────────────────────────
 object ReelFrenLog {
     private const val TAG = "ReelFren/CF"
     fun d(scope: String, msg: String) {
@@ -24,7 +23,6 @@ object ReelFrenLog {
     }
 }
 
-// ── Models ───────────────────────────────────────────────────────────────────
 data class DetailInfo(
     val id: String, val provider: String, val title: String,
     val cover: String, val intro: String, val episodes: Int,
@@ -43,7 +41,6 @@ data class QualityEntry(val label: String, val url: String, val format: String)
 data class SubtitleEntry(val label: String, val lang: String, val url: String)
 data class VideoEntry(val episode: Int, val duration: Int, val vid: String, val available: Boolean)
 
-// ── Config & Provider Registry ───────────────────────────────────────────────
 object ReelFrenConfig {
     const val REEL_SITE = "https://reelfren.net"
     const val DEFAULT_API_BASE = "https://reelfren.net"
@@ -112,7 +109,6 @@ object ReelFrenConfig {
     )
 }
 
-// ── JSON Parser ──────────────────────────────────────────────────────────────
 object ReelFrenParse {
 
     private val SUB_ARRAY_KEYS = arrayOf(
@@ -379,7 +375,6 @@ object ReelFrenParse {
     }
 }
 
-// ── Unified Persistence & State ──────────────────────────────────────────────
 object ReelFrenStore {
     @Volatile var appContext: Context? = null
         private set
@@ -511,7 +506,6 @@ object ReelFrenStore {
     private fun key(type: String, host: String) = "${type}_$host"
 }
 
-// ── Quality & Stream Format Mapping ──────────────────────────────────────────
 object ReelFrenQuality {
     private val heavy = Regex("(?i)\\b(h\\.?26[56]|hevc|x\\.?26[56]|av1)\\b")
     private val resRegex = Regex("(?i)(\\d{3,4})\\s*p\\b")
@@ -551,7 +545,6 @@ object ReelFrenQuality {
     }
 }
 
-// ── URL Parsing ──────────────────────────────────────────────────────────────
 object ReelFrenUrl {
     private val pathRegex = Regex("/(?:drama|watch)/([^/?#|]+)/([^/?#|]+)")
     private val epRegex = Regex("[?&]ep=(\\d+)")
@@ -582,7 +575,6 @@ object ReelFrenUrl {
     }
 }
 
-// ── HTTP Client ──────────────────────────────────────────────────────────────
 object ReelFrenClient {
 
     const val FALLBACK_UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 " +
@@ -686,13 +678,8 @@ object ReelFrenClient {
         val solved = ReelFrenCloudflare.solve(solveUrl, invalidatedCookie = initialCookie)
         
         if (!solved) {
-            ReelFrenLog.d("Client.get", "Silent solve failed. Forcing interactive dialog.")
-             val interactiveSolved = ReelFrenCloudflare.solve(
-                solveUrl,
-                invalidatedCookie = ReelFrenStore.cookie(targetHost),
-                forceInteractive = true
-            )
-            if (!interactiveSolved) return null
+            ReelFrenLog.d("Client.get", "Solve failed (dismissed or timed out). Returning null.")
+            return null
         }
 
         jsonText = try {
@@ -707,7 +694,7 @@ object ReelFrenClient {
         val isStillChallenged = jsonText.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(200, null, jsonText)
         
         if (isStillChallenged) {
-            ReelFrenLog.d("Client.get", "Failed to retrieve JSON even after solve. Forcing interactive dialog.")
+            ReelFrenLog.d("Client.get", "WebView fetch failed even after solve. Forcing interactive dialog.")
             
             val forcedInteractiveSolved = ReelFrenCloudflare.solve(
                 solveUrl,
@@ -722,11 +709,12 @@ object ReelFrenClient {
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
-                ReelFrenLog.t("Client.get/wvRetryInteractive", e)
+                ReelFrenLog.t("Client.get/wvAfterInteractive", e)
                 null
             }
             
             if (jsonText.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(200, null, jsonText)) {
+                ReelFrenLog.d("Client.get", "Fetch failed after forced interactive. Giving up.")
                 return null
             }
         }
