@@ -308,8 +308,14 @@ object ReelFrenCloudflare {
     }
 
     suspend fun fetchViaWebViewAsPage(url: String): String? {
-        val act = activity() ?: return null
-        if (act.isFinishing || act.isDestroyed) return null
+        val act = activity() ?: run {
+            ReelFrenLog.d("CF/webview-page", "activity null")
+            return null
+        }
+        if (act.isFinishing || act.isDestroyed) {
+            ReelFrenLog.d("CF/webview-page", "activity finishing/destroyed")
+            return null
+        }
         
         return withContext(Dispatchers.Main) {
             suspendCancellableCoroutine { cont ->
@@ -318,6 +324,7 @@ object ReelFrenCloudflare {
                 val decor = act.window?.decorView as? ViewGroup
                 
                 if (decor == null) {
+                    ReelFrenLog.d("CF/webview-page", "decor null")
                     if (cont.isActive) cont.resume(null)
                     return@suspendCancellableCoroutine
                 }
@@ -364,6 +371,7 @@ object ReelFrenCloudflare {
                             val jsonText = runCatching {
                                 org.json.JSONTokener(res ?: "").nextValue() as? String
                             }.getOrNull()?.trim().orEmpty()
+                            
                             if (jsonText.startsWith("{") || jsonText.startsWith("[")) {
                                 finish(jsonText)
                             } else {
@@ -636,6 +644,7 @@ object ReelFrenCloudflare {
 
                 override fun onPageStarted(view: WebView?, loadedUrl: String?, favicon: Bitmap?) {
                     if (done.get() || loadedUrl == null || loadedUrl == "about:blank") return
+                    mainFrameError = null
                     view?.evaluateJavascript(SHADOW_HOOK_JS, null)
                 }
 
@@ -772,30 +781,19 @@ object ReelFrenCloudflare {
             cookies.setAcceptThirdPartyCookies(wv, true)
 
             fun checkSolved(): Boolean {
-                val rawCookie = cookies.getCookie(url) ?: cookies.getCookie("https://$host").orEmpty()
-                val token = extractClearanceToken(rawCookie)
-                return token.isNotEmpty() &&
-                       token !in rejectedTokens &&
-                       !isChallengeOrBlankTitle(wv.title)
+                return !isChallengeOrBlankTitle(wv.title)
             }
 
             fun checkAndAutoInteract(tick: Int) {
                 if (resolved.get() || settling.get()) return
 
-                val rawCookie = cookies.getCookie(url) ?: cookies.getCookie("https://$host").orEmpty()
-                val token = extractClearanceToken(rawCookie)
                 val title = wv.title.orEmpty()
-                val isFreshToken = token.isNotEmpty() && token !in rejectedTokens
-
-                ReelFrenLog.d("CF/dialog-poll", "tick#$tick title='$title' cookieLen=${rawCookie.length} freshCf=$isFreshToken")
-
-                if (isFreshToken) {
-                    if (!isChallengeOrBlankTitle(title)) {
-                        if (settling.compareAndSet(false, true)) {
-                            handler.postDelayed({ finish(true) }, 800L)
-                        }
-                        return
+                
+                if (!isChallengeOrBlankTitle(title)) {
+                    if (settling.compareAndSet(false, true)) {
+                        handler.postDelayed({ finish(true) }, 800L)
                     }
+                    return
                 }
 
                 if (tick >= 4 && tick % 4 == 0 && isChallengeOrBlankTitle(title)) {
