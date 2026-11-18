@@ -17,10 +17,10 @@ import java.util.concurrent.ConcurrentHashMap
 object ReelFrenLog {
     private const val TAG = "ReelFren/CF"
     fun d(scope: String, msg: String) {
-        Log.e(TAG, "[$scope][${Thread.currentThread().name}]$msg")
+        Log.e(TAG, "[$scope][${Thread.currentThread().name}] $msg")
     }
     fun t(scope: String, e: Throwable) {
-        Log.e(TAG, "[$scope][${Thread.currentThread().name}] ${e.javaClass.simpleName}:${e.message}", e)
+        Log.e(TAG, "[$scope][${Thread.currentThread().name}] ${e.javaClass.simpleName}: ${e.message}", e)
     }
 }
 
@@ -132,6 +132,10 @@ object ReelFrenParse {
     )
 
     fun homeItems(body: String): List<HomeItem> {
+        if (body.isBlank()) {
+            ReelFrenLog.d("Parse.homeItems", "Empty response body (len=0)")
+            return emptyList()
+        }
         val root = runCatching { JSONObject(body) }.getOrNull() ?: run {
             ReelFrenLog.d("Parse.homeItems", "Invalid JSON (len=${body.length})")
             return emptyList()
@@ -149,7 +153,7 @@ object ReelFrenParse {
             ?: root.optJSONArray("items")
             ?: root.optJSONArray("list")
             ?: run {
-                ReelFrenLog.d("Parse.homeItems", "No items array (len=${body.length}):${body.take(180)}")
+                ReelFrenLog.d("Parse.homeItems", "No items array (len=${body.length}): ${body.take(180)}")
                 return emptyList()
             }
 
@@ -170,6 +174,7 @@ object ReelFrenParse {
     }
 
     fun detail(body: String): DetailInfo? {
+        if (body.isBlank()) return null
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
         val o = root.optJSONObject("detail") ?: root.optJSONObject("data") ?: root
         val id = clean(o, "id")
@@ -200,6 +205,7 @@ object ReelFrenParse {
     }
 
     fun playback(body: String): PlaybackInfo? {
+        if (body.isBlank()) return null
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
         val o = root.optJSONObject("data") ?: root.optJSONObject("playback") ?: root
 
@@ -244,7 +250,7 @@ object ReelFrenParse {
             totalEpisodes = o.optInt("totalEpisodes", 1),
             locked = o.optBoolean("locked"),
             qualities = qualities,
-            subtitles = dedupedSubs,
+            subtitles = subs,
             server = clean(o, "sourceServer").ifEmpty { "1" }
         )
     }
@@ -416,11 +422,8 @@ object ReelFrenStore {
 
     fun providerPrefsEditor(): SharedPreferences.Editor? = providerPrefs?.edit()
 
-    fun enabledProviders(): Map<String, String> {
-        return ReelFrenConfig.PROVIDERS_MAP.filter { (_, slug) ->
-            isProviderEnabled(slug)
-        }.ifEmpty { ReelFrenConfig.PROVIDERS_MAP }
-    }
+    fun enabledProviders(): Map<String, String> =
+        ReelFrenConfig.PROVIDERS_MAP.filter { (_, slug) -> isProviderEnabled(slug) }
 
     fun apiBase(): String {
         val raw = storePrefs?.getString("api_base", ReelFrenConfig.DEFAULT_API_BASE).orEmpty()
@@ -476,7 +479,7 @@ object ReelFrenStore {
     }
 
     fun setUserAgent(host: String, ua: String) {
-        if (host.isBlank() || ua.isBlank()) return
+        if (host.isBlank()) return
         val norm = host.lowercase(Locale.ROOT)
         val cleaned = normalizeUa(ua)
         memoryUa[norm] = cleaned
@@ -595,7 +598,6 @@ object ReelFrenClient {
 
     fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
         val p = mutableListOf<String>()
-        
         val isGlobal = slug == "all_dramas"
         
         if (!isGlobal && slug.isNotEmpty()) {
@@ -607,7 +609,7 @@ object ReelFrenClient {
         if (category.isNotEmpty()) p += "category=${query(category)}"
         
         val off = page - 1
-        if (off > 0) p += "offset=$off"
+        p += "offset=$off"
         
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
@@ -652,7 +654,7 @@ object ReelFrenClient {
         val initialCookie = ReelFrenStore.cookie(targetHost)
 
         val firstResp = try {
-            app.get(url, headers = headers(url), timeout = 20L)
+            app.get(url, headers = headers(url), timeout = 25L, cacheTime = 0)
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
@@ -665,7 +667,7 @@ object ReelFrenClient {
             return null
         }
 
-        if (!ReelFrenCloudflare.isChallengeResponse(firstResp.code, firstResp.headers, firstResp.text)) {
+        if (firstResp.text.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(firstResp.code, firstResp.headers, firstResp.text)) {
             return firstResp.text
         }
 
@@ -674,13 +676,13 @@ object ReelFrenClient {
         val latestCookie = ReelFrenStore.cookie(targetHost)
         if (latestCookie.isNotBlank() && latestCookie != initialCookie && latestCookie.contains("cf_clearance")) {
             val quickRetry = try {
-                app.get(url, headers = headers(url), timeout = 20L)
+                app.get(url, headers = headers(url), timeout = 25L, cacheTime = 0)
             } catch (ce: CancellationException) {
                 throw ce
             } catch (_: Exception) {
                 null
             }
-            if (quickRetry != null && !ReelFrenCloudflare.isChallengeResponse(quickRetry.code, quickRetry.headers, quickRetry.text)) {
+            if (quickRetry != null && quickRetry.text.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(quickRetry.code, quickRetry.headers, quickRetry.text)) {
                 return quickRetry.text
             }
         }
@@ -688,18 +690,25 @@ object ReelFrenClient {
         val solveUrl = if (isSiteDomain(targetHost)) ReelFrenConfig.REEL_SITE else url
 
         val solved = ReelFrenCloudflare.solve(solveUrl, invalidatedCookie = initialCookie)
-        if (!solved) return null
+        if (!solved) {
+            ReelFrenLog.d("Client.get", "Solve failed/timed out, but proceeding to try fetching anyway")
+        }
 
-        val retryResp = try {
-            app.get(url, headers = headers(url), timeout = 20L)
+        val retryRespText = try {
+            val wvRes = ReelFrenCloudflare.fetchViaWebViewAsPage(url)
+            if (wvRes != null && wvRes.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(200, null, wvRes)) {
+                wvRes
+            } else {
+                app.get(url, headers = headers(url), timeout = 25L, cacheTime = 0).text
+            }
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
             ReelFrenLog.t("Client.get/retry", e)
-            return null
+            "" 
         }
 
-        if (ReelFrenCloudflare.isChallengeResponse(retryResp.code, retryResp.headers, retryResp.text)) {
+        if (retryRespText.isEmpty() || ReelFrenCloudflare.isChallengeResponse(200, null, retryRespText)) {
             ReelFrenLog.d("Client.get", "Still challenged after solve -> forcing interactive dialog")
             val interactiveSolved = ReelFrenCloudflare.solve(
                 solveUrl,
@@ -708,21 +717,27 @@ object ReelFrenClient {
             )
             if (!interactiveSolved) return null
 
-            val finalResp = try {
-                app.get(url, headers = headers(url), timeout = 20L)
+            val finalRespText = try {
+                val wvFinalRes = ReelFrenCloudflare.fetchViaWebViewAsPage(url)
+                if (wvFinalRes != null && wvFinalRes.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(200, null, wvFinalRes)) {
+                    wvFinalRes
+                } else {
+                    app.get(url, headers = headers(url), timeout = 25L, cacheTime = 0).text
+                }
             } catch (ce: CancellationException) {
                 throw ce
             } catch (_: Exception) {
                 return null
             }
-            return if (ReelFrenCloudflare.isChallengeResponse(finalResp.code, finalResp.headers, finalResp.text)) {
+            
+            return if (finalRespText.isEmpty() || ReelFrenCloudflare.isChallengeResponse(200, null, finalRespText)) {
                 null
             } else {
-                finalResp.text
+                finalRespText
             }
         }
 
-        return retryResp.text
+        return retryRespText
     }
 
     suspend fun home(slug: String, category: String = "", page: Int = 1): List<HomeItem> =
