@@ -13,7 +13,6 @@ import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
-// ── Unified Logger ───────────────────────────────────────────────────────────
 object ReelFrenLog {
     private const val TAG = "ReelFren/CF"
     fun d(scope: String, msg: String) {
@@ -24,7 +23,6 @@ object ReelFrenLog {
     }
 }
 
-// ── Models ───────────────────────────────────────────────────────────────────
 data class DetailInfo(
     val id: String, val provider: String, val title: String,
     val cover: String, val intro: String, val episodes: Int,
@@ -43,7 +41,6 @@ data class QualityEntry(val label: String, val url: String, val format: String)
 data class SubtitleEntry(val label: String, val lang: String, val url: String)
 data class VideoEntry(val episode: Int, val duration: Int, val vid: String, val available: Boolean)
 
-// ── Config & Provider Registry ───────────────────────────────────────────────
 object ReelFrenConfig {
     const val REEL_SITE = "https://reelfren.net"
     const val DEFAULT_API_BASE = "https://reelfren.net"
@@ -112,7 +109,6 @@ object ReelFrenConfig {
     )
 }
 
-// ── JSON Parser ──────────────────────────────────────────────────────────────
 object ReelFrenParse {
 
     private val SUB_ARRAY_KEYS = arrayOf(
@@ -142,7 +138,7 @@ object ReelFrenParse {
         }
         val status = root.optInt("status", 200)
         if (status >= 400 || root.has("error")) {
-            ReelFrenLog.d("Parse.homeItems", "Upstream API error (status=$status, title='${root.optString("title")}', body='${body.take(200)}')")
+            ReelFrenLog.d("Parse.homeItems", "Upstream API error (status=$status, title='${root.optString("title")}')")
             return emptyList()
         }
         val dataObj = root.optJSONObject("data")
@@ -250,7 +246,7 @@ object ReelFrenParse {
             totalEpisodes = o.optInt("totalEpisodes", 1),
             locked = o.optBoolean("locked"),
             qualities = qualities,
-            subtitles = subs,
+            subtitles = dedupedSubs,
             server = clean(o, "sourceServer").ifEmpty { "1" }
         )
     }
@@ -379,7 +375,6 @@ object ReelFrenParse {
     }
 }
 
-// ── Unified Persistence & State ──────────────────────────────────────────────
 object ReelFrenStore {
     @Volatile var appContext: Context? = null
         private set
@@ -511,7 +506,6 @@ object ReelFrenStore {
     private fun key(type: String, host: String) = "${type}_$host"
 }
 
-// ── Quality & Stream Format Mapping ──────────────────────────────────────────
 object ReelFrenQuality {
     private val heavy = Regex("(?i)\\b(h\\.?26[56]|hevc|x\\.?26[56]|av1)\\b")
     private val resRegex = Regex("(?i)(\\d{3,4})\\s*p\\b")
@@ -551,7 +545,6 @@ object ReelFrenQuality {
     }
 }
 
-// ── URL Parsing ──────────────────────────────────────────────────────────────
 object ReelFrenUrl {
     private val pathRegex = Regex("/(?:drama|watch)/([^/?#|]+)/([^/?#|]+)")
     private val epRegex = Regex("[?&]ep=(\\d+)")
@@ -582,7 +575,6 @@ object ReelFrenUrl {
     }
 }
 
-// ── HTTP Client ──────────────────────────────────────────────────────────────
 object ReelFrenClient {
 
     const val FALLBACK_UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 " +
@@ -609,7 +601,7 @@ object ReelFrenClient {
         if (category.isNotEmpty()) p += "category=${query(category)}"
         
         val off = page - 1
-        p += "offset=$off"
+        if (off > 0) p += "offset=$off"
         
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
@@ -709,6 +701,13 @@ object ReelFrenClient {
         }
 
         if (retryRespText.isEmpty() || ReelFrenCloudflare.isChallengeResponse(200, null, retryRespText)) {
+            val freshToken = ReelFrenCloudflare.extractClearanceToken(ReelFrenStore.cookie(targetHost))
+            val initialToken = ReelFrenCloudflare.extractClearanceToken(initialCookie)
+            if (freshToken.isNotEmpty() && freshToken != initialToken) {
+                ReelFrenLog.d("Client.get", "Fresh cookie present but request failed — returning null without forcing dialog")
+                return null
+            }
+            
             ReelFrenLog.d("Client.get", "Still challenged after solve -> forcing interactive dialog")
             val interactiveSolved = ReelFrenCloudflare.solve(
                 solveUrl,
