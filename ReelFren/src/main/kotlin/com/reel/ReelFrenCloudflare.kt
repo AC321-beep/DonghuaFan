@@ -397,16 +397,19 @@ object ReelFrenCloudflare {
                 }
                 
                 cont.invokeOnCancellation { finish(null) }
-                
-                // Inject Cache-Control: no-cache to force WebView to reach out to CF, avoiding cache poisoning
-                val headers = mutableMapOf("Cache-Control" to "no-cache")
                 decor.addView(container)
+                
+                // Inject Accept header to bypass Next.js HTML routing, forcing pure JSON
+                val headers = mutableMapOf(
+                    "Accept" to "application/json, text/plain, */*",
+                    "Cache-Control" to "no-cache",
+                    "Referer" to "${ReelFrenConfig.REEL_SITE}/"
+                )
                 web.loadUrl(url, headers)
                 handler.postDelayed(pollRunnable, 1_500L)
             }
         }
     }
-
 
     fun prewarmIfNeeded() {
         val host = hostOf(ReelFrenConfig.REEL_SITE)
@@ -592,77 +595,89 @@ object ReelFrenCloudflare {
                 val title = web.title.orEmpty()
                 val isFreshToken = token.isNotEmpty() && token !in rejectedTokens
 
-                ReelFrenLog.d("CF/silent-poll", "tick#$tick title='$title' cookieLen=${rawCookie.length} freshCf=$isFreshToken")
+                web.evaluateJavascript("(function(){ return document.body ? (document.body.innerText || document.body.textContent || '') : ''; })();") { res ->
+                    if (done.get() || settling.get()) return@evaluateJavascript
+                    
+                    val raw = runCatching { org.json.JSONTokener(res ?: "").nextValue() as? String }.getOrNull()?.trim().orEmpty()
+                    val hasJson = raw.isNotEmpty() && (raw.startsWith("{") || raw.startsWith("["))
+                    val isApiUrl = url.contains("/api/")
+                    
+                    ReelFrenLog.d("CF/silent-poll", "tick#$tick title='$title' cookieLen=${rawCookie.length} freshCf=$isFreshToken hasJson=$hasJson")
 
-                if (isFreshToken) {
-                    if (!isChallengeOrBlankTitle(title)) {
-                        if (settling.compareAndSet(false, true)) {
-                            handler.postDelayed({ finish(true) }, 800L)
-                        }
-                        return
-                    } else {
-                        freshTokenCount++
-                        if (freshTokenCount >= 4) {
-                            ReelFrenLog.d("CF/silent", "Forcing success due to stable fresh token despite title='$title'")
+                    if (isFreshToken) {
+                        // Success only if the API gives us JSON, OR if it's a non-API URL and the title clears
+                        if ((isApiUrl && hasJson) || (!isApiUrl && !isChallengeOrBlankTitle(title))) {
+                            ReelFrenLog.d("CF/silent", "Forcing success due to valid JSON or clean title")
                             if (settling.compareAndSet(false, true)) {
-                                finish(true)
+                                handler.postDelayed({ finish(true) }, 800L)
                             }
-                            return
-                        }
-                    }
-                } else {
-                    freshTokenCount = 0
-                }
-
-                if (tick >= 4 && tick % 4 == 0 && isChallengeOrBlankTitle(title)) {
-                    val locateJs = """
-                        (function() {
-                            var dpr = window.devicePixelRatio || 1;
-                            function toPhys(el, tag) {
-                                if (!el || !el.getBoundingClientRect) return '';
-                                var r = el.getBoundingClientRect();
-                                if (r.width < 180 || r.height < 40) return '';
-                                var px = Math.round((r.left + 28) * dpr);
-                                var py = Math.round((r.top + (r.height / 2)) * dpr);
-                                return px + ',' + py + ',' + tag + '(' + Math.round(r.left) + ',' + Math.round(r.top) + ',' + Math.round(r.width) + 'x' + Math.round(r.height) + ',dpr=' + dpr + ')';
-                            }
-                            if (window.__cfLastShadowRoot) {
-                                var sf = window.__cfLastShadowRoot.querySelector('iframe');
-                                var c1 = toPhys(sf, 'shadow-iframe');
-                                if (c1) return c1;
-                            }
-                            if (window.__cfLastShadowHost) {
-                                var c2 = toPhys(window.__cfLastShadowHost, 'shadow-host');
-                                if (c2) return c2;
-                            }
-                            var sel = 'iframe[src*="challenges.cloudflare.com"], [id^="cf-chl-widget"], #turnstile-wrapper, .cf-turnstile, #challenge-stage, .cb-c';
-                            var c3 = toPhys(document.querySelector(sel), 'selector');
-                            if (c3) return c3;
-
-                            var all = document.querySelectorAll('div, iframe');
-                            for (var i = 0; i < all.length; i++) {
-                                var r = all[i].getBoundingClientRect();
-                                if (r.width >= 240 && r.width <= 360 && r.height >= 50 && r.height <= 85 && r.top >= 40) {
-                                    var c4 = toPhys(all[i], 'geom');
-                                    if (c4) return c4;
-                                }
-                            }
-                            return '';
-                        })();
-                    """.trimIndent()
-                    web.evaluateJavascript(locateJs) { res ->
-                        if (done.get() || settling.get()) return@evaluateJavascript
-                        val raw = res?.trim('"').orEmpty()
-                        if (raw.isEmpty()) {
-                            ReelFrenLog.d("CF/silent-tap", "Turnstile box not rendered yet at tick#$tick")
                             return@evaluateJavascript
+                        } else {
+                            // Watchdog fallback: If we hold a valid token but the DOM won't render JSON, 
+                            // assume Cloudflare passed us but Next.js choked on the route. Proceed anyway.
+                            freshTokenCount++
+                            if (freshTokenCount >= 4) {
+                                ReelFrenLog.d("CF/silent", "Forcing success due to stable fresh token timeout")
+                                if (settling.compareAndSet(false, true)) {
+                                    finish(true)
+                                }
+                                return@evaluateJavascript
+                            }
                         }
-                        val parts = raw.split(",")
-                        val cx = parts.getOrNull(0)?.toFloatOrNull() ?: return@evaluateJavascript
-                        val cy = parts.getOrNull(1)?.toFloatOrNull() ?: return@evaluateJavascript
-                        val info = parts.drop(2).joinToString(",")
-                        ReelFrenLog.d("CF/silent-tap", "Dispatching tap at physical ($cx, $cy) [$info]")
-                        simulateTouchTap(web, handler, cx, cy)
+                    } else {
+                        freshTokenCount = 0
+                    }
+
+                    if (tick >= 4 && tick % 4 == 0 && isChallengeOrBlankTitle(title)) {
+                        val locateJs = """
+                            (function() {
+                                var dpr = window.devicePixelRatio || 1;
+                                function toPhys(el, tag) {
+                                    if (!el || !el.getBoundingClientRect) return '';
+                                    var r = el.getBoundingClientRect();
+                                    if (r.width < 180 || r.height < 40) return '';
+                                    var px = Math.round((r.left + 28) * dpr);
+                                    var py = Math.round((r.top + (r.height / 2)) * dpr);
+                                    return px + ',' + py + ',' + tag + '(' + Math.round(r.left) + ',' + Math.round(r.top) + ',' + Math.round(r.width) + 'x' + Math.round(r.height) + ',dpr=' + dpr + ')';
+                                }
+                                if (window.__cfLastShadowRoot) {
+                                    var sf = window.__cfLastShadowRoot.querySelector('iframe');
+                                    var c1 = toPhys(sf, 'shadow-iframe');
+                                    if (c1) return c1;
+                                }
+                                if (window.__cfLastShadowHost) {
+                                    var c2 = toPhys(window.__cfLastShadowHost, 'shadow-host');
+                                    if (c2) return c2;
+                                }
+                                var sel = 'iframe[src*="challenges.cloudflare.com"], [id^="cf-chl-widget"], #turnstile-wrapper, .cf-turnstile, #challenge-stage, .cb-c';
+                                var c3 = toPhys(document.querySelector(sel), 'selector');
+                                if (c3) return c3;
+    
+                                var all = document.querySelectorAll('div, iframe');
+                                for (var i = 0; i < all.length; i++) {
+                                    var r = all[i].getBoundingClientRect();
+                                    if (r.width >= 240 && r.width <= 360 && r.height >= 50 && r.height <= 85 && r.top >= 40) {
+                                        var c4 = toPhys(all[i], 'geom');
+                                        if (c4) return c4;
+                                    }
+                                }
+                                return '';
+                            })();
+                        """.trimIndent()
+                        web.evaluateJavascript(locateJs) { jsRes ->
+                            if (done.get() || settling.get()) return@evaluateJavascript
+                            val jsRaw = jsRes?.trim('"').orEmpty()
+                            if (jsRaw.isEmpty()) {
+                                ReelFrenLog.d("CF/silent-tap", "Turnstile box not rendered yet at tick#$tick")
+                                return@evaluateJavascript
+                            }
+                            val parts = jsRaw.split(",")
+                            val cx = parts.getOrNull(0)?.toFloatOrNull() ?: return@evaluateJavascript
+                            val cy = parts.getOrNull(1)?.toFloatOrNull() ?: return@evaluateJavascript
+                            val info = parts.drop(2).joinToString(",")
+                            ReelFrenLog.d("CF/silent-tap", "Dispatching tap at physical ($cx, $cy) [$info]")
+                            simulateTouchTap(web, handler, cx, cy)
+                        }
                     }
                 }
             }
@@ -727,12 +742,15 @@ object ReelFrenCloudflare {
             }
 
             cont.invokeOnCancellation { finish(false) }
-
             decor.addView(container)
-            web.onResume()
-            web.resumeTimers()
-            web.onWindowFocusChanged(true)
-            web.loadUrl(url)
+            
+            // Force JSON parsing logic using Accept header
+            val headers = mutableMapOf(
+                "Accept" to "application/json, text/plain, */*",
+                "Cache-Control" to "no-cache",
+                "Referer" to "${ReelFrenConfig.REEL_SITE}/"
+            )
+            web.loadUrl(url, headers)
             handler.postDelayed(pollRunnable, 500L)
         }
     }
@@ -811,10 +829,6 @@ object ReelFrenCloudflare {
             webRef = wv
             cookies.setAcceptThirdPartyCookies(wv, true)
 
-            fun checkSolved(): Boolean {
-                return !isChallengeOrBlankTitle(wv.title)
-            }
-
             fun checkAndAutoInteract(tick: Int) {
                 if (resolved.get() || settling.get()) return
 
@@ -823,73 +837,82 @@ object ReelFrenCloudflare {
                 val title = wv.title.orEmpty()
                 val isFreshToken = token.isNotEmpty() && token !in rejectedTokens
 
-                ReelFrenLog.d("CF/dialog-poll", "tick#$tick title='$title' cookieLen=${rawCookie.length} freshCf=$isFreshToken")
+                wv.evaluateJavascript("(function(){ return document.body ? (document.body.innerText || document.body.textContent || '') : ''; })();") { res ->
+                    if (resolved.get() || settling.get()) return@evaluateJavascript
+                    
+                    val raw = runCatching { org.json.JSONTokener(res ?: "").nextValue() as? String }.getOrNull()?.trim().orEmpty()
+                    val hasJson = raw.isNotEmpty() && (raw.startsWith("{") || raw.startsWith("["))
+                    val isApiUrl = url.contains("/api/")
+                    
+                    ReelFrenLog.d("CF/dialog-poll", "tick#$tick title='$title' cookieLen=${rawCookie.length} freshCf=$isFreshToken hasJson=$hasJson")
 
-                if (isFreshToken) {
-                    if (!isChallengeOrBlankTitle(title)) {
-                        if (settling.compareAndSet(false, true)) {
-                            handler.postDelayed({ finish(true) }, 800L)
-                        }
-                        return
-                    } else {
-                        freshTokenCount++
-                        if (freshTokenCount >= 4) {
-                            ReelFrenLog.d("CF/dialog", "Forcing success due to stable fresh token despite title='$title'")
+                    if (isFreshToken) {
+                        if ((isApiUrl && hasJson) || (!isApiUrl && !isChallengeOrBlankTitle(title))) {
+                            ReelFrenLog.d("CF/dialog", "Forcing success due to valid JSON or clean title")
                             if (settling.compareAndSet(false, true)) {
-                                finish(true)
+                                handler.postDelayed({ finish(true) }, 800L)
                             }
-                            return
-                        }
-                    }
-                } else {
-                    freshTokenCount = 0
-                }
-
-                if (tick >= 4 && tick % 4 == 0 && isChallengeOrBlankTitle(title)) {
-                    val locateJs = """
-                        (function() {
-                            var dpr = window.devicePixelRatio || 1;
-                            function toPhys(el, tag) {
-                                if (!el || !el.getBoundingClientRect) return '';
-                                var r = el.getBoundingClientRect();
-                                if (r.width < 180 || r.height < 40) return '';
-                                var px = Math.round((r.left + 28) * dpr);
-                                var py = Math.round((r.top + (r.height / 2)) * dpr);
-                                return px + ',' + py + ',' + tag + '(' + Math.round(r.left) + ',' + Math.round(r.top) + ',' + Math.round(r.width) + 'x' + Math.round(r.height) + ',dpr=' + dpr + ')';
-                            }
-                            if (window.__cfLastShadowRoot) {
-                                var sf = window.__cfLastShadowRoot.querySelector('iframe');
-                                var c1 = toPhys(sf, 'shadow-iframe');
-                                if (c1) return c1;
-                            }
-                            if (window.__cfLastShadowHost) {
-                                var c2 = toPhys(window.__cfLastShadowHost, 'shadow-host');
-                                if (c2) return c2;
-                            }
-                            var sel = 'iframe[src*="challenges.cloudflare.com"], [id^="cf-chl-widget"], #turnstile-wrapper, .cf-turnstile, #challenge-stage, .cb-c';
-                            var c3 = toPhys(document.querySelector(sel), 'selector');
-                            if (c3) return c3;
-
-                            var all = document.querySelectorAll('div, iframe');
-                            for (var i = 0; i < all.length; i++) {
-                                var r = all[i].getBoundingClientRect();
-                                if (r.width >= 240 && r.width <= 360 && r.height >= 50 && r.height <= 85 && r.top >= 40) {
-                                    var c4 = toPhys(all[i], 'geom');
-                                    if (c4) return c4;
+                            return@evaluateJavascript
+                        } else {
+                            freshTokenCount++
+                            if (freshTokenCount >= 4) {
+                                ReelFrenLog.d("CF/dialog", "Forcing success due to stable fresh token timeout")
+                                if (settling.compareAndSet(false, true)) {
+                                    finish(true)
                                 }
+                                return@evaluateJavascript
                             }
-                            return '';
-                        })();
-                    """.trimIndent()
-                    wv.evaluateJavascript(locateJs) { res ->
-                        if (resolved.get() || settling.get()) return@evaluateJavascript
-                        val raw = res?.trim('"').orEmpty()
-                        if (raw.isEmpty()) return@evaluateJavascript
-                        val parts = raw.split(",")
-                        val cx = parts.getOrNull(0)?.toFloatOrNull() ?: return@evaluateJavascript
-                        val cy = parts.getOrNull(1)?.toFloatOrNull() ?: return@evaluateJavascript
-                        ReelFrenLog.d("CF/dialog-tap", "Dispatching tap at physical ($cx, $cy)")
-                        simulateTouchTap(wv, handler, cx, cy)
+                        }
+                    } else {
+                        freshTokenCount = 0
+                    }
+
+                    if (tick >= 4 && tick % 4 == 0 && isChallengeOrBlankTitle(title)) {
+                        val locateJs = """
+                            (function() {
+                                var dpr = window.devicePixelRatio || 1;
+                                function toPhys(el, tag) {
+                                    if (!el || !el.getBoundingClientRect) return '';
+                                    var r = el.getBoundingClientRect();
+                                    if (r.width < 180 || r.height < 40) return '';
+                                    var px = Math.round((r.left + 28) * dpr);
+                                    var py = Math.round((r.top + (r.height / 2)) * dpr);
+                                    return px + ',' + py + ',' + tag + '(' + Math.round(r.left) + ',' + Math.round(r.top) + ',' + Math.round(r.width) + 'x' + Math.round(r.height) + ',dpr=' + dpr + ')';
+                                }
+                                if (window.__cfLastShadowRoot) {
+                                    var sf = window.__cfLastShadowRoot.querySelector('iframe');
+                                    var c1 = toPhys(sf, 'shadow-iframe');
+                                    if (c1) return c1;
+                                }
+                                if (window.__cfLastShadowHost) {
+                                    var c2 = toPhys(window.__cfLastShadowHost, 'shadow-host');
+                                    if (c2) return c2;
+                                }
+                                var sel = 'iframe[src*="challenges.cloudflare.com"], [id^="cf-chl-widget"], #turnstile-wrapper, .cf-turnstile, #challenge-stage, .cb-c';
+                                var c3 = toPhys(document.querySelector(sel), 'selector');
+                                if (c3) return c3;
+    
+                                var all = document.querySelectorAll('div, iframe');
+                                for (var i = 0; i < all.length; i++) {
+                                    var r = all[i].getBoundingClientRect();
+                                    if (r.width >= 240 && r.width <= 360 && r.height >= 50 && r.height <= 85 && r.top >= 40) {
+                                        var c4 = toPhys(all[i], 'geom');
+                                        if (c4) return c4;
+                                    }
+                                }
+                                return '';
+                            })();
+                        """.trimIndent()
+                        wv.evaluateJavascript(locateJs) { jsRes ->
+                            if (resolved.get() || settling.get()) return@evaluateJavascript
+                            val rawJs = jsRes?.trim('"').orEmpty()
+                            if (rawJs.isEmpty()) return@evaluateJavascript
+                            val parts = rawJs.split(",")
+                            val cx = parts.getOrNull(0)?.toFloatOrNull() ?: return@evaluateJavascript
+                            val cy = parts.getOrNull(1)?.toFloatOrNull() ?: return@evaluateJavascript
+                            ReelFrenLog.d("CF/dialog-tap", "Dispatching tap at physical ($cx, $cy)")
+                            simulateTouchTap(wv, handler, cx, cy)
+                        }
                     }
                 }
             }
@@ -906,9 +929,7 @@ object ReelFrenCloudflare {
 
                 override fun onPageFinished(view: WebView?, loadedUrl: String?) {
                     if (resolved.get() || settling.get() || loadedUrl == "about:blank") return
-                    if (checkSolved() && settling.compareAndSet(false, true)) {
-                        handler.postDelayed({ finish(true) }, 800L)
-                    }
+                    checkAndAutoInteract(0)
                 }
 
                 override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
@@ -937,12 +958,6 @@ object ReelFrenCloudflare {
                 override fun run() {
                     if (resolved.get() || settling.get()) return
                     count++
-                    if (checkSolved()) {
-                        if (settling.compareAndSet(false, true)) {
-                            handler.postDelayed({ finish(true) }, 800L)
-                        }
-                        return
-                    }
                     checkAndAutoInteract(count)
                     if (resolved.get() || settling.get()) return
 
@@ -950,9 +965,13 @@ object ReelFrenCloudflare {
                 }
             }
             handler.postDelayed(watchdog, 1_500L)
-            wv.onResume()
-            wv.resumeTimers()
-            wv.loadUrl(url)
+            
+            val headers = mutableMapOf(
+                "Accept" to "application/json, text/plain, */*",
+                "Cache-Control" to "no-cache",
+                "Referer" to "${ReelFrenConfig.REEL_SITE}/"
+            )
+            wv.loadUrl(url, headers)
         } catch (e: Exception) {
             ReelFrenLog.t("CF/dialog", e)
             finish(false)
