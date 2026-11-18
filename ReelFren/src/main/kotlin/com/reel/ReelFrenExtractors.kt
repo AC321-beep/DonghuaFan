@@ -11,9 +11,6 @@ import kotlinx.coroutines.CancellationException
 import java.net.URI
 import java.util.Locale
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Video link builder
-// ─────────────────────────────────────────────────────────────────────────────
 object ReelFrenDirectLink {
     suspend fun build(q: QualityEntry): ExtractorLink? {
         if (q.url.isEmpty()) return null
@@ -31,20 +28,14 @@ object ReelFrenDirectLink {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Subtitle extractor
-// ─────────────────────────────────────────────────────────────────────────────
 object ReelFrenSubtitles {
 
     private val PLACEHOLDER_VALUES = setOf(
         "", "null", "none", "false", "0", "#", "-", "n/a", "na", "hardcoded", "undefined"
     )
 
-    // Matches all #EXT-X-MEDIA lines, filtering TYPE=SUBTITLES via code
     private val mediaRegex = Regex("""#EXT-X-MEDIA:([^\r\n]*)""", RegexOption.IGNORE_CASE)
     private val typeRegex  = Regex("""TYPE=SUBTITLES""", RegexOption.IGNORE_CASE)
-    
-    // Handles double, single, and unquoted URI/LANGUAGE/NAME variants
     private val uriRegex   = Regex("""URI=(?:"([^"]+)"|'([^']+)'|([^,\s]+))""", RegexOption.IGNORE_CASE)
     private val langRegex  = Regex("""LANGUAGE=(?:"([^"]*)"|'([^']*)'|([^,\s]+))""", RegexOption.IGNORE_CASE)
     private val nameRegex  = Regex("""NAME=(?:"([^"]*)"|'([^']*)'|([^,\s]+))""", RegexOption.IGNORE_CASE)
@@ -56,13 +47,12 @@ object ReelFrenSubtitles {
     ) {
         val seenUrls = mutableSetOf<String>()
 
-        // Pass 1: Explicit subtitle tracks from API
         for (entry in entries) {
             val resolved = resolveUrl(entry.url) ?: continue
             if (!seenUrls.add(resolved)) continue
 
             val displayLabel = resolveDisplayLabel(entry.lang, entry.label)
-            
+
             callback(
                 newSubtitleFile(lang = displayLabel, url = resolved) {
                     this.headers = ReelFrenClient.headers(resolved)
@@ -70,7 +60,6 @@ object ReelFrenSubtitles {
             )
         }
 
-        // Pass 2: Extract from HLS manifests
         val hlsUrls = qualities.filter { isHls(it) }.map { it.url }.distinct()
         for (hlsUrl in hlsUrls) {
             for (sub in extractHlsSubs(hlsUrl)) {
@@ -123,7 +112,7 @@ object ReelFrenSubtitles {
             cleanLabel.isNotEmpty() && !cleanLabel.equals(rawLang.trim(), ignoreCase = true) && cleanLabel.length > 3 -> cleanLabel
             mappedName != "Unknown" -> mappedName
             cleanLabel.isNotEmpty() -> cleanLabel
-            else -> "Unknown" // FIXED: No longer hardcoding to "English"
+            else -> "Unknown"
         }
     }
 
@@ -225,11 +214,6 @@ object ReelFrenSubtitles {
         return result
     }
 
-    /**
-     * Handles HLS subtitle playlists.
-     * If single segment: returns the direct .vtt/.srt URL.
-     * If multi-segment: downloads all chunks and merges them into a base64 data URL so ExoPlayer can read them.
-     */
     private suspend fun resolveSubtitleM3u8ToDirectFile(subM3u8Url: String): String? {
         val subManifest = try {
             app.get(subM3u8Url, headers = ReelFrenClient.headers(subM3u8Url)).text
@@ -251,16 +235,13 @@ object ReelFrenSubtitles {
             return resolveRelativeUrl(subM3u8Url, segments[0]).ifBlank { null }
         }
 
-        // Multi-segment subtitle: download and merge into a single data URL
         val sb = StringBuilder()
         for (seg in segments) {
             val segUrl = resolveRelativeUrl(subM3u8Url, seg)
             try {
                 val chunk = app.get(segUrl, headers = ReelFrenClient.headers(segUrl)).text
                 sb.append(chunk).append("\n")
-            } catch (_: Exception) {
-                // Ignore single chunk failures to salvage the rest
-            }
+            } catch (_: Exception) { }
         }
 
         if (sb.isNotEmpty()) {
@@ -271,9 +252,6 @@ object ReelFrenSubtitles {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Fallback extractor
-// ─────────────────────────────────────────────────────────────────────────────
 class ReelFrenDirectLinkExtractor : ExtractorApi() {
     override val name = "ReelFrenDirect"
     override val mainUrl = ReelFrenConfig.REEL_SITE
@@ -293,6 +271,7 @@ class ReelFrenDirectLinkExtractor : ExtractorApi() {
             url
         }
         val type = ReelFrenQuality.linkType(resolved)
+
         if (resolved.contains(".m3u8", ignoreCase = true)) {
             runCatching {
                 ReelFrenSubtitles.emit(
@@ -302,6 +281,7 @@ class ReelFrenDirectLinkExtractor : ExtractorApi() {
                 )
             }
         }
+
         callback(
             newExtractorLink(name, name, resolved, type) {
                 this.referer = referer ?: "${ReelFrenConfig.REEL_SITE}/"
