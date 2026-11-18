@@ -23,20 +23,17 @@ class Reelfren : MainAPI() {
     override val supportedTypes = setOf(TvType.TvSeries, TvType.Movie, TvType.AsianDrama)
 
     private val seenIds = ConcurrentHashMap<String, MutableSet<String>>()
+    private val dupPageStreak = ConcurrentHashMap<String, Int>()
 
     override val mainPage: List<MainPageData>
         get() {
             val enabled = ReelFrenStore.enabledProviders()
             ReelFrenLog.d("Main/mainPage", "returning ${enabled.size} enabled pages")
-            
-            // Only "All Dramas" as a global tab
-            val globalPages = listOf(
-                "all_dramas" to "All Dramas"
-            )
-            
+
+            val globalPages = listOf("all_dramas" to "All Dramas")
             val providerPages = enabled.map { (display, slug) -> slug to display }
             val allPages = globalPages + providerPages
-            
+
             return mainPageOf(*allPages.toTypedArray())
         }
 
@@ -45,28 +42,56 @@ class Reelfren : MainAPI() {
         ReelFrenLog.d("Main/getMainPage", "ENTRY page=$page slug=$slug name=${request.name}")
         val items = mutableListOf<SearchResponse>()
         var rawCount = 0
+        var hasNext = false
 
         val seen = seenIds.getOrPut(slug) { ConcurrentHashMap.newKeySet() }
-        if (page <= 1) seen.clear()
+        if (page <= 1) {
+            seen.clear()
+            dupPageStreak.remove(slug)
+        }
 
         try {
-            // Default behavior for "All Dramas" and individual providers
             val homeItems = ReelFrenClient.home(slug, page = page)
             rawCount = homeItems.size
             for (item in homeItems) {
-                if (seen.add(item.id)) {
-                    val actualSlug = item.provider.ifEmpty { slug }
-                    toCard(actualSlug, item)?.let { items.add(it) }
+                if (!seen.add(item.id)) continue
+
+                if (slug == "all_dramas" && item.provider.isEmpty()) {
+                    ReelFrenLog.d(
+                        "Main/getMainPage",
+                        "Skip provider-less item in all_dramas: ${item.id} '${item.title}'"
+                    )
+                    continue
                 }
+
+                val actualSlug = item.provider.ifEmpty { slug }
+                toCard(actualSlug, item)?.let { items.add(it) }
             }
-            ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=$rawCount added=${items.size}")
+
+            if (rawCount > 0 && items.isEmpty()) {
+                val streak = (dupPageStreak[slug] ?: 0) + 1
+                dupPageStreak[slug] = streak
+                hasNext = streak < 2
+                ReelFrenLog.d(
+                    "Main/getMainPage",
+                    "slug=$slug all-duplicate page #$streak hasNext=$hasNext"
+                )
+            } else {
+                dupPageStreak.remove(slug)
+                hasNext = rawCount > 0
+            }
+
+            ReelFrenLog.d(
+                "Main/getMainPage",
+                "slug=$slug raw=$rawCount added=${items.size} hasNext=$hasNext"
+            )
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
             ReelFrenLog.t("Main/getMainPage", e)
         }
 
-        return newHomePageResponse(request, items, hasNext = rawCount > 0)
+        return newHomePageResponse(request, items, hasNext = hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse>? {
@@ -157,10 +182,6 @@ class Reelfren : MainAPI() {
         if (slug.isEmpty() || id.isEmpty()) return false
 
         val playback = ReelFrenClient.playback(slug, id, episode) ?: return false
-        ReelFrenLog.d(
-            "Main/loadLinks",
-            "Parsed playback qualities=${playback.qualities.size} rawSubs=${playback.subtitles.size}"
-        )
 
         try {
             ReelFrenSubtitles.emit(
@@ -187,8 +208,7 @@ class Reelfren : MainAPI() {
 
     private fun toCard(slug: String, item: HomeItem): SearchResponse? {
         if (item.id.isEmpty() || item.title.isEmpty()) return null
-        
-        // Use the item's specific provider if it exists (crucial for Global tabs like "All Dramas")
+
         val actualSlug = item.provider.ifEmpty { slug }
         val url = ReelFrenUrl.page(actualSlug, item.id)
         val poster = ReelFrenClient.absUrl(item.cover).ifEmpty { null }
