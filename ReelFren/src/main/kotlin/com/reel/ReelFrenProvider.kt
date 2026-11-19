@@ -1,837 +1,234 @@
 package com.reel
 
-import android.annotation.SuppressLint
-import android.app.Activity
-import android.app.Dialog
-import android.content.Context
-import android.content.ContextWrapper
-import android.graphics.Bitmap
-import android.graphics.Color
-import android.net.http.SslError
-import android.os.Build
-import android.os.Handler
-import android.os.Looper
-import android.os.SystemClock
-import android.view.InputDevice
-import android.view.MotionEvent
-import android.view.View
-import android.view.ViewGroup
-import android.webkit.CookieManager
-import android.webkit.SslErrorHandler
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import android.widget.FrameLayout
-import android.widget.LinearLayout
-import android.widget.TextView
-import com.lagradost.cloudstream3.CommonActivity
-import kotlinx.coroutines.*
-import okhttp3.Headers
-import java.net.URI
-import java.util.Locale
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.ExtractorLink
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.coroutines.resume
 
-class SolveSession(
-    val deferred: CompletableDeferred<Boolean> = CompletableDeferred(),
-    val allowInteractive: AtomicBoolean = AtomicBoolean(false),
-    @Volatile var abortSilent: (() -> Unit)? = null
-)
+class Reelfren : MainAPI() {
 
-object ReelFrenCfState {
-    private val solving = ConcurrentHashMap<String, SolveSession>()
-    val solverScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    override var mainUrl = ReelFrenConfig.REEL_SITE
+    override var name = "ReelFren"
+    override var lang = "en"
+    override val hasMainPage = true
+    override val hasQuickSearch = true
+    override var sequentialMainPage = true
+    override var sequentialMainPageDelay = 120L
+    override val getMainPageTimeoutMs = 240_000L
+    override val supportedTypes = setOf(TvType.TvSeries, TvType.Movie, TvType.AsianDrama)
 
-    fun beginSolve(
-        host: String,
-        interactiveAllowed: Boolean,
-        forceInteractive: Boolean
-    ): Pair<SolveSession, Boolean> {
-        while (true) {
-            val fresh = SolveSession(allowInteractive = AtomicBoolean(interactiveAllowed))
-            val existing = solving.putIfAbsent(host, fresh)
-            if (existing == null) return fresh to true
+    private val seenIds = ConcurrentHashMap<String, MutableSet<String>>()
+    private val dupPageStreak = ConcurrentHashMap<String, Int>()
 
-            if (existing.deferred.isCompleted) {
-                if (solving.replace(host, existing, fresh)) {
-                    return fresh to true
-                }
-                continue
-            }
+    override val mainPage: List<MainPageData>
+        get() {
+            val enabled = ReelFrenStore.enabledProviders()
+            ReelFrenLog.d("Main/mainPage", "returning ${enabled.size} enabled pages")
 
-            if (interactiveAllowed) {
-                existing.allowInteractive.set(true)
-            }
-            if (forceInteractive) {
-                existing.abortSilent?.invoke()
-            }
-            return existing to false
+            val globalPages = listOf("all_dramas" to "All Dramas")
+            val providerPages = enabled.map { (display, slug) -> slug to display }
+            val allPages = globalPages + providerPages
+
+            return mainPageOf(*allPages.toTypedArray())
         }
-    }
 
-    fun completeAndEndSolve(host: String, session: SolveSession, result: Boolean) {
-        solving.remove(host, session)
-        if (!session.deferred.isCompleted) {
-            session.deferred.complete(result)
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
+        val slug = request.data
+        ReelFrenLog.d("Main/getMainPage", "ENTRY page=$page slug=$slug name=${request.name}")
+        val items = mutableListOf<SearchResponse>()
+        var rawCount = 0
+        var hasNext = false
+
+        val seen = seenIds.getOrPut(slug) { ConcurrentHashMap.newKeySet() }
+        if (page <= 1) {
+            seen.clear()
+            dupPageStreak.remove(slug)
         }
-    }
-}
 
-object ReelFrenCloudflare {
-
-    private val clearanceRegex = Regex("(?:^|;\\s*)cf_clearance=([^;]+)")
-
-    private const val SHADOW_HOOK_JS = """
-        (function() {
-            if (!Element.prototype.__cfOrigAttachShadow) {
-                Element.prototype.__cfOrigAttachShadow = Element.prototype.attachShadow;
-                Element.prototype.attachShadow = function(init) {
-                    var sr = this.__cfOrigAttachShadow.call(this, init);
-                    window.__cfLastShadowHost = this;
-                    window.__cfLastShadowRoot = sr;
-                    return sr;
-                };
-            }
-        })();
-    """
-
-    fun hostOf(url: String): String =
-        runCatching { URI(url).host }.getOrNull()?.lowercase(Locale.ROOT) ?: ""
-
-    fun extractClearanceToken(cookieHeader: String?): String =
-        cookieHeader?.let { clearanceRegex.find(it)?.groupValues?.getOrNull(1) }.orEmpty()
-
-    fun isChallengeResponse(code: Int, headers: Headers?, body: String): Boolean {
-        if (headers?.get("cf-mitigated")?.equals("challenge", ignoreCase = true) == true) {
-            return true
-        }
-        val trimmed = body.trimStart()
-        if (code in 200..299 && (trimmed.startsWith("{") || trimmed.startsWith("["))) {
-            return false
-        }
-        if (code == 403 || code == 503) {
-            if (headers?.get("server")?.contains("cloudflare", ignoreCase = true) == true) {
-                return true
-            }
-        }
-        return isChallengeBody(trimmed)
-    }
-
-    fun isChallengeBody(body: String): Boolean {
-        if (body.isEmpty()) return false
-        val firstChar = body[0]
-        if (firstChar == '{' || firstChar == '[') return false
-        val sample = if (body.length > 6000) body.substring(0, 6000) else body
-        val lower = sample.lowercase(Locale.ROOT)
-        return lower.contains("just a moment") ||
-               lower.contains("checking your browser") ||
-               lower.contains("cf-challenge") ||
-               lower.contains("_cf_chl_opt") ||
-               lower.contains("cf-turnstile") ||
-               lower.contains("attention required") ||
-               lower.contains("verify you are human")
-    }
-
-    private fun isChallengeOrBlankTitle(title: String?): Boolean {
-        val t = title?.lowercase(Locale.ROOT)?.trim().orEmpty()
-        return t.isEmpty() ||
-               t == "about:blank" ||
-               t == "loading..." ||
-               t == "loading" ||
-               t.startsWith("loading...") ||
-               t.contains("please wait") ||
-               t.contains("just a moment") ||
-               t.contains("attention required") ||
-               t.contains("checking your browser") ||
-               t.contains("security check") ||
-               t.contains("one more step") ||
-               t.contains("verify you are human") ||
-               t.contains("403 forbidden") ||
-               t.contains("access denied") ||
-               t.contains("webpage not available")
-    }
-
-    private fun activity(): Activity? {
-        CommonActivity.activity?.let { return it }
-        var ctx: Context? = ReelFrenStore.appContext
-        var depth = 0
-        while (ctx != null && depth < 12) {
-            if (ctx is Activity) return ctx
-            ctx = (ctx as? ContextWrapper)?.baseContext
-            depth++
-        }
-        return null
-    }
-
-    private fun resolveWebViewUa(activity: Activity, host: String): String {
-        val existing = ReelFrenStore.userAgent(host)
-        if (existing.isNotBlank() && existing != ReelFrenClient.FALLBACK_UA) return existing
-        val ua = runCatching {
-            ReelFrenStore.normalizeUa(WebSettings.getDefaultUserAgent(activity))
-        }.getOrNull()?.takeIf { it.isNotBlank() } ?: ReelFrenStore.defaultSystemUa
-        ReelFrenStore.setUserAgent(host, ua)
-        return ua
-    }
-
-    private fun scrubStaleClearance(url: String, host: String) {
-        ReelFrenStore.saveCookie(host, "")
-        runCatching {
-            val cm = CookieManager.getInstance()
-            val origins = listOf(url, "https://$host", "https://$host/")
-            val cookieNames = linkedSetOf("cf_clearance", "__cf_bm", "_cfuvid")
-
-            for (origin in origins) {
-                val raw = cm.getCookie(origin).orEmpty()
-                for (pair in raw.split(";")) {
-                    val name = pair.substringBefore("=").trim()
-                    if (name.isNotEmpty() && (name.startsWith("cf_") || name.startsWith("__cf") || name.startsWith("_cf"))) {
-                        cookieNames.add(name)
-                    }
-                }
-            }
-
-            val expireAttrs = "Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT"
-            for (origin in origins) {
-                for (name in cookieNames) {
-                    for (path in listOf("/", "/api")) {
-                        val attrsList = listOf(
-                            "$expireAttrs; Path=$path; Secure; HttpOnly",
-                            "$expireAttrs; Domain=$host; Path=$path; Secure; HttpOnly",
-                            "$expireAttrs; Domain=.$host; Path=$path; Secure; HttpOnly",
-                            "$expireAttrs; Path=$path; Secure; HttpOnly; Partitioned",
-                            "$expireAttrs; Domain=$host; Path=$path; Secure; HttpOnly; Partitioned",
-                            "$expireAttrs; Domain=.$host; Path=$path; Secure; HttpOnly; Partitioned",
-                            "$expireAttrs; Path=$path; Secure",
-                            "$expireAttrs; Domain=$host; Path=$path; Secure",
-                            "$expireAttrs; Domain=.$host; Path=$path; Secure",
-                            "$expireAttrs; Path=$path; Secure; Partitioned",
-                            "$expireAttrs; Domain=$host; Path=$path; Secure; Partitioned",
-                            "$expireAttrs; Domain=.$host; Path=$path; Secure; Partitioned",
-                            "$expireAttrs; Path=$path"
-                        )
-                        for (attrs in attrsList) {
-                            cm.setCookie(origin, "$name=; $attrs")
-                        }
-                    }
-                }
-            }
-            cm.flush()
-        }.onFailure { ReelFrenLog.t("CF/scrub", it) }
-    }
-
-    private fun handleSslError(targetHost: String, sslHandler: SslErrorHandler?, error: SslError?) {
-        if (sslHandler == null || error == null) return
-        val errHost = hostOf(error.url ?: "")
-        val isTrustedDomain = errHost.isEmpty() ||
-            errHost == targetHost ||
-            errHost.endsWith(".$targetHost") ||
-            errHost.contains("cloudflare", ignoreCase = true)
-
-        if (error.primaryError == SslError.SSL_UNTRUSTED && isTrustedDomain) {
-            ReelFrenLog.d("CF/ssl", "Proceeding past SSL_UNTRUSTED (-202) for ${error.url}")
-            sslHandler.proceed()
-        } else {
-            ReelFrenLog.d("CF/ssl", "Cancelling SSL error=${error.primaryError} url=${error.url}")
-            sslHandler.cancel()
-        }
-    }
-
-    private fun persistCookie(url: String, host: String, ua: String) {
         try {
-            val cm = CookieManager.getInstance()
-            val cookie = cm.getCookie(url) ?: cm.getCookie("https://$host") ?: return
-            if (extractClearanceToken(cookie).isNotEmpty()) {
-                ReelFrenStore.saveCookie(host, cookie)
-                ReelFrenStore.setUserAgent(host, ua)
-                ReelFrenStore.recordPrewarmResult(true)
-                cm.flush()
-                ReelFrenLog.d("CF/cookie", "Persisted cf_clearance for $host (len=${cookie.length})")
-            }
-        } catch (e: Exception) {
-            ReelFrenLog.t("CF/cookie", e)
-        }
-    }
+            val homeItems = ReelFrenClient.home(slug, page = page)
+            rawCount = homeItems.size
+            for (item in homeItems) {
+                if (!seen.add(item.id)) continue
 
-    private fun simulateTouchTap(web: WebView, handler: Handler, x: Float, y: Float) {
-        runCatching {
-            val downTime = SystemClock.uptimeMillis()
-            val props = arrayOf(MotionEvent.PointerProperties().apply {
-                id = 0
-                toolType = MotionEvent.TOOL_TYPE_FINGER
-            })
-            val coords = arrayOf(MotionEvent.PointerCoords().apply {
-                this.x = x
-                this.y = y
-                pressure = 1.0f
-                size = 1.0f
-            })
-            val down = MotionEvent.obtain(
-                downTime, downTime, MotionEvent.ACTION_DOWN,
-                1, props, coords, 0, 0, 1.0f, 1.0f,
-                0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
+                if (slug == "all_dramas" && item.provider.isEmpty()) {
+                    ReelFrenLog.d(
+                        "Main/getMainPage",
+                        "Skip provider-less item in all_dramas: ${item.id} '${item.title}'"
+                    )
+                    continue
+                }
+
+                val actualSlug = item.provider.ifEmpty { slug }
+                toCard(actualSlug, item)?.let { items.add(it) }
+            }
+
+            if (rawCount > 0 && items.isEmpty()) {
+                val streak = (dupPageStreak[slug] ?: 0) + 1
+                dupPageStreak[slug] = streak
+                hasNext = streak < 2
+                ReelFrenLog.d(
+                    "Main/getMainPage",
+                    "slug=$slug all-duplicate page #$streak hasNext=$hasNext"
+                )
+            } else {
+                dupPageStreak.remove(slug)
+                hasNext = rawCount > 0
+            }
+
+            ReelFrenLog.d(
+                "Main/getMainPage",
+                "slug=$slug raw=$rawCount added=${items.size} hasNext=$hasNext"
             )
-            web.dispatchTouchEvent(down)
-            down.recycle()
-
-            handler.postDelayed({
-                runCatching {
-                    val moveTime = SystemClock.uptimeMillis()
-                    coords[0].x += 2f
-                    coords[0].y += 2f
-                    val move = MotionEvent.obtain(
-                        downTime, moveTime, MotionEvent.ACTION_MOVE,
-                        1, props, coords, 0, 0, 1.0f, 1.0f,
-                        0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
-                    )
-                    web.dispatchTouchEvent(move)
-                    move.recycle()
-                }
-            }, 30L)
-
-            handler.postDelayed({
-                runCatching {
-                    val upTime = SystemClock.uptimeMillis()
-                    val up = MotionEvent.obtain(
-                        downTime, upTime, MotionEvent.ACTION_UP,
-                        1, props, coords, 0, 0, 1.0f, 1.0f,
-                        0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
-                    )
-                    web.dispatchTouchEvent(up)
-                    up.recycle()
-                }
-            }, 80L)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            ReelFrenLog.t("Main/getMainPage", e)
         }
+
+        return newHomePageResponse(request, items, hasNext = hasNext)
     }
 
-    fun prewarmIfNeeded() {
-        val host = hostOf(ReelFrenConfig.REEL_SITE)
-        if (extractClearanceToken(ReelFrenStore.cookie(host)).isNotEmpty()) return
-        if (ReelFrenStore.shouldSkipPrewarm()) return
+    override suspend fun search(query: String): List<SearchResponse>? {
+        val term = query.trim()
+        if (term.isEmpty()) return emptyList()
+        ReelFrenLog.d("Main/search", "ENTRY query='$term'")
 
-        ReelFrenCfState.solverScope.launch {
-            val deadline = SystemClock.uptimeMillis() + 20_000L
-            while (SystemClock.uptimeMillis() < deadline) {
-                val act = activity()
-                if (act != null && !act.isFinishing && !act.isDestroyed && act.window?.decorView != null) {
-                    break
-                }
-                delay(500L)
-            }
-            val readyAct = activity()
-            if (readyAct == null || readyAct.isFinishing || readyAct.isDestroyed || readyAct.window?.decorView == null) {
-                ReelFrenLog.d("CF/prewarm", "Activity not ready within 20s -> skipping pre-warm")
-                ReelFrenStore.recordPrewarmResult(false)
-                return@launch
-            }
-            delay(500L)
-            if (extractClearanceToken(ReelFrenStore.cookie(host)).isNotEmpty()) return@launch
+        val results = ConcurrentHashMap<String, SearchResponse>()
+        val deadline = System.currentTimeMillis() + 60_000L
+        val enabledSlugs = ReelFrenStore.enabledProviders().values.toList()
+        val semaphore = Semaphore(4)
 
-            try {
-                val ok = solve(ReelFrenConfig.REEL_SITE, silentOnly = true)
-                ReelFrenStore.recordPrewarmResult(ok)
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (t: Throwable) {
-                ReelFrenLog.t("CF/prewarm", t)
-                ReelFrenStore.recordPrewarmResult(false)
-            }
-        }
-    }
-
-    suspend fun solve(
-        url: String,
-        invalidatedCookie: String? = null,
-        forceInteractive: Boolean = false,
-        silentOnly: Boolean = false
-    ): Boolean {
-        val host = hostOf(url)
-        if (host.isBlank()) return false
-
-        val (session, isOwner) = ReelFrenCfState.beginSolve(
-            host = host,
-            interactiveAllowed = !silentOnly,
-            forceInteractive = forceInteractive
-        )
-        if (!isOwner) {
-            ReelFrenLog.d("CF/solve", "Joined in-flight solve for $host (interactiveAllowed=${!silentOnly})")
-            return session.deferred.await()
-        }
-
-        val currentCookie = ReelFrenStore.cookie(host)
-        val staleToken = extractClearanceToken(invalidatedCookie)
-        val currentToken = extractClearanceToken(currentCookie)
-        if (!forceInteractive && currentToken.isNotEmpty() && currentToken != staleToken) {
-            ReelFrenLog.d("CF/solve", "Fresh clearance already in store for $host -> short-circuit")
-            ReelFrenCfState.completeAndEndSolve(host, session, true)
-            return true
-        }
-
-        ReelFrenCfState.solverScope.launch {
-            try {
-                val act = activity()
-                if (act == null || act.isFinishing || act.isDestroyed) {
-                    ReelFrenCfState.completeAndEndSolve(host, session, false)
-                    return@launch
-                }
-
-                val cm = CookieManager.getInstance()
-                val residualCmToken = if (invalidatedCookie != null || forceInteractive) {
-                    extractClearanceToken(cm.getCookie(url) ?: cm.getCookie("https://$host"))
-                } else {
-                    ""
-                }
-                val rejectedTokens = setOf(staleToken, residualCmToken).filter { it.isNotEmpty() }.toSet()
-
-                if (invalidatedCookie != null) {
-                    scrubStaleClearance(url, host)
-                }
-
-                val silentSuccess = if (!forceInteractive) {
-                    attemptSilent(act, url, host, rejectedTokens, session)
-                } else {
-                    false
-                }
-
-                if (silentSuccess) {
-                    ReelFrenCfState.completeAndEndSolve(host, session, true)
-                } else if (!session.allowInteractive.get()) {
-                    ReelFrenLog.d("CF/solve", "Background pre-warm ended without foreground demand -> skipping dialog")
-                    ReelFrenCfState.completeAndEndSolve(host, session, false)
-                } else {
-                    showInteractiveDialog(act, url, host, rejectedTokens, session)
-                }
-            } catch (t: Throwable) {
-                ReelFrenCfState.completeAndEndSolve(host, session, false)
-                if (t is CancellationException) throw t
-                ReelFrenLog.t("CF/solve", t)
-            }
-        }
-
-        return session.deferred.await()
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun attemptSilent(
-        activity: Activity,
-        url: String,
-        host: String,
-        rejectedTokens: Set<String>,
-        session: SolveSession
-    ): Boolean {
-        val decor = activity.window?.decorView as? ViewGroup ?: return false
-
-        return suspendCancellableCoroutine { cont ->
-            val done = AtomicBoolean(false)
-            val settling = AtomicBoolean(false)
-            val handler = Handler(Looper.getMainLooper())
-            val ua = resolveWebViewUa(activity, host)
-            val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
-            var mainFrameError: String? = null
-
-            val container = object : FrameLayout(activity) {
-                override fun dispatchTouchEvent(ev: MotionEvent?): Boolean = false
-            }.apply {
-                layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1200)
-                alpha = 0.01f
-                isClickable = false
-                isFocusable = false
-                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
-            }
-
-            val web = WebView(activity).apply {
-                layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1200)
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    loadsImagesAutomatically = true
-                    javaScriptCanOpenWindowsAutomatically = true
-                    mediaPlaybackRequiresUserGesture = false
-                    cacheMode = WebSettings.LOAD_DEFAULT
-                    userAgentString = ua
-                }
-                webChromeClient = WebChromeClient()
-            }
-            cookies.setAcceptThirdPartyCookies(web, true)
-            container.addView(web)
-
-            fun finish(success: Boolean) {
-                if (!done.compareAndSet(false, true)) return
-                session.abortSilent = null
-                handler.removeCallbacksAndMessages(null)
-                ReelFrenLog.d("CF/silent", "finish(success=$success) for $host")
-
-                if (success) {
-                    persistCookie(url, host, ua)
-                }
-                runCatching { web.stopLoading() }
-                runCatching { web.loadUrl("about:blank") }
-                runCatching { container.removeView(web) }
-                runCatching { decor.removeView(container) }
-                runCatching { web.destroy() }
-
-                if (cont.isActive) cont.resume(success)
-            }
-
-            session.abortSilent = {
-                handler.post { finish(false) }
-            }
-
-            fun checkAndAutoInteract(tick: Int) {
-                if (done.get() || settling.get()) return
-                web.postInvalidateOnAnimation()
-
-                val rawCookie = cookies.getCookie(url) ?: cookies.getCookie("https://$host").orEmpty()
-                val token = extractClearanceToken(rawCookie)
-                val title = web.title.orEmpty()
-                val isFreshToken = token.isNotEmpty() && token !in rejectedTokens
-
-                ReelFrenLog.d("CF/silent-poll", "tick#$tick title='$title' cookieLen=${rawCookie.length} freshCf=$isFreshToken")
-
-                if (isFreshToken) {
-                    if (!isChallengeOrBlankTitle(title)) {
-                        if (settling.compareAndSet(false, true)) {
-                            handler.postDelayed({ finish(true) }, 800L)
-                        }
-                        return
-                    }
-                }
-
-                if (tick >= 4 && tick % 4 == 0 && isChallengeOrBlankTitle(title)) {
-                    val locateJs = """
-                        (function() {
-                            var dpr = window.devicePixelRatio || 1;
-                            function toPhys(el, tag) {
-                                if (!el || !el.getBoundingClientRect) return '';
-                                var r = el.getBoundingClientRect();
-                                if (r.width < 180 || r.height < 40) return '';
-                                var px = Math.round((r.left + 28) * dpr);
-                                var py = Math.round((r.top + (r.height / 2)) * dpr);
-                                return px + ',' + py + ',' + tag + '(' + Math.round(r.left) + ',' + Math.round(r.top) + ',' + Math.round(r.width) + 'x' + Math.round(r.height) + ',dpr=' + dpr + ')';
-                            }
-                            if (window.__cfLastShadowRoot) {
-                                var sf = window.__cfLastShadowRoot.querySelector('iframe');
-                                var c1 = toPhys(sf, 'shadow-iframe');
-                                if (c1) return c1;
-                            }
-                            if (window.__cfLastShadowHost) {
-                                var c2 = toPhys(window.__cfLastShadowHost, 'shadow-host');
-                                if (c2) return c2;
-                            }
-                            var sel = 'iframe[src*="challenges.cloudflare.com"], [id^="cf-chl-widget"], #turnstile-wrapper, .cf-turnstile, #challenge-stage, .cb-c';
-                            var c3 = toPhys(document.querySelector(sel), 'selector');
-                            if (c3) return c3;
-    
-                            var all = document.querySelectorAll('div, iframe');
-                            for (var i = 0; i < all.length; i++) {
-                                var r = all[i].getBoundingClientRect();
-                                if (r.width >= 240 && r.width <= 360 && r.height >= 50 && r.height <= 85 && r.top >= 40) {
-                                    var c4 = toPhys(all[i], 'geom');
-                                    if (c4) return c4;
+        coroutineScope {
+            enabledSlugs.map { slug ->
+                async {
+                    if (System.currentTimeMillis() > deadline) return@async
+                    semaphore.withPermit {
+                        if (System.currentTimeMillis() > deadline) return@withPermit
+                        try {
+                            ReelFrenClient.search(slug, term).forEach { item ->
+                                toCard(slug, item)?.let { card ->
+                                    results.putIfAbsent(card.url, card)
                                 }
                             }
-                            return '';
-                        })();
-                    """.trimIndent()
-                    web.evaluateJavascript(locateJs) { jsRes ->
-                        if (done.get() || settling.get()) return@evaluateJavascript
-                        val raw = jsRes?.trim('"').orEmpty()
-                        if (raw.isEmpty()) {
-                            ReelFrenLog.d("CF/silent-tap", "Turnstile box not rendered yet at tick#$tick")
-                            return@evaluateJavascript
+                        } catch (ce: CancellationException) {
+                            throw ce
+                        } catch (e: Exception) {
+                            ReelFrenLog.t("Main/search", e)
                         }
-                        val parts = raw.split(",")
-                        val cx = parts.getOrNull(0)?.toFloatOrNull() ?: return@evaluateJavascript
-                        val cy = parts.getOrNull(1)?.toFloatOrNull() ?: return@evaluateJavascript
-                        val info = parts.drop(2).joinToString(",")
-                        ReelFrenLog.d("CF/silent-tap", "Dispatching tap at physical ($cx, $cy) [$info]")
-                        simulateTouchTap(web, handler, cx, cy)
                     }
                 }
+            }.awaitAll()
+        }
+
+        ReelFrenLog.d("Main/search", "EXIT results=${results.size}")
+        return results.values.take(60)
+    }
+
+    override suspend fun load(url: String): LoadResponse? {
+        ReelFrenLog.d("Main/load", "ENTRY url=$url")
+        val (slug, id, _) = ReelFrenUrl.parse(url)
+        if (slug.isEmpty() || id.isEmpty()) return null
+
+        val info = ReelFrenClient.detail(slug, id) ?: return null
+        val cover = ReelFrenClient.absUrl(info.cover).ifEmpty { null }
+        val imgHeaders = ReelFrenClient.posterHeaders(cover)
+        val plot = info.intro.takeIf { it.isNotEmpty() }
+
+        return if (info.videos.size > 1 || info.episodes > 1) {
+            newTvSeriesLoadResponse(
+                name = info.title,
+                url = url,
+                type = TvType.TvSeries,
+                episodes = info.videos.map { v ->
+                    newEpisode(ReelFrenUrl.episode(slug, id, v.episode)) {
+                        name = "Episode ${v.episode}"
+                        episode = v.episode
+                        posterUrl = cover
+                    }
+                }
+            ) {
+                posterUrl = cover
+                posterHeaders = imgHeaders
+                this.plot = plot
             }
-
-            web.webViewClient = object : WebViewClient() {
-                override fun onReceivedSslError(view: WebView?, sslHandler: SslErrorHandler?, error: SslError?) {
-                    handleSslError(host, sslHandler, error)
-                }
-
-                override fun onPageStarted(view: WebView?, loadedUrl: String?, favicon: Bitmap?) {
-                    if (done.get() || loadedUrl == null || loadedUrl == "about:blank") return
-                    mainFrameError = null
-                    view?.evaluateJavascript(SHADOW_HOOK_JS, null)
-                }
-
-                override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                    if (done.get() || loadedUrl == "about:blank") return
-                    view?.onWindowFocusChanged(true)
-                    checkAndAutoInteract(0)
-                }
-
-                override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                    if (request?.isForMainFrame == true) {
-                        mainFrameError = "${error?.errorCode}: ${error?.description}"
-                        ReelFrenLog.d("CF/silent", "Main-frame network error: $mainFrameError")
-                    }
-                }
-
-                override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
-                    val code = errorResponse?.statusCode ?: 0
-                    if (request?.isForMainFrame == true && code in 500..599 && code != 503) {
-                        ReelFrenLog.d("CF/silent", "Main-frame HTTP $code -> aborting silent")
-                        finish(false)
-                    }
-                }
+        } else {
+            newMovieLoadResponse(
+                name = info.title,
+                url = url,
+                type = TvType.Movie,
+                dataUrl = url
+            ) {
+                posterUrl = cover
+                posterHeaders = imgHeaders
+                this.plot = plot
             }
-
-            val startMs = SystemClock.uptimeMillis()
-            val pollRunnable = object : Runnable {
-                var ticks = 0
-                override fun run() {
-                    if (done.get()) return
-                    ticks++
-                    checkAndAutoInteract(ticks)
-                    if (done.get()) return
-
-                    val elapsed = SystemClock.uptimeMillis() - startMs
-
-                    if (mainFrameError != null && !isChallengeOrBlankTitle(web.title)) {
-                        finish(false)
-                        return
-                    }
-
-                    if (elapsed >= 30_000L) {
-                        finish(false)
-                        return
-                    }
-
-                    val nextDelay = if (elapsed < 8_000L) 500L else 1_000L
-                    handler.postDelayed(this, nextDelay)
-                }
-            }
-
-            cont.invokeOnCancellation { finish(false) }
-
-            decor.addView(container)
-            web.onResume()
-            web.resumeTimers()
-            web.onWindowFocusChanged(true)
-            web.loadUrl(url)
-            handler.postDelayed(pollRunnable, 500L)
         }
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun showInteractiveDialog(
-        activity: Activity,
-        url: String,
-        host: String,
-        rejectedTokens: Set<String>,
-        session: SolveSession
-    ) {
-        if (activity.isFinishing || activity.isDestroyed) {
-            ReelFrenCfState.completeAndEndSolve(host, session, false)
-            return
-        }
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        ReelFrenLog.d("Main/loadLinks", "ENTRY data=$data isCasting=$isCasting")
+        val (slug, id, episode) = ReelFrenUrl.parse(data)
+        if (slug.isEmpty() || id.isEmpty()) return false
 
-        val resolved = AtomicBoolean(false)
-        val settling = AtomicBoolean(false)
-        val handler = Handler(Looper.getMainLooper())
-        var webRef: WebView? = null
-        var layoutRef: LinearLayout? = null
-        var dialogRef: Dialog? = null
-        val ua = resolveWebViewUa(activity, host)
-        val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
-
-        fun finish(success: Boolean) {
-            if (!resolved.compareAndSet(false, true)) return
-            handler.removeCallbacksAndMessages(null)
-            ReelFrenLog.d("CF/dialog", "finish(success=$success) for $host")
-
-            if (success) {
-                persistCookie(url, host, ua)
-            }
-            ReelFrenCfState.completeAndEndSolve(host, session, success)
-
-            handler.post {
-                runCatching { webRef?.stopLoading() }
-                runCatching { webRef?.loadUrl("about:blank") }
-                runCatching { layoutRef?.removeView(webRef) }
-                runCatching { webRef?.destroy() }
-                webRef = null
-                runCatching { dialogRef?.dismiss() }
-                dialogRef = null
-            }
-        }
+        val playback = ReelFrenClient.playback(slug, id, episode) ?: return false
 
         try {
-            val dlg = Dialog(activity)
-            dialogRef = dlg
-
-            val layout = LinearLayout(activity).apply {
-                orientation = LinearLayout.VERTICAL
-                setBackgroundColor(Color.parseColor("#0A0C12"))
-            }
-            layoutRef = layout
-
-            val header = TextView(activity).apply {
-                text = "Verifying you are human..."
-                setTextColor(Color.WHITE)
-                textSize = 15f
-                setPadding(50, 40, 50, 40)
-            }
-            layout.addView(header)
-
-            val wv = WebView(activity).apply {
-                settings.apply {
-                    javaScriptEnabled = true
-                    domStorageEnabled = true
-                    databaseEnabled = true
-                    userAgentString = ua
-                }
-                webChromeClient = WebChromeClient()
-            }
-            webRef = wv
-            cookies.setAcceptThirdPartyCookies(wv, true)
-
-            fun checkSolved(): Boolean {
-                return !isChallengeOrBlankTitle(wv.title)
-            }
-
-            fun checkAndAutoInteract(tick: Int) {
-                if (resolved.get() || settling.get()) return
-
-                val rawCookie = cookies.getCookie(url) ?: cookies.getCookie("https://$host").orEmpty()
-                val token = extractClearanceToken(rawCookie)
-                val title = wv.title.orEmpty()
-                val isFreshToken = token.isNotEmpty() && token !in rejectedTokens
-
-                ReelFrenLog.d("CF/dialog-poll", "tick#$tick title='$title' cookieLen=${rawCookie.length} freshCf=$isFreshToken")
-
-                if (isFreshToken) {
-                    if (!isChallengeOrBlankTitle(title)) {
-                        if (settling.compareAndSet(false, true)) {
-                            handler.postDelayed({ finish(true) }, 800L)
-                        }
-                        return
-                    }
-                }
-
-                if (tick >= 4 && tick % 4 == 0 && isChallengeOrBlankTitle(title)) {
-                    val locateJs = """
-                        (function() {
-                            var dpr = window.devicePixelRatio || 1;
-                            function toPhys(el, tag) {
-                                if (!el || !el.getBoundingClientRect) return '';
-                                var r = el.getBoundingClientRect();
-                                if (r.width < 180 || r.height < 40) return '';
-                                var px = Math.round((r.left + 28) * dpr);
-                                var py = Math.round((r.top + (r.height / 2)) * dpr);
-                                return px + ',' + py + ',' + tag + '(' + Math.round(r.left) + ',' + Math.round(r.top) + ',' + Math.round(r.width) + 'x' + Math.round(r.height) + ',dpr=' + dpr + ')';
-                            }
-                            if (window.__cfLastShadowRoot) {
-                                var sf = window.__cfLastShadowRoot.querySelector('iframe');
-                                var c1 = toPhys(sf, 'shadow-iframe');
-                                if (c1) return c1;
-                            }
-                            if (window.__cfLastShadowHost) {
-                                var c2 = toPhys(window.__cfLastShadowHost, 'shadow-host');
-                                if (c2) return c2;
-                            }
-                            var sel = 'iframe[src*="challenges.cloudflare.com"], [id^="cf-chl-widget"], #turnstile-wrapper, .cf-turnstile, #challenge-stage, .cb-c';
-                            var c3 = toPhys(document.querySelector(sel), 'selector');
-                            if (c3) return c3;
-
-                            var all = document.querySelectorAll('div, iframe');
-                            for (var i = 0; i < all.length; i++) {
-                                var r = all[i].getBoundingClientRect();
-                                if (r.width >= 240 && r.width <= 360 && r.height >= 50 && r.height <= 85 && r.top >= 40) {
-                                    var c4 = toPhys(all[i], 'geom');
-                                    if (c4) return c4;
-                                }
-                            }
-                            return '';
-                        })();
-                    """.trimIndent()
-                    wv.evaluateJavascript(locateJs) { res ->
-                        if (resolved.get() || settling.get()) return@evaluateJavascript
-                        val raw = res?.trim('"').orEmpty()
-                        if (raw.isEmpty()) return@evaluateJavascript
-                        val parts = raw.split(",")
-                        val cx = parts.getOrNull(0)?.toFloatOrNull() ?: return@evaluateJavascript
-                        val cy = parts.getOrNull(1)?.toFloatOrNull() ?: return@evaluateJavascript
-                        ReelFrenLog.d("CF/dialog-tap", "Dispatching tap at physical ($cx, $cy)")
-                        simulateTouchTap(wv, handler, cx, cy)
-                    }
-                }
-            }
-
-            wv.webViewClient = object : WebViewClient() {
-                override fun onReceivedSslError(view: WebView?, sslHandler: SslErrorHandler?, error: SslError?) {
-                    handleSslError(host, sslHandler, error)
-                }
-
-                override fun onPageStarted(view: WebView?, loadedUrl: String?, favicon: Bitmap?) {
-                    if (resolved.get() || loadedUrl == null || loadedUrl == "about:blank") return
-                    view?.evaluateJavascript(SHADOW_HOOK_JS, null)
-                }
-
-                override fun onPageFinished(view: WebView?, loadedUrl: String?) {
-                    if (resolved.get() || settling.get() || loadedUrl == "about:blank") return
-                    if (checkSolved() && settling.compareAndSet(false, true)) {
-                        handler.postDelayed({ finish(true) }, 800L)
-                    }
-                }
-
-                override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                    if (request?.isForMainFrame == true && request.url?.host?.contains("cloudflare", true) != true) {
-                        ReelFrenLog.d("CF/dialog", "Main-frame error (${error?.errorCode}) -> finish(false)")
-                        finish(false)
-                    }
-                }
-
-                override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
-                    val code = errorResponse?.statusCode ?: 0
-                    if (request?.isForMainFrame == true && code in 500..599 && code != 503) {
-                        ReelFrenLog.d("CF/dialog", "Main-frame HTTP $code -> finish(false)")
-                        finish(false)
-                    }
-                }
-            }
-
-            layout.addView(wv, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 1200))
-            dlg.setContentView(layout)
-            dlg.setOnDismissListener { finish(false) }
-            dlg.show()
-
-            val watchdog = object : Runnable {
-                var count = 0
-                override fun run() {
-                    if (resolved.get() || settling.get()) return
-                    count++
-                    if (checkSolved()) {
-                        if (settling.compareAndSet(false, true)) {
-                            handler.postDelayed({ finish(true) }, 800L)
-                        }
-                        return
-                    }
-                    checkAndAutoInteract(count)
-                    if (resolved.get() || settling.get()) return
-
-                    if (count < 45) handler.postDelayed(this, 1_500L) else finish(false)
-                }
-            }
-            handler.postDelayed(watchdog, 1_500L)
-            wv.onResume()
-            wv.resumeTimers()
-            wv.loadUrl(url)
+            ReelFrenSubtitles.emit(
+                entries   = playback.subtitles,
+                qualities = playback.qualities,
+                callback  = subtitleCallback
+            )
+        } catch (ce: CancellationException) {
+            throw ce
         } catch (e: Exception) {
-            ReelFrenLog.t("CF/dialog", e)
-            finish(false)
+            ReelFrenLog.t("Main/loadLinks/subtitles", e)
+        }
+
+        var emitted = false
+        playback.qualities.forEach { q ->
+            ReelFrenDirectLink.build(q)?.let {
+                callback(it)
+                emitted = true
+            }
+        }
+        ReelFrenLog.d("Main/loadLinks", "EXIT emitted=$emitted")
+        return emitted
+    }
+
+    private fun toCard(slug: String, item: HomeItem): SearchResponse? {
+        if (item.id.isEmpty() || item.title.isEmpty()) return null
+
+        val actualSlug = item.provider.ifEmpty { slug }
+        val url = ReelFrenUrl.page(actualSlug, item.id)
+        val poster = ReelFrenClient.absUrl(item.cover).ifEmpty { null }
+        val imgHeaders = ReelFrenClient.posterHeaders(poster)
+        val displayTitle = if (item.episodes > 0) {
+            "${item.title} [${item.episodes} EP]"
+        } else {
+            "${item.title} [NEW]"
+        }
+
+        return if (item.episodes != 1) {
+            newTvSeriesSearchResponse(displayTitle, url, TvType.TvSeries) {
+                this.posterUrl = poster
+                this.posterHeaders = imgHeaders
+            }
+        } else {
+            newMovieSearchResponse(displayTitle, url, TvType.Movie) {
+                this.posterUrl = poster
+                this.posterHeaders = imgHeaders
+            }
         }
     }
 }
