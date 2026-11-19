@@ -104,10 +104,19 @@ object ReelFrenParse {
     private val SUB_LABEL_KEYS = arrayOf("label", "name", "title", "display", "langName", "language")
 
     fun homeItems(body: String): List<HomeItem> {
-        if (body.isBlank()) return emptyList()
-        val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
+        if (body.isBlank()) {
+            ReelFrenLog.d("Parse.home", "Body is entirely blank")
+            return emptyList()
+        }
+        val root = runCatching { JSONObject(body) }.getOrNull() ?: run {
+            ReelFrenLog.d("Parse.home", "Failed to parse JSON. Body snippet: ${body.take(100)}")
+            return emptyList()
+        }
         val dataObj = root.optJSONObject("data")
-        val arr = root.optJSONArray("data") ?: dataObj?.optJSONArray("items") ?: dataObj?.optJSONArray("list") ?: dataObj?.optJSONArray("results") ?: root.optJSONArray("items") ?: root.optJSONArray("list") ?: return emptyList()
+        val arr = root.optJSONArray("data") ?: dataObj?.optJSONArray("items") ?: dataObj?.optJSONArray("list") ?: dataObj?.optJSONArray("results") ?: root.optJSONArray("items") ?: root.optJSONArray("list") ?: run {
+            ReelFrenLog.d("Parse.home", "Could not locate array in JSON: ${root.keys().asSequence().joinToString()}")
+            return emptyList()
+        }
 
         return (0 until arr.length()).mapNotNull { i ->
             val o = arr.optJSONObject(i) ?: return@mapNotNull null
@@ -298,7 +307,6 @@ object ReelFrenStore {
         return providerPrefs?.getBoolean("provider_$slug", default) ?: default
     }
 
-    // ALL SETTINGS/PREWARM FUNCTIONS FULLY RESTORED
     fun setProviderEnabled(editor: SharedPreferences.Editor, slug: String, enabled: Boolean) {
         editor.putBoolean("provider_$slug", enabled)
     }
@@ -456,7 +464,6 @@ object ReelFrenUrl {
     }
 }
 
-// ── CookieJar Bridge ────────────────────────────────────────────────────────
 class WebViewCookieJar : CookieJar {
     private val cookieManager = CookieManager.getInstance()
 
@@ -478,7 +485,6 @@ class WebViewCookieJar : CookieJar {
     }
 }
 
-// ── HTTP Client with Spoofed TLS & CookieJar ────────────────────────────────
 object ReelFrenClient {
 
     const val FALLBACK_UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
@@ -546,6 +552,10 @@ object ReelFrenClient {
         if (isSiteDomain(host)) {
             map["Origin"] = ReelFrenConfig.REEL_SITE
             map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
+            
+            // Explicitly inject cookie just in case CookieJar is sluggish
+            val cookie = ReelFrenStore.cookie(host)
+            if (cookie.isNotBlank()) map["Cookie"] = cookie
         }
         return map
     }
@@ -559,6 +569,8 @@ object ReelFrenClient {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val isReelFrenApi = isSiteDomain(targetHost)
         
+        ReelFrenLog.d("Client.get", "[GET INIT] url=$url isApi=$isReelFrenApi")
+
         if (!isReelFrenApi) {
             return try {
                 app.get(url, headers = headers(url, false), timeout = 25L).text
@@ -568,41 +580,47 @@ object ReelFrenClient {
         ReelFrenLog.d("Client.get", "Attempting fast-path OkHttp fetch for: $url")
         var jsonText = try {
             spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text
-        } catch (e: Exception) { "" }
+        } catch (e: Exception) { 
+            ReelFrenLog.d("Client.get", "OkHttp EXCEPTION on fast-path: ${e.message}")
+            "" 
+        }
 
         if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) {
+            ReelFrenLog.d("Client.get", "✅ Fast-path succeeded! Length: ${jsonText.length}")
             return jsonText
         }
 
-        ReelFrenLog.d("Client.get", "Fast-path failed. Acquiring Mutex to solve CF sequentially...")
+        ReelFrenLog.d("Client.get", "⚠️ Fast-path failed or challenged. Acquiring Mutex...")
         
         apiMutex.withLock {
-            ReelFrenLog.d("Client.get", "Mutex acquired for $url. Double checking if another thread already solved it...")
+            ReelFrenLog.d("Client.get", "🔒 Mutex acquired for $url. Double checking cache...")
             
             jsonText = try {
                 spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text
             } catch (e: Exception) { "" }
             
             if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) {
-                ReelFrenLog.d("Client.get", "Pre-cleared by previous provider! Proceeding.")
+                ReelFrenLog.d("Client.get", "🔓 Pre-cleared by previous provider! Proceeding.")
                 return jsonText
             }
 
-            ReelFrenLog.d("Client.get", "Delegating to CFSolver on root site.")
+            ReelFrenLog.d("Client.get", "🛠️ Delegating to CFSolver (JavaScript DOM Injection) on root site.")
             val solved = ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)
             
             if (!solved) {
-                ReelFrenLog.d("Client.get", "CFSolver failed. Aborting fetch.")
+                ReelFrenLog.d("Client.get", "❌ CFSolver failed. Aborting fetch.")
                 return null
             }
 
-            ReelFrenLog.d("Client.get", "CF solved. Final fetch attempt for $url")
+            ReelFrenLog.d("Client.get", "🚀 CF solved. Fetching JSON via Injected JavaScript...")
             val webViewResult = ReelFrenCloudflare.fetchJsonWithWebView(url)
             
             if (webViewResult.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(webViewResult)) {
-                ReelFrenLog.d("Client.get", "Final JSON WebView fetch failed. Giving up.")
+                ReelFrenLog.d("Client.get", "❌ Final JSON JS-fetch failed. Giving up.")
                 return null
             }
+            
+            ReelFrenLog.d("Client.get", "✅ JSON JS-fetch Succeeded! Length: ${webViewResult.length}")
             return webViewResult
         }
     }
