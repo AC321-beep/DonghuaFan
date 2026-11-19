@@ -8,6 +8,7 @@ import android.content.ContextWrapper
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.http.SslError
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -39,6 +40,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.Headers
+import org.json.JSONTokener
 import java.net.URI
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -122,13 +124,7 @@ object ReelFrenCloudflare {
                 return true
             }
         }
-        return isChallengeBody(trimmed)
-    }
-
-    private fun isChallengeBody(body: String): Boolean {
         if (body.isEmpty()) return false
-        val firstChar = body[0]
-        if (firstChar == '{' || firstChar == '[') return false
         val sample = if (body.length > 6000) body.substring(0, 6000) else body
         val lower = sample.lowercase(Locale.ROOT)
         return lower.contains("just a moment") ||
@@ -159,7 +155,7 @@ object ReelFrenCloudflare {
                t.contains("webpage not available")
     }
 
-    private fun activity(): Activity? {
+    fun activity(): Activity? {
         CommonActivity.activity?.let { return it }
         var ctx: Context? = ReelFrenStore.appContext
         var depth = 0
@@ -248,6 +244,32 @@ object ReelFrenCloudflare {
                     up.recycle()
                 }
             }, 80L)
+        }
+    }
+
+    // FIX: Restored prewarmIfNeeded method
+    fun prewarmIfNeeded() {
+        val host = hostOf(ReelFrenConfig.REEL_SITE)
+        val cm = CookieManager.getInstance()
+        val cookies = cm.getCookie(ReelFrenConfig.REEL_SITE) ?: ""
+        if (cookies.contains("cf_clearance")) return
+        
+        if (ReelFrenStore.shouldSkipPrewarm()) return
+
+        ReelFrenCfState.solverScope.launch {
+            delay(2000L) 
+            val act = activity() ?: return@launch
+            if (act.isFinishing || act.isDestroyed || act.window?.decorView == null) return@launch
+
+            try {
+                val ok = solve(ReelFrenConfig.REEL_SITE, silentOnly = true)
+                ReelFrenStore.recordPrewarmResult(ok)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                ReelFrenLog.t("CF/prewarm", e)
+                ReelFrenStore.recordPrewarmResult(false)
+            }
         }
     }
 
