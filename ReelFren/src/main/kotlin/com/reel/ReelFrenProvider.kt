@@ -13,7 +13,7 @@ import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 
 class ReelFrenProvider(
-    override val name: String,
+    override var name: String, // FIX: Changed from 'val' to 'var' to match Cloudstream's MainAPI
     private val slug: String
 ) : MainAPI() {
 
