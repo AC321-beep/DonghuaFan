@@ -13,7 +13,6 @@ import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
-// ── Unified Logger ───────────────────────────────────────────────────────────
 object ReelFrenLog {
     private const val TAG = "ReelFren/CF"
     fun d(scope: String, msg: String) {
@@ -24,7 +23,6 @@ object ReelFrenLog {
     }
 }
 
-// ── Models ───────────────────────────────────────────────────────────────────
 data class DetailInfo(
     val id: String, val provider: String, val title: String,
     val cover: String, val intro: String, val episodes: Int,
@@ -43,7 +41,6 @@ data class QualityEntry(val label: String, val url: String, val format: String)
 data class SubtitleEntry(val label: String, val lang: String, val url: String)
 data class VideoEntry(val episode: Int, val duration: Int, val vid: String, val available: Boolean)
 
-// ── Config & Provider Registry ───────────────────────────────────────────────
 object ReelFrenConfig {
     const val REEL_SITE = "https://reelfren.net"
     const val DEFAULT_API_BASE = "https://reelfren.net"
@@ -112,7 +109,6 @@ object ReelFrenConfig {
     )
 }
 
-// ── JSON Parser ──────────────────────────────────────────────────────────────
 object ReelFrenParse {
 
     private val SUB_ARRAY_KEYS = arrayOf(
@@ -379,7 +375,6 @@ object ReelFrenParse {
     }
 }
 
-// ── Unified Persistence & State ──────────────────────────────────────────────
 object ReelFrenStore {
     @Volatile var appContext: Context? = null
         private set
@@ -511,7 +506,6 @@ object ReelFrenStore {
     private fun key(type: String, host: String) = "${type}_$host"
 }
 
-// ── Quality & Stream Format Mapping ──────────────────────────────────────────
 object ReelFrenQuality {
     private val heavy = Regex("(?i)\\b(h\\.?26[56]|hevc|x\\.?26[56]|av1)\\b")
     private val resRegex = Regex("(?i)(\\d{3,4})\\s*p\\b")
@@ -551,7 +545,6 @@ object ReelFrenQuality {
     }
 }
 
-// ── URL Parsing ──────────────────────────────────────────────────────────────
 object ReelFrenUrl {
     private val pathRegex = Regex("/(?:drama|watch)/([^/?#|]+)/([^/?#|]+)")
     private val epRegex = Regex("[?&]ep=(\\d+)")
@@ -582,7 +575,6 @@ object ReelFrenUrl {
     }
 }
 
-// ── HTTP Client ──────────────────────────────────────────────────────────────
 object ReelFrenClient {
 
     const val FALLBACK_UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 " +
@@ -651,84 +643,84 @@ object ReelFrenClient {
 
     suspend fun get(url: String): String? {
         val targetHost = ReelFrenCloudflare.hostOf(url)
-        val isReelFrenApi = isSiteDomain(targetHost)
         
-        if (!isReelFrenApi) {
+        // Use OkHttp for external domains
+        if (!isSiteDomain(targetHost)) {
             return try {
                 app.get(url, headers = headers(url), timeout = 25L).text
-            } catch (ce: CancellationException) {
-                throw ce
             } catch (e: Exception) {
                 ReelFrenLog.t("Client.get/external", e)
                 null
             }
         }
 
-        ReelFrenLog.d("Client.get", "Attempting WebView API fetch for: $url")
-        var jsonText = try {
-            ReelFrenCloudflare.fetchViaWebViewAsPage(url)
+        val initialCookie = ReelFrenStore.cookie(targetHost)
+
+        // Attempt OkHttp fetch for ReelFren endpoints as primary strategy. 
+        // This is highly efficient and utilizes the solved cookies if they are valid.
+        var firstRespText = try {
+            app.get(url, headers = headers(url), timeout = 25L, cacheTime = 0).text
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
-            ReelFrenLog.t("Client.get/wv", e)
-            null
+            ReelFrenLog.t("Client.get/OkHttp", e)
+            ""
         }
 
-        val isChallenged = jsonText.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(200, null, jsonText)
-        
-        if (!isChallenged) {
-             return jsonText
+        if (firstRespText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(200, null, firstRespText)) {
+            return firstRespText
         }
 
-        ReelFrenLog.d("Client.get", "Challenge detected on $url")
+        ReelFrenLog.d("Client.get", "OkHttp failed or challenged. Attempting CF solve on root domain.")
         
-        val initialCookie = ReelFrenStore.cookie(targetHost)
-        // Solve on the specific API URL with injected Accept headers
-        val solved = ReelFrenCloudflare.solve(url, invalidatedCookie = initialCookie)
+        // We MUST solve on the root site so Turnstile renders in HTML and sets domain-scoped cookies.
+        val solveUrl = ReelFrenConfig.REEL_SITE
+        val solved = ReelFrenCloudflare.solve(solveUrl, invalidatedCookie = initialCookie)
         
         if (!solved) {
             ReelFrenLog.d("Client.get", "Solve failed (dismissed or timed out). Returning null.")
             return null
         }
 
-        jsonText = try {
-            ReelFrenCloudflare.fetchViaWebViewAsPage(url)
+        // Retry with OkHttp using the newly minted cookie
+        var retryRespText = try {
+            app.get(url, headers = headers(url), timeout = 25L, cacheTime = 0).text
         } catch (ce: CancellationException) {
             throw ce
         } catch (e: Exception) {
-            ReelFrenLog.t("Client.get/wvRetry", e)
-            null
+            ReelFrenLog.t("Client.get/OkHttpRetry", e)
+            ""
         }
-        
-        val isStillChallenged = jsonText.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(200, null, jsonText)
+
+        val isStillChallenged = retryRespText.isEmpty() || ReelFrenCloudflare.isChallengeResponse(200, null, retryRespText)
         
         if (isStillChallenged) {
-            ReelFrenLog.d("Client.get", "WebView fetch failed even after solve. Forcing interactive dialog.")
+            ReelFrenLog.d("Client.get", "OkHttp fetch failed even after solve. Forcing interactive dialog.")
             
             val forcedInteractiveSolved = ReelFrenCloudflare.solve(
-                url,
+                solveUrl,
                 invalidatedCookie = ReelFrenStore.cookie(targetHost),
                 forceInteractive = true
             )
             
             if (!forcedInteractiveSolved) return null
             
-            jsonText = try {
-                ReelFrenCloudflare.fetchViaWebViewAsPage(url)
+            retryRespText = try {
+                app.get(url, headers = headers(url), timeout = 25L, cacheTime = 0).text
             } catch (ce: CancellationException) {
                 throw ce
             } catch (e: Exception) {
-                ReelFrenLog.t("Client.get/wvAfterInteractive", e)
-                null
+                ReelFrenLog.t("Client.get/OkHttpAfterInteractive", e)
+                ""
             }
             
-            if (jsonText.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(200, null, jsonText)) {
+            if (retryRespText.isEmpty() || ReelFrenCloudflare.isChallengeResponse(200, null, retryRespText)) {
                 ReelFrenLog.d("Client.get", "Fetch failed after forced interactive. Giving up.")
                 return null
             }
         }
 
-        return jsonText
+        return retryRespText
     }
 
     suspend fun home(slug: String, category: String = "", page: Int = 1): List<HomeItem> =
