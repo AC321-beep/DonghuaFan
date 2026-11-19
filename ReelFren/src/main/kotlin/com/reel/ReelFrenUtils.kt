@@ -56,7 +56,7 @@ data class VideoEntry(val episode: Int, val duration: Int, val vid: String, val 
 // ── Config & Provider Registry ───────────────────────────────────────────────
 object ReelFrenConfig {
     const val REEL_SITE = "https://reelfren.net"
-    // CRITICAL FIX: The API is hosted on a separate subdomain!
+    // THIS IS THE FIX. IT MUST BE api.reelfren.net
     const val DEFAULT_API_BASE = "https://api.reelfren.net"
 
     val DEFAULT_ENABLED_SLUGS = setOf(
@@ -481,7 +481,7 @@ object ReelFrenClient {
 
     const val FALLBACK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    private val siteHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.REEL_SITE) }
+    private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
 
     private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
@@ -509,8 +509,7 @@ object ReelFrenClient {
 
     private fun apiBase() = ReelFrenStore.apiBase()
     private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
-    private fun isSiteDomain(host: String): Boolean = host.isNotEmpty() && (host == siteHost || host.endsWith(".$siteHost"))
-
+    
     fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
         val p = mutableListOf<String>()
         val isGlobal = slug == "all_dramas"
@@ -529,37 +528,41 @@ object ReelFrenClient {
     fun searchUrl(slug: String, term: String) = "${apiBase()}/api/search?q=${query(term)}&provider=${query(slug)}&lang=en"
 
     fun headers(url: String, isApiCall: Boolean = false): Map<String, String> {
-        val host = ReelFrenCloudflare.hostOf(url)
+        val targetHost = ReelFrenCloudflare.hostOf(url)
         val map = linkedMapOf<String, String>()
         
-        map["User-Agent"] = ReelFrenStore.userAgent(host)
+        map["User-Agent"] = ReelFrenStore.userAgent(targetHost)
         map["Accept-Language"] = "en-US,en;q=0.9"
         
         if (isApiCall) {
-            // Using standard JSON headers verified against the Network Trace
+            // Using standard JSON headers, matching your PC browser trace
             map["Accept"] = "application/json, text/plain, */*"
         } else {
             map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
         }
 
-        if (isSiteDomain(host)) {
+        // Add correct Origin and Referer explicitly for the API requests
+        if (targetHost == apiHost || targetHost.contains("reelfren.net")) {
             map["Origin"] = ReelFrenConfig.REEL_SITE
             map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
             
-            val cookie = ReelFrenStore.cookie(host)
+            // Inject the clearance cookie manually if OkHttp gets confused by subdomains
+            val cookie = ReelFrenStore.cookie(targetHost)
             if (cookie.isNotBlank()) map["Cookie"] = cookie
         }
         return map
     }
 
     fun posterHeaders(posterUrl: String?): Map<String, String>? {
-        if (posterUrl.isNullOrEmpty() || !isSiteDomain(ReelFrenCloudflare.hostOf(posterUrl))) return null
+        if (posterUrl.isNullOrEmpty()) return null
+        val host = ReelFrenCloudflare.hostOf(posterUrl)
+        if (!host.contains("reelfren.net")) return null
         return headers(posterUrl, isApiCall = false)
     }
 
     suspend fun get(url: String): String? {
         val targetHost = ReelFrenCloudflare.hostOf(url)
-        val isReelFrenApi = isSiteDomain(targetHost)
+        val isReelFrenApi = targetHost == apiHost
         
         ReelFrenLog.d("Client.get", "[GET INIT] url=$url isApi=$isReelFrenApi")
 
@@ -596,7 +599,8 @@ object ReelFrenClient {
                 return jsonText
             }
 
-            ReelFrenLog.d("Client.get", "🛠️ Delegating to native CFSolver on root site.")
+            ReelFrenLog.d("Client.get", "🛠️ Delegating to native CFSolver on ROOT site (reelfren.net)")
+            // We solve on the ROOT site to get the valid clearance cookie
             val solved = ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)
             
             if (!solved) {
@@ -604,7 +608,7 @@ object ReelFrenClient {
                 return null
             }
 
-            ReelFrenLog.d("Client.get", "🚀 CF solved. Firing native OkHttp fetch...")
+            ReelFrenLog.d("Client.get", "🚀 CF solved. Firing native OkHttp fetch to API...")
             val finalJson = try {
                 spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text
             } catch (e: Exception) { "" }
