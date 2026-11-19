@@ -218,7 +218,32 @@ object ReelFrenCloudflare {
         }
     }
 
-    // ── Dedicated JSON Fetcher ─────────────────────────────────────────────────────────────
+    // ALL PREWARM LOGIC RESTORED
+    fun prewarmIfNeeded() {
+        val host = hostOf(ReelFrenConfig.REEL_SITE)
+        val cm = CookieManager.getInstance()
+        val cookies = cm.getCookie(ReelFrenConfig.REEL_SITE) ?: ""
+        if (cookies.contains("cf_clearance")) return
+        
+        if (ReelFrenStore.shouldSkipPrewarm()) return
+
+        ReelFrenCfState.solverScope.launch {
+            delay(2000L) 
+            val act = activity() ?: return@launch
+            if (act.isFinishing || act.isDestroyed || act.window?.decorView == null) return@launch
+
+            try {
+                val ok = solve(ReelFrenConfig.REEL_SITE, silentOnly = true)
+                ReelFrenStore.recordPrewarmResult(ok)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                ReelFrenLog.t("CF/prewarm", e)
+                ReelFrenStore.recordPrewarmResult(false)
+            }
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     suspend fun fetchJsonWithWebView(url: String): String? {
         val activity = activity() ?: return null
@@ -298,7 +323,6 @@ object ReelFrenCloudflare {
                 cont.invokeOnCancellation { finish(null) }
                 decor?.addView(container)
                 
-                // Inject application/json to bypass Next.js HTML delivery
                 val headers = mutableMapOf(
                     "Accept" to "application/json, text/plain, */*",
                     "Cache-Control" to "no-cache",
@@ -590,7 +614,6 @@ object ReelFrenCloudflare {
                     mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     userAgentString = ua
                 }
-                webChromeClient = WebChromeClient()
             }
             webRef = wv
             cookies.setAcceptThirdPartyCookies(wv, true)
