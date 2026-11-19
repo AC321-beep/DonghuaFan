@@ -15,7 +15,7 @@ class ReelFrenPlugin : Plugin() {
             registerMainAPI(ReelFrenProvider(name, slug))
         }
 
-        // 3. Trigger the Cloudflare pre-warmer if needed
+        // 3. Trigger the Cloudflare pre-warmer on launch
         ReelFrenCloudflare.prewarmIfNeeded()
     }
 }
