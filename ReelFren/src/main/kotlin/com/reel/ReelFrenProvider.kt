@@ -9,9 +9,11 @@ import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.mainPageOf
+import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
+import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 
 class ReelFrenProvider : MainAPI() {
 
@@ -24,16 +26,13 @@ class ReelFrenProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.AsianDrama, TvType.TvSeries, TvType.Movie)
 
-    // THE GLOBAL TAB LOGIC:
-    // "All Dramas" is forced as the first (default) tab. 
-    // Then we dynamically append all the user's enabled providers from Settings.
     override val mainPage = mainPageOf(
         "all_dramas" to "All Dramas",
         *ReelFrenStore.enabledProviders().map { it.value to it.key }.toTypedArray()
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        val slug = request.data // Gets "all_dramas", "pinedrama", etc. from the dropdown
+        val slug = request.data
         ReelFrenLog.d("Main/getMainPage", "ENTRY page=$page slug=$slug name=${request.name}")
         
         val items = ReelFrenClient.home(slug, page = page)
@@ -45,8 +44,6 @@ class ReelFrenProvider : MainAPI() {
         val mapped = items.mapNotNull { item ->
             if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
             
-            // CRITICAL ROUTING: If we are on the global "all_dramas" tab, we MUST use the 
-            // item.provider payload so the video routes to the correct specific backend.
             val actualSlug = item.provider.ifEmpty { slug }
             
             newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
@@ -60,7 +57,6 @@ class ReelFrenProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse>? {
         ReelFrenLog.d("Main/search", "query='$query'")
-        // Search globally across all dramas by forcing the "all_dramas" slug
         val items = ReelFrenClient.search("all_dramas", query)
         
         val mapped = items.mapNotNull { item ->
@@ -82,11 +78,40 @@ class ReelFrenProvider : MainAPI() {
         if (id.isEmpty() || slug.isEmpty()) throw ErrorLoadingException("Invalid URL or missing ID")
         
         val d = ReelFrenClient.detail(slug, id) ?: throw ErrorLoadingException("Failed to load detail")
-        
-        return newMovieLoadResponse(d.title, url, TvType.AsianDrama, d.videos.joinToString(",") { it.vid }) {
-            this.posterUrl = ReelFrenClient.absUrl(d.cover)
-            this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
-            this.plot = d.intro
+        val coverUrl = ReelFrenClient.absUrl(d.cover)
+        val coverHeaders = ReelFrenClient.posterHeaders(coverUrl)
+
+        // CRITICAL FIX: Properly map the videos array into actual episodes
+        if (d.videos.size > 1 || d.episodes > 1) {
+            return newTvSeriesLoadResponse(
+                name = d.title,
+                url = url,
+                type = TvType.AsianDrama,
+                episodes = d.videos.map { v ->
+                    newEpisode(ReelFrenUrl.episode(slug, id, v.episode)) {
+                        this.name = "Episode ${v.episode}"
+                        this.episode = v.episode
+                        this.posterUrl = coverUrl
+                    }
+                }
+            ) {
+                this.posterUrl = coverUrl
+                this.posterHeaders = coverHeaders
+                this.plot = d.intro
+            }
+        } else {
+            // It's a standalone movie
+            val singleVideoId = d.videos.firstOrNull()?.episode ?: 1
+            return newMovieLoadResponse(
+                name = d.title,
+                url = url,
+                type = TvType.Movie,
+                dataUrl = ReelFrenUrl.episode(slug, id, singleVideoId)
+            ) {
+                this.posterUrl = coverUrl
+                this.posterHeaders = coverHeaders
+                this.plot = d.intro
+            }
         }
     }
 
@@ -120,7 +145,6 @@ class ReelFrenProvider : MainAPI() {
                     referer = "$mainUrl/",
                     quality = ReelFrenQuality.of(q.label),
                     type = linkType,
-                    // Send isApiCall = false for standard media requests
                     headers = ReelFrenClient.headers(qUrl, isApiCall = false)
                 )
             )
