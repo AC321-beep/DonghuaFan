@@ -21,9 +21,12 @@ import okhttp3.Protocol
 import okhttp3.TlsVersion
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
 
 // ── Unified Logger ───────────────────────────────────────────────────────────
 object ReelFrenLog {
@@ -295,6 +298,7 @@ object ReelFrenParse {
     }
 }
 
+// ── Unified Persistence & State (FULLY RESTORED) ─────────────────────────────
 object ReelFrenStore {
     @Volatile var appContext: Context? = null
         private set
@@ -303,7 +307,11 @@ object ReelFrenStore {
 
     @Volatile private var storePrefs: SharedPreferences? = null
     @Volatile private var providerPrefs: SharedPreferences? = null
+    
+    private val memoryUa = ConcurrentHashMap<String, String>()
+    private val memoryCookies = ConcurrentHashMap<String, String>()
     private val wvVersionRegex = Regex("""Version/\d+\.\d+\s*""")
+    private val rootDomain by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.REEL_SITE) }
 
     fun normalizeUa(rawUa: String): String = rawUa.replace("; wv", "").replace(wvVersionRegex, "").trim()
 
@@ -338,14 +346,79 @@ object ReelFrenStore {
         return if (clean.startsWith("https://") || clean.startsWith("http://")) clean else ReelFrenConfig.DEFAULT_API_BASE
     }
 
-    fun userAgent(host: String): String {
+    // Fully restored cookie persistence 
+    fun cookie(host: String): String {
+        if (host.isBlank()) return ""
         val norm = host.lowercase(Locale.ROOT)
-        return storePrefs?.getString("ua_$norm", null)?.takeIf { it.isNotBlank() } ?: defaultSystemUa
+        memoryCookies[norm]?.let { return it }
+        val saved = storePrefs?.getString("cookie_$norm", "").orEmpty()
+        if (saved.isNotEmpty()) {
+            memoryCookies[norm] = saved
+            return saved
+        }
+        if (norm != rootDomain && norm.endsWith(".$rootDomain")) {
+            return cookie(rootDomain)
+        }
+        return ""
+    }
+
+    fun saveCookie(host: String, cookie: String) {
+        if (host.isBlank()) return
+        val norm = host.lowercase(Locale.ROOT)
+        if (cookie.isBlank()) {
+            memoryCookies.remove(norm)
+        } else {
+            memoryCookies[norm] = cookie
+        }
+        storePrefs?.edit()?.putString("cookie_$norm", cookie)?.apply()
+        ReelFrenLog.d("Store", "saveCookie($norm) len=${cookie.length}")
+    }
+
+    fun userAgent(host: String): String {
+        if (host.isBlank()) return defaultSystemUa
+        val norm = host.lowercase(Locale.ROOT)
+        memoryUa[norm]?.let { return it }
+        val saved = storePrefs?.getString("ua_$norm", null)?.takeIf { it.isNotBlank() }
+        if (saved != null) {
+            val cleaned = normalizeUa(saved)
+            memoryUa[norm] = cleaned
+            return cleaned
+        }
+        if (norm != rootDomain && norm.endsWith(".$rootDomain")) {
+            return userAgent(rootDomain)
+        }
+        return defaultSystemUa
     }
 
     fun setUserAgent(host: String, ua: String) {
+        if (host.isBlank()) return
         val norm = host.lowercase(Locale.ROOT)
-        storePrefs?.edit()?.putString("ua_$norm", normalizeUa(ua))?.apply()
+        val cleaned = normalizeUa(ua)
+        memoryUa[norm] = cleaned
+        storePrefs?.edit()?.putString("ua_$norm", cleaned)?.apply()
+    }
+
+    // Fully restored prewarm trackers
+    fun shouldSkipPrewarm(): Boolean {
+        val lastFail = storePrefs?.getLong("prewarm_last_fail", 0L) ?: 0L
+        val failCount = storePrefs?.getInt("prewarm_fail_count", 0) ?: 0
+        if (lastFail == 0L || failCount <= 0) return false
+        val shift = (failCount - 1).coerceIn(0, 6)
+        val cooldown = 60_000L * (1L shl shift)
+        return (System.currentTimeMillis() - lastFail) < cooldown
+    }
+
+    fun recordPrewarmResult(success: Boolean) {
+        val editor = storePrefs?.edit() ?: return
+        if (success) {
+            editor.putLong("prewarm_last_fail", 0L)
+            editor.putInt("prewarm_fail_count", 0)
+        } else {
+            val count = (storePrefs?.getInt("prewarm_fail_count", 0) ?: 0) + 1
+            editor.putLong("prewarm_last_fail", System.currentTimeMillis())
+            editor.putInt("prewarm_fail_count", count)
+        }
+        editor.apply()
     }
 }
 
@@ -419,7 +492,6 @@ object ReelFrenUrl {
 }
 
 // ── CookieJar Bridge ────────────────────────────────────────────────────────
-// This forces OkHttp to read cookies DIRECTLY from Android's WebView memory in real-time.
 class WebViewCookieJar : CookieJar {
     private val cookieManager = CookieManager.getInstance()
 
@@ -441,7 +513,7 @@ class WebViewCookieJar : CookieJar {
     }
 }
 
-// ── HTTP Client with Spoofed TLS & CookieJar ─────────────────────────────────────────────
+// ── HTTP Client with Spoofed TLS & CookieJar ────────────────────────────────
 object ReelFrenClient {
 
     const val FALLBACK_UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
@@ -464,7 +536,6 @@ object ReelFrenClient {
         )
         .build()
 
-    // Spoofed OkHttp Client using the synchronous CookieJar
     private val spoofedClient = app.baseClient.newBuilder()
         .cookieJar(WebViewCookieJar())
         .connectionSpecs(listOf(chromeSpec, ConnectionSpec.CLEARTEXT))
