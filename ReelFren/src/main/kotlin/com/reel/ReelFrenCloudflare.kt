@@ -40,7 +40,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.Headers
-import org.json.JSONTokener
 import java.net.URI
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -124,7 +123,13 @@ object ReelFrenCloudflare {
                 return true
             }
         }
+        return isChallengeBody(trimmed)
+    }
+
+    private fun isChallengeBody(body: String): Boolean {
         if (body.isEmpty()) return false
+        val firstChar = body[0]
+        if (firstChar == '{' || firstChar == '[') return false
         val sample = if (body.length > 6000) body.substring(0, 6000) else body
         val lower = sample.lowercase(Locale.ROOT)
         return lower.contains("just a moment") ||
@@ -155,7 +160,7 @@ object ReelFrenCloudflare {
                t.contains("webpage not available")
     }
 
-    fun activity(): Activity? {
+    private fun activity(): Activity? {
         CommonActivity.activity?.let { return it }
         var ctx: Context? = ReelFrenStore.appContext
         var depth = 0
@@ -177,6 +182,23 @@ object ReelFrenCloudflare {
         }.getOrNull() ?: ReelFrenClient.FALLBACK_UA
         ReelFrenStore.setUserAgent(host, ua)
         return ua
+    }
+    
+    // RESTORED: This properly updates SharedPreferences when solving succeeds, fixing the store mismatch
+    private fun persistCookie(url: String, host: String, ua: String) {
+        try {
+            val cm = CookieManager.getInstance()
+            val cookie = cm.getCookie(url) ?: cm.getCookie("https://$host") ?: return
+            if (extractClearanceToken(cookie).isNotEmpty()) {
+                ReelFrenStore.saveCookie(host, cookie)
+                ReelFrenStore.setUserAgent(host, ua)
+                ReelFrenStore.recordPrewarmResult(true)
+                cm.flush()
+                ReelFrenLog.d("CF/cookie", "Persisted cf_clearance for $host (len=${cookie.length})")
+            }
+        } catch (e: Exception) {
+            ReelFrenLog.t("CF/cookie", e)
+        }
     }
 
     private fun handleSslError(targetHost: String, sslHandler: SslErrorHandler?, error: SslError?) {
@@ -247,7 +269,6 @@ object ReelFrenCloudflare {
         }
     }
 
-    // FIX: Restored prewarmIfNeeded method
     fun prewarmIfNeeded() {
         val host = hostOf(ReelFrenConfig.REEL_SITE)
         val cm = CookieManager.getInstance()
@@ -367,6 +388,8 @@ object ReelFrenCloudflare {
                 if (!done.compareAndSet(false, true)) return
                 handler.removeCallbacksAndMessages(null)
                 ReelFrenLog.d("CF/silent", "finish(success=$success) for $host")
+                
+                if (success) persistCookie(url, host, ua) // Syncs to Store
 
                 Handler(Looper.getMainLooper()).post {
                     runCatching { decor.removeView(container) }
@@ -427,9 +450,13 @@ object ReelFrenCloudflare {
                                 var c1 = toPhys(sf, 'shadow-iframe');
                                 if (c1) return c1;
                             }
+                            if (window.__cfLastShadowHost) {
+                                var c2 = toPhys(window.__cfLastShadowHost, 'shadow-host');
+                                if (c2) return c2;
+                            }
                             var sel = 'iframe[src*="challenges.cloudflare.com"], #turnstile-wrapper, .cf-turnstile, #challenge-stage';
-                            var c2 = toPhys(document.querySelector(sel), 'selector');
-                            if (c2) return c2;
+                            var c3 = toPhys(document.querySelector(sel), 'selector');
+                            if (c3) return c3;
                             return '';
                         })();
                     """.trimIndent()
@@ -524,6 +551,7 @@ object ReelFrenCloudflare {
             handler.removeCallbacksAndMessages(null)
             ReelFrenLog.d("CF/dialog", "finish(success=$success) for $host")
 
+            if (success) persistCookie(url, host, ua) // Syncs to Store
             ReelFrenCfState.completeAndEndSolve(host, session, success)
 
             handler.post {
@@ -618,9 +646,22 @@ object ReelFrenCloudflare {
                                 var c1 = toPhys(sf, 'shadow-iframe');
                                 if (c1) return c1;
                             }
+                            if (window.__cfLastShadowHost) {
+                                var c2 = toPhys(window.__cfLastShadowHost, 'shadow-host');
+                                if (c2) return c2;
+                            }
                             var sel = 'iframe[src*="challenges.cloudflare.com"], #turnstile-wrapper, .cf-turnstile, #challenge-stage';
-                            var c2 = toPhys(document.querySelector(sel), 'selector');
-                            if (c2) return c2;
+                            var c3 = toPhys(document.querySelector(sel), 'selector');
+                            if (c3) return c3;
+    
+                            var all = document.querySelectorAll('div, iframe');
+                            for (var i = 0; i < all.length; i++) {
+                                var r = all[i].getBoundingClientRect();
+                                if (r.width >= 240 && r.width <= 360 && r.height >= 50 && r.height <= 85 && r.top >= 40) {
+                                    var c4 = toPhys(all[i], 'geom');
+                                    if (c4) return c4;
+                                }
+                            }
                             return '';
                         })();
                     """.trimIndent()
