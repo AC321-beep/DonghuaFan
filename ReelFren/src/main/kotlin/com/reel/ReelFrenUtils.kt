@@ -104,19 +104,10 @@ object ReelFrenParse {
     private val SUB_LABEL_KEYS = arrayOf("label", "name", "title", "display", "langName", "language")
 
     fun homeItems(body: String): List<HomeItem> {
-        if (body.isBlank()) {
-            ReelFrenLog.d("Parse.home", "Body is entirely blank")
-            return emptyList()
-        }
-        val root = runCatching { JSONObject(body) }.getOrNull() ?: run {
-            ReelFrenLog.d("Parse.home", "Failed to parse JSON. Body snippet: ${body.take(100)}")
-            return emptyList()
-        }
+        if (body.isBlank()) return emptyList()
+        val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
         val dataObj = root.optJSONObject("data")
-        val arr = root.optJSONArray("data") ?: dataObj?.optJSONArray("items") ?: dataObj?.optJSONArray("list") ?: dataObj?.optJSONArray("results") ?: root.optJSONArray("items") ?: root.optJSONArray("list") ?: run {
-            ReelFrenLog.d("Parse.home", "Could not locate array in JSON: ${root.keys().asSequence().joinToString()}")
-            return emptyList()
-        }
+        val arr = root.optJSONArray("data") ?: dataObj?.optJSONArray("items") ?: dataObj?.optJSONArray("list") ?: dataObj?.optJSONArray("results") ?: root.optJSONArray("items") ?: root.optJSONArray("list") ?: return emptyList()
 
         return (0 until arr.length()).mapNotNull { i ->
             val o = arr.optJSONObject(i) ?: return@mapNotNull null
@@ -487,7 +478,7 @@ class WebViewCookieJar : CookieJar {
 
 object ReelFrenClient {
 
-    const val FALLBACK_UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    const val FALLBACK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
     private val siteHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.REEL_SITE) }
     private val apiMutex = Mutex()
@@ -544,7 +535,10 @@ object ReelFrenClient {
         map["Accept-Language"] = "en-US,en;q=0.9"
         
         if (isApiCall) {
+            // CRITICAL FIX: To prevent Next.js from throwing a 404, we MUST spoof the exact Next.js RSC Headers
             map["Accept"] = "application/json, text/plain, */*"
+            map["RSC"] = "1"
+            map["Next-Router-State-Tree"] = "%5B%22%22%2C%7B%22children%22%3A%5B%22(main)%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%5D%7D%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
         } else {
             map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
         }
@@ -553,7 +547,7 @@ object ReelFrenClient {
             map["Origin"] = ReelFrenConfig.REEL_SITE
             map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
             
-            // Explicitly inject cookie just in case CookieJar is sluggish
+            // Inject cookie just in case CookieJar is sluggish
             val cookie = ReelFrenStore.cookie(host)
             if (cookie.isNotBlank()) map["Cookie"] = cookie
         }
@@ -577,7 +571,7 @@ object ReelFrenClient {
             } catch (e: Exception) { null }
         }
 
-        ReelFrenLog.d("Client.get", "Attempting fast-path OkHttp fetch for: $url")
+        ReelFrenLog.d("Client.get", "Attempting fast-path Next.js Spoof fetch for: $url")
         var jsonText = try {
             spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text
         } catch (e: Exception) { 
@@ -590,7 +584,7 @@ object ReelFrenClient {
             return jsonText
         }
 
-        ReelFrenLog.d("Client.get", "⚠️ Fast-path failed or challenged. Acquiring Mutex...")
+        ReelFrenLog.d("Client.get", "⚠️ Fast-path failed or challenged. Acquiring CF Mutex...")
         
         apiMutex.withLock {
             ReelFrenLog.d("Client.get", "🔒 Mutex acquired for $url. Double checking cache...")
@@ -604,7 +598,7 @@ object ReelFrenClient {
                 return jsonText
             }
 
-            ReelFrenLog.d("Client.get", "🛠️ Delegating to CFSolver (JavaScript DOM Injection) on root site.")
+            ReelFrenLog.d("Client.get", "🛠️ Delegating to native CFSolver on root site.")
             val solved = ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)
             
             if (!solved) {
@@ -612,16 +606,18 @@ object ReelFrenClient {
                 return null
             }
 
-            ReelFrenLog.d("Client.get", "🚀 CF solved. Fetching JSON via Injected JavaScript...")
-            val webViewResult = ReelFrenCloudflare.fetchJsonWithWebView(url)
+            ReelFrenLog.d("Client.get", "🚀 CF solved. Firing spoofed OkHttp fetch...")
+            val finalJson = try {
+                spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text
+            } catch (e: Exception) { "" }
             
-            if (webViewResult.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(webViewResult)) {
-                ReelFrenLog.d("Client.get", "❌ Final JSON JS-fetch failed. Giving up.")
+            if (finalJson.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(finalJson)) {
+                ReelFrenLog.d("Client.get", "❌ Final OkHttp fetch failed. Giving up.")
                 return null
             }
             
-            ReelFrenLog.d("Client.get", "✅ JSON JS-fetch Succeeded! Length: ${webViewResult.length}")
-            return webViewResult
+            ReelFrenLog.d("Client.get", "✅ Next.js Spoofer Succeeded! Length: ${finalJson.length}")
+            return finalJson
         }
     }
 
