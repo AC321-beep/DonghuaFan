@@ -218,7 +218,6 @@ object ReelFrenCloudflare {
         }
     }
 
-    // ALL PREWARM LOGIC RESTORED
     fun prewarmIfNeeded() {
         val host = hostOf(ReelFrenConfig.REEL_SITE)
         val cm = CookieManager.getInstance()
@@ -244,8 +243,9 @@ object ReelFrenCloudflare {
         }
     }
 
+    // CRITICAL FIX: The robust Javascript DOM JSON Fetcher
     @SuppressLint("SetJavaScriptEnabled")
-    suspend fun fetchJsonWithWebView(url: String): String? {
+    suspend fun fetchJsonWithWebView(apiUrl: String): String? {
         val activity = activity() ?: return null
         if (activity.isFinishing || activity.isDestroyed) return null
         
@@ -253,7 +253,7 @@ object ReelFrenCloudflare {
             suspendCancellableCoroutine { cont ->
                 val done = AtomicBoolean(false)
                 val handler = Handler(Looper.getMainLooper())
-                val host = hostOf(url)
+                val host = hostOf(apiUrl)
                 val ua = resolveWebViewUa(activity, host)
                 val decor = activity.window?.decorView as? ViewGroup
 
@@ -287,48 +287,68 @@ object ReelFrenCloudflare {
                     cont.resume(res)
                 }
 
+                var fetchInjected = false
                 val pollRunnable = object : Runnable {
                     var ticks = 0
                     override fun run() {
                         if (done.get()) return
                         ticks++
                         
-                        web.evaluateJavascript("(function(){ return document.body ? (document.body.innerText || document.body.textContent) : ''; })();") { res ->
-                            if (done.get()) return@evaluateJavascript
-                            val raw = runCatching { JSONTokener(res ?: "").nextValue() as? String }.getOrNull()?.trim()
-
-                            if (!raw.isNullOrEmpty() && (raw.startsWith("{") || raw.startsWith("["))) {
-                                ReelFrenLog.d("CF/Fetch", "✅ JSON fetched via WebView!")
-                                finish(raw)
-                                return@evaluateJavascript
+                        if (!fetchInjected) {
+                            val title = web.title.orEmpty()
+                            // Wait until the safe root HTML page loads
+                            if (!isChallengeOrBlankTitle(title)) {
+                                fetchInjected = true
+                                ReelFrenLog.d("CF/Fetch", "Root HTML loaded. Injecting JS fetch for API...")
+                                val js = """
+                                    (function() {
+                                        var div = document.createElement('div');
+                                        div.id = 'reelfren_injected_data';
+                                        div.style.display = 'none';
+                                        document.body.appendChild(div);
+                                        fetch('$apiUrl', {
+                                            headers: { 'Accept': 'application/json, text/plain, */*' }
+                                        })
+                                        .then(r => r.text())
+                                        .then(t => { document.getElementById('reelfren_injected_data').textContent = 'JSON_RESULT:' + t; })
+                                        .catch(e => { document.getElementById('reelfren_injected_data').textContent = 'JSON_ERROR:' + e; });
+                                    })();
+                                """.trimIndent()
+                                web.evaluateJavascript(js, null)
                             }
+                        } else {
+                            // Extract the payload out of the DOM div we created
+                            web.evaluateJavascript("(function(){ var el = document.getElementById('reelfren_injected_data'); return el ? el.textContent : ''; })();") { res ->
+                                if (done.get()) return@evaluateJavascript
+                                val raw = runCatching { JSONTokener(res ?: "").nextValue() as? String }.getOrNull()?.trim()
 
-                            val title = web.title ?: ""
-                            if (isChallengeResponse(raw ?: "") || title.contains("Just a moment") || title.contains("Webpage not available")) {
-                                ReelFrenLog.d("CF/Fetch", "⚠️ Hit Challenge/Error during API fetch: $title")
-                                finish(null)
-                                return@evaluateJavascript
+                                if (raw != null && raw.startsWith("JSON_RESULT:")) {
+                                    ReelFrenLog.d("CF/Fetch", "✅ JSON successfully fetched via JS injection!")
+                                    finish(raw.removePrefix("JSON_RESULT:").trim())
+                                    return@evaluateJavascript
+                                }
+                                if (raw != null && raw.startsWith("JSON_ERROR:")) {
+                                    ReelFrenLog.d("CF/Fetch", "⚠️ JS Fetch failed: $raw")
+                                    finish(null)
+                                    return@evaluateJavascript
+                                }
                             }
-
-                            if (ticks > 15) {
-                                ReelFrenLog.d("CF/Fetch", "❌ Timeout waiting for JSON.")
-                                finish(null)
-                                return@evaluateJavascript
-                            }
-                            handler.postDelayed(this, 1000)
                         }
+
+                        if (ticks > 20) { // 20 seconds timeout
+                            ReelFrenLog.d("CF/Fetch", "❌ Timeout waiting for JSON.")
+                            finish(null)
+                            return
+                        }
+                        handler.postDelayed(this, 1000)
                     }
                 }
 
                 cont.invokeOnCancellation { finish(null) }
                 decor?.addView(container)
                 
-                val headers = mutableMapOf(
-                    "Accept" to "application/json, text/plain, */*",
-                    "Cache-Control" to "no-cache",
-                    "Referer" to "${ReelFrenConfig.REEL_SITE}/"
-                )
-                web.loadUrl(url, headers)
+                // CRITICAL DIFFERENCE: We load the HTML homepage so the Android WebView does not crash/abort on application/json content types.
+                web.loadUrl(ReelFrenConfig.REEL_SITE)
                 handler.postDelayed(pollRunnable, 1000)
             }
         }
@@ -490,7 +510,6 @@ object ReelFrenCloudflare {
                         val parts = rawJs.split(",")
                         val cx = parts.getOrNull(0)?.toFloatOrNull() ?: return@evaluateJavascript
                         val cy = parts.getOrNull(1)?.toFloatOrNull() ?: return@evaluateJavascript
-                        ReelFrenLog.d("CF/silent-tap", "Dispatching tap at physical ($cx, $cy)")
                         simulateTouchTap(web, handler, cx, cy)
                     }
                 }
