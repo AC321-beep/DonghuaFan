@@ -12,13 +12,18 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -243,9 +248,176 @@ object ReelFrenCloudflare {
         }
     }
 
-    // WE REMOVED THE JAVASCRIPT FETCH AND JSON INJECTION HERE.
-    // THE SOLVER ONLY SOLVES CLOUDFLARE ON THE HTML HOMEPAGE.
-    // OKHTTP HANDLES THE FETCHING IN REELFRENCLIENT.
+    // ── THE AGGRESSIVE DEBUG JSON FETCHER ──────────────────────────────────────────────────
+    @SuppressLint("SetJavaScriptEnabled")
+    suspend fun fetchJsonWithWebView(apiUrl: String): String? {
+        val activity = activity() ?: run {
+            ReelFrenLog.d("CF/JSFetch", "❌ Activity is null")
+            return null
+        }
+        if (activity.isFinishing || activity.isDestroyed) {
+            ReelFrenLog.d("CF/JSFetch", "❌ Activity is dead")
+            return null
+        }
+        
+        return withContext(Dispatchers.Main) {
+            suspendCancellableCoroutine { cont ->
+                val done = AtomicBoolean(false)
+                val handler = Handler(Looper.getMainLooper())
+                val host = hostOf(apiUrl)
+                val ua = resolveWebViewUa(activity, host)
+                val decor = activity.window?.decorView as? ViewGroup
+
+                val container = object : FrameLayout(activity) {
+                    override fun dispatchTouchEvent(ev: MotionEvent?): Boolean = false
+                }.apply {
+                    layoutParams = ViewGroup.LayoutParams(300, 300)
+                    translationX = 20000f
+                    alpha = 0f
+                }
+
+                val web = WebView(activity).apply {
+                    layoutParams = FrameLayout.LayoutParams(300, 300)
+                    settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        userAgentString = ua
+                    }
+                }
+                
+                // CATCH ALL BROWSER LOGS
+                web.webChromeClient = object : WebChromeClient() {
+                    override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                        val msg = consoleMessage?.message() ?: ""
+                        if (msg.startsWith("CF_DEBUG:")) {
+                            ReelFrenLog.d("CF/JS_CONSOLE", msg)
+                        }
+                        return super.onConsoleMessage(consoleMessage)
+                    }
+                }
+                
+                web.webViewClient = object : WebViewClient() {
+                    override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                        if (request?.isForMainFrame == true) {
+                            ReelFrenLog.d("CF/JSFetch", "🛑 WebView Network Error: ${error?.errorCode} ${error?.description}")
+                        }
+                    }
+                    override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, errorResponse: WebResourceResponse?) {
+                        if (request?.isForMainFrame == true) {
+                            ReelFrenLog.d("CF/JSFetch", "🛑 WebView HTTP Error: ${errorResponse?.statusCode}")
+                        }
+                    }
+                }
+
+                CookieManager.getInstance().setAcceptCookie(true)
+                container.addView(web)
+
+                fun finish(res: String?) {
+                    if (!done.compareAndSet(false, true)) return
+                    handler.removeCallbacksAndMessages(null)
+                    Handler(Looper.getMainLooper()).post {
+                        runCatching { decor?.removeView(container) }
+                        runCatching { web.stopLoading() }
+                        runCatching { web.destroy() }
+                    }
+                    cont.resume(res)
+                }
+
+                var fetchInjected = false
+                val pollRunnable = object : Runnable {
+                    var ticks = 0
+                    override fun run() {
+                        if (done.get()) return
+                        ticks++
+                        
+                        if (!fetchInjected) {
+                            val title = web.title.orEmpty()
+                            if (!isChallengeOrBlankTitle(title)) {
+                                fetchInjected = true
+                                ReelFrenLog.d("CF/JSFetch", "🟢 HTML Root is clean ($title). Injecting aggressive JS fetch...")
+                                
+                                // CRITICAL BYPASS: `credentials: 'same-origin'` forces the browser to send the cf_clearance cookie with the fetch request!
+                                val js = """
+                                    (function() {
+                                        console.log("CF_DEBUG: Injecting div container");
+                                        var div = document.createElement('div');
+                                        div.id = 'reelfren_injected_data';
+                                        div.style.display = 'none';
+                                        document.body.appendChild(div);
+                                        
+                                        console.log("CF_DEBUG: Firing fetch to: $apiUrl");
+                                        fetch('$apiUrl', {
+                                            method: 'GET',
+                                            credentials: 'same-origin',
+                                            headers: { 
+                                                'Accept': 'application/json, text/plain, */*',
+                                                'Cache-Control': 'no-cache'
+                                            }
+                                        })
+                                        .then(r => {
+                                            console.log("CF_DEBUG: Fetch returned HTTP Status " + r.status);
+                                            return r.text();
+                                        })
+                                        .then(t => { 
+                                            console.log("CF_DEBUG: Fetch body length is " + (t ? t.length : 0));
+                                            document.getElementById('reelfren_injected_data').textContent = 'JSON_RESULT:' + t; 
+                                        })
+                                        .catch(e => { 
+                                            console.log("CF_DEBUG: Fetch failed completely: " + e.message);
+                                            document.getElementById('reelfren_injected_data').textContent = 'JSON_ERROR:' + e; 
+                                        });
+                                    })();
+                                """.trimIndent()
+                                web.evaluateJavascript(js, null)
+                            } else {
+                                ReelFrenLog.d("CF/JSFetch", "⏳ Waiting for clean root HTML (tick $ticks) title='$title'")
+                            }
+                        } else {
+                            web.evaluateJavascript("(function(){ var el = document.getElementById('reelfren_injected_data'); return el ? el.textContent : ''; })();") { res ->
+                                if (done.get()) return@evaluateJavascript
+                                val raw = runCatching { JSONTokener(res ?: "").nextValue() as? String }.getOrNull()?.trim()
+
+                                if (raw != null && raw.startsWith("JSON_RESULT:")) {
+                                    val data = raw.removePrefix("JSON_RESULT:").trim()
+                                    if (data.isEmpty()) {
+                                        ReelFrenLog.d("CF/JSFetch", "⚠️ JSON result returned but is completely empty")
+                                    } else {
+                                        finish(data)
+                                    }
+                                    return@evaluateJavascript
+                                }
+                                if (raw != null && raw.startsWith("JSON_ERROR:")) {
+                                    ReelFrenLog.d("CF/JSFetch", "⚠️ JavaScript threw an error: $raw")
+                                    finish(null)
+                                    return@evaluateJavascript
+                                }
+                            }
+                        }
+
+                        if (ticks > 25) {
+                            ReelFrenLog.d("CF/JSFetch", "❌ Timed out after 25s")
+                            finish(null)
+                            return
+                        }
+                        handler.postDelayed(this, 1000)
+                    }
+                }
+
+                cont.invokeOnCancellation { finish(null) }
+                decor?.addView(container)
+                
+                // We load the main HTML page. Once it clears, the pollRunnable injects the JSON fetch.
+                val headers = mutableMapOf(
+                    "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "Cache-Control" to "no-cache",
+                    "Referer" to "${ReelFrenConfig.REEL_SITE}/"
+                )
+                ReelFrenLog.d("CF/JSFetch", "🌐 Loading root HTML page to bootstrap fetch...")
+                web.loadUrl(ReelFrenConfig.REEL_SITE, headers)
+                handler.postDelayed(pollRunnable, 1000)
+            }
+        }
+    }
 
     suspend fun solve(
         url: String,
