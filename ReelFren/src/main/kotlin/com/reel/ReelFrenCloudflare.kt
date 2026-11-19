@@ -8,7 +8,6 @@ import android.content.ContextWrapper
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.http.SslError
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -19,6 +18,9 @@ import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -120,7 +122,13 @@ object ReelFrenCloudflare {
                 return true
             }
         }
+        return isChallengeBody(trimmed)
+    }
+
+    private fun isChallengeBody(body: String): Boolean {
         if (body.isEmpty()) return false
+        val firstChar = body[0]
+        if (firstChar == '{' || firstChar == '[') return false
         val sample = if (body.length > 6000) body.substring(0, 6000) else body
         val lower = sample.lowercase(Locale.ROOT)
         return lower.contains("just a moment") ||
@@ -151,7 +159,7 @@ object ReelFrenCloudflare {
                t.contains("webpage not available")
     }
 
-    fun activity(): Activity? {
+    private fun activity(): Activity? {
         CommonActivity.activity?.let { return it }
         var ctx: Context? = ReelFrenStore.appContext
         var depth = 0
@@ -397,9 +405,9 @@ object ReelFrenCloudflare {
                                 var c1 = toPhys(sf, 'shadow-iframe');
                                 if (c1) return c1;
                             }
-                            var sel = 'iframe[src*="challenges.cloudflare.com"], [id^="cf-chl-widget"], #turnstile-wrapper, .cf-turnstile, #challenge-stage, .cb-c';
-                            var c3 = toPhys(document.querySelector(sel), 'selector');
-                            if (c3) return c3;
+                            var sel = 'iframe[src*="challenges.cloudflare.com"], #turnstile-wrapper, .cf-turnstile, #challenge-stage';
+                            var c2 = toPhys(document.querySelector(sel), 'selector');
+                            if (c2) return c2;
                             return '';
                         })();
                     """.trimIndent()
@@ -457,7 +465,6 @@ object ReelFrenCloudflare {
             cont.invokeOnCancellation { finish(false) }
 
             decor.addView(container)
-            // Native HTML navigation for Turnstile
             val headers = mutableMapOf(
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "Cache-Control" to "no-cache",
@@ -589,18 +596,9 @@ object ReelFrenCloudflare {
                                 var c1 = toPhys(sf, 'shadow-iframe');
                                 if (c1) return c1;
                             }
-                            var sel = 'iframe[src*="challenges.cloudflare.com"], [id^="cf-chl-widget"], #turnstile-wrapper, .cf-turnstile, #challenge-stage, .cb-c';
-                            var c3 = toPhys(document.querySelector(sel), 'selector');
-                            if (c3) return c3;
-    
-                            var all = document.querySelectorAll('div, iframe');
-                            for (var i = 0; i < all.length; i++) {
-                                var r = all[i].getBoundingClientRect();
-                                if (r.width >= 240 && r.width <= 360 && r.height >= 50 && r.height <= 85 && r.top >= 40) {
-                                    var c4 = toPhys(all[i], 'geom');
-                                    if (c4) return c4;
-                                }
-                            }
+                            var sel = 'iframe[src*="challenges.cloudflare.com"], #turnstile-wrapper, .cf-turnstile, #challenge-stage';
+                            var c2 = toPhys(document.querySelector(sel), 'selector');
+                            if (c2) return c2;
                             return '';
                         })();
                     """.trimIndent()
@@ -646,7 +644,7 @@ object ReelFrenCloudflare {
                     checkAndAutoInteract(count)
                     if (resolved.get() || settling.get()) return
 
-                    if (count < 60) handler.postDelayed(this, 1_500L) else finish(false)
+                    if (count < 45) handler.postDelayed(this, 1_500L) else finish(false)
                 }
             }
             handler.postDelayed(watchdog, 1_500L)
