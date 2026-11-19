@@ -90,6 +90,12 @@ object ReelFrenCfState {
             runCatching { session.deferred.complete(result) }
         }
     }
+    
+    // Kept for backward compatibility with Interceptor calls
+    fun userAgentFor(host: String): String? = ReelFrenStore.userAgent(host).ifEmpty { null }
+    fun setUserAgent(host: String, ua: String) {
+        ReelFrenStore.setUserAgent(host, ua)
+    }
 }
 
 object ReelFrenCloudflare {
@@ -647,8 +653,8 @@ object ReelFrenCloudflare {
             }
 
             cont.invokeOnCancellation { finish(false) }
+
             decor.addView(container)
-            
             val headers = mutableMapOf(
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "Cache-Control" to "no-cache",
@@ -803,11 +809,11 @@ object ReelFrenCloudflare {
                             return '';
                         })();
                     """.trimIndent()
-                    wv.evaluateJavascript(locateJs) { res ->
+                    wv.evaluateJavascript(locateJs) { jsRes ->
                         if (resolved.get() || settling.get()) return@evaluateJavascript
-                        val raw = res?.trim('"').orEmpty()
-                        if (raw.isEmpty()) return@evaluateJavascript
-                        val parts = raw.split(",")
+                        val rawJs = jsRes?.trim('"').orEmpty()
+                        if (rawJs.isEmpty()) return@evaluateJavascript
+                        val parts = rawJs.split(",")
                         val cx = parts.getOrNull(0)?.toFloatOrNull() ?: return@evaluateJavascript
                         val cy = parts.getOrNull(1)?.toFloatOrNull() ?: return@evaluateJavascript
                         ReelFrenLog.d("CF/dialog-tap", "Dispatching tap at physical ($cx, $cy)")
