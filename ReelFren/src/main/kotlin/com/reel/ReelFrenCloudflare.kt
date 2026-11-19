@@ -30,6 +30,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import com.lagradost.cloudstream3.CommonActivity
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -419,9 +420,11 @@ object ReelFrenCloudflare {
                     }
                     showInteractiveDialog(act, url, host, rejectedTokens, session)
                 }
+            } catch (ce: CancellationException) {
+                ReelFrenCfState.completeAndEndSolve(host, session, false)
+                throw ce
             } catch (t: Throwable) {
                 ReelFrenCfState.completeAndEndSolve(host, session, false)
-                if (t is CancellationException) throw t
                 ReelFrenLog.t("CF/solve", t)
             }
         }
@@ -644,8 +647,8 @@ object ReelFrenCloudflare {
             }
 
             cont.invokeOnCancellation { finish(false) }
-
             decor.addView(container)
+            
             val headers = mutableMapOf(
                 "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
                 "Cache-Control" to "no-cache",
@@ -800,11 +803,11 @@ object ReelFrenCloudflare {
                             return '';
                         })();
                     """.trimIndent()
-                    wv.evaluateJavascript(locateJs) { jsRes ->
+                    wv.evaluateJavascript(locateJs) { res ->
                         if (resolved.get() || settling.get()) return@evaluateJavascript
-                        val rawJs = jsRes?.trim('"').orEmpty()
-                        if (rawJs.isEmpty()) return@evaluateJavascript
-                        val parts = rawJs.split(",")
+                        val raw = res?.trim('"').orEmpty()
+                        if (raw.isEmpty()) return@evaluateJavascript
+                        val parts = raw.split(",")
                         val cx = parts.getOrNull(0)?.toFloatOrNull() ?: return@evaluateJavascript
                         val cy = parts.getOrNull(1)?.toFloatOrNull() ?: return@evaluateJavascript
                         ReelFrenLog.d("CF/dialog-tap", "Dispatching tap at physical ($cx, $cy)")
