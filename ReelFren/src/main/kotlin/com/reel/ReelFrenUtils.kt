@@ -3,18 +3,27 @@ package com.reel
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import android.webkit.CookieManager
 import android.webkit.WebSettings
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import okhttp3.CipherSuite
+import okhttp3.ConnectionSpec
+import okhttp3.Cookie
+import okhttp3.CookieJar
+import okhttp3.HttpUrl
+import okhttp3.Protocol
+import okhttp3.TlsVersion
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
+// ── Unified Logger ───────────────────────────────────────────────────────────
 object ReelFrenLog {
     private const val TAG = "ReelFren/CF"
     fun d(scope: String, msg: String) {
@@ -25,6 +34,7 @@ object ReelFrenLog {
     }
 }
 
+// ── Models ───────────────────────────────────────────────────────────────────
 data class DetailInfo(
     val id: String, val provider: String, val title: String,
     val cover: String, val intro: String, val episodes: Int,
@@ -43,6 +53,7 @@ data class QualityEntry(val label: String, val url: String, val format: String)
 data class SubtitleEntry(val label: String, val lang: String, val url: String)
 data class VideoEntry(val episode: Int, val duration: Int, val vid: String, val available: Boolean)
 
+// ── Config & Provider Registry ───────────────────────────────────────────────
 object ReelFrenConfig {
     const val REEL_SITE = "https://reelfren.net"
     const val DEFAULT_API_BASE = "https://reelfren.net"
@@ -84,6 +95,7 @@ object ReelFrenConfig {
     )
 }
 
+// ── JSON Parser ──────────────────────────────────────────────────────────────
 object ReelFrenParse {
     private val SUB_ARRAY_KEYS = arrayOf("subtitles", "subtitleList", "subs", "tracks", "captions", "captionList")
     private val SUB_DIRECT_KEYS = arrayOf("subtitleUrl", "subUrl", "subtitle", "vtt", "srt", "captionUrl", "webvtt")
@@ -286,6 +298,13 @@ object ReelFrenStore {
         return providerPrefs?.getBoolean("provider_$slug", default) ?: default
     }
 
+    // ALL SETTINGS/PREWARM FUNCTIONS FULLY RESTORED
+    fun setProviderEnabled(editor: SharedPreferences.Editor, slug: String, enabled: Boolean) {
+        editor.putBoolean("provider_$slug", enabled)
+    }
+
+    fun providerPrefsEditor(): SharedPreferences.Editor? = providerPrefs?.edit()
+
     fun enabledProviders(): Map<String, String> =
         ReelFrenConfig.PROVIDERS_MAP.filter { (_, slug) -> isProviderEnabled(slug) }
 
@@ -343,6 +362,28 @@ object ReelFrenStore {
         val cleaned = normalizeUa(ua)
         memoryUa[norm] = cleaned
         storePrefs?.edit()?.putString("ua_$norm", cleaned)?.apply()
+    }
+
+    fun shouldSkipPrewarm(): Boolean {
+        val lastFail = storePrefs?.getLong("prewarm_last_fail", 0L) ?: 0L
+        val failCount = storePrefs?.getInt("prewarm_fail_count", 0) ?: 0
+        if (lastFail == 0L || failCount <= 0) return false
+        val shift = (failCount - 1).coerceIn(0, 6)
+        val cooldown = 60_000L * (1L shl shift)
+        return (System.currentTimeMillis() - lastFail) < cooldown
+    }
+
+    fun recordPrewarmResult(success: Boolean) {
+        val editor = storePrefs?.edit() ?: return
+        if (success) {
+            editor.putLong("prewarm_last_fail", 0L)
+            editor.putInt("prewarm_fail_count", 0)
+        } else {
+            val count = (storePrefs?.getInt("prewarm_fail_count", 0) ?: 0) + 1
+            editor.putLong("prewarm_last_fail", System.currentTimeMillis())
+            editor.putInt("prewarm_fail_count", count)
+        }
+        editor.apply()
     }
 }
 
@@ -415,13 +456,58 @@ object ReelFrenUrl {
     }
 }
 
+// ── CookieJar Bridge ────────────────────────────────────────────────────────
+class WebViewCookieJar : CookieJar {
+    private val cookieManager = CookieManager.getInstance()
+
+    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+        val urlString = url.toString()
+        for (cookie in cookies) {
+            cookieManager.setCookie(urlString, cookie.toString())
+        }
+        cookieManager.flush()
+    }
+
+    override fun loadForRequest(url: HttpUrl): List<Cookie> {
+        val cookieStr = cookieManager.getCookie(url.toString())
+        if (cookieStr.isNullOrEmpty()) return emptyList()
+
+        return cookieStr.split(";").mapNotNull {
+            Cookie.parse(url, it.trim())
+        }
+    }
+}
+
+// ── HTTP Client with Spoofed TLS & CookieJar ────────────────────────────────
 object ReelFrenClient {
 
     const val FALLBACK_UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+
     private val siteHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.REEL_SITE) }
-    
-    // The Master Lock: Prevents 10 simultaneous categories from triggering CF at once
     private val apiMutex = Mutex()
+
+    private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
+        .tlsVersions(TlsVersion.TLS_1_2, TlsVersion.TLS_1_3)
+        .cipherSuites(
+            CipherSuite.TLS_AES_128_GCM_SHA256,
+            CipherSuite.TLS_AES_256_GCM_SHA384,
+            CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            CipherSuite.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            CipherSuite.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+        )
+        .build()
+
+    private val spoofedClient = app.baseClient.newBuilder()
+        .cookieJar(WebViewCookieJar())
+        .connectionSpecs(listOf(chromeSpec, ConnectionSpec.CLEARTEXT))
+        .protocols(listOf(Protocol.HTTP_1_1))
+        .build()
+
+    private val spoofedApp = com.lagradost.nicehttp.Requests(spoofedClient)
 
     private fun apiBase() = ReelFrenStore.apiBase()
     private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
@@ -460,8 +546,6 @@ object ReelFrenClient {
         if (isSiteDomain(host)) {
             map["Origin"] = ReelFrenConfig.REEL_SITE
             map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
-            val cookie = ReelFrenStore.cookie(host)
-            if (cookie.isNotBlank()) map["Cookie"] = cookie
         }
         return map
     }
@@ -473,32 +557,35 @@ object ReelFrenClient {
 
     suspend fun get(url: String): String? {
         val targetHost = ReelFrenCloudflare.hostOf(url)
+        val isReelFrenApi = isSiteDomain(targetHost)
         
-        // Fast path: Standard fetch via OkHttp for external domains and cached sessions
-        ReelFrenLog.d("Client.get", "Attempting request via OkHttp: $url")
-        var responseText = try {
-            app.get(url, headers = headers(url, isApiCall = isSiteDomain(targetHost)), timeout = 15L).text
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (e: Exception) { "" }
-
-        if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) {
-            return responseText
+        if (!isReelFrenApi) {
+            return try {
+                app.get(url, headers = headers(url, false), timeout = 25L).text
+            } catch (e: Exception) { null }
         }
 
-        ReelFrenLog.d("Client.get", "OkHttp failed or challenged. Acquiring CF Mutex...")
+        ReelFrenLog.d("Client.get", "Attempting fast-path OkHttp fetch for: $url")
+        var jsonText = try {
+            spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text
+        } catch (e: Exception) { "" }
+
+        if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) {
+            return jsonText
+        }
+
+        ReelFrenLog.d("Client.get", "Fast-path failed. Acquiring Mutex to solve CF sequentially...")
         
-        // Enter single-flight solving. Only 1 provider at a time solves Cloudflare.
         apiMutex.withLock {
-            ReelFrenLog.d("Client.get", "Mutex acquired. Double checking cache...")
+            ReelFrenLog.d("Client.get", "Mutex acquired for $url. Double checking if another thread already solved it...")
             
-            responseText = try {
-                app.get(url, headers = headers(url, isApiCall = isSiteDomain(targetHost)), timeout = 15L).text
+            jsonText = try {
+                spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text
             } catch (e: Exception) { "" }
             
-            if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) {
+            if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) {
                 ReelFrenLog.d("Client.get", "Pre-cleared by previous provider! Proceeding.")
-                return responseText
+                return jsonText
             }
 
             ReelFrenLog.d("Client.get", "Delegating to CFSolver on root site.")
@@ -509,16 +596,14 @@ object ReelFrenClient {
                 return null
             }
 
-            // CRITICAL CHANGE: We bypass OkHttp ENTIRELY for the post-solve API fetch to avoid TLS mismatch.
-            // We use a hidden WebView to fetch the JSON API response using Chrome's native engine.
-            ReelFrenLog.d("Client.get", "CF solved. Fetching JSON natively via WebView...")
-            val jsonText = ReelFrenCloudflare.fetchJsonWithWebView(url)
+            ReelFrenLog.d("Client.get", "CF solved. Final fetch attempt for $url")
+            val webViewResult = ReelFrenCloudflare.fetchJsonWithWebView(url)
             
-            if (jsonText.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(jsonText)) {
+            if (webViewResult.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(webViewResult)) {
                 ReelFrenLog.d("Client.get", "Final JSON WebView fetch failed. Giving up.")
                 return null
             }
-            return jsonText
+            return webViewResult
         }
     }
 
