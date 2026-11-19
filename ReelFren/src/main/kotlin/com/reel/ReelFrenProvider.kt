@@ -8,15 +8,14 @@ import com.lagradost.cloudstream3.MainPageRequest
 import com.lagradost.cloudstream3.SearchResponse
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 
-class ReelFrenProvider(
-    override var name: String, // FIX: Changed from 'val' to 'var' to match Cloudstream's MainAPI
-    private val slug: String
-) : MainAPI() {
+class ReelFrenProvider : MainAPI() {
 
+    override var name = "ReelFren"
     override var mainUrl = ReelFrenConfig.REEL_SITE
     override var lang = "en"
     override val hasMainPage = true
@@ -24,13 +23,21 @@ class ReelFrenProvider(
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.AsianDrama, TvType.TvSeries)
 
+    // Maps the enabled providers into the Cloudstream Homepage Dropdown
+    override val mainPage = mainPageOf(
+        *ReelFrenStore.enabledProviders().map { it.value to it.key }.toTypedArray()
+    )
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        ReelFrenLog.d("Main/getMainPage", "ENTRY page=$page slug=$slug name=$name")
+        val slug = request.data // Gets "pinedrama", "shorten", etc. from the dropdown
+        ReelFrenLog.d("Main/getMainPage", "ENTRY page=$page slug=$slug name=${request.name}")
+        
         val items = ReelFrenClient.home(slug, page = page)
         if (items.isEmpty()) {
             ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=0 added=0 hasNext=false")
             return newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
+        
         val mapped = items.map { item ->
             newMovieSearchResponse(item.title, ReelFrenUrl.page(slug, item.id), TvType.AsianDrama) {
                 this.posterUrl = ReelFrenClient.absUrl(item.cover)
@@ -42,10 +49,11 @@ class ReelFrenProvider(
     }
 
     override suspend fun search(query: String): List<SearchResponse>? {
-        ReelFrenLog.d("Main/search", "query='$query' slug=$slug")
-        val items = ReelFrenClient.search(slug, query)
+        ReelFrenLog.d("Main/search", "query='$query'")
+        // Search globally across all dramas
+        val items = ReelFrenClient.search("all_dramas", query)
         val mapped = items.map { item ->
-            newMovieSearchResponse(item.title, ReelFrenUrl.page(slug, item.id), TvType.AsianDrama) {
+            newMovieSearchResponse(item.title, ReelFrenUrl.page(item.provider, item.id), TvType.AsianDrama) {
                 this.posterUrl = ReelFrenClient.absUrl(item.cover)
                 this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
             }
@@ -56,8 +64,8 @@ class ReelFrenProvider(
 
     override suspend fun load(url: String): LoadResponse? {
         ReelFrenLog.d("Main/load", "url=$url")
-        val (_, id, _) = ReelFrenUrl.parse(url)
-        if (id.isEmpty()) throw ErrorLoadingException("Invalid URL or missing ID")
+        val (slug, id, _) = ReelFrenUrl.parse(url)
+        if (id.isEmpty() || slug.isEmpty()) throw ErrorLoadingException("Invalid URL or missing ID")
         val d = ReelFrenClient.detail(slug, id) ?: throw ErrorLoadingException("Failed to load detail")
         
         return newMovieLoadResponse(d.title, url, TvType.AsianDrama, d.videos.joinToString(",") { it.vid }) {
@@ -74,8 +82,8 @@ class ReelFrenProvider(
         callback: (com.lagradost.cloudstream3.utils.ExtractorLink) -> Unit
     ): Boolean {
         ReelFrenLog.d("Main/loadLinks", "url=$data")
-        val (_, id, ep) = ReelFrenUrl.parse(data)
-        if (id.isEmpty()) return false
+        val (slug, id, ep) = ReelFrenUrl.parse(data)
+        if (id.isEmpty() || slug.isEmpty()) return false
         val p = ReelFrenClient.playback(slug, id, ep) ?: return false
 
         p.subtitles.forEach { sub ->
