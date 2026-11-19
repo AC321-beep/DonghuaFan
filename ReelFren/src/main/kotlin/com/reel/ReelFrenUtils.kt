@@ -3,13 +3,16 @@ package com.reel
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
+import android.webkit.CookieManager
 import android.webkit.WebSettings
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import kotlinx.coroutines.CancellationException
 import okhttp3.CipherSuite
 import okhttp3.ConnectionSpec
+import okhttp3.Interceptor
 import okhttp3.Protocol
+import okhttp3.Response
 import okhttp3.TlsVersion
 import org.json.JSONArray
 import org.json.JSONObject
@@ -584,14 +587,53 @@ object ReelFrenUrl {
     }
 }
 
+// ── Strict State Interceptor ─────────────────────────────────────────────────────────────
+class ReelFrenInterceptor : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val original = chain.request()
+        val host = original.url.host
+        val builder = original.newBuilder()
+
+        val ua = ReelFrenCfState.userAgentFor(host) ?: ReelFrenClient.FALLBACK_UA
+        builder.header("User-Agent", ua)
+        
+        builder.removeHeader("X-Requested-With")
+
+        // CRITICAL FIX: Pull the cookie from our synchronous Store instead of the asynchronous CookieManager.
+        val existing = original.header("Cookie")
+        val savedAppCookie = ReelFrenStore.cookie(host)
+        
+        val merged = listOfNotNull(existing?.ifEmpty { null }, savedAppCookie.ifEmpty { null })
+            .joinToString("; ")
+            
+        if (merged.isNotEmpty()) {
+            builder.header("Cookie", merged)
+        }
+
+        // Must inject Accept: application/json for API requests so Next.js returns JSON instead of HTML
+        if (original.url.encodedPath.startsWith("/api/")) {
+            builder.header("Accept", "application/json, text/plain, */*")
+        } else {
+            builder.header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        }
+        
+        builder.header("Accept-Language", "en-US,en;q=0.5")
+        builder.header("Connection", "keep-alive")
+        builder.header("Sec-Fetch-Dest", "document")
+        builder.header("Sec-Fetch-Mode", "navigate")
+        builder.header("Sec-Fetch-Site", "same-origin")
+
+        return chain.proceed(builder.build())
+    }
+}
+
+// ── HTTP Client with Interceptor & Spoofed TLS ─────────────────────────────────────────────
 object ReelFrenClient {
 
-    const val FALLBACK_UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 " +
-                            "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+    const val FALLBACK_UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 
     private val siteHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.REEL_SITE) }
 
-    // Spoofed OkHttp TLS Fingerprint to mimic Chrome and bypass CF's HTTP/2 JA3 checks
     private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
         .tlsVersions(TlsVersion.TLS_1_2, TlsVersion.TLS_1_3)
         .cipherSuites(
@@ -607,7 +649,9 @@ object ReelFrenClient {
         )
         .build()
 
+    // Spoofed OkHttp Client paired with our Interceptor
     private val spoofedClient = app.baseClient.newBuilder()
+        .addInterceptor(ReelFrenInterceptor())
         .connectionSpecs(listOf(chromeSpec, ConnectionSpec.CLEARTEXT))
         .protocols(listOf(Protocol.HTTP_1_1))
         .build()
@@ -624,14 +668,9 @@ object ReelFrenClient {
         val p = mutableListOf<String>()
         val isGlobal = slug == "all_dramas"
         
-        if (!isGlobal && slug.isNotEmpty()) {
-            p += "provider=${query(slug)}"
-        }
-        
+        if (!isGlobal && slug.isNotEmpty()) p += "provider=${query(slug)}"
         p += "lang=en"
-        
         if (category.isNotEmpty()) p += "category=${query(category)}"
-        
         val off = page - 1
         if (off > 0) p += "offset=$off"
         
@@ -649,34 +688,17 @@ object ReelFrenClient {
 
     fun headers(url: String, isApiCall: Boolean = false): Map<String, String> {
         val host = ReelFrenCloudflare.hostOf(url)
-        val savedUa = ReelFrenStore.userAgent(host)
-
-        val map = linkedMapOf(
-            "User-Agent"      to savedUa,
-            "Accept-Language" to "en-US,en;q=0.9"
-        )
-        
-        if (isApiCall) {
-            map["Accept"] = "application/json, text/plain, */*"
-        } else {
-            map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-        }
-
+        val map = linkedMapOf<String, String>()
         if (isSiteDomain(host)) {
             map["Origin"] = ReelFrenConfig.REEL_SITE
             map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
-            val savedCookie = ReelFrenStore.cookie(host)
-            if (savedCookie.isNotBlank()) {
-                map["Cookie"] = savedCookie
-            }
         }
         return map
     }
 
     fun posterHeaders(posterUrl: String?): Map<String, String>? {
         if (posterUrl.isNullOrEmpty()) return null
-        val host = ReelFrenCloudflare.hostOf(posterUrl)
-        return if (isSiteDomain(host)) headers(posterUrl, isApiCall = false) else null
+        return if (isSiteDomain(ReelFrenCloudflare.hostOf(posterUrl))) headers(posterUrl, isApiCall = false) else null
     }
 
     suspend fun get(url: String): String? {
@@ -705,17 +727,16 @@ object ReelFrenClient {
 
         ReelFrenLog.d("Client.get", "Challenge detected. Delegating to CFSolver on root site.")
         
-        val initialCookie = ReelFrenStore.cookie(targetHost)
-        // MUST solve on the root HTML site to satisfy Turnstile's DOM rendering requirements
         val solveUrl = ReelFrenConfig.REEL_SITE
-        val solved = ReelFrenCloudflare.solve(solveUrl, invalidatedCookie = initialCookie)
+        val solved = ReelFrenCloudflare.solve(solveUrl)
         
         if (!solved) {
             ReelFrenLog.d("Client.get", "CFSolver failed (dismissed or timed out). Returning null.")
             return null
         }
 
-        // Retry the API fetch using Spoofed OkHttp now that CookieManager holds the fresh clearance
+        // The cookie was saved synchronously inside CFSolver -> Store. 
+        // Interceptor will grab it perfectly.
         responseText = try {
             if (isReelFrenApi) {
                 spoofedApp.get(url, headers = headers(url, isApiCall = true), timeout = 25L, cacheTime = 0).text
@@ -732,33 +753,8 @@ object ReelFrenClient {
         val isStillChallenged = responseText.isEmpty() || ReelFrenCloudflare.isChallengeResponse(200, null, responseText)
         
         if (isStillChallenged) {
-            ReelFrenLog.d("Client.get", "Spoofed OkHttp fetch failed even after solve. Forcing interactive dialog.")
-            
-            val forcedInteractiveSolved = ReelFrenCloudflare.solve(
-                solveUrl,
-                invalidatedCookie = ReelFrenStore.cookie(targetHost),
-                forceInteractive = true
-            )
-            
-            if (!forcedInteractiveSolved) return null
-            
-            responseText = try {
-                if (isReelFrenApi) {
-                    spoofedApp.get(url, headers = headers(url, isApiCall = true), timeout = 25L, cacheTime = 0).text
-                } else {
-                    app.get(url, headers = headers(url, isApiCall = false), timeout = 25L).text
-                }
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (e: Exception) {
-                ReelFrenLog.t("Client.get/fetch3", e)
-                ""
-            }
-            
-            if (responseText.isEmpty() || ReelFrenCloudflare.isChallengeResponse(200, null, responseText)) {
-                ReelFrenLog.d("Client.get", "Final fetch failed after forced interactive. Giving up.")
-                return null
-            }
+            ReelFrenLog.d("Client.get", "Spoofed OkHttp fetch failed even after solve. Giving up.")
+            return null
         }
 
         return responseText
