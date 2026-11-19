@@ -56,7 +56,8 @@ data class VideoEntry(val episode: Int, val duration: Int, val vid: String, val 
 // ── Config & Provider Registry ───────────────────────────────────────────────
 object ReelFrenConfig {
     const val REEL_SITE = "https://reelfren.net"
-    const val DEFAULT_API_BASE = "https://reelfren.net"
+    // CRITICAL FIX: The API is hosted on a separate subdomain!
+    const val DEFAULT_API_BASE = "https://api.reelfren.net"
 
     val DEFAULT_ENABLED_SLUGS = setOf(
         "dramabox", "reelshort", "wetv", "happyshort", "shorten",
@@ -535,10 +536,8 @@ object ReelFrenClient {
         map["Accept-Language"] = "en-US,en;q=0.9"
         
         if (isApiCall) {
-            // CRITICAL FIX: To prevent Next.js from throwing a 404, we MUST spoof the exact Next.js RSC Headers
+            // Using standard JSON headers verified against the Network Trace
             map["Accept"] = "application/json, text/plain, */*"
-            map["RSC"] = "1"
-            map["Next-Router-State-Tree"] = "%5B%22%22%2C%7B%22children%22%3A%5B%22(main)%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%5D%7D%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
         } else {
             map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
         }
@@ -547,7 +546,6 @@ object ReelFrenClient {
             map["Origin"] = ReelFrenConfig.REEL_SITE
             map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
             
-            // Inject cookie just in case CookieJar is sluggish
             val cookie = ReelFrenStore.cookie(host)
             if (cookie.isNotBlank()) map["Cookie"] = cookie
         }
@@ -571,7 +569,7 @@ object ReelFrenClient {
             } catch (e: Exception) { null }
         }
 
-        ReelFrenLog.d("Client.get", "Attempting fast-path Next.js Spoof fetch for: $url")
+        ReelFrenLog.d("Client.get", "Attempting fast-path API fetch for: $url")
         var jsonText = try {
             spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text
         } catch (e: Exception) { 
@@ -606,7 +604,7 @@ object ReelFrenClient {
                 return null
             }
 
-            ReelFrenLog.d("Client.get", "🚀 CF solved. Firing spoofed OkHttp fetch...")
+            ReelFrenLog.d("Client.get", "🚀 CF solved. Firing native OkHttp fetch...")
             val finalJson = try {
                 spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text
             } catch (e: Exception) { "" }
@@ -616,7 +614,7 @@ object ReelFrenClient {
                 return null
             }
             
-            ReelFrenLog.d("Client.get", "✅ Next.js Spoofer Succeeded! Length: ${finalJson.length}")
+            ReelFrenLog.d("Client.get", "✅ API Fetch Succeeded! Length: ${finalJson.length}")
             return finalJson
         }
     }
