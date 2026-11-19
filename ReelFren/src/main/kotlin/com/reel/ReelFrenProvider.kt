@@ -81,7 +81,6 @@ class ReelFrenProvider : MainAPI() {
         val coverUrl = ReelFrenClient.absUrl(d.cover)
         val coverHeaders = ReelFrenClient.posterHeaders(coverUrl)
 
-        // CRITICAL FIX: Properly map the videos array into actual episodes
         if (d.videos.size > 1 || d.episodes > 1) {
             return newTvSeriesLoadResponse(
                 name = d.title,
@@ -100,7 +99,6 @@ class ReelFrenProvider : MainAPI() {
                 this.plot = d.intro
             }
         } else {
-            // It's a standalone movie
             val singleVideoId = d.videos.firstOrNull()?.episode ?: 1
             return newMovieLoadResponse(
                 name = d.title,
@@ -134,18 +132,43 @@ class ReelFrenProvider : MainAPI() {
         var found = false
         p.qualities.forEach { q ->
             val qUrl = ReelFrenClient.absUrl(q.url)
+            if (qUrl.isBlank() || !qUrl.startsWith("http")) return@forEach
+
             val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
             val linkType = ReelFrenQuality.linkType(qUrl, format)
             
+            // 1. FIX THE QUALITY DISPLAY
+            // Replaces "1 1080p" with cleaner text like "ReelFren 1080p" or "Server 2 - HD"
+            val serverStr = if (p.server.isBlank() || p.server == "1") "ReelFren" else "Server ${p.server}"
+            val finalName = if (q.label.contains("Auto", true) || q.label.isBlank()) {
+                serverStr
+            } else {
+                "$serverStr - ${q.label}"
+            }
+
+            // 2. FIX THE 2004 ExoPlayer CDN ERROR
+            // Strip out all the Accept/HTML headers that trigger AWS S3 and Cloudfront firewalls
+            val host = ReelFrenCloudflare.hostOf(qUrl)
+            val streamHeaders = mutableMapOf<String, String>()
+            streamHeaders["User-Agent"] = ReelFrenStore.userAgent(host)
+            
+            if (host.contains("reelfren.net")) {
+                streamHeaders["Referer"] = "$mainUrl/"
+                val cookie = ReelFrenStore.cookie(host)
+                if (cookie.isNotEmpty()) streamHeaders["Cookie"] = cookie
+            } else {
+                // By providing a blank Referer to 3rd party video CDNs, we prevent Error 2004
+            }
+
             callback(
                 com.lagradost.cloudstream3.utils.ExtractorLink(
                     source = name,
-                    name = p.server,
+                    name = finalName,
                     url = qUrl,
-                    referer = "$mainUrl/",
+                    referer = if (host.contains("reelfren.net")) "$mainUrl/" else "", 
                     quality = ReelFrenQuality.of(q.label),
                     type = linkType,
-                    headers = ReelFrenClient.headers(qUrl, isApiCall = false)
+                    headers = streamHeaders
                 )
             )
             found = true
