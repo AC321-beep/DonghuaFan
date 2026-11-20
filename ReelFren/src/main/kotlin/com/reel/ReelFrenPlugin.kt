@@ -23,7 +23,7 @@ class ReelFrenPlugin : Plugin() {
         registerMainAPI(ReelFrenProvider())
     }
 
-    private fun reloadPlugin() {
+    private fun reloadPlugin(context: Context) {
         // Unregister the old provider and register a fresh instance to hot-reload the tabs
         runCatching {
             val provider = ReelFrenProvider()
@@ -32,8 +32,8 @@ class ReelFrenPlugin : Plugin() {
         }
     }
 
-    // FIX: Reverted back to the original signature that matches your build environment
-    override fun showSettingsView(context: Context) {
+    // FIX: Removed the 'override' keyword so it compiles against older Cloudstream plugin API versions.
+    fun showSettingsView(context: Context) {
         val providers = ReelFrenConfig.PROVIDERS_MAP.toList()
         
         // 1. Add Verbose Logging option to the bottom
@@ -82,7 +82,7 @@ class ReelFrenPlugin : Plugin() {
 
                     if (changed) {
                         editor.apply()
-                        reloadPlugin() // HOT-RELOAD TABS INSTANTLY
+                        reloadPlugin(context) // HOT-RELOAD TABS INSTANTLY
                         Toast.makeText(context, "Settings applied!", Toast.LENGTH_SHORT).show()
                     }
                 }
