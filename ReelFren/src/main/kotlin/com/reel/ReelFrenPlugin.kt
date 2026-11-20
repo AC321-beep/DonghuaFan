@@ -32,8 +32,8 @@ class ReelFrenPlugin : Plugin() {
         }
     }
 
-    // FIX: Reverted to the proper signature `showSettingsView(context: Context, tv: Boolean)`
-    override fun showSettingsView(context: Context, tv: Boolean) {
+    // FIX: Reverted back to the original signature that matches your build environment
+    override fun showSettingsView(context: Context) {
         val providers = ReelFrenConfig.PROVIDERS_MAP.toList()
         
         // 1. Add Verbose Logging option to the bottom
