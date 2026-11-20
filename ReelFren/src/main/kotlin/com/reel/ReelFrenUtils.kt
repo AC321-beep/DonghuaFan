@@ -27,7 +27,7 @@ import java.util.concurrent.ConcurrentHashMap
 object ReelFrenLog {
     private const val TAG = "ReelFren/CF"
     
-    // FIX: Re-added the verbose flag that the plugin file is trying to toggle
+    // STRICTLY DYNAMIC: Defaults to false, respects your shared preferences.
     var isVerbose: Boolean = false 
 
     fun d(scope: String, msg: String) {
@@ -308,11 +308,21 @@ object ReelFrenStore {
         appContext = ctx.applicationContext
         storePrefs = appContext?.getSharedPreferences("reelfren_store", Context.MODE_PRIVATE)
         providerPrefs = appContext?.getSharedPreferences("reelfren_prefs", Context.MODE_PRIVATE)
+        
+        // Dynamically load verbose logging state on initialization
+        ReelFrenLog.isVerbose = providerPrefs?.getBoolean("verbose_logging", false) ?: false
+
         runCatching {
             normalizeUa(WebSettings.getDefaultUserAgent(ctx))
         }.getOrNull()?.takeIf { it.isNotBlank() }?.let { ua ->
             defaultSystemUa = ua
         }
+    }
+
+    // Call this from anywhere in your plugin to toggle logging dynamically!
+    fun setVerboseLogging(enabled: Boolean) {
+        ReelFrenLog.isVerbose = enabled
+        providerPrefs?.edit()?.putBoolean("verbose_logging", enabled)?.apply()
     }
 
     fun isProviderEnabled(slug: String): Boolean {
