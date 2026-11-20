@@ -147,6 +147,7 @@ class ReelFrenProvider : MainAPI() {
                         this.headers = mapOf(
                             "User-Agent" to ReelFrenStore.userAgent(subHost),
                             "Referer" to "$mainUrl/",
+                            "Origin" to mainUrl, // Added to fix CORS blocking on static-aka.cubetv.cc
                             "Accept" to "*/*"
                         )
                     }
@@ -163,7 +164,6 @@ class ReelFrenProvider : MainAPI() {
             val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
             val linkType = ReelFrenQuality.linkType(qUrl, format)
             
-            // THE FIX: Provide strictly the server name. Cloudstream handles appending the quality label automatically!
             val finalName = if (p.server.isBlank() || p.server == "1") "ReelFren" else "Server ${p.server}"
 
             val host = ReelFrenCloudflare.hostOf(qUrl)
@@ -172,6 +172,7 @@ class ReelFrenProvider : MainAPI() {
             
             if (host.contains("reelfren.net")) {
                 streamHeaders["Referer"] = "$mainUrl/"
+                streamHeaders["Origin"] = mainUrl
                 val cookie = ReelFrenStore.cookie(host)
                 if (cookie.isNotEmpty()) streamHeaders["Cookie"] = cookie
             }
