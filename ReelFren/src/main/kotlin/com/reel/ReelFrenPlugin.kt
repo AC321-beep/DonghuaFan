@@ -72,13 +72,12 @@ class ReelFrenPlugin : Plugin() {
 
                                 if (changed) {
                                     editor.apply()
-                                    // Update backend
+                                    
+                                    // Update backend mapping in memory
                                     registerMainAPI(ReelFrenProvider()) 
                                     
-                                    Toast.makeText(activity, "Settings applied!", Toast.LENGTH_SHORT).show()
-                                    
-                                    // AUTO-RELOAD HOMEPAGE TABS INSTANTLY
-                                    activity.recreate()
+                                    // Let the user safely reload the page themselves
+                                    Toast.makeText(activity, "Settings saved! Please reload the Home Page.", Toast.LENGTH_LONG).show()
                                 }
                             }
                         }
