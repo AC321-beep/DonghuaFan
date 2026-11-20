@@ -13,6 +13,7 @@ import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
+import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import java.net.URLDecoder
 import java.util.Locale
@@ -140,7 +141,16 @@ class ReelFrenProvider : MainAPI() {
                 val displayLang = sub.label.ifEmpty { sub.lang }.ifEmpty { "English" }
                     .replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
                 
-                subtitleCallback(SubtitleFile(displayLang, cleanUrl))
+                val subHost = ReelFrenCloudflare.hostOf(cleanUrl)
+                subtitleCallback(
+                    newSubtitleFile(lang = displayLang, url = cleanUrl) {
+                        this.headers = mapOf(
+                            "User-Agent" to ReelFrenStore.userAgent(subHost),
+                            "Referer" to "$mainUrl/",
+                            "Accept" to "*/*"
+                        )
+                    }
+                )
                 ReelFrenLog.d("Main/loadLinks", "Emitted Subtitle: $displayLang -> $cleanUrl")
             }
         }
@@ -153,12 +163,8 @@ class ReelFrenProvider : MainAPI() {
             val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
             val linkType = ReelFrenQuality.linkType(qUrl, format)
             
-            val serverStr = if (p.server.isBlank() || p.server == "1") "ReelFren" else "Server ${p.server}"
-            val finalName = if (q.label.contains("Auto", true) || q.label.isBlank()) {
-                serverStr
-            } else {
-                "$serverStr - ${q.label}"
-            }
+            // THE FIX: Provide strictly the server name. Cloudstream handles appending the quality label automatically!
+            val finalName = if (p.server.isBlank() || p.server == "1") "ReelFren" else "Server ${p.server}"
 
             val host = ReelFrenCloudflare.hostOf(qUrl)
             val streamHeaders = mutableMapOf<String, String>()
