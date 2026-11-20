@@ -23,7 +23,7 @@ class ReelFrenPlugin : Plugin() {
         registerMainAPI(ReelFrenProvider())
     }
 
-    private fun reloadPlugin(context: Context) {
+    private fun reloadPlugin() {
         // Unregister the old provider and register a fresh instance to hot-reload the tabs
         runCatching {
             val provider = ReelFrenProvider()
@@ -32,7 +32,8 @@ class ReelFrenPlugin : Plugin() {
         }
     }
 
-    override fun showSettingsView(context: Context) {
+    // FIX: Reverted to the proper signature `showSettingsView(context: Context, tv: Boolean)`
+    override fun showSettingsView(context: Context, tv: Boolean) {
         val providers = ReelFrenConfig.PROVIDERS_MAP.toList()
         
         // 1. Add Verbose Logging option to the bottom
@@ -81,7 +82,7 @@ class ReelFrenPlugin : Plugin() {
 
                     if (changed) {
                         editor.apply()
-                        reloadPlugin(context) // HOT-RELOAD TABS INSTANTLY
+                        reloadPlugin() // HOT-RELOAD TABS INSTANTLY
                         Toast.makeText(context, "Settings applied!", Toast.LENGTH_SHORT).show()
                     }
                 }
