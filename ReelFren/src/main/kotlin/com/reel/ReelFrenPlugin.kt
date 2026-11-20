@@ -2,6 +2,8 @@ package com.reel
 
 import android.app.AlertDialog
 import android.content.Context
+import android.widget.CheckBox
+import android.widget.FrameLayout
 import android.widget.Toast
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
@@ -16,43 +18,43 @@ class ReelFrenPlugin : Plugin() {
         ReelFrenStore.init(context)
         ReelFrenCloudflare.prewarmIfNeeded()
 
-        // Register ONE global provider
         registerMainAPI(ReelFrenProvider())
-        
-        // Uncomment this if your project includes the ReelFrenDirectLinkExtractor class:
-        // registerExtractorAPI(ReelFrenDirectLinkExtractor())
 
         openSettings = {
             val activity = CommonActivity.activity
             if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
                 
-                val providerNames = ReelFrenConfig.PROVIDERS_MAP.keys.toMutableList()
-                val providerSlugs = ReelFrenConfig.PROVIDERS_MAP.values.toMutableList()
-
-                // Add Verbose Logging option to the bottom of the list
-                providerNames.add("") // Visual spacer
-                providerNames.add("\uD83D\uDD27 Enable Verbose Logging (Debug)")
-
-                val checkedStates = BooleanArray(providerNames.size)
+                val providerNames = ReelFrenConfig.PROVIDERS_MAP.keys.toTypedArray()
+                val providerSlugs = ReelFrenConfig.PROVIDERS_MAP.values.toTypedArray()
                 
-                // Load Provider States
-                for (i in providerSlugs.indices) {
-                    checkedStates[i] = ReelFrenStore.isProviderEnabled(providerSlugs[i])
+                val checkedStates = BooleanArray(providerSlugs.size) { i ->
+                    ReelFrenStore.isProviderEnabled(providerSlugs[i])
                 }
-                
-                // Spacer is unchecked
-                checkedStates[providerNames.size - 2] = false
-                
-                // Load Verbose Logging State
-                checkedStates[providerNames.size - 1] = ReelFrenLog.isVerbose
 
                 activity.runOnUiThread {
                     if (activity.isFinishing || activity.isDestroyed) return@runOnUiThread
+                    
+                    // Create a clean, separate container for the Verbose Logging toggle
+                    val container = FrameLayout(activity)
+                    val verboseCheckbox = CheckBox(activity).apply {
+                        text = "Enable Verbose Logging (Debug)"
+                        isChecked = ReelFrenLog.isVerbose
+                    }
+                    val params = FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.MATCH_PARENT, 
+                        FrameLayout.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        setMargins(60, 20, 60, 20)
+                    }
+                    container.addView(verboseCheckbox, params)
+
                     AlertDialog.Builder(activity)
-                        .setTitle("ReelFren Settings")
-                        .setMultiChoiceItems(providerNames.toTypedArray(), checkedStates) { _, which, isChecked ->
+                        .setTitle("Select Providers")
+                        .setMultiChoiceItems(providerNames, checkedStates) { _, which, isChecked ->
                             checkedStates[which] = isChecked
                         }
+                        // This pins the CheckBox to the bottom of the dialog, visually separate from the list
+                        .setView(container) 
                         .setPositiveButton("Save") { _, _ ->
                             val editor = ReelFrenStore.providerPrefsEditor()
                             if (editor != null) {
@@ -70,8 +72,8 @@ class ReelFrenPlugin : Plugin() {
                                     }
                                 }
                                 
-                                // Save Verbose Logging
-                                val newVerboseState = checkedStates[providerNames.size - 1]
+                                // Save Verbose Logging state from the standalone checkbox
+                                val newVerboseState = verboseCheckbox.isChecked
                                 if (ReelFrenLog.isVerbose != newVerboseState) {
                                     ReelFrenStore.setVerboseLogging(newVerboseState)
                                     changed = true
