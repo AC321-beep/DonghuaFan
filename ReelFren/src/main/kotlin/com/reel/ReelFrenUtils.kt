@@ -56,7 +56,6 @@ data class VideoEntry(val episode: Int, val duration: Int, val vid: String, val 
 // ── Config & Provider Registry ───────────────────────────────────────────────
 object ReelFrenConfig {
     const val REEL_SITE = "https://reelfren.net"
-    // THIS IS THE FIX. IT MUST BE api.reelfren.net
     const val DEFAULT_API_BASE = "https://api.reelfren.net"
 
     val DEFAULT_ENABLED_SLUGS = setOf(
@@ -98,10 +97,9 @@ object ReelFrenConfig {
 
 // ── JSON Parser ──────────────────────────────────────────────────────────────
 object ReelFrenParse {
-    private val SUB_ARRAY_KEYS = arrayOf("subtitles", "subtitleList", "subs", "tracks", "captions", "captionList")
     private val SUB_DIRECT_KEYS = arrayOf("subtitleUrl", "subUrl", "subtitle", "vtt", "srt", "captionUrl", "webvtt")
     private val SUB_URL_KEYS = arrayOf("url", "src", "file", "subUrl", "subtitleUrl", "vtt", "srt", "link", "path", "webvtt")
-    private val SUB_LANG_KEYS = arrayOf("lang", "srclang", "srcLang", "language", "code", "locale", "langCode", "iso", "languageCode", "language_code", "lang_code")
+    private val SUB_LANG_KEYS = arrayOf("lang", "srclang", "srcLang", "language", "code", "locale", "langCode", "iso", "languageCode", "name")
     private val SUB_LABEL_KEYS = arrayOf("label", "name", "title", "display", "langName", "language")
 
     fun homeItems(body: String): List<HomeItem> {
@@ -152,6 +150,7 @@ object ReelFrenParse {
                 if (url.isNotEmpty()) {
                     qualities += QualityEntry(label = firstNonEmpty(q, "label", "quality", "name").ifEmpty { "Auto" }, url = url, format = clean(q, "format"))
                 }
+                // Scan for subtitles inside the quality objects
                 collectSubtitlesFromNode(q, subs)
             }
         }
@@ -162,6 +161,7 @@ object ReelFrenParse {
         }
         if (qualities.isEmpty()) return null
 
+        // Scan for subtitles in the main JSON structures
         collectSubtitlesFromNode(o, subs)
         if (o !== root) collectSubtitlesFromNode(root, subs)
 
@@ -176,17 +176,32 @@ object ReelFrenParse {
         )
     }
 
+    // FIX 2: Aggressive Dynamic Subtitle Scanning
     private fun collectSubtitlesFromNode(node: JSONObject, out: MutableList<SubtitleEntry>) {
-        for (key in SUB_ARRAY_KEYS) {
-            node.optJSONArray(key)?.let { arr -> parseSubtitleArray(arr, out) }
-            node.optJSONObject(key)?.let { obj -> parseSubtitleObjectOrMap(obj, out) }
+        val keys = node.keys()
+        while (keys.hasNext()) {
+            val key = keys.next()
+            val lowerKey = key.lowercase(Locale.ROOT)
+            
+            // Dynamically catch ANY key that sounds like it holds subtitles (e.g. "subtitle_list", "captionsData")
+            if (lowerKey.contains("sub") || lowerKey.contains("track") || lowerKey.contains("caption")) {
+                node.optJSONArray(key)?.let { arr -> parseSubtitleArray(arr, out) }
+                node.optJSONObject(key)?.let { obj -> parseSubtitleObjectOrMap(obj, out) }
+            }
         }
-        node.optJSONObject("subtitle")?.let { obj -> parseSubtitleObjectOrMap(obj, out) }
-        val fallbackLang = firstNonEmpty(node, "lang", "language", "srclang").ifEmpty { "en" }
+        
+        // Also check if the URL string is directly attached to the node
         for (key in SUB_DIRECT_KEYS) {
             if (node.optJSONObject(key) != null || node.optJSONArray(key) != null) continue
             val directUrl = clean(node, key)
-            if (looksLikeSubtitleUrl(directUrl)) out += SubtitleEntry(label = clean(node, "subtitleLabel").ifEmpty { fallbackLang }, lang = fallbackLang, url = directUrl)
+            if (looksLikeSubtitleUrl(directUrl)) {
+                val fallbackLang = firstNonEmpty(node, "lang", "language", "srclang").ifEmpty { "English" }
+                out += SubtitleEntry(
+                    label = clean(node, "subtitleLabel").ifEmpty { fallbackLang }, 
+                    lang = fallbackLang, 
+                    url = directUrl
+                )
+            }
         }
     }
 
@@ -199,7 +214,11 @@ object ReelFrenParse {
                 val rawUrl = arr.optString(i, "").trim()
                 if (looksLikeSubtitleUrl(rawUrl)) {
                     val guessedLang = guessLangFromUrl(rawUrl)
-                    out += SubtitleEntry(label = if (guessedLang == "und") "Subtitle ${i + 1}" else guessedLang.uppercase(), lang = guessedLang, url = rawUrl)
+                    out += SubtitleEntry(
+                        label = if (guessedLang == "und") "Subtitle ${i + 1}" else guessedLang.uppercase(), 
+                        lang = guessedLang, 
+                        url = rawUrl
+                    )
                 }
             }
         }
@@ -226,7 +245,7 @@ object ReelFrenParse {
         if (kind == "thumbnails" || kind == "chapters" || kind == "metadata") return null
         val u = firstNonEmpty(s, *SUB_URL_KEYS)
         if (!looksLikeSubtitleUrl(u)) return null
-        val lang = firstNonEmpty(s, *SUB_LANG_KEYS).ifEmpty { defaultLang }
+        val lang = firstNonEmpty(s, *SUB_LANG_KEYS).ifEmpty { defaultLang }.ifEmpty { "English" }
         return SubtitleEntry(label = firstNonEmpty(s, *SUB_LABEL_KEYS).ifEmpty { lang }, lang = lang, url = u)
     }
 
@@ -535,18 +554,15 @@ object ReelFrenClient {
         map["Accept-Language"] = "en-US,en;q=0.9"
         
         if (isApiCall) {
-            // Using standard JSON headers, matching your PC browser trace
             map["Accept"] = "application/json, text/plain, */*"
         } else {
             map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
         }
 
-        // Add correct Origin and Referer explicitly for the API requests
         if (targetHost == apiHost || targetHost.contains("reelfren.net")) {
             map["Origin"] = ReelFrenConfig.REEL_SITE
             map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
             
-            // Inject the clearance cookie manually if OkHttp gets confused by subdomains
             val cookie = ReelFrenStore.cookie(targetHost)
             if (cookie.isNotBlank()) map["Cookie"] = cookie
         }
@@ -600,7 +616,6 @@ object ReelFrenClient {
             }
 
             ReelFrenLog.d("Client.get", "🛠️ Delegating to native CFSolver on ROOT site (reelfren.net)")
-            // We solve on the ROOT site to get the valid clearance cookie
             val solved = ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)
             
             if (!solved) {
