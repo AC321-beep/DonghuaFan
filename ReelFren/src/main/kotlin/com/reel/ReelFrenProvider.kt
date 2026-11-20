@@ -14,6 +14,7 @@ import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
+import java.net.URLDecoder
 import java.util.Locale
 
 class ReelFrenProvider : MainAPI() {
@@ -126,9 +127,16 @@ class ReelFrenProvider : MainAPI() {
         
         val p = ReelFrenClient.playback(slug, id, ep) ?: return false
 
-        // FIX: Extract subtitles cleanly directly to Cloudstream
+        // FIX: Extract direct subtitle URL from proxy wrapper if present
         p.subtitles.forEach { sub ->
-            val cleanUrl = ReelFrenClient.absUrl(sub.url)
+            var cleanUrl = ReelFrenClient.absUrl(sub.url)
+            
+            // Bypass internal proxy like `https://api.reelfren.net/api/proxy/cubetv-subtitle?url=...`
+            if (cleanUrl.contains("/api/proxy/") && cleanUrl.contains("?url=")) {
+                val encodedUrl = cleanUrl.substringAfter("?url=")
+                cleanUrl = runCatching { URLDecoder.decode(encodedUrl, "UTF-8") }.getOrDefault(cleanUrl)
+            }
+
             if (cleanUrl.isNotBlank()) {
                 val displayLang = sub.label.ifEmpty { sub.lang }.ifEmpty { "English" }
                     .replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
@@ -146,14 +154,17 @@ class ReelFrenProvider : MainAPI() {
             val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
             val linkType = ReelFrenQuality.linkType(qUrl, format)
             
-            // FIX: Supply ONLY the server name to prevent "1080p 1080p" duplicates[cite: 1]
-            val finalName = if (p.server.isBlank() || p.server == "1") "ReelFren" else "Server ${p.server}"
+            val serverStr = if (p.server.isBlank() || p.server == "1") "ReelFren" else "Server ${p.server}"
+            val finalName = if (q.label.contains("Auto", true) || q.label.isBlank()) {
+                serverStr
+            } else {
+                "$serverStr - ${q.label}"
+            }
 
             val host = ReelFrenCloudflare.hostOf(qUrl)
             val streamHeaders = mutableMapOf<String, String>()
             streamHeaders["User-Agent"] = ReelFrenStore.userAgent(host)
             
-            // FIX: Prevent Error 2004 by omitting Referer on 3rd party CDNs
             if (host.contains("reelfren.net")) {
                 streamHeaders["Referer"] = "$mainUrl/"
                 val cookie = ReelFrenStore.cookie(host)
