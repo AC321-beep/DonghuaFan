@@ -13,9 +13,7 @@ import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
-import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
-import java.util.Locale
 
 class ReelFrenProvider : MainAPI() {
 
@@ -127,35 +125,8 @@ class ReelFrenProvider : MainAPI() {
         
         val p = ReelFrenClient.playback(slug, id, ep) ?: return false
 
-        p.subtitles.forEach { sub ->
-            val proxyUrl = ReelFrenClient.absUrl(sub.url)
-            
-            if (proxyUrl.isNotBlank()) {
-                val displayLang = sub.label.ifEmpty { sub.lang }.ifEmpty { "English" }
-                    .replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
-                
-                val subHost = ReelFrenCloudflare.hostOf(proxyUrl)
-                val subHeaders = mutableMapOf<String, String>()
-                
-                subHeaders["User-Agent"] = ReelFrenStore.userAgent(subHost)
-                subHeaders["Referer"] = "$mainUrl/"
-                subHeaders["Origin"] = mainUrl
-                subHeaders["Accept"] = "*/*"
-                
-                // INJECT CLOUDFLARE COOKIE SO EXOPLAYER CAN HIT THE PROXY ENDPOINT
-                val cookie = ReelFrenStore.cookie(subHost)
-                if (cookie.isNotEmpty()) {
-                    subHeaders["Cookie"] = cookie
-                }
-
-                subtitleCallback(
-                    newSubtitleFile(lang = displayLang, url = proxyUrl) {
-                        this.headers = subHeaders
-                    }
-                )
-                ReelFrenLog.d("Main/loadLinks", "Emitted Subtitle Proxy: $displayLang -> $proxyUrl")
-            }
-        }
+        // DELEGATE TO ADVANCED SUBTITLE EXTRACTOR (Handles Proxy + HLS Manifests + Base64 Merging)
+        ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback)
 
         var found = false
         p.qualities.forEach { q ->
@@ -167,26 +138,15 @@ class ReelFrenProvider : MainAPI() {
             
             val finalName = if (p.server.isBlank() || p.server == "1") "ReelFren" else "Server ${p.server}"
 
-            val host = ReelFrenCloudflare.hostOf(qUrl)
-            val streamHeaders = mutableMapOf<String, String>()
-            streamHeaders["User-Agent"] = ReelFrenStore.userAgent(host)
-            
-            if (host.contains("reelfren.net")) {
-                streamHeaders["Referer"] = "$mainUrl/"
-                streamHeaders["Origin"] = mainUrl
-                val cookie = ReelFrenStore.cookie(host)
-                if (cookie.isNotEmpty()) streamHeaders["Cookie"] = cookie
-            }
-
             callback(
                 com.lagradost.cloudstream3.utils.ExtractorLink(
                     source = name,
                     name = finalName,
                     url = qUrl,
-                    referer = if (host.contains("reelfren.net")) "$mainUrl/" else "", 
+                    referer = "${ReelFrenConfig.REEL_SITE}/", 
                     quality = ReelFrenQuality.of(q.label),
                     type = linkType,
-                    headers = streamHeaders
+                    headers = ReelFrenClient.headers(qUrl) // Unified headers handles Origin, Referer, and Cookies
                 )
             )
             found = true
