@@ -1,9 +1,9 @@
 cloudstream {
-    description = "Watch short dramas from ReelFren (PineDrama, Shorten, DramaBox, WeTV, iQIYI etc.)"
+    description = "Watch short dramas from 50+ providers (Reelshort,Happyshort, Shorten, DramaBox, WeTV, iQIYI etc.)"
     authors = listOf("AC321-beep")
     status = 1
     tvTypes = listOf("TvSeries", "Movie", "AsianDrama")
     language = "en"
-    version = 2
-    iconUrl = "https://reelfren.net/favicon.ico"
+    version = 3
+    iconUrl = "https://reelfren.net/favicon.png" 
 }
