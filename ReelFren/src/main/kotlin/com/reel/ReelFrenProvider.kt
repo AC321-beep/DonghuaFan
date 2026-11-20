@@ -15,7 +15,6 @@ import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
-import java.net.URLDecoder
 import java.util.Locale
 
 class ReelFrenProvider : MainAPI() {
@@ -129,30 +128,32 @@ class ReelFrenProvider : MainAPI() {
         val p = ReelFrenClient.playback(slug, id, ep) ?: return false
 
         p.subtitles.forEach { sub ->
-            var cleanUrl = ReelFrenClient.absUrl(sub.url)
+            val proxyUrl = ReelFrenClient.absUrl(sub.url)
             
-            // Bypass internal proxy to provide direct .srt file to ExoPlayer
-            if (cleanUrl.contains("/api/proxy/") && cleanUrl.contains("?url=")) {
-                val encodedUrl = cleanUrl.substringAfter("?url=")
-                cleanUrl = runCatching { URLDecoder.decode(encodedUrl, "UTF-8") }.getOrDefault(cleanUrl)
-            }
-
-            if (cleanUrl.isNotBlank()) {
+            if (proxyUrl.isNotBlank()) {
                 val displayLang = sub.label.ifEmpty { sub.lang }.ifEmpty { "English" }
                     .replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
                 
-                val subHost = ReelFrenCloudflare.hostOf(cleanUrl)
+                val subHost = ReelFrenCloudflare.hostOf(proxyUrl)
+                val subHeaders = mutableMapOf<String, String>()
+                
+                subHeaders["User-Agent"] = ReelFrenStore.userAgent(subHost)
+                subHeaders["Referer"] = "$mainUrl/"
+                subHeaders["Origin"] = mainUrl
+                subHeaders["Accept"] = "*/*"
+                
+                // INJECT CLOUDFLARE COOKIE SO EXOPLAYER CAN HIT THE PROXY ENDPOINT
+                val cookie = ReelFrenStore.cookie(subHost)
+                if (cookie.isNotEmpty()) {
+                    subHeaders["Cookie"] = cookie
+                }
+
                 subtitleCallback(
-                    newSubtitleFile(lang = displayLang, url = cleanUrl) {
-                        this.headers = mapOf(
-                            "User-Agent" to ReelFrenStore.userAgent(subHost),
-                            "Referer" to "$mainUrl/",
-                            "Origin" to mainUrl, // Added to fix CORS blocking on static-aka.cubetv.cc
-                            "Accept" to "*/*"
-                        )
+                    newSubtitleFile(lang = displayLang, url = proxyUrl) {
+                        this.headers = subHeaders
                     }
                 )
-                ReelFrenLog.d("Main/loadLinks", "Emitted Subtitle: $displayLang -> $cleanUrl")
+                ReelFrenLog.d("Main/loadLinks", "Emitted Subtitle Proxy: $displayLang -> $proxyUrl")
             }
         }
 
