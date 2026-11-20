@@ -26,10 +26,17 @@ import java.util.concurrent.ConcurrentHashMap
 // ── Unified Logger ───────────────────────────────────────────────────────────
 object ReelFrenLog {
     private const val TAG = "ReelFren/CF"
+    
+    // FIX: Re-added the verbose flag that the plugin file is trying to toggle
+    var isVerbose: Boolean = false 
+
     fun d(scope: String, msg: String) {
+        if (!isVerbose) return
         Log.e(TAG, "[$scope][${Thread.currentThread().name}] $msg")
     }
+    
     fun t(scope: String, e: Throwable) {
+        if (!isVerbose) return
         Log.e(TAG, "[$scope][${Thread.currentThread().name}] ${e.javaClass.simpleName}: ${e.message}", e)
     }
 }
@@ -174,7 +181,6 @@ object ReelFrenParse {
         )
     }
 
-    // FIX: Aggressive Dynamic Subtitle Scanning
     private fun collectSubtitlesFromNode(node: JSONObject, out: MutableList<SubtitleEntry>) {
         val keys = node.keys()
         while (keys.hasNext()) {
