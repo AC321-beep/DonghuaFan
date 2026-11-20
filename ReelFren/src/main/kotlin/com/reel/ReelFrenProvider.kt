@@ -14,8 +14,6 @@ import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import java.net.URLDecoder
 import java.util.Locale
 
@@ -56,15 +54,6 @@ class ReelFrenProvider : MainAPI() {
             }
         }
         ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=${items.size} added=${mapped.size} hasNext=true")
-        
-        // INJECT THE SETTINGS BUTTON ON THE HOMEPAGE
-        if (page == 1 && slug == "all_dramas") {
-            val settingsItem = newMovieSearchResponse("⚙️ ReelFren Settings", "reelfren://settings", TvType.Movie) {
-                this.posterUrl = "https://ui-avatars.com/api/?name=Settings&background=2B2B2B&color=fff&size=512"
-            }
-            return newHomePageResponse(request.name, listOf(settingsItem) + mapped, hasNext = true)
-        }
-        
         return newHomePageResponse(request.name, mapped, hasNext = true)
     }
 
@@ -87,17 +76,6 @@ class ReelFrenProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         ReelFrenLog.d("Main/load", "url=$url")
-        
-        // INTERCEPT THE SETTINGS BUTTON CLICK
-        if (url == "reelfren://settings") {
-            withContext(Dispatchers.Main) {
-                ReelFrenCloudflare.activity()?.let { act ->
-                    ReelFrenPlugin.showSettingsDialog(act)
-                }
-            }
-            throw ErrorLoadingException("Opened Settings Menu. Please press back to return.")
-        }
-        
         val (slug, id, _) = ReelFrenUrl.parse(url)
         if (id.isEmpty() || slug.isEmpty()) throw ErrorLoadingException("Invalid URL or missing ID")
         
@@ -152,6 +130,7 @@ class ReelFrenProvider : MainAPI() {
         p.subtitles.forEach { sub ->
             var cleanUrl = ReelFrenClient.absUrl(sub.url)
             
+            // Bypass internal proxy to provide direct .srt file to ExoPlayer
             if (cleanUrl.contains("/api/proxy/") && cleanUrl.contains("?url=")) {
                 val encodedUrl = cleanUrl.substringAfter("?url=")
                 cleanUrl = runCatching { URLDecoder.decode(encodedUrl, "UTF-8") }.getOrDefault(cleanUrl)
