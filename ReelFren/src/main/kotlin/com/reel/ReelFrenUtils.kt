@@ -150,7 +150,6 @@ object ReelFrenParse {
                 if (url.isNotEmpty()) {
                     qualities += QualityEntry(label = firstNonEmpty(q, "label", "quality", "name").ifEmpty { "Auto" }, url = url, format = clean(q, "format"))
                 }
-                // Scan for subtitles inside the quality objects
                 collectSubtitlesFromNode(q, subs)
             }
         }
@@ -161,7 +160,6 @@ object ReelFrenParse {
         }
         if (qualities.isEmpty()) return null
 
-        // Scan for subtitles in the main JSON structures
         collectSubtitlesFromNode(o, subs)
         if (o !== root) collectSubtitlesFromNode(root, subs)
 
@@ -176,21 +174,19 @@ object ReelFrenParse {
         )
     }
 
-    // FIX 2: Aggressive Dynamic Subtitle Scanning
+    // FIX: Aggressive Dynamic Subtitle Scanning
     private fun collectSubtitlesFromNode(node: JSONObject, out: MutableList<SubtitleEntry>) {
         val keys = node.keys()
         while (keys.hasNext()) {
             val key = keys.next()
             val lowerKey = key.lowercase(Locale.ROOT)
             
-            // Dynamically catch ANY key that sounds like it holds subtitles (e.g. "subtitle_list", "captionsData")
             if (lowerKey.contains("sub") || lowerKey.contains("track") || lowerKey.contains("caption")) {
                 node.optJSONArray(key)?.let { arr -> parseSubtitleArray(arr, out) }
                 node.optJSONObject(key)?.let { obj -> parseSubtitleObjectOrMap(obj, out) }
             }
         }
         
-        // Also check if the URL string is directly attached to the node
         for (key in SUB_DIRECT_KEYS) {
             if (node.optJSONObject(key) != null || node.optJSONArray(key) != null) continue
             val directUrl = clean(node, key)
@@ -215,7 +211,7 @@ object ReelFrenParse {
                 if (looksLikeSubtitleUrl(rawUrl)) {
                     val guessedLang = guessLangFromUrl(rawUrl)
                     out += SubtitleEntry(
-                        label = if (guessedLang == "und") "Subtitle ${i + 1}" else guessedLang.uppercase(), 
+                        label = if (guessedLang == "und") "Subtitle ${i + 1}" else guessedLang.uppercase(Locale.ROOT), 
                         lang = guessedLang, 
                         url = rawUrl
                     )
