@@ -125,8 +125,10 @@ class ReelFrenProvider : MainAPI() {
         
         val p = ReelFrenClient.playback(slug, id, ep) ?: return false
 
+        // FIX 2: Ensure the subtitle language label is safely extracted so Cloudstream can display it
         p.subtitles.forEach { sub ->
-            subtitleCallback(SubtitleFile(sub.lang, ReelFrenClient.absUrl(sub.url)))
+            val langDisplay = sub.label.ifEmpty { sub.lang }.ifEmpty { "English" }
+            subtitleCallback(SubtitleFile(langDisplay, ReelFrenClient.absUrl(sub.url)))
         }
 
         var found = false
@@ -137,17 +139,9 @@ class ReelFrenProvider : MainAPI() {
             val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
             val linkType = ReelFrenQuality.linkType(qUrl, format)
             
-            // 1. FIX THE QUALITY DISPLAY
-            // Replaces "1 1080p" with cleaner text like "ReelFren 1080p" or "Server 2 - HD"
-            val serverStr = if (p.server.isBlank() || p.server == "1") "ReelFren" else "Server ${p.server}"
-            val finalName = if (q.label.contains("Auto", true) || q.label.isBlank()) {
-                serverStr
-            } else {
-                "$serverStr - ${q.label}"
-            }
+            // FIX 1: Provide ONLY the base server name. Cloudstream will auto-append the "1080p" mapping natively.
+            val finalName = if (p.server.isBlank() || p.server == "1") "ReelFren" else "Server ${p.server}"
 
-            // 2. FIX THE 2004 ExoPlayer CDN ERROR
-            // Strip out all the Accept/HTML headers that trigger AWS S3 and Cloudfront firewalls
             val host = ReelFrenCloudflare.hostOf(qUrl)
             val streamHeaders = mutableMapOf<String, String>()
             streamHeaders["User-Agent"] = ReelFrenStore.userAgent(host)
@@ -156,8 +150,6 @@ class ReelFrenProvider : MainAPI() {
                 streamHeaders["Referer"] = "$mainUrl/"
                 val cookie = ReelFrenStore.cookie(host)
                 if (cookie.isNotEmpty()) streamHeaders["Cookie"] = cookie
-            } else {
-                // By providing a blank Referer to 3rd party video CDNs, we prevent Error 2004
             }
 
             callback(
