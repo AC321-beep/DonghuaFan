@@ -127,6 +127,7 @@ object ReelFrenSubtitles {
             val resolved = resolveUrl(entry.url) ?: continue
             if (!seenUrls.add(resolved)) continue
 
+            // FIX: Force Cloudstream to understand the full language string
             val displayLabel = resolveDisplayLabel(entry.lang, entry.label)
             
             callback(
@@ -181,16 +182,18 @@ object ReelFrenSubtitles {
     }
 
     private fun resolveDisplayLabel(rawLang: String, rawLabel: String): String {
-        val cleanLabel = rawLabel.trim()
         val normFromLang = normalizeLang(rawLang)
-        val normFromLabel = if (normFromLang == "und") normalizeLang(cleanLabel) else normFromLang
-        val mappedName = langLabel(normFromLabel)
-
-        return when {
-            cleanLabel.isNotEmpty() && !cleanLabel.equals(rawLang.trim(), ignoreCase = true) && cleanLabel.length > 3 -> cleanLabel
-            mappedName != "Unknown" -> mappedName
-            cleanLabel.isNotEmpty() -> cleanLabel
-            else -> "Unknown" 
+        val normFromLabel = if (normFromLang == "und") normalizeLang(rawLabel) else normFromLang
+        
+        // FIX: Always return the full, mapped language name string to Cloudstream
+        val fullLangName = langLabel(normFromLabel)
+        
+        return if (fullLangName != "Unknown") {
+            fullLangName
+        } else {
+            // Fallback to the raw label if we can't map it, but capitalize it so Cloudstream UI looks nice
+            rawLabel.trim().replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
+                .ifEmpty { "English" } 
         }
     }
 
@@ -783,7 +786,6 @@ object ReelFrenClient {
     fun videoUrl(slug: String, id: String, ep: Int) = "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep"
     fun searchUrl(slug: String, term: String) = "${apiBase()}/api/search?q=${query(term)}&provider=${query(slug)}&lang=en"
 
-    // GLOBAL HEADERS FUNCTION (Universally injects Origin and Referer for Proxy and CDN bypass)
     fun headers(url: String, isApiCall: Boolean = false): Map<String, String> {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val map = linkedMapOf<String, String>()
