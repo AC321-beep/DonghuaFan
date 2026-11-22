@@ -1,9 +1,7 @@
 package com.reel
 
-import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
-import android.content.ContextWrapper
 import android.widget.Toast
 import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.CommonActivity
@@ -16,18 +14,8 @@ import kotlinx.coroutines.launch
 
 @CloudstreamPlugin
 class ReelFrenPlugin : Plugin() {
-    
-    // Safely unwrap the context to find the true host activity using standard android.app.Activity
-    private fun resolveActivity(context: Context): Activity? {
-        var cur: Context? = context
-        while (cur is ContextWrapper) {
-            if (cur is Activity) return cur
-            cur = cur.baseContext
-        }
-        return CommonActivity.activity
-    }
 
-    // Uses reflection to wipe the old provider from Cloudstream's locked memory
+    // ADDED: Uses reflection to safely wipe old instances from Cloudstream's memory
     private fun syncAndRegisterProvider() {
         runCatching {
             synchronized(APIHolder.allProviders) {
@@ -49,7 +37,6 @@ class ReelFrenPlugin : Plugin() {
                 apisField.set(APIHolder, updated)
             }
         }
-        // Register the fresh instance
         registerMainAPI(ReelFrenProvider())
     }
 
@@ -57,22 +44,27 @@ class ReelFrenPlugin : Plugin() {
         ReelFrenStore.init(context)
         ReelFrenCloudflare.prewarmIfNeeded()
 
+        // CHANGED: Use the memory-sync version to prevent duplicates
         syncAndRegisterProvider()
 
         openSettings = {
-            val activity = resolveActivity(context)
+            val activity = CommonActivity.activity
             if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
                 
                 val providerNames = ReelFrenConfig.PROVIDERS_MAP.keys.toMutableList()
                 val providerSlugs = ReelFrenConfig.PROVIDERS_MAP.values.toMutableList()
 
+                // Appending clearly marked toggle to the bottom of the list without a spacer.
                 providerNames.add("🔧 [DEBUG] Enable Verbose Logging")
 
                 val checkedStates = BooleanArray(providerNames.size)
                 
+                // Load Provider States
                 for (i in providerSlugs.indices) {
                     checkedStates[i] = ReelFrenStore.isProviderEnabled(providerSlugs[i])
                 }
+                
+                // Load Verbose Logging State (Last Item)
                 checkedStates[providerNames.size - 1] = ReelFrenLog.isVerbose
 
                 activity.runOnUiThread {
@@ -88,6 +80,7 @@ class ReelFrenPlugin : Plugin() {
                             if (editor != null) {
                                 var changed = false
                                 
+                                // Save Providers
                                 for (i in providerSlugs.indices) {
                                     val slug = providerSlugs[i]
                                     val wasEnabled = ReelFrenStore.isProviderEnabled(slug)
@@ -99,6 +92,7 @@ class ReelFrenPlugin : Plugin() {
                                     }
                                 }
                                 
+                                // Save Verbose Logging (Last Item)
                                 val newVerboseState = checkedStates[providerNames.size - 1]
                                 if (ReelFrenLog.isVerbose != newVerboseState) {
                                     ReelFrenStore.setVerboseLogging(newVerboseState)
@@ -108,12 +102,12 @@ class ReelFrenPlugin : Plugin() {
                                 if (changed) {
                                     editor.apply()
                                     
-                                    // 1. Force memory sync
+                                    // CHANGED: Force memory sync
                                     syncAndRegisterProvider() 
                                     
                                     Toast.makeText(activity, "Settings applied!", Toast.LENGTH_SHORT).show()
                                     
-                                    // 2. Safe Auto-Reload using the unwrapped activity
+                                    // CHANGED: Safe, crash-proof automatic reload
                                     activity.runOnUiThread {
                                         runCatching { activity.recreate() }
                                     }
