@@ -96,7 +96,7 @@ class ReelFrenPlugin : Plugin() {
                                     }
                                 }
                                 
-                                val newVerboseState = checked   States[providerNames.size - 1]
+                                val newVerboseState = checkedStates[providerNames.size - 1]
                                 if (ReelFrenLog.isVerbose != newVerboseState) {
                                     ReelFrenStore.setVerboseLogging(newVerboseState)
                                     changed = true
@@ -104,11 +104,8 @@ class ReelFrenPlugin : Plugin() {
 
                                 if (changed) {
                                     editor.apply()
-                                    // 1. Immediately apply the changes in memory so the background code uses the new settings
                                     syncAndRegisterProvider() 
                                     
-                                    // 2. We skip activity.recreate() entirely. 
-                                    // This completely eliminates the WindowLeaked crash while still allowing the tabs to update.
                                     Toast.makeText(activity, "Saved! Please navigate back to refresh.", Toast.LENGTH_LONG).show()
                                 }
                             }
