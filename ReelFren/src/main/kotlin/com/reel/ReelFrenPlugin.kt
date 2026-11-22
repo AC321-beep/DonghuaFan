@@ -1,10 +1,10 @@
 package com.reel
 
+import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
 import android.content.ContextWrapper
 import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
 import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.MainAPI
@@ -17,14 +17,14 @@ import kotlinx.coroutines.launch
 @CloudstreamPlugin
 class ReelFrenPlugin : Plugin() {
     
-    // Safely unwrap the context to find the true host activity
-    private fun resolveAppCompatActivity(context: Context): AppCompatActivity? {
+    // Safely unwrap the context to find the true host activity using standard android.app.Activity
+    private fun resolveActivity(context: Context): Activity? {
         var cur: Context? = context
         while (cur is ContextWrapper) {
-            if (cur is AppCompatActivity) return cur
+            if (cur is Activity) return cur
             cur = cur.baseContext
         }
-        return CommonActivity.activity as? AppCompatActivity
+        return CommonActivity.activity
     }
 
     // Uses reflection to wipe the old provider from Cloudstream's locked memory
@@ -60,7 +60,7 @@ class ReelFrenPlugin : Plugin() {
         syncAndRegisterProvider()
 
         openSettings = {
-            val activity = resolveAppCompatActivity(context)
+            val activity = resolveActivity(context)
             if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
                 
                 val providerNames = ReelFrenConfig.PROVIDERS_MAP.keys.toMutableList()
