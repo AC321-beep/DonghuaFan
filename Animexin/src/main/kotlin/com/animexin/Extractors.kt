@@ -1,14 +1,31 @@
 package com.Animexin
 
+import android.util.Base64
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.extractors.Filesim
 import com.lagradost.cloudstream3.extractors.StreamSB
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedInputStream
+import java.net.HttpURLConnection
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.net.SocketTimeoutException
+import java.net.URL
 import java.net.URLDecoder
+import javax.crypto.Cipher
+import javax.crypto.CipherInputStream
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 class FileMoonSx : Filesim() {
     override val name = "FileMoonSx"
@@ -48,6 +65,7 @@ class Vtbe : ExtractorApi() {
                 )
             )
         } catch (e: Exception) {
+            AnimexinLogger.e("Vtbe", "Extraction failed for $url", e)
             return null
         }
     }
@@ -63,6 +81,7 @@ class OkRu : ExtractorApi() {
             val id = Regex("""/video(?:embed)?/(\d+)""").find(url)?.groupValues?.get(1)
                 ?: url.substringAfterLast("/").substringBefore("?")
             if (id.isBlank()) return null
+            AnimexinLogger.d("OkRu") { "Fetching metadata for mid=$id" }
 
             val jsonStr = app.post("https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id").text
             if (!jsonStr.startsWith("{")) return null
@@ -116,8 +135,10 @@ class OkRu : ExtractorApi() {
                 )
             }
 
+            AnimexinLogger.d("OkRu") { "mid=$id resolved ${links.size} link(s)" }
             return links
         } catch (e: Exception) {
+            AnimexinLogger.e("OkRu", "Extraction failed for $url", e)
             return null
         }
     }
@@ -139,6 +160,8 @@ class Dtube : ExtractorApi() {
                 ?: if (videoId == null) url.substringAfterLast("/").takeIf { it.isNotBlank() } else null
 
             val lookupId = shortId ?: videoId
+            AnimexinLogger.d("DTube") { "Lookup id=$lookupId (uuid=$videoId)" }
+
             if (lookupId != null) {
                 try {
                     val apiResponse = app.get("https://api.d.tube/videos/$lookupId").text
@@ -154,11 +177,12 @@ class Dtube : ExtractorApi() {
                             ?: json.optString("gatewayUrl").takeIf { it.isNotBlank() }
 
                         if (!directHls.isNullOrBlank()) {
+                            AnimexinLogger.d("DTube") { "API returned direct HLS: $directHls" }
                             return M3u8Helper.generateM3u8(name, directHls, url)
                         }
                     }
                 } catch (e: Exception) {
-                    // Fall back to probing nodes
+                    AnimexinLogger.d("DTube") { "API lookup failed, probing NAS nodes" }
                 }
             }
 
@@ -168,6 +192,7 @@ class Dtube : ExtractorApi() {
                     val m3u8Url = "https://$node.d.tube/videos/$videoId/master.m3u8"
                     try {
                         if (app.get(m3u8Url).isSuccessful) {
+                            AnimexinLogger.d("DTube") { "Found active stream on node $node: $m3u8Url" }
                             return M3u8Helper.generateM3u8(name, m3u8Url, url)
                         }
                     } catch (e: Exception) {
@@ -176,9 +201,414 @@ class Dtube : ExtractorApi() {
                 }
             }
         } catch (e: Exception) {
-            // Fails silently
+            AnimexinLogger.e("DTube", "Extraction failed for $url", e)
         }
         return null
+    }
+}
+
+class Odysee : ExtractorApi() {
+    override var name = "Odysee"
+    override var mainUrl = "https://odysee.com"
+    override val requiresReferer = false
+
+    companion object {
+        private const val FETCH_TIMEOUT_MS = 12_000L
+        private const val SPLIT_TIMEOUT_MS = 4_000L
+        private const val LBRY_PROXY_API = "https://api.na-backend.odysee.com/api/v1/proxy?m=get"
+
+        private val RE_CONTENT_URL = Regex(""""contentUrl"\s*:\s*"([^"]+)"""")
+        private val RE_STREAM_URL = Regex(
+            """https?:(?:\\/|/)(?:\\/|/)[^"'\s<>]+\.(?:m3u8|mp4)[^"'\s<>]*""",
+            RegexOption.IGNORE_CASE
+        )
+        private val RE_ODYCDN_STREAM = Regex(
+            """https?:(?:\\/|/)(?:\\/|/)player\.odycdn\.com/[^"'\s<>]+""",
+            RegexOption.IGNORE_CASE
+        )
+
+        private fun buildLbryUri(url: String): String? {
+            val clean = url.substringBefore('?').substringBefore('#')
+            val rawPath = when {
+                "/$/embed/" in clean -> clean.substringAfter("/$/embed/")
+                "odysee.com/" in clean -> clean.substringAfter("odysee.com/")
+                else -> return null
+            }
+            val decodedPath = runCatching { URLDecoder.decode(rawPath, "UTF-8") }
+                .getOrDefault(rawPath)
+                .trim('/')
+            if (decodedPath.isBlank()) return null
+
+            val lbryPath = decodedPath.replace(':', '#')
+            return if (lbryPath.startsWith("lbry://")) lbryPath else "lbry://$lbryPath"
+        }
+    }
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val pageReferer = referer ?: "$mainUrl/"
+        AnimexinLogger.d("Odysee") { "Fetching embed page: $url" }
+
+        // 1. Scrape the embed page directly (preserves ?r=...&signature=...&signature_ts=... for unlisted streams)
+        val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+            runCatching { app.get(url, referer = pageReferer).text }.getOrNull()
+        }
+
+        var streamUrl: String? = null
+        if (!html.isNullOrBlank()) {
+            streamUrl = RE_CONTENT_URL.find(html)?.groupValues?.get(1)?.replace("\\/", "/")
+                ?: RE_STREAM_URL.find(html)?.value?.replace("\\/", "/")
+                ?: RE_ODYCDN_STREAM.find(html)?.value?.replace("\\/", "/")
+            if (!streamUrl.isNullOrBlank()) {
+                AnimexinLogger.d("Odysee") { "Scraped stream URL from HTML: $streamUrl" }
+            }
+        }
+
+        // 2. Fallback to LBRY/Odysee JSON-RPC proxy if the embed HTML didn't inline the stream URL
+        if (streamUrl.isNullOrBlank()) {
+            val lbryUri = buildLbryUri(url)
+            AnimexinLogger.d("Odysee") { "HTML scrape empty; querying LBRY API for uri=$lbryUri" }
+            if (!lbryUri.isNullOrBlank()) {
+                val apiResp = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                    runCatching {
+                        app.post(
+                            LBRY_PROXY_API,
+                            headers = mapOf("Content-Type" to "application/json"),
+                            json = mapOf(
+                                "jsonrpc" to "2.0",
+                                "method" to "get",
+                                "params" to mapOf("uri" to lbryUri)
+                            )
+                        ).text
+                    }.getOrNull()
+                }
+
+                if (!apiResp.isNullOrBlank() && apiResp.startsWith("{")) {
+                    streamUrl = runCatching {
+                        JSONObject(apiResp)
+                            .optJSONObject("result")
+                            ?.optString("streaming_url")
+                            ?.takeIf { it.isNotBlank() }
+                    }.getOrNull()
+                    if (!streamUrl.isNullOrBlank()) {
+                        AnimexinLogger.d("Odysee") { "LBRY API returned streaming_url: $streamUrl" }
+                    }
+                }
+            }
+        }
+
+        val resolved = streamUrl?.takeIf { it.isNotBlank() }
+        if (resolved == null) {
+            AnimexinLogger.d("Odysee") { "Failed to resolve any stream for: $url" }
+            return
+        }
+
+        val isHls = resolved.contains(".m3u8", ignoreCase = true) || resolved.contains("/hls/", ignoreCase = true)
+
+        if (isHls) {
+            callback(
+                newExtractorLink(name, "$name (Auto)", resolved, ExtractorLinkType.M3U8) {
+                    this.referer = url
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+            val variants = withTimeoutOrNull(SPLIT_TIMEOUT_MS) {
+                runCatching { M3u8Helper.generateM3u8(name, resolved, url) }.getOrNull()
+            }
+            variants?.forEach(callback)
+        } else {
+            callback(
+                newExtractorLink(name, name, resolved, INFER_TYPE) {
+                    this.referer = url
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+        }
+    }
+}
+
+class MegaNz : ExtractorApi() {
+    override var name = "Mega"
+    override var mainUrl = "https://mega.nz"
+    override val requiresReferer = false
+
+    companion object {
+        private const val FETCH_TIMEOUT_MS = 12_000L
+        private const val PROXY_IDLE_TIMEOUT_MS = 20 * 60 * 1000
+        private const val BUFFER_SIZE = 65_536
+
+        private val proxyScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        private val RE_EMBED_OR_FILE = Regex(
+            """mega\.(?:co\.)?nz/(?:embed|file)/([a-zA-Z0-9_-]+)#([a-zA-Z0-9_-]+)"""
+        )
+        private val RE_LEGACY_HASH = Regex(
+            """mega\.(?:co\.)?nz/#!([a-zA-Z0-9_-]+)!([a-zA-Z0-9_-]+)"""
+        )
+
+        private fun decodeMegaKey(encodedKey: String): Pair<ByteArray, ByteArray>? {
+            return try {
+                val padded = when (encodedKey.length % 4) {
+                    2 -> "$encodedKey=="
+                    3 -> "$encodedKey="
+                    else -> encodedKey
+                }
+                val raw = Base64.decode(padded, Base64.URL_SAFE or Base64.NO_WRAP)
+                if (raw.size < 32) return null
+
+                val aesKey = ByteArray(16)
+                for (i in 0 until 16) {
+                    aesKey[i] = (raw[i].toInt() xor raw[i + 16].toInt()).toByte()
+                }
+                val nonce = ByteArray(8)
+                System.arraycopy(raw, 16, nonce, 0, 8)
+                Pair(aesKey, nonce)
+            } catch (e: Exception) {
+                null
+            }
+        }
+
+        private fun startLocalDecryptProxy(
+            upstreamUrl: String,
+            fileSize: Long,
+            aesKey: ByteArray,
+            nonce: ByteArray,
+            fileId: String
+        ): String {
+            val server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1")).apply {
+                soTimeout = PROXY_IDLE_TIMEOUT_MS
+            }
+            val port = server.localPort
+
+            proxyScope.launch {
+                try {
+                    while (!server.isClosed) {
+                        val client = try {
+                            server.accept()
+                        } catch (e: SocketTimeoutException) {
+                            break
+                        } catch (e: Exception) {
+                            break
+                        }
+                        launch {
+                            handleClientRequest(client, upstreamUrl, fileSize, aesKey, nonce)
+                        }
+                    }
+                } finally {
+                    runCatching { server.close() }
+                }
+            }
+
+            return "http://127.0.0.1:$port/mega_$fileId.mp4"
+        }
+
+        private fun handleClientRequest(
+            client: Socket,
+            upstreamUrl: String,
+            fileSize: Long,
+            aesKey: ByteArray,
+            nonce: ByteArray
+        ) {
+            client.use { socket ->
+                var upstreamConn: HttpURLConnection? = null
+                try {
+                    socket.soTimeout = 30_000
+                    val input = BufferedInputStream(socket.getInputStream(), 8192)
+                    val out = socket.getOutputStream()
+
+                    val requestLines = mutableListOf<String>()
+                    val lineBuf = StringBuilder()
+                    while (true) {
+                        val b = input.read()
+                        if (b == -1) break
+                        if (b == '\n'.code) {
+                            val line = lineBuf.toString().trimEnd('\r')
+                            lineBuf.clear()
+                            if (line.isEmpty()) break
+                            requestLines.add(line)
+                        } else {
+                            lineBuf.append(b.toChar())
+                        }
+                    }
+                    if (requestLines.isEmpty()) return
+
+                    val method = requestLines[0].substringBefore(' ').uppercase()
+                    val rangeHeader = requestLines.firstOrNull {
+                        it.startsWith("Range:", ignoreCase = true)
+                    }?.substringAfter(':')?.trim()
+
+                    var start = 0L
+                    var end = fileSize - 1L
+                    var hasRange = false
+
+                    if (!rangeHeader.isNullOrBlank() && rangeHeader.startsWith("bytes=", ignoreCase = true)) {
+                        val spec = rangeHeader.substringAfter('=').substringBefore(',').trim()
+                        val startStr = spec.substringBefore('-')
+                        val endStr = spec.substringAfter('-', "")
+                        start = startStr.toLongOrNull() ?: 0L
+                        if (endStr.isNotBlank()) {
+                            end = minOf(endStr.toLongOrNull() ?: (fileSize - 1L), fileSize - 1L)
+                        }
+                        hasRange = true
+                    }
+
+                    if (start < 0L || start > end || start >= fileSize) {
+                        val err = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */$fileSize\r\nConnection: close\r\n\r\n"
+                        out.write(err.toByteArray(Charsets.UTF_8))
+                        out.flush()
+                        return
+                    }
+
+                    val contentLength = end - start + 1L
+                    val blockIndex = start / 16L
+                    val alignedStart = blockIndex * 16L
+                    val skipBytes = (start - alignedStart).toInt()
+
+                    val iv = ByteArray(16)
+                    System.arraycopy(nonce, 0, iv, 0, 8)
+                    var ctr = blockIndex
+                    for (i in 15 downTo 8) {
+                        iv[i] = (ctr and 0xFFL).toByte()
+                        ctr = ctr ushr 8
+                    }
+
+                    val cipher = Cipher.getInstance("AES/CTR/NoPadding").apply {
+                        init(Cipher.DECRYPT_MODE, SecretKeySpec(aesKey, "AES"), IvParameterSpec(iv))
+                    }
+
+                    upstreamConn = (URL(upstreamUrl).openConnection() as HttpURLConnection).apply {
+                        connectTimeout = 12_000
+                        readTimeout = 30_000
+                        setRequestProperty("Range", "bytes=$alignedStart-$end")
+                    }
+
+                    val respCode = upstreamConn.responseCode
+                    if (respCode !in 200..299) {
+                        AnimexinLogger.e("Mega", "Upstream storage returned HTTP $respCode")
+                        val err = "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        out.write(err.toByteArray(Charsets.UTF_8))
+                        out.flush()
+                        return
+                    }
+
+                    val headers = buildString {
+                        if (hasRange) {
+                            append("HTTP/1.1 206 Partial Content\r\n")
+                            append("Content-Range: bytes $start-$end/$fileSize\r\n")
+                        } else {
+                            append("HTTP/1.1 200 OK\r\n")
+                        }
+                        append("Content-Type: video/mp4\r\n")
+                        append("Accept-Ranges: bytes\r\n")
+                        append("Content-Length: $contentLength\r\n")
+                        append("Connection: close\r\n\r\n")
+                    }
+                    out.write(headers.toByteArray(Charsets.UTF_8))
+                    out.flush()
+
+                    if (method == "HEAD") return
+
+                    CipherInputStream(BufferedInputStream(upstreamConn.inputStream, BUFFER_SIZE), cipher).use { cipherIn ->
+                        var toSkip = skipBytes
+                        while (toSkip > 0) {
+                            val skipped = cipherIn.skip(toSkip.toLong()).toInt()
+                            if (skipped <= 0) {
+                                if (cipherIn.read() == -1) return
+                                toSkip--
+                            } else {
+                                toSkip -= skipped
+                            }
+                        }
+
+                        val buffer = ByteArray(BUFFER_SIZE)
+                        var remaining = contentLength
+                        while (remaining > 0L) {
+                            val toRead = minOf(buffer.size.toLong(), remaining).toInt()
+                            val read = cipherIn.read(buffer, 0, toRead)
+                            if (read == -1) break
+                            out.write(buffer, 0, read)
+                            remaining -= read
+                        }
+                        out.flush()
+                    }
+                } catch (e: Exception) {
+                    // Client disconnected or seeked
+                } finally {
+                    runCatching { upstreamConn?.disconnect() }
+                }
+            }
+        }
+    }
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val match = RE_EMBED_OR_FILE.find(url) ?: RE_LEGACY_HASH.find(url)
+        if (match == null) {
+            AnimexinLogger.d("Mega") { "URL did not match expected Mega pattern: $url" }
+            return
+        }
+        val fileId = match.groupValues[1]
+        val rawKeyStr = match.groupValues[2]
+
+        val (aesKey, nonce) = decodeMegaKey(rawKeyStr) ?: run {
+            AnimexinLogger.e("Mega", "Failed to decode AES key fragment for fileId=$fileId")
+            return
+        }
+
+        AnimexinLogger.d("Mega") { "Querying Mega API for fileId=$fileId" }
+        val apiResponse = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+            runCatching {
+                app.post(
+                    "https://g.api.mega.co.nz/cs?id=0",
+                    headers = mapOf("Content-Type" to "application/json"),
+                    json = listOf(
+                        mapOf(
+                            "a" to "g",
+                            "g" to 1,
+                            "p" to fileId
+                        )
+                    )
+                ).text
+            }.getOrNull()
+        } ?: return
+
+        if (!apiResponse.startsWith("[")) {
+            AnimexinLogger.e("Mega", "Unexpected Mega API response for $fileId: ${apiResponse.take(120)}")
+            return
+        }
+
+        val fileObj = runCatching { JSONArray(apiResponse).optJSONObject(0) }.getOrNull() ?: return
+        val fileSize = fileObj.optLong("s", -1L)
+        val downloadUrl = fileObj.optString("g")
+
+        if (fileSize <= 0L || downloadUrl.isBlank()) {
+            AnimexinLogger.e("Mega", "Missing storage URL or size in Mega response for $fileId")
+            return
+        }
+
+        val localProxyUrl = startLocalDecryptProxy(
+            upstreamUrl = downloadUrl,
+            fileSize = fileSize,
+            aesKey = aesKey,
+            nonce = nonce,
+            fileId = fileId
+        )
+        AnimexinLogger.d("Mega") { "Started local decrypt proxy ($fileSize bytes) -> $localProxyUrl" }
+
+        callback(
+            newExtractorLink(name, name, localProxyUrl, ExtractorLinkType.VIDEO) {
+                this.referer = mainUrl
+                this.quality = Qualities.Unknown.value
+            }
+        )
     }
 }
 
@@ -208,7 +638,6 @@ class Rumble : ExtractorApi() {
         )
         private val RE_EMBED_PATH_ID = Regex("""/embed/([a-zA-Z0-9_-]+)""")
 
-        // Filter out .tar segment archives and 180p storyboard timeline scrubbing previews (.Faa.mp4)
         private val JUNK_KEYWORDS =
             listOf("/assets/", "loop", "preview", "tracker", "thumb", "timeline", ".faa.mp4", ".tar")
         private val HARD_JUNK =
@@ -240,31 +669,35 @@ class Rumble : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        // Fast path — strip query/fragment before checking extension
         val cleanPath = url.substringBefore('?').substringBefore('#')
         if (cleanPath.endsWith(".mp4", ignoreCase = true) || cleanPath.endsWith(".m3u8", ignoreCase = true)) {
+            AnimexinLogger.d("Rumble") { "Fast-path direct stream: $url" }
             val linkType = if (cleanPath.endsWith(".m3u8", ignoreCase = true))
                 ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
             callback(newExtractorLink(name, name, url, linkType) { this.referer = referer ?: url })
             return
         }
 
+        AnimexinLogger.d("Rumble") { "Fetching page: $url" }
         val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
             try { app.get(url, referer = referer ?: mainUrl, headers = DEFAULT_HEADERS).text }
             catch (e: Exception) { null }
-        } ?: return
+        } ?: run {
+            AnimexinLogger.e("Rumble", "Failed or timed out fetching: $url")
+            return
+        }
 
-        // 1. Inline HTML payload path — modern embed pages inline p.f["<id>"] = { ... "hls": ... } directly
+        // 1. Inline HTML payload path
         val inlineSlice = when {
             html.contains("p.f[") -> html.substringAfter("p.f[").substringBefore("\"evt\":{")
             html.contains("{\"mp4") -> html.substringAfter("{\"mp4").substringBefore("\"evt\":{")
             else -> ""
         }
-        if (inlineSlice.isNotEmpty() && extractFromScriptData(inlineSlice, url, callback)) {
+        if (inlineSlice.isNotEmpty() && extractFromScriptData(inlineSlice, url, "InlineHTML", callback)) {
             return
         }
 
-        // 2. API path — extract embed videoId from Rumble("play", {...}), /embed/ URL, or oEmbed link
+        // 2. API path
         val configMatch = RE_JSON_CONFIG.find(html)
         val rawConfig = configMatch?.groupValues?.get(1)
         val decodedHtml = runCatching { URLDecoder.decode(html, "UTF-8") }.getOrDefault(html)
@@ -284,6 +717,8 @@ class Rumble : ExtractorApi() {
         } ?: RE_EMBED_PATH_ID.find(url)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
           ?: RE_EMBED_PATH_ID.find(decodedHtml)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
 
+        AnimexinLogger.d("Rumble") { "Inline scrape missed; resolved embed videoId=$videoId" }
+
         if (!videoId.isNullOrBlank()) {
             val apiUrls = listOf(
                 "https://rumble.com/embedJS/u4/?ifr=0&dref=&request=video&ver=2&v=$videoId",
@@ -295,18 +730,18 @@ class Rumble : ExtractorApi() {
                         app.get(apiUrl, referer = url, headers = DEFAULT_HEADERS).text
                     }.getOrNull()
                 } ?: continue
-                if (extractFromScriptData(apiResponse, url, callback)) return
+                if (extractFromScriptData(apiResponse, url, apiUrl.substringAfter("embedJS/").substringBefore('/'), callback)) return
             }
         }
 
         // 3. Full HTML scrape fallback
-        extractFromScriptData(html, url, callback)
+        extractFromScriptData(html, url, "FullHTML", callback)
     }
 
-    /** Returns true if at least one link was emitted via [callback]. */
     private suspend fun extractFromScriptData(
         scriptData: String,
         url: String,
+        stage: String,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val scrapedUrls = LinkedHashSet<String>()
@@ -321,6 +756,7 @@ class Rumble : ExtractorApi() {
 
             if (scrapedUrls.add(cleanUrl)) {
                 emitted = true
+                AnimexinLogger.d("Rumble") { "[$stage/Pass1] Matched stream: $cleanUrl" }
                 emitOne(cleanUrl, match, scriptData, url, name, callback)
             }
         }
@@ -334,6 +770,7 @@ class Rumble : ExtractorApi() {
 
                 if (scrapedUrls.add(cleanUrl)) {
                     emitted = true
+                    AnimexinLogger.d("Rumble") { "[$stage/Pass2-Trailer] Matched stream: $cleanUrl" }
                     emitOne(cleanUrl, match, scriptData, url, "$name Trailer", callback)
                 }
             }
@@ -375,8 +812,6 @@ class Rumble : ExtractorApi() {
             val qMatch = RE_QUALITY_H.findAll(precedingText).lastOrNull()
                 ?: RE_QUALITY_BRACE.findAll(precedingText).lastOrNull()
 
-            // Label carries the resolution — leave quality at Unknown so
-            // CloudStream doesn't append "360p" a second time in the picker.
             val displayLabel = if (qMatch != null)
                 "$labelBase ${qMatch.groupValues[1]}p"
             else
