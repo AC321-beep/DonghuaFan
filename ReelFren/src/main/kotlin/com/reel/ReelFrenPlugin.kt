@@ -1,13 +1,9 @@
 package com.reel
 
-import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
-import android.content.ContextWrapper
 import android.widget.Toast
-import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.CommonActivity
-import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import kotlinx.coroutines.CoroutineScope
@@ -16,60 +12,30 @@ import kotlinx.coroutines.launch
 
 @CloudstreamPlugin
 class ReelFrenPlugin : Plugin() {
-    
-    private fun resolveActivity(context: Context): Activity? {
-        var cur: Context? = context
-        while (cur is ContextWrapper) {
-            if (cur is Activity) return cur
-            cur = cur.baseContext
-        }
-        return CommonActivity.activity
-    }
-
-    private fun syncAndRegisterProvider() {
-        runCatching {
-            synchronized(APIHolder.allProviders) {
-                APIHolder.allProviders.removeAll { it.name == "ReelFren" }
-            }
-            
-            val apisField = APIHolder::class.java.getDeclaredField("apis").apply { isAccessible = true }
-            val currentApis = apisField.get(APIHolder)
-            
-            if (currentApis is MutableList<*>) {
-                @Suppress("UNCHECKED_CAST")
-                val mutableApis = currentApis as MutableList<MainAPI>
-                synchronized(mutableApis) {
-                    mutableApis.removeAll { it.name == "ReelFren" }
-                }
-            } else if (currentApis is List<*>) {
-                @Suppress("UNCHECKED_CAST")
-                val updated = (currentApis as List<MainAPI>).filter { it.name != "ReelFren" }
-                apisField.set(APIHolder, updated)
-            }
-        }
-        registerMainAPI(ReelFrenProvider())
-    }
-
     override fun load(context: Context) {
         ReelFrenStore.init(context)
         ReelFrenCloudflare.prewarmIfNeeded()
 
-        syncAndRegisterProvider()
+        registerMainAPI(ReelFrenProvider())
 
         openSettings = {
-            val activity = resolveActivity(context)
+            val activity = CommonActivity.activity
             if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
                 
                 val providerNames = ReelFrenConfig.PROVIDERS_MAP.keys.toMutableList()
                 val providerSlugs = ReelFrenConfig.PROVIDERS_MAP.values.toMutableList()
 
+                // Appending clearly marked toggle to the bottom of the list without a spacer.
                 providerNames.add("🔧 [DEBUG] Enable Verbose Logging")
 
                 val checkedStates = BooleanArray(providerNames.size)
                 
+                // Load Provider States
                 for (i in providerSlugs.indices) {
                     checkedStates[i] = ReelFrenStore.isProviderEnabled(providerSlugs[i])
                 }
+                
+                // Load Verbose Logging State (Last Item)
                 checkedStates[providerNames.size - 1] = ReelFrenLog.isVerbose
 
                 activity.runOnUiThread {
@@ -80,11 +46,12 @@ class ReelFrenPlugin : Plugin() {
                         .setMultiChoiceItems(providerNames.toTypedArray(), checkedStates) { _, which, isChecked ->
                             checkedStates[which] = isChecked
                         }
-                        .setPositiveButton("Save") { dialog, _ ->
+                        .setPositiveButton("Save") { _, _ ->
                             val editor = ReelFrenStore.providerPrefsEditor()
                             if (editor != null) {
                                 var changed = false
                                 
+                                // Save Providers
                                 for (i in providerSlugs.indices) {
                                     val slug = providerSlugs[i]
                                     val wasEnabled = ReelFrenStore.isProviderEnabled(slug)
@@ -96,6 +63,7 @@ class ReelFrenPlugin : Plugin() {
                                     }
                                 }
                                 
+                                // Save Verbose Logging (Last Item)
                                 val newVerboseState = checkedStates[providerNames.size - 1]
                                 if (ReelFrenLog.isVerbose != newVerboseState) {
                                     ReelFrenStore.setVerboseLogging(newVerboseState)
@@ -104,17 +72,17 @@ class ReelFrenPlugin : Plugin() {
 
                                 if (changed) {
                                     editor.apply()
-                                    syncAndRegisterProvider() 
                                     
-                                    Toast.makeText(activity, "Saved! Please navigate back to refresh.", Toast.LENGTH_LONG).show()
+                                    // Update backend mapping in memory
+                                    registerMainAPI(ReelFrenProvider()) 
+                                    
+                                    // Let the user safely reload the page themselves
+                                    Toast.makeText(activity, "Settings saved! Please reload the Home Page.", Toast.LENGTH_LONG).show()
                                 }
                             }
-                            dialog.dismiss()
                         }
-                        .setNegativeButton("Cancel") { dialog, _ -> 
-                            dialog.dismiss() 
-                        }
-                        .setNeutralButton("Clear Cookies") { dialog, _ ->
+                        .setNegativeButton("Cancel", null)
+                        .setNeutralButton("Clear Cookies") { _, _ ->
                             CoroutineScope(Dispatchers.IO).launch {
                                 android.webkit.CookieManager.getInstance().removeAllCookies(null)
                                 android.webkit.CookieManager.getInstance().flush()
@@ -126,7 +94,6 @@ class ReelFrenPlugin : Plugin() {
                                     Toast.makeText(activity, "Cookies and CF Clearance cleared.", Toast.LENGTH_SHORT).show()
                                 }
                             }
-                            dialog.dismiss()
                         }
                         .show()
                 }
