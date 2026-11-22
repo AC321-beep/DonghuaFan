@@ -2,8 +2,12 @@ package com.reel
 
 import android.app.AlertDialog
 import android.content.Context
+import android.content.ContextWrapper
 import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.CommonActivity
+import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import kotlinx.coroutines.CoroutineScope
@@ -12,30 +16,63 @@ import kotlinx.coroutines.launch
 
 @CloudstreamPlugin
 class ReelFrenPlugin : Plugin() {
+    
+    // Safely unwrap the context to find the true host activity
+    private fun resolveAppCompatActivity(context: Context): AppCompatActivity? {
+        var cur: Context? = context
+        while (cur is ContextWrapper) {
+            if (cur is AppCompatActivity) return cur
+            cur = cur.baseContext
+        }
+        return CommonActivity.activity as? AppCompatActivity
+    }
+
+    // Uses reflection to wipe the old provider from Cloudstream's locked memory
+    private fun syncAndRegisterProvider() {
+        runCatching {
+            synchronized(APIHolder.allProviders) {
+                APIHolder.allProviders.removeAll { it.name == "ReelFren" }
+            }
+            
+            val apisField = APIHolder::class.java.getDeclaredField("apis").apply { isAccessible = true }
+            val currentApis = apisField.get(APIHolder)
+            
+            if (currentApis is MutableList<*>) {
+                @Suppress("UNCHECKED_CAST")
+                val mutableApis = currentApis as MutableList<MainAPI>
+                synchronized(mutableApis) {
+                    mutableApis.removeAll { it.name == "ReelFren" }
+                }
+            } else if (currentApis is List<*>) {
+                @Suppress("UNCHECKED_CAST")
+                val updated = (currentApis as List<MainAPI>).filter { it.name != "ReelFren" }
+                apisField.set(APIHolder, updated)
+            }
+        }
+        // Register the fresh instance
+        registerMainAPI(ReelFrenProvider())
+    }
+
     override fun load(context: Context) {
         ReelFrenStore.init(context)
         ReelFrenCloudflare.prewarmIfNeeded()
 
-        registerMainAPI(ReelFrenProvider())
+        syncAndRegisterProvider()
 
         openSettings = {
-            val activity = CommonActivity.activity
+            val activity = resolveAppCompatActivity(context)
             if (activity != null && !activity.isFinishing && !activity.isDestroyed) {
                 
                 val providerNames = ReelFrenConfig.PROVIDERS_MAP.keys.toMutableList()
                 val providerSlugs = ReelFrenConfig.PROVIDERS_MAP.values.toMutableList()
 
-                // Appending clearly marked toggle to the bottom of the list without a spacer.
                 providerNames.add("🔧 [DEBUG] Enable Verbose Logging")
 
                 val checkedStates = BooleanArray(providerNames.size)
                 
-                // Load Provider States
                 for (i in providerSlugs.indices) {
                     checkedStates[i] = ReelFrenStore.isProviderEnabled(providerSlugs[i])
                 }
-                
-                // Load Verbose Logging State (Last Item)
                 checkedStates[providerNames.size - 1] = ReelFrenLog.isVerbose
 
                 activity.runOnUiThread {
@@ -51,7 +88,6 @@ class ReelFrenPlugin : Plugin() {
                             if (editor != null) {
                                 var changed = false
                                 
-                                // Save Providers
                                 for (i in providerSlugs.indices) {
                                     val slug = providerSlugs[i]
                                     val wasEnabled = ReelFrenStore.isProviderEnabled(slug)
@@ -63,7 +99,6 @@ class ReelFrenPlugin : Plugin() {
                                     }
                                 }
                                 
-                                // Save Verbose Logging (Last Item)
                                 val newVerboseState = checkedStates[providerNames.size - 1]
                                 if (ReelFrenLog.isVerbose != newVerboseState) {
                                     ReelFrenStore.setVerboseLogging(newVerboseState)
@@ -73,11 +108,15 @@ class ReelFrenPlugin : Plugin() {
                                 if (changed) {
                                     editor.apply()
                                     
-                                    // Update backend mapping in memory
-                                    registerMainAPI(ReelFrenProvider()) 
+                                    // 1. Force memory sync
+                                    syncAndRegisterProvider() 
                                     
-                                    // Let the user safely reload the page themselves
-                                    Toast.makeText(activity, "Settings saved! Please reload the Home Page.", Toast.LENGTH_LONG).show()
+                                    Toast.makeText(activity, "Settings applied!", Toast.LENGTH_SHORT).show()
+                                    
+                                    // 2. Safe Auto-Reload using the unwrapped activity
+                                    activity.runOnUiThread {
+                                        runCatching { activity.recreate() }
+                                    }
                                 }
                             }
                         }
