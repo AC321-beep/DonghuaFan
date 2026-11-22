@@ -21,6 +21,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.coroutineScope
 
 class ReelFrenProvider : MainAPI() {
 
@@ -42,7 +43,6 @@ class ReelFrenProvider : MainAPI() {
         private val bgSearchScope = CoroutineScope(Dispatchers.IO)
     }
 
-    // FIX: Added 'get() =' so Cloudstream rebuilds the tabs dynamically on every reload
     override val mainPage get() = mainPageOf(
         "all_dramas" to "All Dramas",
         *ReelFrenStore.enabledProviders().map { it.value to it.key }.toTypedArray()
@@ -191,29 +191,61 @@ class ReelFrenProvider : MainAPI() {
 
         ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback)
 
-        var found = false
-        p.qualities.forEach { q ->
-            val qUrl = ReelFrenClient.absUrl(q.url)
-            if (qUrl.isBlank() || !qUrl.startsWith("http")) return@forEach
+        val workingLinks = mutableListOf<com.lagradost.cloudstream3.utils.ExtractorLink>()
 
-            val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
-            val linkType = ReelFrenQuality.linkType(qUrl, format)
+        // Run validation on all qualities in parallel
+        coroutineScope {
+            val validationJobs = p.qualities.map { q ->
+                async {
+                    val qUrl = ReelFrenClient.absUrl(q.url)
+                    if (qUrl.isBlank() || !qUrl.startsWith("http")) return@async null
+
+                    // SMART PING: Perform a lightweight check to ensure the URL isn't throwing a 401 or 403
+                    val isAlive = runCatching {
+                        val checkHeaders = ReelFrenClient.headers(qUrl).toMutableMap()
+                        // 0-100 byte range header prevents downloading the whole video if it's an MP4
+                        checkHeaders["Range"] = "bytes=0-100" 
+                        val response = com.lagradost.cloudstream3.app.get(qUrl, headers = checkHeaders, timeout = 4000L)
+                        response.code in 200..299 || response.code in 300..399
+                    }.getOrDefault(false)
+
+                    if (!isAlive) {
+                        ReelFrenLog.d("Main/loadLinks", "Filtered out DEAD link: $qUrl")
+                        return@async null
+                    }
+
+                    val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
+                    val linkType = ReelFrenQuality.linkType(qUrl, format)
+                    
+                    // UNIQUE NAMING: Ensures Cloudstream does not treat multiple working servers as duplicates
+                    val baseServer = if (p.server.isBlank() || p.server == "1") "ReelFren" else "Server ${p.server}"
+                    val cleanLabel = q.label.replace("(?i)auto".toRegex(), "").trim()
+                    
+                    val finalName = if (cleanLabel.isNotEmpty() && !baseServer.contains(cleanLabel)) {
+                        "$baseServer - $cleanLabel"
+                    } else {
+                        baseServer
+                    }
+
+                    com.lagradost.cloudstream3.utils.ExtractorLink(
+                        source = name,
+                        name = finalName,
+                        url = qUrl,
+                        referer = "${ReelFrenConfig.REEL_SITE}/", 
+                        quality = ReelFrenQuality.of(q.label),
+                        type = linkType,
+                        headers = ReelFrenClient.headers(qUrl) 
+                    )
+                }
+            }
             
-            val finalName = if (p.server.isBlank() || p.server == "1") "ReelFren" else "Server ${p.server}"
-
-            callback(
-                com.lagradost.cloudstream3.utils.ExtractorLink(
-                    source = name,
-                    name = finalName,
-                    url = qUrl,
-                    referer = "${ReelFrenConfig.REEL_SITE}/", 
-                    quality = ReelFrenQuality.of(q.label),
-                    type = linkType,
-                    headers = ReelFrenClient.headers(qUrl) 
-                )
-            )
-            found = true
+            // Wait for all pings to finish, then emit only the ones that survived
+            validationJobs.awaitAll().filterNotNull().forEach { link ->
+                callback(link)
+                workingLinks.add(link)
+            }
         }
-        return found
+        
+        return workingLinks.isNotEmpty()
     }
 }
