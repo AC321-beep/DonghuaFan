@@ -216,6 +216,9 @@ class Odysee : ExtractorApi() {
         private const val FETCH_TIMEOUT_MS = 12_000L
         private const val SPLIT_TIMEOUT_MS = 4_000L
         private const val LBRY_PROXY_API = "https://api.na-backend.odysee.com/api/v1/proxy?m=get"
+        private const val BROWSER_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 
         private val RE_CONTENT_URL = Regex(""""contentUrl"\s*:\s*"([^"]+)"""")
         private val RE_STREAM_URL = Regex(
@@ -226,6 +229,27 @@ class Odysee : ExtractorApi() {
             """https?:(?:\\/|/)(?:\\/|/)player\.odycdn\.com/[^"'\s<>]+""",
             RegexOption.IGNORE_CASE
         )
+
+        /** Pull ?r=…&signature=…&signature_ts=… from the embed URL. */
+        private fun extractSigParams(url: String): Map<String, String> {
+            val q = url.substringAfter('?', "").substringBefore('#')
+            if (q.isBlank()) return emptyMap()
+            return q.split('&').mapNotNull {
+                val k = it.substringBefore('=')
+                val v = it.substringAfter('=', "")
+                if (k in setOf("r", "signature", "signature_ts") && v.isNotBlank()) k to v else null
+            }.toMap()
+        }
+
+        /** Append any missing signature params to the CDN URL. */
+        private fun withSigParams(url: String, sigs: Map<String, String>): String {
+            if (sigs.isEmpty()) return url
+            val have = url.substringAfter('?', "").split('&').map { it.substringBefore('=') }.toSet()
+            val missing = sigs.filterKeys { it !in have }
+            if (missing.isEmpty()) return url
+            val extra = missing.entries.joinToString("&") { "${it.key}=${it.value}" }
+            return url + (if (url.contains('?')) "&" else "?") + extra
+        }
 
         private fun buildLbryUri(url: String): String? {
             val clean = url.substringBefore('?').substringBefore('#')
@@ -251,82 +275,104 @@ class Odysee : ExtractorApi() {
         callback: (ExtractorLink) -> Unit
     ) {
         val pageReferer = referer ?: "$mainUrl/"
-        AnimexinLogger.d("Odysee") { "Fetching embed page: $url" }
-
-        // 1. Scrape the embed page directly (preserves ?r=...&signature=...&signature_ts=... for unlisted streams)
-        val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-            runCatching { app.get(url, referer = pageReferer).text }.getOrNull()
-        }
+        val sigs = extractSigParams(url)
+        AnimexinLogger.d("Odysee") { "Fetching embed page: $url (sig params: ${sigs.keys})" }
 
         var streamUrl: String? = null
-        if (!html.isNullOrBlank()) {
-            streamUrl = RE_CONTENT_URL.find(html)?.groupValues?.get(1)?.replace("\\/", "/")
-                ?: RE_STREAM_URL.find(html)?.value?.replace("\\/", "/")
-                ?: RE_ODYCDN_STREAM.find(html)?.value?.replace("\\/", "/")
-            if (!streamUrl.isNullOrBlank()) {
-                AnimexinLogger.d("Odysee") { "Scraped stream URL from HTML: $streamUrl" }
+
+        // 1. LBRY API FIRST — one CDN request, not rate-limited.
+        val lbryUri = buildLbryUri(url)
+        if (!lbryUri.isNullOrBlank()) {
+            AnimexinLogger.d("Odysee") { "Querying LBRY API for uri=$lbryUri" }
+            val apiResp = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                runCatching {
+                    app.post(
+                        LBRY_PROXY_API,
+                        headers = mapOf(
+                            "Content-Type" to "application/json",
+                            "User-Agent" to BROWSER_UA
+                        ),
+                        json = mapOf(
+                            "jsonrpc" to "2.0",
+                            "method" to "get",
+                            "params" to mapOf("uri" to lbryUri)
+                        )
+                    ).text
+                }.getOrNull()
+            }
+
+            if (!apiResp.isNullOrBlank() && apiResp.startsWith("{")) {
+                streamUrl = runCatching {
+                    JSONObject(apiResp)
+                        .optJSONObject("result")
+                        ?.optString("streaming_url")
+                        ?.takeIf { it.isNotBlank() }
+                }.getOrNull()
+                if (!streamUrl.isNullOrBlank()) {
+                    AnimexinLogger.d("Odysee") { "LBRY API returned streaming_url" }
+                }
             }
         }
 
-        // 2. Fallback to LBRY/Odysee JSON-RPC proxy if the embed HTML didn't inline the stream URL
+        // 2. HTML scrape fallback (browser UA avoids CDN flagging).
         if (streamUrl.isNullOrBlank()) {
-            val lbryUri = buildLbryUri(url)
-            AnimexinLogger.d("Odysee") { "HTML scrape empty; querying LBRY API for uri=$lbryUri" }
-            if (!lbryUri.isNullOrBlank()) {
-                val apiResp = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
-                    runCatching {
-                        app.post(
-                            LBRY_PROXY_API,
-                            headers = mapOf("Content-Type" to "application/json"),
-                            json = mapOf(
-                                "jsonrpc" to "2.0",
-                                "method" to "get",
-                                "params" to mapOf("uri" to lbryUri)
-                            )
-                        ).text
-                    }.getOrNull()
-                }
+            AnimexinLogger.d("Odysee") { "Falling back to embed-page scrape" }
+            val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
+                runCatching {
+                    app.get(
+                        url, referer = pageReferer,
+                        headers = mapOf("User-Agent" to BROWSER_UA)
+                    ).text
+                }.getOrNull()
+            }
 
-                if (!apiResp.isNullOrBlank() && apiResp.startsWith("{")) {
-                    streamUrl = runCatching {
-                        JSONObject(apiResp)
-                            .optJSONObject("result")
-                            ?.optString("streaming_url")
-                            ?.takeIf { it.isNotBlank() }
-                    }.getOrNull()
-                    if (!streamUrl.isNullOrBlank()) {
-                        AnimexinLogger.d("Odysee") { "LBRY API returned streaming_url: $streamUrl" }
-                    }
+            if (!html.isNullOrBlank()) {
+                streamUrl = RE_CONTENT_URL.find(html)?.groupValues?.get(1)?.replace("\\/", "/")
+                    ?: RE_STREAM_URL.find(html)?.value?.replace("\\/", "/")
+                    ?: RE_ODYCDN_STREAM.find(html)?.value?.replace("\\/", "/")
+                if (!streamUrl.isNullOrBlank()) {
+                    AnimexinLogger.d("Odysee") { "Scraped stream URL: $streamUrl" }
                 }
             }
         }
 
-        val resolved = streamUrl?.takeIf { it.isNotBlank() }
-        if (resolved == null) {
+        val raw = streamUrl?.takeIf { it.isNotBlank() }
+        if (raw == null) {
             AnimexinLogger.d("Odysee") { "Failed to resolve any stream for: $url" }
             return
         }
 
-        val isHls = resolved.contains(".m3u8", ignoreCase = true) || resolved.contains("/hls/", ignoreCase = true)
+        // 3. THE FIX — carry signature from embed URL onto the CDN URL.
+        val resolved = withSigParams(raw, sigs)
+        AnimexinLogger.d("Odysee") { "Final CDN URL: $resolved" }
+
+        val hdrs = mapOf(
+            "User-Agent" to BROWSER_UA,
+            "Origin" to "https://odysee.com",
+            "Referer" to "https://odysee.com/",
+            "Accept" to "*/*"
+        )
+        val isHls = resolved.contains(".m3u8", ignoreCase = true) ||
+            resolved.contains("/hls/", ignoreCase = true)
 
         if (isHls) {
-            callback(
-                newExtractorLink(name, "$name (Auto)", resolved, ExtractorLinkType.M3U8) {
-                    this.referer = url
-                    this.quality = Qualities.Unknown.value
-                }
-            )
+            callback(newExtractorLink(name, "$name (Auto)", resolved, ExtractorLinkType.M3U8) {
+                this.referer = "https://odysee.com/"
+                this.quality = Qualities.Unknown.value
+                this.headers = hdrs
+            })
             val variants = withTimeoutOrNull(SPLIT_TIMEOUT_MS) {
-                runCatching { M3u8Helper.generateM3u8(name, resolved, url) }.getOrNull()
+                runCatching {
+                    M3u8Helper.generateM3u8(name, resolved, "https://odysee.com/", headers = hdrs)
+                }.getOrNull()
             }
             variants?.forEach(callback)
         } else {
-            callback(
-                newExtractorLink(name, name, resolved, INFER_TYPE) {
-                    this.referer = url
-                    this.quality = Qualities.Unknown.value
-                }
-            )
+            callback(newExtractorLink(name, name, resolved, INFER_TYPE) {
+                this.referer = "https://odysee.com/"
+                this.quality = Qualities.Unknown.value
+                this.headers = hdrs
+            })
         }
     }
 }
@@ -340,6 +386,9 @@ class MegaNz : ExtractorApi() {
         private const val FETCH_TIMEOUT_MS = 12_000L
         private const val PROXY_IDLE_TIMEOUT_MS = 20 * 60 * 1000
         private const val BUFFER_SIZE = 65_536
+        private const val BROWSER_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 
         private val proxyScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -480,10 +529,16 @@ class MegaNz : ExtractorApi() {
                         init(Cipher.DECRYPT_MODE, SecretKeySpec(aesKey, "AES"), IvParameterSpec(iv))
                     }
 
+                    // ── FIX: add User-Agent / Referer / Accept-Encoding so Mega storage nodes
+                    //    don't reject the request with 403, and so gzip doesn't break AES-CTR offsets.
                     upstreamConn = (URL(upstreamUrl).openConnection() as HttpURLConnection).apply {
                         connectTimeout = 12_000
                         readTimeout = 30_000
                         setRequestProperty("Range", "bytes=$alignedStart-$end")
+                        setRequestProperty("User-Agent", BROWSER_UA)
+                        setRequestProperty("Referer", "https://mega.nz/")
+                        setRequestProperty("Accept", "*/*")
+                        setRequestProperty("Accept-Encoding", "identity")
                     }
 
                     val respCode = upstreamConn.responseCode
@@ -573,7 +628,8 @@ class MegaNz : ExtractorApi() {
                         mapOf(
                             "a" to "g",
                             "g" to 1,
-                            "p" to fileId
+                            "p" to fileId,
+                            "ssl" to 1          // ── FIX: force HTTPS storage URL
                         )
                     )
                 ).text
@@ -612,7 +668,13 @@ class MegaNz : ExtractorApi() {
     }
 }
 
-class Rumble : ExtractorApi() {
+/**
+ * Hardsub Rumble — unchanged behaviour from original. The only difference is that
+ * the class is `open` and calls an `onM3u8Resolved` hook (default no-op) so the
+ * Allsub subclass can piggy-back soft-subtitle extraction without altering
+ * hardsub flow.
+ */
+open class Rumble : ExtractorApi() {
     override var name = "Rumble"
     override var mainUrl = "https://rumble.com"
     override val requiresReferer = false
@@ -663,6 +725,19 @@ class Rumble : ExtractorApi() {
         }
     }
 
+    /**
+     * Hook fired whenever an HLS master URL is emitted.
+     * Default is no-op → hardsub behaviour is completely unchanged.
+     * [AllsubRumble] overrides this to parse #EXT-X-MEDIA subtitle tracks.
+     */
+    protected open suspend fun onM3u8Resolved(
+        m3u8Url: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        // no-op for hardsub
+    }
+
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -675,6 +750,11 @@ class Rumble : ExtractorApi() {
             val linkType = if (cleanPath.endsWith(".m3u8", ignoreCase = true))
                 ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
             callback(newExtractorLink(name, name, url, linkType) { this.referer = referer ?: url })
+
+            // Still fire the hook on the direct m3u8 case (Allsub uses this path rarely).
+            if (linkType == ExtractorLinkType.M3U8) {
+                onM3u8Resolved(url, referer ?: url, subtitleCallback)
+            }
             return
         }
 
@@ -693,7 +773,7 @@ class Rumble : ExtractorApi() {
             html.contains("{\"mp4") -> html.substringAfter("{\"mp4").substringBefore("\"evt\":{")
             else -> ""
         }
-        if (inlineSlice.isNotEmpty() && extractFromScriptData(inlineSlice, url, "InlineHTML", callback)) {
+        if (inlineSlice.isNotEmpty() && extractFromScriptData(inlineSlice, url, "InlineHTML", subtitleCallback, callback)) {
             return
         }
 
@@ -730,18 +810,23 @@ class Rumble : ExtractorApi() {
                         app.get(apiUrl, referer = url, headers = DEFAULT_HEADERS).text
                     }.getOrNull()
                 } ?: continue
-                if (extractFromScriptData(apiResponse, url, apiUrl.substringAfter("embedJS/").substringBefore('/'), callback)) return
+                if (extractFromScriptData(
+                        apiResponse, url,
+                        apiUrl.substringAfter("embedJS/").substringBefore('/'),
+                        subtitleCallback, callback
+                    )) return
             }
         }
 
         // 3. Full HTML scrape fallback
-        extractFromScriptData(html, url, "FullHTML", callback)
+        extractFromScriptData(html, url, "FullHTML", subtitleCallback, callback)
     }
 
     private suspend fun extractFromScriptData(
         scriptData: String,
         url: String,
         stage: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val scrapedUrls = LinkedHashSet<String>()
@@ -757,7 +842,7 @@ class Rumble : ExtractorApi() {
             if (scrapedUrls.add(cleanUrl)) {
                 emitted = true
                 AnimexinLogger.d("Rumble") { "[$stage/Pass1] Matched stream: $cleanUrl" }
-                emitOne(cleanUrl, match, scriptData, url, name, callback)
+                emitOne(cleanUrl, match, scriptData, url, name, subtitleCallback, callback)
             }
         }
 
@@ -771,7 +856,7 @@ class Rumble : ExtractorApi() {
                 if (scrapedUrls.add(cleanUrl)) {
                     emitted = true
                     AnimexinLogger.d("Rumble") { "[$stage/Pass2-Trailer] Matched stream: $cleanUrl" }
-                    emitOne(cleanUrl, match, scriptData, url, "$name Trailer", callback)
+                    emitOne(cleanUrl, match, scriptData, url, "$name Trailer", subtitleCallback, callback)
                 }
             }
         }
@@ -785,6 +870,7 @@ class Rumble : ExtractorApi() {
         scriptData: String,
         referer: String,
         labelBase: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
         if (cleanUrl.contains(".m3u8", ignoreCase = true)) {
@@ -795,6 +881,9 @@ class Rumble : ExtractorApi() {
                     this.headers = DEFAULT_HEADERS
                 }
             )
+
+            // NEW: hook for Allsub. No-op on hardsub Rumble.
+            runCatching { onM3u8Resolved(cleanUrl, referer, subtitleCallback) }
 
             val variants = try {
                 withTimeoutOrNull(SPLIT_TIMEOUT_MS) {
@@ -825,5 +914,73 @@ class Rumble : ExtractorApi() {
                 }
             )
         }
+    }
+}
+
+/**
+ * All-sub Rumble — the soft-subtitle variant (HLS master carries #EXT-X-MEDIA
+ * tracks). Only the display name and subtitle extraction differ from [Rumble].
+ */
+class AllsubRumble : Rumble() {
+    override var name = "Allsub Rumble"
+
+    companion object {
+        private val UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
+    }
+
+    override suspend fun onM3u8Resolved(
+        m3u8Url: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        val master = runCatching {
+            app.get(
+                m3u8Url,
+                referer = referer,
+                headers = mapOf(
+                    "User-Agent" to UA,
+                    "Accept-Language" to "en-US,en;q=0.9"
+                )
+            ).text
+        }.getOrNull() ?: return
+
+        val base = m3u8Url.substringBeforeLast('/')
+        for (line in master.lines()) {
+            if (!line.startsWith("#EXT-X-MEDIA:", ignoreCase = true)) continue
+            if (!line.contains("TYPE=SUBTITLES", ignoreCase = true)) continue
+            val attrs = parseHlsAttrs(line.substringAfter(':', ""))
+            val uri = attrs["URI"] ?: continue
+            val label = attrs["NAME"] ?: attrs["LANGUAGE"] ?: "Subtitle"
+            val abs = if (uri.startsWith("http")) uri else "$base/$uri"
+            subtitleCallback(SubtitleFile(label, abs))
+        }
+    }
+
+    private fun parseHlsAttrs(input: String): Map<String, String> {
+        val result = mutableMapOf<String, String>()
+        var i = 0
+        while (i < input.length) {
+            val eq = input.indexOf('=', i)
+            if (eq < 0) break
+            val key = input.substring(i, eq).trim().trimStart(',')
+            val vStart = eq + 1
+            val value: String
+            if (vStart < input.length && input[vStart] == '"') {
+                val close = input.indexOf('"', vStart + 1)
+                if (close < 0) break
+                value = input.substring(vStart + 1, close)
+                i = close + 1
+                if (i < input.length && input[i] == ',') i++
+            } else {
+                val comma = input.indexOf(',', vStart)
+                val end = if (comma < 0) input.length else comma
+                value = input.substring(vStart, end)
+                i = if (comma < 0) input.length else comma + 1
+            }
+            if (key.isNotBlank()) result[key] = value
+        }
+        return result
     }
 }
