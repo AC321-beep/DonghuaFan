@@ -14,9 +14,13 @@ import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 class ReelFrenProvider : MainAPI() {
 
@@ -28,6 +32,16 @@ class ReelFrenProvider : MainAPI() {
     override val hasChromecastSupport = true
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.AsianDrama, TvType.TvSeries, TvType.Movie)
+
+    companion object {
+        private var cachedSearchQuery: String = ""
+        private var cachedSearchResults: List<SearchResponse> = emptyList()
+        private var cachedSearchTime: Long = 0L
+        private const val CACHE_EXPIRY_MS = 10 * 60 * 1000L // 10 minutes
+        
+        // Dedicated detached scope so slow searches can finish in the background
+        private val bgSearchScope = CoroutineScope(Dispatchers.IO)
+    }
 
     override val mainPage = mainPageOf(
         "all_dramas" to "All Dramas",
@@ -59,43 +73,71 @@ class ReelFrenProvider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse>? {
-        ReelFrenLog.d("Main/search", "query='$query'")
+        val cleanQuery = query.trim()
+        ReelFrenLog.d("Main/search", "query='$cleanQuery'")
         
+        if (cleanQuery.isEmpty()) return emptyList()
+
+        val now = System.currentTimeMillis()
+        if (cleanQuery == cachedSearchQuery && cachedSearchResults.isNotEmpty() && (now - cachedSearchTime) < CACHE_EXPIRY_MS) {
+            ReelFrenLog.d("Main/search", "Returning ${cachedSearchResults.size} cached results for '$cleanQuery'")
+            return cachedSearchResults
+        }
+
         val activeProviders = ReelFrenStore.enabledProviders().values.toList()
         if (activeProviders.isEmpty()) {
             ReelFrenLog.d("Main/search", "No providers enabled. Aborting search.")
             return emptyList()
         }
 
-        // The API requires a provider to search. 
-        // We launch parallel asynchronous searches for every enabled provider and merge the results.
-        return coroutineScope {
-            val deferredSearches = activeProviders.map { slug ->
-                async {
-                    runCatching {
-                        ReelFrenClient.search(slug, query)
-                    }.getOrDefault(emptyList())
+        cachedSearchQuery = cleanQuery
+        cachedSearchResults = emptyList()
+        cachedSearchTime = now
+
+        // 1. Launch all searches in the detached background scope
+        val deferredSearches = activeProviders.map { slug ->
+            bgSearchScope.async {
+                val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
+                items.mapNotNull { item ->
+                    if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
+                    val actualSlug = item.provider.ifEmpty { "all_dramas" }
+                    newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
+                        this.posterUrl = ReelFrenClient.absUrl(item.cover)
+                        this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
+                    }
                 }
             }
-            
-            val allItems = deferredSearches.awaitAll().flatten()
-            
-            val mapped = allItems.mapNotNull { item ->
-                if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
-                
-                val actualSlug = item.provider.ifEmpty { "all_dramas" }
-                newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
-                    this.posterUrl = ReelFrenClient.absUrl(item.cover)
-                    this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
-                }
-            }
-            
-            // Remove duplicates (same ID and provider) just in case the API glitches
-            val distinctResults = mapped.distinctBy { it.url }
-            
-            ReelFrenLog.d("Main/search", "query='$query' distinct_results=${distinctResults.size}")
-            distinctResults
         }
+
+        val fastResults = mutableListOf<SearchResponse>()
+        
+        // 2. Wait up to 4 seconds for the fast servers to reply
+        try {
+            withTimeout(4000L) {
+                fastResults.addAll(deferredSearches.awaitAll().flatten())
+            }
+        } catch (e: TimeoutCancellationException) {
+            // 3. Timeout hit! Extract only the results that finished in time
+            val completed = deferredSearches.filter { it.isCompleted && !it.isCancelled }.flatMap { it.getCompleted() }
+            fastResults.addAll(completed)
+            ReelFrenLog.d("Main/search", "Timeout hit. Returning ${completed.size} fast results.")
+        }
+
+        val distinctFast = fastResults.distinctBy { it.url }
+        cachedSearchResults = distinctFast
+
+        // 4. Let the slow servers finish in the background and silently update the cache
+        bgSearchScope.launch {
+            val allLateResults = deferredSearches.awaitAll().flatten().distinctBy { it.url }
+            if (cachedSearchQuery == cleanQuery) {
+                cachedSearchResults = allLateResults
+                if (allLateResults.size > distinctFast.size) {
+                    ReelFrenLog.d("Main/search", "Background cache silently grew from ${distinctFast.size} to ${allLateResults.size} items")
+                }
+            }
+        }
+
+        return distinctFast
     }
 
     override suspend fun load(url: String): LoadResponse? {
