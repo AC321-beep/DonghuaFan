@@ -14,6 +14,9 @@ import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 
 class ReelFrenProvider : MainAPI() {
 
@@ -57,19 +60,42 @@ class ReelFrenProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse>? {
         ReelFrenLog.d("Main/search", "query='$query'")
-        val items = ReelFrenClient.search("all_dramas", query)
         
-        val mapped = items.mapNotNull { item ->
-            if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
-            
-            val actualSlug = item.provider.ifEmpty { "all_dramas" }
-            newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
-                this.posterUrl = ReelFrenClient.absUrl(item.cover)
-                this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
-            }
+        val activeProviders = ReelFrenStore.enabledProviders().values.toList()
+        if (activeProviders.isEmpty()) {
+            ReelFrenLog.d("Main/search", "No providers enabled. Aborting search.")
+            return emptyList()
         }
-        ReelFrenLog.d("Main/search", "query='$query' results=${mapped.size}")
-        return mapped
+
+        // The API requires a provider to search. 
+        // We launch parallel asynchronous searches for every enabled provider and merge the results.
+        return coroutineScope {
+            val deferredSearches = activeProviders.map { slug ->
+                async {
+                    runCatching {
+                        ReelFrenClient.search(slug, query)
+                    }.getOrDefault(emptyList())
+                }
+            }
+            
+            val allItems = deferredSearches.awaitAll().flatten()
+            
+            val mapped = allItems.mapNotNull { item ->
+                if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
+                
+                val actualSlug = item.provider.ifEmpty { "all_dramas" }
+                newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
+                    this.posterUrl = ReelFrenClient.absUrl(item.cover)
+                    this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
+                }
+            }
+            
+            // Remove duplicates (same ID and provider) just in case the API glitches
+            val distinctResults = mapped.distinctBy { it.url }
+            
+            ReelFrenLog.d("Main/search", "query='$query' distinct_results=${distinctResults.size}")
+            distinctResults
+        }
     }
 
     override suspend fun load(url: String): LoadResponse? {
@@ -125,7 +151,6 @@ class ReelFrenProvider : MainAPI() {
         
         val p = ReelFrenClient.playback(slug, id, ep) ?: return false
 
-        // DELEGATE TO ADVANCED SUBTITLE EXTRACTOR (Handles Proxy + HLS Manifests + Base64 Merging)
         ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback)
 
         var found = false
@@ -146,7 +171,7 @@ class ReelFrenProvider : MainAPI() {
                     referer = "${ReelFrenConfig.REEL_SITE}/", 
                     quality = ReelFrenQuality.of(q.label),
                     type = linkType,
-                    headers = ReelFrenClient.headers(qUrl) // Unified headers handles Origin, Referer, and Cookies
+                    headers = ReelFrenClient.headers(qUrl) 
                 )
             )
             found = true
