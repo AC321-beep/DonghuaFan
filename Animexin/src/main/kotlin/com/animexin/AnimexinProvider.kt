@@ -1,6 +1,8 @@
 package com.Animexin
 
+import android.content.Context
 import android.util.Base64
+import android.util.Log
 import android.webkit.CookieManager
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
@@ -12,6 +14,43 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+
+object AnimexinLogger {
+    private const val PREFS_NAME = "animexin_settings"
+    private const val KEY_VERBOSE = "verbose_logging"
+
+    @Volatile
+    var isVerbose: Boolean = false
+
+    fun init(context: Context) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        isVerbose = prefs.getBoolean(KEY_VERBOSE, false)
+    }
+
+    fun setVerbose(context: Context, enabled: Boolean) {
+        isVerbose = enabled
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_VERBOSE, enabled)
+            .apply()
+    }
+
+    inline fun d(subTag: String, msg: () -> String) {
+        if (isVerbose) {
+            Log.d("AnimeXin/$subTag", msg())
+        }
+    }
+
+    fun e(subTag: String, msg: String, throwable: Throwable? = null) {
+        if (isVerbose) {
+            if (throwable != null) {
+                Log.e("AnimeXin/$subTag", msg, throwable)
+            } else {
+                Log.e("AnimeXin/$subTag", msg)
+            }
+        }
+    }
+}
 
 class AnimexinProvider : MainAPI() {
     override var mainUrl = "https://animexin.dev"
@@ -31,6 +70,7 @@ class AnimexinProvider : MainAPI() {
     )
 
     private suspend fun getSafeDocument(url: String): Document {
+        AnimexinLogger.d("HTTP") { "GET $url" }
         val responseResult = runCatching { app.get(url, interceptor = cfInterceptor) }
 
         val needsSolve = responseResult.fold(
@@ -43,11 +83,13 @@ class AnimexinProvider : MainAPI() {
                 doc.selectFirst("div.cf-turnstile, #cf-wrapper") != null
             },
             onFailure = { e ->
+                AnimexinLogger.e("HTTP", "Request failed for $url:${e.message}", e)
                 e.message?.contains("403") == true || e.message?.contains("503") == true
             }
         )
 
         if (needsSolve) {
+            AnimexinLogger.d("CF") { "Challenge detected for $url, invoking CFSolver" }
             if (CFSolver(url).solve()) {
                 return app.get(url, interceptor = cfInterceptor).document
             } else {
@@ -209,6 +251,7 @@ class AnimexinProvider : MainAPI() {
             }
             String(Base64.decode(padded, Base64.DEFAULT), Charsets.UTF_8).trim()
         } catch (e: Exception) {
+            AnimexinLogger.e("Provider", "Base64 decode failed for input (${trimmed.take(24)}...)", e)
             trimmed
         }
     }
@@ -233,6 +276,7 @@ class AnimexinProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        AnimexinLogger.d("Provider") { "loadLinks started for: $data" }
         val document = getSafeDocument(data)
         val extractedIframeUrls = ConcurrentHashMap.newKeySet<String>()
         val yieldedStreamUrls = ConcurrentHashMap.newKeySet<String>()
@@ -261,18 +305,21 @@ class AnimexinProvider : MainAPI() {
             else if (finalUrl.startsWith("/")) finalUrl = "$mainUrl$finalUrl"
             else if (!finalUrl.startsWith("http")) finalUrl = "https://$finalUrl"
 
-            // Strip tracking params (like ?pub=) while keeping video ID params (?v=, ?id=, ?vid=)
+            // Preserve video ID params (?v=, ?id=, ?vid=, ?video=) while stripping tracking params (?pub=, ?nochat=)
             val basePart = finalUrl.substringBefore("?")
-            val idParam = Regex("""[?&](?:v|id|vid)=([^&]+)""").find(finalUrl)?.value.orEmpty()
+            val idParam = Regex("""[?&](?:v|id|vid|video)=([^&]+)""").find(finalUrl)?.value.orEmpty()
             val dedupUrl = basePart + idParam
-            if (!extractedIframeUrls.add(dedupUrl)) return
+            if (!extractedIframeUrls.add(dedupUrl)) {
+                AnimexinLogger.d("Provider") { "Skipping duplicate iframe: $dedupUrl" }
+                return
+            }
 
             val tag = langTag(lang)
 
             val trackingCallback: (ExtractorLink) -> Unit = { link ->
                 val localized = if (tag != null) {
-                    val newName = if (!link.name.contains(tag)) "${link.name} $tag" else link.name
-                    val newSource = if (!link.source.contains(tag)) "${link.source} $tag" else link.source
+                    val newName = if (!link.name.contains(tag)) "${link.name}$tag" else link.name
+                    val newSource = if (!link.source.contains(tag)) "${link.source}$tag" else link.source
 
                     ExtractorLink(
                         source = newSource,
@@ -288,20 +335,36 @@ class AnimexinProvider : MainAPI() {
                     link
                 }
 
-                if (yieldedStreamUrls.add(localized.url)) callback(localized)
+                if (yieldedStreamUrls.add(localized.url)) {
+                    AnimexinLogger.d("Provider") { "Emitted link -> [${localized.name}]${localized.url}" }
+                    callback(localized)
+                }
             }
 
             try {
                 val isHandled = when {
                     "rumble.com" in finalUrl || "rmbl.ws" in finalUrl -> {
+                        AnimexinLogger.d("Provider") { "Routing to Rumble (lang=$lang):$finalUrl" }
                         Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback)
                         true
                     }
+                    "odysee.com" in finalUrl -> {
+                        AnimexinLogger.d("Provider") { "Routing to Odysee (lang=$lang):$finalUrl" }
+                        Odysee().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback)
+                        true
+                    }
+                    "mega.nz" in finalUrl || "mega.co.nz" in finalUrl -> {
+                        AnimexinLogger.d("Provider") { "Routing to MegaNz (lang=$lang):$finalUrl" }
+                        MegaNz().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback)
+                        true
+                    }
                     "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> {
+                        AnimexinLogger.d("Provider") { "Routing to OkRu (lang=$lang):$finalUrl" }
                         OkRu().getUrl(finalUrl, mainUrl)?.forEach { trackingCallback(it) }
                         true
                     }
                     "d.tube" in finalUrl || "dtube" in finalUrl -> {
+                        AnimexinLogger.d("Provider") { "Routing to Dtube (lang=$lang):$finalUrl" }
                         Dtube().getUrl(finalUrl, mainUrl)?.forEach { trackingCallback(it) }
                         true
                     }
@@ -309,10 +372,11 @@ class AnimexinProvider : MainAPI() {
                 }
 
                 if (!isHandled) {
+                    AnimexinLogger.d("Provider") { "Routing to loadExtractor (lang=$lang):$finalUrl" }
                     loadExtractor(finalUrl, referer = mainUrl, subtitleCallback, trackingCallback)
                 }
             } catch (e: Exception) {
-                // Fails silently
+                AnimexinLogger.e("Provider", "Extractor failed for $finalUrl:${e.message}", e)
             }
         }
 
@@ -321,6 +385,7 @@ class AnimexinProvider : MainAPI() {
             ".mobius option, select.mirror option, .server-list li a[data-embed], " +
             ".server-list li a[data-em], .server option, .player option"
         )
+        AnimexinLogger.d("Provider") { "Found ${servers.size} server options" }
 
         val userLang = Locale.getDefault().language
 
@@ -345,8 +410,9 @@ class AnimexinProvider : MainAPI() {
         coroutineScope {
             sortedServers.map { server ->
                 async {
+                    val label = server.text().trim()
                     val lang = detectLang(
-                        server.text(),
+                        label,
                         server.attr("data-lang"),
                         server.attr("data-em"),
                         server.attr("data-embed"),
@@ -367,6 +433,8 @@ class AnimexinProvider : MainAPI() {
                             decoded
                         } else null
 
+                        AnimexinLogger.d("Provider") { "Server '$label' -> lang=$lang, src=$iframeSrc" }
+
                         if (!iframeSrc.isNullOrBlank()) {
                             invokeExtractor(iframeSrc, lang)
                         }
@@ -376,14 +444,18 @@ class AnimexinProvider : MainAPI() {
         }
 
         // 2) Bare iframes in page
-        document.select("iframe").forEach { iframe ->
+        val bareIframes = document.select("iframe")
+        AnimexinLogger.d("Provider") { "Found ${bareIframes.size} bare <iframe> tags" }
+        bareIframes.forEach { iframe ->
             val src = iframe.extractIframeSrc()
             if (!src.isNullOrBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
                 val lang = detectLang(src, iframe.attr("title"), iframe.attr("data-lang"))
+                AnimexinLogger.d("Provider") { "Bare iframe -> lang=$lang, src=$src" }
                 invokeExtractor(src, lang)
             }
         }
 
+        AnimexinLogger.d("Provider") { "loadLinks finished: ${yieldedStreamUrls.size} unique stream(s) emitted" }
         return true
     }
 }
