@@ -1,18 +1,17 @@
 package com.Animexin
 
 import android.app.AlertDialog
+import android.content.Context
 import android.widget.LinearLayout
 import android.widget.Switch
 import android.widget.TextView
-import com.lagradost.cloudstream3.AcraApplication
-import com.lagradost.cloudstream3.plugins.BasePlugin
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.plugins.Plugin
 
 @CloudstreamPlugin
-class AnimexinPlugin : BasePlugin() {
-    override fun load() {
-        // Restore persisted verbose logging preference on plugin startup
-        AcraApplication.context?.let { AnimexinLogger.init(it) }
+class AnimexinPlugin : Plugin() {
+    override fun load(context: Context) {
+        AnimexinLogger.init(context)
 
         // Register the main scraper
         registerMainAPI(AnimexinProvider())
@@ -29,7 +28,7 @@ class AnimexinPlugin : BasePlugin() {
         registerExtractorAPI(FileMoonSx())
 
         // In-app settings dialog (accessible via the extension gear icon in CloudStream)
-        openSettings = { ctx ->
+        openSettings = { ctx: Context ->
             val padding = (20 * ctx.resources.displayMetrics.density).toInt()
             val container = LinearLayout(ctx).apply {
                 orientation = LinearLayout.VERTICAL
