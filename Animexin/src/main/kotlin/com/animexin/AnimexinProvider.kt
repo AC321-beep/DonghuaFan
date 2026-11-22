@@ -7,13 +7,11 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.suspendCancellableCoroutine
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
-import kotlin.coroutines.resume
 
 class AnimexinProvider : MainAPI() {
     override var mainUrl = "https://animexin.dev"
@@ -32,36 +30,31 @@ class AnimexinProvider : MainAPI() {
         "anime/?status=completed&type=&order=update" to "Completed"
     )
 
-   private suspend fun getSafeDocument(url: String): Document {
-        // runCatching safely handles OkHttp throwing exceptions on 403/503 errors
+    private suspend fun getSafeDocument(url: String): Document {
         val responseResult = runCatching { app.get(url, interceptor = cfInterceptor) }
 
         val needsSolve = responseResult.fold(
             onSuccess = { resp ->
                 val doc = resp.document
                 val title = doc.title().lowercase()
-                
-                // Only trigger if HTTP code is a block OR strong Cloudflare DOM markers are present
+
                 resp.code in listOf(403, 503) ||
                 listOf("just a moment", "security verification", "attention required", "cloudflare", "verify you are human").any { title.contains(it) } ||
                 doc.selectFirst("div.cf-turnstile, #cf-wrapper") != null
             },
             onFailure = { e ->
-                // Trigger solve if the request crashed specifically due to a 403/503 block
                 e.message?.contains("403") == true || e.message?.contains("503") == true
             }
         )
 
         if (needsSolve) {
-            // Trigger the new CFSolver (attempts silent 1x1 first, falls back to dialog)
             if (CFSolver(url).solve()) {
                 return app.get(url, interceptor = cfInterceptor).document
             } else {
                 throw Error("Cloudflare bypass was cancelled or failed.")
             }
         }
-        
-        // If no solve was needed, return the successfully fetched document
+
         return responseResult.getOrThrow().document
     }
 
@@ -196,6 +189,44 @@ class AnimexinProvider : MainAPI() {
         }
     }
 
+    private fun decodeBase64Safe(input: String): String {
+        val trimmed = input.trim()
+        if (trimmed.startsWith("http", ignoreCase = true) ||
+            trimmed.startsWith("//") ||
+            trimmed.startsWith("<")
+        ) {
+            return trimmed
+        }
+        return try {
+            val normalized = trimmed
+                .replace("\\s+".toRegex(), "")
+                .replace('-', '+')
+                .replace('_', '/')
+            val padded = when (normalized.length % 4) {
+                2 -> "$normalized=="
+                3 -> "$normalized="
+                else -> normalized
+            }
+            String(Base64.decode(padded, Base64.DEFAULT), Charsets.UTF_8).trim()
+        } catch (e: Exception) {
+            trimmed
+        }
+    }
+
+    private fun Element.extractIframeSrc(): String? {
+        val candidates = listOf(
+            this.attr("data-lazy-src"),
+            this.attr("data-src"),
+            this.attr("src")
+        )
+        return candidates.firstOrNull { src ->
+            src.isNotBlank() &&
+            !src.equals("about:blank", ignoreCase = true) &&
+            !src.startsWith("data:", ignoreCase = true) &&
+            !src.startsWith("javascript:", ignoreCase = true)
+        }?.trim()
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -206,7 +237,6 @@ class AnimexinProvider : MainAPI() {
         val extractedIframeUrls = ConcurrentHashMap.newKeySet<String>()
         val yieldedStreamUrls = ConcurrentHashMap.newKeySet<String>()
 
-        // Detect language from any combination of label / attribute / URL.
         fun detectLang(vararg sources: String?): String? {
             val combined = sources.filterNotNull().joinToString(" ").lowercase()
             val hasIndo = combined.contains("indonesia") || combined.contains("indo") || combined.contains("bahasa")
@@ -219,7 +249,6 @@ class AnimexinProvider : MainAPI() {
             }
         }
 
-        // Short label appended to the picker name.
         fun langTag(lang: String?): String? = when (lang) {
             "eng" -> "[Eng]"
             "ind" -> "[Indo]"
@@ -229,22 +258,22 @@ class AnimexinProvider : MainAPI() {
         suspend fun invokeExtractor(iframeUrl: String, lang: String? = null) {
             var finalUrl = iframeUrl.trim()
             if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
-            else if (finalUrl.startsWith("/")) finalUrl = "https://animexin.dev$finalUrl"
+            else if (finalUrl.startsWith("/")) finalUrl = "$mainUrl$finalUrl"
             else if (!finalUrl.startsWith("http")) finalUrl = "https://$finalUrl"
 
-            val dedupUrl = finalUrl.substringBefore("?")
+            // Strip tracking params (like ?pub=) while keeping video ID params (?v=, ?id=, ?vid=)
+            val basePart = finalUrl.substringBefore("?")
+            val idParam = Regex("""[?&](?:v|id|vid)=([^&]+)""").find(finalUrl)?.value.orEmpty()
+            val dedupUrl = basePart + idParam
             if (!extractedIframeUrls.add(dedupUrl)) return
 
             val tag = langTag(lang)
 
-           // Tag lang on every link AND append [Eng]/[Indo] to the displayed name/source.
-            // Emit immediately — no buffering, no delay.
             val trackingCallback: (ExtractorLink) -> Unit = { link ->
                 val localized = if (tag != null) {
                     val newName = if (!link.name.contains(tag)) "${link.name} $tag" else link.name
                     val newSource = if (!link.source.contains(tag)) "${link.source} $tag" else link.source
-                    
-                    // Manually rebuild the ExtractorLink since .copy() is no longer supported
+
                     ExtractorLink(
                         source = newSource,
                         name = newName,
@@ -264,6 +293,10 @@ class AnimexinProvider : MainAPI() {
 
             try {
                 val isHandled = when {
+                    "rumble.com" in finalUrl || "rmbl.ws" in finalUrl -> {
+                        Rumble().getUrl(finalUrl, mainUrl, subtitleCallback, trackingCallback)
+                        true
+                    }
                     "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> {
                         OkRu().getUrl(finalUrl, mainUrl)?.forEach { trackingCallback(it) }
                         true
@@ -289,10 +322,8 @@ class AnimexinProvider : MainAPI() {
             ".server-list li a[data-em], .server option, .player option"
         )
 
-        // Read the user's system/app locale (e.g. "en" for English, "id" or "in" for Indonesian)
         val userLang = Locale.getDefault().language
 
-        // Sort servers dynamically based on user language preference before processing them
         val sortedServers = servers.sortedByDescending { server ->
             val lang = detectLang(
                 server.text(),
@@ -303,14 +334,10 @@ class AnimexinProvider : MainAPI() {
             )
 
             when {
-                // User prefers Indonesian
                 (userLang == "id" || userLang == "in") && lang == "ind" -> 2
                 (userLang == "id" || userLang == "in") && lang == "eng" -> 1
-                
-                // User prefers English (or anything else defaults to English priority)
                 lang == "eng" -> 2
                 lang == "ind" -> 1
-                
                 else -> 0
             }
         }
@@ -332,15 +359,11 @@ class AnimexinProvider : MainAPI() {
                         .trim()
 
                     if (rawData.isNotBlank()) {
-                        val decoded = try {
-                            String(Base64.decode(rawData, Base64.DEFAULT))
-                        } catch (e: Exception) {
-                            rawData
-                        }
+                        val decoded = decodeBase64Safe(rawData)
 
                         val iframeSrc = if (decoded.contains("<iframe", ignoreCase = true)) {
-                            Jsoup.parse(decoded).selectFirst("iframe")?.attr("src")
-                        } else if (decoded.startsWith("http") || decoded.startsWith("//")) {
+                            Jsoup.parse(decoded).selectFirst("iframe")?.extractIframeSrc()
+                        } else if (decoded.startsWith("http", ignoreCase = true) || decoded.startsWith("//")) {
                             decoded
                         } else null
 
@@ -354,8 +377,8 @@ class AnimexinProvider : MainAPI() {
 
         // 2) Bare iframes in page
         document.select("iframe").forEach { iframe ->
-            val src = iframe.attr("src")
-            if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
+            val src = iframe.extractIframeSrc()
+            if (!src.isNullOrBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) {
                 val lang = detectLang(src, iframe.attr("title"), iframe.attr("data-lang"))
                 invokeExtractor(src, lang)
             }
