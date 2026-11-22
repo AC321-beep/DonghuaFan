@@ -77,9 +77,9 @@ class ReelFrenPlugin : Plugin() {
                 activity.runOnUiThread {
                     if (activity.isFinishing || activity.isDestroyed) return@runOnUiThread
                     
-                    var dialog: AlertDialog? = null
+                    var requiresRestart = false
                     
-                    val builder = AlertDialog.Builder(activity)
+                    val dialog = AlertDialog.Builder(activity)
                         .setTitle("ReelFren Settings")
                         .setMultiChoiceItems(providerNames.toTypedArray(), checkedStates) { _, which, isChecked ->
                             checkedStates[which] = isChecked
@@ -87,8 +87,6 @@ class ReelFrenPlugin : Plugin() {
                         .setPositiveButton("Save") { _, _ ->
                             val editor = ReelFrenStore.providerPrefsEditor()
                             if (editor != null) {
-                                var changed = false
-                                
                                 for (i in providerSlugs.indices) {
                                     val slug = providerSlugs[i]
                                     val wasEnabled = ReelFrenStore.isProviderEnabled(slug)
@@ -96,33 +94,20 @@ class ReelFrenPlugin : Plugin() {
                                     
                                     if (wasEnabled != isNowEnabled) {
                                         ReelFrenStore.setProviderEnabled(editor, slug, isNowEnabled)
-                                        changed = true
+                                        requiresRestart = true
                                     }
                                 }
                                 
                                 val newVerboseState = checkedStates[providerNames.size - 1]
                                 if (ReelFrenLog.isVerbose != newVerboseState) {
                                     ReelFrenStore.setVerboseLogging(newVerboseState)
-                                    changed = true
+                                    requiresRestart = true
                                 }
 
-                                if (changed) {
+                                if (requiresRestart) {
                                     editor.apply()
-                                    syncAndRegisterProvider() 
-                                    
-                                    // 1. Explicitly dismiss the dialog first to prevent WindowLeaks
-                                    dialog?.dismiss()
-                                    
+                                    syncAndRegisterProvider()
                                     Toast.makeText(activity, "Settings applied! Reloading...", Toast.LENGTH_SHORT).show()
-                                    
-                                    // 2. Safely post the recreate command to the end of the UI queue
-                                    Handler(Looper.getMainLooper()).post {
-                                        runCatching { 
-                                            if (!activity.isFinishing && !activity.isDestroyed) {
-                                                activity.recreate() 
-                                            }
-                                        }
-                                    }
                                 }
                             }
                         }
@@ -140,8 +125,17 @@ class ReelFrenPlugin : Plugin() {
                                 }
                             }
                         }
+                        .create()
                         
-                    dialog = builder.create()
+                    // Listen for the dialog to completely dismiss before executing the restart
+                    dialog.setOnDismissListener {
+                        if (requiresRestart && !activity.isFinishing && !activity.isDestroyed) {
+                            Handler(Looper.getMainLooper()).post {
+                                runCatching { activity.recreate() }
+                            }
+                        }
+                    }
+
                     dialog.show()
                 }
             } else {
