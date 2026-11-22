@@ -122,13 +122,19 @@ object ReelFrenSubtitles {
         callback: (SubtitleFile) -> Unit
     ) {
         val seenUrls = mutableSetOf<String>()
+        // FIX: Tracks the names of emitted languages to prevent ExoPlayer from overwriting duplicates
+        val seenLabels = mutableMapOf<String, Int>()
 
         for (entry in entries) {
             val resolved = resolveUrl(entry.url) ?: continue
             if (!seenUrls.add(resolved)) continue
 
-            // FIX: Force Cloudstream to understand the full language string
-            val displayLabel = resolveDisplayLabel(entry.lang, entry.label)
+            val baseLabel = resolveDisplayLabel(entry.lang, entry.label)
+            val count = seenLabels.getOrDefault(baseLabel, 0)
+            seenLabels[baseLabel] = count + 1
+            
+            // If we have two English tracks, they become "English" and "English 2"
+            val displayLabel = if (count > 0) "$baseLabel ${count + 1}" else baseLabel
             
             callback(
                 newSubtitleFile(lang = displayLabel, url = resolved) {
@@ -143,8 +149,18 @@ object ReelFrenSubtitles {
             for (sub in extractHlsSubs(hlsUrl)) {
                 val url = runCatching { sub.url }.getOrNull() ?: continue
                 if (seenUrls.add(url)) {
-                    callback(sub)
-                    ReelFrenLog.d("Subtitles/emit", "Emitted HLS: ${sub.lang} -> $url")
+                    val baseLabel = sub.lang
+                    val count = seenLabels.getOrDefault(baseLabel, 0)
+                    seenLabels[baseLabel] = count + 1
+                    
+                    val displayLabel = if (count > 0) "$baseLabel ${count + 1}" else baseLabel
+                    
+                    callback(
+                        newSubtitleFile(lang = displayLabel, url = url) {
+                            this.headers = ReelFrenClient.headers(url)
+                        }
+                    )
+                    ReelFrenLog.d("Subtitles/emit", "Emitted HLS: $displayLabel -> $url")
                 }
             }
         }
@@ -185,13 +201,11 @@ object ReelFrenSubtitles {
         val normFromLang = normalizeLang(rawLang)
         val normFromLabel = if (normFromLang == "und") normalizeLang(rawLabel) else normFromLang
         
-        // FIX: Always return the full, mapped language name string to Cloudstream
         val fullLangName = langLabel(normFromLabel)
         
         return if (fullLangName != "Unknown") {
             fullLangName
         } else {
-            // Fallback to the raw label if we can't map it, but capitalize it so Cloudstream UI looks nice
             rawLabel.trim().replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }
                 .ifEmpty { "English" } 
         }
@@ -776,15 +790,26 @@ object ReelFrenClient {
         if (!isGlobal && slug.isNotEmpty()) p += "provider=${query(slug)}"
         p += "lang=en"
         if (category.isNotEmpty()) p += "category=${query(category)}"
-        val off = page - 1
-        if (off > 0) p += "offset=$off"
+        
+        // FIX: Provide standard pagination attributes to stop backend from looping page 1
+        p += "page=$page"
+        val offset = (page - 1) * 20
+        if (offset > 0) p += "offset=$offset"
         
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
     fun detailUrl(slug: String, id: String) = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
     fun videoUrl(slug: String, id: String, ep: Int) = "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep"
-    fun searchUrl(slug: String, term: String) = "${apiBase()}/api/search?q=${query(term)}&provider=${query(slug)}&lang=en"
+    
+    // FIX: Remove provider parameter if 'all_dramas' to prevent search API crash
+    fun searchUrl(slug: String, term: String): String {
+        val p = mutableListOf<String>()
+        p += "q=${query(term)}"
+        p += "lang=en"
+        if (slug != "all_dramas" && slug.isNotEmpty()) p += "provider=${query(slug)}"
+        return "${apiBase()}/api/search?${p.joinToString("&")}"
+    }
 
     fun headers(url: String, isApiCall: Boolean = false): Map<String, String> {
         val targetHost = ReelFrenCloudflare.hostOf(url)
