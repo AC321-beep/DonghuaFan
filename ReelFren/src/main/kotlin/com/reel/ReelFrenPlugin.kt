@@ -4,8 +4,6 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
 import android.content.ContextWrapper
-import android.os.Handler
-import android.os.Looper
 import android.widget.Toast
 import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.CommonActivity
@@ -77,16 +75,16 @@ class ReelFrenPlugin : Plugin() {
                 activity.runOnUiThread {
                     if (activity.isFinishing || activity.isDestroyed) return@runOnUiThread
                     
-                    var requiresRestart = false
-                    
-                    val dialog = AlertDialog.Builder(activity)
+                    AlertDialog.Builder(activity)
                         .setTitle("ReelFren Settings")
                         .setMultiChoiceItems(providerNames.toTypedArray(), checkedStates) { _, which, isChecked ->
                             checkedStates[which] = isChecked
                         }
-                        .setPositiveButton("Save") { _, _ ->
+                        .setPositiveButton("Save") { dialog, _ ->
                             val editor = ReelFrenStore.providerPrefsEditor()
                             if (editor != null) {
+                                var changed = false
+                                
                                 for (i in providerSlugs.indices) {
                                     val slug = providerSlugs[i]
                                     val wasEnabled = ReelFrenStore.isProviderEnabled(slug)
@@ -94,25 +92,32 @@ class ReelFrenPlugin : Plugin() {
                                     
                                     if (wasEnabled != isNowEnabled) {
                                         ReelFrenStore.setProviderEnabled(editor, slug, isNowEnabled)
-                                        requiresRestart = true
+                                        changed = true
                                     }
                                 }
                                 
-                                val newVerboseState = checkedStates[providerNames.size - 1]
+                                val newVerboseState = checked   States[providerNames.size - 1]
                                 if (ReelFrenLog.isVerbose != newVerboseState) {
                                     ReelFrenStore.setVerboseLogging(newVerboseState)
-                                    requiresRestart = true
+                                    changed = true
                                 }
 
-                                if (requiresRestart) {
+                                if (changed) {
                                     editor.apply()
-                                    syncAndRegisterProvider()
-                                    Toast.makeText(activity, "Settings applied! Reloading...", Toast.LENGTH_SHORT).show()
+                                    // 1. Immediately apply the changes in memory so the background code uses the new settings
+                                    syncAndRegisterProvider() 
+                                    
+                                    // 2. We skip activity.recreate() entirely. 
+                                    // This completely eliminates the WindowLeaked crash while still allowing the tabs to update.
+                                    Toast.makeText(activity, "Saved! Please navigate back to refresh.", Toast.LENGTH_LONG).show()
                                 }
                             }
+                            dialog.dismiss()
                         }
-                        .setNegativeButton("Cancel", null)
-                        .setNeutralButton("Clear Cookies") { _, _ ->
+                        .setNegativeButton("Cancel") { dialog, _ -> 
+                            dialog.dismiss() 
+                        }
+                        .setNeutralButton("Clear Cookies") { dialog, _ ->
                             CoroutineScope(Dispatchers.IO).launch {
                                 android.webkit.CookieManager.getInstance().removeAllCookies(null)
                                 android.webkit.CookieManager.getInstance().flush()
@@ -124,19 +129,9 @@ class ReelFrenPlugin : Plugin() {
                                     Toast.makeText(activity, "Cookies and CF Clearance cleared.", Toast.LENGTH_SHORT).show()
                                 }
                             }
+                            dialog.dismiss()
                         }
-                        .create()
-                        
-                    // Listen for the dialog to completely dismiss before executing the restart
-                    dialog.setOnDismissListener {
-                        if (requiresRestart && !activity.isFinishing && !activity.isDestroyed) {
-                            Handler(Looper.getMainLooper()).post {
-                                runCatching { activity.recreate() }
-                            }
-                        }
-                    }
-
-                    dialog.show()
+                        .show()
                 }
             } else {
                 Toast.makeText(context, "Cannot open settings right now", Toast.LENGTH_SHORT).show()
