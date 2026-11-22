@@ -3,6 +3,7 @@ package com.Animexin
 import android.util.Base64
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.extractors.DoodLaExtractor
 import com.lagradost.cloudstream3.extractors.Filesim
 import com.lagradost.cloudstream3.extractors.StreamSB
 import com.lagradost.cloudstream3.extractors.StreamWishExtractor
@@ -10,6 +11,7 @@ import com.lagradost.cloudstream3.utils.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
@@ -39,6 +41,16 @@ class Waaw : StreamSB() {
 class Wishfast : StreamWishExtractor() {
     override val name = "StreamWish"
     override val mainUrl = "https://wishfast.top"
+}
+
+/**
+ * All Sub Player Dood — soft-subtitle variant hosted on playmogo.com.
+ * Playmogo is a DoodStream mirror; DoodLaExtractor already handles
+ * the pass_md5 → token → direct-URL handshake and any domain redirects.
+ */
+class AllsubDoodStream : DoodLaExtractor() {
+    override var name = "Allsub DoodStream"
+    override var mainUrl = "https://playmogo.com"
 }
 
 class Vtbe : ExtractorApi() {
@@ -266,6 +278,28 @@ class Odysee : ExtractorApi() {
             val lbryPath = decodedPath.replace(':', '#')
             return if (lbryPath.startsWith("lbry://")) lbryPath else "lbry://$lbryPath"
         }
+
+        private suspend fun <T> retryBackoff(
+            n: Int = 3,
+            initialMs: Long = 1500,
+            factor: Double = 2.0,
+            block: suspend (attempt: Int) -> T
+        ): T {
+            var d = initialMs
+            var last: Exception? = null
+            repeat(n) { i ->
+                try {
+                    return block(i)
+                } catch (e: Exception) {
+                    last = e
+                    if (i < n - 1) {
+                        delay(d)
+                        d = (d * factor).toLong()
+                    }
+                }
+            }
+            throw last!!
+        }
     }
 
     override suspend fun getUrl(
@@ -280,7 +314,7 @@ class Odysee : ExtractorApi() {
 
         var streamUrl: String? = null
 
-        // 1. LBRY API FIRST — one CDN request, not rate-limited.
+        // 1. LBRY API first (one CDN request, not rate-limited).
         val lbryUri = buildLbryUri(url)
         if (!lbryUri.isNullOrBlank()) {
             AnimexinLogger.d("Odysee") { "Querying LBRY API for uri=$lbryUri" }
@@ -314,15 +348,17 @@ class Odysee : ExtractorApi() {
             }
         }
 
-        // 2. HTML scrape fallback (browser UA avoids CDN flagging).
+        // 2. HTML scrape fallback (browser UA + retry).
         if (streamUrl.isNullOrBlank()) {
             AnimexinLogger.d("Odysee") { "Falling back to embed-page scrape" }
             val html = withTimeoutOrNull(FETCH_TIMEOUT_MS) {
                 runCatching {
-                    app.get(
-                        url, referer = pageReferer,
-                        headers = mapOf("User-Agent" to BROWSER_UA)
-                    ).text
+                    retryBackoff(3, 2000) {
+                        app.get(
+                            url, referer = pageReferer,
+                            headers = mapOf("User-Agent" to BROWSER_UA)
+                        ).text
+                    }
                 }.getOrNull()
             }
 
@@ -342,14 +378,16 @@ class Odysee : ExtractorApi() {
             return
         }
 
-        // 3. THE FIX — carry signature from embed URL onto the CDN URL.
+        // 3. Carry signature params onto the CDN URL.
         val resolved = withSigParams(raw, sigs)
         AnimexinLogger.d("Odysee") { "Final CDN URL: $resolved" }
 
+        // ── FIX for 401: the CDN validates that the Referer matches the *full*
+        //    embed URL (path + ?r=&signature=&signature_ts=), not just the host.
         val hdrs = mapOf(
             "User-Agent" to BROWSER_UA,
             "Origin" to "https://odysee.com",
-            "Referer" to "https://odysee.com/",
+            "Referer" to url,
             "Accept" to "*/*"
         )
         val isHls = resolved.contains(".m3u8", ignoreCase = true) ||
@@ -357,19 +395,19 @@ class Odysee : ExtractorApi() {
 
         if (isHls) {
             callback(newExtractorLink(name, "$name (Auto)", resolved, ExtractorLinkType.M3U8) {
-                this.referer = "https://odysee.com/"
+                this.referer = url
                 this.quality = Qualities.Unknown.value
                 this.headers = hdrs
             })
             val variants = withTimeoutOrNull(SPLIT_TIMEOUT_MS) {
                 runCatching {
-                    M3u8Helper.generateM3u8(name, resolved, "https://odysee.com/", headers = hdrs)
+                    M3u8Helper.generateM3u8(name, resolved, url, headers = hdrs)
                 }.getOrNull()
             }
             variants?.forEach(callback)
         } else {
             callback(newExtractorLink(name, name, resolved, INFER_TYPE) {
-                this.referer = "https://odysee.com/"
+                this.referer = url
                 this.quality = Qualities.Unknown.value
                 this.headers = hdrs
             })
@@ -529,8 +567,9 @@ class MegaNz : ExtractorApi() {
                         init(Cipher.DECRYPT_MODE, SecretKeySpec(aesKey, "AES"), IvParameterSpec(iv))
                     }
 
-                    // ── FIX: add User-Agent / Referer / Accept-Encoding so Mega storage nodes
-                    //    don't reject the request with 403, and so gzip doesn't break AES-CTR offsets.
+                    // ── FIX: add UA / Referer / Accept / Accept-Encoding so the
+                    //    Mega storage node doesn't 403 us, and so gzip doesn't
+                    //    corrupt the AES-CTR byte offsets.
                     upstreamConn = (URL(upstreamUrl).openConnection() as HttpURLConnection).apply {
                         connectTimeout = 12_000
                         readTimeout = 30_000
@@ -629,7 +668,7 @@ class MegaNz : ExtractorApi() {
                             "a" to "g",
                             "g" to 1,
                             "p" to fileId,
-                            "ssl" to 1          // ── FIX: force HTTPS storage URL
+                            "ssl" to 1          // force HTTPS storage URL
                         )
                     )
                 ).text
@@ -669,10 +708,10 @@ class MegaNz : ExtractorApi() {
 }
 
 /**
- * Hardsub Rumble — unchanged behaviour from original. The only difference is that
- * the class is `open` and calls an `onM3u8Resolved` hook (default no-op) so the
- * Allsub subclass can piggy-back soft-subtitle extraction without altering
- * hardsub flow.
+ * Hardsub Rumble — behaviour is unchanged from the original. The only
+ * difference is that the class is `open` and exposes a protected
+ * `onM3u8Resolved` hook (default no-op) so [AllsubRumble] can piggy-back
+ * soft-subtitle extraction without touching the hardsub flow.
  */
 open class Rumble : ExtractorApi() {
     override var name = "Rumble"
@@ -751,7 +790,6 @@ open class Rumble : ExtractorApi() {
                 ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
             callback(newExtractorLink(name, name, url, linkType) { this.referer = referer ?: url })
 
-            // Still fire the hook on the direct m3u8 case (Allsub uses this path rarely).
             if (linkType == ExtractorLinkType.M3U8) {
                 onM3u8Resolved(url, referer ?: url, subtitleCallback)
             }
@@ -882,7 +920,7 @@ open class Rumble : ExtractorApi() {
                 }
             )
 
-            // NEW: hook for Allsub. No-op on hardsub Rumble.
+            // Hook for Allsub. No-op on hardsub Rumble.
             runCatching { onM3u8Resolved(cleanUrl, referer, subtitleCallback) }
 
             val variants = try {
@@ -919,7 +957,8 @@ open class Rumble : ExtractorApi() {
 
 /**
  * All-sub Rumble — the soft-subtitle variant (HLS master carries #EXT-X-MEDIA
- * tracks). Only the display name and subtitle extraction differ from [Rumble].
+ * subtitle tracks). Only the display name and subtitle extraction differ
+ * from [Rumble]; hardsub behaviour is untouched.
  */
 class AllsubRumble : Rumble() {
     override var name = "Allsub Rumble"
