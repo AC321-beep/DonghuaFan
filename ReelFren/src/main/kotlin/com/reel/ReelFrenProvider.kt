@@ -39,11 +39,11 @@ class ReelFrenProvider : MainAPI() {
         private var cachedSearchTime: Long = 0L
         private const val CACHE_EXPIRY_MS = 10 * 60 * 1000L // 10 minutes
         
-        // Dedicated detached scope so slow searches can finish in the background
         private val bgSearchScope = CoroutineScope(Dispatchers.IO)
     }
 
-    override val mainPage = mainPageOf(
+    // FIX: Added 'get() =' so Cloudstream rebuilds the tabs dynamically on every reload
+    override val mainPage get() = mainPageOf(
         "all_dramas" to "All Dramas",
         *ReelFrenStore.enabledProviders().map { it.value to it.key }.toTypedArray()
     )
@@ -94,7 +94,6 @@ class ReelFrenProvider : MainAPI() {
         cachedSearchResults = emptyList()
         cachedSearchTime = now
 
-        // 1. Launch all searches in the detached background scope
         val deferredSearches = activeProviders.map { slug ->
             bgSearchScope.async {
                 val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
@@ -111,13 +110,11 @@ class ReelFrenProvider : MainAPI() {
 
         val fastResults = mutableListOf<SearchResponse>()
         
-        // 2. Wait up to 4 seconds for the fast servers to reply
         try {
             withTimeout(4000L) {
                 fastResults.addAll(deferredSearches.awaitAll().flatten())
             }
         } catch (e: TimeoutCancellationException) {
-            // 3. Timeout hit! Extract only the results that finished in time
             val completed = deferredSearches.filter { it.isCompleted && !it.isCancelled }.flatMap { it.getCompleted() }
             fastResults.addAll(completed)
             ReelFrenLog.d("Main/search", "Timeout hit. Returning ${completed.size} fast results.")
@@ -126,7 +123,6 @@ class ReelFrenProvider : MainAPI() {
         val distinctFast = fastResults.distinctBy { it.url }
         cachedSearchResults = distinctFast
 
-        // 4. Let the slow servers finish in the background and silently update the cache
         bgSearchScope.launch {
             val allLateResults = deferredSearches.awaitAll().flatten().distinctBy { it.url }
             if (cachedSearchQuery == cleanQuery) {
