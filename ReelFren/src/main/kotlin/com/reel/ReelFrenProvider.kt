@@ -128,7 +128,7 @@ class ReelFrenProvider : MainAPI() {
             if (cachedSearchQuery == cleanQuery) {
                 cachedSearchResults = allLateResults
                 if (allLateResults.size > distinctFast.size) {
-                    ReelFrenLog.d("Main/search", "Background cache silently grew from ${distinctFast.size} to ${allLateResults.size} items")
+                    ReelFrenLog.d("Main/search", "Background cache silently grew from ${distinctFast.size} to${allLateResults.size} items")
                 }
             }
         }
@@ -193,17 +193,14 @@ class ReelFrenProvider : MainAPI() {
 
         val workingLinks = mutableListOf<com.lagradost.cloudstream3.utils.ExtractorLink>()
 
-        // Run validation on all qualities in parallel
         coroutineScope {
             val validationJobs = p.qualities.map { q ->
                 async {
                     val qUrl = ReelFrenClient.absUrl(q.url)
                     if (qUrl.isBlank() || !qUrl.startsWith("http")) return@async null
 
-                    // SMART PING: Perform a lightweight check to ensure the URL isn't throwing a 401 or 403
                     val isAlive = runCatching {
                         val checkHeaders = ReelFrenClient.headers(qUrl).toMutableMap()
-                        // 0-100 byte range header prevents downloading the whole video if it's an MP4
                         checkHeaders["Range"] = "bytes=0-100" 
                         val response = com.lagradost.cloudstream3.app.get(qUrl, headers = checkHeaders, timeout = 4000L)
                         response.code in 200..299 || response.code in 300..399
@@ -217,12 +214,11 @@ class ReelFrenProvider : MainAPI() {
                     val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
                     val linkType = ReelFrenQuality.linkType(qUrl, format)
                     
-                    // UNIQUE NAMING: Ensures Cloudstream does not treat multiple working servers as duplicates
                     val baseServer = if (p.server.isBlank() || p.server == "1") "ReelFren" else "Server ${p.server}"
                     val cleanLabel = q.label.replace("(?i)auto".toRegex(), "").trim()
                     
                     val finalName = if (cleanLabel.isNotEmpty() && !baseServer.contains(cleanLabel)) {
-                        "$baseServer - $cleanLabel"
+                        "$baseServer -$cleanLabel"
                     } else {
                         baseServer
                     }
@@ -239,7 +235,6 @@ class ReelFrenProvider : MainAPI() {
                 }
             }
             
-            // Wait for all pings to finish, then emit only the ones that survived
             validationJobs.awaitAll().filterNotNull().forEach { link ->
                 callback(link)
                 workingLinks.add(link)
