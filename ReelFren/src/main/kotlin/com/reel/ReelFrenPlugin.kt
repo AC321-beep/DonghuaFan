@@ -77,7 +77,9 @@ class ReelFrenPlugin : Plugin() {
                 activity.runOnUiThread {
                     if (activity.isFinishing || activity.isDestroyed) return@runOnUiThread
                     
-                    AlertDialog.Builder(activity)
+                    var dialog: AlertDialog? = null
+                    
+                    val builder = AlertDialog.Builder(activity)
                         .setTitle("ReelFren Settings")
                         .setMultiChoiceItems(providerNames.toTypedArray(), checkedStates) { _, which, isChecked ->
                             checkedStates[which] = isChecked
@@ -108,12 +110,19 @@ class ReelFrenPlugin : Plugin() {
                                     editor.apply()
                                     syncAndRegisterProvider() 
                                     
+                                    // 1. Explicitly dismiss the dialog first to prevent WindowLeaks
+                                    dialog?.dismiss()
+                                    
                                     Toast.makeText(activity, "Settings applied! Reloading...", Toast.LENGTH_SHORT).show()
                                     
-                                    // FIX: 200ms delay gives the UI time to close the AlertDialog before wiping the activity
-                                    Handler(Looper.getMainLooper()).postDelayed({
-                                        runCatching { activity.recreate() }
-                                    }, 200)
+                                    // 2. Safely post the recreate command to the end of the UI queue
+                                    Handler(Looper.getMainLooper()).post {
+                                        runCatching { 
+                                            if (!activity.isFinishing && !activity.isDestroyed) {
+                                                activity.recreate() 
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -131,7 +140,9 @@ class ReelFrenPlugin : Plugin() {
                                 }
                             }
                         }
-                        .show()
+                        
+                    dialog = builder.create()
+                    dialog.show()
                 }
             } else {
                 Toast.makeText(context, "Cannot open settings right now", Toast.LENGTH_SHORT).show()
