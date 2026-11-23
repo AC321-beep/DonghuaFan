@@ -92,17 +92,17 @@ const val SAFE_FALLBACK_UA =
 
 fun isRealSiteHtml(html: String): Boolean {
     val l = html.lowercase()
-    return l.contains("class=\"listupd") ||
-            l.contains("class=\"entry-title\"") ||
-            l.contains("class=\"eplister\"") ||
-            l.contains("id=\"embed_holder\"") ||
-            l.contains("class=\"bsx\"") ||
-            l.contains("const ts_config")
+    return l.contains("listupd") ||
+            l.contains("entry-title") ||
+            l.contains("eplister") ||
+            l.contains("embed_holder") ||
+            l.contains("bsx") ||
+            l.contains("ts_config") ||
+            (l.contains("animekhor") && (l.contains("wp-content") || l.contains("postbody") || l.contains("site-footer")))
 }
 
 fun isCfChallengeHtml(html: String): Boolean {
     if (html.isBlank()) return false
-    if (isRealSiteHtml(html)) return false
 
     val l = html.lowercase()
     val hasChallengeMarker = l.contains("<title>bot verification") ||
@@ -120,6 +120,7 @@ fun isCfChallengeHtml(html: String): Boolean {
             l.contains("cf_chl_opt")
 
     if (hasChallengeMarker) return true
+    if (isRealSiteHtml(html)) return false
 
     if (l.contains("<title> 403 forbidden") ||
         l.contains("<title>403 forbidden") ||
@@ -488,6 +489,11 @@ class CFSolver(
         val host = runCatching { URI(url).host }.getOrNull() ?: return false
         if (!host.contains("animekhor", ignoreCase = true)) return false
 
+        if (CFState.isHostVerified(host)) {
+            AnimekhorLogger.d("CFSolver") { "✅ Skipping solve for $host (already verified)" }
+            return true
+        }
+
         if (CFState.isInCooldown(host)) {
             AnimekhorLogger.d("CFSolver") { "⏸ CF solve skipped for $host (cooldown active)" }
             return false
@@ -578,6 +584,8 @@ class CFSolver(
                 cookieManager.setAcceptThirdPartyCookies(webView, true)
                 container.addView(webView)
 
+                lateinit var poll: () -> Unit
+
                 fun scheduleNextPoll(delayMs: Long = 1000L) {
                     if (done.get()) return
                     pollRunnable?.let { handler.removeCallbacks(it) }
@@ -600,8 +608,8 @@ class CFSolver(
                     if (cont.isActive) cont.resume(success)
                 }
 
-                fun poll() {
-                    if (done.get()) return
+                poll = poll@{
+                    if (done.get()) return@poll
                     tick++
 
                     val rawCookie = CFState.extractAllCookies(host, webView.url ?: url)
@@ -643,7 +651,7 @@ class CFSolver(
                                 }
                             }
                         }.onFailure { destroyWebView(false) }
-                        return
+                        return@poll
                     }
 
                     if (tick >= 3 && tick % 3 == 0) {
@@ -827,14 +835,16 @@ class CFSolver(
                 buttonRow.addView(Space(activity), LinearLayout.LayoutParams(20, 1))
                 buttonRow.addView(cancelBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
+                lateinit var poll: () -> Unit
+
                 fun scheduleNextCheck(delayMs: Long = 1000L) {
                     if (resolved.get()) return
                     checkRunnable?.let { handler.removeCallbacks(it) }
                     checkRunnable = Runnable { poll() }.also { handler.postDelayed(it, delayMs) }
                 }
 
-                fun poll() {
-                    if (resolved.get()) return
+                poll = poll@{
+                    if (resolved.get()) return@poll
                     tick++
                     val rawCookie = CFState.extractAllCookies(host, webView.url ?: url)
                     val hasClearance = rawCookie.contains("cf_clearance")
@@ -866,7 +876,7 @@ class CFSolver(
                                 scheduleNextCheck(1000L)
                             }
                         }
-                        return
+                        return@poll
                     }
 
                     if (tick >= 3 && tick % 3 == 0) {
