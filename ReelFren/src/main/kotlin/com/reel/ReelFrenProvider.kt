@@ -128,7 +128,7 @@ class ReelFrenProvider : MainAPI() {
             if (cachedSearchQuery == cleanQuery) {
                 cachedSearchResults = allLateResults
                 if (allLateResults.size > distinctFast.size) {
-                    ReelFrenLog.d("Main/search", "Background cache silently grew from ${distinctFast.size} to ${allLateResults.size} items")
+                    ReelFrenLog.d("Main/search", "Background cache silently grew from ${distinctFast.size} to${allLateResults.size} items")
                 }
             }
         }
@@ -219,7 +219,7 @@ class ReelFrenProvider : MainAPI() {
                         val cleanLabel = q.label.replace("(?i)auto".toRegex(), "").trim()
                         
                         val finalName = if (cleanLabel.isNotEmpty()) {
-                            "$baseServer - $cleanLabel"
+                            "$baseServer -$cleanLabel"
                         } else {
                             baseServer
                         }
