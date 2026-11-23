@@ -52,7 +52,7 @@ data class HomeItem(
 )
 data class PlaybackInfo(
     val title: String, val episodeNumber: Int, val totalEpisodes: Int,
-    val locked: Boolean, val qualities: List<QualityEntry>, // Qualities for the FIRST server found
+    val locked: Boolean, val qualities: List<QualityEntry>,
     val subtitles: List<SubtitleEntry>, val server: String
 )
 data class QualityEntry(val label: String, val url: String, val format: String)
@@ -285,16 +285,42 @@ object ReelFrenParse {
         return DetailInfo(id = id, provider = clean(o, "provider"), title = title, cover = clean(o, "cover"), intro = clean(o, "intro"), episodes = o.optInt("episodes", videos.size), videos = videos.sortedBy { it.episode })
     }
 
-    fun playback(body: String): PlaybackInfo? {
-        if (body.isBlank()) return null
-        val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
-        val o = root.optJSONObject("data") ?: root.optJSONObject("playback") ?: root
+    // --- CRITICAL REELFREN FIX FOR MISSING MULTI-SERVERS ---
+    fun playbackServers(slug: String, id: String, ep: Int): List<PlaybackInfo> {
+        val jsonText = runCatching { 
+            // We use runBlocking or extract this logic into the suspend call in loadLinks 
+            // Let's implement the parsing logic assuming we already have the raw body text.
+            ""
+        }.getOrDefault("")
+        return emptyList() // (We handle the actual suspend call in the main class instead)
+    }
 
+    fun playbackMulti(body: String): List<PlaybackInfo> {
+        if (body.isBlank()) return emptyList()
+        val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
+        val dataNode = root.optJSONObject("data") ?: root.optJSONObject("playback") ?: root
+
+        val serverList = mutableListOf<PlaybackInfo>()
+        
+        val multiServers = dataNode.optJSONArray("servers") ?: dataNode.optJSONArray("serverList")
+        if (multiServers != null) {
+            for (i in 0 until multiServers.length()) {
+                val serverObj = multiServers.optJSONObject(i) ?: continue
+                parseSinglePlaybackObj(serverObj, root)?.let { serverList.add(it) }
+            }
+        } 
+        
+        if (serverList.isEmpty()) {
+            parseSinglePlaybackObj(dataNode, root)?.let { serverList.add(it) }
+        }
+
+        return serverList
+    }
+
+    private fun parseSinglePlaybackObj(o: JSONObject, root: JSONObject): PlaybackInfo? {
         val qualities = mutableListOf<QualityEntry>()
         val subs = mutableListOf<SubtitleEntry>()
-        
-        // --- Naming Logic Fix ---
-        // If the API returns multiple arrays that represent true distinct servers, this captures the first one properly.
+
         val qArr = o.optJSONArray("qualityList") ?: o.optJSONArray("qualities") ?: o.optJSONArray("sources") 
                    ?: o.optJSONArray("videos") ?: o.optJSONArray("list") ?: o.optJSONArray("streams")
         
@@ -325,7 +351,7 @@ object ReelFrenParse {
             locked = o.optBoolean("locked"),
             qualities = qualities,
             subtitles = subs.distinctBy { "${it.lang.lowercase(Locale.ROOT)}|${it.url}" },
-            server = clean(o, "sourceServer", "server", "name").ifEmpty { "1" } // TRUE SERVER ID
+            server = clean(o, "sourceServer", "server", "name").ifEmpty { "1" }
         )
     }
 
@@ -599,6 +625,9 @@ class WebViewCookieJar : CookieJar {
 
 object ReelFrenClient {
     const val FALLBACK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    // Apply Mobile UA universally to force clean streams from VolcEngine CDNs
+    const val MOBILE_APP_UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
+    
     private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
     private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
@@ -661,7 +690,7 @@ object ReelFrenClient {
 
     fun videoHeaders(url: String): Map<String, String> {
         val map = linkedMapOf<String, String>()
-        map["User-Agent"] = FALLBACK_UA 
+        map["User-Agent"] = MOBILE_APP_UA 
         map["Accept"] = "*/*"
         map["Connection"] = "keep-alive"
         map["Origin"] = ReelFrenConfig.REEL_SITE
@@ -716,6 +745,12 @@ object ReelFrenClient {
             ReelFrenLog.d("Client.get", "✅ API Fetch Succeeded! Length: ${finalJson.length}")
             return finalJson
         }
+    }
+
+    // --- NEW: Expose playbackMulti for the provider ---
+    suspend fun playbackServers(slug: String, id: String, ep: Int): List<PlaybackInfo> {
+        val jsonText = get(videoUrl(slug, id, ep)) ?: return emptyList()
+        return ReelFrenParse.playbackMulti(jsonText)
     }
 
     suspend fun home(slug: String, category: String = "", page: Int = 1): List<HomeItem> = get(homeUrl(slug, category, page))?.let(ReelFrenParse::homeItems) ?: emptyList()
