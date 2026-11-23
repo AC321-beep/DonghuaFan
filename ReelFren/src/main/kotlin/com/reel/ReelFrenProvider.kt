@@ -194,7 +194,6 @@ class ReelFrenProvider : MainAPI() {
         val workingLinks = mutableListOf<com.lagradost.cloudstream3.utils.ExtractorLink>()
 
         coroutineScope {
-            // FIX: Index is passed to dynamically number servers to prevent Cloudstream deduplication
             val validationJobs = p.qualities.mapIndexed { index, q ->
                 async {
                     val qUrl = ReelFrenClient.absUrl(q.url)
@@ -213,9 +212,7 @@ class ReelFrenProvider : MainAPI() {
                     }
 
                     val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
-                    val linkType = ReelFrenQuality.linkType(qUrl, format)
                     
-                    // FIX: Ensure every link has a distinct "Server X" name so none get merged or discarded
                     val baseServer = "Server ${index + 1}"
                     val cleanLabel = q.label.replace("(?i)auto".toRegex(), "").trim()
                     
@@ -225,14 +222,25 @@ class ReelFrenProvider : MainAPI() {
                         baseServer
                     }
 
+                    // --- NATIVE EXTRACTOR FIX FOR NAL CRASH ---
+                    // By passing Range: bytes=0- in the ExtractorLink, ExoPlayer makes the request
+                    // with this specific header. This forces CDN proxies (like Mediagate) to bypass
+                    // their obfuscation pipeline and serve raw, unchunked bytes, stopping the crash.
+                    val safeHeaders = ReelFrenClient.headers(qUrl).toMutableMap()
+                    if (qUrl.contains("melolostatic.com", ignoreCase = true) || qUrl.contains("volcengine", ignoreCase = true)) {
+                        safeHeaders["Accept"] = "*/*"
+                        safeHeaders["Connection"] = "keep-alive"
+                        safeHeaders["Range"] = "bytes=0-"
+                    }
+
                     com.lagradost.cloudstream3.utils.ExtractorLink(
                         source = name,
                         name = finalName,
                         url = qUrl,
                         referer = "${ReelFrenConfig.REEL_SITE}/", 
                         quality = ReelFrenQuality.of(q.label),
-                        type = linkType,
-                        headers = ReelFrenClient.headers(qUrl) 
+                        type = ReelFrenQuality.linkType(qUrl, format), 
+                        headers = safeHeaders 
                     )
                 }
             }
