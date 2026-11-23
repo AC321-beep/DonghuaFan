@@ -94,9 +94,8 @@ class AnimekhorProvider : MainAPI() {
     private fun isValidSiteHtml(html: String): Boolean =
         html.length > 500 && !isCfChallenge(html) && isRealSiteHtml(html)
 
-    private suspend fun executeGet(url: String, headers: Map<String, String> = browserHeaders) = try {
+    private suspend fun executeGet(url: String, headers: Map<String, String> = browserHeaders): NiceResponse? = try {
         withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
-            // CFInterceptor automatically attaches the correct User-Agent and Cookies securely
             app.get(url, headers = headers, interceptor = cfInterceptor)
         }
     } catch (e: CancellationException) {
@@ -123,10 +122,8 @@ class AnimekhorProvider : MainAPI() {
             if (isValidSiteHtml(html)) return Jsoup.parse(html, url)
         }
 
-        var response: okhttp3.Response? = null
+        var response: NiceResponse? = null
 
-        // FAST-PATH: Double-checked locking prevents 7 concurrent homepage categories
-        // from fetching sequentially. Once the first request succeeds, the lock is bypassed.
         if (!CFState.isHostVerified(host)) {
             CFState.withColdStartLock(host) {
                 if (!CFState.isHostVerified(host)) {
@@ -139,7 +136,6 @@ class AnimekhorProvider : MainAPI() {
             }
         }
 
-        // If the lock was bypassed (verified by another concurrent thread), fetch safely in parallel
         if (response == null) {
             response = executeGet(url, headers)
         }
