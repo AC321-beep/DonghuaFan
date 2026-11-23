@@ -189,16 +189,21 @@ object ReelFrenClient {
         return headers(posterUrl, isApiCall = false)
     }
 
-    suspend fun get(url: String): String? {
+   suspend fun get(url: String): String? {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val isReelFrenApi = targetHost == apiHost
         
         if (!isReelFrenApi) return try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (e: Exception) { null }
 
+        ReelFrenLog.d("Client.get", "Attempting fast-path API fetch for: $url")
         var jsonText = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (e: Exception) { "" }
-        if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) return jsonText
-
-        apiMutex.withLock {
+        if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) {
+            ReelFrenLog.d("Client.get", "✅ Fast-path succeeded! Length: ${jsonText.length}")
+            return jsonText
+        }
+        ReelFrenLog.d("Client.get", "⚠️ Fast-path failed. Falling back to CF Mutex...")
+        
+       apiMutex.withLock {
             jsonText = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (e: Exception) { "" }
             if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) return jsonText
 
