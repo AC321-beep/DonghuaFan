@@ -25,7 +25,6 @@ import android.widget.Space
 import android.widget.TextView
 import android.widget.Toast
 import com.lagradost.cloudstream3.CommonActivity
-import com.lagradost.cloudstream3.NiceResponse
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
