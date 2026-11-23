@@ -128,7 +128,7 @@ class ReelFrenProvider : MainAPI() {
             if (cachedSearchQuery == cleanQuery) {
                 cachedSearchResults = allLateResults
                 if (allLateResults.size > distinctFast.size) {
-                    ReelFrenLog.d("Main/search", "Background cache silently grew from ${distinctFast.size} to${allLateResults.size} items")
+                    ReelFrenLog.d("Main/search", "Background cache silently grew from ${distinctFast.size} to ${allLateResults.size} items")
                 }
             }
         }
@@ -194,7 +194,8 @@ class ReelFrenProvider : MainAPI() {
         val workingLinks = mutableListOf<com.lagradost.cloudstream3.utils.ExtractorLink>()
 
         coroutineScope {
-            val validationJobs = p.qualities.map { q ->
+            // FIX: Index is passed to dynamically number servers to prevent Cloudstream deduplication
+            val validationJobs = p.qualities.mapIndexed { index, q ->
                 async {
                     val qUrl = ReelFrenClient.absUrl(q.url)
                     if (qUrl.isBlank() || !qUrl.startsWith("http")) return@async null
@@ -214,11 +215,12 @@ class ReelFrenProvider : MainAPI() {
                     val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
                     val linkType = ReelFrenQuality.linkType(qUrl, format)
                     
-                    val baseServer = if (p.server.isBlank() || p.server == "1") "ReelFren" else "Server ${p.server}"
+                    // FIX: Ensure every link has a distinct "Server X" name so none get merged or discarded
+                    val baseServer = "Server ${index + 1}"
                     val cleanLabel = q.label.replace("(?i)auto".toRegex(), "").trim()
                     
-                    val finalName = if (cleanLabel.isNotEmpty() && !baseServer.contains(cleanLabel)) {
-                        "$baseServer -$cleanLabel"
+                    val finalName = if (cleanLabel.isNotEmpty()) {
+                        "$baseServer - $cleanLabel"
                     } else {
                         baseServer
                     }
