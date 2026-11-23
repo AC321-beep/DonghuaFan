@@ -39,9 +39,7 @@ object AnimekhorLogger {
     }
 
     inline fun d(subTag: String, msg: () -> String) {
-        if (isVerbose) {
-            Log.d("AnimeKhor/$subTag", msg())
-        }
+        if (isVerbose) Log.d("AnimeKhor/$subTag", msg())
     }
 
     fun i(subTag: String, msg: String) {
@@ -53,11 +51,8 @@ object AnimekhorLogger {
     }
 
     fun e(subTag: String, msg: String, throwable: Throwable? = null) {
-        if (throwable != null) {
-            Log.e("AnimeKhor/$subTag", msg, throwable)
-        } else {
-            Log.e("AnimeKhor/$subTag", msg)
-        }
+        if (throwable != null) Log.e("AnimeKhor/$subTag", msg, throwable)
+        else Log.e("AnimeKhor/$subTag", msg)
     }
 }
 
@@ -82,12 +77,6 @@ class AnimekhorProvider : MainAPI() {
         "Upgrade-Insecure-Requests" to "1"
     )
 
-    private val defaultHeaders: Map<String, String>
-        get() = mapOf(
-            "User-Agent" to CFState.getBrowserUserAgent(),
-            "Referer" to "$mainUrl/"
-        ) + browserHeaders
-
     private val cardSelector = "div.listupd > article, div.bsx"
 
     override val mainPage = mainPageOf(
@@ -105,21 +94,10 @@ class AnimekhorProvider : MainAPI() {
     private fun isValidSiteHtml(html: String): Boolean =
         html.length > 500 && !isCfChallenge(html) && isRealSiteHtml(html)
 
-    private fun cfHeaders(url: String, base: Map<String, String> = defaultHeaders): Map<String, String> {
-        val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
-        val cookies: String = CFState.extractAllCookies(host, url)
-
-        val merged: MutableMap<String, String> = base.toMutableMap()
-        merged["User-Agent"] = CFState.getBrowserUserAgent()
-        if (cookies.isNotBlank()) {
-            merged["Cookie"] = CFState.mergeCookies(base["Cookie"], cookies)
-        }
-        return merged
-    }
-
-    private suspend fun executeGet(url: String, headers: Map<String, String>) = try {
+    private suspend fun executeGet(url: String, headers: Map<String, String> = browserHeaders) = try {
         withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
-            app.get(url, headers = cfHeaders(url, headers), interceptor = cfInterceptor)
+            // CFInterceptor automatically attaches the correct User-Agent and Cookies securely
+            app.get(url, headers = headers, interceptor = cfInterceptor)
         }
     } catch (e: CancellationException) {
         throw e
@@ -130,12 +108,10 @@ class AnimekhorProvider : MainAPI() {
 
     private suspend fun fetchDocument(
         url: String,
-        headers: Map<String, String> = defaultHeaders
+        headers: Map<String, String> = browserHeaders
     ): Document? {
         val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
-        if (!host.contains("animekhor", ignoreCase = true)) {
-            return null
-        }
+        if (!host.contains("animekhor", ignoreCase = true)) return null
 
         CFState.getSolvedHtml(url)?.let { html ->
             if (isValidSiteHtml(html)) return Jsoup.parse(html, url)
@@ -147,50 +123,53 @@ class AnimekhorProvider : MainAPI() {
             if (isValidSiteHtml(html)) return Jsoup.parse(html, url)
         }
 
-        val response = if (!CFState.isHostVerified(host)) {
-            val (res, cachedDoc) = CFState.withColdStartLock(host) {
-                withTimeoutOrNull(SOLVE_WAIT_TIMEOUT_MS) { CFState.awaitOngoingSolve(host) }
-                CFState.getSolvedHtml(url)?.let { html ->
-                    if (isValidSiteHtml(html)) {
-                        return@withColdStartLock null to Jsoup.parse(html, url)
+        var response: okhttp3.Response? = null
+
+        // FAST-PATH: Double-checked locking prevents 7 concurrent homepage categories
+        // from fetching sequentially. Once the first request succeeds, the lock is bypassed.
+        if (!CFState.isHostVerified(host)) {
+            CFState.withColdStartLock(host) {
+                if (!CFState.isHostVerified(host)) {
+                    val r = executeGet(url, headers)
+                    if (r != null && r.code in 200..299 && isValidSiteHtml(r.text)) {
+                        CFState.markHostVerified(host)
                     }
+                    response = r
                 }
-                val r = executeGet(url, headers)
-                if (r != null && r.code in 200..299 && isValidSiteHtml(r.text)) {
-                    CFState.markHostVerified(host)
-                }
-                r to null
             }
-            if (cachedDoc != null) return cachedDoc
-            res
-        } else {
-            executeGet(url, headers)
-        } ?: return null
-
-        AnimekhorLogger.d("Provider") { "🌐 Initial Fetch: ${response.code} (${response.text.length}B) for $url" }
-
-        if (response.code in 200..299 && isValidSiteHtml(response.text)) {
-            CFState.markHostVerified(host)
-            return response.document
         }
 
-        val cfMitigated = response.headers["cf-mitigated"]?.equals("challenge", ignoreCase = true) == true
+        // If the lock was bypassed (verified by another concurrent thread), fetch safely in parallel
+        if (response == null) {
+            response = executeGet(url, headers)
+        }
+
+        val finalRes = response ?: return null
+
+        AnimekhorLogger.d("Provider") { "🌐 Fetch: HTTP ${finalRes.code} (${finalRes.text.length}B) for $url" }
+
+        if (finalRes.code in 200..299 && isValidSiteHtml(finalRes.text)) {
+            CFState.markHostVerified(host)
+            return finalRes.document
+        }
+
+        val cfMitigated = finalRes.headers["cf-mitigated"]?.equals("challenge", ignoreCase = true) == true
         val challengeDetected = cfMitigated ||
-                isCfChallenge(response.text) ||
-                (response.code in listOf(403, 503) && !isRealSiteHtml(response.text) &&
-                        (response.text.contains("cloudflare", ignoreCase = true) ||
-                         response.text.contains("ddos-guard", ignoreCase = true))) ||
-                (response.code in 200..299 && response.text.isNotBlank() &&
-                        response.text.length < 3500 && !isRealSiteHtml(response.text))
+                isCfChallenge(finalRes.text) ||
+                (finalRes.code in listOf(403, 503) && !isRealSiteHtml(finalRes.text) &&
+                        (finalRes.text.contains("cloudflare", ignoreCase = true) ||
+                         finalRes.text.contains("ddos-guard", ignoreCase = true))) ||
+                (finalRes.code in 200..299 && finalRes.text.isNotBlank() &&
+                        finalRes.text.length < 3500 && !isRealSiteHtml(finalRes.text))
 
         if (!challengeDetected) {
-            if (response.code in 200..299 && response.text.isNotBlank()) {
+            if (finalRes.code in 200..299 && finalRes.text.isNotBlank()) {
                 CFState.markHostVerified(host)
-                return response.document
+                return finalRes.document
             }
             AnimekhorLogger.e(
                 "Provider",
-                "🛑 Non-challenge HTTP ${response.code} for $url: ${response.text.take(200)}"
+                "🛑 Non-challenge HTTP ${finalRes.code} for $url: ${finalRes.text.take(200)}"
             )
             return null
         }
@@ -198,7 +177,7 @@ class AnimekhorProvider : MainAPI() {
         CFState.markHostUnverified(host)
         AnimekhorLogger.w(
             "Provider",
-            "🛡 Challenge detected (HTTP ${response.code}, cfMitigated=$cfMitigated) for $url"
+            "🛡 Challenge detected (HTTP ${finalRes.code}, cfMitigated=$cfMitigated) for $url"
         )
 
         if (CommonActivity.activity == null || CFState.isInCooldown(host)) {
@@ -206,7 +185,7 @@ class AnimekhorProvider : MainAPI() {
             return null
         }
 
-        val isHumanCaptcha = isHumanOnlyChallenge(response.text)
+        val isHumanCaptcha = isHumanOnlyChallenge(finalRes.text)
         if (isHumanCaptcha) {
             AnimekhorLogger.w("Provider", "🧩 Interactive CAPTCHA detected — skipping silent solver")
         }
