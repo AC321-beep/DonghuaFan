@@ -128,7 +128,7 @@ class ReelFrenProvider : MainAPI() {
             if (cachedSearchQuery == cleanQuery) {
                 cachedSearchResults = allLateResults
                 if (allLateResults.size > distinctFast.size) {
-                    ReelFrenLog.d("Main/search", "Background cache silently grew from ${distinctFast.size} to ${allLateResults.size} items")
+                    ReelFrenLog.d("Main/search", "Background cache silently grew from ${distinctFast.size} to${allLateResults.size} items")
                 }
             }
         }
@@ -187,7 +187,6 @@ class ReelFrenProvider : MainAPI() {
         val (slug, id, ep) = ReelFrenUrl.parse(data)
         if (id.isEmpty() || slug.isEmpty()) return false
         
-        // Emits multiple distinct servers to Cloudstream if the API provides them
         val serverList = ReelFrenClient.playbackServers(slug, id, ep)
         if (serverList.isEmpty()) return false
 
@@ -220,12 +219,11 @@ class ReelFrenProvider : MainAPI() {
                         val cleanLabel = q.label.replace("(?i)auto".toRegex(), "").trim()
                         
                         val finalName = if (cleanLabel.isNotEmpty()) {
-                            "$baseServer - $cleanLabel"
+                            "$baseServer -$cleanLabel"
                         } else {
                             baseServer
                         }
 
-                        // Use global safe headers including Mobile UA and Range
                         com.lagradost.cloudstream3.utils.ExtractorLink(
                             source = name,
                             name = finalName,
