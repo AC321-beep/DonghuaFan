@@ -126,13 +126,21 @@ class WebViewCookieJar : CookieJar {
 }
 
 object ReelFrenClient {
-    // EXACT SAME USER-AGENT ENFORCED ACROSS CF SOLVER, API FETCH, AND EXOPLAYER
     const val GLOBAL_MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
     
     private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
+    
+    // RESTORED: Cloudflare JA3 TLS Fingerprint Spoofing
     private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
-        .tlsVersions(TlsVersion.TLS_1_2, TlsVersion.TLS_1_3).build()
+        .tlsVersions(TlsVersion.TLS_1_2, TlsVersion.TLS_1_3)
+        .cipherSuites(
+            CipherSuite.TLS_AES_128_GCM_SHA256, CipherSuite.TLS_AES_256_GCM_SHA384, CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, CipherSuite.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, CipherSuite.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+        ).build()
+        
     private val spoofedClient = app.baseClient.newBuilder().cookieJar(WebViewCookieJar())
         .connectionSpecs(listOf(chromeSpec, ConnectionSpec.CLEARTEXT))
         .protocols(listOf(Protocol.HTTP_1_1)).build()
@@ -189,21 +197,16 @@ object ReelFrenClient {
         return headers(posterUrl, isApiCall = false)
     }
 
-   suspend fun get(url: String): String? {
+    suspend fun get(url: String): String? {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val isReelFrenApi = targetHost == apiHost
         
         if (!isReelFrenApi) return try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (e: Exception) { null }
 
-        ReelFrenLog.d("Client.get", "Attempting fast-path API fetch for: $url")
         var jsonText = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (e: Exception) { "" }
-        if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) {
-            ReelFrenLog.d("Client.get", "✅ Fast-path succeeded! Length: ${jsonText.length}")
-            return jsonText
-        }
-        ReelFrenLog.d("Client.get", "⚠️ Fast-path failed. Falling back to CF Mutex...")
-        
-       apiMutex.withLock {
+        if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) return jsonText
+
+        apiMutex.withLock {
             jsonText = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (e: Exception) { "" }
             if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) return jsonText
 
@@ -623,7 +626,6 @@ object ReelFrenStore {
     }
 
     fun userAgent(host: String): String {
-        // ALWAYS RETURN THE GLOBAL MOBILE CHROME UA TO PREVENT 403 CDN MISMATCHES
         return ReelFrenClient.GLOBAL_MOBILE_UA
     }
 
