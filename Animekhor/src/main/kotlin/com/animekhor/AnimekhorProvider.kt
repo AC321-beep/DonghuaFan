@@ -94,7 +94,7 @@ class AnimekhorProvider : MainAPI() {
     private fun isValidSiteHtml(html: String): Boolean =
         html.length > 500 && !isCfChallenge(html) && isRealSiteHtml(html)
 
-    private suspend fun executeGet(url: String, headers: Map<String, String> = browserHeaders): NiceResponse? = try {
+    private suspend fun executeGet(url: String, headers: Map<String, String> = browserHeaders) = try {
         withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
             app.get(url, headers = headers, interceptor = cfInterceptor)
         }
@@ -122,22 +122,20 @@ class AnimekhorProvider : MainAPI() {
             if (isValidSiteHtml(html)) return Jsoup.parse(html, url)
         }
 
-        var response: NiceResponse? = null
-
-        if (!CFState.isHostVerified(host)) {
+        val response = if (!CFState.isHostVerified(host)) {
             CFState.withColdStartLock(host) {
                 if (!CFState.isHostVerified(host)) {
                     val r = executeGet(url, headers)
                     if (r != null && r.code in 200..299 && isValidSiteHtml(r.text)) {
                         CFState.markHostVerified(host)
                     }
-                    response = r
+                    r
+                } else {
+                    null // Bypassed the lock, fetch below
                 }
-            }
-        }
-
-        if (response == null) {
-            response = executeGet(url, headers)
+            } ?: executeGet(url, headers)
+        } else {
+            executeGet(url, headers)
         }
 
         val finalRes = response ?: return null
@@ -149,7 +147,11 @@ class AnimekhorProvider : MainAPI() {
             return finalRes.document
         }
 
-        val cfMitigated = finalRes.headers["cf-mitigated"]?.equals("challenge", ignoreCase = true) == true
+        // Only parse headers safely now that the type resolves correctly
+        val cfMitigated = finalRes.headers.toMap().entries.any { 
+            it.key.equals("cf-mitigated", ignoreCase = true) && it.value.contains("challenge", ignoreCase = true) 
+        }
+        
         val challengeDetected = cfMitigated ||
                 isCfChallenge(finalRes.text) ||
                 (finalRes.code in listOf(403, 503) && !isRealSiteHtml(finalRes.text) &&
