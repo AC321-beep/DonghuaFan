@@ -52,13 +52,13 @@ class ReelFrenProvider : MainAPI() {
         val slug = request.data
         ReelFrenLog.d("Main/getMainPage", "ENTRY page=$page slug=$slug name=${request.name}")
         
-        val items = ReelFrenClient.home(slug, page)
+        val items: List<HomeItem> = ReelFrenClient.home(slug, page = page)
         if (items.isEmpty()) {
             ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=0 added=0 hasNext=false")
             return newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
         
-        val mapped = items.mapNotNull { item ->
+        val mapped = items.mapNotNull { item: HomeItem ->
             if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
             
             val actualSlug = item.provider.ifEmpty { slug }
@@ -96,8 +96,8 @@ class ReelFrenProvider : MainAPI() {
 
         val deferredSearches = activeProviders.map { slug ->
             bgSearchScope.async {
-                val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
-                items.mapNotNull { item ->
+                val items: List<HomeItem> = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
+                items.mapNotNull { item: HomeItem ->
                     if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
                     val actualSlug = item.provider.ifEmpty { "all_dramas" }
                     newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
@@ -141,7 +141,7 @@ class ReelFrenProvider : MainAPI() {
         val (slug, id, _) = ReelFrenUrl.parse(url)
         if (id.isEmpty() || slug.isEmpty()) throw ErrorLoadingException("Invalid URL or missing ID")
         
-        val d = ReelFrenClient.detail(slug, id) ?: throw ErrorLoadingException("Failed to load detail")
+        val d: DetailInfo = ReelFrenClient.detail(slug, id) ?: throw ErrorLoadingException("Failed to load detail")
         val coverUrl = ReelFrenClient.absUrl(d.cover)
         val coverHeaders = ReelFrenClient.posterHeaders(coverUrl)
 
@@ -150,7 +150,7 @@ class ReelFrenProvider : MainAPI() {
                 name = d.title,
                 url = url,
                 type = TvType.AsianDrama,
-                episodes = d.videos.map { v ->
+                episodes = d.videos.map { v: VideoEntry ->
                     newEpisode(ReelFrenUrl.episode(slug, id, v.episode)) {
                         this.name = "Episode ${v.episode}"
                         this.episode = v.episode
@@ -187,7 +187,7 @@ class ReelFrenProvider : MainAPI() {
         val (slug, id, ep) = ReelFrenUrl.parse(data)
         if (id.isEmpty() || slug.isEmpty()) return false
         
-        val serverList = ReelFrenClient.playbackServers(slug, id, ep)
+        val serverList: List<PlaybackInfo> = ReelFrenClient.playbackServers(slug, id, ep)
         if (serverList.isEmpty()) return false
 
         val workingLinks = mutableListOf<com.lagradost.cloudstream3.utils.ExtractorLink>()
