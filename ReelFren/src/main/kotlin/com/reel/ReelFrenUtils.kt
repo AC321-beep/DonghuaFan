@@ -46,18 +46,15 @@ data class DetailInfo(
     val cover: String, val intro: String, val episodes: Int,
     val videos: List<VideoEntry>
 )
-
 data class HomeItem(
     val id: String, val provider: String, val title: String,
     val cover: String, val intro: String, val episodes: Int
 )
-
 data class PlaybackInfo(
     val title: String, val episodeNumber: Int, val totalEpisodes: Int,
     val locked: Boolean, val qualities: List<QualityEntry>,
     val subtitles: List<SubtitleEntry>, val server: String
 )
-
 data class QualityEntry(val label: String, val url: String, val format: String)
 data class SubtitleEntry(val label: String, val lang: String, val url: String)
 data class VideoEntry(val episode: Int, val duration: Int, val vid: String, val available: Boolean)
