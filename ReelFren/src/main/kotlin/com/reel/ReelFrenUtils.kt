@@ -535,8 +535,7 @@ object ReelFrenQuality {
     }
 
     fun linkType(url: String, format: String = ""): ExtractorLinkType = when {
-        // FIX: Reverted melolostatic to standard ExtractorLinkType.WEB_VIDEO
-        url.contains("melolostatic.com", ignoreCase = true) -> ExtractorLinkType.WEB_VIDEO
+        // Returned to standard extraction since WEB_VIDEO is not supported on this branch
         format.equals("hls", ignoreCase = true) || url.contains(".m3u8", ignoreCase = true) -> ExtractorLinkType.M3U8
         format.equals("dash", ignoreCase = true) || url.contains(".mpd", ignoreCase = true) -> ExtractorLinkType.DASH
         else -> ExtractorLinkType.VIDEO
