@@ -22,6 +22,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.coroutineScope
+import java.util.concurrent.atomic.AtomicBoolean
 
 class ReelFrenProvider : MainAPI() {
 
@@ -187,64 +188,64 @@ class ReelFrenProvider : MainAPI() {
         val (slug, id, ep) = ReelFrenUrl.parse(data)
         if (id.isEmpty() || slug.isEmpty()) return false
         
-        val workingLinks = mutableListOf<com.lagradost.cloudstream3.utils.ExtractorLink>()
+        // We use an AtomicBoolean to safely track if we found at least one working link across all concurrent threads.
+        val foundLinks = AtomicBoolean(false)
 
         coroutineScope {
             val serverIds = listOf(1, 2, 3, 4, 5)
             
-            val deferredServers = serverIds.map { serverId ->
-                async {
-                    runCatching { ReelFrenClient.playback(slug, id, ep, serverId) }.getOrNull()
-                }
-            }
+            // By using `launch` instead of `async`, we don't block. We start all 5 server requests concurrently.
+            serverIds.forEach { serverId ->
+                launch {
+                    val p = runCatching { ReelFrenClient.playback(slug, id, ep, serverId) }.getOrNull() ?: return@launch
+                    
+                    ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback)
+                    
+                    // Inside the server response, we launch concurrent threads for every single quality.
+                    p.qualities.forEach { q ->
+                        launch {
+                            val qUrl = ReelFrenClient.absUrl(q.url)
+                            if (qUrl.isBlank() || !qUrl.startsWith("http")) return@launch
 
-            val serverResults = deferredServers.awaitAll().filterNotNull()
+                            // Quick ping using Chrome Mobile headers to check if link is live
+                            val isAlive = runCatching {
+                                val checkHeaders = ReelFrenClient.videoHeaders(qUrl).toMutableMap()
+                                checkHeaders["Range"] = "bytes=0-100" 
+                                val response = com.lagradost.cloudstream3.app.get(qUrl, headers = checkHeaders, timeout = 4000L)
+                                response.code in 200..399
+                            }.getOrDefault(false)
 
-            val validationJobs = serverResults.flatMap { p ->
-                ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback)
-                
-                p.qualities.map { q ->
-                    async {
-                        val qUrl = ReelFrenClient.absUrl(q.url)
-                        if (qUrl.isBlank() || !qUrl.startsWith("http")) return@async null
+                            if (!isAlive) {
+                                ReelFrenLog.d("Main/loadLinks", "Filtered out DEAD link: $qUrl")
+                                return@launch
+                            }
 
-                        val isAlive = runCatching {
-                            val checkHeaders = ReelFrenClient.videoHeaders(qUrl).toMutableMap()
-                            checkHeaders["Range"] = "bytes=0-100" 
-                            val response = com.lagradost.cloudstream3.app.get(qUrl, headers = checkHeaders, timeout = 4000L)
-                            response.code in 200..399
-                        }.getOrDefault(false)
+                            val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
+                            val baseServer = "Server ${p.server}" 
+                            val cleanLabel = q.label.replace("(?i)auto".toRegex(), "").trim()
+                            val finalName = if (cleanLabel.isNotEmpty()) "$baseServer - $cleanLabel" else baseServer
 
-                        if (!isAlive) {
-                            ReelFrenLog.d("Main/loadLinks", "Filtered out DEAD link: $qUrl")
-                            return@async null
+                            // The millisecond a link is validated, we emit it to the UI!
+                            val link = com.lagradost.cloudstream3.utils.ExtractorLink(
+                                source = name,
+                                name = finalName,
+                                url = qUrl,
+                                referer = "${ReelFrenConfig.REEL_SITE}/", 
+                                quality = ReelFrenQuality.of(q.label),
+                                type = ReelFrenQuality.linkType(qUrl, format), 
+                                headers = ReelFrenClient.videoHeaders(qUrl)
+                            )
+                            
+                            foundLinks.set(true)
+                            callback(link)
                         }
-
-                        val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
-                        
-                        val baseServer = "Server ${p.server}" 
-                        val cleanLabel = q.label.replace("(?i)auto".toRegex(), "").trim()
-                        val finalName = if (cleanLabel.isNotEmpty()) "$baseServer - $cleanLabel" else baseServer
-
-                        com.lagradost.cloudstream3.utils.ExtractorLink(
-                            source = name,
-                            name = finalName,
-                            url = qUrl,
-                            referer = "${ReelFrenConfig.REEL_SITE}/", 
-                            quality = ReelFrenQuality.of(q.label),
-                            type = ReelFrenQuality.linkType(qUrl, format), 
-                            headers = ReelFrenClient.videoHeaders(qUrl)
-                        )
                     }
                 }
             }
-            
-            validationJobs.awaitAll().filterNotNull().forEach { link ->
-                callback(link)
-                workingLinks.add(link)
-            }
         }
         
-        return workingLinks.isNotEmpty()
+        // coroutineScope automatically waits for all child `launch` blocks to finish,
+        // so returning foundLinks.get() here is perfectly safe and fulfills the boolean contract.
+        return foundLinks.get()
     }
 }
