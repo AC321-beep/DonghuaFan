@@ -187,75 +187,45 @@ class ReelFrenProvider : MainAPI() {
         val (slug, id, ep) = ReelFrenUrl.parse(data)
         if (id.isEmpty() || slug.isEmpty()) return false
         
-        val p = ReelFrenClient.playback(slug, id, ep) ?: return false
-
-        ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback)
+        // Use the new multi-server playback parser
+        val serverList = ReelFrenClient.playbackServers(slug, id, ep)
+        if (serverList.isEmpty()) return false
 
         val workingLinks = mutableListOf<com.lagradost.cloudstream3.utils.ExtractorLink>()
 
         coroutineScope {
-            // FIX: Removed the incorrect indexed mapping. We now correctly map the true server name parsed from the JSON.
-            val validationJobs = p.qualities.map { q ->
-                async {
-                    val qUrl = ReelFrenClient.absUrl(q.url)
-                    if (qUrl.isBlank() || !qUrl.startsWith("http")) return@async null
+            val validationJobs = serverList.flatMap { p ->
+                ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback)
+                
+                p.qualities.map { q ->
+                    async {
+                        val qUrl = ReelFrenClient.absUrl(q.url)
+                        if (qUrl.isBlank() || !qUrl.startsWith("http")) return@async null
 
-                    val isAlive = runCatching {
-                        val checkHeaders = ReelFrenClient.videoHeaders(qUrl).toMutableMap()
-                        checkHeaders["Range"] = "bytes=0-100" 
-                        val response = com.lagradost.cloudstream3.app.get(qUrl, headers = checkHeaders, timeout = 4000L)
-                        response.code in 200..299 || response.code in 300..399
-                    }.getOrDefault(false)
+                        val isAlive = runCatching {
+                            val checkHeaders = ReelFrenClient.videoHeaders(qUrl).toMutableMap()
+                            checkHeaders["Range"] = "bytes=0-100" 
+                            val response = com.lagradost.cloudstream3.app.get(qUrl, headers = checkHeaders, timeout = 4000L)
+                            response.code in 200..299 || response.code in 300..399
+                        }.getOrDefault(false)
 
-                    if (!isAlive) {
-                        ReelFrenLog.d("Main/loadLinks", "Filtered out DEAD link: $qUrl")
-                        return@async null
-                    }
-
-                    val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
-                    
-                    // TRUE SERVER NAMING: If the API says this is "Server 2", it is Server 2. 
-                    // If the API says it's "1", we name it "Server 1". This prevents the UI from duplicating "Server 1 - 720p" "Server 2 - 540p" incorrectly.
-                    val baseServer = if (p.server.isBlank()) "Server 1" else if (p.server.toIntOrNull() != null) "Server ${p.server}" else p.server
-                    val cleanLabel = q.label.replace("(?i)auto".toRegex(), "").trim()
-                    
-                    val finalName = if (cleanLabel.isNotEmpty()) {
-                        "$baseServer - $cleanLabel"
-                    } else {
-                        baseServer
-                    }
-
-                    val isObfuscated = qUrl.contains("melolostatic.com", ignoreCase = true) || qUrl.contains("volcengine", ignoreCase = true)
-
-                    if (isObfuscated) {
-                        // --- NATIVE JAVASCRIPT BYPASS FIX ---
-                        // Because the raw stream is encrypted, we MUST extract the true video source by loading the URL
-                        // in a background WebView and grabbing the final decrypted `.m3u8` or `.mp4` string.
-                        try {
-                            val webViewHtml = com.lagradost.cloudstream3.app.get(qUrl, interceptor = com.lagradost.cloudstream3.network.WebViewResolver(Regex("""\.m3u8|\.mp4"""))).text
-                            
-                            // Extract the raw, decrypted video URL from the resolved HTML
-                            val decryptedUrl = Regex("""(https?://[^"']+(?:\.m3u8|\.mp4)[^"']*)""").find(webViewHtml)?.groupValues?.get(1)
-                            
-                            if (!decryptedUrl.isNullOrBlank()) {
-                                com.lagradost.cloudstream3.utils.ExtractorLink(
-                                    source = name,
-                                    name = finalName,
-                                    url = decryptedUrl,
-                                    referer = "${ReelFrenConfig.REEL_SITE}/", 
-                                    quality = ReelFrenQuality.of(q.label),
-                                    type = ReelFrenQuality.linkType(decryptedUrl, format), 
-                                    headers = ReelFrenClient.videoHeaders(decryptedUrl) 
-                                ).also { 
-                                    callback(it)
-                                    workingLinks.add(it)
-                                }
-                            }
-                        } catch (e: Exception) {
-                            ReelFrenLog.d("Main/loadLinks", "WebView resolution failed for $qUrl")
+                        if (!isAlive) {
+                            ReelFrenLog.d("Main/loadLinks", "Filtered out DEAD link: $qUrl")
+                            return@async null
                         }
-                    } else {
-                        // Standard unencrypted extraction
+
+                        val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
+                        
+                        val baseServer = if (p.server.isBlank()) "Server 1" else if (p.server.toIntOrNull() != null) "Server ${p.server}" else p.server
+                        val cleanLabel = q.label.replace("(?i)auto".toRegex(), "").trim()
+                        
+                        val finalName = if (cleanLabel.isNotEmpty()) {
+                            "$baseServer - $cleanLabel"
+                        } else {
+                            baseServer
+                        }
+
+                        // Native extraction using the Mobile UA safe headers globally provided by ReelFrenClient
                         com.lagradost.cloudstream3.utils.ExtractorLink(
                             source = name,
                             name = finalName,
@@ -264,15 +234,15 @@ class ReelFrenProvider : MainAPI() {
                             quality = ReelFrenQuality.of(q.label),
                             type = ReelFrenQuality.linkType(qUrl, format), 
                             headers = ReelFrenClient.videoHeaders(qUrl) 
-                        ).also {
-                            callback(it)
-                            workingLinks.add(it)
-                        }
+                        )
                     }
                 }
             }
             
-            validationJobs.awaitAll()
+            validationJobs.awaitAll().filterNotNull().forEach { link ->
+                callback(link)
+                workingLinks.add(link)
+            }
         }
         
         return workingLinks.isNotEmpty()
