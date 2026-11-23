@@ -188,47 +188,35 @@ class ReelFrenProvider : MainAPI() {
         val (slug, id, ep) = ReelFrenUrl.parse(data)
         if (id.isEmpty() || slug.isEmpty()) return false
         
-        // We use an AtomicBoolean to safely track if we found at least one working link across all concurrent threads.
         val foundLinks = AtomicBoolean(false)
 
         coroutineScope {
             val serverIds = listOf(1, 2, 3, 4, 5)
             
-            // By using `launch` instead of `async`, we don't block. We start all 5 server requests concurrently.
             serverIds.forEach { serverId ->
                 launch {
                     val p = runCatching { ReelFrenClient.playback(slug, id, ep, serverId) }.getOrNull() ?: return@launch
                     
                     ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback)
                     
-                    // Inside the server response, we launch concurrent threads for every single quality.
                     p.qualities.forEach { q ->
                         launch {
                             val qUrl = ReelFrenClient.absUrl(q.url)
                             if (qUrl.isBlank() || !qUrl.startsWith("http")) return@launch
 
-                            // Quick ping using Chrome Mobile headers to check if link is live
-                            val isAlive = runCatching {
-                                val checkHeaders = ReelFrenClient.videoHeaders(qUrl).toMutableMap()
-                                checkHeaders["Range"] = "bytes=0-100" 
-                                val response = com.lagradost.cloudstream3.app.get(qUrl, headers = checkHeaders, timeout = 4000L)
-                                response.code in 200..399
-                            }.getOrDefault(false)
-
-                            if (!isAlive) {
-                                ReelFrenLog.d("Main/loadLinks", "Filtered out DEAD link: $qUrl")
-                                return@launch
-                            }
+                            // REMOVED THE isAlive PING. 
+                            // It was killing valid VolcEngine links due to single-use token consumption 
+                            // or CDN anti-bot checks against Cloudstream's nicehttp client.
 
                             val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
-                            val baseServer = "Server ${p.server}" 
-                            val cleanLabel = q.label.replace("(?i)auto".toRegex(), "").trim()
-                            val finalName = if (cleanLabel.isNotEmpty()) "$baseServer - $cleanLabel" else baseServer
-
-                            // The millisecond a link is validated, we emit it to the UI!
+                            
+                            // FIX: Cleaned up the name so Cloudstream doesn't output "720p 720p".
+                            // If it's a known provider like "Captain Sapi", we append it. Otherwise, just "Server X".
+                            val serverNameString = if (p.server.toIntOrNull() != null) "Server ${p.server}" else p.server
+                            
                             val link = com.lagradost.cloudstream3.utils.ExtractorLink(
                                 source = name,
-                                name = finalName,
+                                name = serverNameString,
                                 url = qUrl,
                                 referer = "${ReelFrenConfig.REEL_SITE}/", 
                                 quality = ReelFrenQuality.of(q.label),
@@ -244,8 +232,6 @@ class ReelFrenProvider : MainAPI() {
             }
         }
         
-        // coroutineScope automatically waits for all child `launch` blocks to finish,
-        // so returning foundLinks.get() here is perfectly safe and fulfills the boolean contract.
         return foundLinks.get()
     }
 }
