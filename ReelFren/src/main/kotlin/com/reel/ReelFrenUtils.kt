@@ -529,14 +529,14 @@ object ReelFrenQuality {
     fun label(raw: String) = raw.trim().ifEmpty { "Auto" }
 
     fun inferFormat(url: String): String = when {
-        url.contains("melolostatic.com", ignoreCase = true) -> "hls"
         url.contains(".m3u8", ignoreCase = true) -> "hls"
         url.contains(".mpd", ignoreCase = true)  -> "dash"
         else -> "video"
     }
 
     fun linkType(url: String, format: String = ""): ExtractorLinkType = when {
-        url.contains("melolostatic.com", ignoreCase = true) -> ExtractorLinkType.M3U8
+        // FIX: Reverted melolostatic to standard ExtractorLinkType.WEB_VIDEO
+        url.contains("melolostatic.com", ignoreCase = true) -> ExtractorLinkType.WEB_VIDEO
         format.equals("hls", ignoreCase = true) || url.contains(".m3u8", ignoreCase = true) -> ExtractorLinkType.M3U8
         format.equals("dash", ignoreCase = true) || url.contains(".mpd", ignoreCase = true) -> ExtractorLinkType.DASH
         else -> ExtractorLinkType.VIDEO
