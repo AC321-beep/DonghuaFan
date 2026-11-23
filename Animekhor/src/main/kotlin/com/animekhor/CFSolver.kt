@@ -60,7 +60,7 @@ fun isRealSiteHtml(html: String): Boolean {
 fun isCfChallengeHtml(html: String): Boolean {
     if (html.isBlank()) return false
     val l = html.lowercase()
-    
+
     val hasChallengeMarker = l.contains("<title>bot verification") ||
             l.contains("/cdn-cgi/challenge-platform/") ||
             l.contains("cf-browser-verification") ||
@@ -184,7 +184,6 @@ object CFState {
         if (host.isNotBlank()) verifiedHosts.remove(host.lowercase())
     }
 
-    // Removed generic <T> to fix compiler resolution panics completely
     suspend fun withColdStartLock(host: String, block: suspend () -> Unit) {
         val mutex = coldStartLocks.getOrPut(host.lowercase()) { Mutex() }
         mutex.withLock { block() }
@@ -285,7 +284,6 @@ object CFState {
                     if (cont.isActive) cont.resume(html)
                 }
 
-                // Object Runnable instead of lambda recursion to prevent compiler panics
                 val pollRunnableObj = object : Runnable {
                     override fun run() {
                         if (done.get()) return
@@ -293,19 +291,23 @@ object CFState {
                         webView.evaluateJavascript(
                             "(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();"
                         ) { raw ->
-                            if (done.get()) return@evaluateJavascript
-                            val html = decodeJsHtml(raw)
-                            if (!html.isNullOrBlank() && html.length >= 500 && !isCfChallengeHtml(html) && isRealSiteHtml(html)) {
-                                finish(html)
-                            } else {
-                                handler.postDelayed(this, 600L)
+                            if (!done.get()) {
+                                val html = decodeJsHtml(raw)
+                                if (!html.isNullOrBlank() && html.length >= 500 && !isCfChallengeHtml(html) && isRealSiteHtml(html)) {
+                                    finish(html)
+                                } else {
+                                    handler.postDelayed(this@Runnable, 600L)
+                                }
                             }
                         }
                     }
                 }
 
                 webView.webViewClient = object : WebViewClient() {
-                    override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                    override fun shouldInterceptRequest(
+                        view: WebView?,
+                        request: WebResourceRequest?
+                    ): WebResourceResponse? {
                         if (!shouldAllowBackgroundWebResource(request)) {
                             return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
                         }
@@ -413,11 +415,16 @@ class CFSolver(
             })();
         """.trimIndent()
         web.evaluateJavascript(locateJs) { jsRes ->
-            if (!isActive()) return@evaluateJavascript
-            val parts = jsRes?.trim('"')?.split(",") ?: return@evaluateJavascript
-            val cx = parts.getOrNull(0)?.toFloatOrNull() ?: return@evaluateJavascript
-            val cy = parts.getOrNull(1)?.toFloatOrNull() ?: return@evaluateJavascript
-            simulateTouchTap(web, handler, cx, cy)
+            if (isActive()) {
+                val parts = jsRes?.trim('"')?.split(",")
+                if (parts != null && parts.size >= 2) {
+                    val cx = parts[0].toFloatOrNull()
+                    val cy = parts[1].toFloatOrNull()
+                    if (cx != null && cy != null) {
+                        simulateTouchTap(web, handler, cx, cy)
+                    }
+                }
+            }
         }
     }
 
@@ -534,7 +541,6 @@ class CFSolver(
                     if (cont.isActive) cont.resume(success)
                 }
 
-                // Object Runnable pattern entirely skips compiler lambda cyclic panics
                 val pollRunnableObj = object : Runnable {
                     var tick = 0
                     override fun run() {
@@ -554,22 +560,19 @@ class CFSolver(
                                 webView.evaluateJavascript(
                                     "(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();"
                                 ) { raw ->
-                                    if (done.get()) return@evaluateJavascript
-                                    val html = decodeJsHtml(raw).orEmpty()
-
-                                    if (isHumanOnlyChallenge(html)) {
-                                        AnimekhorLogger.w("CFSolver", "🧩 [Silent] Human CAPTCHA detected in DOM — escalating")
-                                        destroyWebView(false)
-                                        return@evaluateJavascript
-                                    }
-
-                                    if (html.length > 500 && !isChallengeOrErrorTitle(webView.title.orEmpty()) && !isCfChallengeHtml(html)) {
-                                        destroyWebView(true)
-                                    } else {
-                                        if (tick >= 3 && tick % 3 == 0 && onChallenge) {
-                                            triggerTurnstileAutoTap(webView, handler) { !done.get() }
+                                    if (!done.get()) {
+                                        val html = decodeJsHtml(raw).orEmpty()
+                                        if (isHumanOnlyChallenge(html)) {
+                                            AnimekhorLogger.w("CFSolver", "🧩 [Silent] Human CAPTCHA detected in DOM — escalating")
+                                            destroyWebView(false)
+                                        } else if (html.length > 500 && !isChallengeOrErrorTitle(webView.title.orEmpty()) && !isCfChallengeHtml(html)) {
+                                            destroyWebView(true)
+                                        } else {
+                                            if (tick >= 3 && tick % 3 == 0 && onChallenge) {
+                                                triggerTurnstileAutoTap(webView, handler) { !done.get() }
+                                            }
+                                            handler.postDelayed(this@Runnable, 1000L)
                                         }
-                                        handler.postDelayed(this@Runnable, 1000L)
                                     }
                                 }
                             }.onFailure { destroyWebView(false) }
@@ -758,18 +761,19 @@ class CFSolver(
 
                         if (!onChallenge || hasClearance) {
                             webView.evaluateJavascript("(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();") { raw ->
-                                if (resolved.get()) return@evaluateJavascript
-                                val html = decodeJsHtml(raw)
-                                
-                                if (!html.isNullOrBlank() && html.length > 500 && !isChallengeOrErrorTitle(webView.title.orEmpty()) && !isCfChallengeHtml(html)) {
-                                    finish(true)
-                                } else {
-                                    status.text = "Complete the verification below, then tap Continue."
-                                    status.setTextColor(Color.parseColor("#A0A0A0"))
-                                    if (tick >= 3 && tick % 3 == 0 && onChallenge) {
-                                        triggerTurnstileAutoTap(webView, handler) { !resolved.get() }
+                                if (!resolved.get()) {
+                                    val html = decodeJsHtml(raw)
+                                    
+                                    if (!html.isNullOrBlank() && html.length > 500 && !isChallengeOrErrorTitle(webView.title.orEmpty()) && !isCfChallengeHtml(html)) {
+                                        finish(true)
+                                    } else {
+                                        status.text = "Complete the verification below, then tap Continue."
+                                        status.setTextColor(Color.parseColor("#A0A0A0"))
+                                        if (tick >= 3 && tick % 3 == 0 && onChallenge) {
+                                            triggerTurnstileAutoTap(webView, handler) { !resolved.get() }
+                                        }
+                                        handler.postDelayed(this@Runnable, 1000L)
                                     }
-                                    handler.postDelayed(this@Runnable, 1000L)
                                 }
                             }
                             return
