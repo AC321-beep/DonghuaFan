@@ -134,12 +134,27 @@ class AnimekhorProvider : MainAPI() {
             return response.document
         }
 
-        // Trigger solver on explicit CF/LiteSpeed challenges OR silent 200 OK interstitials
-        // that lack real AnimeKhor DOM markers.
-        val challengeDetected = isCfChallenge(response.text) ||
-                (response.code in 200..299 && response.text.isNotBlank() && !isRealSiteHtml(response.text))
+        // Only trigger CFSolver when an actual anti-bot challenge is present:
+        // 1) Cloudflare's explicit `cf-mitigated: challenge` response header
+        // 2) Known Cloudflare / Turnstile / LiteSpeed challenge HTML markers
+        // 3) 403/503 responses lacking real site HTML that reference Cloudflare/DDoS-Guard
+        // 4) Tiny (< 3.5 KB) 200 OK JS-redirect interstitials lacking real site HTML
+        val cfMitigated = response.headers["cf-mitigated"]?.equals("challenge", ignoreCase = true) == true
+        val challengeDetected = cfMitigated ||
+                isCfChallenge(response.text) ||
+                (response.code in listOf(403, 503) && !isRealSiteHtml(response.text) &&
+                        (response.text.contains("cloudflare", ignoreCase = true) ||
+                         response.text.contains("ddos-guard", ignoreCase = true))) ||
+                (response.code in 200..299 && response.text.isNotBlank() &&
+                        response.text.length < 3500 && !isRealSiteHtml(response.text))
 
         if (!challengeDetected) {
+            // If the site returned a normal 200 OK page (e.g., empty search result when anti-bot is off),
+            // parse it directly without invoking the solver.
+            if (response.code in 200..299 && response.text.isNotBlank()) {
+                CFState.markHostVerified(host)
+                return response.document
+            }
             AnimekhorLogger.e(
                 "Provider",
                 "🛑 Non-challenge error (${response.code}) for $url: ${response.text.take(200)}"
@@ -149,7 +164,7 @@ class AnimekhorProvider : MainAPI() {
 
         CFState.markHostUnverified(host)
         AnimekhorLogger.w("Provider") {
-            "🛡 Challenge/Interstitial (${response.code}) for $url: ${response.text.take(250)}"
+            "🛡 Challenge/Interstitial (${response.code}, cfMitigated=$cfMitigated) for $url: ${response.text.take(250)}"
         }
 
         if (CommonActivity.activity == null || CFState.isInCooldown(host)) {
