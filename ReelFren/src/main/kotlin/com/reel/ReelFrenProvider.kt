@@ -187,7 +187,7 @@ class ReelFrenProvider : MainAPI() {
         val (slug, id, ep) = ReelFrenUrl.parse(data)
         if (id.isEmpty() || slug.isEmpty()) return false
         
-        // Use the new multi-server playback parser
+        // Emits multiple distinct servers to Cloudstream if the API provides them
         val serverList = ReelFrenClient.playbackServers(slug, id, ep)
         if (serverList.isEmpty()) return false
 
@@ -225,7 +225,7 @@ class ReelFrenProvider : MainAPI() {
                             baseServer
                         }
 
-                        // Native extraction using the Mobile UA safe headers globally provided by ReelFrenClient
+                        // Use global safe headers including Mobile UA and Range
                         com.lagradost.cloudstream3.utils.ExtractorLink(
                             source = name,
                             name = finalName,
