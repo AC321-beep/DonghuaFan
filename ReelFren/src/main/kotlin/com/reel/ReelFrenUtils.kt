@@ -26,21 +26,9 @@ import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
-object ReelFrenLog {
-    private const val TAG = "ReelFren/CF"
-    var isVerbose: Boolean = false 
-
-    fun d(scope: String, msg: String) {
-        if (!isVerbose) return
-        Log.e(TAG, "[$scope][${Thread.currentThread().name}] $msg")
-    }
-    
-    fun t(scope: String, e: Throwable) {
-        if (!isVerbose) return
-        Log.e(TAG, "[$scope][${Thread.currentThread().name}] ${e.javaClass.simpleName}: ${e.message}", e)
-    }
-}
-
+// ----------------------------------------------------------------------
+// DATA MODELS
+// ----------------------------------------------------------------------
 data class DetailInfo(
     val id: String, val provider: String, val title: String,
     val cover: String, val intro: String, val episodes: Int,
@@ -59,6 +47,27 @@ data class QualityEntry(val label: String, val url: String, val format: String)
 data class SubtitleEntry(val label: String, val lang: String, val url: String)
 data class VideoEntry(val episode: Int, val duration: Int, val vid: String, val available: Boolean)
 
+// ----------------------------------------------------------------------
+// LOGGER
+// ----------------------------------------------------------------------
+object ReelFrenLog {
+    private const val TAG = "ReelFren/CF"
+    var isVerbose: Boolean = false 
+
+    fun d(scope: String, msg: String) {
+        if (!isVerbose) return
+        Log.e(TAG, "[$scope][${Thread.currentThread().name}] $msg")
+    }
+    
+    fun t(scope: String, e: Throwable) {
+        if (!isVerbose) return
+        Log.e(TAG, "[$scope][${Thread.currentThread().name}] ${e.javaClass.simpleName}: ${e.message}", e)
+    }
+}
+
+// ----------------------------------------------------------------------
+// CONFIG
+// ----------------------------------------------------------------------
 object ReelFrenConfig {
     const val REEL_SITE = "https://reelfren.net"
     const val DEFAULT_API_BASE = "https://api.reelfren.net"
@@ -100,6 +109,167 @@ object ReelFrenConfig {
     )
 }
 
+// ----------------------------------------------------------------------
+// NETWORK CLIENT (Moved up to fix resolution issues)
+// ----------------------------------------------------------------------
+class WebViewCookieJar : CookieJar {
+    private val cookieManager = CookieManager.getInstance()
+    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+        val urlString = url.toString()
+        for (cookie in cookies) cookieManager.setCookie(urlString, cookie.toString())
+        cookieManager.flush()
+    }
+    override fun loadForRequest(url: HttpUrl): List<Cookie> {
+        val cookieStr = cookieManager.getCookie(url.toString())
+        if (cookieStr.isNullOrEmpty()) return emptyList()
+        return cookieStr.split(";").mapNotNull { Cookie.parse(url, it.trim()) }
+    }
+}
+
+object ReelFrenClient {
+    const val FALLBACK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    const val MOBILE_APP_UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
+    
+    private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
+    private val apiMutex = Mutex()
+    private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
+        .tlsVersions(TlsVersion.TLS_1_2, TlsVersion.TLS_1_3)
+        .cipherSuites(
+            CipherSuite.TLS_AES_128_GCM_SHA256, CipherSuite.TLS_AES_256_GCM_SHA384, CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, CipherSuite.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            CipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, CipherSuite.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+        ).build()
+
+    private val spoofedClient = app.baseClient.newBuilder()
+        .cookieJar(WebViewCookieJar())
+        .connectionSpecs(listOf(chromeSpec, ConnectionSpec.CLEARTEXT))
+        .protocols(listOf(Protocol.HTTP_1_1))
+        .build()
+
+    private val spoofedApp = com.lagradost.nicehttp.Requests(spoofedClient)
+
+    private fun apiBase() = ReelFrenStore.apiBase()
+    private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
+    
+    fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
+        val p = mutableListOf<String>()
+        val isGlobal = slug == "all_dramas"
+        if (!isGlobal && slug.isNotEmpty()) p += "provider=${query(slug)}"
+        p += "lang=en"
+        if (category.isNotEmpty()) p += "category=${query(category)}"
+        p += "page=$page"
+        val offset = (page - 1) * 20
+        if (offset > 0) p += "offset=$offset"
+        return "${apiBase()}/api/home?${p.joinToString("&")}"
+    }
+
+    fun detailUrl(slug: String, id: String) = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
+    fun videoUrl(slug: String, id: String, ep: Int) = "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep"
+    
+    fun searchUrl(slug: String, term: String): String {
+        val p = mutableListOf<String>()
+        p += "q=${query(term)}"
+        p += "lang=en"
+        if (slug != "all_dramas" && slug.isNotEmpty()) p += "provider=${query(slug)}"
+        return "${apiBase()}/api/search?${p.joinToString("&")}"
+    }
+
+    fun headers(url: String, isApiCall: Boolean = false): Map<String, String> {
+        val targetHost = ReelFrenCloudflare.hostOf(url)
+        val map = linkedMapOf<String, String>()
+        map["User-Agent"] = ReelFrenStore.userAgent(targetHost)
+        map["Accept-Language"] = "en-US,en;q=0.9"
+        map["Origin"] = ReelFrenConfig.REEL_SITE
+        map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
+        if (isApiCall) map["Accept"] = "application/json, text/plain, */*" else map["Accept"] = "*/*"
+        if (targetHost == apiHost || targetHost.contains("reelfren.net")) {
+            val cookie = ReelFrenStore.cookie(targetHost)
+            if (cookie.isNotBlank()) map["Cookie"] = cookie
+        }
+        return map
+    }
+
+    fun videoHeaders(url: String): Map<String, String> {
+        val map = linkedMapOf<String, String>()
+        map["User-Agent"] = MOBILE_APP_UA 
+        map["Accept"] = "*/*"
+        map["Connection"] = "keep-alive"
+        map["Origin"] = ReelFrenConfig.REEL_SITE
+        map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
+        map["Range"] = "bytes=0-" 
+        return map
+    }
+
+    fun posterHeaders(posterUrl: String?): Map<String, String>? {
+        if (posterUrl.isNullOrEmpty()) return null
+        return headers(posterUrl, isApiCall = false)
+    }
+
+    suspend fun get(url: String): String? {
+        val targetHost = ReelFrenCloudflare.hostOf(url)
+        val isReelFrenApi = targetHost == apiHost
+        
+        ReelFrenLog.d("Client.get", "[GET INIT] url=$url isApi=$isReelFrenApi")
+
+        if (!isReelFrenApi) {
+            return try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (e: Exception) { null }
+        }
+
+        ReelFrenLog.d("Client.get", "Attempting fast-path API fetch for: $url")
+        var jsonText = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } 
+        catch (e: Exception) { ReelFrenLog.d("Client.get", "OkHttp EXCEPTION on fast-path: ${e.message}"); "" }
+
+        if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) {
+            ReelFrenLog.d("Client.get", "✅ Fast-path succeeded! Length: ${jsonText.length}")
+            return jsonText
+        }
+
+        ReelFrenLog.d("Client.get", "⚠️ Fast-path failed or challenged. Acquiring CF Mutex...")
+        apiMutex.withLock {
+            ReelFrenLog.d("Client.get", "🔒 Mutex acquired for $url. Double checking cache...")
+            jsonText = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (e: Exception) { "" }
+            
+            if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) {
+                ReelFrenLog.d("Client.get", "🔓 Pre-cleared by previous provider! Proceeding."); return jsonText
+            }
+
+            ReelFrenLog.d("Client.get", "🛠️ Delegating to native CFSolver on ROOT site (reelfren.net)")
+            if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) { ReelFrenLog.d("Client.get", "❌ CFSolver failed. Aborting fetch."); return null }
+
+            ReelFrenLog.d("Client.get", "🚀 CF solved. Firing native OkHttp fetch to API...")
+            val finalJson = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (e: Exception) { "" }
+            
+            if (finalJson.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(finalJson)) {
+                ReelFrenLog.d("Client.get", "❌ Final OkHttp fetch failed. Giving up."); return null
+            }
+            
+            ReelFrenLog.d("Client.get", "✅ API Fetch Succeeded! Length: ${finalJson.length}")
+            return finalJson
+        }
+    }
+    
+    fun absUrl(value: String): String {
+        val clean = value.trim()
+        if (clean.isEmpty()) return ""
+        if (clean.startsWith("https://", true) || clean.startsWith("http://", true)) return clean
+        if (clean.startsWith("//")) return "https:$clean"
+        val base = apiBase()
+        return if (clean.startsWith("/")) "$base$clean" else "$base/$clean"
+    }
+
+    suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = get(homeUrl(slug, category, page))?.let(ReelFrenParse::homeItems) ?: emptyList()
+    suspend fun detail(slug: String, id: String): DetailInfo? = get(detailUrl(slug, id))?.let(ReelFrenParse::detail)
+    suspend fun search(slug: String, term: String): List<HomeItem> = get(searchUrl(slug, term))?.let(ReelFrenParse::homeItems) ?: emptyList()
+    suspend fun playbackServers(slug: String, id: String, ep: Int): List<PlaybackInfo> {
+        val jsonText = get(videoUrl(slug, id, ep)) ?: return emptyList()
+        return ReelFrenParse.playbackServers(jsonText)
+    }
+}
+
+// ----------------------------------------------------------------------
+// SUBTITLES
+// ----------------------------------------------------------------------
 object ReelFrenSubtitles {
     private val PLACEHOLDER_VALUES = setOf("", "null", "none", "false", "0", "#", "-", "n/a", "na", "hardcoded", "undefined")
     private val mediaRegex = Regex("""#EXT-X-MEDIA:([^\r\n]*)""", RegexOption.IGNORE_CASE)
@@ -247,6 +417,9 @@ object ReelFrenSubtitles {
     }
 }
 
+// ----------------------------------------------------------------------
+// PARSERS
+// ----------------------------------------------------------------------
 object ReelFrenParse {
     private val SUB_DIRECT_KEYS = arrayOf("subtitleUrl", "subUrl", "subtitle", "vtt", "srt", "captionUrl", "webvtt")
     private val SUB_URL_KEYS = arrayOf("url", "src", "file", "subUrl", "subtitleUrl", "vtt", "srt", "link", "path", "webvtt")
@@ -440,6 +613,9 @@ object ReelFrenParse {
     }
 }
 
+// ----------------------------------------------------------------------
+// DATA STORE
+// ----------------------------------------------------------------------
 object ReelFrenStore {
     @Volatile var appContext: Context? = null
         private set
@@ -540,6 +716,9 @@ object ReelFrenStore {
     }
 }
 
+// ----------------------------------------------------------------------
+// UTILS
+// ----------------------------------------------------------------------
 object ReelFrenQuality {
     private val heavy = Regex("(?i)\\b(h\\.?26[56]|hevc|x\\.?26[56]|av1)\\b")
     private val resRegex = Regex("(?i)(\\d{3,4})\\s*p\\b")
@@ -596,149 +775,5 @@ object ReelFrenUrl {
         val id = parts.getOrNull(1)?.trim().orEmpty()
         val ep = parts.getOrNull(2)?.trim()?.toIntOrNull() ?: 1
         return if (slug.isNotEmpty() && id.isNotEmpty()) Triple(slug, id, ep) else Triple("", "", 1)
-    }
-}
-
-class WebViewCookieJar : CookieJar {
-    private val cookieManager = CookieManager.getInstance()
-    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
-        val urlString = url.toString()
-        for (cookie in cookies) cookieManager.setCookie(urlString, cookie.toString())
-        cookieManager.flush()
-    }
-    override fun loadForRequest(url: HttpUrl): List<Cookie> {
-        val cookieStr = cookieManager.getCookie(url.toString())
-        if (cookieStr.isNullOrEmpty()) return emptyList()
-        return cookieStr.split(";").mapNotNull { Cookie.parse(url, it.trim()) }
-    }
-}
-
-object ReelFrenClient {
-    const val FALLBACK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    // Apply Mobile UA universally to force clean streams from VolcEngine CDNs
-    const val MOBILE_APP_UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
-    
-    private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
-    private val apiMutex = Mutex()
-    private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
-        .tlsVersions(TlsVersion.TLS_1_2, TlsVersion.TLS_1_3)
-        .cipherSuites(
-            CipherSuite.TLS_AES_128_GCM_SHA256, CipherSuite.TLS_AES_256_GCM_SHA384, CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
-            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, CipherSuite.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-            CipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, CipherSuite.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-        ).build()
-
-    private val spoofedClient = app.baseClient.newBuilder()
-        .cookieJar(WebViewCookieJar())
-        .connectionSpecs(listOf(chromeSpec, ConnectionSpec.CLEARTEXT))
-        .protocols(listOf(Protocol.HTTP_1_1))
-        .build()
-
-    private val spoofedApp = com.lagradost.nicehttp.Requests(spoofedClient)
-
-    private fun apiBase() = ReelFrenStore.apiBase()
-    private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
-    
-    fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
-        val p = mutableListOf<String>()
-        val isGlobal = slug == "all_dramas"
-        if (!isGlobal && slug.isNotEmpty()) p += "provider=${query(slug)}"
-        p += "lang=en"
-        if (category.isNotEmpty()) p += "category=${query(category)}"
-        p += "page=$page"
-        val offset = (page - 1) * 20
-        if (offset > 0) p += "offset=$offset"
-        return "${apiBase()}/api/home?${p.joinToString("&")}"
-    }
-
-    fun detailUrl(slug: String, id: String) = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
-    fun videoUrl(slug: String, id: String, ep: Int) = "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep"
-    
-    fun searchUrl(slug: String, term: String): String {
-        val p = mutableListOf<String>()
-        p += "q=${query(term)}"
-        p += "lang=en"
-        if (slug != "all_dramas" && slug.isNotEmpty()) p += "provider=${query(slug)}"
-        return "${apiBase()}/api/search?${p.joinToString("&")}"
-    }
-
-    fun headers(url: String, isApiCall: Boolean = false): Map<String, String> {
-        val targetHost = ReelFrenCloudflare.hostOf(url)
-        val map = linkedMapOf<String, String>()
-        map["User-Agent"] = ReelFrenStore.userAgent(targetHost)
-        map["Accept-Language"] = "en-US,en;q=0.9"
-        map["Origin"] = ReelFrenConfig.REEL_SITE
-        map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
-        if (isApiCall) map["Accept"] = "application/json, text/plain, */*" else map["Accept"] = "*/*"
-        if (targetHost == apiHost || targetHost.contains("reelfren.net")) {
-            val cookie = ReelFrenStore.cookie(targetHost)
-            if (cookie.isNotBlank()) map["Cookie"] = cookie
-        }
-        return map
-    }
-
-    fun videoHeaders(url: String): Map<String, String> {
-        val map = linkedMapOf<String, String>()
-        map["User-Agent"] = MOBILE_APP_UA 
-        map["Accept"] = "*/*"
-        map["Connection"] = "keep-alive"
-        map["Origin"] = ReelFrenConfig.REEL_SITE
-        map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
-        map["Range"] = "bytes=0-" 
-        return map
-    }
-
-    fun posterHeaders(posterUrl: String?): Map<String, String>? {
-        if (posterUrl.isNullOrEmpty()) return null
-        return headers(posterUrl, isApiCall = false)
-    }
-
-    suspend fun get(url: String): String? {
-        val targetHost = ReelFrenCloudflare.hostOf(url)
-        val isReelFrenApi = targetHost == apiHost
-        
-        ReelFrenLog.d("Client.get", "[GET INIT] url=$url isApi=$isReelFrenApi")
-
-        if (!isReelFrenApi) {
-            return try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (e: Exception) { null }
-        }
-
-        ReelFrenLog.d("Client.get", "Attempting fast-path API fetch for: $url")
-        var jsonText = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } 
-        catch (e: Exception) { ReelFrenLog.d("Client.get", "OkHttp EXCEPTION on fast-path: ${e.message}"); "" }
-
-        if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) {
-            ReelFrenLog.d("Client.get", "✅ Fast-path succeeded! Length: ${jsonText.length}")
-            return jsonText
-        }
-
-        ReelFrenLog.d("Client.get", "⚠️ Fast-path failed or challenged. Acquiring CF Mutex...")
-        apiMutex.withLock {
-            ReelFrenLog.d("Client.get", "🔒 Mutex acquired for $url. Double checking cache...")
-            jsonText = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (e: Exception) { "" }
-            
-            if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) {
-                ReelFrenLog.d("Client.get", "🔓 Pre-cleared by previous provider! Proceeding."); return jsonText
-            }
-
-            ReelFrenLog.d("Client.get", "🛠️ Delegating to native CFSolver on ROOT site (reelfren.net)")
-            if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) { ReelFrenLog.d("Client.get", "❌ CFSolver failed. Aborting fetch."); return null }
-
-            ReelFrenLog.d("Client.get", "🚀 CF solved. Firing native OkHttp fetch to API...")
-            val finalJson = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (e: Exception) { "" }
-            
-            if (finalJson.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(finalJson)) {
-                ReelFrenLog.d("Client.get", "❌ Final OkHttp fetch failed. Giving up."); return null
-            }
-            
-            ReelFrenLog.d("Client.get", "✅ API Fetch Succeeded! Length: ${finalJson.length}")
-            return finalJson
-        }
-    }
-
-    suspend fun playbackServers(slug: String, id: String, ep: Int): List<PlaybackInfo> {
-        val jsonText = get(videoUrl(slug, id, ep)) ?: return emptyList()
-        return ReelFrenParse.playbackServers(jsonText)
     }
 }
