@@ -190,8 +190,6 @@ class ReelFrenProvider : MainAPI() {
         val workingLinks = mutableListOf<com.lagradost.cloudstream3.utils.ExtractorLink>()
 
         coroutineScope {
-            // BRUTE FORCE SERVERS: We explicitly ping the API for servers 1 through 5.
-            // If the server doesn't exist, it returns null and is safely ignored.
             val serverIds = listOf(1, 2, 3, 4, 5)
             
             val deferredServers = serverIds.map { serverId ->
@@ -210,9 +208,9 @@ class ReelFrenProvider : MainAPI() {
                         val qUrl = ReelFrenClient.absUrl(q.url)
                         if (qUrl.isBlank() || !qUrl.startsWith("http")) return@async null
 
-                        // Ping the stream quickly to drop completely dead CDN links before handing to UI
                         val isAlive = runCatching {
-                            val checkHeaders = mapOf("Origin" to ReelFrenConfig.REEL_SITE, "Referer" to "${ReelFrenConfig.REEL_SITE}/", "Range" to "bytes=0-100")
+                            val checkHeaders = ReelFrenClient.videoHeaders(qUrl).toMutableMap()
+                            checkHeaders["Range"] = "bytes=0-100" 
                             val response = com.lagradost.cloudstream3.app.get(qUrl, headers = checkHeaders, timeout = 4000L)
                             response.code in 200..399
                         }.getOrDefault(false)
@@ -224,18 +222,10 @@ class ReelFrenProvider : MainAPI() {
 
                         val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
                         
-                        // We use the explicit server ID we requested to ensure they group properly
                         val baseServer = "Server ${p.server}" 
                         val cleanLabel = q.label.replace("(?i)auto".toRegex(), "").trim()
-                        
-                        val finalName = if (cleanLabel.isNotEmpty()) {
-                            "$baseServer - $cleanLabel"
-                        } else {
-                            baseServer
-                        }
+                        val finalName = if (cleanLabel.isNotEmpty()) "$baseServer - $cleanLabel" else baseServer
 
-                        // Emit the link with standard base headers. We let Cloudstream's ExoPlayer automatically inject the UA.
-                        // Server 2 and 3 will play flawlessly.
                         com.lagradost.cloudstream3.utils.ExtractorLink(
                             source = name,
                             name = finalName,
@@ -243,7 +233,7 @@ class ReelFrenProvider : MainAPI() {
                             referer = "${ReelFrenConfig.REEL_SITE}/", 
                             quality = ReelFrenQuality.of(q.label),
                             type = ReelFrenQuality.linkType(qUrl, format), 
-                            headers = mapOf("Origin" to ReelFrenConfig.REEL_SITE, "Referer" to "${ReelFrenConfig.REEL_SITE}/")
+                            headers = ReelFrenClient.videoHeaders(qUrl)
                         )
                     }
                 }
