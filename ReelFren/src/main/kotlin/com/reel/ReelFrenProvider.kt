@@ -200,7 +200,7 @@ class ReelFrenProvider : MainAPI() {
                     if (qUrl.isBlank() || !qUrl.startsWith("http")) return@async null
 
                     val isAlive = runCatching {
-                        val checkHeaders = ReelFrenClient.headers(qUrl).toMutableMap()
+                        val checkHeaders = ReelFrenClient.videoHeaders(qUrl).toMutableMap()
                         checkHeaders["Range"] = "bytes=0-100" 
                         val response = com.lagradost.cloudstream3.app.get(qUrl, headers = checkHeaders, timeout = 4000L)
                         response.code in 200..299 || response.code in 300..399
@@ -222,14 +222,11 @@ class ReelFrenProvider : MainAPI() {
                         baseServer
                     }
 
-                    // --- NATIVE EXTRACTOR FIX FOR NAL CRASH ---
-                    // By passing Range: bytes=0- in the ExtractorLink, ExoPlayer makes the request
-                    // with this specific header. This forces CDN proxies (like Mediagate) to bypass
-                    // their obfuscation pipeline and serve raw, unchunked bytes, stopping the crash.
-                    val safeHeaders = ReelFrenClient.headers(qUrl).toMutableMap()
+                    // Native extraction with safe headers applied globally by videoHeaders()
+                    val safeHeaders = ReelFrenClient.videoHeaders(qUrl).toMutableMap()
+                    
                     if (qUrl.contains("melolostatic.com", ignoreCase = true) || qUrl.contains("volcengine", ignoreCase = true)) {
-                        safeHeaders["Accept"] = "*/*"
-                        safeHeaders["Connection"] = "keep-alive"
+                        // Optional fallback in case the UA spoof isn't enough, we still enforce Range bytes
                         safeHeaders["Range"] = "bytes=0-"
                     }
 
