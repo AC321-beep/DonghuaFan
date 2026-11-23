@@ -1,7 +1,6 @@
 package com.animekhor
 
 import android.util.Base64
-import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
@@ -65,11 +64,10 @@ class AnimekhorProvider : MainAPI() {
 
     private fun cfHeaders(url: String, base: Map<String, String> = defaultHeaders): Map<String, String> {
         val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
-        val cfUa: String = CFState.userAgentFor(host) ?: CFState.getBrowserUserAgent()
         val cookies: String = CFState.extractAllCookies(host, url)
 
         val merged: MutableMap<String, String> = base.toMutableMap()
-        merged["User-Agent"] = cfUa
+        merged["User-Agent"] = CFState.getBrowserUserAgent()
         if (cookies.isNotBlank()) {
             merged["Cookie"] = CFState.mergeCookies(base["Cookie"], cookies)
         }
@@ -129,7 +127,7 @@ class AnimekhorProvider : MainAPI() {
             executeGet(url, headers)
         } ?: return null
 
-        Log.d("Animekhor/Provider", "🌐 Initial Fetch: ${response.code} for $url")
+        AnimekhorLogger.d("Provider") { "🌐 Initial Fetch: ${response.code} for $url" }
 
         if (response.code in 200..299 && isValidSiteHtml(response.text)) {
             CFState.markHostVerified(host)
@@ -142,15 +140,17 @@ class AnimekhorProvider : MainAPI() {
                 (response.code in 200..299 && response.text.isNotBlank() && !isRealSiteHtml(response.text))
 
         if (!challengeDetected) {
-            Log.e(
-                "Animekhor/Provider",
+            AnimekhorLogger.e(
+                "Provider",
                 "🛑 Non-challenge error (${response.code}) for $url: ${response.text.take(200)}"
             )
             return null
         }
 
         CFState.markHostUnverified(host)
-        Log.w("Animekhor/Provider", "🛡 Challenge/Interstitial (${response.code}) for $url: ${response.text.take(250)}")
+        AnimekhorLogger.w("Provider") {
+            "🛡 Challenge/Interstitial (${response.code}) for $url: ${response.text.take(250)}"
+        }
 
         if (CommonActivity.activity == null || CFState.isInCooldown(host)) {
             return null
@@ -158,7 +158,7 @@ class AnimekhorProvider : MainAPI() {
 
         val isHumanCaptcha = isHumanOnlyChallenge(response.text)
         if (isHumanCaptcha) {
-            Log.w("Animekhor/Provider", "🧩 Interactive CAPTCHA detected — skipping silent solver")
+            AnimekhorLogger.w("Provider") { "🧩 Interactive CAPTCHA detected — skipping silent solver" }
         }
 
         val solved: Boolean = try {
@@ -183,7 +183,7 @@ class AnimekhorProvider : MainAPI() {
             if (act != null && !act.isFinishing && !act.isDestroyed) {
                 val html = CFState.fetchViaWebView(act, url)
                 if (!html.isNullOrBlank() && isValidSiteHtml(html)) {
-                    Log.d("Animekhor/Provider", "✅ WebView transport succeeded (${html.length} bytes)")
+                    AnimekhorLogger.d("Provider") { "✅ WebView transport succeeded (${html.length} bytes)" }
                     return Jsoup.parse(html, url)
                 }
             }
@@ -335,6 +335,7 @@ class AnimekhorProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        AnimekhorLogger.d("Provider") { "loadLinks started for: $data" }
         val document = try {
             fetchDocument(data)
         } catch (e: CancellationException) {
@@ -348,7 +349,10 @@ class AnimekhorProvider : MainAPI() {
         val yieldedSubtitleUrls = ConcurrentHashMap.newKeySet<String>()
 
         val trackingCallback: (ExtractorLink) -> Unit = { link ->
-            if (yieldedStreamUrls.add(link.url)) callback(link)
+            if (yieldedStreamUrls.add(link.url)) {
+                AnimekhorLogger.d("Provider") { "Emitted link -> [${link.name}] ${link.url}" }
+                callback(link)
+            }
         }
         val trackingSubtitleCallback: (SubtitleFile) -> Unit = { sub ->
             if (yieldedSubtitleUrls.add(sub.url)) subtitleCallback(sub)
@@ -374,43 +378,56 @@ class AnimekhorProvider : MainAPI() {
             }
 
             val dedupUrl = if ("?v=" in finalUrl || "?id=" in finalUrl) finalUrl else finalUrl.substringBefore("?")
-            if (!extractedIframeUrls.add(dedupUrl)) return
+            if (!extractedIframeUrls.add(dedupUrl)) {
+                AnimekhorLogger.d("Provider") { "Skipping duplicate iframe: $dedupUrl" }
+                return
+            }
 
             try {
                 val isHandled: Boolean = when {
                     "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> {
+                        AnimekhorLogger.d("Provider") { "Routing ($label) to OkRuCustom: $finalUrl" }
                         OkRuCustom().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true
                     }
                     "p2pstream" in finalUrl -> {
+                        AnimekhorLogger.d("Provider") { "Routing ($label) to P2pstream: $finalUrl" }
                         P2pstream().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true
                     }
                     "upns.live" in finalUrl -> {
+                        AnimekhorLogger.d("Provider") { "Routing ($label) to UpnsLive: $finalUrl" }
                         UpnsLive().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true
                     }
                     "emturbovid" in finalUrl -> {
+                        AnimekhorLogger.d("Provider") { "Routing ($label) to Emturbovid: $finalUrl" }
                         Emturbovid().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true
                     }
                     "bysekoze.com" in finalUrl -> {
+                        AnimekhorLogger.d("Provider") { "Routing ($label) to Bysekoze: $finalUrl" }
                         Bysekoze().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true
                     }
                     "rumble.com" in finalUrl -> {
+                        AnimekhorLogger.d("Provider") { "Routing ($label) to Rumble: $finalUrl" }
                         Rumble().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true
                     }
                     "abyssplayer.com" in finalUrl -> {
+                        AnimekhorLogger.d("Provider") { "Routing ($label) to AbyssPlayer: $finalUrl" }
                         AbyssPlayer().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true
                     }
                     "d.tube" in finalUrl -> {
+                        AnimekhorLogger.d("Provider") { "Routing ($label) to Dtube: $finalUrl" }
                         Dtube().getUrl(finalUrl, mainUrl)?.forEach(trackingCallback); true
                     }
                     else -> false
                 }
 
                 if (!isHandled) {
+                    AnimekhorLogger.d("Provider") { "Routing ($label) to loadExtractor: $finalUrl" }
                     loadExtractor(finalUrl, referer = mainUrl, trackingSubtitleCallback, trackingCallback)
                 }
             } catch (e: CancellationException) {
                 throw e
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                AnimekhorLogger.e("Provider", "Extractor failed ($label) for $finalUrl: ${e.message}", e)
             }
         }
 
@@ -475,6 +492,7 @@ class AnimekhorProvider : MainAPI() {
             jobs.awaitAll()
         }
 
+        AnimekhorLogger.d("Provider") { "loadLinks finished: ${yieldedStreamUrls.size} unique stream(s) emitted" }
         return yieldedStreamUrls.isNotEmpty()
     }
 }
