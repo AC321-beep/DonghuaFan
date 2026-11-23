@@ -122,8 +122,11 @@ class AnimekhorProvider : MainAPI() {
             if (isValidSiteHtml(html)) return Jsoup.parse(html, url)
         }
 
-        val response = if (!CFState.isHostVerified(host)) {
-            val (lockedRes, cachedDoc) = CFState.withColdStartLock(host) {
+        var response: NiceResponse? = null
+        var cachedDoc: Document? = null
+
+        if (!CFState.isHostVerified(host)) {
+            val lockedPair = CFState.withColdStartLock(host) {
                 if (!CFState.isHostVerified(host)) {
                     val r = executeGet(url, headers)
                     if (r != null && r.code in 200..299 && isValidSiteHtml(r.text)) {
@@ -131,13 +134,16 @@ class AnimekhorProvider : MainAPI() {
                     }
                     Pair(r, null)
                 } else {
-                    Pair(null, null) // Lock was bypassed; will be fetched below
+                    Pair(null, null)
                 }
             }
-            if (cachedDoc != null) return cachedDoc
-            lockedRes ?: executeGet(url, headers)
-        } else {
-            executeGet(url, headers)
+            response = lockedPair.first
+            cachedDoc = lockedPair.second
+        }
+
+        if (cachedDoc != null) return cachedDoc
+        if (response == null) {
+            response = executeGet(url, headers)
         }
 
         val finalRes = response ?: return null
