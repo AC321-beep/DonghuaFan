@@ -52,7 +52,7 @@ data class HomeItem(
 )
 data class PlaybackInfo(
     val title: String, val episodeNumber: Int, val totalEpisodes: Int,
-    val locked: Boolean, val qualities: List<QualityEntry>,
+    val locked: Boolean, val qualities: List<QualityEntry>, // Qualities for the FIRST server found
     val subtitles: List<SubtitleEntry>, val server: String
 )
 data class QualityEntry(val label: String, val url: String, val format: String)
@@ -292,7 +292,9 @@ object ReelFrenParse {
 
         val qualities = mutableListOf<QualityEntry>()
         val subs = mutableListOf<SubtitleEntry>()
-
+        
+        // --- Naming Logic Fix ---
+        // If the API returns multiple arrays that represent true distinct servers, this captures the first one properly.
         val qArr = o.optJSONArray("qualityList") ?: o.optJSONArray("qualities") ?: o.optJSONArray("sources") 
                    ?: o.optJSONArray("videos") ?: o.optJSONArray("list") ?: o.optJSONArray("streams")
         
@@ -323,7 +325,7 @@ object ReelFrenParse {
             locked = o.optBoolean("locked"),
             qualities = qualities,
             subtitles = subs.distinctBy { "${it.lang.lowercase(Locale.ROOT)}|${it.url}" },
-            server = clean(o, "sourceServer", "server", "name").ifEmpty { "1" }
+            server = clean(o, "sourceServer", "server", "name").ifEmpty { "1" } // TRUE SERVER ID
         )
     }
 
@@ -597,9 +599,6 @@ class WebViewCookieJar : CookieJar {
 
 object ReelFrenClient {
     const val FALLBACK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    // Apply Mobile UA universally to force clean streams from VolcEngine CDNs
-    const val MOBILE_APP_UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
-    
     private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
     private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
@@ -662,7 +661,7 @@ object ReelFrenClient {
 
     fun videoHeaders(url: String): Map<String, String> {
         val map = linkedMapOf<String, String>()
-        map["User-Agent"] = MOBILE_APP_UA // Bypasses VolcEngine mediagate chunking
+        map["User-Agent"] = FALLBACK_UA 
         map["Accept"] = "*/*"
         map["Connection"] = "keep-alive"
         map["Origin"] = ReelFrenConfig.REEL_SITE
