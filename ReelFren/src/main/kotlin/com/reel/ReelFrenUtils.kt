@@ -285,7 +285,6 @@ object ReelFrenParse {
         return DetailInfo(id = id, provider = clean(o, "provider"), title = title, cover = clean(o, "cover"), intro = clean(o, "intro"), episodes = o.optInt("episodes", videos.size), videos = videos.sortedBy { it.episode })
     }
 
-    // Unifies single and multi-server parsing into one function
     fun playback(body: String): List<PlaybackInfo> {
         if (body.isBlank()) return emptyList()
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
