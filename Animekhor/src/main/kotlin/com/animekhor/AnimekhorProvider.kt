@@ -42,17 +42,19 @@ object AnimekhorLogger {
         if (isVerbose) Log.d("AnimeKhor/$subTag", msg())
     }
 
-    fun i(subTag: String, msg: String) {
-        Log.i("AnimeKhor/$subTag", msg)
+    inline fun i(subTag: String, msg: () -> String) {
+        if (isVerbose) Log.i("AnimeKhor/$subTag", msg())
     }
 
-    fun w(subTag: String, msg: String) {
-        Log.w("AnimeKhor/$subTag", msg)
+    inline fun w(subTag: String, msg: () -> String) {
+        if (isVerbose) Log.w("AnimeKhor/$subTag", msg())
     }
 
-    fun e(subTag: String, msg: String, throwable: Throwable? = null) {
-        if (throwable != null) Log.e("AnimeKhor/$subTag", msg, throwable)
-        else Log.e("AnimeKhor/$subTag", msg)
+    inline fun e(subTag: String, msg: () -> String, throwable: Throwable? = null) {
+        if (isVerbose) {
+            if (throwable != null) Log.e("AnimeKhor/$subTag", msg(), throwable)
+            else Log.e("AnimeKhor/$subTag", msg())
+        }
     }
 }
 
@@ -74,7 +76,11 @@ class AnimekhorProvider : MainAPI() {
     private val browserHeaders = mapOf(
         "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language" to "en-US,en;q=0.9",
-        "Upgrade-Insecure-Requests" to "1"
+        "Upgrade-Insecure-Requests" to "1",
+        "Sec-Fetch-Dest" to "document",
+        "Sec-Fetch-Mode" to "navigate",
+        "Sec-Fetch-Site" to "same-origin",
+        "Sec-Fetch-User" to "?1"
     )
 
     private val cardSelector = "div.listupd > article, div.bsx"
@@ -94,14 +100,13 @@ class AnimekhorProvider : MainAPI() {
     private fun isValidSiteHtml(html: String): Boolean =
         html.length > 500 && !isCfChallenge(html) && isRealSiteHtml(html)
 
-    private suspend fun executeGet(url: String, headers: Map<String, String> = browserHeaders) = try {
+    private suspend fun executeGet(url: String, headers: Map<String, String>) = try {
         withTimeoutOrNull(PAGE_FETCH_TIMEOUT_MS) {
             app.get(url, headers = headers, interceptor = cfInterceptor)
         }
     } catch (e: CancellationException) {
         throw e
-    } catch (e: Exception) {
-        AnimekhorLogger.e("HTTP", "GET failed for $url: ${e.message}", e)
+    } catch (_: Exception) {
         null
     }
 
@@ -110,7 +115,9 @@ class AnimekhorProvider : MainAPI() {
         headers: Map<String, String> = browserHeaders
     ): Document? {
         val host: String = try { URI(url).host ?: "" } catch (_: Exception) { "" }
-        if (!host.contains("animekhor", ignoreCase = true)) return null
+        if (!host.contains("animekhor", ignoreCase = true)) {
+            return null
+        }
 
         CFState.getSolvedHtml(url)?.let { html ->
             if (isValidSiteHtml(html)) return Jsoup.parse(html, url)
@@ -123,77 +130,61 @@ class AnimekhorProvider : MainAPI() {
         }
 
         val response = if (!CFState.isHostVerified(host)) {
-            CFState.withColdStartLock(host) {
-                if (!CFState.isHostVerified(host)) {
-                    val r = executeGet(url, headers)
-                    if (r != null && r.code in 200..299 && isValidSiteHtml(r.text)) {
-                        CFState.markHostVerified(host)
+            val (res, cachedDoc) = CFState.withColdStartLock(host) {
+                withTimeoutOrNull(SOLVE_WAIT_TIMEOUT_MS) { CFState.awaitOngoingSolve(host) }
+                CFState.getSolvedHtml(url)?.let { html ->
+                    if (isValidSiteHtml(html)) {
+                        return@withColdStartLock null to Jsoup.parse(html, url)
                     }
-                    r
-                } else {
-                    null // Bypassed the lock, fetch below
                 }
-            } ?: executeGet(url, headers)
+                val r = executeGet(url, headers)
+                if (r != null && r.code in 200..299 && isValidSiteHtml(r.text)) {
+                    CFState.markHostVerified(host)
+                }
+                r to null
+            }
+            if (cachedDoc != null) return cachedDoc
+            res
         } else {
             executeGet(url, headers)
-        }
+        } ?: return null
 
-        val finalRes = response ?: return null
+        AnimekhorLogger.d("Provider") { "🌐 Fetch: HTTP ${response.code} for $url" }
 
-        AnimekhorLogger.d("Provider") { "🌐 Fetch: HTTP ${finalRes.code} (${finalRes.text.length}B) for $url" }
-
-        if (finalRes.code in 200..299 && isValidSiteHtml(finalRes.text)) {
+        if (response.code in 200..299 && isValidSiteHtml(response.text)) {
             CFState.markHostVerified(host)
-            return finalRes.document
+            return response.document
         }
 
-        // Only parse headers safely now that the type resolves correctly
-        val cfMitigated = finalRes.headers.toMap().entries.any { 
-            it.key.equals("cf-mitigated", ignoreCase = true) && it.value.contains("challenge", ignoreCase = true) 
-        }
-        
-        val challengeDetected = cfMitigated ||
-                isCfChallenge(finalRes.text) ||
-                (finalRes.code in listOf(403, 503) && !isRealSiteHtml(finalRes.text) &&
-                        (finalRes.text.contains("cloudflare", ignoreCase = true) ||
-                         finalRes.text.contains("ddos-guard", ignoreCase = true))) ||
-                (finalRes.code in 200..299 && finalRes.text.isNotBlank() &&
-                        finalRes.text.length < 3500 && !isRealSiteHtml(finalRes.text))
+        val challengeDetected = isCfChallenge(response.text) ||
+                (response.code in 200..299 && response.text.isNotBlank() && !isRealSiteHtml(response.text))
 
         if (!challengeDetected) {
-            if (finalRes.code in 200..299 && finalRes.text.isNotBlank()) {
+            if (response.code in 200..299 && response.text.isNotBlank()) {
                 CFState.markHostVerified(host)
-                return finalRes.document
+                return response.document
             }
-            AnimekhorLogger.e(
-                "Provider",
-                "🛑 Non-challenge HTTP ${finalRes.code} for $url: ${finalRes.text.take(200)}"
-            )
+            AnimekhorLogger.e("Provider", { "🛑 Non-challenge error (${response.code}) for $url: ${response.text.take(200)}" })
             return null
         }
 
         CFState.markHostUnverified(host)
-        AnimekhorLogger.w(
-            "Provider",
-            "🛡 Challenge detected (HTTP ${finalRes.code}, cfMitigated=$cfMitigated) for $url"
-        )
+        AnimekhorLogger.w("Provider", { "🛡 Challenge/Interstitial (${response.code}) for $url: ${response.text.take(250)}" })
 
         if (CommonActivity.activity == null || CFState.isInCooldown(host)) {
-            AnimekhorLogger.w("Provider", "⏸ Solver skipped (activity=${CommonActivity.activity != null}, cooldown=${CFState.isInCooldown(host)})")
             return null
         }
 
-        val isHumanCaptcha = isHumanOnlyChallenge(finalRes.text)
+        val isHumanCaptcha = isHumanOnlyChallenge(response.text)
         if (isHumanCaptcha) {
-            AnimekhorLogger.w("Provider", "🧩 Interactive CAPTCHA detected — skipping silent solver")
+            AnimekhorLogger.w("Provider", { "🧩 Interactive CAPTCHA detected — skipping silent solver" })
         }
 
         val solved: Boolean = try {
             CFSolver(url, skipSilent = isHumanCaptcha).solve()
         } catch (e: CancellationException) {
             throw e
-        } catch (e: Exception) {
-            AnimekhorLogger.e("Provider", "CFSolver threw exception: ${e.message}", e)
+        } catch (_: Exception) {
             false
         }
 
@@ -204,7 +195,6 @@ class AnimekhorProvider : MainAPI() {
 
             val retryResponse = executeGet(url, headers)
             if (retryResponse != null && retryResponse.code in 200..299 && isValidSiteHtml(retryResponse.text)) {
-                CFState.markHostVerified(host)
                 return retryResponse.document
             }
 
@@ -212,12 +202,10 @@ class AnimekhorProvider : MainAPI() {
             if (act != null && !act.isFinishing && !act.isDestroyed) {
                 val html = CFState.fetchViaWebView(act, url)
                 if (!html.isNullOrBlank() && isValidSiteHtml(html)) {
-                    CFState.markHostVerified(host)
-                    AnimekhorLogger.i("Provider", "✅ WebView transport succeeded (${html.length} bytes) for $url")
+                    AnimekhorLogger.d("Provider", { "✅ WebView transport succeeded (${html.length} bytes)" })
                     return Jsoup.parse(html, url)
                 }
             }
-            AnimekhorLogger.w("Provider", "⚠️ Solver reported success but retry & WebView fallback failed for $url")
         }
         return null
     }
@@ -360,73 +348,26 @@ class AnimekhorProvider : MainAPI() {
         }
     }
 
-    private fun decodeBase64Safe(input: String): String {
-        val trimmed = input.trim()
-        if (trimmed.startsWith("http", ignoreCase = true) ||
-            trimmed.startsWith("//") ||
-            trimmed.startsWith("<")
-        ) {
-            return trimmed
-        }
-        return try {
-            val normalized = trimmed
-                .replace("\\s+".toRegex(), "")
-                .replace('-', '+')
-                .replace('_', '/')
-            val padded = when (normalized.length % 4) {
-                2 -> "$normalized=="
-                3 -> "$normalized="
-                else -> normalized
-            }
-            String(Base64.decode(padded, Base64.DEFAULT), Charsets.UTF_8).trim()
-        } catch (e: Exception) {
-            AnimekhorLogger.e("Provider", "Base64 decode failed for input (${trimmed.take(24)}...)", e)
-            trimmed
-        }
-    }
-
-    private fun Element.extractIframeSrc(): String? {
-        val candidates = listOf(
-            this.attr("data-lazy-src"),
-            this.attr("data-src"),
-            this.attr("src")
-        )
-        return candidates.firstOrNull { src ->
-            src.isNotBlank() &&
-            !src.equals("about:blank", ignoreCase = true) &&
-            !src.startsWith("data:", ignoreCase = true) &&
-            !src.startsWith("javascript:", ignoreCase = true)
-        }?.trim()
-    }
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        AnimekhorLogger.i("Provider", "loadLinks started for: $data")
         val document = try {
             fetchDocument(data)
         } catch (e: CancellationException) {
             throw e
-        } catch (e: Exception) {
-            AnimekhorLogger.e("Provider", "loadLinks fetchDocument error for $data: ${e.message}", e)
+        } catch (_: Exception) {
             null
-        } ?: run {
-            AnimekhorLogger.w("Provider", "loadLinks aborted: fetchDocument returned null for $data")
-            return false
-        }
+        } ?: return false
 
         val extractedIframeUrls = ConcurrentHashMap.newKeySet<String>()
         val yieldedStreamUrls = ConcurrentHashMap.newKeySet<String>()
         val yieldedSubtitleUrls = ConcurrentHashMap.newKeySet<String>()
 
         val trackingCallback: (ExtractorLink) -> Unit = { link ->
-            if (yieldedStreamUrls.add(link.url)) {
-                AnimekhorLogger.d("Provider") { "Emitted link -> [${link.name}] ${link.url}" }
-                callback(link)
-            }
+            if (yieldedStreamUrls.add(link.url)) callback(link)
         }
         val trackingSubtitleCallback: (SubtitleFile) -> Unit = { sub ->
             if (yieldedSubtitleUrls.add(sub.url)) subtitleCallback(sub)
@@ -452,56 +393,43 @@ class AnimekhorProvider : MainAPI() {
             }
 
             val dedupUrl = if ("?v=" in finalUrl || "?id=" in finalUrl) finalUrl else finalUrl.substringBefore("?")
-            if (!extractedIframeUrls.add(dedupUrl)) {
-                AnimekhorLogger.d("Provider") { "Skipping duplicate iframe: $dedupUrl" }
-                return
-            }
+            if (!extractedIframeUrls.add(dedupUrl)) return
 
             try {
                 val isHandled: Boolean = when {
                     "ok.ru" in finalUrl || "odnoklassniki.ru" in finalUrl -> {
-                        AnimekhorLogger.d("Provider") { "Routing ($label) to OkRuCustom: $finalUrl" }
                         OkRuCustom().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true
                     }
                     "p2pstream" in finalUrl -> {
-                        AnimekhorLogger.d("Provider") { "Routing ($label) to P2pstream: $finalUrl" }
                         P2pstream().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true
                     }
                     "upns.live" in finalUrl -> {
-                        AnimekhorLogger.d("Provider") { "Routing ($label) to UpnsLive: $finalUrl" }
                         UpnsLive().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true
                     }
                     "emturbovid" in finalUrl -> {
-                        AnimekhorLogger.d("Provider") { "Routing ($label) to Emturbovid: $finalUrl" }
                         Emturbovid().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true
                     }
                     "bysekoze.com" in finalUrl -> {
-                        AnimekhorLogger.d("Provider") { "Routing ($label) to Bysekoze: $finalUrl" }
                         Bysekoze().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true
                     }
                     "rumble.com" in finalUrl -> {
-                        AnimekhorLogger.d("Provider") { "Routing ($label) to Rumble: $finalUrl" }
                         Rumble().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true
                     }
                     "abyssplayer.com" in finalUrl -> {
-                        AnimekhorLogger.d("Provider") { "Routing ($label) to AbyssPlayer: $finalUrl" }
                         AbyssPlayer().getUrl(finalUrl, mainUrl, trackingSubtitleCallback, trackingCallback); true
                     }
                     "d.tube" in finalUrl -> {
-                        AnimekhorLogger.d("Provider") { "Routing ($label) to Dtube: $finalUrl" }
                         Dtube().getUrl(finalUrl, mainUrl)?.forEach(trackingCallback); true
                     }
                     else -> false
                 }
 
                 if (!isHandled) {
-                    AnimekhorLogger.d("Provider") { "Routing ($label) to loadExtractor: $finalUrl" }
                     loadExtractor(finalUrl, referer = mainUrl, trackingSubtitleCallback, trackingCallback)
                 }
             } catch (e: CancellationException) {
                 throw e
-            } catch (e: Exception) {
-                AnimekhorLogger.e("Provider", "Extractor failed ($label) for $finalUrl: ${e.message}", e)
+            } catch (_: Exception) {
             }
         }
 
@@ -514,26 +442,17 @@ class AnimekhorProvider : MainAPI() {
             .toList()
 
         val serverElements = document.select(
-            ".mobius option, select.mirror option, .server-list li a[data-embed], " +
-            ".server-list li a[data-em], .server option, .player option"
+            ".mobius option, select.mirror option, .server-list li a[data-embed], .server-list li a[data-em]"
         )
 
         val directIframeSrcs: List<String> = document
-            .select("#embed_holder iframe, .playerx iframe, .video-content iframe, iframe")
+            .select("#embed_holder iframe, .playerx iframe, .video-content iframe")
             .mapNotNull { iframe ->
-                val src = iframe.extractIframeSrc()
-                if (!src.isNullOrBlank() &&
-                    !src.contains("youtube", true) &&
-                    !src.contains("disqus", true) &&
-                    !src.contains("facebook", true) &&
-                    !src.contains("google", true)
-                ) src else null
+                val src = iframe.attr("src")
+                    .ifBlank { iframe.attr("data-src") }
+                    .ifBlank { iframe.attr("data-lazy-src") }
+                if (src.isNotBlank() && !src.contains("youtube", true) && !src.contains("disqus", true)) src else null
             }
-
-        AnimekhorLogger.i(
-            "Provider",
-            "Sources parsed for $data -> raw=${rawMatches.size}, servers=${serverElements.size}, iframes=${directIframeSrcs.size}"
-        )
 
         coroutineScope {
             val jobs = buildList {
@@ -548,12 +467,20 @@ class AnimekhorProvider : MainAPI() {
                             .trim()
                         if (rawData.isBlank()) return@async
 
-                        val decoded = decodeBase64Safe(rawData)
                         val iframeSrc: String = when {
-                            decoded.startsWith("http", ignoreCase = true) || decoded.startsWith("//") -> decoded
-                            decoded.contains("<iframe", ignoreCase = true) ->
-                                Jsoup.parse(decoded).selectFirst("iframe")?.extractIframeSrc() ?: ""
-                            else -> ""
+                            rawData.startsWith("http") || rawData.startsWith("//") -> rawData
+                            rawData.startsWith("<iframe", ignoreCase = true) ->
+                                Jsoup.parse(rawData).selectFirst("iframe")?.attr("src") ?: ""
+                            else -> try {
+                                val decoded = String(Base64.decode(rawData, Base64.DEFAULT))
+                                if (decoded.contains("<iframe", ignoreCase = true))
+                                    Jsoup.parse(decoded).selectFirst("iframe")?.attr("src") ?: decoded
+                                else decoded
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                ""
+                            }
                         }
 
                         if (iframeSrc.isNotBlank()) invokeExtractor(iframeSrc, server.text().trim())
@@ -567,7 +494,6 @@ class AnimekhorProvider : MainAPI() {
             jobs.awaitAll()
         }
 
-        AnimekhorLogger.i("Provider", "loadLinks finished for $data: ${yieldedStreamUrls.size} stream(s) emitted")
         return yieldedStreamUrls.isNotEmpty()
     }
 }
