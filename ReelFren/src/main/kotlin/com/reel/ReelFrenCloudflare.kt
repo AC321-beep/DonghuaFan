@@ -139,25 +139,12 @@ object ReelFrenCloudflare {
         return null
     }
 
-    private fun resolveWebViewUa(activity: Activity, host: String): String {
-        val existing = ReelFrenStore.userAgent(host)
-        if (existing.isNotBlank() && existing != ReelFrenClient.FALLBACK_UA) return existing
-        val ua = runCatching {
-            WebSettings.getDefaultUserAgent(activity)
-                .replace("; wv", "")
-                .replace(Regex("""Version/\d+\.\d+\s*"""), "")
-        }.getOrNull() ?: ReelFrenClient.FALLBACK_UA
-        ReelFrenStore.setUserAgent(host, ua)
-        return ua
-    }
-
     private fun persistCookie(url: String, host: String, ua: String) {
         try {
             val cm = CookieManager.getInstance()
             val cookie = cm.getCookie(url) ?: cm.getCookie("https://$host") ?: return
             if (extractClearanceToken(cookie).isNotEmpty()) {
                 ReelFrenStore.saveCookie(host, cookie)
-                ReelFrenStore.setUserAgent(host, ua)
                 cm.flush()
                 ReelFrenLog.d("CF/cookie", "Persisted cf_clearance for $host (len=${cookie.length})")
             }
@@ -301,7 +288,7 @@ object ReelFrenCloudflare {
             val settling = AtomicBoolean(false)
             var freshTokenCount = 0
             val handler = Handler(Looper.getMainLooper())
-            val ua = resolveWebViewUa(activity, host)
+            val ua = ReelFrenStore.userAgent(host) // Always uses the global Chrome Mobile UA
             val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
 
             val container = object : FrameLayout(activity) {
@@ -473,7 +460,7 @@ object ReelFrenCloudflare {
         var webRef: WebView? = null
         var layoutRef: LinearLayout? = null
         var dialogRef: Dialog? = null
-        val ua = resolveWebViewUa(activity, host)
+        val ua = ReelFrenStore.userAgent(host) // Always uses the global Chrome Mobile UA
         val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
 
         fun finish(success: Boolean) {
