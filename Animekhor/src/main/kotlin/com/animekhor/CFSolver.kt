@@ -59,8 +59,8 @@ fun isRealSiteHtml(html: String): Boolean {
 
 fun isCfChallengeHtml(html: String): Boolean {
     if (html.isBlank()) return false
-    val l = html.lowercase()
 
+    val l = html.lowercase()
     val hasChallengeMarker = l.contains("<title>bot verification") ||
             l.contains("/cdn-cgi/challenge-platform/") ||
             l.contains("cf-browser-verification") ||
@@ -112,6 +112,7 @@ internal fun shouldAllowBackgroundWebResource(req: WebResourceRequest?): Boolean
             host.contains("recaptcha")
 
     if (isChallengeProvider) return true
+
     if (!host.contains("animekhor")) return false
 
     val path = req.url?.path?.lowercase().orEmpty()
@@ -129,12 +130,14 @@ object CFState {
     private var globalUserAgent: String = ""
 
     private val solving = ConcurrentHashMap<String, CompletableDeferred<Boolean>>()
+    private val solvedHtmlCache = ConcurrentHashMap<String, Pair<Long, String>>()
     private val verifiedHosts = ConcurrentHashMap<String, Long>()
     private val coldStartLocks = ConcurrentHashMap<String, Mutex>()
-    private val failedUntil = ConcurrentHashMap<String, Long>()
 
     private const val DEFAULT_COOLDOWN_MS = 60_000L
+    private const val HTML_CACHE_TTL_MS = 45_000L
     private const val VERIFIED_HOST_TTL_MS = 30 * 60_000L
+    private val failedUntil = ConcurrentHashMap<String, Long>()
 
     val solverScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
@@ -165,6 +168,8 @@ object CFState {
         }
         return SAFE_FALLBACK_UA
     }
+
+    private fun normalizeUrl(url: String): String = url.trim().trimEnd('/')
 
     fun isHostVerified(host: String): Boolean {
         val key = host.lowercase()
@@ -213,6 +218,27 @@ object CFState {
             runCatching { cm.getCookie(url) }.getOrNull()
         ).filter { it.isNotBlank() }
         return mergeCookies(sources.joinToString("; "), null)
+    }
+
+    fun storeSolvedHtml(url: String, html: String) {
+        if (html.length <= 200) return
+        val key = normalizeUrl(url)
+        val now = System.currentTimeMillis()
+        solvedHtmlCache.entries.removeIf { now - it.value.first > HTML_CACHE_TTL_MS }
+        if (solvedHtmlCache.size >= 32) {
+            solvedHtmlCache.minByOrNull { it.value.first }?.key?.let { solvedHtmlCache.remove(it) }
+        }
+        solvedHtmlCache[key] = now to html
+    }
+
+    fun getSolvedHtml(url: String): String? {
+        val key = normalizeUrl(url)
+        val entry = solvedHtmlCache[key] ?: return null
+        if (System.currentTimeMillis() - entry.first > HTML_CACHE_TTL_MS) {
+            solvedHtmlCache.remove(key)
+            return null
+        }
+        return entry.second
     }
 
     suspend fun awaitOngoingSolve(host: String) {
@@ -287,6 +313,7 @@ object CFState {
                 val pollRunnableObj = object : Runnable {
                     override fun run() {
                         if (done.get()) return
+                        val self = this
                         webView.postInvalidateOnAnimation()
                         webView.evaluateJavascript(
                             "(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();"
@@ -294,9 +321,10 @@ object CFState {
                             if (!done.get()) {
                                 val html = decodeJsHtml(raw)
                                 if (!html.isNullOrBlank() && html.length >= 500 && !isCfChallengeHtml(html) && isRealSiteHtml(html)) {
+                                    storeSolvedHtml(url, html)
                                     finish(html)
                                 } else {
-                                    handler.postDelayed(this@Runnable, 600L)
+                                    handler.postDelayed(self, 600L)
                                 }
                             }
                         }
@@ -545,6 +573,7 @@ class CFSolver(
                     var tick = 0
                     override fun run() {
                         if (done.get()) return
+                        val self = this
                         tick++
                         webView.postInvalidateOnAnimation()
 
@@ -562,27 +591,29 @@ class CFSolver(
                                 ) { raw ->
                                     if (!done.get()) {
                                         val html = decodeJsHtml(raw).orEmpty()
+
                                         if (isHumanOnlyChallenge(html)) {
                                             AnimekhorLogger.w("CFSolver", "🧩 [Silent] Human CAPTCHA detected in DOM — escalating")
                                             destroyWebView(false)
                                         } else if (html.length > 500 && !isChallengeOrErrorTitle(webView.title.orEmpty()) && !isCfChallengeHtml(html)) {
+                                            CFState.storeSolvedHtml(url, html)
+                                            webView.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
                                             destroyWebView(true)
                                         } else {
                                             if (tick >= 3 && tick % 3 == 0 && onChallenge) {
                                                 triggerTurnstileAutoTap(webView, handler) { !done.get() }
                                             }
-                                            handler.postDelayed(this@Runnable, 1000L)
+                                            handler.postDelayed(self, 1000L)
                                         }
                                     }
                                 }
                             }.onFailure { destroyWebView(false) }
-                            return
+                        } else {
+                            if (tick >= 3 && tick % 3 == 0) {
+                                triggerTurnstileAutoTap(webView, handler) { !done.get() }
+                            }
+                            handler.postDelayed(self, 1000L)
                         }
-
-                        if (tick >= 3 && tick % 3 == 0) {
-                            triggerTurnstileAutoTap(webView, handler) { !done.get() }
-                        }
-                        handler.postDelayed(this, 1000L)
                     }
                 }
 
@@ -728,6 +759,8 @@ class CFSolver(
                             w.evaluateJavascript("(function(){ return document.documentElement ? document.documentElement.outerHTML : ''; })();") { raw ->
                                 val html = decodeJsHtml(raw)
                                 if (!html.isNullOrBlank() && html.length > 500 && !isChallengeOrErrorTitle(w.title.orEmpty()) && !isCfChallengeHtml(html)) {
+                                    CFState.storeSolvedHtml(url, html)
+                                    w.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
                                     finish(true)
                                 } else {
                                     status.text = "Please complete the verification first, then tap Continue."
@@ -751,6 +784,7 @@ class CFSolver(
                     var tick = 0
                     override fun run() {
                         if (resolved.get()) return
+                        val self = this
                         tick++
                         val rawCookie = CFState.extractAllCookies(host, webView.url ?: url)
                         val hasClearance = rawCookie.contains("cf_clearance")
@@ -765,6 +799,8 @@ class CFSolver(
                                     val html = decodeJsHtml(raw)
                                     
                                     if (!html.isNullOrBlank() && html.length > 500 && !isChallengeOrErrorTitle(webView.title.orEmpty()) && !isCfChallengeHtml(html)) {
+                                        CFState.storeSolvedHtml(url, html)
+                                        webView.url?.let { loaded -> CFState.storeSolvedHtml(loaded, html) }
                                         finish(true)
                                     } else {
                                         status.text = "Complete the verification below, then tap Continue."
@@ -772,17 +808,16 @@ class CFSolver(
                                         if (tick >= 3 && tick % 3 == 0 && onChallenge) {
                                             triggerTurnstileAutoTap(webView, handler) { !resolved.get() }
                                         }
-                                        handler.postDelayed(this@Runnable, 1000L)
+                                        handler.postDelayed(self, 1000L)
                                     }
                                 }
                             }
-                            return
+                        } else {
+                            if (tick >= 3 && tick % 3 == 0) {
+                                triggerTurnstileAutoTap(webView, handler) { !resolved.get() }
+                            }
+                            handler.postDelayed(self, 1000L)
                         }
-
-                        if (tick >= 3 && tick % 3 == 0) {
-                            triggerTurnstileAutoTap(webView, handler) { !resolved.get() }
-                        }
-                        handler.postDelayed(this, 1000L)
                     }
                 }
 
