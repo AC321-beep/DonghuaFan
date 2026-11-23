@@ -145,6 +145,7 @@ object ReelFrenCloudflare {
             val cookie = cm.getCookie(url) ?: cm.getCookie("https://$host") ?: return
             if (extractClearanceToken(cookie).isNotEmpty()) {
                 ReelFrenStore.saveCookie(host, cookie)
+                ReelFrenStore.setUserAgent(host, ua)
                 cm.flush()
                 ReelFrenLog.d("CF/cookie", "Persisted cf_clearance for $host (len=${cookie.length})")
             }
@@ -288,7 +289,7 @@ object ReelFrenCloudflare {
             val settling = AtomicBoolean(false)
             var freshTokenCount = 0
             val handler = Handler(Looper.getMainLooper())
-            val ua = ReelFrenStore.userAgent(host) // Always uses the global Chrome Mobile UA
+            val ua = ReelFrenClient.GLOBAL_MOBILE_UA
             val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
 
             val container = object : FrameLayout(activity) {
@@ -460,7 +461,7 @@ object ReelFrenCloudflare {
         var webRef: WebView? = null
         var layoutRef: LinearLayout? = null
         var dialogRef: Dialog? = null
-        val ua = ReelFrenStore.userAgent(host) // Always uses the global Chrome Mobile UA
+        val ua = ReelFrenClient.GLOBAL_MOBILE_UA
         val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
 
         fun finish(success: Boolean) {
