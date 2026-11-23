@@ -285,17 +285,8 @@ object ReelFrenParse {
         return DetailInfo(id = id, provider = clean(o, "provider"), title = title, cover = clean(o, "cover"), intro = clean(o, "intro"), episodes = o.optInt("episodes", videos.size), videos = videos.sortedBy { it.episode })
     }
 
-    // --- CRITICAL REELFREN FIX FOR MISSING MULTI-SERVERS ---
-    fun playbackServers(slug: String, id: String, ep: Int): List<PlaybackInfo> {
-        val jsonText = runCatching { 
-            // We use runBlocking or extract this logic into the suspend call in loadLinks 
-            // Let's implement the parsing logic assuming we already have the raw body text.
-            ""
-        }.getOrDefault("")
-        return emptyList() // (We handle the actual suspend call in the main class instead)
-    }
-
-    fun playbackMulti(body: String): List<PlaybackInfo> {
+    // Unifies single and multi-server parsing into one function
+    fun playback(body: String): List<PlaybackInfo> {
         if (body.isBlank()) return emptyList()
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
         val dataNode = root.optJSONObject("data") ?: root.optJSONObject("playback") ?: root
@@ -747,23 +738,8 @@ object ReelFrenClient {
         }
     }
 
-    // --- NEW: Expose playbackMulti for the provider ---
     suspend fun playbackServers(slug: String, id: String, ep: Int): List<PlaybackInfo> {
         val jsonText = get(videoUrl(slug, id, ep)) ?: return emptyList()
-        return ReelFrenParse.playbackMulti(jsonText)
-    }
-
-    suspend fun home(slug: String, category: String = "", page: Int = 1): List<HomeItem> = get(homeUrl(slug, category, page))?.let(ReelFrenParse::homeItems) ?: emptyList()
-    suspend fun detail(slug: String, id: String): DetailInfo? = get(detailUrl(slug, id))?.let(ReelFrenParse::detail)
-    suspend fun playback(slug: String, id: String, ep: Int): PlaybackInfo? = get(videoUrl(slug, id, ep))?.let(ReelFrenParse::playback)
-    suspend fun search(slug: String, term: String): List<HomeItem> = get(searchUrl(slug, term))?.let(ReelFrenParse::homeItems) ?: emptyList()
-
-    fun absUrl(value: String): String {
-        val clean = value.trim()
-        if (clean.isEmpty()) return ""
-        if (clean.startsWith("https://", true) || clean.startsWith("http://", true)) return clean
-        if (clean.startsWith("//")) return "https:$clean"
-        val base = apiBase()
-        return if (clean.startsWith("/")) "$base$clean" else "$base/$clean"
+        return ReelFrenParse.playback(jsonText)
     }
 }
