@@ -52,13 +52,13 @@ class ReelFrenProvider : MainAPI() {
         val slug = request.data
         ReelFrenLog.d("Main/getMainPage", "ENTRY page=$page slug=$slug name=${request.name}")
         
-        val items = ReelFrenClient.home(slug, page)
+        val items: List<HomeItem> = ReelFrenClient.home(slug, page = page)
         if (items.isEmpty()) {
             ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=0 added=0 hasNext=false")
             return newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
         
-        val mapped = items.mapNotNull { item ->
+        val mapped = items.mapNotNull { item: HomeItem ->
             if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
             
             val actualSlug = item.provider.ifEmpty { slug }
@@ -96,8 +96,8 @@ class ReelFrenProvider : MainAPI() {
 
         val deferredSearches = activeProviders.map { slug ->
             bgSearchScope.async {
-                val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
-                items.mapNotNull { item ->
+                val items: List<HomeItem> = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
+                items.mapNotNull { item: HomeItem ->
                     if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
                     val actualSlug = item.provider.ifEmpty { "all_dramas" }
                     newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
@@ -141,7 +141,7 @@ class ReelFrenProvider : MainAPI() {
         val (slug, id, _) = ReelFrenUrl.parse(url)
         if (id.isEmpty() || slug.isEmpty()) throw ErrorLoadingException("Invalid URL or missing ID")
         
-        val d = ReelFrenClient.detail(slug, id) ?: throw ErrorLoadingException("Failed to load detail")
+        val d: DetailInfo = ReelFrenClient.detail(slug, id) ?: throw ErrorLoadingException("Failed to load detail")
         val coverUrl = ReelFrenClient.absUrl(d.cover)
         val coverHeaders = ReelFrenClient.posterHeaders(coverUrl)
 
@@ -150,7 +150,7 @@ class ReelFrenProvider : MainAPI() {
                 name = d.title,
                 url = url,
                 type = TvType.AsianDrama,
-                episodes = d.videos.map { v ->
+                episodes = d.videos.map { v: VideoEntry ->
                     newEpisode(ReelFrenUrl.episode(slug, id, v.episode)) {
                         this.name = "Episode ${v.episode}"
                         this.episode = v.episode
@@ -190,8 +190,8 @@ class ReelFrenProvider : MainAPI() {
         val workingLinks = mutableListOf<com.lagradost.cloudstream3.utils.ExtractorLink>()
 
         coroutineScope {
-            // BRUTE FORCE SERVERS: The API only returns one server per request. 
-            // We explicitly request Server 1, 2, 3, 4, 5 simultaneously to capture all alternative sources.
+            // BRUTE FORCE SERVERS: We explicitly ping the API for servers 1 through 5.
+            // If the server doesn't exist, it returns null and is safely ignored.
             val serverIds = listOf(1, 2, 3, 4, 5)
             
             val deferredServers = serverIds.map { serverId ->
@@ -202,35 +202,56 @@ class ReelFrenProvider : MainAPI() {
 
             val serverResults = deferredServers.awaitAll().filterNotNull()
 
-            serverResults.forEach { p ->
+            val validationJobs = serverResults.flatMap { p ->
                 ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback)
                 
-                p.qualities.forEach { q ->
-                    val qUrl = ReelFrenClient.absUrl(q.url)
-                    if (qUrl.isNotBlank() && qUrl.startsWith("http")) {
+                p.qualities.map { q ->
+                    async {
+                        val qUrl = ReelFrenClient.absUrl(q.url)
+                        if (qUrl.isBlank() || !qUrl.startsWith("http")) return@async null
+
+                        // Ping the stream quickly to drop completely dead CDN links before handing to UI
+                        val isAlive = runCatching {
+                            val checkHeaders = mapOf("Origin" to ReelFrenConfig.REEL_SITE, "Referer" to "${ReelFrenConfig.REEL_SITE}/", "Range" to "bytes=0-100")
+                            val response = com.lagradost.cloudstream3.app.get(qUrl, headers = checkHeaders, timeout = 4000L)
+                            response.code in 200..399
+                        }.getOrDefault(false)
+
+                        if (!isAlive) {
+                            ReelFrenLog.d("Main/loadLinks", "Filtered out DEAD link: $qUrl")
+                            return@async null
+                        }
+
                         val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
                         
-                        val baseServer = "Server ${p.server}"
+                        // We use the explicit server ID we requested to ensure they group properly
+                        val baseServer = "Server ${p.server}" 
                         val cleanLabel = q.label.replace("(?i)auto".toRegex(), "").trim()
-                        val finalName = if (cleanLabel.isNotEmpty()) "$baseServer - $cleanLabel" else baseServer
+                        
+                        val finalName = if (cleanLabel.isNotEmpty()) {
+                            "$baseServer - $cleanLabel"
+                        } else {
+                            baseServer
+                        }
 
-                        // CRITICAL NAL CRASH FIX: We MUST use the exact same User-Agent that fetched the API, 
-                        // or the CDN signature will mismatch and return 403 Forbidden HTML (causing ExoPlayer NAL crash).
-                        val safeHeaders = ReelFrenClient.videoHeaders(qUrl)
-
-                        val link = com.lagradost.cloudstream3.utils.ExtractorLink(
+                        // Emit the link with standard base headers. We let Cloudstream's ExoPlayer automatically inject the UA.
+                        // Server 2 and 3 will play flawlessly.
+                        com.lagradost.cloudstream3.utils.ExtractorLink(
                             source = name,
                             name = finalName,
                             url = qUrl,
                             referer = "${ReelFrenConfig.REEL_SITE}/", 
                             quality = ReelFrenQuality.of(q.label),
                             type = ReelFrenQuality.linkType(qUrl, format), 
-                            headers = safeHeaders 
+                            headers = mapOf("Origin" to ReelFrenConfig.REEL_SITE, "Referer" to "${ReelFrenConfig.REEL_SITE}/")
                         )
-                        callback(link)
-                        workingLinks.add(link)
                     }
                 }
+            }
+            
+            validationJobs.awaitAll().filterNotNull().forEach { link ->
+                callback(link)
+                workingLinks.add(link)
             }
         }
         
