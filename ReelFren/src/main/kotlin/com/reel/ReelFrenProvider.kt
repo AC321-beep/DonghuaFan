@@ -194,7 +194,8 @@ class ReelFrenProvider : MainAPI() {
         val workingLinks = mutableListOf<com.lagradost.cloudstream3.utils.ExtractorLink>()
 
         coroutineScope {
-            val validationJobs = p.qualities.mapIndexed { index, q ->
+            // FIX: Removed the incorrect indexed mapping. We now correctly map the true server name parsed from the JSON.
+            val validationJobs = p.qualities.map { q ->
                 async {
                     val qUrl = ReelFrenClient.absUrl(q.url)
                     if (qUrl.isBlank() || !qUrl.startsWith("http")) return@async null
@@ -213,7 +214,9 @@ class ReelFrenProvider : MainAPI() {
 
                     val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
                     
-                    val baseServer = "Server ${index + 1}"
+                    // TRUE SERVER NAMING: If the API says this is "Server 2", it is Server 2. 
+                    // If the API says it's "1", we name it "Server 1". This prevents the UI from duplicating "Server 1 - 720p" "Server 2 - 540p" incorrectly.
+                    val baseServer = if (p.server.isBlank()) "Server 1" else if (p.server.toIntOrNull() != null) "Server ${p.server}" else p.server
                     val cleanLabel = q.label.replace("(?i)auto".toRegex(), "").trim()
                     
                     val finalName = if (cleanLabel.isNotEmpty()) {
@@ -222,30 +225,54 @@ class ReelFrenProvider : MainAPI() {
                         baseServer
                     }
 
-                    // Native extraction with safe headers applied globally by videoHeaders()
-                    val safeHeaders = ReelFrenClient.videoHeaders(qUrl).toMutableMap()
-                    
-                    if (qUrl.contains("melolostatic.com", ignoreCase = true) || qUrl.contains("volcengine", ignoreCase = true)) {
-                        // Optional fallback in case the UA spoof isn't enough, we still enforce Range bytes
-                        safeHeaders["Range"] = "bytes=0-"
-                    }
+                    val isObfuscated = qUrl.contains("melolostatic.com", ignoreCase = true) || qUrl.contains("volcengine", ignoreCase = true)
 
-                    com.lagradost.cloudstream3.utils.ExtractorLink(
-                        source = name,
-                        name = finalName,
-                        url = qUrl,
-                        referer = "${ReelFrenConfig.REEL_SITE}/", 
-                        quality = ReelFrenQuality.of(q.label),
-                        type = ReelFrenQuality.linkType(qUrl, format), 
-                        headers = safeHeaders 
-                    )
+                    if (isObfuscated) {
+                        // --- NATIVE JAVASCRIPT BYPASS FIX ---
+                        // Because the raw stream is encrypted, we MUST extract the true video source by loading the URL
+                        // in a background WebView and grabbing the final decrypted `.m3u8` or `.mp4` string.
+                        try {
+                            val webViewHtml = com.lagradost.cloudstream3.app.get(qUrl, interceptor = com.lagradost.cloudstream3.network.WebViewResolver(Regex("""\.m3u8|\.mp4"""))).text
+                            
+                            // Extract the raw, decrypted video URL from the resolved HTML
+                            val decryptedUrl = Regex("""(https?://[^"']+(?:\.m3u8|\.mp4)[^"']*)""").find(webViewHtml)?.groupValues?.get(1)
+                            
+                            if (!decryptedUrl.isNullOrBlank()) {
+                                com.lagradost.cloudstream3.utils.ExtractorLink(
+                                    source = name,
+                                    name = finalName,
+                                    url = decryptedUrl,
+                                    referer = "${ReelFrenConfig.REEL_SITE}/", 
+                                    quality = ReelFrenQuality.of(q.label),
+                                    type = ReelFrenQuality.linkType(decryptedUrl, format), 
+                                    headers = ReelFrenClient.videoHeaders(decryptedUrl) 
+                                ).also { 
+                                    callback(it)
+                                    workingLinks.add(it)
+                                }
+                            }
+                        } catch (e: Exception) {
+                            ReelFrenLog.d("Main/loadLinks", "WebView resolution failed for $qUrl")
+                        }
+                    } else {
+                        // Standard unencrypted extraction
+                        com.lagradost.cloudstream3.utils.ExtractorLink(
+                            source = name,
+                            name = finalName,
+                            url = qUrl,
+                            referer = "${ReelFrenConfig.REEL_SITE}/", 
+                            quality = ReelFrenQuality.of(q.label),
+                            type = ReelFrenQuality.linkType(qUrl, format), 
+                            headers = ReelFrenClient.videoHeaders(qUrl) 
+                        ).also {
+                            callback(it)
+                            workingLinks.add(it)
+                        }
+                    }
                 }
             }
             
-            validationJobs.awaitAll().filterNotNull().forEach { link ->
-                callback(link)
-                workingLinks.add(link)
-            }
+            validationJobs.awaitAll()
         }
         
         return workingLinks.isNotEmpty()
