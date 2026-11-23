@@ -535,7 +535,6 @@ object ReelFrenQuality {
     }
 
     fun linkType(url: String, format: String = ""): ExtractorLinkType = when {
-        // Returned to standard extraction since WEB_VIDEO is not supported on this branch
         format.equals("hls", ignoreCase = true) || url.contains(".m3u8", ignoreCase = true) -> ExtractorLinkType.M3U8
         format.equals("dash", ignoreCase = true) || url.contains(".mpd", ignoreCase = true) -> ExtractorLinkType.DASH
         else -> ExtractorLinkType.VIDEO
@@ -598,6 +597,9 @@ class WebViewCookieJar : CookieJar {
 
 object ReelFrenClient {
     const val FALLBACK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    // Apply Mobile UA universally to force clean streams from VolcEngine CDNs
+    const val MOBILE_APP_UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
+    
     private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
     private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
@@ -655,6 +657,17 @@ object ReelFrenClient {
             val cookie = ReelFrenStore.cookie(targetHost)
             if (cookie.isNotBlank()) map["Cookie"] = cookie
         }
+        return map
+    }
+
+    fun videoHeaders(url: String): Map<String, String> {
+        val map = linkedMapOf<String, String>()
+        map["User-Agent"] = MOBILE_APP_UA // Bypasses VolcEngine mediagate chunking
+        map["Accept"] = "*/*"
+        map["Connection"] = "keep-alive"
+        map["Origin"] = ReelFrenConfig.REEL_SITE
+        map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
+        map["Range"] = "bytes=0-" 
         return map
     }
 
