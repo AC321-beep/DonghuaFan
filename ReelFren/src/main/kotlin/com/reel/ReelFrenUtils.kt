@@ -26,9 +26,6 @@ import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
-// ----------------------------------------------------------------------
-// DATA MODELS
-// ----------------------------------------------------------------------
 data class DetailInfo(
     val id: String, val provider: String, val title: String,
     val cover: String, val intro: String, val episodes: Int,
@@ -50,50 +47,41 @@ data class VideoEntry(val episode: Int, val duration: Int, val vid: String, val 
 object ReelFrenLog {
     private const val TAG = "ReelFren/CF"
     var isVerbose: Boolean = false 
+    
     fun d(scope: String, msg: String) {
         if (!isVerbose) return
         Log.e(TAG, "[$scope][${Thread.currentThread().name}] $msg")
+    }
+
+    // RESTORED: ReelFrenCloudflare.kt relies on this to log exceptions
+    fun t(scope: String, e: Throwable) {
+        if (!isVerbose) return
+        Log.e(TAG, "[$scope][${Thread.currentThread().name}] ${e.javaClass.simpleName}: ${e.message}", e)
     }
 }
 
 object ReelFrenConfig {
     const val REEL_SITE = "https://reelfren.net"
     const val DEFAULT_API_BASE = "https://api.reelfren.net"
-
     val DEFAULT_ENABLED_SLUGS = setOf(
         "dramabox", "reelshort", "wetv", "happyshort", "shorten",
         "dramawave", "shortmax", "netshort", "pinedrama", "vigloo"
     )
-
     val PROVIDERS_MAP: LinkedHashMap<String, String> = linkedMapOf(
-        "Anamana"         to "anamana", "AniBoy"          to "aniboy",
-        "Melolo"          to "melolo", "Sereal+"         to "sereal",
-        "PineDrama"       to "pinedrama", "Shorten"         to "shorten",
-        "HappyShort"      to "happyshort", "Vigloo"          to "vigloo",
-        "Vigloo 2"        to "vigloo2", "RapidTV"         to "rapidtv",
-        "RapidTV 2"       to "rapidtv2", "RaptDrama"       to "raptdrama",
-        "CubeTV"          to "cubetv", "JoyReels"        to "joyreels",
-        "AnyReel"         to "anyreel", "Shortical"       to "shortical",
-        "StoReel"         to "storeel", "LoveShots"       to "loveshots",
-        "MomeShort"       to "momeshort", "MoreShort"       to "moreshort",
-        "ToonShort"       to "toonshort", "SixthShort"      to "sixthshort",
-        "SoReel"          to "soreel", "StoryGo"         to "storygo",
-        "MiniShort"       to "minishort", "WinkNovel"       to "winknovel",
-        "My Muse"         to "mymuse", "SarosTV"         to "sarostv",
-        "ReelAI"          to "reelai", "Reelife"         to "reelife",
-        "ReelShort"       to "reelshort", "ReelShort 2"     to "reelshort2",
-        "DramaBox"        to "dramabox", "DramaWave"       to "dramawave",
-        "DramaNova"       to "dramanova", "KalosTV"         to "kalostv",
-        "VibeShort"       to "vibeshort", "FreeReels"       to "freereels",
-        "WeTV"            to "wetv", "StoryReel"       to "storyreel",
-        "MovieBox Shorts" to "movieboxshorts", "BonusTV"         to "bonustv",
-        "MoboReels"       to "moboreels", "NetShort"        to "netshort",
-        "MyDrama"         to "mydrama", "FlareFlow"       to "flareflow",
-        "PlayLet"         to "playlet", "ShortMax"        to "shortmax",
-        "FlexTV"          to "flextv", "FlexTV 2"        to "flextv2",
-        "CandyJar"        to "candyjar", "BlinkDrama"      to "blinkdrama",
-        "iQIYI"           to "iqiyi", "MovieBox"        to "moviebox",
-        "FilmBox"         to "filmbox"
+        "Anamana" to "anamana", "AniBoy" to "aniboy", "Melolo" to "melolo", "Sereal+" to "sereal",
+        "PineDrama" to "pinedrama", "Shorten" to "shorten", "HappyShort" to "happyshort", "Vigloo" to "vigloo",
+        "Vigloo 2" to "vigloo2", "RapidTV" to "rapidtv", "RapidTV 2" to "rapidtv2", "RaptDrama" to "raptdrama",
+        "CubeTV" to "cubetv", "JoyReels" to "joyreels", "AnyReel" to "anyreel", "Shortical" to "shortical",
+        "StoReel" to "storeel", "LoveShots" to "loveshots", "MomeShort" to "momeshort", "MoreShort" to "moreshort",
+        "ToonShort" to "toonshort", "SixthShort" to "sixthshort", "SoReel" to "soreel", "StoryGo" to "storygo",
+        "MiniShort" to "minishort", "WinkNovel" to "winknovel", "My Muse" to "mymuse", "SarosTV" to "sarostv",
+        "ReelAI" to "reelai", "Reelife" to "reelife", "ReelShort" to "reelshort", "ReelShort 2" to "reelshort2",
+        "DramaBox" to "dramabox", "DramaWave" to "dramawave", "DramaNova" to "dramanova", "KalosTV" to "kalostv",
+        "VibeShort" to "vibeshort", "FreeReels" to "freereels", "WeTV" to "wetv", "StoryReel" to "storyreel",
+        "MovieBox Shorts" to "movieboxshorts", "BonusTV" to "bonustv", "MoboReels" to "moboreels", "NetShort" to "netshort",
+        "MyDrama" to "mydrama", "FlareFlow" to "flareflow", "PlayLet" to "playlet", "ShortMax" to "shortmax",
+        "FlexTV" to "flextv", "FlexTV 2" to "flextv2", "CandyJar" to "candyjar", "BlinkDrama" to "blinkdrama",
+        "iQIYI" to "iqiyi", "MovieBox" to "moviebox", "FilmBox" to "filmbox"
     )
 }
 
@@ -111,11 +99,9 @@ class WebViewCookieJar : CookieJar {
     }
 }
 
-// ----------------------------------------------------------------------
-// NETWORK CLIENT
-// ----------------------------------------------------------------------
 object ReelFrenClient {
     const val FALLBACK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    const val MOBILE_APP_UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
     
     private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
@@ -140,7 +126,6 @@ object ReelFrenClient {
 
     fun detailUrl(slug: String, id: String) = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
     
-    // Explicit server request enumeration
     fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) = "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&server=$server"
     
     fun searchUrl(slug: String, term: String): String {
@@ -167,8 +152,6 @@ object ReelFrenClient {
     fun videoHeaders(url: String): Map<String, String> {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val map = linkedMapOf<String, String>()
-        // CRITICAL: We must use the exact same UA for the video that we used to fetch the API, 
-        // otherwise the CDN signature will mismatch and throw a 403 (causing ExoPlayer Invalid NAL length).
         map["User-Agent"] = ReelFrenStore.userAgent(targetHost)
         map["Accept"] = "*/*"
         map["Connection"] = "keep-alive"
@@ -221,9 +204,6 @@ object ReelFrenClient {
     }
 }
 
-// ----------------------------------------------------------------------
-// PARSERS
-// ----------------------------------------------------------------------
 object ReelFrenParse {
     private val SUB_DIRECT_KEYS = arrayOf("subtitleUrl", "subUrl", "subtitle", "vtt", "srt", "captionUrl", "webvtt")
     private val SUB_URL_KEYS = arrayOf("url", "src", "file", "subUrl", "subtitleUrl", "vtt", "srt", "link", "path", "webvtt")
@@ -273,7 +253,6 @@ object ReelFrenParse {
         val qArr = dataNode.optJSONArray("qualityList") ?: dataNode.optJSONArray("qualities") ?: dataNode.optJSONArray("sources") 
                    ?: dataNode.optJSONArray("videos") ?: dataNode.optJSONArray("list") ?: dataNode.optJSONArray("streams")
         
-        // If the server doesn't exist, the quality array will be null or empty. Safely return null.
         if (qArr == null || qArr.length() == 0) return null
 
         for (i in 0 until qArr.length()) {
@@ -400,9 +379,6 @@ object ReelFrenParse {
     }
 }
 
-// ----------------------------------------------------------------------
-// SUBTITLES
-// ----------------------------------------------------------------------
 object ReelFrenSubtitles {
     private val PLACEHOLDER_VALUES = setOf("", "null", "none", "false", "0", "#", "-", "n/a", "na", "hardcoded", "undefined")
     private val mediaRegex = Regex("""#EXT-X-MEDIA:([^\r\n]*)""", RegexOption.IGNORE_CASE)
@@ -508,51 +484,8 @@ object ReelFrenSubtitles {
         "en" -> "English"; "id" -> "Indonesian"; "es" -> "Spanish"; "pt" -> "Portuguese"; "zh" -> "Chinese"; "ja" -> "Japanese"; "ko" -> "Korean"; "th" -> "Thai"; "vi" -> "Vietnamese"; "fr" -> "French"; "de" -> "German"; "ar" -> "Arabic"; "hi" -> "Hindi"; "fil" -> "Filipino"; "ms" -> "Malay"; "ru" -> "Russian"; "tr" -> "Turkish"; "it" -> "Italian"; "pl" -> "Polish"; "nl" -> "Dutch"; "und" -> "Unknown"
         else -> lang.uppercase(Locale.ROOT)
     }
-
-    private fun groupValue(m: MatchResult): String {
-        for (i in 1 until m.groupValues.size) { val v = m.groupValues[i]; if (v.isNotEmpty()) return v }
-        return ""
-    }
-
-    private suspend fun extractHlsSubs(m3u8Url: String): List<SubtitleFile> {
-        val manifest = try { app.get(m3u8Url, headers = ReelFrenClient.headers(m3u8Url)).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { return emptyList() }
-        val result = mutableListOf<SubtitleFile>()
-        for (m in mediaRegex.findAll(manifest)) {
-            val line = m.groupValues.getOrNull(1).orEmpty()
-            if (!typeRegex.containsMatchIn(line)) continue
-            val uri = uriRegex.find(line)?.let { groupValue(it) } ?: continue
-            val abs = resolveRelativeUrl(m3u8Url, uri)
-            if (abs.isBlank()) continue
-            val rawLang = langRegex.find(line)?.let { groupValue(it) }.orEmpty()
-            val rawName = nameRegex.find(line)?.let { groupValue(it) }.orEmpty()
-            val displayLabel = resolveDisplayLabel(rawLang, rawName)
-            val finalSubUrl = if (abs.substringBefore('?').endsWith(".m3u8", ignoreCase = true)) { resolveSubtitleM3u8ToDirectFile(abs) ?: continue } else { abs }
-            result += newSubtitleFile(lang = displayLabel, url = finalSubUrl) { this.headers = ReelFrenClient.headers(finalSubUrl) }
-        }
-        return result
-    }
-
-    private suspend fun resolveSubtitleM3u8ToDirectFile(subM3u8Url: String): String? {
-        val subManifest = try { app.get(subM3u8Url, headers = ReelFrenClient.headers(subM3u8Url)).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { return null }
-        val segments = subManifest.lineSequence().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }.toList()
-        if (segments.isEmpty()) return null
-        if (segments.size == 1) return resolveRelativeUrl(subM3u8Url, segments[0]).ifBlank { null }
-        val sb = StringBuilder()
-        for (seg in segments) {
-            val segUrl = resolveRelativeUrl(subM3u8Url, seg)
-            try { sb.append(app.get(segUrl, headers = ReelFrenClient.headers(segUrl)).text).append("\n") } catch (_: Exception) {}
-        }
-        if (sb.isNotEmpty()) {
-            val base64 = android.util.Base64.encodeToString(sb.toString().toByteArray(), android.util.Base64.NO_WRAP)
-            return "data:text/plain;base64,$base64"
-        }
-        return null
-    }
 }
 
-// ----------------------------------------------------------------------
-// DATA STORE
-// ----------------------------------------------------------------------
 object ReelFrenStore {
     @Volatile var appContext: Context? = null
         private set
