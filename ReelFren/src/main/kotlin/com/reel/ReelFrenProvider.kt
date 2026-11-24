@@ -14,14 +14,11 @@ import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 
 class ReelFrenProvider : MainAPI() {
@@ -40,8 +37,6 @@ class ReelFrenProvider : MainAPI() {
         private var cachedSearchResults: List<SearchResponse> = emptyList()
         private var cachedSearchTime: Long = 0L
         private const val CACHE_EXPIRY_MS = 10 * 60 * 1000L // 10 minutes
-        
-        private val bgSearchScope = CoroutineScope(Dispatchers.IO)
     }
 
     override val mainPage get() = mainPageOf(
@@ -85,7 +80,7 @@ class ReelFrenProvider : MainAPI() {
             return cachedSearchResults
         }
 
-        val activeProviders = ReelFrenStore.enabledProviders().values.toList()
+        val activeProviders = ReelFrenStore.enabledProviders().keys.toList()
         if (activeProviders.isEmpty()) {
             ReelFrenLog.d("Main/search", "No providers enabled. Aborting search.")
             return emptyList()
@@ -95,45 +90,20 @@ class ReelFrenProvider : MainAPI() {
         cachedSearchResults = emptyList()
         cachedSearchTime = now
 
-        // CRITICAL FIX: To prevent CF blocking and API rejections, only search 2 explicitly defined providers 
-        // on the fast path, and ensure we NEVER search the blocked "all_dramas" endpoint
-        val validProviders = activeProviders.filter { it != "all_dramas" }
-        val primaryProviders = validProviders.take(2)
-        val secondaryProviders = validProviders.drop(2)
-
-        val primarySearches = primaryProviders.map { slug ->
-            bgSearchScope.async {
-                val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
-                items.mapNotNull { item ->
-                    if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
-                    val actualSlug = item.provider.ifEmpty { slug }
-                    newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
-                        this.posterUrl = ReelFrenClient.absUrl(item.cover)
-                        this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
-                    }
-                }
-            }
-        }
-
-        val fastResults = mutableListOf<SearchResponse>()
+        // CRITICAL FIX: Safe, highly concurrent execution using Cloudstream's app.async
+        val allResults = mutableListOf<SearchResponse>()
         
-        try {
-            withTimeout(3500L) { // Reduced timeout to prevent UI hang if CF blocks
-                fastResults.addAll(primarySearches.awaitAll().flatten())
-            }
-        } catch (e: TimeoutCancellationException) {
-            val completed = primarySearches.filter { it.isCompleted && !it.isCancelled }.flatMap { it.getCompleted() }
-            fastResults.addAll(completed)
-            ReelFrenLog.d("Main/search", "Timeout hit on primary search. Returning ${completed.size} fast results.")
-        }
-
-        val distinctFast = fastResults.distinctBy { it.url }
-        cachedSearchResults = distinctFast
-
-        bgSearchScope.launch {
-            val secondarySearches = secondaryProviders.map { slug ->
+        coroutineScope {
+            val deferredSearches = activeProviders.map { slug ->
                 async {
-                    val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
+                    val items = try { 
+                        ReelFrenClient.search(slug, cleanQuery) 
+                    } catch (e: CancellationException) { 
+                        emptyList() 
+                    } catch (e: Exception) { 
+                        emptyList() 
+                    }
+                    
                     items.mapNotNull { item ->
                         if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
                         val actualSlug = item.provider.ifEmpty { slug }
@@ -145,18 +115,16 @@ class ReelFrenProvider : MainAPI() {
                 }
             }
             
-            val allSecondary = secondarySearches.awaitAll().flatten()
-            val allResults = (distinctFast + allSecondary).distinctBy { it.url }
-            
-            if (cachedSearchQuery == cleanQuery) {
-                cachedSearchResults = allResults
-                if (allResults.size > distinctFast.size) {
-                    ReelFrenLog.d("Main/search", "Background cache expanded to ${allResults.size} items")
-                }
-            }
+            // Wait for all searches to complete. Because ReelFrenClient.get uses Mutex for CF, 
+            // these will safely queue behind the CF solver if challenged, without cancelling each other.
+            allResults.addAll(deferredSearches.awaitAll().flatten())
         }
 
-        return distinctFast
+        val distinctResults = allResults.distinctBy { it.url }
+        cachedSearchResults = distinctResults
+        ReelFrenLog.d("Main/search", "Search complete. Found ${distinctResults.size} total results.")
+        
+        return distinctResults
     }
 
     override suspend fun load(url: String): LoadResponse? {
