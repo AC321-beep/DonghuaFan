@@ -286,7 +286,17 @@ object ReelFrenParse {
         o.optJSONArray("videos")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val v = arr.optJSONObject(i) ?: continue
-                videos += VideoEntry(episode = v.optInt("episode", i + 1), duration = v.optInt("duration"), vid = clean(v, "vid"), available = v.optBoolean("available", true))
+                
+                // CRITICAL FIX: Explicitly validate the video ID (vid) to prevent crashing Cloudstream's episode loader
+                val vid = clean(v, "vid")
+                if (vid.isEmpty()) continue
+                
+                videos += VideoEntry(
+                    episode = v.optInt("episode", i + 1), 
+                    duration = v.optInt("duration"), 
+                    vid = vid, 
+                    available = v.optBoolean("available", true)
+                )
             }
         }
         
