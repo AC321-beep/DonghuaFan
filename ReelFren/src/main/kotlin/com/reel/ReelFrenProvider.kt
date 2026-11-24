@@ -95,8 +95,6 @@ class ReelFrenProvider : MainAPI() {
         cachedSearchResults = emptyList()
         cachedSearchTime = now
 
-        // CRITICAL FIX: To prevent Cloudflare/API rate limiting on search, we only query the top 3 enabled providers 
-        // initially, and let the rest resolve in the background without holding up the UI.
         val primaryProviders = activeProviders.take(3)
         val secondaryProviders = activeProviders.drop(3)
 
@@ -129,7 +127,6 @@ class ReelFrenProvider : MainAPI() {
         val distinctFast = fastResults.distinctBy { it.url }
         cachedSearchResults = distinctFast
 
-        // Fire off the rest of the providers in the background to populate the cache for later
         bgSearchScope.launch {
             val secondarySearches = secondaryProviders.map { slug ->
                 async {
@@ -178,7 +175,7 @@ class ReelFrenProvider : MainAPI() {
                         this.name = "Episode ${v.episode}"
                         this.episode = v.episode
                         this.posterUrl = coverUrl
-                        this.posterHeaders = coverHeaders
+                        // Removed posterHeaders here - Cloudstream does not support this on individual episodes
                     }
                 }
             ) {
