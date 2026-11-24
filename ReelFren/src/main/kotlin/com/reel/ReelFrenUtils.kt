@@ -1,26 +1,45 @@
 package com.reel
 
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.app.Dialog
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.SharedPreferences
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
+import android.view.InputDevice
+import android.view.MotionEvent
+import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
+import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import okhttp3.CipherSuite
-import okhttp3.ConnectionSpec
-import okhttp3.Cookie
-import okhttp3.CookieJar
-import okhttp3.HttpUrl
-import okhttp3.Protocol
-import okhttp3.TlsVersion
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
@@ -28,6 +47,8 @@ import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
 
 // ----------------------------------------------------------------------
 // DATA MODELS
@@ -113,44 +134,15 @@ object ReelFrenConfig {
 }
 
 // ----------------------------------------------------------------------
-// NETWORK CLIENT
+// NETWORK CLIENT (Simplified - Removed SpoofedApp)
 // ----------------------------------------------------------------------
-class WebViewCookieJar : CookieJar {
-    private val cookieManager = CookieManager.getInstance()
-    override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
-        val urlString = url.toString()
-        for (cookie in cookies) cookieManager.setCookie(urlString, cookie.toString())
-        cookieManager.flush()
-    }
-    override fun loadForRequest(url: HttpUrl): List<Cookie> {
-        val cookieStr = cookieManager.getCookie(url.toString())
-        if (cookieStr.isNullOrEmpty()) return emptyList()
-        return cookieStr.split(";").mapNotNull { Cookie.parse(url, it.trim()) }
-    }
-}
-
 object ReelFrenClient {
-    const val GLOBAL_MOBILE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    const val FALLBACK_UA = GLOBAL_MOBILE_UA
+    const val GLOBAL_MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
     
     private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
     
     @Volatile private var currentApiVersion = "v21"
-    
-    private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
-        .tlsVersions(TlsVersion.TLS_1_2, TlsVersion.TLS_1_3)
-        .cipherSuites(
-            CipherSuite.TLS_AES_128_GCM_SHA256, CipherSuite.TLS_AES_256_GCM_SHA384, CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
-            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, CipherSuite.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-            CipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, CipherSuite.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-        ).build()
-        
-    private val spoofedClient = app.baseClient.newBuilder().cookieJar(WebViewCookieJar())
-        .connectionSpecs(listOf(chromeSpec, ConnectionSpec.CLEARTEXT))
-        .protocols(listOf(Protocol.HTTP_1_1)).build()
-    private val spoofedApp = com.lagradost.nicehttp.Requests(spoofedClient)
 
     private fun apiBase() = ReelFrenStore.apiBase()
     private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
@@ -168,9 +160,9 @@ object ReelFrenClient {
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
-    fun detailApiUrl(slug: String, id: String, includeVersion: Boolean = true): String {
-        val base = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
-        return if (includeVersion && currentApiVersion.isNotBlank()) "$base&cv=$currentApiVersion" else base
+    // CRITICAL: detailApiUrl MUST NOT contain cv=v21
+    fun detailApiUrl(slug: String, id: String): String {
+        return "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
     }
 
     fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
@@ -200,16 +192,7 @@ object ReelFrenClient {
         if (isApiCall) {
             map["Accept"] = "application/json, text/plain, */*" 
         } else {
-            // These WAF bypass headers are required to prevent Cloudflare from resetting the TLS connection
             map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-            map["sec-ch-ua"] = "\"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\", \"Not-A.Brand\";v=\"99\""
-            map["sec-ch-ua-mobile"] = "?0"
-            map["sec-ch-ua-platform"] = "\"Windows\""
-            map["sec-fetch-dest"] = "document"
-            map["sec-fetch-mode"] = "navigate"
-            map["sec-fetch-site"] = "same-origin"
-            map["sec-fetch-user"] = "?1"
-            map["upgrade-insecure-requests"] = "1"
         }
         
         if (targetHost == apiHost || targetHost.contains("reelfren.net")) {
@@ -244,9 +227,6 @@ object ReelFrenClient {
         return lower.contains("version") && (lower.contains("update") || lower.contains("invalid") || lower.contains("deprecated"))
     }
 
-    // CRITICAL FIX: Decoupled Client
-    // API Uses spoofedApp. HTML uses app.get()
-    // Both wait 500ms after CF Mutex to ensure CookieManager sync.
     suspend fun get(url: String, isApiCall: Boolean = true): String? {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val isReelFrenHost = targetHost == apiHost || targetHost.contains("reelfren.net")
@@ -257,76 +237,42 @@ object ReelFrenClient {
             return try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { null }
         }
 
-        // --- HTML FALLBACK ROUTE ---
-        if (!isApiCall) {
-            ReelFrenLog.d("Client.get", "Attempting native app.get() fetch for HTML: $url")
-            var htmlResponse = try { 
-                app.get(url, headers = headers(url, false), timeout = 25L).text 
-            } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
-                ReelFrenLog.t("Client.get", e)
-                "" 
-            }
-
-            if (htmlResponse.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(htmlResponse)) return htmlResponse
-
-            ReelFrenLog.d("Client.get", "HTML fetch challenged. Triggering CF Mutex...")
-            apiMutex.withLock {
-                htmlResponse = try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { "" }
-                if (htmlResponse.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(htmlResponse)) return htmlResponse
-
-                if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) return null
-                
-                // Allow CookieManager.flush() to write to disk before native OkHttp reads it
-                delay(500L)
-                
-                val finalHtml = try { 
-                    app.get(url, headers = headers(url, false), timeout = 25L).text 
-                } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
-                    ReelFrenLog.t("Client.get", e)
-                    "" 
-                }
-                
-                if (finalHtml.isEmpty() || ReelFrenCloudflare.isChallengeResponse(finalHtml)) return null
-                return finalHtml
-            }
-        }
-
-        // --- API ROUTE ---
-        ReelFrenLog.d("Client.get", "Attempting spoofed TLS fetch for API: $url")
-        var apiResponse = try { 
-            spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text 
+        ReelFrenLog.d("Client.get", "Attempting native app.get() fetch for: $url")
+        var responseText = try { 
+            app.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
         } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
             ReelFrenLog.t("Client.get", e)
             "" 
         }
         
-        if (isVersionError(apiResponse) && url.contains("cv=")) {
-            ReelFrenLog.d("Client.get", "Version error detected on $currentApiVersion. Retrying without cv...")
+        if (isApiCall && isVersionError(responseText) && url.contains("cv=")) {
+            ReelFrenLog.d("Client.get", "Version error detected. Retrying without cv...")
             val newUrl = url.replace(Regex("[?&]cv=[^&]+"), "").replace("?provider=&", "?provider=")
-            apiResponse = try { spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { "" }
+            responseText = try { app.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
         }
         
-        if (apiResponse.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(apiResponse)) return apiResponse
+        if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
-        ReelFrenLog.d("Client.get", "API fetch challenged. Triggering CF Mutex...")
+        ReelFrenLog.d("Client.get", "Fetch challenged. Triggering CF Mutex...")
         apiMutex.withLock {
-            apiResponse = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { "" }
+            // Double check inside the lock to see if another thread already solved it
+            responseText = try { app.get(url, headers = headers(url, isApiCall), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
             
-            if (apiResponse.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(apiResponse)) return apiResponse
+            if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
             if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) return null
             
-            // Allow CookieManager.flush() to write to disk before WebViewCookieJar reads it
-            delay(500L)
+            // Allow CookieManager.flush() to write to disk before native OkHttp reads it
+            delay(800L)
             
-            val finalApi = try { 
-                spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text 
+            val finalResponse = try { 
+                app.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
             } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
                 ReelFrenLog.t("Client.get", e)
                 "" 
             }
-            if (finalApi.isEmpty() || ReelFrenCloudflare.isChallengeResponse(finalApi)) return null
-            return finalApi
+            if (finalResponse.isEmpty() || ReelFrenCloudflare.isChallengeResponse(finalResponse)) return null
+            return finalResponse
         }
     }
 
@@ -334,24 +280,16 @@ object ReelFrenClient {
         get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
     suspend fun detail(slug: String, id: String): DetailInfo? {
-        ReelFrenLog.d("Client.detail", "Attempting API detail fetch...")
-        val primaryApiJson = get(detailApiUrl(slug, id, includeVersion = true), isApiCall = true)
-        val primaryParsed = primaryApiJson?.let { ReelFrenParse.detailApi(it, slug, id) }
+        ReelFrenLog.d("Client.detail", "Attempting API detail fetch (no cv param)...")
+        val apiJson = get(detailApiUrl(slug, id), isApiCall = true)
+        val apiParsed = apiJson?.let { ReelFrenParse.detailApi(it, slug, id) }
         
-        if (primaryParsed != null && primaryParsed.title.isNotEmpty()) {
-            ReelFrenLog.d("Client.detail", "API detail parsed (episodes=${primaryParsed.videos.size}).")
-            return primaryParsed
+        if (apiParsed != null && apiParsed.title.isNotEmpty()) {
+            ReelFrenLog.d("Client.detail", "API detail parsed (episodes=${apiParsed.videos.size}).")
+            return apiParsed
         }
         
-        val noCvApiJson = get(detailApiUrl(slug, id, includeVersion = false), isApiCall = true)
-        val noCvParsed = noCvApiJson?.let { ReelFrenParse.detailApi(it, slug, id) }
-        
-        if (noCvParsed != null && noCvParsed.title.isNotEmpty()) {
-            ReelFrenLog.d("Client.detail", "API detail (no-cv) parsed (episodes=${noCvParsed.videos.size}).")
-            return noCvParsed
-        }
-        
-        ReelFrenLog.d("Client.detail", "API detail incomplete/empty. Falling back to HTML detail parser.")
+        ReelFrenLog.d("Client.detail", "API detail failed/empty. Falling back to HTML detail parser.")
         val htmlStr = get(detailHtmlUrl(slug, id), isApiCall = false) ?: return null
         return ReelFrenParse.detailHtml(htmlStr, slug, id)
     }
