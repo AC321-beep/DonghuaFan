@@ -188,6 +188,8 @@ object ReelFrenClient {
         return "${apiBase()}/api/search?${p.joinToString("&")}"
     }
 
+    // CRITICAL FIX: Simplified headers. Cloudflare WAF flags overly specific pseudo-headers.
+    // Relying strictly on the clearance cookie and standard User-Agent.
     fun headers(url: String, isApiCall: Boolean = false): Map<String, String> {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val map = linkedMapOf<String, String>()
@@ -200,14 +202,6 @@ object ReelFrenClient {
             map["Accept"] = "application/json, text/plain, */*" 
         } else {
             map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-            map["sec-ch-ua"] = "\"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\", \"Not-A.Brand\";v=\"99\""
-            map["sec-ch-ua-mobile"] = "?0"
-            map["sec-ch-ua-platform"] = "\"Windows\""
-            map["sec-fetch-dest"] = "document"
-            map["sec-fetch-mode"] = "navigate"
-            map["sec-fetch-site"] = "same-origin"
-            map["sec-fetch-user"] = "?1"
-            map["upgrade-insecure-requests"] = "1"
         }
         
         if (targetHost == apiHost || targetHost.contains("reelfren.net")) {
@@ -491,6 +485,92 @@ object ReelFrenParse {
             ?: buildDetailFromJson(root, fallbackSlug, fallbackId)
     }
 
+    private fun extractAllJsonObjectsForKey(source: String, key: String): List<String> {
+        val results = mutableListOf<String>()
+        val token = "\"$key\":{"
+        var searchFrom = 0
+
+        while (searchFrom < source.length) {
+            val startIndex = source.indexOf(token, searchFrom)
+            if (startIndex == -1) break
+
+            val objectStart = startIndex + token.length - 1
+            var braceCount = 0
+            var isString = false
+            var isEscaped = false
+            var endIndex = -1
+
+            for (i in objectStart until source.length) {
+                val ch = source[i]
+                if (isEscaped) {
+                    isEscaped = false
+                    continue
+                }
+                if (ch == '\\') {
+                    isEscaped = true
+                    continue
+                }
+                if (ch == '"') {
+                    isString = !isString
+                    continue
+                }
+                if (!isString) {
+                    if (ch == '{') {
+                        braceCount++
+                    } else if (ch == '}') {
+                        braceCount--
+                        if (braceCount == 0) {
+                            endIndex = i + 1
+                            break
+                        }
+                    }
+                }
+            }
+
+            if (endIndex > objectStart) {
+                results += source.substring(objectStart, endIndex)
+                searchFrom = endIndex
+            } else {
+                searchFrom = startIndex + token.length
+            }
+        }
+        return results
+    }
+
+    private fun unescapeNextPayload(raw: String): String {
+        val sb = StringBuilder(raw.length)
+        var i = 0
+        while (i < raw.length) {
+            val ch = raw[i]
+            if (ch == '\\' && i + 1 < raw.length) {
+                when (val next = raw[i + 1]) {
+                    '"' -> { sb.append('"'); i += 2 }
+                    '\\' -> { sb.append('\\'); i += 2 }
+                    'n' -> { sb.append('\n'); i += 2 }
+                    'r' -> { sb.append('\r'); i += 2 }
+                    't' -> { sb.append('\t'); i += 2 }
+                    'u' -> {
+                        if (i + 5 < raw.length) {
+                            val hex = raw.substring(i + 2, i + 6).toIntOrNull(16)
+                            if (hex != null) {
+                                sb.append(hex.toChar())
+                                i += 6
+                                continue
+                            }
+                        }
+                        sb.append(ch)
+                        i++
+                    }
+                    else -> { sb.append(ch).append(next); i += 2 }
+                }
+            } else {
+                sb.append(ch)
+                i++
+            }
+        }
+        return sb.toString()
+    }
+
     fun detailHtml(htmlBody: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
         if (htmlBody.isBlank()) return null
 
@@ -534,6 +614,22 @@ object ReelFrenParse {
                         videos = videos
                     )
                 }
+            }
+        }
+
+        val candidates = mutableListOf<String>()
+        candidates += extractAllJsonObjectsForKey(htmlBody, "detail")
+        val unescaped = unescapeNextPayload(htmlBody)
+        if (unescaped != htmlBody) {
+            candidates += extractAllJsonObjectsForKey(unescaped, "detail")
+        }
+
+        for (rawJson in candidates) {
+            val obj = runCatching { JSONObject(rawJson) }.getOrNull() ?: continue
+            val parsed = buildDetailFromJson(obj, fallbackSlug, fallbackId)
+            if (parsed != null && parsed.title.isNotEmpty()) {
+                ReelFrenLog.d("Parse.detailHtml", "Successfully parsed detail from embedded JSON snippet.")
+                return parsed
             }
         }
 
