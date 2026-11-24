@@ -11,7 +11,6 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import okhttp3.CipherSuite
 import okhttp3.ConnectionSpec
 import okhttp3.Cookie
 import okhttp3.CookieJar
@@ -131,19 +130,14 @@ object ReelFrenClient {
     private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
     
-    // RESTORED: Cloudflare JA3 TLS Fingerprint Spoofing
+    // FIX: Removed strict CipherSuites that break Android 10. Allows OS to negotiate naturally.
     private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
         .tlsVersions(TlsVersion.TLS_1_2, TlsVersion.TLS_1_3)
-        .cipherSuites(
-            CipherSuite.TLS_AES_128_GCM_SHA256, CipherSuite.TLS_AES_256_GCM_SHA384, CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
-            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, CipherSuite.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-            CipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, CipherSuite.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-        ).build()
+        .build()
         
     private val spoofedClient = app.baseClient.newBuilder().cookieJar(WebViewCookieJar())
         .connectionSpecs(listOf(chromeSpec, ConnectionSpec.CLEARTEXT))
-        .protocols(listOf(Protocol.HTTP_1_1)).build()
+        .protocols(listOf(Protocol.HTTP_1_1, Protocol.HTTP_2)).build()
     private val spoofedApp = com.lagradost.nicehttp.Requests(spoofedClient)
 
     private fun apiBase() = ReelFrenStore.apiBase()
@@ -203,15 +197,26 @@ object ReelFrenClient {
         
         if (!isReelFrenApi) return try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (e: Exception) { null }
 
-        var jsonText = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (e: Exception) { "" }
+        ReelFrenLog.d("Client.get", "Fetching API: $url")
+        var jsonText = try { 
+            spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text 
+        } catch (e: Exception) { 
+            ReelFrenLog.t("Client.get", e) // Added logging so we never silently fail again
+            "" 
+        }
+        
         if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) return jsonText
 
+        ReelFrenLog.d("Client.get", "Falling back to CF Mutex...")
         apiMutex.withLock {
             jsonText = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (e: Exception) { "" }
             if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) return jsonText
 
             if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) return null
-            val finalJson = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (e: Exception) { "" }
+            val finalJson = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (e: Exception) { 
+                ReelFrenLog.t("Client.get", e)
+                "" 
+            }
             if (finalJson.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(finalJson)) return null
             return finalJson
         }
