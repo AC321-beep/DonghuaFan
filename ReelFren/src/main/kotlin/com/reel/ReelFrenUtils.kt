@@ -546,6 +546,46 @@ object ReelFrenSubtitles {
         "en" -> "English"; "id" -> "Indonesian"; "es" -> "Spanish"; "pt" -> "Portuguese"; "zh" -> "Chinese"; "ja" -> "Japanese"; "ko" -> "Korean"; "th" -> "Thai"; "vi" -> "Vietnamese"; "fr" -> "French"; "de" -> "German"; "ar" -> "Arabic"; "hi" -> "Hindi"; "fil" -> "Filipino"; "ms" -> "Malay"; "ru" -> "Russian"; "tr" -> "Turkish"; "it" -> "Italian"; "pl" -> "Polish"; "nl" -> "Dutch"; "und" -> "Unknown"
         else -> lang.uppercase(Locale.ROOT)
     }
+
+    private fun groupValue(m: MatchResult): String {
+        for (i in 1 until m.groupValues.size) { val v = m.groupValues[i]; if (v.isNotEmpty()) return v }
+        return ""
+    }
+
+    private suspend fun extractHlsSubs(m3u8Url: String): List<SubtitleFile> {
+        val manifest = try { app.get(m3u8Url, headers = ReelFrenClient.headers(m3u8Url)).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { return emptyList() }
+        val result = mutableListOf<SubtitleFile>()
+        for (m in mediaRegex.findAll(manifest)) {
+            val line = m.groupValues.getOrNull(1).orEmpty()
+            if (!typeRegex.containsMatchIn(line)) continue
+            val uri = uriRegex.find(line)?.let { groupValue(it) } ?: continue
+            val abs = resolveRelativeUrl(m3u8Url, uri)
+            if (abs.isBlank()) continue
+            val rawLang = langRegex.find(line)?.let { groupValue(it) }.orEmpty()
+            val rawName = nameRegex.find(line)?.let { groupValue(it) }.orEmpty()
+            val displayLabel = resolveDisplayLabel(rawLang, rawName)
+            val finalSubUrl = if (abs.substringBefore('?').endsWith(".m3u8", ignoreCase = true)) { resolveSubtitleM3u8ToDirectFile(abs) ?: continue } else { abs }
+            result += newSubtitleFile(lang = displayLabel, url = finalSubUrl) { this.headers = ReelFrenClient.headers(finalSubUrl) }
+        }
+        return result
+    }
+
+    private suspend fun resolveSubtitleM3u8ToDirectFile(subM3u8Url: String): String? {
+        val subManifest = try { app.get(subM3u8Url, headers = ReelFrenClient.headers(subM3u8Url)).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { return null }
+        val segments = subManifest.lineSequence().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }.toList()
+        if (segments.isEmpty()) return null
+        if (segments.size == 1) return resolveRelativeUrl(subM3u8Url, segments[0]).ifBlank { null }
+        val sb = StringBuilder()
+        for (seg in segments) {
+            val segUrl = resolveRelativeUrl(subM3u8Url, seg)
+            try { sb.append(app.get(segUrl, headers = ReelFrenClient.headers(segUrl)).text).append("\n") } catch (_: Exception) {}
+        }
+        if (sb.isNotEmpty()) {
+            val base64 = android.util.Base64.encodeToString(sb.toString().toByteArray(), android.util.Base64.NO_WRAP)
+            return "data:text/plain;base64,$base64"
+        }
+        return null
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -695,4 +735,3 @@ object ReelFrenUrl {
         return if (slug.isNotEmpty() && id.isNotEmpty()) Triple(slug, id, ep) else Triple("", "", 1)
     }
 }
-
