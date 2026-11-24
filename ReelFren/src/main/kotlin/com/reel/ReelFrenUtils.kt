@@ -159,7 +159,7 @@ object ReelFrenClient {
         val isGlobal = slug == "all_dramas"
         if (!isGlobal && slug.isNotEmpty()) p += "provider=${query(slug)}"
         p += "lang=en"
-        p += "cv=$currentApiVersion" // Home requires cv
+        p += "cv=$currentApiVersion"
         if (category.isNotEmpty()) p += "category=${query(category)}"
         p += "page=$page"
         val offset = (page - 1) * 20
@@ -167,9 +167,9 @@ object ReelFrenClient {
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
-    // CRITICAL FIX: The API rejects the detail endpoint if `cv` is provided. We must omit it.
-    fun detailApiUrl(slug: String, id: String): String {
-        return "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
+    fun detailApiUrl(slug: String, id: String, includeVersion: Boolean = true): String {
+        val base = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
+        return if (includeVersion && currentApiVersion.isNotBlank()) "$base&cv=$currentApiVersion" else base
     }
 
     fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
@@ -181,7 +181,7 @@ object ReelFrenClient {
         val p = mutableListOf<String>()
         p += "q=${query(term)}"
         p += "lang=en"
-        p += "cv=$currentApiVersion" // Search requires cv
+        p += "cv=$currentApiVersion"
         if (slug.isNotEmpty() && slug != "all_dramas") {
             p += "provider=${query(slug)}"
         }
@@ -239,55 +239,92 @@ object ReelFrenClient {
             return try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { null }
         }
 
-        ReelFrenLog.d("Client.get", "Attempting spoofed TLS fetch for: $url")
-        var responseText = try { 
-            spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
-        } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
-            ReelFrenLog.d("Client.get", "OkHttp EXCEPTION on fast-path: ${e.message}"); "" 
-        }
-        
-        if (isApiCall && isVersionError(responseText) && url.contains("cv=")) {
-            ReelFrenLog.d("Client.get", "Version error detected on $currentApiVersion. Retrying without cv...")
-            val newUrl = url.replace(Regex("[?&]cv=[^&]+"), "").replace("?provider=&", "?provider=")
-            responseText = try { spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
-        }
-        
-        if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
-
-        ReelFrenLog.d("Client.get", "Falling back to CF Mutex...")
-        apiMutex.withLock {
-            responseText = try { spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
-            
-            if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
-
-            if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) return null
-            val finalResponse = try { 
-                spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
+        if (!isApiCall) {
+            ReelFrenLog.d("Client.get", "Attempting native app.get() fetch for HTML: $url")
+            var htmlResponse = try { 
+                app.get(url, headers = headers(url, false), timeout = 25L).text 
             } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
                 ReelFrenLog.t("Client.get", e)
                 "" 
             }
-            if (finalResponse.isEmpty() || ReelFrenCloudflare.isChallengeResponse(finalResponse)) return null
-            return finalResponse
+
+            if (htmlResponse.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(htmlResponse)) return htmlResponse
+
+            ReelFrenLog.d("Client.get", "HTML fetch challenged. Triggering CF Mutex...")
+            apiMutex.withLock {
+                htmlResponse = try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { "" }
+                if (htmlResponse.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(htmlResponse)) return htmlResponse
+
+                if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) return null
+                
+                val finalHtml = try { 
+                    app.get(url, headers = headers(url, false), timeout = 25L).text 
+                } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
+                    ReelFrenLog.t("Client.get", e)
+                    "" 
+                }
+                
+                if (finalHtml.isEmpty() || ReelFrenCloudflare.isChallengeResponse(finalHtml)) return null
+                return finalHtml
+            }
+        }
+
+        ReelFrenLog.d("Client.get", "Attempting spoofed TLS fetch for API: $url")
+        var apiResponse = try { 
+            spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text 
+        } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
+            ReelFrenLog.t("Client.get", e)
+            "" 
+        }
+        
+        if (isVersionError(apiResponse) && url.contains("cv=")) {
+            ReelFrenLog.d("Client.get", "Version error detected on $currentApiVersion. Retrying without cv...")
+            val newUrl = url.replace(Regex("[?&]cv=[^&]+"), "").replace("?provider=&", "?provider=")
+            apiResponse = try { spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { "" }
+        }
+        
+        if (apiResponse.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(apiResponse)) return apiResponse
+
+        ReelFrenLog.d("Client.get", "API fetch challenged. Triggering CF Mutex...")
+        apiMutex.withLock {
+            apiResponse = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { "" }
+            
+            if (apiResponse.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(apiResponse)) return apiResponse
+
+            if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) return null
+            val finalApi = try { 
+                spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text 
+            } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
+                ReelFrenLog.t("Client.get", e)
+                "" 
+            }
+            if (finalApi.isEmpty() || ReelFrenCloudflare.isChallengeResponse(finalApi)) return null
+            return finalApi
         }
     }
 
     suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = 
         get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
-    // CRITICAL FIX: We now hit the API strictly WITHOUT the `cv` parameter.
-    // If the API returns nothing, we jump directly to the robust HTML scraper.
     suspend fun detail(slug: String, id: String): DetailInfo? {
         ReelFrenLog.d("Client.detail", "Attempting API detail fetch...")
-        val apiJson = get(detailApiUrl(slug, id), isApiCall = true)
-        val apiParsed = apiJson?.let { ReelFrenParse.detailApi(it, slug, id) }
+        val primaryApiJson = get(detailApiUrl(slug, id, includeVersion = true), isApiCall = true)
+        val primaryParsed = primaryApiJson?.let { ReelFrenParse.detailApi(it, slug, id) }
         
-        if (apiParsed != null && apiParsed.title.isNotEmpty()) {
-            ReelFrenLog.d("Client.detail", "API detail parsed successfully (episodes=${apiParsed.videos.size}).")
-            return apiParsed
+        if (primaryParsed != null && primaryParsed.title.isNotEmpty()) {
+            ReelFrenLog.d("Client.detail", "API detail parsed (episodes=${primaryParsed.videos.size}).")
+            return primaryParsed
         }
         
-        ReelFrenLog.d("Client.detail", "API detail failed/empty. Falling back to HTML detail parser.")
+        val noCvApiJson = get(detailApiUrl(slug, id, includeVersion = false), isApiCall = true)
+        val noCvParsed = noCvApiJson?.let { ReelFrenParse.detailApi(it, slug, id) }
+        
+        if (noCvParsed != null && noCvParsed.title.isNotEmpty()) {
+            ReelFrenLog.d("Client.detail", "API detail (no-cv) parsed (episodes=${noCvParsed.videos.size}).")
+            return noCvParsed
+        }
+        
+        ReelFrenLog.d("Client.detail", "API detail incomplete/empty. Falling back to HTML detail parser.")
         val htmlStr = get(detailHtmlUrl(slug, id), isApiCall = false) ?: return null
         return ReelFrenParse.detailHtml(htmlStr, slug, id)
     }
