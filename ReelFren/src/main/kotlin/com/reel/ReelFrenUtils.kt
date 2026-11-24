@@ -130,6 +130,9 @@ object ReelFrenClient {
     private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
     
+    // DYNAMIC VERSION TRACKER: Starts at v21, but can be updated dynamically if the API rejects it.
+    @Volatile private var currentApiVersion = "v21"
+    
     private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
         .tlsVersions(TlsVersion.TLS_1_2, TlsVersion.TLS_1_3)
         .build()
@@ -143,7 +146,7 @@ object ReelFrenClient {
     private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
     
     fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
-        val p = mutableListOf("lang=en", "page=$page")
+        val p = mutableListOf("lang=en", "cv=$currentApiVersion", "page=$page")
         if (slug != "all_dramas" && slug.isNotEmpty()) p += "provider=${query(slug)}"
         if (category.isNotEmpty()) p += "category=${query(category)}"
         val offset = (page - 1) * 20
@@ -151,11 +154,11 @@ object ReelFrenClient {
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
-    fun detailUrl(slug: String, id: String) = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
-    fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) = "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&server=$server"
+    fun detailUrl(slug: String, id: String) = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en&cv=$currentApiVersion"
+    fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) = "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&lang=en&server=$server&cv=$currentApiVersion"
     
     fun searchUrl(slug: String, term: String): String {
-        val p = mutableListOf("q=${query(term)}", "lang=en")
+        val p = mutableListOf("q=${query(term)}", "lang=en", "cv=$currentApiVersion")
         if (slug != "all_dramas" && slug.isNotEmpty()) p += "provider=${query(slug)}"
         return "${apiBase()}/api/search?${p.joinToString("&")}"
     }
@@ -190,6 +193,13 @@ object ReelFrenClient {
         return headers(posterUrl, isApiCall = false)
     }
 
+    // INTERNAL HELPER: Checks if the JSON indicates a version mismatch
+    private fun isVersionError(json: String): Boolean {
+        if (json.isEmpty()) return false
+        val lower = json.lowercase(Locale.ROOT)
+        return lower.contains("version") && (lower.contains("update") || lower.contains("invalid") || lower.contains("deprecated"))
+    }
+
     suspend fun get(url: String): String? {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val isReelFrenApi = targetHost == apiHost
@@ -202,6 +212,13 @@ object ReelFrenClient {
         } catch (e: Exception) { 
             ReelFrenLog.t("Client.get", e) 
             "" 
+        }
+        
+        // DYNAMIC VERSION FALLBACK: If the API throws a version error, try bumping it dynamically
+        if (isVersionError(jsonText)) {
+            ReelFrenLog.d("Client.get", "Version error detected on $currentApiVersion. Attempting generic fallback...")
+            val newUrl = url.replace("cv=$currentApiVersion", "")
+            jsonText = try { spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text } catch (e: Exception) { "" }
         }
         
         if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) return jsonText
@@ -267,35 +284,45 @@ object ReelFrenParse {
         }
     }
 
+    private fun findDramaObject(root: JSONObject): JSONObject? {
+        var target = root.optJSONObject("detail") ?: root.optJSONObject("data") ?: root
+        if (target.has("info")) return target.optJSONObject("info")
+        if (target.has("drama")) return target.optJSONObject("drama")
+        if (target.has("movie")) return target.optJSONObject("movie")
+        return target
+    }
+
     fun detail(body: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
         if (body.isBlank()) return null
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
-        val o = root.optJSONObject("detail") ?: root.optJSONObject("data") ?: root
+        
+        val o = findDramaObject(root) ?: return null
         
         val id = clean(o, "id").ifEmpty { clean(o, "dramaId") }.ifEmpty { fallbackId }
-        val title = clean(o, "title").ifEmpty { clean(o, "name") }
+        val title = clean(o, "title").ifEmpty { clean(o, "name") }.ifEmpty { clean(root.optJSONObject("data") ?: root, "title") }
         
-        if (id.isEmpty() || title.isEmpty()) {
-            ReelFrenLog.d("Parse.detail", "Failed parsing detail. Missing ID or Title in JSON. Fallback ID: $fallbackId")
+        if (title.isEmpty()) {
+            ReelFrenLog.d("Parse.detail", "Failed parsing detail. Missing Title in JSON payload.")
             return null
         }
         
         val provider = clean(o, "provider").ifEmpty { fallbackSlug }
         
         val videos = mutableListOf<VideoEntry>()
-        o.optJSONArray("videos")?.let { arr ->
+        val vArr = o.optJSONArray("videos") ?: o.optJSONArray("episodes") ?: o.optJSONArray("list") ?: root.optJSONObject("data")?.optJSONArray("videos")
+        
+        vArr?.let { arr ->
             for (i in 0 until arr.length()) {
                 val v = arr.optJSONObject(i) ?: continue
                 
-                // CRITICAL FIX: Explicitly validate the video ID (vid) to prevent crashing Cloudstream's episode loader
-                val vid = clean(v, "vid")
+                val vid = clean(v, "vid").ifEmpty { clean(v, "id") }.ifEmpty { clean(v, "videoId") }
                 if (vid.isEmpty()) continue
                 
                 videos += VideoEntry(
-                    episode = v.optInt("episode", i + 1), 
-                    duration = v.optInt("duration"), 
+                    episode = v.optInt("episode", v.optInt("ep", i + 1)), 
+                    duration = v.optInt("duration", v.optInt("length")), 
                     vid = vid, 
-                    available = v.optBoolean("available", true)
+                    available = v.optBoolean("available", v.optBoolean("is_free", true))
                 )
             }
         }
@@ -304,9 +331,9 @@ object ReelFrenParse {
             id = id, 
             provider = provider, 
             title = title, 
-            cover = clean(o, "cover"), 
+            cover = clean(o, "cover").ifEmpty { clean(o, "poster") }, 
             intro = clean(o, "intro").ifEmpty { clean(o, "description") }, 
-            episodes = o.optInt("episodes", videos.size), 
+            episodes = o.optInt("episodes", o.optInt("total_episodes", videos.size)), 
             videos = videos.sortedBy { it.episode }
         )
     }
