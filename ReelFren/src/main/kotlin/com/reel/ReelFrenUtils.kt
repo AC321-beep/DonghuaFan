@@ -200,7 +200,7 @@ object ReelFrenClient {
         if (isApiCall) {
             map["Accept"] = "application/json, text/plain, */*" 
         } else {
-            // These WAF bypass headers are required to prevent Cloudflare from resetting the TLS connection on spoofedApp
+            // These WAF bypass headers are required to prevent Cloudflare from resetting the TLS connection
             map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
             map["sec-ch-ua"] = "\"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\", \"Not-A.Brand\";v=\"99\""
             map["sec-ch-ua-mobile"] = "?0"
@@ -244,8 +244,9 @@ object ReelFrenClient {
         return lower.contains("version") && (lower.contains("update") || lower.contains("invalid") || lower.contains("deprecated"))
     }
 
-    // CRITICAL FIX: The Mutex block now waits 500ms after a successful CF solve to allow the 
-    // asynchronous CookieManager.flush() to propagate the cf_clearance cookie to OkHttp.
+    // CRITICAL FIX: Decoupled Client
+    // API Uses spoofedApp. HTML uses app.get()
+    // Both wait 500ms after CF Mutex to ensure CookieManager sync.
     suspend fun get(url: String, isApiCall: Boolean = true): String? {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val isReelFrenHost = targetHost == apiHost || targetHost.contains("reelfren.net")
@@ -256,40 +257,76 @@ object ReelFrenClient {
             return try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { null }
         }
 
-        ReelFrenLog.d("Client.get", "Attempting spoofed TLS fetch for API: $url")
-        var responseText = try { 
-            spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
-        } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
-            ReelFrenLog.d("Client.get", "OkHttp EXCEPTION on fast-path: ${e.message}"); "" 
-        }
-        
-        if (isApiCall && isVersionError(responseText) && url.contains("cv=")) {
-            ReelFrenLog.d("Client.get", "Version error detected on $currentApiVersion. Retrying without cv...")
-            val newUrl = url.replace(Regex("[?&]cv=[^&]+"), "").replace("?provider=&", "?provider=")
-            responseText = try { spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
-        }
-        
-        if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
-
-        ReelFrenLog.d("Client.get", "Falling back to CF Mutex...")
-        apiMutex.withLock {
-            responseText = try { spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
-            
-            if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
-
-            if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) return null
-            
-            // DELAY IS MANDATORY: Allow WebView CookieManager flush to sync with OkHttp
-            delay(500L)
-            
-            val finalResponse = try { 
-                spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
+        // --- HTML FALLBACK ROUTE ---
+        if (!isApiCall) {
+            ReelFrenLog.d("Client.get", "Attempting native app.get() fetch for HTML: $url")
+            var htmlResponse = try { 
+                app.get(url, headers = headers(url, false), timeout = 25L).text 
             } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
                 ReelFrenLog.t("Client.get", e)
                 "" 
             }
-            if (finalResponse.isEmpty() || ReelFrenCloudflare.isChallengeResponse(finalResponse)) return null
-            return finalResponse
+
+            if (htmlResponse.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(htmlResponse)) return htmlResponse
+
+            ReelFrenLog.d("Client.get", "HTML fetch challenged. Triggering CF Mutex...")
+            apiMutex.withLock {
+                htmlResponse = try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { "" }
+                if (htmlResponse.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(htmlResponse)) return htmlResponse
+
+                if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) return null
+                
+                // Allow CookieManager.flush() to write to disk before native OkHttp reads it
+                delay(500L)
+                
+                val finalHtml = try { 
+                    app.get(url, headers = headers(url, false), timeout = 25L).text 
+                } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
+                    ReelFrenLog.t("Client.get", e)
+                    "" 
+                }
+                
+                if (finalHtml.isEmpty() || ReelFrenCloudflare.isChallengeResponse(finalHtml)) return null
+                return finalHtml
+            }
+        }
+
+        // --- API ROUTE ---
+        ReelFrenLog.d("Client.get", "Attempting spoofed TLS fetch for API: $url")
+        var apiResponse = try { 
+            spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text 
+        } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
+            ReelFrenLog.t("Client.get", e)
+            "" 
+        }
+        
+        if (isVersionError(apiResponse) && url.contains("cv=")) {
+            ReelFrenLog.d("Client.get", "Version error detected on $currentApiVersion. Retrying without cv...")
+            val newUrl = url.replace(Regex("[?&]cv=[^&]+"), "").replace("?provider=&", "?provider=")
+            apiResponse = try { spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { "" }
+        }
+        
+        if (apiResponse.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(apiResponse)) return apiResponse
+
+        ReelFrenLog.d("Client.get", "API fetch challenged. Triggering CF Mutex...")
+        apiMutex.withLock {
+            apiResponse = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { "" }
+            
+            if (apiResponse.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(apiResponse)) return apiResponse
+
+            if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) return null
+            
+            // Allow CookieManager.flush() to write to disk before WebViewCookieJar reads it
+            delay(500L)
+            
+            val finalApi = try { 
+                spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text 
+            } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
+                ReelFrenLog.t("Client.get", e)
+                "" 
+            }
+            if (finalApi.isEmpty() || ReelFrenCloudflare.isChallengeResponse(finalApi)) return null
+            return finalApi
         }
     }
 
