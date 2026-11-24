@@ -171,7 +171,6 @@ object ReelFrenClient {
         return if (includeVersion && currentApiVersion.isNotBlank()) "$base&cv=$currentApiVersion" else base
     }
 
-    // CRITICAL FIX: ?lang=en is required for the Next.js server to serve metadata properly.
     fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
     
     fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) = 
@@ -215,9 +214,9 @@ object ReelFrenClient {
         return map
     }
 
-    // CRITICAL FIX: Omit "Referer" to prevent Volcengine CDN and Telegram proxy from rejecting Coil image loads
-    fun posterHeaders(): Map<String, String> {
-        return mapOf("User-Agent" to GLOBAL_MOBILE_UA)
+    fun posterHeaders(posterUrl: String?): Map<String, String>? {
+        if (posterUrl.isNullOrEmpty()) return null
+        return headers(posterUrl, isApiCall = false)
     }
 
     private fun isVersionError(json: String): Boolean {
@@ -226,24 +225,32 @@ object ReelFrenClient {
         return lower.contains("version") && (lower.contains("update") || lower.contains("invalid") || lower.contains("deprecated"))
     }
 
+    // CRITICAL FIX: Only uses spoofedApp and CF Mutex for API calls. 
+    // HTML webpage fallbacks use standard app.get() which handles interceptors properly.
     suspend fun get(url: String, isApiCall: Boolean = true): String? {
         val targetHost = ReelFrenCloudflare.hostOf(url)
-        val isReelFrenHost = targetHost == apiHost || targetHost.contains("reelfren.net")
+        val isReelFrenApi = targetHost == apiHost
         
-        ReelFrenLog.d("Client.get", "[GET INIT] url=$url isApi=$isReelFrenHost")
+        ReelFrenLog.d("Client.get", "[GET INIT] url=$url isApiCall=$isApiCall")
 
-        if (!isReelFrenHost) {
-            return try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { null }
+        if (!isApiCall || !isReelFrenApi) {
+            ReelFrenLog.d("Client.get", "Fetching non-API or HTML route natively: $url")
+            return try { 
+                app.get(url, headers = headers(url, false), timeout = 25L).text 
+            } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
+                ReelFrenLog.d("Client.get", "Native HTML fetch failed: ${e.message}")
+                null 
+            }
         }
 
-        ReelFrenLog.d("Client.get", "Attempting fast-path fetch for: $url")
+        ReelFrenLog.d("Client.get", "Attempting fast-path API fetch for: $url")
         var responseText = try { 
             spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
         } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
             ReelFrenLog.d("Client.get", "OkHttp EXCEPTION on fast-path: ${e.message}"); "" 
         }
         
-        if (isApiCall && isVersionError(responseText) && url.contains("cv=")) {
+        if (isVersionError(responseText) && url.contains("cv=")) {
             ReelFrenLog.d("Client.get", "Version error detected on $currentApiVersion. Retrying without cv...")
             val newUrl = url.replace(Regex("[?&]cv=[^&]+"), "").replace("?provider=&", "?provider=")
             responseText = try { spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
@@ -302,28 +309,30 @@ object ReelFrenClient {
         return ReelFrenParse.playback(jsonText, serverId)
     }
     
-    fun absUrl(value: String): String {
-        val clean = value.trim()
-        if (clean.isEmpty()) return ""
-        
-        var decodedUrl = clean
+    fun decodeProxyUrl(rawUrl: String): String {
+        val clean = rawUrl.trim()
         if (clean.contains("go.nunodrama.my.id/p/telegram_")) {
             try {
                 val encodedPart = clean.substringAfterLast("/")
                 val decodedBytes = Base64.decode(encodedPart, Base64.URL_SAFE)
-                val decodedStr = String(decodedBytes, Charsets.UTF_8)
-                if (decodedStr.startsWith("http")) {
-                    decodedUrl = decodedStr
+                val decodedUrl = String(decodedBytes, Charsets.UTF_8)
+                if (decodedUrl.startsWith("http")) {
+                    return decodedUrl
                 }
             } catch (e: Exception) {
                 // Ignore fallback to raw
             }
         }
-        
-        if (decodedUrl.startsWith("https://", true) || decodedUrl.startsWith("http://", true)) return decodedUrl
-        if (decodedUrl.startsWith("//")) return "https:$decodedUrl"
+        return clean
+    }
+
+    fun absUrl(value: String): String {
+        val clean = decodeProxyUrl(value.trim())
+        if (clean.isEmpty()) return ""
+        if (clean.startsWith("https://", true) || clean.startsWith("http://", true)) return clean
+        if (clean.startsWith("//")) return "https:$clean"
         val base = apiBase()
-        return if (decodedUrl.startsWith("/")) "$base$decodedUrl" else "$base/$decodedUrl"
+        return if (clean.startsWith("/")) "$base$clean" else "$base/$clean"
     }
 }
 
@@ -573,7 +582,6 @@ object ReelFrenParse {
             }
         }
 
-        // Deep fallback to raw HTML metadata & tags
         val ogTitle = Regex("""<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             .find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
         val pageTitle = Regex("""<title[^>]*>(.*?)</title>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
@@ -581,7 +589,6 @@ object ReelFrenParse {
         
         val title = ogTitle.ifEmpty { pageTitle }.replace("Episode 1", "").trim()
         
-        // If Cloudflare "Just a moment..." page is returned, abort fallback safely
         if (title.isEmpty() || title.contains("Just a moment", ignoreCase = true)) {
             ReelFrenLog.d("Parse.detailHtml", "Failed to extract Title from HTML tags or hit CF page.")
             return null
@@ -618,6 +625,7 @@ object ReelFrenParse {
             VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true)
         }
 
+        ReelFrenLog.d("Parse.detailHtml", "Successfully parsed detail using raw HTML Regex fallback.")
         return DetailInfo(
             id = fallbackId,
             provider = fallbackSlug,
@@ -943,25 +951,18 @@ object ReelFrenSubtitles {
 object ReelFrenStore {
     @Volatile var appContext: Context? = null
         private set
-    @Volatile var defaultSystemUa: String = ReelFrenClient.FALLBACK_UA
-        private set
 
     @Volatile private var storePrefs: SharedPreferences? = null
     @Volatile private var providerPrefs: SharedPreferences? = null
     
-    private val memoryUa = ConcurrentHashMap<String, String>()
     private val memoryCookies = ConcurrentHashMap<String, String>()
-    private val wvVersionRegex = Regex("""Version/\d+\.\d+\s*""")
     private val rootDomain by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.REEL_SITE) }
-
-    fun normalizeUa(rawUa: String): String = rawUa.replace("; wv", "").replace(wvVersionRegex, "").trim()
 
     fun init(ctx: Context) {
         appContext = ctx.applicationContext
         storePrefs = appContext?.getSharedPreferences("reelfren_store", Context.MODE_PRIVATE)
         providerPrefs = appContext?.getSharedPreferences("reelfren_prefs", Context.MODE_PRIVATE)
         ReelFrenLog.isVerbose = providerPrefs?.getBoolean("verbose_logging", false) ?: false
-        runCatching { normalizeUa(WebSettings.getDefaultUserAgent(ctx)) }.getOrNull()?.takeIf { it.isNotBlank() }?.let { ua -> defaultSystemUa = ua }
     }
 
     fun setVerboseLogging(enabled: Boolean) {
@@ -1006,21 +1007,11 @@ object ReelFrenStore {
     }
 
     fun userAgent(host: String): String {
-        if (host.isBlank()) return defaultSystemUa
-        val norm = host.lowercase(Locale.ROOT)
-        memoryUa[norm]?.let { return it }
-        val saved = storePrefs?.getString("ua_$norm", null)?.takeIf { it.isNotBlank() }
-        if (saved != null) { val cleaned = normalizeUa(saved); memoryUa[norm] = cleaned; return cleaned }
-        if (norm != rootDomain && norm.endsWith(".$rootDomain")) return userAgent(rootDomain)
-        return defaultSystemUa
+        return ReelFrenClient.GLOBAL_MOBILE_UA
     }
 
     fun setUserAgent(host: String, ua: String) {
-        if (host.isBlank()) return
-        val norm = host.lowercase(Locale.ROOT)
-        val cleaned = normalizeUa(ua)
-        memoryUa[norm] = cleaned
-        storePrefs?.edit()?.putString("ua_$norm", cleaned)?.apply()
+        // Disabled: We strictly enforce the hardcoded Mobile Chrome UA.
     }
 
     fun shouldSkipPrewarm(): Boolean {
