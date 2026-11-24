@@ -112,7 +112,8 @@ class ReelFrenProvider : MainAPI() {
         val fastResults = mutableListOf<SearchResponse>()
         
         try {
-            withTimeout(4000L) {
+            // Increased timeout to 5s to ensure searches have enough time to bypass Cloudflare if needed
+            withTimeout(5000L) {
                 fastResults.addAll(deferredSearches.awaitAll().flatten())
             }
         } catch (e: TimeoutCancellationException) {
@@ -204,14 +205,6 @@ class ReelFrenProvider : MainAPI() {
                             val qUrl = ReelFrenClient.absUrl(q.url)
                             if (qUrl.isBlank() || !qUrl.startsWith("http")) return@launch
 
-                            // REMOVED THE isAlive PING. 
-                            // It was killing valid VolcEngine links due to single-use token consumption 
-                            // or CDN anti-bot checks against Cloudstream's nicehttp client.
-
-                            val format = q.format.ifEmpty { ReelFrenQuality.inferFormat(qUrl) }
-                            
-                            // FIX: Cleaned up the name so Cloudstream doesn't output "720p 720p".
-                            // If it's a known provider like "Captain Sapi", we append it. Otherwise, just "Server X".
                             val serverNameString = if (p.server.toIntOrNull() != null) "Server ${p.server}" else p.server
                             
                             val link = com.lagradost.cloudstream3.utils.ExtractorLink(
@@ -220,7 +213,7 @@ class ReelFrenProvider : MainAPI() {
                                 url = qUrl,
                                 referer = "${ReelFrenConfig.REEL_SITE}/", 
                                 quality = ReelFrenQuality.of(q.label),
-                                type = ReelFrenQuality.linkType(qUrl, format), 
+                                type = ReelFrenQuality.linkType(qUrl, q.format), // CRITICAL FIX: Safe inference overrides false 'mp4' flags
                                 headers = ReelFrenClient.videoHeaders(qUrl)
                             )
                             
