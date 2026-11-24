@@ -95,15 +95,18 @@ class ReelFrenProvider : MainAPI() {
         cachedSearchResults = emptyList()
         cachedSearchTime = now
 
-        val primaryProviders = activeProviders.take(3)
-        val secondaryProviders = activeProviders.drop(3)
+        // CRITICAL FIX: To prevent CF blocking and API rejections, only search 2 explicitly defined providers 
+        // on the fast path, and ensure we NEVER search the blocked "all_dramas" endpoint
+        val validProviders = activeProviders.filter { it != "all_dramas" }
+        val primaryProviders = validProviders.take(2)
+        val secondaryProviders = validProviders.drop(2)
 
         val primarySearches = primaryProviders.map { slug ->
             bgSearchScope.async {
                 val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
                 items.mapNotNull { item ->
                     if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
-                    val actualSlug = item.provider.ifEmpty { "all_dramas" }
+                    val actualSlug = item.provider.ifEmpty { slug }
                     newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
                         this.posterUrl = ReelFrenClient.absUrl(item.cover)
                         this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
@@ -115,7 +118,7 @@ class ReelFrenProvider : MainAPI() {
         val fastResults = mutableListOf<SearchResponse>()
         
         try {
-            withTimeout(5000L) {
+            withTimeout(3500L) { // Reduced timeout to prevent UI hang if CF blocks
                 fastResults.addAll(primarySearches.awaitAll().flatten())
             }
         } catch (e: TimeoutCancellationException) {
@@ -133,7 +136,7 @@ class ReelFrenProvider : MainAPI() {
                     val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
                     items.mapNotNull { item ->
                         if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
-                        val actualSlug = item.provider.ifEmpty { "all_dramas" }
+                        val actualSlug = item.provider.ifEmpty { slug }
                         newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
                             this.posterUrl = ReelFrenClient.absUrl(item.cover)
                             this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
@@ -175,7 +178,6 @@ class ReelFrenProvider : MainAPI() {
                         this.name = "Episode ${v.episode}"
                         this.episode = v.episode
                         this.posterUrl = coverUrl
-                        // Removed posterHeaders here - Cloudstream does not support this on individual episodes
                     }
                 }
             ) {
