@@ -67,8 +67,7 @@ class ReelFrenProvider : MainAPI() {
             
             newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
                 this.posterUrl = ReelFrenClient.absUrl(item.cover)
-                // AGGRESSIVE DEBUG FIX: Spoofed headers for Volcengine explicitly attached to poster
-                this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
+                this.posterHeaders = ReelFrenClient.posterHeaders()
             }
         }
         ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=${items.size} added=${mapped.size} hasNext=true")
@@ -114,7 +113,7 @@ class ReelFrenProvider : MainAPI() {
                         val actualSlug = item.provider.ifEmpty { slug }
                         newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
                             this.posterUrl = ReelFrenClient.absUrl(item.cover)
-                            this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
+                            this.posterHeaders = ReelFrenClient.posterHeaders()
                         }
                     }
                 }
@@ -144,7 +143,7 @@ class ReelFrenProvider : MainAPI() {
                         secondaryResults.add(
                             newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
                                 this.posterUrl = ReelFrenClient.absUrl(item.cover)
-                                this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
+                                this.posterHeaders = ReelFrenClient.posterHeaders()
                             }
                         )
                     }
@@ -169,7 +168,7 @@ class ReelFrenProvider : MainAPI() {
         
         val d: DetailInfo = ReelFrenClient.detail(slug, id) ?: throw ErrorLoadingException("Failed to load detail")
         val coverUrl = ReelFrenClient.absUrl(d.cover)
-        val coverHeaders = ReelFrenClient.posterHeaders(coverUrl)
+        val coverHeaders = ReelFrenClient.posterHeaders()
 
         if (d.videos.size > 1 || d.episodes > 1) {
             return newTvSeriesLoadResponse(
