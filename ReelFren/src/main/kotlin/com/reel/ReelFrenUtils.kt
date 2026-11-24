@@ -153,7 +153,7 @@ object ReelFrenClient {
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
-    // CRITICAL FIX: Detail endpoint now scrapes the Next.js HTML page directly, bypassing the dead API.
+    fun detailApiUrl(slug: String, id: String) = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en&cv=$currentApiVersion"
     fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
     
     fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) = "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&lang=en&server=$server&cv=$currentApiVersion"
@@ -239,8 +239,24 @@ object ReelFrenClient {
 
     suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
-    // CRITICAL FIX: Fetch HTML page and parse SSR JSON payload
-    suspend fun detail(slug: String, id: String): DetailInfo? = get(detailHtmlUrl(slug, id), isApiCall = false)?.let { ReelFrenParse.detailHtml(it, slug, id) }
+    // HYBRID FETCH: Try fast API first. If it fails, fallback to indestructible HTML scraper.
+    suspend fun detail(slug: String, id: String): DetailInfo? {
+        val apiUrl = detailApiUrl(slug, id)
+        val apiJson = get(apiUrl, isApiCall = true)
+        
+        if (!apiJson.isNullOrEmpty()) {
+            val apiResult = ReelFrenParse.detailApi(apiJson, slug, id)
+            if (apiResult != null && apiResult.title.isNotEmpty()) {
+                ReelFrenLog.d("Client.detail", "API parse successful.")
+                return apiResult
+            }
+        }
+        
+        ReelFrenLog.d("Client.detail", "API parse failed or empty. Falling back to indestructible HTML scraper.")
+        val htmlUrl = detailHtmlUrl(slug, id)
+        val htmlStr = get(htmlUrl, isApiCall = false) ?: return null
+        return ReelFrenParse.detailHtml(htmlStr, slug, id)
+    }
     
     suspend fun search(slug: String, term: String): List<HomeItem> = get(searchUrl(slug, term), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
@@ -330,29 +346,14 @@ object ReelFrenParse {
         }
     }
 
-    // CRITICAL FIX: Extracts the Next.js SSR state array from the raw HTML page
-    fun detailHtml(htmlBody: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
-        if (htmlBody.isBlank()) return null
-        
-        // Find the self.__next_f.push string containing the detail object
-        val match = Regex("""\\"detail\\":(\{.*?\})""").find(htmlBody) 
-            ?: Regex("""\"detail\":(\{.*?\})""").find(htmlBody)
-            
-        if (match == null) {
-            ReelFrenLog.d("Parse.detailHtml", "Failed to extract Next.js detail object from HTML.")
-            return null
-        }
-
-        val rawJsonStr = match.groupValues[1].replace("\\\"", "\"").replace("\\\\", "\\")
-        val root = runCatching { JSONObject(rawJsonStr) }.getOrNull() ?: return null
+    fun detailApi(body: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
+        if (body.isBlank()) return null
+        val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
         
         val id = findValueRecursively(root, "id", "dramaId").ifEmpty { fallbackId }
         val title = findValueRecursively(root, "title", "name", "dramaName")
         
-        if (title.isEmpty()) {
-            ReelFrenLog.d("Parse.detailHtml", "Failed parsing detail. Missing Title in extracted JSON payload.")
-            return null
-        }
+        if (title.isEmpty()) return null
         
         val provider = findValueRecursively(root, "provider").ifEmpty { fallbackSlug }
         val cover = findValueRecursively(root, "cover", "poster", "imageUrl")
@@ -379,15 +380,51 @@ object ReelFrenParse {
         
         val totalEps = findValueRecursively(root, "episodes", "total_episodes").toIntOrNull() ?: videos.size
 
-        return DetailInfo(
-            id = id, 
-            provider = provider, 
-            title = title, 
-            cover = cover, 
-            intro = intro, 
-            episodes = totalEps, 
-            videos = videos.sortedBy { it.episode }
-        )
+        return DetailInfo(id, provider, title, cover, intro, totalEps, videos.sortedBy { it.episode })
+    }
+
+    fun detailHtml(htmlBody: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
+        if (htmlBody.isBlank()) return null
+        
+        val match = Regex("""\\"detail\\":(\{.*?\})""").find(htmlBody) 
+            ?: Regex("""\"detail\":(\{.*?\})""").find(htmlBody)
+            
+        if (match == null) return null
+
+        val rawJsonStr = match.groupValues[1].replace("\\\"", "\"").replace("\\\\", "\\")
+        val root = runCatching { JSONObject(rawJsonStr) }.getOrNull() ?: return null
+        
+        val id = findValueRecursively(root, "id", "dramaId").ifEmpty { fallbackId }
+        val title = findValueRecursively(root, "title", "name", "dramaName")
+        
+        if (title.isEmpty()) return null
+        
+        val provider = findValueRecursively(root, "provider").ifEmpty { fallbackSlug }
+        val cover = findValueRecursively(root, "cover", "poster", "imageUrl")
+        val intro = findValueRecursively(root, "intro", "description", "summary")
+        
+        val videos = mutableListOf<VideoEntry>()
+        val vArr = findArrayRecursively(root, "videos", "episodes", "list")
+        
+        vArr?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val v = arr.optJSONObject(i) ?: continue
+                
+                val vid = clean(v, "vid").ifEmpty { clean(v, "id") }.ifEmpty { clean(v, "videoId") }
+                if (vid.isEmpty()) continue
+                
+                videos += VideoEntry(
+                    episode = v.optInt("episode", v.optInt("ep", i + 1)), 
+                    duration = v.optInt("duration", v.optInt("length")), 
+                    vid = vid, 
+                    available = v.optBoolean("available", v.optBoolean("is_free", true))
+                )
+            }
+        }
+        
+        val totalEps = findValueRecursively(root, "episodes", "total_episodes").toIntOrNull() ?: videos.size
+
+        return DetailInfo(id, provider, title, cover, intro, totalEps, videos.sortedBy { it.episode })
     }
 
     fun playback(body: String, requestedServerId: Int): PlaybackInfo? {
@@ -596,7 +633,7 @@ object ReelFrenSubtitles {
 
     private fun resolveDisplayLabel(rawLang: String, rawLabel: String): String {
         val normFromLang = normalizeLang(rawLang)
-        val normFromLabel = if (normFromLang == "und") normalizeLang(rawLabel) else normFromLang
+        val normFromLabel = if (normFromLang == "und") normalizeLang(rawLabel) else normFromLabel
         val fullLangName = langLabel(normFromLabel)
         return if (fullLangName != "Unknown") fullLangName else rawLabel.trim().replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }.ifEmpty { "English" } 
     }
