@@ -4,6 +4,6 @@ cloudstream {
     status = 1
     tvTypes = listOf("TvSeries", "Movie", "AsianDrama")
     language = "en"
-    version = 4
+    version = 5
     iconUrl = "https://www.google.com/s2/favicons?domain=reelfren.net&sz=256"
 }
