@@ -11,6 +11,7 @@ import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.CipherSuite
@@ -188,7 +189,6 @@ object ReelFrenClient {
         return "${apiBase()}/api/search?${p.joinToString("&")}"
     }
 
-    // CRITICAL FIX: The exact headers from the successful Chrome trace
     fun headers(url: String, isApiCall: Boolean = false): Map<String, String> {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val map = linkedMapOf<String, String>()
@@ -200,8 +200,8 @@ object ReelFrenClient {
         if (isApiCall) {
             map["Accept"] = "application/json, text/plain, */*" 
         } else {
-            // These specific WAF bypass headers prevent Cloudflare from resetting the TLS connection on spoofedApp
-            map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+            // These WAF bypass headers are required to prevent Cloudflare from resetting the TLS connection on spoofedApp
+            map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
             map["sec-ch-ua"] = "\"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\", \"Not-A.Brand\";v=\"99\""
             map["sec-ch-ua-mobile"] = "?0"
             map["sec-ch-ua-platform"] = "\"Windows\""
@@ -244,7 +244,8 @@ object ReelFrenClient {
         return lower.contains("version") && (lower.contains("update") || lower.contains("invalid") || lower.contains("deprecated"))
     }
 
-    // CRITICAL FIX: Route everything through spoofedApp. Do not use app.get() as its CookieManager syncs too slowly.
+    // CRITICAL FIX: The Mutex block now waits 500ms after a successful CF solve to allow the 
+    // asynchronous CookieManager.flush() to propagate the cf_clearance cookie to OkHttp.
     suspend fun get(url: String, isApiCall: Boolean = true): String? {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val isReelFrenHost = targetHost == apiHost || targetHost.contains("reelfren.net")
@@ -255,7 +256,7 @@ object ReelFrenClient {
             return try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { null }
         }
 
-        ReelFrenLog.d("Client.get", "Attempting spoofed TLS fetch for: $url")
+        ReelFrenLog.d("Client.get", "Attempting spoofed TLS fetch for API: $url")
         var responseText = try { 
             spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
         } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
@@ -277,6 +278,10 @@ object ReelFrenClient {
             if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
             if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) return null
+            
+            // DELAY IS MANDATORY: Allow WebView CookieManager flush to sync with OkHttp
+            delay(500L)
+            
             val finalResponse = try { 
                 spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
             } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
