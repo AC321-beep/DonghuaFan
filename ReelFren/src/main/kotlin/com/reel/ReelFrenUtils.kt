@@ -265,11 +265,59 @@ object ReelFrenParse {
     private val SUB_LANG_KEYS = arrayOf("lang", "srclang", "srcLang", "language", "code", "locale", "langCode", "iso", "languageCode", "name")
     private val SUB_LABEL_KEYS = arrayOf("label", "name", "title", "display", "langName", "language")
 
+    // RECURSIVE SCANNER: Finds a specific key anywhere in the JSON tree
+    private fun findValueRecursively(obj: JSONObject, vararg keysToFind: String): String {
+        for (key in keysToFind) {
+            val v = clean(obj, key)
+            if (v.isNotEmpty()) return v
+        }
+
+        val it = obj.keys()
+        while (it.hasNext()) {
+            val key = it.next()
+            val child = obj.optJSONObject(key)
+            if (child != null) {
+                val found = findValueRecursively(child, *keysToFind)
+                if (found.isNotEmpty()) return found
+            } else {
+                val childArray = obj.optJSONArray(key)
+                if (childArray != null) {
+                    for (i in 0 until childArray.length()) {
+                        val arrayObj = childArray.optJSONObject(i)
+                        if (arrayObj != null) {
+                            val found = findValueRecursively(arrayObj, *keysToFind)
+                            if (found.isNotEmpty()) return found
+                        }
+                    }
+                }
+            }
+        }
+        return ""
+    }
+
+    // RECURSIVE SCANNER: Finds a specific array anywhere in the JSON tree
+    private fun findArrayRecursively(obj: JSONObject, vararg keysToFind: String): JSONArray? {
+        for (key in keysToFind) {
+            val arr = obj.optJSONArray(key)
+            if (arr != null && arr.length() > 0) return arr
+        }
+
+        val it = obj.keys()
+        while (it.hasNext()) {
+            val key = it.next()
+            val child = obj.optJSONObject(key)
+            if (child != null) {
+                val found = findArrayRecursively(child, *keysToFind)
+                if (found != null) return found
+            }
+        }
+        return null
+    }
+
     fun homeItems(body: String): List<HomeItem> {
         if (body.isBlank()) return emptyList()
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
-        val dataObj = root.optJSONObject("data")
-        val arr = root.optJSONArray("data") ?: dataObj?.optJSONArray("items") ?: dataObj?.optJSONArray("list") ?: dataObj?.optJSONArray("results") ?: root.optJSONArray("items") ?: root.optJSONArray("list") ?: return emptyList()
+        val arr = findArrayRecursively(root, "data", "items", "list", "results") ?: return emptyList()
 
         return (0 until arr.length()).mapNotNull { i ->
             val o = arr.optJSONObject(i) ?: return@mapNotNull null
@@ -281,32 +329,25 @@ object ReelFrenParse {
         }
     }
 
-    private fun findDramaObject(root: JSONObject): JSONObject? {
-        var target = root.optJSONObject("detail") ?: root.optJSONObject("data") ?: root
-        if (target.has("info")) return target.optJSONObject("info")
-        if (target.has("drama")) return target.optJSONObject("drama")
-        if (target.has("movie")) return target.optJSONObject("movie")
-        return target
-    }
-
     fun detail(body: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
         if (body.isBlank()) return null
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
         
-        val o = findDramaObject(root) ?: return null
-        
-        val id = clean(o, "id").ifEmpty { clean(o, "dramaId") }.ifEmpty { fallbackId }
-        val title = clean(o, "title").ifEmpty { clean(o, "name") }.ifEmpty { clean(root.optJSONObject("data") ?: root, "title") }
+        // Let the recursive scanner find the data, no matter where it is hidden.
+        val id = findValueRecursively(root, "id", "dramaId").ifEmpty { fallbackId }
+        val title = findValueRecursively(root, "title", "name", "dramaName")
         
         if (title.isEmpty()) {
             ReelFrenLog.d("Parse.detail", "Failed parsing detail. Missing Title in JSON payload.")
             return null
         }
         
-        val provider = clean(o, "provider").ifEmpty { fallbackSlug }
+        val provider = findValueRecursively(root, "provider").ifEmpty { fallbackSlug }
+        val cover = findValueRecursively(root, "cover", "poster", "imageUrl")
+        val intro = findValueRecursively(root, "intro", "description", "summary")
         
         val videos = mutableListOf<VideoEntry>()
-        val vArr = o.optJSONArray("videos") ?: o.optJSONArray("episodes") ?: o.optJSONArray("list") ?: root.optJSONObject("data")?.optJSONArray("videos")
+        val vArr = findArrayRecursively(root, "videos", "episodes", "list")
         
         vArr?.let { arr ->
             for (i in 0 until arr.length()) {
@@ -324,13 +365,15 @@ object ReelFrenParse {
             }
         }
         
+        val totalEps = findValueRecursively(root, "episodes", "total_episodes").toIntOrNull() ?: videos.size
+
         return DetailInfo(
             id = id, 
             provider = provider, 
             title = title, 
-            cover = clean(o, "cover").ifEmpty { clean(o, "poster") }, 
-            intro = clean(o, "intro").ifEmpty { clean(o, "description") }, 
-            episodes = o.optInt("episodes", o.optInt("total_episodes", videos.size)), 
+            cover = cover, 
+            intro = intro, 
+            episodes = totalEps, 
             videos = videos.sortedBy { it.episode }
         )
     }
@@ -338,42 +381,38 @@ object ReelFrenParse {
     fun playback(body: String, requestedServerId: Int): PlaybackInfo? {
         if (body.isBlank()) return null
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
-        val dataNode = root.optJSONObject("data") ?: root.optJSONObject("playback") ?: root
-
+        
         val qualities = mutableListOf<QualityEntry>()
         val subs = mutableListOf<SubtitleEntry>()
 
-        val qArr = dataNode.optJSONArray("qualityList") ?: dataNode.optJSONArray("qualities") ?: dataNode.optJSONArray("sources") 
-                   ?: dataNode.optJSONArray("videos") ?: dataNode.optJSONArray("list") ?: dataNode.optJSONArray("streams")
-        
-        if (qArr == null || qArr.length() == 0) return null
+        val qArr = findArrayRecursively(root, "qualityList", "qualities", "sources", "videos", "list", "streams")
 
-        for (i in 0 until qArr.length()) {
-            val q = qArr.optJSONObject(i) ?: continue
-            val url = firstNonEmpty(q, "url", "src", "file", "videoUrl")
-            if (url.isNotEmpty()) {
-                // CRITICAL FIX: Explicitly parse the format parameter from the JSON to prevent NAL header crashes.
-                val explicitFormat = clean(q, "format")
-                qualities += QualityEntry(label = firstNonEmpty(q, "label", "quality", "name", "resolution").ifEmpty { "Auto" }, url = url, format = explicitFormat)
+        if (qArr != null) {
+            for (i in 0 until qArr.length()) {
+                val q = qArr.optJSONObject(i) ?: continue
+                val url = firstNonEmpty(q, "url", "src", "file", "videoUrl")
+                if (url.isNotEmpty()) {
+                    val explicitFormat = clean(q, "format")
+                    qualities += QualityEntry(label = firstNonEmpty(q, "label", "quality", "name", "resolution").ifEmpty { "Auto" }, url = url, format = explicitFormat)
+                }
+                collectSubtitlesFromNode(q, subs)
             }
-            collectSubtitlesFromNode(q, subs)
         }
 
-        val direct = firstNonEmpty(dataNode, "videoUrl", "url", "streamUrl", "playUrl", "m3u8", "src")
+        val direct = findValueRecursively(root, "videoUrl", "url", "streamUrl", "playUrl", "m3u8", "src")
         if (direct.isNotEmpty() && qualities.none { it.url == direct }) {
-            // CRITICAL FIX: Infer the format of the root videoUrl properly
             qualities.add(0, QualityEntry("Auto", direct, ReelFrenQuality.inferFormat(direct)))
         }
+        
         if (qualities.isEmpty()) return null
 
-        collectSubtitlesFromNode(dataNode, subs)
-        if (dataNode !== root) collectSubtitlesFromNode(root, subs)
+        collectSubtitlesFromNode(root, subs)
 
         return PlaybackInfo(
-            title = clean(dataNode, "title").ifEmpty { clean(dataNode, "name") },
-            episodeNumber = dataNode.optInt("episodeNumber", 1),
-            totalEpisodes = dataNode.optInt("totalEpisodes", 1),
-            locked = dataNode.optBoolean("locked"),
+            title = findValueRecursively(root, "title", "name"),
+            episodeNumber = findValueRecursively(root, "episodeNumber", "episode").toIntOrNull() ?: 1,
+            totalEpisodes = findValueRecursively(root, "totalEpisodes").toIntOrNull() ?: 1,
+            locked = findValueRecursively(root, "locked", "isLocked").toBoolean(),
             qualities = qualities,
             subtitles = subs.distinctBy { "${it.lang.lowercase(Locale.ROOT)}|${it.url}" },
             server = requestedServerId.toString()
@@ -720,7 +759,6 @@ object ReelFrenQuality {
 
     fun label(raw: String) = raw.trim().ifEmpty { "Auto" }
 
-    // CRITICAL FIX: Aggressively parses format tags directly from the API response
     fun inferFormat(url: String, explicitFormat: String = ""): String {
         val cleanFormat = explicitFormat.trim().lowercase(Locale.ROOT)
         if (cleanFormat.isNotEmpty()) return cleanFormat
@@ -728,11 +766,10 @@ object ReelFrenQuality {
             url.contains(".m3u8", ignoreCase = true) -> "hls"
             url.contains(".mpd", ignoreCase = true)  -> "dash"
             url.contains(".mp4", ignoreCase = true) || url.contains("mime_type=video_mp4", ignoreCase = true) -> "mp4"
-            else -> "video" // Default fallback
+            else -> "video"
         }
     }
 
-    // CRITICAL FIX: Ensures Cloudstream does not attempt to parse raw MP4 streams as segmented HLS
     fun linkType(url: String, format: String = ""): ExtractorLinkType {
         val f = inferFormat(url, format)
         return when (f) {
