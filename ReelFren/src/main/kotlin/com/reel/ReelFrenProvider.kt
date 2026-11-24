@@ -67,7 +67,7 @@ class ReelFrenProvider : MainAPI() {
             
             newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
                 this.posterUrl = ReelFrenClient.absUrl(item.cover)
-                this.posterHeaders = ReelFrenClient.posterHeaders()
+                this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
             }
         }
         ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=${items.size} added=${mapped.size} hasNext=true")
@@ -96,8 +96,6 @@ class ReelFrenProvider : MainAPI() {
         cachedSearchResults = emptyList()
         cachedSearchTime = now
 
-        // CRITICAL FIX: To prevent CF blocking and API rejections, explicitly query only a safe number 
-        // of providers sequentially. 'all_dramas' is omitted because the API rejects it.
         val validProviders = activeProviders.filter { it != "all_dramas" }
         if (validProviders.isEmpty()) return emptyList()
 
@@ -115,7 +113,7 @@ class ReelFrenProvider : MainAPI() {
                         val actualSlug = item.provider.ifEmpty { slug }
                         newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
                             this.posterUrl = ReelFrenClient.absUrl(item.cover)
-                            this.posterHeaders = ReelFrenClient.posterHeaders()
+                            this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
                         }
                     }
                 }
@@ -145,12 +143,12 @@ class ReelFrenProvider : MainAPI() {
                         secondaryResults.add(
                             newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
                                 this.posterUrl = ReelFrenClient.absUrl(item.cover)
-                                this.posterHeaders = ReelFrenClient.posterHeaders()
+                                this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
                             }
                         )
                     }
                 }
-                kotlinx.coroutines.delay(500) // Delay to prevent triggering Cloudflare WAF during background fetching
+                kotlinx.coroutines.delay(500)
             }
             
             val allResults = (distinctFast + secondaryResults).distinctBy { it.url }
@@ -170,7 +168,7 @@ class ReelFrenProvider : MainAPI() {
         
         val d: DetailInfo = ReelFrenClient.detail(slug, id) ?: throw ErrorLoadingException("Failed to load detail")
         val coverUrl = ReelFrenClient.absUrl(d.cover)
-        val coverHeaders = ReelFrenClient.posterHeaders()
+        val coverHeaders = ReelFrenClient.posterHeaders(coverUrl)
 
         if (d.videos.size > 1 || d.episodes > 1) {
             return newTvSeriesLoadResponse(
