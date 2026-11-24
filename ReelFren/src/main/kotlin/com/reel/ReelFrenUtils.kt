@@ -130,7 +130,6 @@ object ReelFrenClient {
     private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
     
-    // DYNAMIC VERSION TRACKER: Starts at v21, but can be updated dynamically if the API rejects it.
     @Volatile private var currentApiVersion = "v21"
     
     private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
@@ -193,7 +192,6 @@ object ReelFrenClient {
         return headers(posterUrl, isApiCall = false)
     }
 
-    // INTERNAL HELPER: Checks if the JSON indicates a version mismatch
     private fun isVersionError(json: String): Boolean {
         if (json.isEmpty()) return false
         val lower = json.lowercase(Locale.ROOT)
@@ -214,7 +212,6 @@ object ReelFrenClient {
             "" 
         }
         
-        // DYNAMIC VERSION FALLBACK: If the API throws a version error, try bumping it dynamically
         if (isVersionError(jsonText)) {
             ReelFrenLog.d("Client.get", "Version error detected on $currentApiVersion. Attempting generic fallback...")
             val newUrl = url.replace("cv=$currentApiVersion", "")
@@ -355,13 +352,16 @@ object ReelFrenParse {
             val q = qArr.optJSONObject(i) ?: continue
             val url = firstNonEmpty(q, "url", "src", "file", "videoUrl")
             if (url.isNotEmpty()) {
-                qualities += QualityEntry(label = firstNonEmpty(q, "label", "quality", "name", "resolution").ifEmpty { "Auto" }, url = url, format = clean(q, "format"))
+                // CRITICAL FIX: Explicitly parse the format parameter from the JSON to prevent NAL header crashes.
+                val explicitFormat = clean(q, "format")
+                qualities += QualityEntry(label = firstNonEmpty(q, "label", "quality", "name", "resolution").ifEmpty { "Auto" }, url = url, format = explicitFormat)
             }
             collectSubtitlesFromNode(q, subs)
         }
 
         val direct = firstNonEmpty(dataNode, "videoUrl", "url", "streamUrl", "playUrl", "m3u8", "src")
         if (direct.isNotEmpty() && qualities.none { it.url == direct }) {
+            // CRITICAL FIX: Infer the format of the root videoUrl properly
             qualities.add(0, QualityEntry("Auto", direct, ReelFrenQuality.inferFormat(direct)))
         }
         if (qualities.isEmpty()) return null
@@ -720,16 +720,27 @@ object ReelFrenQuality {
 
     fun label(raw: String) = raw.trim().ifEmpty { "Auto" }
 
-    fun inferFormat(url: String): String = when {
-        url.contains(".m3u8", ignoreCase = true) -> "hls"
-        url.contains(".mpd", ignoreCase = true)  -> "dash"
-        else -> "video"
+    // CRITICAL FIX: Aggressively parses format tags directly from the API response
+    fun inferFormat(url: String, explicitFormat: String = ""): String {
+        val cleanFormat = explicitFormat.trim().lowercase(Locale.ROOT)
+        if (cleanFormat.isNotEmpty()) return cleanFormat
+        return when {
+            url.contains(".m3u8", ignoreCase = true) -> "hls"
+            url.contains(".mpd", ignoreCase = true)  -> "dash"
+            url.contains(".mp4", ignoreCase = true) || url.contains("mime_type=video_mp4", ignoreCase = true) -> "mp4"
+            else -> "video" // Default fallback
+        }
     }
 
-    fun linkType(url: String, format: String = ""): ExtractorLinkType = when {
-        format.equals("hls", ignoreCase = true) || url.contains(".m3u8", ignoreCase = true) -> ExtractorLinkType.M3U8
-        format.equals("dash", ignoreCase = true) || url.contains(".mpd", ignoreCase = true) -> ExtractorLinkType.DASH
-        else -> ExtractorLinkType.VIDEO
+    // CRITICAL FIX: Ensures Cloudstream does not attempt to parse raw MP4 streams as segmented HLS
+    fun linkType(url: String, format: String = ""): ExtractorLinkType {
+        val f = inferFormat(url, format)
+        return when (f) {
+            "hls" -> ExtractorLinkType.M3U8
+            "dash" -> ExtractorLinkType.DASH
+            "mp4", "video" -> ExtractorLinkType.VIDEO
+            else -> ExtractorLinkType.VIDEO
+        }
     }
 
     fun of(label: String): Int {
