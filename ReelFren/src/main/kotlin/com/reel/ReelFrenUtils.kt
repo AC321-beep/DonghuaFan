@@ -155,7 +155,7 @@ object ReelFrenClient {
 
     fun detailApiUrl(slug: String, id: String) = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en&cv=$currentApiVersion"
     
-    // Changed /drama/ to /watch/ to avoid 301 redirects (matching the actual browser URL structure)
+    // Changed to /watch/ to avoid 301 redirects
     fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/watch/${query(slug)}/${query(id)}?lang=en"
     
     fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) = "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&lang=en&server=$server&cv=$currentApiVersion"
@@ -178,14 +178,6 @@ object ReelFrenClient {
             val cookie = ReelFrenStore.cookie(targetHost)
             if (cookie.isNotBlank()) map["Cookie"] = cookie
         }
-        return map
-    }
-
-    // New: Header builder specifically for lightweight Next.js RSC data fetching
-    fun rscHeaders(url: String): Map<String, String> {
-        val map = headers(url, isApiCall = false).toMutableMap()
-        map["Accept"] = "*/*"
-        map["RSC"] = "1" 
         return map
     }
 
@@ -249,39 +241,20 @@ object ReelFrenClient {
 
     suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
-    // Updated Fallback Order: RSC -> HTML -> API
+    // Updated: Stable HTML fetching logic
     suspend fun detail(slug: String, id: String): DetailInfo? {
         val htmlUrl = detailHtmlUrl(slug, id)
+        ReelFrenLog.d("Client.detail", "Fetching stable HTML page...")
         
-        // 1. FASTEST: Fetch the Next.js RSC payload (Lightweight data tree)
-        ReelFrenLog.d("Client.detail", "Fetching fast RSC payload...")
-        val rscPayload = try {
-            spoofedApp.get(htmlUrl, headers = rscHeaders(htmlUrl), timeout = 25L).text
-        } catch (e: Exception) { 
-            ReelFrenLog.t("Client.detail", e)
-            "" 
-        }
-
-        if (rscPayload.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(rscPayload)) {
-            val rscResult = ReelFrenParse.detailHtml(rscPayload, slug, id)
-            if (rscResult != null && rscResult.title.isNotEmpty() && rscResult.videos.isNotEmpty()) {
-                ReelFrenLog.d("Client.detail", "RSC parse successful.")
-                return rscResult
-            }
-        }
-
-        // 2. RELIABLE: Fallback to standard HTML scraper
-        ReelFrenLog.d("Client.detail", "RSC failed or empty. Falling back to indestructible HTML scraper.")
         val htmlStr = get(htmlUrl, isApiCall = false)
         if (!htmlStr.isNullOrEmpty()) {
             val htmlResult = ReelFrenParse.detailHtml(htmlStr, slug, id)
-            if (htmlResult != null && htmlResult.title.isNotEmpty()) {
+            if (htmlResult != null && htmlResult.title.isNotEmpty() && htmlResult.videos.isNotEmpty()) {
                 ReelFrenLog.d("Client.detail", "HTML parse successful.")
                 return htmlResult
             }
         }
         
-        // 3. LAST RESORT: Original API endpoint (in case the site ever re-enables it)
         ReelFrenLog.d("Client.detail", "HTML failed. Attempting API fallback as last resort...")
         val apiUrl = detailApiUrl(slug, id)
         val apiJson = get(apiUrl, isApiCall = true)
@@ -293,7 +266,6 @@ object ReelFrenClient {
             }
         }
         
-        ReelFrenLog.d("Client.detail", "All extraction methods failed for $slug / $id")
         return null
     }
     
@@ -422,19 +394,24 @@ object ReelFrenParse {
         return DetailInfo(id, provider, title, cover, intro, totalEps, videos.sortedBy { it.episode })
     }
 
-    // CRITICAL FIX: Bracket-matching algorithm to surgically extract {"detail": ...} without relying on JSONArray
-    private fun extractJsonObjectFromString(source: String, key: String): String? {
-        val searchStr = "\"$key\":{"
-        val startIndex = source.indexOf(searchStr)
-        if (startIndex == -1) return null
+    // NEW: Bulletproof extractor handles escaped JSON, raw JSON, and optional spaces
+    private fun extractDetailJson(source: String): String? {
+        // 1. Unescape the source string. Converts \"detail\":{ to "detail":{
+        val unescaped = source.replace("\\\"", "\"").replace("\\\\", "\\")
         
-        val objectStart = startIndex + "\"$key\":".length
+        // 2. Regex finds "detail":{ or "detail": { 
+        val regex = Regex("\"detail\"\\s*:\\s*\\{")
+        val match = regex.find(unescaped) ?: return null
+        
+        val objectStart = match.range.last // The index of '{'
+        
         var braceCount = 0
         var isString = false
         var isEscaped = false
         
-        for (i in objectStart until source.length) {
-            val char = source[i]
+        // 3. Bracket matching
+        for (i in objectStart until unescaped.length) {
+            val char = unescaped[i]
             
             if (isEscaped) {
                 isEscaped = false
@@ -457,7 +434,7 @@ object ReelFrenParse {
                 } else if (char == '}') {
                     braceCount--
                     if (braceCount == 0) {
-                        return source.substring(objectStart, i + 1)
+                        return unescaped.substring(objectStart, i + 1)
                     }
                 }
             }
@@ -468,14 +445,10 @@ object ReelFrenParse {
     fun detailHtml(htmlBody: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
         if (htmlBody.isBlank()) return null
         
-        // 1. Unescape the HTML string so we can parse it as normal JSON text
-        val unescapedHtml = htmlBody.replace("\\\"", "\"").replace("\\\\", "\\")
-        
-        // 2. Surgically extract the {"detail": ...} block
-        val rawJsonStr = extractJsonObjectFromString(unescapedHtml, "detail")
+        val rawJsonStr = extractDetailJson(htmlBody)
         
         if (rawJsonStr.isNullOrEmpty()) {
-            ReelFrenLog.d("Parse.detailHtml", "Failed to extract Next.js detail object via bracket matching.")
+            ReelFrenLog.d("Parse.detailHtml", "Failed to extract Next.js detail object.")
             return null
         }
 
