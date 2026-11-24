@@ -153,12 +153,15 @@ object ReelFrenClient {
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
-    fun detailApiUrl(slug: String, id: String) = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en&cv=$currentApiVersion"
+    fun detailApiUrl(slug: String, id: String, includeVersion: Boolean = true): String {
+        val base = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
+        return if (includeVersion && currentApiVersion.isNotBlank()) "$base&cv=$currentApiVersion" else base
+    }
+
+    fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
     
-    // Changed to /watch/ to avoid 301 redirects
-    fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/watch/${query(slug)}/${query(id)}?lang=en"
-    
-    fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) = "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&lang=en&server=$server&cv=$currentApiVersion"
+    fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) = 
+        "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&lang=en&server=$server&cv=$currentApiVersion"
     
     fun searchUrl(slug: String, term: String): String {
         val p = mutableListOf("q=${query(term)}", "lang=en", "cv=$currentApiVersion")
@@ -173,7 +176,9 @@ object ReelFrenClient {
         map["Accept-Language"] = "en-US,en;q=0.9"
         map["Origin"] = ReelFrenConfig.REEL_SITE
         map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
-        if (isApiCall) map["Accept"] = "application/json, text/plain, */*" else map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        if (isApiCall) map["Accept"] = "application/json, text/plain, */*" 
+        else map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        
         if (targetHost == apiHost || targetHost.contains("reelfren.net")) {
             val cookie = ReelFrenStore.cookie(targetHost)
             if (cookie.isNotBlank()) map["Cookie"] = cookie
@@ -204,72 +209,79 @@ object ReelFrenClient {
 
     suspend fun get(url: String, isApiCall: Boolean = true): String? {
         val targetHost = ReelFrenCloudflare.hostOf(url)
-        val isReelFrenApi = targetHost == apiHost || targetHost.contains("reelfren.net")
+        val isReelFrenHost = targetHost == apiHost || targetHost.contains("reelfren.net")
         
-        if (!isReelFrenApi) return try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (e: Exception) { null }
+        if (!isReelFrenHost) {
+            return try { 
+                app.get(url, headers = headers(url, false), timeout = 25L).text 
+            } catch (ce: CancellationException) { throw ce } catch (_: Exception) { null }
+        }
 
         ReelFrenLog.d("Client.get", "Fetching: $url (isApiCall=$isApiCall)")
         var responseText = try { 
             spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
-        } catch (e: Exception) { 
+        } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
             ReelFrenLog.t("Client.get", e) 
             "" 
         }
         
-        if (isApiCall && isVersionError(responseText)) {
-            ReelFrenLog.d("Client.get", "Version error detected on $currentApiVersion. Attempting generic fallback...")
-            val newUrl = url.replace("cv=$currentApiVersion", "")
-            responseText = try { spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text } catch (e: Exception) { "" }
+        if (isApiCall && isVersionError(responseText) && url.contains("cv=")) {
+            ReelFrenLog.d("Client.get", "Version error detected on $currentApiVersion. Retrying without cv...")
+            val newUrl = url.replace(Regex("[?&]cv=[^&]+"), "").replace("?provider=&", "?provider=")
+            responseText = try { 
+                spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text 
+            } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
         }
         
         if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
         ReelFrenLog.d("Client.get", "Falling back to CF Mutex...")
         apiMutex.withLock {
-            responseText = try { spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text } catch (e: Exception) { "" }
+            responseText = try { 
+                spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
+            } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
+            
             if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
             if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) return null
-            val finalResponse = try { spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text } catch (e: Exception) { 
+            val finalResponse = try { 
+                spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
+            } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
                 ReelFrenLog.t("Client.get", e)
                 "" 
             }
-            if (finalResponse.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(finalResponse)) return null
+            if (finalResponse.isEmpty() || ReelFrenCloudflare.isChallengeResponse(finalResponse)) return null
             return finalResponse
         }
     }
 
-    suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
+    suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = 
+        get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
-    // Updated: Stable HTML fetching logic
     suspend fun detail(slug: String, id: String): DetailInfo? {
-        val htmlUrl = detailHtmlUrl(slug, id)
-        ReelFrenLog.d("Client.detail", "Fetching stable HTML page...")
+        val primaryApiJson = get(detailApiUrl(slug, id, includeVersion = true), isApiCall = true)
+        val primaryParsed = primaryApiJson?.let { ReelFrenParse.detailApi(it, slug, id) }
         
-        val htmlStr = get(htmlUrl, isApiCall = false)
-        if (!htmlStr.isNullOrEmpty()) {
-            val htmlResult = ReelFrenParse.detailHtml(htmlStr, slug, id)
-            if (htmlResult != null && htmlResult.title.isNotEmpty() && htmlResult.videos.isNotEmpty()) {
-                ReelFrenLog.d("Client.detail", "HTML parse successful.")
-                return htmlResult
-            }
+        if (primaryParsed != null && primaryParsed.title.isNotEmpty()) {
+            ReelFrenLog.d("Client.detail", "API detail parsed (episodes=${primaryParsed.videos.size}).")
+            return primaryParsed
         }
         
-        ReelFrenLog.d("Client.detail", "HTML failed. Attempting API fallback as last resort...")
-        val apiUrl = detailApiUrl(slug, id)
-        val apiJson = get(apiUrl, isApiCall = true)
-        if (!apiJson.isNullOrEmpty()) {
-            val apiResult = ReelFrenParse.detailApi(apiJson, slug, id)
-            if (apiResult != null && apiResult.title.isNotEmpty()) {
-                ReelFrenLog.d("Client.detail", "API parse successful.")
-                return apiResult
-            }
+        val noCvApiJson = get(detailApiUrl(slug, id, includeVersion = false), isApiCall = true)
+        val noCvParsed = noCvApiJson?.let { ReelFrenParse.detailApi(it, slug, id) }
+        
+        if (noCvParsed != null && noCvParsed.title.isNotEmpty()) {
+            ReelFrenLog.d("Client.detail", "API detail (no-cv) parsed (episodes=${noCvParsed.videos.size}).")
+            return noCvParsed
         }
         
-        return null
+        ReelFrenLog.d("Client.detail", "API parse failed or empty. Falling back to indestructible HTML scraper.")
+        val htmlStr = get(detailHtmlUrl(slug, id), isApiCall = false) ?: return null
+        return ReelFrenParse.detailHtml(htmlStr, slug, id)
     }
     
-    suspend fun search(slug: String, term: String): List<HomeItem> = get(searchUrl(slug, term), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
+    suspend fun search(slug: String, term: String): List<HomeItem> = 
+        get(searchUrl(slug, term), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
     suspend fun playback(slug: String, id: String, ep: Int, serverId: Int): PlaybackInfo? {
         val jsonText = get(videoUrl(slug, id, ep, serverId), isApiCall = true) ?: return null
@@ -300,7 +312,6 @@ object ReelFrenParse {
             val v = clean(obj, key)
             if (v.isNotEmpty()) return v
         }
-
         val it = obj.keys()
         while (it.hasNext()) {
             val key = it.next()
@@ -329,7 +340,6 @@ object ReelFrenParse {
             val arr = obj.optJSONArray(key)
             if (arr != null && arr.length() > 0) return arr
         }
-
         val it = obj.keys()
         while (it.hasNext()) {
             val key = it.next()
@@ -342,10 +352,22 @@ object ReelFrenParse {
         return null
     }
 
+    // CRITICAL FIX: Safe array extraction for search/home that avoids finding the wrong array.
     fun homeItems(body: String): List<HomeItem> {
         if (body.isBlank()) return emptyList()
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
-        val arr = findArrayRecursively(root, "data", "items", "list", "results") ?: return emptyList()
+        
+        val dataObj = root.optJSONObject("data")
+        var arr = root.optJSONArray("data") 
+            ?: dataObj?.optJSONArray("items") 
+            ?: dataObj?.optJSONArray("list") 
+            ?: dataObj?.optJSONArray("results") 
+            ?: root.optJSONArray("items") 
+            ?: root.optJSONArray("list")
+            
+        if (arr == null) {
+            arr = findArrayRecursively(root, "data", "items", "list", "results") ?: return emptyList()
+        }
 
         return (0 until arr.length()).mapNotNull { i ->
             val o = arr.optJSONObject(i) ?: return@mapNotNull null
@@ -353,152 +375,225 @@ object ReelFrenParse {
             val title = clean(o, "title").ifEmpty { clean(o, "name") }
             
             if (id.isEmpty() || title.isEmpty()) null
-            else HomeItem(id = id, provider = clean(o, "provider"), title = title, cover = clean(o, "cover"), intro = clean(o, "intro"), episodes = o.optInt("episodes"))
+            else HomeItem(
+                id = id, 
+                provider = clean(o, "provider"), 
+                title = title, 
+                cover = clean(o, "cover").ifEmpty { clean(o, "poster") }, 
+                intro = clean(o, "intro"), 
+                episodes = o.optInt("episodes")
+            )
         }
+    }
+
+    private fun buildDetailFromJson(root: JSONObject, fallbackSlug: String, fallbackId: String): DetailInfo? {
+        val id = findValueRecursively(root, "id", "dramaId").ifEmpty { fallbackId }
+        val title = findValueRecursively(root, "title", "name", "dramaName")
+        if (title.isEmpty()) return null
+
+        val provider = findValueRecursively(root, "provider").ifEmpty { fallbackSlug }
+        val cover = findValueRecursively(root, "cover", "poster", "imageUrl")
+        val intro = findValueRecursively(root, "intro", "description", "summary")
+
+        val videos = mutableListOf<VideoEntry>()
+        val vArr = findArrayRecursively(root, "videos", "episodes", "list")
+        vArr?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val v = arr.optJSONObject(i) ?: continue
+                val epNum = v.optInt("episode", v.optInt("ep", i + 1)).takeIf { it > 0 } ?: (i + 1)
+                val vid = clean(v, "vid").ifEmpty { clean(v, "id") }.ifEmpty { clean(v, "videoId") }.ifEmpty { "ep_$epNum" }
+                videos += VideoEntry(
+                    episode = epNum,
+                    duration = v.optInt("duration", v.optInt("length")),
+                    vid = vid,
+                    available = v.optBoolean("available", v.optBoolean("is_free", true))
+                )
+            }
+        }
+
+        val parsedTotal = findValueRecursively(root, "episodes", "total_episodes", "numberOfEpisodes").toIntOrNull() ?: 0
+        val totalEps = maxOf(parsedTotal, videos.size)
+
+        if (videos.isEmpty() && totalEps > 0) {
+            for (epNum in 1..totalEps) {
+                videos += VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true)
+            }
+        }
+
+        return DetailInfo(
+            id = id,
+            provider = provider,
+            title = title,
+            cover = cover,
+            intro = intro,
+            episodes = if (totalEps > 0) totalEps else videos.size,
+            videos = videos.distinctBy { it.episode }.sortedBy { it.episode }
+        )
     }
 
     fun detailApi(body: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
         if (body.isBlank()) return null
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
-        
-        val id = findValueRecursively(root, "id", "dramaId").ifEmpty { fallbackId }
-        val title = findValueRecursively(root, "title", "name", "dramaName")
-        
-        if (title.isEmpty()) return null
-        
-        val provider = findValueRecursively(root, "provider").ifEmpty { fallbackSlug }
-        val cover = findValueRecursively(root, "cover", "poster", "imageUrl")
-        val intro = findValueRecursively(root, "intro", "description", "summary")
-        
-        val videos = mutableListOf<VideoEntry>()
-        val vArr = findArrayRecursively(root, "videos", "episodes", "list")
-        
-        vArr?.let { arr ->
-            for (i in 0 until arr.length()) {
-                val v = arr.optJSONObject(i) ?: continue
-                
-                val vid = clean(v, "vid").ifEmpty { clean(v, "id") }.ifEmpty { clean(v, "videoId") }
-                if (vid.isEmpty()) continue
-                
-                videos += VideoEntry(
-                    episode = v.optInt("episode", v.optInt("ep", i + 1)), 
-                    duration = v.optInt("duration", v.optInt("length")), 
-                    vid = vid, 
-                    available = v.optBoolean("available", v.optBoolean("is_free", true))
-                )
-            }
-        }
-        
-        val totalEps = findValueRecursively(root, "episodes", "total_episodes").toIntOrNull() ?: videos.size
-
-        return DetailInfo(id, provider, title, cover, intro, totalEps, videos.sortedBy { it.episode })
+        val candidate = root.optJSONObject("detail") ?: root.optJSONObject("data") ?: root
+        return buildDetailFromJson(candidate, fallbackSlug, fallbackId)
+            ?: buildDetailFromJson(root, fallbackSlug, fallbackId)
     }
 
-    // NEW: Bulletproof extractor handles escaped JSON, raw JSON, and optional spaces
-    private fun extractDetailJson(source: String): String? {
-        // 1. Unescape the source string. Converts \"detail\":{ to "detail":{
-        val unescaped = source.replace("\\\"", "\"").replace("\\\\", "\\")
-        
-        // 2. Regex finds "detail":{ or "detail": { 
-        val regex = Regex("\"detail\"\\s*:\\s*\\{")
-        val match = regex.find(unescaped) ?: return null
-        
-        val objectStart = match.range.last // The index of '{'
-        
-        var braceCount = 0
-        var isString = false
-        var isEscaped = false
-        
-        // 3. Bracket matching
-        for (i in objectStart until unescaped.length) {
-            val char = unescaped[i]
-            
-            if (isEscaped) {
-                isEscaped = false
-                continue
-            }
-            
-            if (char == '\\') {
-                isEscaped = true
-                continue
-            }
-            
-            if (char == '"') {
-                isString = !isString
-                continue
-            }
-            
-            if (!isString) {
-                if (char == '{') {
-                    braceCount++
-                } else if (char == '}') {
-                    braceCount--
-                    if (braceCount == 0) {
-                        return unescaped.substring(objectStart, i + 1)
+    private fun extractAllJsonObjectsForKey(source: String, key: String): List<String> {
+        val results = mutableListOf<String>()
+        val token = "\"$key\":{"
+        var searchFrom = 0
+
+        while (searchFrom < source.length) {
+            val startIndex = source.indexOf(token, searchFrom)
+            if (startIndex == -1) break
+
+            val objectStart = startIndex + token.length - 1
+            var braceCount = 0
+            var isString = false
+            var isEscaped = false
+            var endIndex = -1
+
+            for (i in objectStart until source.length) {
+                val ch = source[i]
+                if (isEscaped) {
+                    isEscaped = false
+                    continue
+                }
+                if (ch == '\\') {
+                    isEscaped = true
+                    continue
+                }
+                if (ch == '"') {
+                    isString = !isString
+                    continue
+                }
+                if (!isString) {
+                    if (ch == '{') {
+                        braceCount++
+                    } else if (ch == '}') {
+                        braceCount--
+                        if (braceCount == 0) {
+                            endIndex = i + 1
+                            break
+                        }
                     }
                 }
             }
+
+            if (endIndex > objectStart) {
+                results += source.substring(objectStart, endIndex)
+                searchFrom = endIndex
+            } else {
+                searchFrom = startIndex + token.length
+            }
         }
-        return null
+        return results
+    }
+
+    private fun unescapeNextPayload(raw: String): String {
+        val sb = StringBuilder(raw.length)
+        var i = 0
+        while (i < raw.length) {
+            val ch = raw[i]
+            if (ch == '\\' && i + 1 < raw.length) {
+                when (val next = raw[i + 1]) {
+                    '"' -> { sb.append('"'); i += 2 }
+                    '\\' -> { sb.append('\\'); i += 2 }
+                    'n' -> { sb.append('\n'); i += 2 }
+                    'r' -> { sb.append('\r'); i += 2 }
+                    't' -> { sb.append('\t'); i += 2 }
+                    'u' -> {
+                        if (i + 5 < raw.length) {
+                            val hex = raw.substring(i + 2, i + 6).toIntOrNull(16)
+                            if (hex != null) {
+                                sb.append(hex.toChar())
+                                i += 6
+                                continue
+                            }
+                        }
+                        sb.append(ch)
+                        i++
+                    }
+                    else -> { sb.append(ch).append(next); i += 2 }
+                }
+            } else {
+                sb.append(ch)
+                i++
+            }
+        }
+        return sb.toString()
     }
 
     fun detailHtml(htmlBody: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
         if (htmlBody.isBlank()) return null
-        
-        val rawJsonStr = extractDetailJson(htmlBody)
-        
-        if (rawJsonStr.isNullOrEmpty()) {
-            ReelFrenLog.d("Parse.detailHtml", "Failed to extract Next.js detail object.")
-            return null
+
+        val candidates = mutableListOf<String>()
+        candidates += extractAllJsonObjectsForKey(htmlBody, "detail")
+        val unescaped = unescapeNextPayload(htmlBody)
+        if (unescaped != htmlBody) {
+            candidates += extractAllJsonObjectsForKey(unescaped, "detail")
         }
 
-        val root = runCatching { JSONObject(rawJsonStr) }.getOrNull()
-        
-        if (root == null) {
-            ReelFrenLog.d("Parse.detailHtml", "Failed to parse extracted JSON object.")
-            return null
-        }
-        
-        val id = findValueRecursively(root, "id", "dramaId").ifEmpty { fallbackId }
-        val title = findValueRecursively(root, "title", "name", "dramaName")
-        
-        if (title.isEmpty()) {
-            ReelFrenLog.d("Parse.detailHtml", "Failed parsing detail. Missing Title in extracted JSON payload.")
-            return null
-        }
-        
-        val provider = findValueRecursively(root, "provider").ifEmpty { fallbackSlug }
-        val cover = findValueRecursively(root, "cover", "poster", "imageUrl")
-        val intro = findValueRecursively(root, "intro", "description", "summary")
-        
-        val videos = mutableListOf<VideoEntry>()
-        val vArr = findArrayRecursively(root, "videos", "episodes", "list")
-        
-        vArr?.let { arr ->
-            for (i in 0 until arr.length()) {
-                val v = arr.optJSONObject(i) ?: continue
-                
-                val vid = clean(v, "vid").ifEmpty { clean(v, "id") }.ifEmpty { clean(v, "videoId") }
-                if (vid.isEmpty()) continue
-                
-                videos += VideoEntry(
-                    episode = v.optInt("episode", v.optInt("ep", i + 1)), 
-                    duration = v.optInt("duration", v.optInt("length")), 
-                    vid = vid, 
-                    available = v.optBoolean("available", v.optBoolean("is_free", true))
-                )
+        for (rawJson in candidates) {
+            val obj = runCatching { JSONObject(rawJson) }.getOrNull() ?: continue
+            val parsed = buildDetailFromJson(obj, fallbackSlug, fallbackId)
+            if (parsed != null && parsed.title.isNotEmpty()) {
+                return parsed
             }
         }
-        
-        val totalEps = findValueRecursively(root, "episodes", "total_episodes").toIntOrNull() ?: videos.size
 
-        return DetailInfo(id, provider, title, cover, intro, totalEps, videos.sortedBy { it.episode })
+        // Deep fallback to raw HTML metadata & tags
+        val ogTitle = Regex("""<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+            .find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+        val pageTitle = Regex("""<title[^>]*>(.*?)</title>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+            .find(htmlBody)?.groupValues?.getOrNull(1)?.substringBefore("|")?.trim().orEmpty()
+        val title = ogTitle.ifEmpty { pageTitle }.replace("Episode 1", "").trim()
+        
+        if (title.isEmpty()) {
+            ReelFrenLog.d("Parse.detailHtml", "Failed to extract Next.js detail object from HTML arrays.")
+            return null
+        }
+
+        val cover = Regex("""<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+            .find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+        val intro = Regex("""<meta[^>]*(?:name=["']description["']|property=["']og:description["'])[^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+            .find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+
+        val epNumbers = Regex("""[?&]ep=(\d+)""").findAll(htmlBody)
+            .mapNotNull { it.groupValues.getOrNull(1)?.toIntOrNull() }
+            .filter { it > 0 }
+            .toMutableSet()
+
+        val chipEps = Regex("""(\d+)(?:<!-- -->)?\s*Episode""", RegexOption.IGNORE_CASE)
+            .find(htmlBody)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        val schemaEps = Regex(""""numberOfEpisodes"\s*:\s*(\d+)""").find(htmlBody)
+            ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        val maxEp = maxOf(chipEps, schemaEps, epNumbers.maxOrNull() ?: 0)
+
+        if (maxEp > 0) {
+            for (n in 1..maxEp) epNumbers += n
+        }
+
+        val videos = epNumbers.sorted().map { epNum ->
+            VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true)
+        }
+
+        return DetailInfo(
+            id = fallbackId,
+            provider = fallbackSlug,
+            title = title,
+            cover = cover,
+            intro = intro.replace(Regex("""Watch Now: .*? as a free short drama on ReelFren."""), "").trim(),
+            episodes = maxOf(maxEp, videos.size),
+            videos = videos
+        )
     }
 
     fun playback(body: String, requestedServerId: Int): PlaybackInfo? {
         if (body.isBlank()) return null
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
-        
+
         val qualities = mutableListOf<QualityEntry>()
         val subs = mutableListOf<SubtitleEntry>()
 
@@ -510,7 +605,11 @@ object ReelFrenParse {
                 val url = firstNonEmpty(q, "url", "src", "file", "videoUrl")
                 if (url.isNotEmpty()) {
                     val explicitFormat = clean(q, "format")
-                    qualities += QualityEntry(label = firstNonEmpty(q, "label", "quality", "name", "resolution").ifEmpty { "Auto" }, url = url, format = explicitFormat)
+                    qualities += QualityEntry(
+                        label = firstNonEmpty(q, "label", "quality", "name", "resolution").ifEmpty { "Auto" },
+                        url = url,
+                        format = explicitFormat
+                    )
                 }
                 collectSubtitlesFromNode(q, subs)
             }
@@ -518,9 +617,9 @@ object ReelFrenParse {
 
         val direct = findValueRecursively(root, "videoUrl", "url", "streamUrl", "playUrl", "m3u8", "src")
         if (direct.isNotEmpty() && qualities.none { it.url == direct }) {
-            qualities.add(0, QualityEntry("Auto", direct, ReelFrenQuality.inferFormat(direct)))
+            qualities.add(0, QualityEntry("Auto", direct, ""))
         }
-        
+
         if (qualities.isEmpty()) return null
 
         collectSubtitlesFromNode(root, subs)
@@ -764,7 +863,7 @@ object ReelFrenSubtitles {
     }
 
     private suspend fun extractHlsSubs(m3u8Url: String): List<SubtitleFile> {
-        val manifest = try { app.get(m3u8Url, headers = ReelFrenClient.headers(m3u8Url)).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { return emptyList() }
+        val manifest = try { app.get(m3u8Url, headers = ReelFrenClient.headers(m3u8Url)).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { return emptyList() }
         val result = mutableListOf<SubtitleFile>()
         for (m in mediaRegex.findAll(manifest)) {
             val line = m.groupValues.getOrNull(1).orEmpty()
@@ -782,7 +881,7 @@ object ReelFrenSubtitles {
     }
 
     private suspend fun resolveSubtitleM3u8ToDirectFile(subM3u8Url: String): String? {
-        val subManifest = try { app.get(subM3u8Url, headers = ReelFrenClient.headers(subM3u8Url)).text } catch (ce: CancellationException) { throw ce } catch (e: Exception) { return null }
+        val subManifest = try { app.get(subM3u8Url, headers = ReelFrenClient.headers(subM3u8Url)).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { return null }
         val segments = subManifest.lineSequence().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }.toList()
         if (segments.isEmpty()) return null
         if (segments.size == 1) return resolveRelativeUrl(subM3u8Url, segments[0]).ifBlank { null }
@@ -894,23 +993,18 @@ object ReelFrenQuality {
 
     fun label(raw: String) = raw.trim().ifEmpty { "Auto" }
 
-    fun inferFormat(url: String, explicitFormat: String = ""): String {
-        val cleanFormat = explicitFormat.trim().lowercase(Locale.ROOT)
-        if (cleanFormat.isNotEmpty()) return cleanFormat
-        return when {
-            url.contains(".m3u8", ignoreCase = true) -> "hls"
-            url.contains(".mpd", ignoreCase = true)  -> "dash"
-            url.contains(".mp4", ignoreCase = true) || url.contains("mime_type=video_mp4", ignoreCase = true) -> "mp4"
-            else -> "video"
+    // CRITICAL FIX: Robust stream format detection that overrides deceptive 'mp4' flags for Volcengine CDN
+    fun linkType(url: String, explicitFormat: String = ""): ExtractorLinkType {
+        val lowerUrl = url.lowercase(Locale.ROOT)
+        if (lowerUrl.contains(".m3u8") || (lowerUrl.contains("&rc=") && lowerUrl.contains("mime_type=video_mp4"))) {
+            return ExtractorLinkType.M3U8
         }
-    }
-
-    fun linkType(url: String, format: String = ""): ExtractorLinkType {
-        val f = inferFormat(url, format)
-        return when (f) {
-            "hls" -> ExtractorLinkType.M3U8
-            "dash" -> ExtractorLinkType.DASH
-            "mp4", "video" -> ExtractorLinkType.VIDEO
+        if (lowerUrl.contains(".mpd")) {
+            return ExtractorLinkType.DASH
+        }
+        return when (explicitFormat.trim().lowercase(Locale.ROOT)) {
+            "hls", "m3u8" -> ExtractorLinkType.M3U8
+            "dash", "mpd" -> ExtractorLinkType.DASH
             else -> ExtractorLinkType.VIDEO
         }
     }
