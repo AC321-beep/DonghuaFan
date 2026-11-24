@@ -95,10 +95,15 @@ class ReelFrenProvider : MainAPI() {
         cachedSearchResults = emptyList()
         cachedSearchTime = now
 
-        val deferredSearches = activeProviders.map { slug ->
+        // CRITICAL FIX: To prevent Cloudflare/API rate limiting on search, we only query the top 3 enabled providers 
+        // initially, and let the rest resolve in the background without holding up the UI.
+        val primaryProviders = activeProviders.take(3)
+        val secondaryProviders = activeProviders.drop(3)
+
+        val primarySearches = primaryProviders.map { slug ->
             bgSearchScope.async {
-                val items: List<HomeItem> = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
-                items.mapNotNull { item: HomeItem ->
+                val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
+                items.mapNotNull { item ->
                     if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
                     val actualSlug = item.provider.ifEmpty { "all_dramas" }
                     newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
@@ -112,25 +117,41 @@ class ReelFrenProvider : MainAPI() {
         val fastResults = mutableListOf<SearchResponse>()
         
         try {
-            // Increased timeout to 5s to ensure searches have enough time to bypass Cloudflare if needed
             withTimeout(5000L) {
-                fastResults.addAll(deferredSearches.awaitAll().flatten())
+                fastResults.addAll(primarySearches.awaitAll().flatten())
             }
         } catch (e: TimeoutCancellationException) {
-            val completed = deferredSearches.filter { it.isCompleted && !it.isCancelled }.flatMap { it.getCompleted() }
+            val completed = primarySearches.filter { it.isCompleted && !it.isCancelled }.flatMap { it.getCompleted() }
             fastResults.addAll(completed)
-            ReelFrenLog.d("Main/search", "Timeout hit. Returning ${completed.size} fast results.")
+            ReelFrenLog.d("Main/search", "Timeout hit on primary search. Returning ${completed.size} fast results.")
         }
 
         val distinctFast = fastResults.distinctBy { it.url }
         cachedSearchResults = distinctFast
 
+        // Fire off the rest of the providers in the background to populate the cache for later
         bgSearchScope.launch {
-            val allLateResults = deferredSearches.awaitAll().flatten().distinctBy { it.url }
+            val secondarySearches = secondaryProviders.map { slug ->
+                async {
+                    val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
+                    items.mapNotNull { item ->
+                        if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
+                        val actualSlug = item.provider.ifEmpty { "all_dramas" }
+                        newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
+                            this.posterUrl = ReelFrenClient.absUrl(item.cover)
+                            this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
+                        }
+                    }
+                }
+            }
+            
+            val allSecondary = secondarySearches.awaitAll().flatten()
+            val allResults = (distinctFast + allSecondary).distinctBy { it.url }
+            
             if (cachedSearchQuery == cleanQuery) {
-                cachedSearchResults = allLateResults
-                if (allLateResults.size > distinctFast.size) {
-                    ReelFrenLog.d("Main/search", "Background cache silently grew from ${distinctFast.size} to ${allLateResults.size} items")
+                cachedSearchResults = allResults
+                if (allResults.size > distinctFast.size) {
+                    ReelFrenLog.d("Main/search", "Background cache expanded to ${allResults.size} items")
                 }
             }
         }
@@ -157,6 +178,7 @@ class ReelFrenProvider : MainAPI() {
                         this.name = "Episode ${v.episode}"
                         this.episode = v.episode
                         this.posterUrl = coverUrl
+                        this.posterHeaders = coverHeaders
                     }
                 }
             ) {
@@ -213,7 +235,7 @@ class ReelFrenProvider : MainAPI() {
                                 url = qUrl,
                                 referer = "${ReelFrenConfig.REEL_SITE}/", 
                                 quality = ReelFrenQuality.of(q.label),
-                                type = ReelFrenQuality.linkType(qUrl, q.format), // CRITICAL FIX: Safe inference overrides false 'mp4' flags
+                                type = ReelFrenQuality.linkType(qUrl, q.format),
                                 headers = ReelFrenClient.videoHeaders(qUrl)
                             )
                             
