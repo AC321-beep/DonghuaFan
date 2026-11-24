@@ -67,6 +67,7 @@ class ReelFrenProvider : MainAPI() {
             
             newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
                 this.posterUrl = ReelFrenClient.absUrl(item.cover)
+                // Proxy URLs are decoded, now ensure headers are passed to prevent CoilImgLoader 403s
                 this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
             }
         }
@@ -96,24 +97,47 @@ class ReelFrenProvider : MainAPI() {
         cachedSearchResults = emptyList()
         cachedSearchTime = now
 
-        // Exclude the 'all_dramas' slug which throws 400 errors from the API
+        // CRITICAL FIX: Only search 2 valid providers initially to prevent CF rate limiting blocks on the UI thread
         val validProviders = activeProviders.filter { it != "all_dramas" }
         if (validProviders.isEmpty()) return emptyList()
 
-        // Use standard concurrent awaiting without complex split logic
-        val allResults = mutableListOf<SearchResponse>()
-        
-        coroutineScope {
-            val deferredSearches = validProviders.map { slug ->
-                async {
-                    val items = try { 
-                        ReelFrenClient.search(slug, cleanQuery) 
-                    } catch (e: CancellationException) { 
-                        emptyList() 
-                    } catch (e: Exception) { 
-                        emptyList() 
+        val primaryProviders = validProviders.take(2)
+        val secondaryProviders = validProviders.drop(2)
+
+        val primarySearches = primaryProviders.map { slug ->
+            bgSearchScope.async {
+                val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
+                items.mapNotNull { item ->
+                    if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
+                    val actualSlug = item.provider.ifEmpty { slug }
+                    newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
+                        this.posterUrl = ReelFrenClient.absUrl(item.cover)
+                        this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
                     }
-                    
+                }
+            }
+        }
+
+        val fastResults = mutableListOf<SearchResponse>()
+        
+        try {
+            withTimeout(3500L) { // Reduced timeout prevents UI hanging if CF Mutex locks
+                fastResults.addAll(primarySearches.awaitAll().flatten())
+            }
+        } catch (e: TimeoutCancellationException) {
+            val completed = primarySearches.filter { it.isCompleted && !it.isCancelled }.flatMap { it.getCompleted() }
+            fastResults.addAll(completed)
+            ReelFrenLog.d("Main/search", "Timeout hit on primary search. Returning ${completed.size} fast results.")
+        }
+
+        val distinctFast = fastResults.distinctBy { it.url }
+        cachedSearchResults = distinctFast
+
+        // Execute remaining provider searches completely silently in the background
+        bgSearchScope.launch {
+            val secondarySearches = secondaryProviders.map { slug ->
+                async {
+                    val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
                     items.mapNotNull { item ->
                         if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
                         val actualSlug = item.provider.ifEmpty { slug }
@@ -124,14 +148,19 @@ class ReelFrenProvider : MainAPI() {
                     }
                 }
             }
-            allResults.addAll(deferredSearches.awaitAll().flatten())
+            
+            val allSecondary = secondarySearches.awaitAll().flatten()
+            val allResults = (distinctFast + allSecondary).distinctBy { it.url }
+            
+            if (cachedSearchQuery == cleanQuery) {
+                cachedSearchResults = allResults
+                if (allResults.size > distinctFast.size) {
+                    ReelFrenLog.d("Main/search", "Background cache expanded to ${allResults.size} items")
+                }
+            }
         }
 
-        val distinctResults = allResults.distinctBy { it.url }
-        cachedSearchResults = distinctResults
-        ReelFrenLog.d("Main/search", "Search complete. Found ${distinctResults.size} total results.")
-        
-        return distinctResults
+        return distinctFast
     }
 
     override suspend fun load(url: String): LoadResponse? {
