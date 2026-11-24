@@ -23,6 +23,7 @@ import okhttp3.TlsVersion
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
+import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -187,7 +188,6 @@ object ReelFrenClient {
         return "${apiBase()}/api/search?${p.joinToString("&")}"
     }
 
-    // CRITICAL FIX: Inject Chrome Sec-Headers to bypass CF on raw HTML routes
     fun headers(url: String, isApiCall: Boolean = false): Map<String, String> {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val map = linkedMapOf<String, String>()
@@ -491,9 +491,6 @@ object ReelFrenParse {
             ?: buildDetailFromJson(root, fallbackSlug, fallbackId)
     }
 
-    // 1. JSON-LD Extractor
-    // 2. Next.js App Router Array Extractor
-    // 3. Raw HTML Regex Extractor
     fun detailHtml(htmlBody: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
         if (htmlBody.isBlank()) return null
 
