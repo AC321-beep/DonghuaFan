@@ -153,7 +153,9 @@ object ReelFrenClient {
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
-    fun detailUrl(slug: String, id: String) = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en&cv=$currentApiVersion"
+    // CRITICAL FIX: Detail endpoint now scrapes the Next.js HTML page directly, bypassing the dead API.
+    fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
+    
     fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) = "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&lang=en&server=$server&cv=$currentApiVersion"
     
     fun searchUrl(slug: String, term: String): String {
@@ -169,7 +171,7 @@ object ReelFrenClient {
         map["Accept-Language"] = "en-US,en;q=0.9"
         map["Origin"] = ReelFrenConfig.REEL_SITE
         map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
-        if (isApiCall) map["Accept"] = "application/json, text/plain, */*" else map["Accept"] = "*/*"
+        if (isApiCall) map["Accept"] = "application/json, text/plain, */*" else map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         if (targetHost == apiHost || targetHost.contains("reelfren.net")) {
             val cookie = ReelFrenStore.cookie(targetHost)
             if (cookie.isNotBlank()) map["Cookie"] = cookie
@@ -198,51 +200,52 @@ object ReelFrenClient {
         return lower.contains("version") && (lower.contains("update") || lower.contains("invalid") || lower.contains("deprecated"))
     }
 
-    suspend fun get(url: String): String? {
+    suspend fun get(url: String, isApiCall: Boolean = true): String? {
         val targetHost = ReelFrenCloudflare.hostOf(url)
-        val isReelFrenApi = targetHost == apiHost
+        val isReelFrenApi = targetHost == apiHost || targetHost.contains("reelfren.net")
         
         if (!isReelFrenApi) return try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (e: Exception) { null }
 
-        ReelFrenLog.d("Client.get", "Fetching API: $url")
-        var jsonText = try { 
-            spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text 
+        ReelFrenLog.d("Client.get", "Fetching: $url (isApiCall=$isApiCall)")
+        var responseText = try { 
+            spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
         } catch (e: Exception) { 
             ReelFrenLog.t("Client.get", e) 
             "" 
         }
         
-        if (isVersionError(jsonText)) {
+        if (isApiCall && isVersionError(responseText)) {
             ReelFrenLog.d("Client.get", "Version error detected on $currentApiVersion. Attempting generic fallback...")
             val newUrl = url.replace("cv=$currentApiVersion", "")
-            jsonText = try { spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text } catch (e: Exception) { "" }
+            responseText = try { spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text } catch (e: Exception) { "" }
         }
         
-        if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) return jsonText
+        if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
         ReelFrenLog.d("Client.get", "Falling back to CF Mutex...")
         apiMutex.withLock {
-            jsonText = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (e: Exception) { "" }
-            if (jsonText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(jsonText)) return jsonText
+            responseText = try { spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text } catch (e: Exception) { "" }
+            if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
             if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) return null
-            val finalJson = try { spoofedApp.get(url, headers = headers(url, true), timeout = 25L).text } catch (e: Exception) { 
+            val finalResponse = try { spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text } catch (e: Exception) { 
                 ReelFrenLog.t("Client.get", e)
                 "" 
             }
-            if (finalJson.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(finalJson)) return null
-            return finalJson
+            if (finalResponse.isNullOrEmpty() || ReelFrenCloudflare.isChallengeResponse(finalResponse)) return null
+            return finalResponse
         }
     }
 
-    suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = get(homeUrl(slug, category, page))?.let(ReelFrenParse::homeItems) ?: emptyList()
+    suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
-    suspend fun detail(slug: String, id: String): DetailInfo? = get(detailUrl(slug, id))?.let { ReelFrenParse.detail(it, slug, id) }
+    // CRITICAL FIX: Fetch HTML page and parse SSR JSON payload
+    suspend fun detail(slug: String, id: String): DetailInfo? = get(detailHtmlUrl(slug, id), isApiCall = false)?.let { ReelFrenParse.detailHtml(it, slug, id) }
     
-    suspend fun search(slug: String, term: String): List<HomeItem> = get(searchUrl(slug, term))?.let(ReelFrenParse::homeItems) ?: emptyList()
+    suspend fun search(slug: String, term: String): List<HomeItem> = get(searchUrl(slug, term), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
     suspend fun playback(slug: String, id: String, ep: Int, serverId: Int): PlaybackInfo? {
-        val jsonText = get(videoUrl(slug, id, ep, serverId)) ?: return null
+        val jsonText = get(videoUrl(slug, id, ep, serverId), isApiCall = true) ?: return null
         return ReelFrenParse.playback(jsonText, serverId)
     }
     
@@ -265,7 +268,6 @@ object ReelFrenParse {
     private val SUB_LANG_KEYS = arrayOf("lang", "srclang", "srcLang", "language", "code", "locale", "langCode", "iso", "languageCode", "name")
     private val SUB_LABEL_KEYS = arrayOf("label", "name", "title", "display", "langName", "language")
 
-    // RECURSIVE SCANNER: Finds a specific key anywhere in the JSON tree
     private fun findValueRecursively(obj: JSONObject, vararg keysToFind: String): String {
         for (key in keysToFind) {
             val v = clean(obj, key)
@@ -295,7 +297,6 @@ object ReelFrenParse {
         return ""
     }
 
-    // RECURSIVE SCANNER: Finds a specific array anywhere in the JSON tree
     private fun findArrayRecursively(obj: JSONObject, vararg keysToFind: String): JSONArray? {
         for (key in keysToFind) {
             val arr = obj.optJSONArray(key)
@@ -329,16 +330,27 @@ object ReelFrenParse {
         }
     }
 
-    fun detail(body: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
-        if (body.isBlank()) return null
-        val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
+    // CRITICAL FIX: Extracts the Next.js SSR state array from the raw HTML page
+    fun detailHtml(htmlBody: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
+        if (htmlBody.isBlank()) return null
         
-        // Let the recursive scanner find the data, no matter where it is hidden.
+        // Find the self.__next_f.push string containing the detail object
+        val match = Regex("""\\"detail\\":(\{.*?\})""").find(htmlBody) 
+            ?: Regex("""\"detail\":(\{.*?\})""").find(htmlBody)
+            
+        if (match == null) {
+            ReelFrenLog.d("Parse.detailHtml", "Failed to extract Next.js detail object from HTML.")
+            return null
+        }
+
+        val rawJsonStr = match.groupValues[1].replace("\\\"", "\"").replace("\\\\", "\\")
+        val root = runCatching { JSONObject(rawJsonStr) }.getOrNull() ?: return null
+        
         val id = findValueRecursively(root, "id", "dramaId").ifEmpty { fallbackId }
         val title = findValueRecursively(root, "title", "name", "dramaName")
         
         if (title.isEmpty()) {
-            ReelFrenLog.d("Parse.detail", "Failed parsing detail. Missing Title in JSON payload.")
+            ReelFrenLog.d("Parse.detailHtml", "Failed parsing detail. Missing Title in extracted JSON payload.")
             return null
         }
         
