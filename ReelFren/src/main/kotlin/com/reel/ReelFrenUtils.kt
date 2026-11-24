@@ -2,6 +2,7 @@ package com.reel
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Base64
 import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.WebSettings
@@ -25,7 +26,6 @@ import java.net.URI
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
-import android.util.Base64
 
 // ----------------------------------------------------------------------
 // DATA MODELS
@@ -301,13 +301,8 @@ object ReelFrenClient {
         return ReelFrenParse.playback(jsonText, serverId)
     }
     
-    fun absUrl(value: String): String {
-        val clean = value.trim()
-        if (clean.isEmpty()) return ""
-        if (clean.startsWith("https://", true) || clean.startsWith("http://", true)) return clean
-        if (clean.startsWith("//")) return "https:$clean"
-        val base = apiBase()
-        
+    fun decodeProxyUrl(rawUrl: String): String {
+        val clean = rawUrl.trim()
         if (clean.contains("go.nunodrama.my.id/p/telegram_")) {
             try {
                 val encodedPart = clean.substringAfterLast("/")
@@ -317,10 +312,18 @@ object ReelFrenClient {
                     return decodedUrl
                 }
             } catch (e: Exception) {
-                // Ignore parsing exceptions, fallback to normal mapping
+                // Ignore fallback to raw
             }
         }
-        
+        return clean
+    }
+
+    fun absUrl(value: String): String {
+        val clean = decodeProxyUrl(value.trim())
+        if (clean.isEmpty()) return ""
+        if (clean.startsWith("https://", true) || clean.startsWith("http://", true)) return clean
+        if (clean.startsWith("//")) return "https:$clean"
+        val base = apiBase()
         return if (clean.startsWith("/")) "$base$clean" else "$base/$clean"
     }
 }
@@ -390,6 +393,7 @@ object ReelFrenParse {
             ?: dataObj?.optJSONArray("results") 
             ?: root.optJSONArray("items") 
             ?: root.optJSONArray("list")
+            ?: root.optJSONArray("results")
             
         if (arr == null) {
             arr = findArrayRecursively(root, "data", "items", "list", "results") ?: return emptyList()
@@ -412,21 +416,17 @@ object ReelFrenParse {
         }
     }
 
-    fun detailApi(body: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
-        if (body.isBlank()) return null
-        val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
-        val candidate = root.optJSONObject("detail") ?: root.optJSONObject("data") ?: root
-
-        val id = findValueRecursively(candidate, "id", "dramaId").ifEmpty { fallbackId }
-        val title = findValueRecursively(candidate, "title", "name", "dramaName")
+    private fun buildDetailFromJson(root: JSONObject, fallbackSlug: String, fallbackId: String): DetailInfo? {
+        val id = findValueRecursively(root, "id", "dramaId").ifEmpty { fallbackId }
+        val title = findValueRecursively(root, "title", "name", "dramaName")
         if (title.isEmpty()) return null
 
-        val provider = findValueRecursively(candidate, "provider").ifEmpty { fallbackSlug }
-        val cover = ReelFrenClient.absUrl(findValueRecursively(candidate, "cover", "poster", "imageUrl"))
-        val intro = findValueRecursively(candidate, "intro", "description", "summary")
+        val provider = findValueRecursively(root, "provider").ifEmpty { fallbackSlug }
+        val cover = ReelFrenClient.absUrl(findValueRecursively(root, "cover", "poster", "imageUrl"))
+        val intro = findValueRecursively(root, "intro", "description", "summary")
 
         val videos = mutableListOf<VideoEntry>()
-        val vArr = findArrayRecursively(candidate, "videos", "episodes", "list")
+        val vArr = findArrayRecursively(root, "videos", "episodes", "list")
         vArr?.let { arr ->
             for (i in 0 until arr.length()) {
                 val v = arr.optJSONObject(i) ?: continue
@@ -441,7 +441,7 @@ object ReelFrenParse {
             }
         }
 
-        val parsedTotal = findValueRecursively(candidate, "episodes", "total_episodes", "numberOfEpisodes").toIntOrNull() ?: 0
+        val parsedTotal = findValueRecursively(root, "episodes", "total_episodes", "numberOfEpisodes").toIntOrNull() ?: 0
         val totalEps = maxOf(parsedTotal, videos.size)
 
         if (videos.isEmpty() && totalEps > 0) {
@@ -461,11 +461,18 @@ object ReelFrenParse {
         )
     }
 
+    fun detailApi(body: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
+        if (body.isBlank()) return null
+        val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
+        val candidate = root.optJSONObject("detail") ?: root.optJSONObject("data") ?: root
+        return buildDetailFromJson(candidate, fallbackSlug, fallbackId)
+            ?: buildDetailFromJson(root, fallbackSlug, fallbackId)
+    }
+
     fun detailHtml(htmlBody: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
         if (htmlBody.isBlank()) return null
         
-        // Pure Regex fallback extraction that bypasses all JSON parsing attempts.
-        // This makes it completely immune to Next.js nesting changes or malformed JSON payloads.
+        // Deep Regex string-extraction fallback that bypasses all JSON parsing attempts.
 
         val ogTitle = Regex("""<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             .find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
