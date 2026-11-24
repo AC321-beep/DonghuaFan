@@ -131,6 +131,7 @@ class WebViewCookieJar : CookieJar {
 
 object ReelFrenClient {
     const val GLOBAL_MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    const val FALLBACK_UA = GLOBAL_MOBILE_UA // <-- Restored Constant
     
     private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
@@ -198,7 +199,8 @@ object ReelFrenClient {
         if (isApiCall) {
             map["Accept"] = "application/json, text/plain, */*" 
         } else {
-            map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+            // WAF bypass headers to prevent Cloudflare from resetting the TLS connection on spoofedApp
+            map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
             map["sec-ch-ua"] = "\"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\", \"Not-A.Brand\";v=\"99\""
             map["sec-ch-ua-mobile"] = "?0"
             map["sec-ch-ua-platform"] = "\"Windows\""
@@ -245,7 +247,7 @@ object ReelFrenClient {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val isReelFrenHost = targetHost == apiHost || targetHost.contains("reelfren.net")
         
-        ReelFrenLog.d("Client.get", "=> REQUEST: $url | API=$isApiCall | Host=$targetHost")
+        ReelFrenLog.d("Client.get", "[GET INIT] url=$url isApiCall=$isApiCall")
 
         if (!isReelFrenHost) {
             return try { spoofedApp.get(url, headers = headers(url, false), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { null }
@@ -282,7 +284,7 @@ object ReelFrenClient {
                 return null
             }
             
-            delay(500L)
+            delay(500L) // Crucial delay for CookieManager.flush() to write before OkHttp reads
             
             val finalResponse = try { 
                 val r = spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L)
