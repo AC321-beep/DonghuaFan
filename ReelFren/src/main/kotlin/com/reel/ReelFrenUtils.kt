@@ -154,7 +154,9 @@ object ReelFrenClient {
     }
 
     fun detailApiUrl(slug: String, id: String) = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en&cv=$currentApiVersion"
-    fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
+    
+    // Changed /drama/ to /watch/ to avoid 301 redirects (matching the actual browser URL structure)
+    fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/watch/${query(slug)}/${query(id)}?lang=en"
     
     fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) = "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&lang=en&server=$server&cv=$currentApiVersion"
     
@@ -176,6 +178,14 @@ object ReelFrenClient {
             val cookie = ReelFrenStore.cookie(targetHost)
             if (cookie.isNotBlank()) map["Cookie"] = cookie
         }
+        return map
+    }
+
+    // New: Header builder specifically for lightweight Next.js RSC data fetching
+    fun rscHeaders(url: String): Map<String, String> {
+        val map = headers(url, isApiCall = false).toMutableMap()
+        map["Accept"] = "*/*"
+        map["RSC"] = "1" 
         return map
     }
 
@@ -239,10 +249,42 @@ object ReelFrenClient {
 
     suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
+    // Updated Fallback Order: RSC -> HTML -> API
     suspend fun detail(slug: String, id: String): DetailInfo? {
+        val htmlUrl = detailHtmlUrl(slug, id)
+        
+        // 1. FASTEST: Fetch the Next.js RSC payload (Lightweight data tree)
+        ReelFrenLog.d("Client.detail", "Fetching fast RSC payload...")
+        val rscPayload = try {
+            spoofedApp.get(htmlUrl, headers = rscHeaders(htmlUrl), timeout = 25L).text
+        } catch (e: Exception) { 
+            ReelFrenLog.t("Client.detail", e)
+            "" 
+        }
+
+        if (rscPayload.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(rscPayload)) {
+            val rscResult = ReelFrenParse.detailHtml(rscPayload, slug, id)
+            if (rscResult != null && rscResult.title.isNotEmpty() && rscResult.videos.isNotEmpty()) {
+                ReelFrenLog.d("Client.detail", "RSC parse successful.")
+                return rscResult
+            }
+        }
+
+        // 2. RELIABLE: Fallback to standard HTML scraper
+        ReelFrenLog.d("Client.detail", "RSC failed or empty. Falling back to indestructible HTML scraper.")
+        val htmlStr = get(htmlUrl, isApiCall = false)
+        if (!htmlStr.isNullOrEmpty()) {
+            val htmlResult = ReelFrenParse.detailHtml(htmlStr, slug, id)
+            if (htmlResult != null && htmlResult.title.isNotEmpty()) {
+                ReelFrenLog.d("Client.detail", "HTML parse successful.")
+                return htmlResult
+            }
+        }
+        
+        // 3. LAST RESORT: Original API endpoint (in case the site ever re-enables it)
+        ReelFrenLog.d("Client.detail", "HTML failed. Attempting API fallback as last resort...")
         val apiUrl = detailApiUrl(slug, id)
         val apiJson = get(apiUrl, isApiCall = true)
-        
         if (!apiJson.isNullOrEmpty()) {
             val apiResult = ReelFrenParse.detailApi(apiJson, slug, id)
             if (apiResult != null && apiResult.title.isNotEmpty()) {
@@ -251,10 +293,8 @@ object ReelFrenClient {
             }
         }
         
-        ReelFrenLog.d("Client.detail", "API parse failed or empty. Falling back to indestructible HTML scraper.")
-        val htmlUrl = detailHtmlUrl(slug, id)
-        val htmlStr = get(htmlUrl, isApiCall = false) ?: return null
-        return ReelFrenParse.detailHtml(htmlStr, slug, id)
+        ReelFrenLog.d("Client.detail", "All extraction methods failed for $slug / $id")
+        return null
     }
     
     suspend fun search(slug: String, term: String): List<HomeItem> = get(searchUrl(slug, term), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
