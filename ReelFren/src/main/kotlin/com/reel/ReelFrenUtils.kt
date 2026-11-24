@@ -128,7 +128,9 @@ class WebViewCookieJar : CookieJar {
 }
 
 object ReelFrenClient {
-    const val FALLBACK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    // CRITICAL FIX: Restored GLOBAL_MOBILE_UA constant to resolve compilation error in ReelFrenCloudflare.kt
+    const val GLOBAL_MOBILE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    const val FALLBACK_UA = GLOBAL_MOBILE_UA
     
     private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
@@ -170,7 +172,6 @@ object ReelFrenClient {
         return if (includeVersion && currentApiVersion.isNotBlank()) "$base&cv=$currentApiVersion" else base
     }
 
-    // CRITICAL FIX: Explicitly removed ?lang=en to prevent Next.js stripping the RSC payload
     fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}"
     
     fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) = 
@@ -229,7 +230,8 @@ object ReelFrenClient {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val isReelFrenHost = targetHost == apiHost || targetHost.contains("reelfren.net")
         
-        ReelFrenLog.d("Client.get", "[GET INIT] url=$url isApi=$isReelFrenApi")
+        // CRITICAL FIX: Changed variable reference from isReelFrenApi to isReelFrenHost
+        ReelFrenLog.d("Client.get", "[GET INIT] url=$url isApi=$isReelFrenHost")
 
         if (!isReelFrenHost) {
             return try { app.get(url, headers = headers(url, false), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { null }
@@ -569,13 +571,11 @@ object ReelFrenParse {
             }
         }
 
-        // Deep fallback to raw HTML metadata & tags
         val ogTitle = Regex("""<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             .find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
         val pageTitle = Regex("""<title[^>]*>(.*?)</title>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
             .find(htmlBody)?.groupValues?.getOrNull(1)?.substringBefore("|")?.trim().orEmpty()
-        val title = ogTitle.ifEmpty { pageTitle }.replace("Episode 1", "").trim()
-        
+        val title = ogTitle.ifEmpty { pageTitle }
         if (title.isEmpty()) {
             ReelFrenLog.d("Parse.detailHtml", "Failed to extract Next.js detail object from HTML arrays.")
             return null
@@ -610,7 +610,7 @@ object ReelFrenParse {
             provider = fallbackSlug,
             title = title,
             cover = cover,
-            intro = intro.replace(Regex("""Watch Now: .*? as a free short drama on ReelFren."""), "").trim(),
+            intro = intro,
             episodes = maxOf(maxEp, videos.size),
             videos = videos
         )
@@ -827,25 +827,25 @@ object ReelFrenSubtitles {
     private fun resolveDisplayLabel(rawLang: String, rawLabel: String): String {
         val nLang = normalizeLang(rawLang)
         var finalLang = nLang
-
+        
         if (nLang == "und") {
             finalLang = normalizeLang(rawLabel)
         }
-
+        
         val fullLangName = langLabel(finalLang)
-
+        
         if (fullLangName != "Unknown") {
             return fullLangName
         }
-
+        
         val cleaned = rawLabel.trim()
-
+        
         if (cleaned.isEmpty()) {
             return "English"
         }
-
-        return cleaned.replaceFirstChar {
-            if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString()
+        
+        return cleaned.replaceFirstChar { 
+            if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() 
         }
     }
 
@@ -935,7 +935,7 @@ object ReelFrenStore {
 
     @Volatile private var storePrefs: SharedPreferences? = null
     @Volatile private var providerPrefs: SharedPreferences? = null
-
+    
     private val memoryUa = ConcurrentHashMap<String, String>()
     private val memoryCookies = ConcurrentHashMap<String, String>()
     private val wvVersionRegex = Regex("""Version/\d+\.\d+\s*""")
@@ -1021,7 +1021,7 @@ object ReelFrenStore {
 
     fun recordPrewarmResult(success: Boolean) {
         val editor = storePrefs?.edit() ?: return
-        if (success) { editor.putLong("prewarm_last_fail", 0L); editor.putInt("prewarm_fail_count", 0) }
+        if (success) { editor.putLong("prewarm_last_fail", 0L); editor.putInt("prewarm_fail_count", 0) } 
         else { val count = (storePrefs?.getInt("prewarm_fail_count", 0) ?: 0) + 1; editor.putLong("prewarm_last_fail", System.currentTimeMillis()); editor.putInt("prewarm_fail_count", count) }
         editor.apply()
     }
@@ -1036,18 +1036,28 @@ object ReelFrenQuality {
 
     fun label(raw: String) = raw.trim().ifEmpty { "Auto" }
 
-    fun inferFormat(url: String): String = when {
-        url.contains("melolostatic.com", ignoreCase = true) -> "hls"
-        url.contains(".m3u8", ignoreCase = true) -> "hls"
-        url.contains(".mpd", ignoreCase = true)  -> "dash"
-        else -> "video"
+    fun inferFormat(url: String, explicitFormat: String = ""): String {
+        val cleanFormat = explicitFormat.trim().lowercase(Locale.ROOT)
+        if (cleanFormat.isNotEmpty()) {
+            if (cleanFormat == "mp4" && url.contains("&rc=")) return "hls" 
+            return cleanFormat
+        }
+        return when {
+            url.contains(".mp4", ignoreCase = true) -> "mp4"
+            url.contains(".m3u8", ignoreCase = true) -> "hls"
+            url.contains(".mpd", ignoreCase = true)  -> "dash"
+            url.contains("mime_type=video_mp4", ignoreCase = true) && url.contains("&rc=") -> "hls" // Force HLS for VolcEngine/Melolo chunks
+            else -> "video"
+        }
     }
 
-    fun linkType(url: String, format: String = ""): ExtractorLinkType = when {
-        url.contains("melolostatic.com", ignoreCase = true) -> ExtractorLinkType.M3U8
-        format.equals("hls", ignoreCase = true) || url.contains(".m3u8", ignoreCase = true) -> ExtractorLinkType.M3U8
-        format.equals("dash", ignoreCase = true) || url.contains(".mpd", ignoreCase = true) -> ExtractorLinkType.DASH
-        else -> ExtractorLinkType.VIDEO
+    fun linkType(url: String, format: String = ""): ExtractorLinkType {
+        val f = inferFormat(url, format)
+        return when (f) {
+            "hls" -> ExtractorLinkType.M3U8
+            "dash" -> ExtractorLinkType.DASH
+            else -> ExtractorLinkType.VIDEO
+        }
     }
 
     fun of(label: String): Int {
