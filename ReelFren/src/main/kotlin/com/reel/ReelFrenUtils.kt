@@ -159,7 +159,7 @@ object ReelFrenClient {
         val isGlobal = slug == "all_dramas"
         if (!isGlobal && slug.isNotEmpty()) p += "provider=${query(slug)}"
         p += "lang=en"
-        p += "cv=$currentApiVersion"
+        p += "cv=$currentApiVersion" // Home requires cv
         if (category.isNotEmpty()) p += "category=${query(category)}"
         p += "page=$page"
         val offset = (page - 1) * 20
@@ -167,9 +167,9 @@ object ReelFrenClient {
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
-    fun detailApiUrl(slug: String, id: String, includeVersion: Boolean = true): String {
-        val base = "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
-        return if (includeVersion && currentApiVersion.isNotBlank()) "$base&cv=$currentApiVersion" else base
+    // CRITICAL FIX: The API rejects the detail endpoint if `cv` is provided. We must omit it.
+    fun detailApiUrl(slug: String, id: String): String {
+        return "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
     }
 
     fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
@@ -181,15 +181,13 @@ object ReelFrenClient {
         val p = mutableListOf<String>()
         p += "q=${query(term)}"
         p += "lang=en"
-        p += "cv=$currentApiVersion"
+        p += "cv=$currentApiVersion" // Search requires cv
         if (slug.isNotEmpty() && slug != "all_dramas") {
             p += "provider=${query(slug)}"
         }
         return "${apiBase()}/api/search?${p.joinToString("&")}"
     }
 
-    // CRITICAL FIX: Simplified headers. Cloudflare WAF flags overly specific pseudo-headers.
-    // Relying strictly on the clearance cookie and standard User-Agent.
     fun headers(url: String, isApiCall: Boolean = false): Map<String, String> {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val map = linkedMapOf<String, String>()
@@ -277,24 +275,19 @@ object ReelFrenClient {
     suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = 
         get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
+    // CRITICAL FIX: We now hit the API strictly WITHOUT the `cv` parameter.
+    // If the API returns nothing, we jump directly to the robust HTML scraper.
     suspend fun detail(slug: String, id: String): DetailInfo? {
-        val primaryApiJson = get(detailApiUrl(slug, id, includeVersion = true), isApiCall = true)
-        val primaryParsed = primaryApiJson?.let { ReelFrenParse.detailApi(it, slug, id) }
+        ReelFrenLog.d("Client.detail", "Attempting API detail fetch...")
+        val apiJson = get(detailApiUrl(slug, id), isApiCall = true)
+        val apiParsed = apiJson?.let { ReelFrenParse.detailApi(it, slug, id) }
         
-        if (primaryParsed != null && primaryParsed.title.isNotEmpty()) {
-            ReelFrenLog.d("Client.detail", "API detail parsed (episodes=${primaryParsed.videos.size}).")
-            return primaryParsed
+        if (apiParsed != null && apiParsed.title.isNotEmpty()) {
+            ReelFrenLog.d("Client.detail", "API detail parsed successfully (episodes=${apiParsed.videos.size}).")
+            return apiParsed
         }
         
-        val noCvApiJson = get(detailApiUrl(slug, id, includeVersion = false), isApiCall = true)
-        val noCvParsed = noCvApiJson?.let { ReelFrenParse.detailApi(it, slug, id) }
-        
-        if (noCvParsed != null && noCvParsed.title.isNotEmpty()) {
-            ReelFrenLog.d("Client.detail", "API detail (no-cv) parsed (episodes=${noCvParsed.videos.size}).")
-            return noCvParsed
-        }
-        
-        ReelFrenLog.d("Client.detail", "API detail incomplete/empty. Falling back to HTML detail parser.")
+        ReelFrenLog.d("Client.detail", "API detail failed/empty. Falling back to HTML detail parser.")
         val htmlStr = get(detailHtmlUrl(slug, id), isApiCall = false) ?: return null
         return ReelFrenParse.detailHtml(htmlStr, slug, id)
     }
