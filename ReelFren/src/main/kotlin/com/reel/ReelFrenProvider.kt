@@ -15,10 +15,14 @@ import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.coroutineScope
 import java.util.concurrent.atomic.AtomicBoolean
 
 class ReelFrenProvider : MainAPI() {
@@ -37,6 +41,8 @@ class ReelFrenProvider : MainAPI() {
         private var cachedSearchResults: List<SearchResponse> = emptyList()
         private var cachedSearchTime: Long = 0L
         private const val CACHE_EXPIRY_MS = 10 * 60 * 1000L // 10 minutes
+        
+        private val bgSearchScope = CoroutineScope(Dispatchers.IO)
     }
 
     override val mainPage get() = mainPageOf(
@@ -80,7 +86,7 @@ class ReelFrenProvider : MainAPI() {
             return cachedSearchResults
         }
 
-        val activeProviders = ReelFrenStore.enabledProviders().keys.toList()
+        val activeProviders = ReelFrenStore.enabledProviders().values.toList()
         if (activeProviders.isEmpty()) {
             ReelFrenLog.d("Main/search", "No providers enabled. Aborting search.")
             return emptyList()
@@ -90,11 +96,15 @@ class ReelFrenProvider : MainAPI() {
         cachedSearchResults = emptyList()
         cachedSearchTime = now
 
-        // CRITICAL FIX: Safe, highly concurrent execution using Cloudstream's app.async
+        // Exclude the 'all_dramas' slug which throws 400 errors from the API
+        val validProviders = activeProviders.filter { it != "all_dramas" }
+        if (validProviders.isEmpty()) return emptyList()
+
+        // Use standard concurrent awaiting without complex split logic
         val allResults = mutableListOf<SearchResponse>()
         
         coroutineScope {
-            val deferredSearches = activeProviders.map { slug ->
+            val deferredSearches = validProviders.map { slug ->
                 async {
                     val items = try { 
                         ReelFrenClient.search(slug, cleanQuery) 
@@ -114,9 +124,6 @@ class ReelFrenProvider : MainAPI() {
                     }
                 }
             }
-            
-            // Wait for all searches to complete. Because ReelFrenClient.get uses Mutex for CF, 
-            // these will safely queue behind the CF solver if challenged, without cancelling each other.
             allResults.addAll(deferredSearches.awaitAll().flatten())
         }
 
