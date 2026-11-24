@@ -23,6 +23,7 @@ import java.net.URI
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import android.util.Base64 // Import for Base64 decoding
 
 // ----------------------------------------------------------------------
 // DATA MODELS
@@ -50,8 +51,8 @@ data class VideoEntry(val episode: Int, val duration: Int, val vid: String, val 
 // ----------------------------------------------------------------------
 object ReelFrenLog {
     private const val TAG = "ReelFren/CF"
-    var isVerbose: Boolean = false 
-    
+    var isVerbose: Boolean = false
+
     fun d(scope: String, msg: String) {
         if (!isVerbose) return
         Log.e(TAG, "[$scope][${Thread.currentThread().name}] $msg")
@@ -126,16 +127,16 @@ class WebViewCookieJar : CookieJar {
 
 object ReelFrenClient {
     const val GLOBAL_MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-    
+
     private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
-    
+
     @Volatile private var currentApiVersion = "v21"
-    
+
     private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
         .tlsVersions(TlsVersion.TLS_1_2, TlsVersion.TLS_1_3)
         .build()
-        
+
     private val spoofedClient = app.baseClient.newBuilder().cookieJar(WebViewCookieJar())
         .connectionSpecs(listOf(chromeSpec, ConnectionSpec.CLEARTEXT))
         .protocols(listOf(Protocol.HTTP_1_1, Protocol.HTTP_2)).build()
@@ -143,7 +144,7 @@ object ReelFrenClient {
 
     private fun apiBase() = ReelFrenStore.apiBase()
     private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
-    
+
     fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
         val p = mutableListOf("lang=en", "cv=$currentApiVersion", "page=$page")
         if (slug != "all_dramas" && slug.isNotEmpty()) p += "provider=${query(slug)}"
@@ -159,10 +160,10 @@ object ReelFrenClient {
     }
 
     fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
-    
-    fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) = 
+
+    fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) =
         "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&lang=en&server=$server&cv=$currentApiVersion"
-    
+
     fun searchUrl(slug: String, term: String): String {
         val p = mutableListOf("q=${query(term)}", "lang=en", "cv=$currentApiVersion")
         if (slug != "all_dramas" && slug.isNotEmpty()) p += "provider=${query(slug)}"
@@ -176,9 +177,7 @@ object ReelFrenClient {
         map["Accept-Language"] = "en-US,en;q=0.9"
         map["Origin"] = ReelFrenConfig.REEL_SITE
         map["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
-        if (isApiCall) map["Accept"] = "application/json, text/plain, */*" 
-        else map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        
+        if (isApiCall) map["Accept"] = "application/json, text/plain, */*" else map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         if (targetHost == apiHost || targetHost.contains("reelfren.net")) {
             val cookie = ReelFrenStore.cookie(targetHost)
             if (cookie.isNotBlank()) map["Cookie"] = cookie
@@ -188,7 +187,7 @@ object ReelFrenClient {
 
     fun videoHeaders(url: String): Map<String, String> {
         val map = linkedMapOf<String, String>()
-        map["User-Agent"] = GLOBAL_MOBILE_UA 
+        map["User-Agent"] = GLOBAL_MOBILE_UA
         map["Accept"] = "*/*"
         map["Connection"] = "keep-alive"
         map["Origin"] = ReelFrenConfig.REEL_SITE
@@ -210,90 +209,107 @@ object ReelFrenClient {
     suspend fun get(url: String, isApiCall: Boolean = true): String? {
         val targetHost = ReelFrenCloudflare.hostOf(url)
         val isReelFrenHost = targetHost == apiHost || targetHost.contains("reelfren.net")
-        
+
         if (!isReelFrenHost) {
-            return try { 
-                app.get(url, headers = headers(url, false), timeout = 25L).text 
-            } catch (ce: CancellationException) { throw ce } catch (_: Exception) { null }
+            return try {
+                app.get(url, headers = headers(url, false), timeout = 25L).text
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                null
+            }
         }
 
         ReelFrenLog.d("Client.get", "Fetching: $url (isApiCall=$isApiCall)")
-        var responseText = try { 
-            spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
-        } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
-            ReelFrenLog.t("Client.get", e) 
-            "" 
+        var responseText = try {
+            spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            ReelFrenLog.t("Client.get", e)
+            ""
         }
-        
+
         if (isApiCall && isVersionError(responseText) && url.contains("cv=")) {
             ReelFrenLog.d("Client.get", "Version error detected on $currentApiVersion. Retrying without cv...")
             val newUrl = url.replace(Regex("[?&]cv=[^&]+"), "").replace("?provider=&", "?provider=")
-            responseText = try { 
-                spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text 
-            } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
+            responseText = try { spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
         }
-        
+
         if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
         ReelFrenLog.d("Client.get", "Falling back to CF Mutex...")
         apiMutex.withLock {
-            responseText = try { 
-                spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
-            } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
-            
+            responseText = try { spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
             if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
             if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) return null
-            val finalResponse = try { 
-                spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
-            } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
+            val finalResponse = try {
+                spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
                 ReelFrenLog.t("Client.get", e)
-                "" 
+                ""
             }
             if (finalResponse.isEmpty() || ReelFrenCloudflare.isChallengeResponse(finalResponse)) return null
             return finalResponse
         }
     }
 
-    suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = 
+    suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> =
         get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
-    
+
     suspend fun detail(slug: String, id: String): DetailInfo? {
         val primaryApiJson = get(detailApiUrl(slug, id, includeVersion = true), isApiCall = true)
         val primaryParsed = primaryApiJson?.let { ReelFrenParse.detailApi(it, slug, id) }
-        
         if (primaryParsed != null && primaryParsed.title.isNotEmpty()) {
             ReelFrenLog.d("Client.detail", "API detail parsed (episodes=${primaryParsed.videos.size}).")
             return primaryParsed
         }
-        
+
         val noCvApiJson = get(detailApiUrl(slug, id, includeVersion = false), isApiCall = true)
         val noCvParsed = noCvApiJson?.let { ReelFrenParse.detailApi(it, slug, id) }
-        
         if (noCvParsed != null && noCvParsed.title.isNotEmpty()) {
             ReelFrenLog.d("Client.detail", "API detail (no-cv) parsed (episodes=${noCvParsed.videos.size}).")
             return noCvParsed
         }
-        
-        ReelFrenLog.d("Client.detail", "API parse failed or empty. Falling back to indestructible HTML scraper.")
+
+        ReelFrenLog.d("Client.detail", "API detail incomplete/empty. Falling back to HTML detail parser.")
         val htmlStr = get(detailHtmlUrl(slug, id), isApiCall = false) ?: return null
         return ReelFrenParse.detailHtml(htmlStr, slug, id)
     }
-    
-    suspend fun search(slug: String, term: String): List<HomeItem> = 
+
+    suspend fun search(slug: String, term: String): List<HomeItem> =
         get(searchUrl(slug, term), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
-    
+
     suspend fun playback(slug: String, id: String, ep: Int, serverId: Int): PlaybackInfo? {
         val jsonText = get(videoUrl(slug, id, ep, serverId), isApiCall = true) ?: return null
         return ReelFrenParse.playback(jsonText, serverId)
     }
-    
+
     fun absUrl(value: String): String {
         val clean = value.trim()
         if (clean.isEmpty()) return ""
         if (clean.startsWith("https://", true) || clean.startsWith("http://", true)) return clean
         if (clean.startsWith("//")) return "https:$clean"
         val base = apiBase()
+        
+        // CRITICAL FIX: Intercept Telegram proxy URLs and extract the original Base64 encoded URL
+        if (clean.contains("go.nunodrama.my.id/p/telegram_")) {
+            try {
+                val encodedPart = clean.substringAfterLast("/")
+                val decodedBytes = Base64.decode(encodedPart, Base64.URL_SAFE)
+                val decodedUrl = String(decodedBytes, Charsets.UTF_8)
+                if (decodedUrl.startsWith("http")) {
+                    ReelFrenLog.d("Client.absUrl", "Decoded image proxy URL: $decodedUrl")
+                    return decodedUrl
+                }
+            } catch (e: Exception) {
+                ReelFrenLog.d("Client.absUrl", "Failed to decode proxy URL: $clean")
+            }
+        }
+        
         return if (clean.startsWith("/")) "$base$clean" else "$base/$clean"
     }
 }
@@ -312,6 +328,7 @@ object ReelFrenParse {
             val v = clean(obj, key)
             if (v.isNotEmpty()) return v
         }
+
         val it = obj.keys()
         while (it.hasNext()) {
             val key = it.next()
@@ -340,6 +357,7 @@ object ReelFrenParse {
             val arr = obj.optJSONArray(key)
             if (arr != null && arr.length() > 0) return arr
         }
+
         val it = obj.keys()
         while (it.hasNext()) {
             val key = it.next()
@@ -352,7 +370,6 @@ object ReelFrenParse {
         return null
     }
 
-    // CRITICAL FIX: Safe array extraction for search/home that avoids finding the wrong array.
     fun homeItems(body: String): List<HomeItem> {
         if (body.isBlank()) return emptyList()
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return emptyList()
@@ -543,13 +560,12 @@ object ReelFrenParse {
             }
         }
 
-        // Deep fallback to raw HTML metadata & tags
+        // Fallback to HTML metadata & episode links if RSC payload is formatted differently
         val ogTitle = Regex("""<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             .find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
         val pageTitle = Regex("""<title[^>]*>(.*?)</title>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
             .find(htmlBody)?.groupValues?.getOrNull(1)?.substringBefore("|")?.trim().orEmpty()
-        val title = ogTitle.ifEmpty { pageTitle }.replace("Episode 1", "").trim()
-        
+        val title = ogTitle.ifEmpty { pageTitle }
         if (title.isEmpty()) {
             ReelFrenLog.d("Parse.detailHtml", "Failed to extract Next.js detail object from HTML arrays.")
             return null
@@ -584,7 +600,7 @@ object ReelFrenParse {
             provider = fallbackSlug,
             title = title,
             cover = cover,
-            intro = intro.replace(Regex("""Watch Now: .*? as a free short drama on ReelFren."""), "").trim(),
+            intro = intro,
             episodes = maxOf(maxEp, videos.size),
             videos = videos
         )
@@ -753,7 +769,7 @@ object ReelFrenSubtitles {
             val count = seenLabels.getOrDefault(baseLabel, 0)
             seenLabels[baseLabel] = count + 1
             val displayLabel = if (count > 0) "$baseLabel ${count + 1}" else baseLabel
-            
+
             callback(newSubtitleFile(lang = displayLabel, url = resolved) { this.headers = ReelFrenClient.headers(resolved) })
         }
 
@@ -766,7 +782,7 @@ object ReelFrenSubtitles {
                     val count = seenLabels.getOrDefault(baseLabel, 0)
                     seenLabels[baseLabel] = count + 1
                     val displayLabel = if (count > 0) "$baseLabel ${count + 1}" else baseLabel
-                    
+
                     callback(newSubtitleFile(lang = displayLabel, url = url) { this.headers = ReelFrenClient.headers(url) })
                 }
             }
@@ -801,25 +817,25 @@ object ReelFrenSubtitles {
     private fun resolveDisplayLabel(rawLang: String, rawLabel: String): String {
         val nLang = normalizeLang(rawLang)
         var finalLang = nLang
-        
+
         if (nLang == "und") {
             finalLang = normalizeLang(rawLabel)
         }
-        
+
         val fullLangName = langLabel(finalLang)
-        
+
         if (fullLangName != "Unknown") {
             return fullLangName
         }
-        
+
         val cleaned = rawLabel.trim()
-        
+
         if (cleaned.isEmpty()) {
             return "English"
         }
-        
-        return cleaned.replaceFirstChar { 
-            if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() 
+
+        return cleaned.replaceFirstChar {
+            if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString()
         }
     }
 
@@ -907,7 +923,7 @@ object ReelFrenStore {
 
     @Volatile private var storePrefs: SharedPreferences? = null
     @Volatile private var providerPrefs: SharedPreferences? = null
-    
+
     private val memoryCookies = ConcurrentHashMap<String, String>()
     private val rootDomain by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.REEL_SITE) }
 
@@ -978,7 +994,7 @@ object ReelFrenStore {
 
     fun recordPrewarmResult(success: Boolean) {
         val editor = storePrefs?.edit() ?: return
-        if (success) { editor.putLong("prewarm_last_fail", 0L); editor.putInt("prewarm_fail_count", 0) } 
+        if (success) { editor.putLong("prewarm_last_fail", 0L); editor.putInt("prewarm_fail_count", 0) }
         else { val count = (storePrefs?.getInt("prewarm_fail_count", 0) ?: 0) + 1; editor.putLong("prewarm_last_fail", System.currentTimeMillis()); editor.putInt("prewarm_fail_count", count) }
         editor.apply()
     }
@@ -993,18 +1009,26 @@ object ReelFrenQuality {
 
     fun label(raw: String) = raw.trim().ifEmpty { "Auto" }
 
-    // CRITICAL FIX: Robust stream format detection that overrides deceptive 'mp4' flags for Volcengine CDN
-    fun linkType(url: String, explicitFormat: String = ""): ExtractorLinkType {
-        val lowerUrl = url.lowercase(Locale.ROOT)
-        if (lowerUrl.contains(".m3u8") || (lowerUrl.contains("&rc=") && lowerUrl.contains("mime_type=video_mp4"))) {
-            return ExtractorLinkType.M3U8
+    fun inferFormat(url: String, explicitFormat: String = ""): String {
+        val cleanFormat = explicitFormat.trim().lowercase(Locale.ROOT)
+        if (cleanFormat.isNotEmpty()) {
+            if (cleanFormat == "mp4" && url.contains("&rc=")) return "hls" 
+            return cleanFormat
         }
-        if (lowerUrl.contains(".mpd")) {
-            return ExtractorLinkType.DASH
+        return when {
+            url.contains(".mp4", ignoreCase = true) -> "mp4"
+            url.contains(".m3u8", ignoreCase = true) -> "hls"
+            url.contains(".mpd", ignoreCase = true)  -> "dash"
+            url.contains("mime_type=video_mp4", ignoreCase = true) && url.contains("&rc=") -> "hls"
+            else -> "video"
         }
-        return when (explicitFormat.trim().lowercase(Locale.ROOT)) {
-            "hls", "m3u8" -> ExtractorLinkType.M3U8
-            "dash", "mpd" -> ExtractorLinkType.DASH
+    }
+
+    fun linkType(url: String, format: String = ""): ExtractorLinkType {
+        val f = inferFormat(url, format)
+        return when (f) {
+            "hls" -> ExtractorLinkType.M3U8
+            "dash" -> ExtractorLinkType.DASH
             else -> ExtractorLinkType.VIDEO
         }
     }
