@@ -239,7 +239,6 @@ object ReelFrenClient {
 
     suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
-    // HYBRID FETCH: Try fast API first. If it fails, fallback to indestructible HTML scraper.
     suspend fun detail(slug: String, id: String): DetailInfo? {
         val apiUrl = detailApiUrl(slug, id)
         val apiJson = get(apiUrl, isApiCall = true)
@@ -632,10 +631,28 @@ object ReelFrenSubtitles {
     }
 
     private fun resolveDisplayLabel(rawLang: String, rawLabel: String): String {
-        val normFromLang = normalizeLang(rawLang)
-        val normFromLabel = if (normFromLang == "und") normalizeLang(rawLabel) else normFromLabel
-        val fullLangName = langLabel(normFromLabel)
-        return if (fullLangName != "Unknown") fullLangName else rawLabel.trim().replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }.ifEmpty { "English" } 
+        val nLang = normalizeLang(rawLang)
+        var finalLang = nLang
+        
+        if (nLang == "und") {
+            finalLang = normalizeLang(rawLabel)
+        }
+        
+        val fullLangName = langLabel(finalLang)
+        
+        if (fullLangName != "Unknown") {
+            return fullLangName
+        }
+        
+        val cleaned = rawLabel.trim()
+        
+        if (cleaned.isEmpty()) {
+            return "English"
+        }
+        
+        return cleaned.replaceFirstChar { 
+            if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() 
+        }
     }
 
     private fun normalizeLang(raw: String): String {
