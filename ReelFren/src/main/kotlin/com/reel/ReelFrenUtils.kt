@@ -223,7 +223,6 @@ object ReelFrenClient {
 
     suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = get(homeUrl(slug, category, page))?.let(ReelFrenParse::homeItems) ?: emptyList()
     
-    // FIX: Pass the slug and id down to the parser so it can fallback to them if the JSON is incomplete
     suspend fun detail(slug: String, id: String): DetailInfo? = get(detailUrl(slug, id))?.let { ReelFrenParse.detail(it, slug, id) }
     
     suspend fun search(slug: String, term: String): List<HomeItem> = get(searchUrl(slug, term))?.let(ReelFrenParse::homeItems) ?: emptyList()
@@ -260,7 +259,6 @@ object ReelFrenParse {
 
         return (0 until arr.length()).mapNotNull { i ->
             val o = arr.optJSONObject(i) ?: return@mapNotNull null
-            // Fallback for messy APIs
             val id = clean(o, "id").ifEmpty { clean(o, "dramaId") }
             val title = clean(o, "title").ifEmpty { clean(o, "name") }
             
@@ -269,13 +267,11 @@ object ReelFrenParse {
         }
     }
 
-    // FIX: Accepts fallbackSlug and fallbackId 
     fun detail(body: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
         if (body.isBlank()) return null
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
         val o = root.optJSONObject("detail") ?: root.optJSONObject("data") ?: root
         
-        // FIX: If the API omits the 'id' field in the JSON (happens with string slugs), we use the one we requested with.
         val id = clean(o, "id").ifEmpty { clean(o, "dramaId") }.ifEmpty { fallbackId }
         val title = clean(o, "title").ifEmpty { clean(o, "name") }
         
@@ -407,4 +403,296 @@ object ReelFrenParse {
         return SubtitleEntry(label = firstNonEmpty(s, *SUB_LABEL_KEYS).ifEmpty { lang }, lang = lang, url = u)
     }
 
-    private fun looksLikeSubtitleUrl(u: String): Boo
+    private fun looksLikeSubtitleUrl(u: String): Boolean {
+        val trimmed = u.trim()
+        if (trimmed.isEmpty()) return false
+        val lower = trimmed.lowercase(Locale.ROOT)
+        if (lower == "null" || lower == "none" || lower == "false" || lower == "0" || lower == "#" || lower == "hardcoded") return false
+        return lower.startsWith("http://") || lower.startsWith("https://") || lower.startsWith("//") || lower.startsWith("/") || lower.startsWith("data:")
+    }
+
+    private fun guessLangFromUrl(url: String): String {
+        val filename = url.substringAfterLast('/').substringBefore('?')
+        val match = Regex("(?:^|[._-])(en|es|pt|id|ar|fr|de|it|ru|zh|ja|ko|hi|vi|th|ms|tr)(?:[._-]|$)", RegexOption.IGNORE_CASE).find(filename)
+        if (match != null) {
+            val code = match.groupValues[1].lowercase()
+            return when (code) { "jp" -> "ja"; "kr" -> "ko"; "in" -> "id"; else -> code }
+        }
+        val lowerUrl = url.lowercase()
+        val langs = listOf("english" to "en", "spanish" to "es", "indonesian" to "id", "portuguese" to "pt", "arabic" to "ar", "french" to "fr", "german" to "de", "japanese" to "ja", "korean" to "ko", "chinese" to "zh")
+        for ((name, code) in langs) { if (lowerUrl.contains(name)) return code }
+        return "und"
+    }
+
+    private fun firstNonEmpty(o: JSONObject, vararg keys: String): String {
+        for (k in keys) { val v = clean(o, k); if (v.isNotEmpty()) return v }
+        return ""
+    }
+
+    private fun clean(o: JSONObject, vararg keys: String): String {
+        for (key in keys) {
+            val v = o.optString(key, "").trim()
+            if (v.isNotEmpty() && !v.equals("null", ignoreCase = true) && !v.equals("undefined", ignoreCase = true)) return v
+        }
+        return ""
+    }
+}
+
+// ----------------------------------------------------------------------
+// SUBTITLES
+// ----------------------------------------------------------------------
+object ReelFrenSubtitles {
+    private val PLACEHOLDER_VALUES = setOf("", "null", "none", "false", "0", "#", "-", "n/a", "na", "hardcoded", "undefined")
+    private val mediaRegex = Regex("""#EXT-X-MEDIA:([^\r\n]*)""", RegexOption.IGNORE_CASE)
+    private val typeRegex  = Regex("""TYPE=SUBTITLES""", RegexOption.IGNORE_CASE)
+    private val uriRegex   = Regex("""URI=(?:"([^"]+)"|'([^']+)'|([^,\s]+))""", RegexOption.IGNORE_CASE)
+    private val langRegex  = Regex("""LANGUAGE=(?:"([^"]*)"|'([^']*)'|([^,\s]+))""", RegexOption.IGNORE_CASE)
+    private val nameRegex  = Regex("""NAME=(?:"([^"]*)"|'([^']*)'|([^,\s]+))""", RegexOption.IGNORE_CASE)
+
+    suspend fun emit(entries: List<SubtitleEntry>, qualities: List<QualityEntry>, callback: (SubtitleFile) -> Unit) {
+        val seenUrls = mutableSetOf<String>()
+        val seenLabels = mutableMapOf<String, Int>()
+
+        for (entry in entries) {
+            val resolved = resolveUrl(entry.url) ?: continue
+            if (!seenUrls.add(resolved)) continue
+
+            val baseLabel = resolveDisplayLabel(entry.lang, entry.label)
+            val count = seenLabels.getOrDefault(baseLabel, 0)
+            seenLabels[baseLabel] = count + 1
+            val displayLabel = if (count > 0) "$baseLabel ${count + 1}" else baseLabel
+            
+            callback(newSubtitleFile(lang = displayLabel, url = resolved) { this.headers = ReelFrenClient.headers(resolved) })
+        }
+
+        val hlsUrls = qualities.filter { isHls(it) }.map { ReelFrenClient.absUrl(it.url) }.distinct()
+        for (hlsUrl in hlsUrls) {
+            for (sub in extractHlsSubs(hlsUrl)) {
+                val url = runCatching { sub.url }.getOrNull() ?: continue
+                if (seenUrls.add(url)) {
+                    val baseLabel = sub.lang
+                    val count = seenLabels.getOrDefault(baseLabel, 0)
+                    seenLabels[baseLabel] = count + 1
+                    val displayLabel = if (count > 0) "$baseLabel ${count + 1}" else baseLabel
+                    
+                    callback(newSubtitleFile(lang = displayLabel, url = url) { this.headers = ReelFrenClient.headers(url) })
+                }
+            }
+        }
+    }
+
+    private fun isHls(q: QualityEntry): Boolean = q.format.equals("hls", ignoreCase = true) || q.url.contains(".m3u8", ignoreCase = true)
+
+    private fun resolveUrl(raw: String): String? {
+        val trimmed = raw.trim()
+        if (trimmed.lowercase(Locale.ROOT) in PLACEHOLDER_VALUES) return null
+        if (trimmed.startsWith("data:", ignoreCase = true)) return trimmed
+        return ReelFrenClient.absUrl(trimmed).ifBlank { null }
+    }
+
+    private fun resolveRelativeUrl(baseUrl: String, relative: String): String {
+        val clean = relative.trim()
+        if (clean.isEmpty()) return ""
+        if (clean.startsWith("https://", true) || clean.startsWith("http://", true)) return clean
+        if (clean.startsWith("//")) return "https:$clean"
+        return runCatching { URI(baseUrl).resolve(clean).toString() }.getOrElse {
+            if (clean.startsWith("/")) {
+                val origin = runCatching { val u = URI(baseUrl); "${u.scheme}://${u.authority}" }.getOrDefault(ReelFrenStore.apiBase())
+                "$origin$clean"
+            } else {
+                val baseDir = baseUrl.substringBefore('?').substringBeforeLast('/', "")
+                if (baseDir.isNotEmpty()) "$baseDir/$clean" else ReelFrenClient.absUrl(clean)
+            }
+        }
+    }
+
+    private fun resolveDisplayLabel(rawLang: String, rawLabel: String): String {
+        val normFromLang = normalizeLang(rawLang)
+        val normFromLabel = if (normFromLang == "und") normalizeLang(rawLabel) else normFromLang
+        val fullLangName = langLabel(normFromLabel)
+        return if (fullLangName != "Unknown") fullLangName else rawLabel.trim().replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.ROOT) else it.toString() }.ifEmpty { "English" } 
+    }
+
+    private fun normalizeLang(raw: String): String {
+        val l = raw.trim().lowercase(Locale.ROOT)
+        return when {
+            l.isBlank() -> "und"
+            l == "en" || l.startsWith("en-") || l.startsWith("en_") || l.contains("english") || l == "eng" -> "en"
+            l == "id" || l == "in" || l.startsWith("id-") || l.contains("indonesian") || l.contains("indonesia") || l.contains("bahasa") || l == "ind" -> "id"
+            l == "es" || l.startsWith("es-") || l.contains("spanish") || l.contains("español") || l == "spa" -> "es"
+            l == "pt" || l.startsWith("pt-") || l.contains("portuguese") || l.contains("português") || l == "por" -> "pt"
+            l == "zh" || l.startsWith("zh-") || l.contains("chinese") || l == "chi" || l == "zho" -> "zh"
+            l == "ja" || l == "jp" || l.startsWith("ja-") || l.contains("japanese") || l == "jpn" -> "ja"
+            l == "ko" || l == "kr" || l.startsWith("ko-") || l.contains("korean") || l == "kor" -> "ko"
+            l == "th" || l.startsWith("th-") || l.contains("thai") || l == "tha" -> "th"
+            l == "vi" || l.startsWith("vi-") || l.contains("vietnamese") || l == "vie" -> "vi"
+            l == "fr" || l.startsWith("fr-") || l.contains("french") || l == "fre" || l == "fra" -> "fr"
+            l == "de" || l.startsWith("de-") || l.contains("german") || l == "ger" || l == "deu" -> "de"
+            l == "ar" || l.startsWith("ar-") || l.contains("arabic") || l == "ara" -> "ar"
+            l == "hi" || l.startsWith("hi-") || l.contains("hindi") || l == "hin" -> "hi"
+            l == "fil" || l == "tl" || l.contains("filipino") || l.contains("tagalog") -> "fil"
+            l == "ms" || l.startsWith("ms-") || l.contains("malay") || l == "may" || l == "msa" -> "ms"
+            l == "ru" || l.startsWith("ru-") || l.contains("russian") || l == "rus" -> "ru"
+            l == "tr" || l.startsWith("tr-") || l.contains("turkish") || l == "tur" -> "tr"
+            l == "it" || l.startsWith("it-") || l.contains("italian") || l == "ita" -> "it"
+            l == "pl" || l.startsWith("pl-") || l.contains("polish") || l == "pol" -> "pl"
+            l == "nl" || l.startsWith("nl-") || l.contains("dutch") || l == "dut" || l == "nld" -> "nl"
+            l.length == 2 || l.length == 3 -> l
+            else -> "und"
+        }
+    }
+
+    private fun langLabel(lang: String): String = when (lang) {
+        "en" -> "English"; "id" -> "Indonesian"; "es" -> "Spanish"; "pt" -> "Portuguese"; "zh" -> "Chinese"; "ja" -> "Japanese"; "ko" -> "Korean"; "th" -> "Thai"; "vi" -> "Vietnamese"; "fr" -> "French"; "de" -> "German"; "ar" -> "Arabic"; "hi" -> "Hindi"; "fil" -> "Filipino"; "ms" -> "Malay"; "ru" -> "Russian"; "tr" -> "Turkish"; "it" -> "Italian"; "pl" -> "Polish"; "nl" -> "Dutch"; "und" -> "Unknown"
+        else -> lang.uppercase(Locale.ROOT)
+    }
+}
+
+// ----------------------------------------------------------------------
+// DATA STORE
+// ----------------------------------------------------------------------
+object ReelFrenStore {
+    @Volatile var appContext: Context? = null
+        private set
+
+    @Volatile private var storePrefs: SharedPreferences? = null
+    @Volatile private var providerPrefs: SharedPreferences? = null
+    
+    private val memoryCookies = ConcurrentHashMap<String, String>()
+    private val rootDomain by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.REEL_SITE) }
+
+    fun init(ctx: Context) {
+        appContext = ctx.applicationContext
+        storePrefs = appContext?.getSharedPreferences("reelfren_store", Context.MODE_PRIVATE)
+        providerPrefs = appContext?.getSharedPreferences("reelfren_prefs", Context.MODE_PRIVATE)
+        ReelFrenLog.isVerbose = providerPrefs?.getBoolean("verbose_logging", false) ?: false
+    }
+
+    fun setVerboseLogging(enabled: Boolean) {
+        ReelFrenLog.isVerbose = enabled
+        providerPrefs?.edit()?.putBoolean("verbose_logging", enabled)?.apply()
+    }
+
+    fun isProviderEnabled(slug: String): Boolean {
+        val default = ReelFrenConfig.DEFAULT_ENABLED_SLUGS.contains(slug)
+        return providerPrefs?.getBoolean("provider_$slug", default) ?: default
+    }
+
+    fun setProviderEnabled(editor: SharedPreferences.Editor, slug: String, enabled: Boolean) {
+        editor.putBoolean("provider_$slug", enabled)
+    }
+
+    fun providerPrefsEditor(): SharedPreferences.Editor? = providerPrefs?.edit()
+
+    fun enabledProviders(): Map<String, String> = ReelFrenConfig.PROVIDERS_MAP.filter { (_, slug) -> isProviderEnabled(slug) }
+
+    fun apiBase(): String {
+        val raw = storePrefs?.getString("api_base", ReelFrenConfig.DEFAULT_API_BASE).orEmpty()
+        val clean = raw.trim().trimEnd('/')
+        return if (clean.startsWith("https://") || clean.startsWith("http://")) clean else ReelFrenConfig.DEFAULT_API_BASE
+    }
+
+    fun cookie(host: String): String {
+        if (host.isBlank()) return ""
+        val norm = host.lowercase(Locale.ROOT)
+        memoryCookies[norm]?.let { return it }
+        val saved = storePrefs?.getString("cookie_$norm", "").orEmpty()
+        if (saved.isNotEmpty()) { memoryCookies[norm] = saved; return saved }
+        if (norm != rootDomain && norm.endsWith(".$rootDomain")) return cookie(rootDomain)
+        return ""
+    }
+
+    fun saveCookie(host: String, cookie: String) {
+        if (host.isBlank()) return
+        val norm = host.lowercase(Locale.ROOT)
+        if (cookie.isBlank()) { memoryCookies.remove(norm) } else { memoryCookies[norm] = cookie }
+        storePrefs?.edit()?.putString("cookie_$norm", cookie)?.apply()
+    }
+
+    fun userAgent(host: String): String {
+        return ReelFrenClient.GLOBAL_MOBILE_UA
+    }
+
+    fun setUserAgent(host: String, ua: String) {
+        // Disabled: We strictly enforce the hardcoded Mobile Chrome UA.
+    }
+
+    fun shouldSkipPrewarm(): Boolean {
+        val lastFail = storePrefs?.getLong("prewarm_last_fail", 0L) ?: 0L
+        val failCount = storePrefs?.getInt("prewarm_fail_count", 0) ?: 0
+        if (lastFail == 0L || failCount <= 0) return false
+        val shift = (failCount - 1).coerceIn(0, 6)
+        val cooldown = 60_000L * (1L shl shift)
+        return (System.currentTimeMillis() - lastFail) < cooldown
+    }
+
+    fun recordPrewarmResult(success: Boolean) {
+        val editor = storePrefs?.edit() ?: return
+        if (success) { editor.putLong("prewarm_last_fail", 0L); editor.putInt("prewarm_fail_count", 0) } 
+        else { val count = (storePrefs?.getInt("prewarm_fail_count", 0) ?: 0) + 1; editor.putLong("prewarm_last_fail", System.currentTimeMillis()); editor.putInt("prewarm_fail_count", count) }
+        editor.apply()
+    }
+}
+
+// ----------------------------------------------------------------------
+// UTILS
+// ----------------------------------------------------------------------
+object ReelFrenQuality {
+    private val heavy = Regex("(?i)\\b(h\\.?26[56]|hevc|x\\.?26[56]|av1)\\b")
+    private val resRegex = Regex("(?i)(\\d{3,4})\\s*p\\b")
+
+    fun label(raw: String) = raw.trim().ifEmpty { "Auto" }
+
+    fun inferFormat(url: String): String = when {
+        url.contains(".m3u8", ignoreCase = true) -> "hls"
+        url.contains(".mpd", ignoreCase = true)  -> "dash"
+        else -> "video"
+    }
+
+    fun linkType(url: String, format: String = ""): ExtractorLinkType = when {
+        format.equals("hls", ignoreCase = true) || url.contains(".m3u8", ignoreCase = true) -> ExtractorLinkType.M3U8
+        format.equals("dash", ignoreCase = true) || url.contains(".mpd", ignoreCase = true) -> ExtractorLinkType.DASH
+        else -> ExtractorLinkType.VIDEO
+    }
+
+    fun of(label: String): Int {
+        val lower = label.lowercase(Locale.ROOT)
+        val base = resRegex.find(label)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: when {
+            lower.contains("2160") || lower.contains("4k") || lower.contains("uhd") -> 2160
+            lower.contains("1080") -> 1080
+            lower.contains("720")  -> 720
+            lower.contains("480")  -> 480
+            lower.contains("360")  -> 360
+            else -> 400
+        }
+        return if (heavy.containsMatchIn(label)) demote(base) else base
+    }
+
+    private fun demote(q: Int) = when { q >= 2160 -> 1080; q >= 1080 -> 720; q >= 720 -> 480; else -> 360 }
+}
+
+object ReelFrenUrl {
+    private val pathRegex = Regex("/(?:drama|watch)/([^/?#|]+)/([^/?#|]+)")
+    private val epRegex = Regex("[?&]ep=(\\d+)")
+
+    fun page(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/$slug/$id"
+    fun episode(slug: String, id: String, ep: Int) = "${ReelFrenConfig.REEL_SITE}/watch/$slug/$id?ep=$ep"
+
+    fun parse(raw: String?): Triple<String, String, Int> {
+        val input = raw?.trim().orEmpty()
+        if (input.isEmpty()) return Triple("", "", 1)
+        pathRegex.find(input)?.let { m ->
+            val slug = m.groupValues[1].trim().lowercase(Locale.ROOT)
+            val id = m.groupValues[2].trim()
+            val ep = epRegex.find(input)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
+            if (slug.isNotEmpty() && id.isNotEmpty()) return Triple(slug, id, ep)
+        }
+        val body = input.substringAfter("://", input).substringAfter("/", "").substringBefore("?").substringBefore("#")
+        val parts = body.split("|")
+        val slug = parts.getOrNull(0)?.trim()?.lowercase(Locale.ROOT).orEmpty()
+        val id = parts.getOrNull(1)?.trim().orEmpty()
+        val ep = parts.getOrNull(2)?.trim()?.toIntOrNull() ?: 1
+        return if (slug.isNotEmpty() && id.isNotEmpty()) Triple(slug, id, ep) else Triple("", "", 1)
+    }
+}
+
