@@ -128,6 +128,7 @@ class WebViewCookieJar : CookieJar {
 }
 
 object ReelFrenClient {
+    // CRITICAL FIX: Retain GLOBAL_MOBILE_UA constant to prevent compilation failures in ReelFrenCloudflare.kt
     const val GLOBAL_MOBILE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     const val FALLBACK_UA = GLOBAL_MOBILE_UA
     
@@ -171,6 +172,7 @@ object ReelFrenClient {
         return if (includeVersion && currentApiVersion.isNotBlank()) "$base&cv=$currentApiVersion" else base
     }
 
+    // CRITICAL FIX: Ensure ?lang=en is omitted from the HTML request to prevent CDN redirects/metadata stripping.
     fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}"
     
     fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) = 
@@ -256,7 +258,10 @@ object ReelFrenClient {
             
             if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
-            if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) return null
+            if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) {
+                ReelFrenLog.d("Client.get", "CFSolver failed to solve. Returning null.")
+                return null
+            }
             val finalResponse = try { 
                 spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text 
             } catch (ce: CancellationException) { throw ce } catch (e: Exception) { 
@@ -301,6 +306,7 @@ object ReelFrenClient {
         return ReelFrenParse.playback(jsonText, serverId)
     }
     
+    // CRITICAL FIX: Base64 Decoding interceptor explicitly for Telegram proxies to prevent HTTP 403s on UI image loads
     fun decodeProxyUrl(rawUrl: String): String {
         val clean = rawUrl.trim()
         if (clean.contains("go.nunodrama.my.id/p/telegram_")) {
@@ -309,10 +315,11 @@ object ReelFrenClient {
                 val decodedBytes = Base64.decode(encodedPart, Base64.URL_SAFE)
                 val decodedUrl = String(decodedBytes, Charsets.UTF_8)
                 if (decodedUrl.startsWith("http")) {
+                    ReelFrenLog.d("Client.decodeProxyUrl", "Decoded image proxy URL: $decodedUrl")
                     return decodedUrl
                 }
             } catch (e: Exception) {
-                // Ignore fallback to raw
+                // Ignore parsing exceptions, fallback to normal mapping
             }
         }
         return clean
@@ -469,11 +476,117 @@ object ReelFrenParse {
             ?: buildDetailFromJson(root, fallbackSlug, fallbackId)
     }
 
+    // CRITICAL FIX: Safe bracket-matching algorithm to surgically extract {"detail": ...} without relying on JSONArray
+    private fun extractAllJsonObjectsForKey(source: String, key: String): List<String> {
+        val results = mutableListOf<String>()
+        val token = "\"$key\":{"
+        var searchFrom = 0
+
+        while (searchFrom < source.length) {
+            val startIndex = source.indexOf(token, searchFrom)
+            if (startIndex == -1) break
+
+            val objectStart = startIndex + token.length - 1
+            var braceCount = 0
+            var isString = false
+            var isEscaped = false
+            var endIndex = -1
+
+            for (i in objectStart until source.length) {
+                val ch = source[i]
+                if (isEscaped) {
+                    isEscaped = false
+                    continue
+                }
+                if (ch == '\\') {
+                    isEscaped = true
+                    continue
+                }
+                if (ch == '"') {
+                    isString = !isString
+                    continue
+                }
+                if (!isString) {
+                    if (ch == '{') {
+                        braceCount++
+                    } else if (ch == '}') {
+                        braceCount--
+                        if (braceCount == 0) {
+                            endIndex = i + 1
+                            break
+                        }
+                    }
+                }
+            }
+
+            if (endIndex > objectStart) {
+                results += source.substring(objectStart, endIndex)
+                searchFrom = endIndex
+            } else {
+                searchFrom = startIndex + token.length
+            }
+        }
+        return results
+    }
+
+    // Helper to unescape deeply nested JSON strings within Next.js chunks
+    private fun unescapeNextPayload(raw: String): String {
+        val sb = StringBuilder(raw.length)
+        var i = 0
+        while (i < raw.length) {
+            val ch = raw[i]
+            if (ch == '\\' && i + 1 < raw.length) {
+                when (val next = raw[i + 1]) {
+                    '"' -> { sb.append('"'); i += 2 }
+                    '\\' -> { sb.append('\\'); i += 2 }
+                    'n' -> { sb.append('\n'); i += 2 }
+                    'r' -> { sb.append('\r'); i += 2 }
+                    't' -> { sb.append('\t'); i += 2 }
+                    'u' -> {
+                        if (i + 5 < raw.length) {
+                            val hex = raw.substring(i + 2, i + 6).toIntOrNull(16)
+                            if (hex != null) {
+                                sb.append(hex.toChar())
+                                i += 6
+                                continue
+                            }
+                        }
+                        sb.append(ch)
+                        i++
+                    }
+                    else -> { sb.append(ch).append(next); i += 2 }
+                }
+            } else {
+                sb.append(ch)
+                i++
+            }
+        }
+        return sb.toString()
+    }
+
+    // CRITICAL FIX: The ultimate hybrid HTML scraper. 
+    // Tries to surgically extract Next.js JSON state first. If it fails, scrapes raw HTML metadata.
     fun detailHtml(htmlBody: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
         if (htmlBody.isBlank()) return null
-        
-        // Deep Regex string-extraction fallback that bypasses all JSON parsing attempts.
 
+        // 1. Try to extract the embedded Next.js JSON Payload
+        val candidates = mutableListOf<String>()
+        candidates += extractAllJsonObjectsForKey(htmlBody, "detail")
+        val unescaped = unescapeNextPayload(htmlBody)
+        if (unescaped != htmlBody) {
+            candidates += extractAllJsonObjectsForKey(unescaped, "detail")
+        }
+
+        for (rawJson in candidates) {
+            val obj = runCatching { JSONObject(rawJson) }.getOrNull() ?: continue
+            val parsed = buildDetailFromJson(obj, fallbackSlug, fallbackId)
+            if (parsed != null && parsed.title.isNotEmpty()) {
+                ReelFrenLog.d("Parse.detailHtml", "Successfully parsed detail from embedded JSON snippet.")
+                return parsed
+            }
+        }
+
+        // 2. If Next.js JSON extraction fails entirely, fallback to deep raw HTML tag parsing
         val ogTitle = Regex("""<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             .find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
         val pageTitle = Regex("""<title[^>]*>(.*?)</title>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
@@ -481,7 +594,7 @@ object ReelFrenParse {
         
         val title = ogTitle.ifEmpty { pageTitle }.replace("Episode 1", "").trim()
         if (title.isEmpty()) {
-            ReelFrenLog.d("Parse.detailHtml", "Failed to extract Title from HTML tags.")
+            ReelFrenLog.d("Parse.detailHtml", "Failed to extract Title from HTML tags. Detail load aborted.")
             return null
         }
 
@@ -516,6 +629,7 @@ object ReelFrenParse {
             VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true)
         }
 
+        ReelFrenLog.d("Parse.detailHtml", "Successfully parsed detail using raw HTML Regex fallback.")
         return DetailInfo(
             id = fallbackId,
             provider = fallbackSlug,
@@ -947,6 +1061,7 @@ object ReelFrenQuality {
 
     fun label(raw: String) = raw.trim().ifEmpty { "Auto" }
 
+    // CRITICAL FIX: Robust stream format detection overrides deceptive 'mp4' flags for Volcengine CDN avoiding NAL length crashes
     fun inferFormat(url: String, explicitFormat: String = ""): String {
         val cleanFormat = explicitFormat.trim().lowercase(Locale.ROOT)
         if (cleanFormat.isNotEmpty()) {
@@ -957,7 +1072,7 @@ object ReelFrenQuality {
             url.contains(".mp4", ignoreCase = true) -> "mp4"
             url.contains(".m3u8", ignoreCase = true) -> "hls"
             url.contains(".mpd", ignoreCase = true)  -> "dash"
-            url.contains("mime_type=video_mp4", ignoreCase = true) && url.contains("&rc=") -> "hls"
+            url.contains("mime_type=video_mp4", ignoreCase = true) && url.contains("&rc=") -> "hls" // Force HLS for VolcEngine/Melolo chunks
             else -> "video"
         }
     }
