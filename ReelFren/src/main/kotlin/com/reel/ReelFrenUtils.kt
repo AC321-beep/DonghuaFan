@@ -322,8 +322,10 @@ object ReelFrenClient {
         if (!omitCvParam) p += "cv=$currentApiVersion"
         
         if (category.isNotEmpty()) p += "category=${query(category)}"
-        val apiOffset = page - 1
-        if (apiOffset > 0) p += "offset=$apiOffset"
+        p += "page=$page"
+        val offset = (page - 1) * 20
+        if (offset > 0) p += "offset=$offset"
+        
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
@@ -485,6 +487,7 @@ object ReelFrenClient {
         return parsed
     }
     
+    // Pass term through to searchHtml to filter out Recommended shelves
     suspend fun search(slug: String, term: String): List<HomeItem> {
         ReelFrenLog.d("Client.search", "API search is blocked (401). Skipping straight to HTML fetch.")
         
@@ -495,7 +498,7 @@ object ReelFrenClient {
             return emptyList()
         }
 
-        val items = ReelFrenParse.searchHtml(htmlStr, slug)
+        val items = ReelFrenParse.searchHtml(htmlStr, slug, term)
         ReelFrenLog.d("Client.search", "HTML search found ${items.size} items for $slug.")
         
         return items
@@ -604,7 +607,8 @@ object ReelFrenParse {
         }
     }
     
-    fun searchHtml(htmlBody: String, requestedSlug: String): List<HomeItem> {
+    // [FIX] Accept query, scrape all, and filter out Recommended shelves
+    fun searchHtml(htmlBody: String, requestedSlug: String, query: String): List<HomeItem> {
         if (htmlBody.isBlank()) return emptyList()
 
         val results = mutableListOf<HomeItem>()
@@ -638,13 +642,31 @@ object ReelFrenParse {
             }
         }
         
-        if (results.isNotEmpty()) {
-            val uniqueResults = results.distinctBy { it.id }
+        // [FIX] Filter against query tokens to exclude Recommended shelves
+        val cleanQuery = query.trim().lowercase(Locale.ROOT)
+        val tokens = cleanQuery.split("\\s+".toRegex()).filter { it.length > 2 }
+
+        val filteredResults = results.filter { item ->
+            if (cleanQuery.isEmpty()) return@filter true
+            val lowerTitle = item.title.lowercase(Locale.ROOT)
+            
+            if (lowerTitle.contains(cleanQuery)) return@filter true
+            if (tokens.isNotEmpty() && tokens.any { lowerTitle.contains(it) }) return@filter true
+            false
+        }
+
+        if (filteredResults.isNotEmpty()) {
+            val uniqueResults = filteredResults.distinctBy { it.id }
             ReelFrenLog.d("Parse.searchHtml", "Successfully parsed ${uniqueResults.size} unique items via Regex.")
             return uniqueResults
         }
 
-        ReelFrenLog.d("Parse.searchHtml", "Next.js chunk parse failed. Search results returning empty.")
+        // [FIX] Differentiate empty search pages (~68KB) vs actual parse failures
+        if (htmlBody.length < 72000) {
+            ReelFrenLog.d("Parse.searchHtml", "Valid empty search page detected. (Size: ${htmlBody.length})")
+        } else {
+            ReelFrenLog.d("Parse.searchHtml", "Next.js chunk parse failed. Search results returning empty. (Size: ${htmlBody.length})")
+        }
         return emptyList()
     }
 
