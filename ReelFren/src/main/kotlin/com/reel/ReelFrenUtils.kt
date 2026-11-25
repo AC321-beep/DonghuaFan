@@ -113,7 +113,7 @@ object ReelFrenConfig {
 }
 
 // ----------------------------------------------------------------------
-// DATA STORE & UTILS (Moved UP for Compilation Safety)
+// DATA STORE & UTILS
 // ----------------------------------------------------------------------
 object ReelFrenStore {
     @Volatile var appContext: Context? = null
@@ -289,10 +289,9 @@ class WebViewCookieJar : CookieJar {
 
 object ReelFrenClient {
     const val GLOBAL_MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    const val FALLBACK_UA = GLOBAL_MOBILE_UA 
     
-    private val apiHost by lazy { 
-        runCatching { URI(ReelFrenConfig.DEFAULT_API_BASE).host }.getOrNull()?.lowercase(Locale.ROOT) ?: ""
-    }
+    private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
     
     @Volatile private var currentApiVersion = "v21"
@@ -315,6 +314,7 @@ object ReelFrenClient {
     private fun apiBase() = ReelFrenStore.apiBase()
     private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
     
+    // API endpoints that still work (HTTP 200)
     fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
         val p = mutableListOf<String>()
         val isGlobal = slug == "all_dramas"
@@ -334,14 +334,22 @@ object ReelFrenClient {
         return "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&lang=en&server=$server$cvStr"
     }
 
+    // HTML Web routes
     fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
     
-    fun searchHtmlUrl(term: String): String {
-        return "${ReelFrenConfig.REEL_SITE}/search?q=${query(term)}&lang=en"
+    // [FIX] Restored provider to search URL builder
+    fun searchHtmlUrl(slug: String, term: String): String {
+        val p = mutableListOf<String>()
+        p += "q=${query(term)}"
+        p += "lang=en"
+        if (slug.isNotEmpty() && slug != "all_dramas") {
+            p += "provider=${query(slug)}"
+        }
+        return "${ReelFrenConfig.REEL_SITE}/search?${p.joinToString("&")}"
     }
 
     fun headers(url: String, isApiCall: Boolean = false): Map<String, String> {
-        val targetHost = runCatching { URI(url).host }.getOrNull()?.lowercase(Locale.ROOT) ?: ""
+        val targetHost = ReelFrenCloudflare.hostOf(url)
         val map = linkedMapOf<String, String>()
         map["User-Agent"] = ReelFrenStore.userAgent(targetHost)
         map["Accept-Language"] = "en-US,en;q=0.9"
@@ -370,7 +378,7 @@ object ReelFrenClient {
     }
 
     fun videoHeaders(url: String): Map<String, String> {
-        val targetHost = runCatching { URI(url).host }.getOrNull()?.lowercase(Locale.ROOT) ?: ""
+        val targetHost = ReelFrenCloudflare.hostOf(url)
         val map = linkedMapOf<String, String>()
         map["User-Agent"] = ReelFrenStore.userAgent(targetHost) 
         map["Accept"] = "*/*"
@@ -396,7 +404,7 @@ object ReelFrenClient {
     }
 
     suspend fun get(url: String, isApiCall: Boolean = true): String? {
-        val targetHost = runCatching { URI(url).host }.getOrNull()?.lowercase(Locale.ROOT) ?: ""
+        val targetHost = ReelFrenCloudflare.hostOf(url)
         val isReelFrenHost = targetHost == apiHost || targetHost.contains("reelfren.net")
         
         ReelFrenLog.d("Client.get", "[GET INIT] url=$url isApiCall=$isApiCall")
@@ -424,7 +432,6 @@ object ReelFrenClient {
             responseText = try { spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
         }
         
-        // Use ReelFrenCloudflare ONLY to check if it's a challenge. CF Solver logic is handled there.
         if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
         ReelFrenLog.d("Client.get", "Falling back to CF Mutex...")
@@ -462,6 +469,7 @@ object ReelFrenClient {
     suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = 
         get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
+    // [FIX] Dead API fetch removed entirely. Skips directly to the successful HTML parse.
     suspend fun detail(slug: String, id: String): DetailInfo? {
         ReelFrenLog.d("Client.detail", "API detail is blocked (401). Skipping straight to HTML fetch.")
         
@@ -482,18 +490,19 @@ object ReelFrenClient {
         return parsed
     }
     
-    suspend fun search(term: String): List<HomeItem> {
-        ReelFrenLog.d("Client.search", "API search is blocked. Attempting global HTML search fetch.")
+    // [FIX] Dead API fetch removed entirely. Scrapes provider-specific HTML search pages directly.
+    suspend fun search(slug: String, term: String): List<HomeItem> {
+        ReelFrenLog.d("Client.search", "API search is blocked (401). Skipping straight to HTML fetch.")
         
-        val htmlStr = get(searchHtmlUrl(term), isApiCall = false)
+        val htmlStr = get(searchHtmlUrl(slug, term), isApiCall = false)
         
         if (htmlStr.isNullOrEmpty()) {
-            ReelFrenLog.d("Client.search", "FATAL: Global HTML search fetch returned null or empty.")
+            ReelFrenLog.d("Client.search", "FATAL: HTML search fetch returned null or empty.")
             return emptyList()
         }
 
-        val items = ReelFrenParse.searchHtml(htmlStr)
-        ReelFrenLog.d("Client.search", "Global HTML search found ${items.size} total items.")
+        val items = ReelFrenParse.searchHtml(htmlStr, slug)
+        ReelFrenLog.d("Client.search", "HTML search found ${items.size} items for $slug.")
         
         return items
     }
@@ -527,7 +536,7 @@ object ReelFrenClient {
     }
 
     fun absUrl(value: String): String {
-        val clean = decodeProxyUrl(value.trim())
+        val clean = value.trim() // Left clean without decoding to avoid HEIC/Coil issues.
         if (clean.isEmpty()) return ""
         if (clean.startsWith("https://", true) || clean.startsWith("http://", true)) return clean
         if (clean.startsWith("//")) return "https:$clean"
@@ -624,7 +633,8 @@ object ReelFrenParse {
         }
     }
     
-    fun searchHtml(htmlBody: String): List<HomeItem> {
+    // [FIX] Uses the robust Regex parser to bypass Next.js object keys for Search
+    fun searchHtml(htmlBody: String, requestedSlug: String): List<HomeItem> {
         if (htmlBody.isBlank()) return emptyList()
 
         val results = mutableListOf<HomeItem>()
@@ -642,6 +652,8 @@ object ReelFrenParse {
                 val id = clean(o, "id").ifEmpty { clean(o, "dramaId") }
                 val title = clean(o, "title").ifEmpty { clean(o, "name") }
                 val provider = clean(o, "provider")
+                
+                if (requestedSlug.isNotEmpty() && requestedSlug != "all_dramas" && provider.isNotEmpty() && provider != requestedSlug) continue
                 
                 if (id.isNotEmpty() && title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
                     results.add(HomeItem(
