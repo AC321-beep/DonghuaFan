@@ -15,11 +15,6 @@ class ReelFrenPlugin : Plugin() {
     override fun load(context: Context) {
         ReelFrenStore.init(context)
         
-        // [IMPROVEMENT] Disabled proactive CF prewarming. 
-        // The spoofed TLS client successfully bypasses Cloudflare natively on ReelFren.
-        // This saves massive CPU/RAM overhead on startup and avoids SSL WebView errors.
-        // ReelFrenCloudflare.prewarmIfNeeded()
-
         registerMainAPI(ReelFrenProvider())
 
         openSettings = {
@@ -81,7 +76,7 @@ class ReelFrenPlugin : Plugin() {
                                     registerMainAPI(ReelFrenProvider()) 
                                     
                                     // Let the user safely reload the page themselves
-                                    Toast. instalment(activity, "Settings saved! Please reload the Home Page.", Toast.LENGTH_LONG).show()
+                                    Toast.makeText(activity, "Settings saved! Please reload the Home Page.", Toast.LENGTH_LONG).show()
                                 }
                             }
                         }
