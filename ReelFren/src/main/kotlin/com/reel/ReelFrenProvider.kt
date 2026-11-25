@@ -41,8 +41,6 @@ class ReelFrenProvider : MainAPI() {
         private var cachedSearchResults: List<SearchResponse> = emptyList()
         private var cachedSearchTime: Long = 0L
         private const val CACHE_EXPIRY_MS = 10 * 60 * 1000L // 10 minutes
-        
-        private val bgSearchScope = CoroutineScope(Dispatchers.IO)
     }
 
     override val mainPage get() = mainPageOf(
@@ -66,7 +64,6 @@ class ReelFrenProvider : MainAPI() {
             val actualSlug = item.provider.ifEmpty { slug }
             
             newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
-                // [FIX] Prevents CoilImgLoader empty URL crash
                 this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
                 this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
             }
@@ -93,75 +90,29 @@ class ReelFrenProvider : MainAPI() {
             return emptyList()
         }
 
-        cachedSearchQuery = cleanQuery
-        cachedSearchResults = emptyList()
-        cachedSearchTime = now
-
-        val validProviders = activeProviders.filter { it != "all_dramas" }
-        if (validProviders.isEmpty()) return emptyList()
-
-        val primaryProviders = validProviders.take(3)
-        val secondaryProviders = validProviders.drop(3)
-
-        val fastResults = mutableListOf<SearchResponse>()
+        // [FIX] Perform ONE global search instead of looping through providers
+        val globalItems = runCatching { ReelFrenClient.search(cleanQuery) }.getOrDefault(emptyList())
         
-        coroutineScope {
-            val primarySearches = primaryProviders.map { slug ->
-                async {
-                    val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
-                    items.mapNotNull { item ->
-                        if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
-                        val actualSlug = item.provider.ifEmpty { slug }
-                        newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
-                            // [FIX] Prevents CoilImgLoader empty URL crash
-                            this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
-                            this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
-                        }
-                    }
-                }
-            }
+        val validProviders = activeProviders.filter { it != "all_dramas" }.toSet()
+        
+        // Filter the global results locally to only include dramas from enabled providers
+        val mappedResults = globalItems.mapNotNull { item ->
+            if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
+            if (!validProviders.contains(item.provider)) return@mapNotNull null
             
-            try {
-                withTimeout(10000L) {
-                    fastResults.addAll(primarySearches.awaitAll().flatten())
-                }
-            } catch (e: TimeoutCancellationException) {
-                val completed = primarySearches.filter { it.isCompleted && !it.isCancelled }.flatMap { it.getCompleted() }
-                fastResults.addAll(completed)
-                ReelFrenLog.d("Main/search", "Timeout hit on primary search. Returning ${completed.size} fast results.")
+            newMovieSearchResponse(item.title, ReelFrenUrl.page(item.provider, item.id), TvType.AsianDrama) {
+                this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
+                this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
             }
-        }
+        }.distinctBy { it.url }
 
-        val distinctFast = fastResults.distinctBy { it.url }
-        cachedSearchResults = distinctFast
+        cachedSearchQuery = cleanQuery
+        cachedSearchResults = mappedResults
+        cachedSearchTime = now
+        
+        ReelFrenLog.d("Main/search", "Global search mapped ${mappedResults.size} enabled items.")
 
-        bgSearchScope.launch {
-            val secondaryResults = mutableListOf<SearchResponse>()
-            for (slug in secondaryProviders) {
-                val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
-                items.forEach { item ->
-                    if (item.id.isNotEmpty() && item.title.isNotEmpty()) {
-                        val actualSlug = item.provider.ifEmpty { slug }
-                        secondaryResults.add(
-                            newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
-                                // [FIX] Prevents CoilImgLoader empty URL crash
-                                this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
-                                this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
-                            }
-                        )
-                    }
-                }
-                kotlinx.coroutines.delay(500)
-            }
-            
-            val allResults = (distinctFast + secondaryResults).distinctBy { it.url }
-            if (cachedSearchQuery == cleanQuery) {
-                cachedSearchResults = allResults
-                ReelFrenLog.d("Main/search", "Background cache expanded to ${allResults.size} items")
-            }
-        }
-
-        return distinctFast
+        return mappedResults
     }
 
     override suspend fun load(url: String): LoadResponse? {
@@ -171,7 +122,6 @@ class ReelFrenProvider : MainAPI() {
         
         val d: DetailInfo = ReelFrenClient.detail(slug, id) ?: throw ErrorLoadingException("Failed to load detail")
         
-        // [FIX] Prevents CoilImgLoader empty URL crash by returning null if cover is blank
         val coverUrl = ReelFrenClient.absUrl(d.cover).takeIf { it.isNotBlank() }
         val coverHeaders = ReelFrenClient.posterHeaders(coverUrl)
 
