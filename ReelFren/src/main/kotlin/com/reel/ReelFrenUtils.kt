@@ -24,7 +24,6 @@ import okhttp3.TlsVersion
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
-import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -289,9 +288,10 @@ class WebViewCookieJar : CookieJar {
 
 object ReelFrenClient {
     const val GLOBAL_MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-    const val FALLBACK_UA = GLOBAL_MOBILE_UA 
     
-    private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
+    private val apiHost by lazy { 
+        runCatching { URI(ReelFrenConfig.DEFAULT_API_BASE).host }.getOrNull()?.lowercase(Locale.ROOT) ?: ""
+    }
     private val apiMutex = Mutex()
     
     @Volatile private var currentApiVersion = "v21"
@@ -314,7 +314,6 @@ object ReelFrenClient {
     private fun apiBase() = ReelFrenStore.apiBase()
     private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
     
-    // API endpoints that still work (HTTP 200)
     fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
         val p = mutableListOf<String>()
         val isGlobal = slug == "all_dramas"
@@ -323,9 +322,11 @@ object ReelFrenClient {
         if (!omitCvParam) p += "cv=$currentApiVersion"
         
         if (category.isNotEmpty()) p += "category=${query(category)}"
-        p += "page=$page"
-        val offset = (page - 1) * 20
-        if (offset > 0) p += "offset=$offset"
+        
+        // [FIX] Corrected pagination math. API expects page indices, not multiplied counts.
+        val apiOffset = page - 1
+        if (apiOffset > 0) p += "offset=$apiOffset"
+        
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
@@ -334,22 +335,14 @@ object ReelFrenClient {
         return "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&lang=en&server=$server$cvStr"
     }
 
-    // HTML Web routes
     fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
     
-    // [FIX] Restored provider to search URL builder
-    fun searchHtmlUrl(slug: String, term: String): String {
-        val p = mutableListOf<String>()
-        p += "q=${query(term)}"
-        p += "lang=en"
-        if (slug.isNotEmpty() && slug != "all_dramas") {
-            p += "provider=${query(slug)}"
-        }
-        return "${ReelFrenConfig.REEL_SITE}/search?${p.joinToString("&")}"
+    fun searchHtmlUrl(term: String): String {
+        return "${ReelFrenConfig.REEL_SITE}/search?q=${query(term)}&lang=en"
     }
 
     fun headers(url: String, isApiCall: Boolean = false): Map<String, String> {
-        val targetHost = ReelFrenCloudflare.hostOf(url)
+        val targetHost = runCatching { URI(url).host }.getOrNull()?.lowercase(Locale.ROOT) ?: ""
         val map = linkedMapOf<String, String>()
         map["User-Agent"] = ReelFrenStore.userAgent(targetHost)
         map["Accept-Language"] = "en-US,en;q=0.9"
@@ -378,7 +371,7 @@ object ReelFrenClient {
     }
 
     fun videoHeaders(url: String): Map<String, String> {
-        val targetHost = ReelFrenCloudflare.hostOf(url)
+        val targetHost = runCatching { URI(url).host }.getOrNull()?.lowercase(Locale.ROOT) ?: ""
         val map = linkedMapOf<String, String>()
         map["User-Agent"] = ReelFrenStore.userAgent(targetHost) 
         map["Accept"] = "*/*"
@@ -404,7 +397,7 @@ object ReelFrenClient {
     }
 
     suspend fun get(url: String, isApiCall: Boolean = true): String? {
-        val targetHost = ReelFrenCloudflare.hostOf(url)
+        val targetHost = runCatching { URI(url).host }.getOrNull()?.lowercase(Locale.ROOT) ?: ""
         val isReelFrenHost = targetHost == apiHost || targetHost.contains("reelfren.net")
         
         ReelFrenLog.d("Client.get", "[GET INIT] url=$url isApiCall=$isApiCall")
@@ -469,7 +462,6 @@ object ReelFrenClient {
     suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = 
         get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
-    // [FIX] Dead API fetch removed entirely. Skips directly to the successful HTML parse.
     suspend fun detail(slug: String, id: String): DetailInfo? {
         ReelFrenLog.d("Client.detail", "API detail is blocked (401). Skipping straight to HTML fetch.")
         
@@ -490,19 +482,18 @@ object ReelFrenClient {
         return parsed
     }
     
-    // [FIX] Dead API fetch removed entirely. Scrapes provider-specific HTML search pages directly.
-    suspend fun search(slug: String, term: String): List<HomeItem> {
-        ReelFrenLog.d("Client.search", "API search is blocked (401). Skipping straight to HTML fetch.")
+    suspend fun search(term: String): List<HomeItem> {
+        ReelFrenLog.d("Client.search", "API search is blocked. Attempting global HTML search fetch.")
         
-        val htmlStr = get(searchHtmlUrl(slug, term), isApiCall = false)
+        val htmlStr = get(searchHtmlUrl(term), isApiCall = false)
         
         if (htmlStr.isNullOrEmpty()) {
-            ReelFrenLog.d("Client.search", "FATAL: HTML search fetch returned null or empty.")
+            ReelFrenLog.d("Client.search", "FATAL: Global HTML search fetch returned null or empty.")
             return emptyList()
         }
 
-        val items = ReelFrenParse.searchHtml(htmlStr, slug)
-        ReelFrenLog.d("Client.search", "HTML search found ${items.size} items for $slug.")
+        val items = ReelFrenParse.searchHtml(htmlStr)
+        ReelFrenLog.d("Client.search", "Global HTML search found ${items.size} total items.")
         
         return items
     }
@@ -511,32 +502,9 @@ object ReelFrenClient {
         val jsonText = get(videoUrl(slug, id, ep, serverId), isApiCall = true) ?: return null
         return ReelFrenParse.playback(jsonText, serverId)
     }
-    
-    fun decodeProxyUrl(rawUrl: String): String {
-        var clean = rawUrl.trim()
-        
-        if (clean.contains("wsrv.nl/?url=")) {
-            try {
-                val encodedUrl = clean.substringAfter("url=").substringBefore("&")
-                clean = URLDecoder.decode(encodedUrl, "UTF-8")
-            } catch (e: Exception) { }
-        }
-        
-        if (clean.contains("go.nunodrama.my.id/p/telegram_")) {
-            try {
-                val encodedPart = clean.substringAfterLast("/")
-                val decodedBytes = Base64.decode(encodedPart, Base64.URL_SAFE)
-                val decodedUrl = String(decodedBytes, Charsets.UTF_8)
-                if (decodedUrl.startsWith("http")) {
-                    clean = decodedUrl
-                }
-            } catch (e: Exception) { }
-        }
-        return clean
-    }
 
     fun absUrl(value: String): String {
-        val clean = value.trim() // Left clean without decoding to avoid HEIC/Coil issues.
+        val clean = value.trim() 
         if (clean.isEmpty()) return ""
         if (clean.startsWith("https://", true) || clean.startsWith("http://", true)) return clean
         if (clean.startsWith("//")) return "https:$clean"
@@ -633,8 +601,7 @@ object ReelFrenParse {
         }
     }
     
-    // [FIX] Uses the robust Regex parser to bypass Next.js object keys for Search
-    fun searchHtml(htmlBody: String, requestedSlug: String): List<HomeItem> {
+    fun searchHtml(htmlBody: String): List<HomeItem> {
         if (htmlBody.isBlank()) return emptyList()
 
         val results = mutableListOf<HomeItem>()
@@ -652,8 +619,6 @@ object ReelFrenParse {
                 val id = clean(o, "id").ifEmpty { clean(o, "dramaId") }
                 val title = clean(o, "title").ifEmpty { clean(o, "name") }
                 val provider = clean(o, "provider")
-                
-                if (requestedSlug.isNotEmpty() && requestedSlug != "all_dramas" && provider.isNotEmpty() && provider != requestedSlug) continue
                 
                 if (id.isNotEmpty() && title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
                     results.add(HomeItem(
