@@ -310,22 +310,51 @@ object ReelFrenClient {
     
     suspend fun detail(slug: String, id: String): DetailInfo? {
         ReelFrenLog.d("Client.detail", "Attempting API detail fetch...")
-        val primaryApiJson = get(detailApiUrl(slug, id), isApiCall = true)
-        val primaryParsed = primaryApiJson?.let { ReelFrenParse.detailApi(it, slug, id) }
         
-        if (primaryParsed != null && primaryParsed.title.isNotEmpty()) {
-            ReelFrenLog.d("Client.detail", "API detail parsed (episodes=${primaryParsed.videos.size}).")
-            return primaryParsed
+        // 1. Primary fast API fetch
+        val primaryResponse = get(detailApiUrl(slug, id), isApiCall = true)?.trimStart()
+        
+        if (!primaryResponse.isNullOrEmpty()) {
+            if (primaryResponse.startsWith("{") || primaryResponse.startsWith("[")) {
+                // Happy path: Fast JSON API response
+                val primaryParsed = ReelFrenParse.detailApi(primaryResponse, slug, id)
+                if (primaryParsed != null && primaryParsed.title.isNotEmpty()) {
+                    ReelFrenLog.d("Client.detail", "API detail parsed successfully (episodes=${primaryParsed.videos.size}).")
+                    return primaryParsed
+                }
+                ReelFrenLog.d("Client.detail", "JSON API parsed but was missing title/videos.")
+            } else if (primaryResponse.startsWith("<")) {
+                // Optimization Shortcut: WAF or proxy returned the HTML page on the API route.
+                // Feed it directly to the HTML scraper to avoid a redundant second network fetch.
+                ReelFrenLog.d("Client.detail", "API endpoint returned HTML (WAF/Proxy). Bypassing second fetch and parsing directly.")
+                val directHtmlParsed = ReelFrenParse.detailHtml(primaryResponse, slug, id)
+                if (directHtmlParsed != null && directHtmlParsed.title.isNotEmpty()) {
+                    ReelFrenLog.d("Client.detail", "Direct HTML parse successful (episodes=${directHtmlParsed.videos.size}).")
+                    return directHtmlParsed
+                }
+                ReelFrenLog.d("Client.detail", "Direct HTML parse failed or returned empty title.")
+            } else {
+                ReelFrenLog.d("Client.detail", "API endpoint returned unknown format (Not JSON or HTML).")
+            }
         }
-        
-        ReelFrenLog.d("Client.detail", "API detail incomplete/empty. Falling back to HTML detail parser.")
+
+        // 2. Bulletproof Fallback: Explicit HTML fetch if the API failed entirely or returned bad data
+        ReelFrenLog.d("Client.detail", "API detail failed/incomplete. Executing explicit HTML fallback fetch.")
         val htmlStr = get(detailHtmlUrl(slug, id), isApiCall = false)
-        if (htmlStr == null) {
-            ReelFrenLog.d("Client.detail", "FATAL: HTML network fetch returned null.")
+        
+        if (htmlStr.isNullOrEmpty()) {
+            ReelFrenLog.d("Client.detail", "FATAL: HTML fallback network fetch returned null or empty.")
             return null
         }
+
+        val fallbackParsed = ReelFrenParse.detailHtml(htmlStr, slug, id)
+        if (fallbackParsed != null && fallbackParsed.title.isNotEmpty()) {
+            ReelFrenLog.d("Client.detail", "Fallback HTML parse successful (episodes=${fallbackParsed.videos.size}).")
+        } else {
+            ReelFrenLog.d("Client.detail", "FATAL: Fallback HTML parsed but returned empty/null title.")
+        }
         
-        return ReelFrenParse.detailHtml(htmlStr, slug, id)
+        return fallbackParsed
     }
     
     suspend fun search(slug: String, term: String): List<HomeItem> = 
