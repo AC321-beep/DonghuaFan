@@ -81,7 +81,7 @@ class ReelFrenPlugin : Plugin() {
                                     registerMainAPI(ReelFrenProvider()) 
                                     
                                     // Let the user safely reload the page themselves
-                                    Toast.makeText(activity, "Settings saved! Please reload the Home Page.", Toast.LENGTH_LONG).show()
+                                    Toast. instalment(activity, "Settings saved! Please reload the Home Page.", Toast.LENGTH_LONG).show()
                                 }
                             }
                         }
