@@ -155,6 +155,7 @@ object ReelFrenClient {
     private fun apiBase() = ReelFrenStore.apiBase()
     private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
     
+    // API endpoints that still work (HTTP 200)
     fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
         val p = mutableListOf<String>()
         val isGlobal = slug == "all_dramas"
@@ -168,24 +169,20 @@ object ReelFrenClient {
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
-    fun detailApiUrl(slug: String, id: String): String {
-        return "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en&cv=$currentApiVersion"
-    }
-
-    fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
-    
     fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1) = 
         "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&lang=en&server=$server&cv=$currentApiVersion"
+
+    // [FIX] Dead API endpoints replaced with HTML Web routes
+    fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
     
-    fun searchUrl(slug: String, term: String): String {
+    fun searchHtmlUrl(slug: String, term: String): String {
         val p = mutableListOf<String>()
         p += "q=${query(term)}"
         p += "lang=en"
-        p += "cv=$currentApiVersion"
         if (slug.isNotEmpty() && slug != "all_dramas") {
             p += "provider=${query(slug)}"
         }
-        return "${apiBase()}/api/search?${p.joinToString("&")}"
+        return "${ReelFrenConfig.REEL_SITE}/search?${p.joinToString("&")}"
     }
 
     fun headers(url: String, isApiCall: Boolean = false): Map<String, String> {
@@ -255,7 +252,7 @@ object ReelFrenClient {
         ReelFrenLog.d("Client.get", "Attempting spoofed TLS fetch for: $url")
         var responseText = try { 
             val r = spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L)
-            ReelFrenLog.d("Client.get", "SPOOFED API HTTP CODE: ${r.code}, SIZE: ${r.text.length}")
+            ReelFrenLog.d("Client.get", "SPOOFED HTTP CODE: ${r.code}, SIZE: ${r.text.length}")
             r.text
         } catch (ce: CancellationException) { 
             ReelFrenLog.d("Client.get", "Coro Cancelled on initial fetch")
@@ -287,7 +284,7 @@ object ReelFrenClient {
             
             val finalResponse = try { 
                 val r = spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L)
-                ReelFrenLog.d("Client.get", "MUTEX API HTTP CODE: ${r.code}, SIZE: ${r.text.length}")
+                ReelFrenLog.d("Client.get", "MUTEX HTTP CODE: ${r.code}, SIZE: ${r.text.length}")
                 r.text
             } catch (ce: CancellationException) { 
                 ReelFrenLog.d("Client.get", "Coro Cancelled on Mutex fetch")
@@ -308,53 +305,40 @@ object ReelFrenClient {
         get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
     
     suspend fun detail(slug: String, id: String): DetailInfo? {
-        ReelFrenLog.d("Client.detail", "Attempting API detail fetch...")
+        ReelFrenLog.d("Client.detail", "API detail is blocked (401). Skipping straight to HTML fetch.")
         
-        // 1. Primary fast API fetch
-        val primaryResponse = get(detailApiUrl(slug, id), isApiCall = true)?.trimStart()
-        
-        if (!primaryResponse.isNullOrEmpty()) {
-            if (primaryResponse.startsWith("{") || primaryResponse.startsWith("[")) {
-                val primaryParsed = ReelFrenParse.detailApi(primaryResponse, slug, id)
-                if (primaryParsed != null && primaryParsed.title.isNotEmpty()) {
-                    ReelFrenLog.d("Client.detail", "API detail parsed successfully (episodes=${primaryParsed.videos.size}).")
-                    return primaryParsed
-                }
-                ReelFrenLog.d("Client.detail", "JSON API parsed but was missing title/videos.")
-            } else if (primaryResponse.startsWith("<")) {
-                ReelFrenLog.d("Client.detail", "API endpoint returned HTML (WAF/Proxy). Bypassing second fetch and parsing directly.")
-                val directHtmlParsed = ReelFrenParse.detailHtml(primaryResponse, slug, id)
-                if (directHtmlParsed != null && directHtmlParsed.title.isNotEmpty()) {
-                    ReelFrenLog.d("Client.detail", "Direct HTML parse successful (episodes=${directHtmlParsed.videos.size}).")
-                    return directHtmlParsed
-                }
-                ReelFrenLog.d("Client.detail", "Direct HTML parse failed or returned empty title.")
-            } else {
-                ReelFrenLog.d("Client.detail", "API endpoint returned unknown format (Not JSON or HTML).")
-            }
-        }
-
-        // 2. Fallback: Explicit HTML fetch
-        ReelFrenLog.d("Client.detail", "API detail failed/incomplete. Executing explicit HTML fallback fetch.")
         val htmlStr = get(detailHtmlUrl(slug, id), isApiCall = false)
         
         if (htmlStr.isNullOrEmpty()) {
-            ReelFrenLog.d("Client.detail", "FATAL: HTML fallback network fetch returned null or empty.")
+            ReelFrenLog.d("Client.detail", "FATAL: HTML network fetch returned null or empty.")
             return null
         }
 
-        val fallbackParsed = ReelFrenParse.detailHtml(htmlStr, slug, id)
-        if (fallbackParsed != null && fallbackParsed.title.isNotEmpty()) {
-            ReelFrenLog.d("Client.detail", "Fallback HTML parse successful (episodes=${fallbackParsed.videos.size}).")
+        val parsed = ReelFrenParse.detailHtml(htmlStr, slug, id)
+        if (parsed != null && parsed.title.isNotEmpty()) {
+            ReelFrenLog.d("Client.detail", "HTML parse successful (episodes=${parsed.videos.size}).")
         } else {
-            ReelFrenLog.d("Client.detail", "FATAL: Fallback HTML parsed but returned empty/null title.")
+            ReelFrenLog.d("Client.detail", "FATAL: HTML parsed but returned empty/null title.")
         }
         
-        return fallbackParsed
+        return parsed
     }
     
-    suspend fun search(slug: String, term: String): List<HomeItem> = 
-        get(searchUrl(slug, term), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
+    suspend fun search(slug: String, term: String): List<HomeItem> {
+        ReelFrenLog.d("Client.search", "API search is blocked (401). Skipping straight to HTML fetch.")
+        
+        val htmlStr = get(searchHtmlUrl(slug, term), isApiCall = false)
+        
+        if (htmlStr.isNullOrEmpty()) {
+            ReelFrenLog.d("Client.search", "FATAL: HTML search fetch returned null or empty.")
+            return emptyList()
+        }
+
+        val items = ReelFrenParse.searchHtml(htmlStr, slug)
+        ReelFrenLog.d("Client.search", "HTML search found ${items.size} items for $slug.")
+        
+        return items
+    }
     
     suspend fun playback(slug: String, id: String, ep: Int, serverId: Int): PlaybackInfo? {
         val jsonText = get(videoUrl(slug, id, ep, serverId), isApiCall = true) ?: return null
@@ -481,6 +465,59 @@ object ReelFrenParse {
             )
         }
     }
+    
+    fun searchHtml(htmlBody: String, requestedSlug: String): List<HomeItem> {
+        if (htmlBody.isBlank()) return emptyList()
+
+        val results = mutableListOf<HomeItem>()
+        
+        ReelFrenLog.d("Parse.searchHtml", "Hunting for Next.js chunks in search HTML...")
+        val candidates = mutableListOf<String>()
+        candidates += extractAllJsonObjectsForKey(htmlBody, "items")
+        candidates += extractAllJsonObjectsForKey(htmlBody, "list")
+        candidates += extractAllJsonObjectsForKey(htmlBody, "results")
+        
+        val unescaped = unescapeNextPayload(htmlBody)
+        if (unescaped != htmlBody) {
+            candidates += extractAllJsonObjectsForKey(unescaped, "items")
+            candidates += extractAllJsonObjectsForKey(unescaped, "list")
+            candidates += extractAllJsonObjectsForKey(unescaped, "results")
+        }
+
+        for (rawJson in candidates) {
+            val arr = runCatching { 
+                val obj = JSONObject(rawJson)
+                obj.optJSONArray("items") ?: obj.optJSONArray("list") ?: obj.optJSONArray("results")
+            }.getOrNull() ?: continue
+            
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val id = clean(o, "id").ifEmpty { clean(o, "dramaId") }
+                val title = clean(o, "title").ifEmpty { clean(o, "name") }
+                val provider = clean(o, "provider")
+                
+                if (requestedSlug.isNotEmpty() && requestedSlug != "all_dramas" && provider.isNotEmpty() && provider != requestedSlug) continue
+                
+                if (id.isNotEmpty() && title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
+                    results.add(HomeItem(
+                        id = id, 
+                        provider = provider, 
+                        title = title, 
+                        cover = ReelFrenClient.absUrl(clean(o, "cover").ifEmpty { clean(o, "poster") }), 
+                        intro = clean(o, "intro"), 
+                        episodes = o.optInt("episodes")
+                    ))
+                }
+            }
+            if (results.isNotEmpty()) {
+                ReelFrenLog.d("Parse.searchHtml", "Successfully parsed ${results.size} items from Next.js snippet.")
+                return results
+            }
+        }
+
+        ReelFrenLog.d("Parse.searchHtml", "Next.js chunk parse failed. Search results returning empty.")
+        return emptyList()
+    }
 
     private fun buildDetailFromJson(root: JSONObject, fallbackSlug: String, fallbackId: String): DetailInfo? {
         val id = findValueRecursively(root, "id", "dramaId").ifEmpty { fallbackId }
@@ -525,14 +562,6 @@ object ReelFrenParse {
             episodes = if (totalEps > 0) totalEps else videos.size,
             videos = videos.distinctBy { it.episode }.sortedBy { it.episode }
         )
-    }
-
-    fun detailApi(body: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
-        if (body.isBlank()) return null
-        val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
-        val candidate = root.optJSONObject("detail") ?: root.optJSONObject("data") ?: root
-        return buildDetailFromJson(candidate, fallbackSlug, fallbackId)
-            ?: buildDetailFromJson(root, fallbackSlug, fallbackId)
     }
 
     private fun extractAllJsonObjectsForKey(source: String, key: String): List<String> {
@@ -1146,22 +1175,6 @@ object ReelFrenStore {
         memoryUa[norm] = cleaned
         storePrefs?.edit()?.putString("ua_$norm", cleaned)?.apply()
     }
-
-    fun shouldSkipPrewarm(): Boolean {
-        val lastFail = storePrefs?.getLong("prewarm_last_fail", 0L) ?: 0L
-        val failCount = storePrefs?.getInt("prewarm_fail_count", 0) ?: 0
-        if (lastFail == 0L || failCount <= 0) return false
-        val shift = (failCount - 1).coerceIn(0, 6)
-        val cooldown = 60_000L * (1L shl shift)
-        return (System.currentTimeMillis() - lastFail) < cooldown
-    }
-
-    fun recordPrewarmResult(success: Boolean) {
-        val editor = storePrefs?.edit() ?: return
-        if (success) { editor.putLong("prewarm_last_fail", 0L); editor.putInt("prewarm_fail_count", 0) } 
-        else { val count = (storePrefs?.getInt("prewarm_fail_count", 0) ?: 0) + 1; editor.putLong("prewarm_last_fail", System.currentTimeMillis()); editor.putInt("prewarm_fail_count", count) }
-        editor.apply()
-    }
 }
 
 // ----------------------------------------------------------------------
@@ -1175,13 +1188,13 @@ object ReelFrenQuality {
 
     fun inferFormat(url: String, explicitFormat: String = ""): String {
         val cleanFormat = explicitFormat.trim().lowercase(Locale.ROOT)
-        // [FIX] Removed logic that forces HLS/M3U8 when encountering an MP4 with `&rc=` or `mime_type=video_mp4`
         if (cleanFormat.isNotEmpty()) {
             return cleanFormat
         }
         return when {
             url.contains(".m3u8", ignoreCase = true) -> "hls"
             url.contains(".mpd", ignoreCase = true)  -> "dash"
+            // [FIX] Removed logic that forces HLS/M3U8 when encountering an MP4 with `&rc=` or `mime_type=video_mp4`
             url.contains(".mp4", ignoreCase = true) || url.contains("mime_type=video_mp4", ignoreCase = true) -> "mp4"
             else -> "video"
         }
