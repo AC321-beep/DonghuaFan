@@ -131,7 +131,7 @@ class WebViewCookieJar : CookieJar {
 
 object ReelFrenClient {
     const val GLOBAL_MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-    const val FALLBACK_UA = GLOBAL_MOBILE_UA // <-- Restored Constant
+    const val FALLBACK_UA = GLOBAL_MOBILE_UA
     
     private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
@@ -169,7 +169,8 @@ object ReelFrenClient {
     }
 
     fun detailApiUrl(slug: String, id: String): String {
-        return "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en"
+        // [FIX] Added missing `&cv=$currentApiVersion`. The server returns 401 Unauthorized without this.
+        return "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en&cv=$currentApiVersion"
     }
 
     fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
@@ -199,7 +200,6 @@ object ReelFrenClient {
         if (isApiCall) {
             map["Accept"] = "application/json, text/plain, */*" 
         } else {
-            // WAF bypass headers to prevent Cloudflare from resetting the TLS connection on spoofedApp
             map["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
             map["sec-ch-ua"] = "\"Chromium\";v=\"120\", \"Google Chrome\";v=\"120\", \"Not-A.Brand\";v=\"99\""
             map["sec-ch-ua-mobile"] = "?0"
@@ -316,7 +316,6 @@ object ReelFrenClient {
         
         if (!primaryResponse.isNullOrEmpty()) {
             if (primaryResponse.startsWith("{") || primaryResponse.startsWith("[")) {
-                // Happy path: Fast JSON API response
                 val primaryParsed = ReelFrenParse.detailApi(primaryResponse, slug, id)
                 if (primaryParsed != null && primaryParsed.title.isNotEmpty()) {
                     ReelFrenLog.d("Client.detail", "API detail parsed successfully (episodes=${primaryParsed.videos.size}).")
@@ -324,8 +323,7 @@ object ReelFrenClient {
                 }
                 ReelFrenLog.d("Client.detail", "JSON API parsed but was missing title/videos.")
             } else if (primaryResponse.startsWith("<")) {
-                // Optimization Shortcut: WAF or proxy returned the HTML page on the API route.
-                // Feed it directly to the HTML scraper to avoid a redundant second network fetch.
+                // Optimization Shortcut: WAF or proxy returned HTML on API route
                 ReelFrenLog.d("Client.detail", "API endpoint returned HTML (WAF/Proxy). Bypassing second fetch and parsing directly.")
                 val directHtmlParsed = ReelFrenParse.detailHtml(primaryResponse, slug, id)
                 if (directHtmlParsed != null && directHtmlParsed.title.isNotEmpty()) {
@@ -338,7 +336,7 @@ object ReelFrenClient {
             }
         }
 
-        // 2. Bulletproof Fallback: Explicit HTML fetch if the API failed entirely or returned bad data
+        // 2. Fallback: Explicit HTML fetch
         ReelFrenLog.d("Client.detail", "API detail failed/incomplete. Executing explicit HTML fallback fetch.")
         val htmlStr = get(detailHtmlUrl(slug, id), isApiCall = false)
         
@@ -372,9 +370,7 @@ object ReelFrenClient {
             try {
                 val encodedUrl = clean.substringAfter("url=").substringBefore("&")
                 clean = URLDecoder.decode(encodedUrl, "UTF-8")
-            } catch (e: Exception) {
-                // pass
-            }
+            } catch (e: Exception) { }
         }
         
         if (clean.contains("go.nunodrama.my.id/p/telegram_")) {
@@ -385,9 +381,7 @@ object ReelFrenClient {
                 if (decodedUrl.startsWith("http")) {
                     clean = decodedUrl
                 }
-            } catch (e: Exception) {
-                // pass
-            }
+            } catch (e: Exception) { }
         }
         return clean
     }
@@ -646,8 +640,9 @@ object ReelFrenParse {
             val schemaObj = runCatching { JSONObject(schemaJsonText) }.getOrNull()
 
             if (schemaObj != null) {
+                // [FIX] Explicitly ignore the generic 'ReelFren' site title fallback.
                 val title = clean(schemaObj, "name").replace("Episode 1", "").trim()
-                if (title.isNotEmpty()) {
+                if (title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
                     val cover = ReelFrenClient.absUrl(clean(schemaObj, "image"))
                     val intro = clean(schemaObj, "description").replace(Regex("""Watch Now: .*? as a free short drama on ReelFren."""), "").trim()
                     
@@ -678,7 +673,7 @@ object ReelFrenParse {
                         videos = videos
                     )
                 } else {
-                    ReelFrenLog.d("Parse.detailHtml", "JSON-LD schema found but title was empty.")
+                    ReelFrenLog.d("Parse.detailHtml", "JSON-LD schema found but title was empty or generic 'ReelFren'.")
                 }
             } else {
                 ReelFrenLog.d("Parse.detailHtml", "JSON-LD schema matched but failed JSONObject parsing.")
@@ -697,7 +692,8 @@ object ReelFrenParse {
         for (rawJson in candidates) {
             val obj = runCatching { JSONObject(rawJson) }.getOrNull() ?: continue
             val parsed = buildDetailFromJson(obj, fallbackSlug, fallbackId)
-            if (parsed != null && parsed.title.isNotEmpty()) {
+            // [FIX] Ensure the Next.js chunk title isn't a false positive
+            if (parsed != null && parsed.title.isNotEmpty() && !parsed.title.equals("ReelFren", ignoreCase = true)) {
                 ReelFrenLog.d("Parse.detailHtml", "Successfully parsed detail from Next.js snippet. Title='${parsed.title}'")
                 return parsed
             }
@@ -713,8 +709,9 @@ object ReelFrenParse {
         
         ReelFrenLog.d("Parse.detailHtml", "Regex extracted title: '$title'")
         
-        if (title.isEmpty() || title.contains("Just a moment", ignoreCase = true) || title.contains("Cloudflare", ignoreCase = true)) {
-            ReelFrenLog.d("Parse.detailHtml", "FATAL: Extracted Title is empty or indicates CF block.")
+        // [FIX] Explicitly reject generic site title here too
+        if (title.isEmpty() || title.contains("Just a moment", ignoreCase = true) || title.contains("Cloudflare", ignoreCase = true) || title.equals("ReelFren", ignoreCase = true)) {
+            ReelFrenLog.d("Parse.detailHtml", "FATAL: Extracted Title is empty, generic, or indicates CF block.")
             return null
         }
 
