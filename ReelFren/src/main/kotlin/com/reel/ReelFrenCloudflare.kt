@@ -7,13 +7,18 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.net.http.SslError
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.MotionEvent
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.SslErrorHandler
+import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -27,6 +32,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -197,6 +203,13 @@ object ReelFrenCloudflare {
                 }
             }, 80L)
         }
+    }
+
+    fun prewarmIfNeeded() {
+        // [FIX] Proactive CF prewarming is completely disabled.
+        // ReelFrenStore.shouldSkipPrewarm() and recordPrewarmResult() were removed
+        // to stop background WebView SSL errors and reduce startup CPU/RAM overhead.
+        // We leave the empty method here safely so it doesn't crash if called.
     }
 
     suspend fun solve(
