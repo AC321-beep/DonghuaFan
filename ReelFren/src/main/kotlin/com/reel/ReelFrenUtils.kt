@@ -335,15 +335,9 @@ object ReelFrenClient {
 
     fun detailHtmlUrl(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/${query(slug)}/${query(id)}?lang=en"
     
-    // [FIX] Accepts 2 arguments to map correctly with Provider
-    fun searchHtmlUrl(slug: String, term: String): String {
-        val p = mutableListOf<String>()
-        p += "q=${query(term)}"
-        p += "lang=en"
-        if (slug.isNotEmpty() && slug != "all_dramas") {
-            p += "provider=${query(slug)}"
-        }
-        return "${ReelFrenConfig.REEL_SITE}/search?${p.joinToString("&")}"
+    // [FIX] Explicit 1-parameter Global Search URL builder
+    fun searchHtmlUrl(term: String): String {
+        return "${ReelFrenConfig.REEL_SITE}/search?q=${query(term)}&lang=en"
     }
 
     fun headers(url: String, isApiCall: Boolean = false): Map<String, String> {
@@ -487,19 +481,19 @@ object ReelFrenClient {
         return parsed
     }
     
-    // [FIX] Accepts 2 arguments to map correctly with Provider
-    suspend fun search(slug: String, term: String): List<HomeItem> {
-        ReelFrenLog.d("Client.search", "API search is blocked (401). Skipping straight to HTML fetch.")
+    // [FIX] Explicit 1-parameter Global Search client method
+    suspend fun search(term: String): List<HomeItem> {
+        ReelFrenLog.d("Client.search", "API search is blocked. Attempting global HTML search fetch.")
         
-        val htmlStr = get(searchHtmlUrl(slug, term), isApiCall = false)
+        val htmlStr = get(searchHtmlUrl(term), isApiCall = false)
         
         if (htmlStr.isNullOrEmpty()) {
-            ReelFrenLog.d("Client.search", "FATAL: HTML search fetch returned null or empty.")
+            ReelFrenLog.d("Client.search", "FATAL: Global HTML search fetch returned null or empty.")
             return emptyList()
         }
 
-        val items = ReelFrenParse.searchHtml(htmlStr, slug)
-        ReelFrenLog.d("Client.search", "HTML search found ${items.size} items for $slug.")
+        val items = ReelFrenParse.searchHtml(htmlStr)
+        ReelFrenLog.d("Client.search", "Global HTML search found ${items.size} total items.")
         
         return items
     }
@@ -607,8 +601,8 @@ object ReelFrenParse {
         }
     }
     
-    // [FIX] Accepts 2 arguments to map correctly with Provider
-    fun searchHtml(htmlBody: String, requestedSlug: String): List<HomeItem> {
+    // [FIX] Explicit 1-parameter Global Search parse method
+    fun searchHtml(htmlBody: String): List<HomeItem> {
         if (htmlBody.isBlank()) return emptyList()
 
         val results = mutableListOf<HomeItem>()
@@ -626,8 +620,6 @@ object ReelFrenParse {
                 val id = clean(o, "id").ifEmpty { clean(o, "dramaId") }
                 val title = clean(o, "title").ifEmpty { clean(o, "name") }
                 val provider = clean(o, "provider")
-                
-                if (requestedSlug.isNotEmpty() && requestedSlug != "all_dramas" && provider.isNotEmpty() && provider != requestedSlug) continue
                 
                 if (id.isNotEmpty() && title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
                     results.add(HomeItem(
