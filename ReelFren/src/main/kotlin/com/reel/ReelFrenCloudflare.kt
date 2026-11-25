@@ -7,18 +7,13 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.graphics.Bitmap
 import android.graphics.Color
-import android.net.http.SslError
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.MotionEvent
-import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
-import android.webkit.SslErrorHandler
-import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -32,7 +27,6 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -202,31 +196,6 @@ object ReelFrenCloudflare {
                     up.recycle()
                 }
             }, 80L)
-        }
-    }
-
-    fun prewarmIfNeeded() {
-        val host = hostOf(ReelFrenConfig.REEL_SITE)
-        val cm = CookieManager.getInstance()
-        val cookies = cm.getCookie(ReelFrenConfig.REEL_SITE) ?: ""
-        if (cookies.contains("cf_clearance")) return
-        
-        if (ReelFrenStore.shouldSkipPrewarm()) return
-
-        ReelFrenCfState.solverScope.launch {
-            delay(2000L) 
-            val act = activity() ?: return@launch
-            if (act.isFinishing || act.isDestroyed || act.window?.decorView == null) return@launch
-
-            try {
-                val ok = solve(ReelFrenConfig.REEL_SITE, silentOnly = true)
-                ReelFrenStore.recordPrewarmResult(ok)
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (e: Exception) {
-                ReelFrenLog.t("CF/prewarm", e)
-                ReelFrenStore.recordPrewarmResult(false)
-            }
         }
     }
 
