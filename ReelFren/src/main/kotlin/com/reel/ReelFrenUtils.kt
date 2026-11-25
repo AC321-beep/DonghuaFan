@@ -466,53 +466,48 @@ object ReelFrenParse {
         }
     }
     
+    // [FIX] Updated HTML search scraper to use robust Regex for Next.js arrays
     fun searchHtml(htmlBody: String, requestedSlug: String): List<HomeItem> {
         if (htmlBody.isBlank()) return emptyList()
 
         val results = mutableListOf<HomeItem>()
-        
         ReelFrenLog.d("Parse.searchHtml", "Hunting for Next.js chunks in search HTML...")
-        val candidates = mutableListOf<String>()
-        candidates += extractAllJsonObjectsForKey(htmlBody, "items")
-        candidates += extractAllJsonObjectsForKey(htmlBody, "list")
-        candidates += extractAllJsonObjectsForKey(htmlBody, "results")
         
-        val unescaped = unescapeNextPayload(htmlBody)
-        if (unescaped != htmlBody) {
-            candidates += extractAllJsonObjectsForKey(unescaped, "items")
-            candidates += extractAllJsonObjectsForKey(unescaped, "list")
-            candidates += extractAllJsonObjectsForKey(unescaped, "results")
-        }
+        // Use regex to find any JSON object that looks like a drama item inside the Next.js payload
+        val itemPattern = Regex("""\{"id":"([^"]+)","provider":"([^"]+)","title":"([^"]+)","cover":"([^"]*)"(?:,"intro":"([^"]*)")?,?"episodes":(\d+)[^}]*\}""")
+        val unescapedBody = unescapeNextPayload(htmlBody)
+        
+        val matches = itemPattern.findAll(unescapedBody).toList()
+        if (matches.isNotEmpty()) {
+            for (match in matches) {
+                val id = match.groupValues[1]
+                val provider = match.groupValues[2]
+                val title = match.groupValues[3].replace("\\\"", "\"").replace("\\'", "'")
+                val cover = match.groupValues[4]
+                val intro = match.groupValues.getOrNull(5)?.replace("\\\"", "\"")?.replace("\\'", "'") ?: ""
+                val episodes = match.groupValues[6].toIntOrNull() ?: 0
 
-        for (rawJson in candidates) {
-            val arr = runCatching { 
-                val obj = JSONObject(rawJson)
-                obj.optJSONArray("items") ?: obj.optJSONArray("list") ?: obj.optJSONArray("results")
-            }.getOrNull() ?: continue
-            
-            for (i in 0 until arr.length()) {
-                val o = arr.optJSONObject(i) ?: continue
-                val id = clean(o, "id").ifEmpty { clean(o, "dramaId") }
-                val title = clean(o, "title").ifEmpty { clean(o, "name") }
-                val provider = clean(o, "provider")
-                
+                // Filter by provider if requested
                 if (requestedSlug.isNotEmpty() && requestedSlug != "all_dramas" && provider.isNotEmpty() && provider != requestedSlug) continue
                 
                 if (id.isNotEmpty() && title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
                     results.add(HomeItem(
-                        id = id, 
-                        provider = provider, 
-                        title = title, 
-                        cover = ReelFrenClient.absUrl(clean(o, "cover").ifEmpty { clean(o, "poster") }), 
-                        intro = clean(o, "intro"), 
-                        episodes = o.optInt("episodes")
+                        id = id,
+                        provider = provider,
+                        title = title,
+                        cover = ReelFrenClient.absUrl(cover),
+                        intro = intro,
+                        episodes = episodes
                     ))
                 }
             }
-            if (results.isNotEmpty()) {
-                ReelFrenLog.d("Parse.searchHtml", "Successfully parsed ${results.size} items from Next.js snippet.")
-                return results
-            }
+        }
+        
+        if (results.isNotEmpty()) {
+            // Distinct by ID to prevent duplicates if the payload repeats data
+            val uniqueResults = results.distinctBy { it.id }
+            ReelFrenLog.d("Parse.searchHtml", "Successfully parsed ${uniqueResults.size} unique items via Regex.")
+            return uniqueResults
         }
 
         ReelFrenLog.d("Parse.searchHtml", "Next.js chunk parse failed. Search results returning empty.")
