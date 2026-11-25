@@ -27,6 +27,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -45,10 +46,7 @@ object ReelFrenCfState {
     private val solving = ConcurrentHashMap<String, SolveSession>()
     val solverScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
-    fun beginSolve(
-        host: String,
-        interactiveAllowed: Boolean
-    ): Pair<SolveSession, Boolean> {
+    fun beginSolve(host: String, interactiveAllowed: Boolean): Pair<SolveSession, Boolean> {
         while (true) {
             val fresh = SolveSession(allowInteractive = AtomicBoolean(interactiveAllowed))
             val existing = solving.putIfAbsent(host, fresh)
@@ -77,7 +75,6 @@ object ReelFrenCfState {
 }
 
 object ReelFrenCloudflare {
-
     private val clearanceRegex = Regex("(?:^|;\\s*)cf_clearance=([^;]+)")
 
     fun hostOf(url: String): String =
@@ -105,19 +102,10 @@ object ReelFrenCloudflare {
     private fun isChallengeOrBlankTitle(title: String?): Boolean {
         val t = title?.lowercase(Locale.ROOT)?.trim().orEmpty()
         return t.isEmpty() ||
-               t == "about:blank" ||
-               t == "loading..." ||
-               t == "loading" ||
-               t.startsWith("loading...") ||
-               t.contains("please wait") ||
-               t.contains("just a moment") ||
-               t.contains("attention required") ||
-               t.contains("checking your browser") ||
-               t.contains("security check") ||
-               t.contains("one more step") ||
-               t.contains("verify you are human") ||
-               t.contains("403 forbidden") ||
-               t.contains("access denied") ||
+               t == "about:blank" || t == "loading..." || t == "loading" || t.startsWith("loading...") ||
+               t.contains("please wait") || t.contains("just a moment") || t.contains("attention required") ||
+               t.contains("checking your browser") || t.contains("security check") || t.contains("one more step") ||
+               t.contains("verify you are human") || t.contains("403 forbidden") || t.contains("access denied") ||
                t.contains("webpage not available")
     }
 
@@ -139,6 +127,7 @@ object ReelFrenCloudflare {
             val cookie = cm.getCookie(url) ?: cm.getCookie("https://$host") ?: return
             if (extractClearanceToken(cookie).isNotEmpty()) {
                 ReelFrenStore.saveCookie(host, cookie)
+                // [FIX] Ensure the UA saved matches exactly what the WebView used
                 ReelFrenStore.setUserAgent(host, ua)
                 cm.flush()
                 ReelFrenLog.d("CF/cookie", "Persisted cf_clearance for $host (len=${cookie.length})")
@@ -151,21 +140,9 @@ object ReelFrenCloudflare {
     private fun simulateTouchTap(web: WebView, handler: Handler, x: Float, y: Float) {
         runCatching {
             val downTime = SystemClock.uptimeMillis()
-            val props = arrayOf(MotionEvent.PointerProperties().apply {
-                id = 0
-                toolType = MotionEvent.TOOL_TYPE_FINGER
-            })
-            val coords = arrayOf(MotionEvent.PointerCoords().apply {
-                this.x = x
-                this.y = y
-                pressure = 1.0f
-                size = 1.0f
-            })
-            val down = MotionEvent.obtain(
-                downTime, downTime, MotionEvent.ACTION_DOWN,
-                1, props, coords, 0, 0, 1.0f, 1.0f,
-                0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
-            )
+            val props = arrayOf(MotionEvent.PointerProperties().apply { id = 0; toolType = MotionEvent.TOOL_TYPE_FINGER })
+            val coords = arrayOf(MotionEvent.PointerCoords().apply { this.x = x; this.y = y; pressure = 1.0f; size = 1.0f })
+            val down = MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, 1, props, coords, 0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0)
             web.dispatchTouchEvent(down)
             down.recycle()
 
@@ -174,11 +151,7 @@ object ReelFrenCloudflare {
                     val moveTime = SystemClock.uptimeMillis()
                     coords[0].x += 2f
                     coords[0].y += 2f
-                    val move = MotionEvent.obtain(
-                        downTime, moveTime, MotionEvent.ACTION_MOVE,
-                        1, props, coords, 0, 0, 1.0f, 1.0f,
-                        0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
-                    )
+                    val move = MotionEvent.obtain(downTime, moveTime, MotionEvent.ACTION_MOVE, 1, props, coords, 0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0)
                     web.dispatchTouchEvent(move)
                     move.recycle()
                 }
@@ -187,11 +160,7 @@ object ReelFrenCloudflare {
             handler.postDelayed({
                 runCatching {
                     val upTime = SystemClock.uptimeMillis()
-                    val up = MotionEvent.obtain(
-                        downTime, upTime, MotionEvent.ACTION_UP,
-                        1, props, coords, 0, 0, 1.0f, 1.0f,
-                        0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0
-                    )
+                    val up = MotionEvent.obtain(downTime, upTime, MotionEvent.ACTION_UP, 1, props, coords, 0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_TOUCHSCREEN, 0)
                     web.dispatchTouchEvent(up)
                     up.recycle()
                 }
@@ -199,20 +168,14 @@ object ReelFrenCloudflare {
         }
     }
 
-    suspend fun solve(
-        url: String,
-        silentOnly: Boolean = false
-    ): Boolean {
+    suspend fun solve(url: String, silentOnly: Boolean = false): Boolean {
         val activity = activity() ?: return false
         if (activity.isFinishing || activity.isDestroyed) return false
 
         val host = hostOf(url)
         if (host.isBlank()) return false
 
-        val (session, isOwner) = ReelFrenCfState.beginSolve(
-            host = host,
-            interactiveAllowed = !silentOnly
-        )
+        val (session, isOwner) = ReelFrenCfState.beginSolve(host = host, interactiveAllowed = !silentOnly)
         if (!isOwner) {
             ReelFrenLog.d("CF/solve", "Joined in-flight solve for $host")
             return session.deferred.await()
@@ -245,12 +208,7 @@ object ReelFrenCloudflare {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun attemptSilent(
-        activity: Activity,
-        url: String,
-        host: String,
-        session: SolveSession
-    ): Boolean = withContext(Dispatchers.Main) {
+    private suspend fun attemptSilent(activity: Activity, url: String, host: String, session: SolveSession): Boolean = withContext(Dispatchers.Main) {
         val decor = activity.window?.decorView as? ViewGroup ?: return@withContext false
 
         suspendCancellableCoroutine { cont ->
@@ -258,6 +216,7 @@ object ReelFrenCloudflare {
             val settling = AtomicBoolean(false)
             var freshTokenCount = 0
             val handler = Handler(Looper.getMainLooper())
+            // [FIX] Explicitly force the WebView to use the same UA as the OkHttp client
             val ua = ReelFrenClient.GLOBAL_MOBILE_UA
             val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
 
@@ -412,12 +371,7 @@ object ReelFrenCloudflare {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun showInteractiveDialog(
-        activity: Activity,
-        url: String,
-        host: String,
-        session: SolveSession
-    ) {
+    private fun showInteractiveDialog(activity: Activity, url: String, host: String, session: SolveSession) {
         if (activity.isFinishing || activity.isDestroyed) {
             ReelFrenCfState.completeAndEndSolve(host, session, false)
             return
