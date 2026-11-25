@@ -14,7 +14,11 @@ import kotlinx.coroutines.launch
 class ReelFrenPlugin : Plugin() {
     override fun load(context: Context) {
         ReelFrenStore.init(context)
-        ReelFrenCloudflare.prewarmIfNeeded()
+        
+        // [IMPROVEMENT] Disabled proactive CF prewarming. 
+        // The spoofed TLS client successfully bypasses Cloudflare natively on ReelFren.
+        // This saves massive CPU/RAM overhead on startup and avoids SSL WebView errors.
+        // ReelFrenCloudflare.prewarmIfNeeded()
 
         registerMainAPI(ReelFrenProvider())
 
