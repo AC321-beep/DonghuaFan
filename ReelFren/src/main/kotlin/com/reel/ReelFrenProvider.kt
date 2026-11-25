@@ -14,15 +14,14 @@ import com.lagradost.cloudstream3.newHomePageResponse
 import com.lagradost.cloudstream3.newMovieLoadResponse
 import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.newTvSeriesLoadResponse
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
-import kotlinx.coroutines.coroutineScope
 import java.util.concurrent.atomic.AtomicBoolean
 
 class ReelFrenProvider : MainAPI() {
@@ -41,6 +40,8 @@ class ReelFrenProvider : MainAPI() {
         private var cachedSearchResults: List<SearchResponse> = emptyList()
         private var cachedSearchTime: Long = 0L
         private const val CACHE_EXPIRY_MS = 10 * 60 * 1000L // 10 minutes
+
+        private val bgSearchScope = CoroutineScope(Dispatchers.IO)
     }
 
     override val mainPage get() = mainPageOf(
@@ -51,18 +52,18 @@ class ReelFrenProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val slug = request.data
         ReelFrenLog.d("Main/getMainPage", "ENTRY page=$page slug=$slug name=${request.name}")
-        
+
         val items: List<HomeItem> = ReelFrenClient.home(slug, page = page)
         if (items.isEmpty()) {
             ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=0 added=0 hasNext=false")
             return newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
-        
+
         val mapped = items.mapNotNull { item: HomeItem ->
             if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
-            
+
             val actualSlug = item.provider.ifEmpty { slug }
-            
+
             newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
                 this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
                 this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
@@ -75,7 +76,7 @@ class ReelFrenProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse>? {
         val cleanQuery = query.trim()
         ReelFrenLog.d("Main/search", "query='$cleanQuery'")
-        
+
         if (cleanQuery.isEmpty()) return emptyList()
 
         val now = System.currentTimeMillis()
@@ -90,38 +91,82 @@ class ReelFrenProvider : MainAPI() {
             return emptyList()
         }
 
-        // [FIX] Perform ONE global search instead of looping through providers
-        val globalItems = runCatching { ReelFrenClient.search(cleanQuery) }.getOrDefault(emptyList())
-        
-        val validProviders = activeProviders.filter { it != "all_dramas" }.toSet()
-        
-        // Filter the global results locally to only include dramas from enabled providers
-        val mappedResults = globalItems.mapNotNull { item ->
-            if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
-            if (!validProviders.contains(item.provider)) return@mapNotNull null
-            
-            newMovieSearchResponse(item.title, ReelFrenUrl.page(item.provider, item.id), TvType.AsianDrama) {
-                this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
-                this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
-            }
-        }.distinctBy { it.url }
-
         cachedSearchQuery = cleanQuery
-        cachedSearchResults = mappedResults
+        cachedSearchResults = emptyList()
         cachedSearchTime = now
-        
-        ReelFrenLog.d("Main/search", "Global search mapped ${mappedResults.size} enabled items.")
 
-        return mappedResults
+        val validProviders = activeProviders.filter { it != "all_dramas" }
+        if (validProviders.isEmpty()) return emptyList()
+
+        val primaryProviders = validProviders.take(3)
+        val secondaryProviders = validProviders.drop(3)
+
+        val fastResults = mutableListOf<SearchResponse>()
+
+        coroutineScope {
+            val primarySearches = primaryProviders.map { slug ->
+                async {
+                    val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
+                    items.mapNotNull { item ->
+                        if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
+                        val actualSlug = item.provider.ifEmpty { slug }
+                        newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
+                            this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
+                            this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
+                        }
+                    }
+                }
+            }
+
+            try {
+                withTimeout(10000L) {
+                    fastResults.addAll(primarySearches.awaitAll().flatten())
+                }
+            } catch (e: TimeoutCancellationException) {
+                val completed = primarySearches.filter { it.isCompleted && !it.isCancelled }.flatMap { it.getCompleted() }
+                fastResults.addAll(completed)
+                ReelFrenLog.d("Main/search", "Timeout hit on primary search. Returning ${completed.size} fast results.")
+            }
+        }
+
+        val distinctFast = fastResults.distinctBy { it.url }
+        cachedSearchResults = distinctFast
+
+        bgSearchScope.launch {
+            val secondaryResults = mutableListOf<SearchResponse>()
+            for (slug in secondaryProviders) {
+                val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
+                items.forEach { item ->
+                    if (item.id.isNotEmpty() && item.title.isNotEmpty()) {
+                        val actualSlug = item.provider.ifEmpty { slug }
+                        secondaryResults.add(
+                            newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
+                                this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
+                                this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
+                            }
+                        )
+                    }
+                }
+                kotlinx.coroutines.delay(500)
+            }
+
+            val allResults = (distinctFast + secondaryResults).distinctBy { it.url }
+            if (cachedSearchQuery == cleanQuery) {
+                cachedSearchResults = allResults
+                ReelFrenLog.d("Main/search", "Background cache expanded to ${allResults.size} items")
+            }
+        }
+
+        return distinctFast
     }
 
     override suspend fun load(url: String): LoadResponse? {
         ReelFrenLog.d("Main/load", "url=$url")
         val (slug, id, _) = ReelFrenUrl.parse(url)
         if (id.isEmpty() || slug.isEmpty()) throw ErrorLoadingException("Invalid URL or missing ID")
-        
+
         val d: DetailInfo = ReelFrenClient.detail(slug, id) ?: throw ErrorLoadingException("Failed to load detail")
-        
+
         val coverUrl = ReelFrenClient.absUrl(d.cover).takeIf { it.isNotBlank() }
         val coverHeaders = ReelFrenClient.posterHeaders(coverUrl)
 
@@ -166,35 +211,35 @@ class ReelFrenProvider : MainAPI() {
         ReelFrenLog.d("Main/loadLinks", "url=$data")
         val (slug, id, ep) = ReelFrenUrl.parse(data)
         if (id.isEmpty() || slug.isEmpty()) return false
-        
+
         val foundLinks = AtomicBoolean(false)
 
         coroutineScope {
             val serverIds = listOf(1, 2, 3, 4, 5)
-            
+
             serverIds.forEach { serverId ->
                 launch {
                     val p = runCatching { ReelFrenClient.playback(slug, id, ep, serverId) }.getOrNull() ?: return@launch
-                    
+
                     ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback)
-                    
+
                     p.qualities.forEach { q ->
                         launch {
                             val qUrl = ReelFrenClient.absUrl(q.url)
                             if (qUrl.isBlank() || !qUrl.startsWith("http")) return@launch
 
                             val serverNameString = if (p.server.toIntOrNull() != null) "Server ${p.server}" else p.server
-                            
+
                             val link = com.lagradost.cloudstream3.utils.ExtractorLink(
                                 source = name,
                                 name = serverNameString,
                                 url = qUrl,
-                                referer = "${ReelFrenConfig.REEL_SITE}/", 
+                                referer = "${ReelFrenConfig.REEL_SITE}/",
                                 quality = ReelFrenQuality.of(q.label),
                                 type = ReelFrenQuality.linkType(qUrl, q.format),
                                 headers = ReelFrenClient.videoHeaders(qUrl)
                             )
-                            
+
                             foundLinks.set(true)
                             callback(link)
                         }
@@ -202,7 +247,7 @@ class ReelFrenProvider : MainAPI() {
                 }
             }
         }
-        
+
         return foundLinks.get()
     }
 }
