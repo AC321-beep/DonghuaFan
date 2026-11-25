@@ -131,7 +131,7 @@ class WebViewCookieJar : CookieJar {
 
 object ReelFrenClient {
     const val GLOBAL_MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-    const val FALLBACK_UA = GLOBAL_MOBILE_UA
+    const val FALLBACK_UA = GLOBAL_MOBILE_UA 
     
     private val apiHost by lazy { ReelFrenCloudflare.hostOf(ReelFrenConfig.DEFAULT_API_BASE) }
     private val apiMutex = Mutex()
@@ -169,7 +169,6 @@ object ReelFrenClient {
     }
 
     fun detailApiUrl(slug: String, id: String): String {
-        // [FIX] Added missing `&cv=$currentApiVersion`. The server returns 401 Unauthorized without this.
         return "${apiBase()}/api/detail?provider=${query(slug)}&id=${query(id)}&lang=en&cv=$currentApiVersion"
     }
 
@@ -323,7 +322,6 @@ object ReelFrenClient {
                 }
                 ReelFrenLog.d("Client.detail", "JSON API parsed but was missing title/videos.")
             } else if (primaryResponse.startsWith("<")) {
-                // Optimization Shortcut: WAF or proxy returned HTML on API route
                 ReelFrenLog.d("Client.detail", "API endpoint returned HTML (WAF/Proxy). Bypassing second fetch and parsing directly.")
                 val directHtmlParsed = ReelFrenParse.detailHtml(primaryResponse, slug, id)
                 if (directHtmlParsed != null && directHtmlParsed.title.isNotEmpty()) {
@@ -640,7 +638,6 @@ object ReelFrenParse {
             val schemaObj = runCatching { JSONObject(schemaJsonText) }.getOrNull()
 
             if (schemaObj != null) {
-                // [FIX] Explicitly ignore the generic 'ReelFren' site title fallback.
                 val title = clean(schemaObj, "name").replace("Episode 1", "").trim()
                 if (title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
                     val cover = ReelFrenClient.absUrl(clean(schemaObj, "image"))
@@ -692,7 +689,6 @@ object ReelFrenParse {
         for (rawJson in candidates) {
             val obj = runCatching { JSONObject(rawJson) }.getOrNull() ?: continue
             val parsed = buildDetailFromJson(obj, fallbackSlug, fallbackId)
-            // [FIX] Ensure the Next.js chunk title isn't a false positive
             if (parsed != null && parsed.title.isNotEmpty() && !parsed.title.equals("ReelFren", ignoreCase = true)) {
                 ReelFrenLog.d("Parse.detailHtml", "Successfully parsed detail from Next.js snippet. Title='${parsed.title}'")
                 return parsed
@@ -709,7 +705,6 @@ object ReelFrenParse {
         
         ReelFrenLog.d("Parse.detailHtml", "Regex extracted title: '$title'")
         
-        // [FIX] Explicitly reject generic site title here too
         if (title.isEmpty() || title.contains("Just a moment", ignoreCase = true) || title.contains("Cloudflare", ignoreCase = true) || title.equals("ReelFren", ignoreCase = true)) {
             ReelFrenLog.d("Parse.detailHtml", "FATAL: Extracted Title is empty, generic, or indicates CF block.")
             return null
@@ -1180,15 +1175,14 @@ object ReelFrenQuality {
 
     fun inferFormat(url: String, explicitFormat: String = ""): String {
         val cleanFormat = explicitFormat.trim().lowercase(Locale.ROOT)
+        // [FIX] Removed logic that forces HLS/M3U8 when encountering an MP4 with `&rc=` or `mime_type=video_mp4`
         if (cleanFormat.isNotEmpty()) {
-            if (cleanFormat == "mp4" && url.contains("&rc=")) return "hls" 
             return cleanFormat
         }
         return when {
-            url.contains(".mp4", ignoreCase = true) -> "mp4"
             url.contains(".m3u8", ignoreCase = true) -> "hls"
             url.contains(".mpd", ignoreCase = true)  -> "dash"
-            url.contains("mime_type=video_mp4", ignoreCase = true) && url.contains("&rc=") -> "hls" // Force HLS for VolcEngine/Melolo chunks
+            url.contains(".mp4", ignoreCase = true) || url.contains("mime_type=video_mp4", ignoreCase = true) -> "mp4"
             else -> "video"
         }
     }
