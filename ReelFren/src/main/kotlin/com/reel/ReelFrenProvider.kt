@@ -66,7 +66,8 @@ class ReelFrenProvider : MainAPI() {
             val actualSlug = item.provider.ifEmpty { slug }
             
             newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
-                this.posterUrl = ReelFrenClient.absUrl(item.cover)
+                // [FIX] Prevents CoilImgLoader empty URL crash
+                this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
                 this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
             }
         }
@@ -112,7 +113,8 @@ class ReelFrenProvider : MainAPI() {
                         if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
                         val actualSlug = item.provider.ifEmpty { slug }
                         newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
-                            this.posterUrl = ReelFrenClient.absUrl(item.cover)
+                            // [FIX] Prevents CoilImgLoader empty URL crash
+                            this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
                             this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
                         }
                     }
@@ -120,8 +122,6 @@ class ReelFrenProvider : MainAPI() {
             }
             
             try {
-                // INCREASED TIMEOUT: Cloudflare solves take ~3.5 seconds.
-                // 4 seconds was causing CancellationExceptions before the retry fetch could finish.
                 withTimeout(10000L) {
                     fastResults.addAll(primarySearches.awaitAll().flatten())
                 }
@@ -144,7 +144,8 @@ class ReelFrenProvider : MainAPI() {
                         val actualSlug = item.provider.ifEmpty { slug }
                         secondaryResults.add(
                             newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
-                                this.posterUrl = ReelFrenClient.absUrl(item.cover)
+                                // [FIX] Prevents CoilImgLoader empty URL crash
+                                this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
                                 this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
                             }
                         )
@@ -169,7 +170,9 @@ class ReelFrenProvider : MainAPI() {
         if (id.isEmpty() || slug.isEmpty()) throw ErrorLoadingException("Invalid URL or missing ID")
         
         val d: DetailInfo = ReelFrenClient.detail(slug, id) ?: throw ErrorLoadingException("Failed to load detail")
-        val coverUrl = ReelFrenClient.absUrl(d.cover)
+        
+        // [FIX] Prevents CoilImgLoader empty URL crash by returning null if cover is blank
+        val coverUrl = ReelFrenClient.absUrl(d.cover).takeIf { it.isNotBlank() }
         val coverHeaders = ReelFrenClient.posterHeaders(coverUrl)
 
         if (d.videos.size > 1 || d.episodes > 1) {
