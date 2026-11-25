@@ -21,6 +21,8 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -34,9 +36,6 @@ class ReelFrenProvider : MainAPI() {
     override val hasChromecastSupport = true
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.AsianDrama, TvType.TvSeries, TvType.Movie)
-    
-    // Stops Cloudstream from firing 15 simultaneous network requests, fixing the UI stutter
-    override var sequentialMainPage = true
 
     companion object {
         private var cachedSearchQuery: String = ""
@@ -45,6 +44,9 @@ class ReelFrenProvider : MainAPI() {
         private const val CACHE_EXPIRY_MS = 10 * 60 * 1000L // 10 minutes
 
         private val bgSearchScope = CoroutineScope(Dispatchers.IO)
+        
+        // [NEW] Traffic light to strictly limit homepage fetching to 3 concurrent tabs
+        private val homeSemaphore = Semaphore(3)
     }
 
     override val mainPage get() = mainPageOf(
@@ -56,7 +58,11 @@ class ReelFrenProvider : MainAPI() {
         val slug = request.data
         ReelFrenLog.d("Main/getMainPage", "ENTRY page=$page slug=$slug name=${request.name}")
 
-        val items: List<HomeItem> = ReelFrenClient.home(slug, page = page)
+        // [NEW] Waits for a permit. Only 3 network requests will execute at a single time.
+        val items: List<HomeItem> = homeSemaphore.withPermit {
+            ReelFrenClient.home(slug, page = page)
+        }
+        
         if (items.isEmpty()) {
             ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=0 added=0 hasNext=false")
             return newHomePageResponse(request.name, emptyList(), hasNext = false)
@@ -109,7 +115,6 @@ class ReelFrenProvider : MainAPI() {
         coroutineScope {
             val primarySearches = primaryProviders.map { slug ->
                 async {
-                    // [FIX] Correctly passes BOTH parameters to match the Utils file
                     val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
                     items.mapNotNull { item ->
                         if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
@@ -139,7 +144,6 @@ class ReelFrenProvider : MainAPI() {
         bgSearchScope.launch {
             val secondaryResults = mutableListOf<SearchResponse>()
             for (slug in secondaryProviders) {
-                // [FIX] Correctly passes BOTH parameters to match the Utils file
                 val items = runCatching { ReelFrenClient.search(slug, cleanQuery) }.getOrDefault(emptyList())
                 items.forEach { item ->
                     if (item.id.isNotEmpty() && item.title.isNotEmpty()) {
