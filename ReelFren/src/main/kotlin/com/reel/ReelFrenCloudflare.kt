@@ -29,7 +29,6 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import com.lagradost.cloudstream3.CommonActivity
 import kotlinx.coroutines.*
-import okhttp3.Headers
 import java.net.URI
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -90,11 +89,12 @@ object ReelFrenCloudflare {
 
     fun extractClearanceToken(cookieHeader: String?): String = cookieHeader?.let { clearanceRegex.find(it)?.groupValues?.getOrNull(1) }.orEmpty()
 
-    fun isChallengeResponse(code: Int, headers: Headers?, body: String): Boolean {
-        if (headers?.get("cf-mitigated")?.equals("challenge", ignoreCase = true) == true) return true
+    // [FIX] Reverted to single parameter to match ReelFrenUtils.kt calls
+    fun isChallengeResponse(body: String): Boolean {
+        if (body.isEmpty()) return false
         val trimmed = body.trimStart()
-        if (code in 200..299 && (trimmed.startsWith("{") || trimmed.startsWith("["))) return false
-        if ((code == 403 || code == 503) && headers?.get("server")?.contains("cloudflare", ignoreCase = true) == true) return true
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) return false
+        
         return isChallengeBody(trimmed)
     }
 
@@ -114,7 +114,8 @@ object ReelFrenCloudflare {
         return t.isEmpty() || t == "about:blank" || t.startsWith("loading") ||
                t.contains("please wait") || t.contains("just a moment") ||
                t.contains("checking your browser") || t.contains("verify you are human") ||
-               t.contains("403 forbidden") || t.contains("access denied")
+               t.contains("403 forbidden") || t.contains("access denied") ||
+               t.contains("attention required")
     }
 
     private fun activity(): Activity? {
@@ -127,6 +128,23 @@ object ReelFrenCloudflare {
             depth++
         }
         return null
+    }
+
+    private fun resolveWebViewUa(activity: Activity, host: String): String {
+        val existing = ReelFrenStore.userAgent(host)
+        if (existing.isNotBlank() && existing != ReelFrenClient.GLOBAL_MOBILE_UA) return existing
+        val ua = runCatching {
+            ReelFrenStore.normalizeUa(WebSettings.getDefaultUserAgent(activity))
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: ReelFrenStore.defaultSystemUa
+        ReelFrenStore.setUserAgent(host, ua)
+        return ua
+    }
+
+    private fun handleSslError(targetHost: String, sslHandler: SslErrorHandler?, error: SslError?) {
+        if (sslHandler == null || error == null) return
+        val errHost = hostOf(error.url ?: "")
+        val isTrustedDomain = errHost.isEmpty() || errHost == targetHost || errHost.endsWith(".$targetHost") || errHost.contains("cloudflare", ignoreCase = true)
+        if (error.primaryError == SslError.SSL_UNTRUSTED && isTrustedDomain) sslHandler.proceed() else sslHandler.cancel()
     }
 
     private fun scrubStaleClearance(url: String, host: String) {
@@ -157,7 +175,7 @@ object ReelFrenCloudflare {
             if (extractClearanceToken(cookie).isNotEmpty()) {
                 ReelFrenStore.saveCookie(host, cookie)
                 ReelFrenStore.setUserAgent(host, ua)
-                ReelFrenStore.recordPrewarmResult(true)
+                // [FIX] Removed recordPrewarmResult call
                 cm.flush()
                 ReelFrenLog.d("CF/cookie", "Persisted cf_clearance for $host (len=${cookie.length})")
             }
@@ -232,8 +250,9 @@ object ReelFrenCloudflare {
             val done = AtomicBoolean(false)
             val settling = AtomicBoolean(false)
             var freshTokenCount = 0
+            var mainFrameError: String? = null
             val handler = Handler(Looper.getMainLooper())
-            val ua = ReelFrenClient.GLOBAL_MOBILE_UA
+            val ua = resolveWebViewUa(activity, host)
             val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
 
             val container = object : FrameLayout(activity) { override fun dispatchTouchEvent(ev: MotionEvent?) = false }.apply {
@@ -308,11 +327,16 @@ object ReelFrenCloudflare {
             }
 
             web.webViewClient = object : WebViewClient() {
-                override fun onReceivedSslError(v: WebView?, sh: SslErrorHandler?, e: SslError?) {
-                    if (e?.primaryError == SslError.SSL_UNTRUSTED) sh?.proceed() else sh?.cancel()
+                override fun onReceivedSslError(v: WebView?, sh: SslErrorHandler?, e: SslError?) = handleSslError(host, sh, e)
+                override fun onPageStarted(v: WebView?, u: String?, f: Bitmap?) {
+                    if (done.get() || u == null || u == "about:blank") return
+                    mainFrameError = null
+                    v?.evaluateJavascript(SHADOW_HOOK_JS, null)
                 }
-                override fun onPageStarted(v: WebView?, u: String?, f: Bitmap?) { v?.evaluateJavascript(SHADOW_HOOK_JS, null) }
                 override fun onPageFinished(v: WebView?, u: String?) { if (!done.get()) checkAndAutoInteract(0) }
+                override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                    if (request?.isForMainFrame == true) mainFrameError = "${error?.errorCode}: ${error?.description}"
+                }
                 override fun onReceivedHttpError(v: WebView?, req: WebResourceRequest?, err: WebResourceResponse?) {
                     if (req?.isForMainFrame == true && err?.statusCode in 500..599 && err?.statusCode != 503) finish(false)
                 }
@@ -325,6 +349,7 @@ object ReelFrenCloudflare {
                     if (done.get()) return
                     checkAndAutoInteract(++ticks)
                     if (done.get()) return
+                    if (mainFrameError != null && !isChallengeOrBlankTitle(web.title)) { finish(false); return }
                     if (SystemClock.uptimeMillis() - startMs >= SILENT_TIMEOUT_MS) { finish(false); return }
                     handler.postDelayed(this, 1_000L)
                 }
@@ -345,7 +370,7 @@ object ReelFrenCloudflare {
         var freshTokenCount = 0
         val handler = Handler(Looper.getMainLooper())
         var webRef: WebView? = null; var dialogRef: Dialog? = null
-        val ua = ReelFrenClient.GLOBAL_MOBILE_UA
+        val ua = resolveWebViewUa(activity, host)
         val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
 
         fun finish(success: Boolean) {
@@ -382,9 +407,7 @@ object ReelFrenCloudflare {
             }
 
             wv.webViewClient = object : WebViewClient() {
-                override fun onReceivedSslError(v: WebView?, sh: SslErrorHandler?, e: SslError?) {
-                    if (e?.primaryError == SslError.SSL_UNTRUSTED) sh?.proceed() else sh?.cancel()
-                }
+                override fun onReceivedSslError(v: WebView?, sh: SslErrorHandler?, e: SslError?) = handleSslError(host, sh, e)
                 override fun onPageFinished(v: WebView?, u: String?) { checkAndAutoInteract() }
             }
 
