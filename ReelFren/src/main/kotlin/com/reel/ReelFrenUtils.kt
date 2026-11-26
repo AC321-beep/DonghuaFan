@@ -313,7 +313,7 @@ object ReelFrenClient {
     private fun apiBase() = ReelFrenStore.apiBase()
     private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
 
-    fun homeUrl(slug: String, category: String = "", page: Int = 1, offset: Int = 0): String {
+    fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
         val p = mutableListOf<String>()
         val isGlobal = slug == "all_dramas"
         if (!isGlobal && slug.isNotEmpty()) p += "provider=${query(slug)}"
@@ -321,7 +321,7 @@ object ReelFrenClient {
         if (!omitCvParam) p += "cv=$currentApiVersion"
         if (category.isNotEmpty()) p += "category=${query(category)}"
         p += "page=$page"
-        if (offset > 0) p += "offset=$offset"
+        // Offset removed to prevent breaking API queries
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
@@ -436,15 +436,14 @@ object ReelFrenClient {
 
         if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
-      ReelFrenLog.d("Client.get", "Falling back to CF Mutex...")
+        ReelFrenLog.d("Client.get", "Falling back to CF Mutex...")
         apiMutex.withLock {
             responseText = try { spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
 
             if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
-            // [FIX] Grab the poisoned cookie and pass it to the solver so it forces a fresh solve
+            // [FIX] Explicitly pass the poisoned cookie to force a clean solver run
             val poisonedCookie = ReelFrenStore.cookie(targetHost)
-            
             if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE, invalidatedCookie = poisonedCookie)) {
                 ReelFrenLog.d("Client.get", "CF Solve returned false.")
                 return null
@@ -471,12 +470,20 @@ object ReelFrenClient {
         }
     }
 
-    suspend fun home(slug: String, page: Int = 1, offset: Int = 0, category: String = ""): List<HomeItem> {
-        val apiItems = get(homeUrl(slug, category, page, offset), isApiCall = true)?.let(ReelFrenParse::homeItems).orEmpty()
+    suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> {
+        val rawResponse = get(homeUrl(slug, category, page), isApiCall = true)
+        val apiItems = rawResponse?.let(ReelFrenParse::homeItems).orEmpty()
 
         if (apiItems.isNotEmpty() || page <= 1 || category.isNotEmpty()) return apiItems
 
-        ReelFrenLog.d("Client.home", "API returned 0 items for $slug on page=$page; trying HTML fallback.")
+        // CRITICAL CHECK: Short-circuit if API returned a valid, empty JSON array (SIZE: ~23 bytes)
+        val trimmed = rawResponse?.trimStart() ?: ""
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+            ReelFrenLog.d("Client.home", "API returned valid JSON but 0 items for $slug on page=$page. End of pagination reached.")
+            return emptyList()
+        }
+
+        ReelFrenLog.d("Client.home", "API failed or returned non-JSON for $slug on page=$page; trying HTML fallback.")
         val htmlStr = get(homeHtmlUrl(slug, page), isApiCall = false)
         if (htmlStr.isNullOrEmpty()) return emptyList()
 
