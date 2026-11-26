@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.util.Base64
 import android.util.Log
 import android.webkit.CookieManager
+import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
@@ -294,7 +295,7 @@ object ReelFrenClient {
     private val apiMutex = Mutex()
 
     @Volatile private var currentApiVersion = "v21"
-    @Volatile private var omitCvParam = false
+    @Volatile private var omitCvParam = true
 
     private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
         .tlsVersions(TlsVersion.TLS_1_2, TlsVersion.TLS_1_3)
@@ -321,7 +322,7 @@ object ReelFrenClient {
         if (!omitCvParam) p += "cv=$currentApiVersion"
         if (category.isNotEmpty()) p += "category=${query(category)}"
         p += "page=$page"
-        if (offset > 0) p += "offset=$offset" // Restored: strictly required by backend for pagination
+        if (offset > 0) p += "offset=$offset"
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
@@ -330,7 +331,7 @@ object ReelFrenClient {
         if (slug.isNotEmpty() && slug != "all_dramas") p += "provider=${query(slug)}"
         p += "page=$page"
         p += "lang=en"
-        return "${ReelFrenConfig.REEL_SITE}/?${p.joinToString("&")}"
+        return "${ReelFrenConfig.REEL_SITE}/explore?${p.joinToString("&")}"
     }
 
     fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1): String {
@@ -344,9 +345,7 @@ object ReelFrenClient {
         val p = mutableListOf<String>()
         p += "q=${query(term)}"
         p += "lang=en"
-        if (slug.isNotEmpty() && slug != "all_dramas") {
-            p += "provider=${query(slug)}"
-        }
+        if (slug.isNotEmpty() && slug != "all_dramas") p += "provider=${query(slug)}"
         return "${ReelFrenConfig.REEL_SITE}/search?${p.joinToString("&")}"
     }
 
@@ -392,9 +391,18 @@ object ReelFrenClient {
 
     fun posterHeaders(url: String?): Map<String, String> {
         val headers = mutableMapOf("User-Agent" to GLOBAL_MOBILE_UA)
-        if (url != null && url.contains("volcengine-forward.storyreel.life")) {
-            headers["Referer"] = "https://volcengine-forward.storyreel.life/"
-            headers["Origin"] = "https://volcengine-forward.storyreel.life"
+        if (url.isNullOrBlank()) return headers
+        when {
+            url.contains("volcengine-forward.storyreel.life", ignoreCase = true) -> {
+                headers["Referer"] = "https://volcengine-forward.storyreel.life/"
+                headers["Origin"] = "https://volcengine-forward.storyreel.life"
+            }
+            url.contains("api.reelfren.net", ignoreCase = true) ||
+            url.contains("reelfren.net", ignoreCase = true) ||
+            url.contains("tiktokcdn", ignoreCase = true) -> {
+                headers["Referer"] = "${ReelFrenConfig.REEL_SITE}/"
+                headers["Origin"] = ReelFrenConfig.REEL_SITE
+            }
         }
         return headers
     }
@@ -403,6 +411,16 @@ object ReelFrenClient {
         if (json.isEmpty()) return false
         val lower = json.lowercase(Locale.ROOT)
         return lower.contains("version") && (lower.contains("update") || lower.contains("invalid") || lower.contains("deprecated"))
+    }
+
+    private suspend fun executeWithRetry(url: String, isApiCall: Boolean): Pair<Int, String> {
+        var r = spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L)
+        if (r.code in 502..504) {
+            ReelFrenLog.d("Client.get", "Gateway Error ${r.code} detected on $url. Retrying...")
+            delay((300L..600L).random())
+            r = spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L)
+        }
+        return r.code to r.text
     }
 
     suspend fun get(url: String, isApiCall: Boolean = true): String? {
@@ -416,29 +434,48 @@ object ReelFrenClient {
         }
 
         ReelFrenLog.d("Client.get", "Attempting spoofed TLS fetch for: $url")
-        var responseText = try {
-            val r = spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L)
-            ReelFrenLog.d("Client.get", "SPOOFED HTTP CODE: ${r.code}, SIZE: ${r.text.length}")
-            r.text
+        var statusCode = 200
+        var responseText = ""
+        
+        try {
+            val (code, text) = executeWithRetry(url, isApiCall)
+            statusCode = code
+            responseText = text
+            ReelFrenLog.d("Client.get", "SPOOFED HTTP CODE: $statusCode, SIZE: ${responseText.length}")
         } catch (ce: CancellationException) {
-            ReelFrenLog.d("Client.get", "Coro Cancelled on initial fetch")
             throw ce
         } catch (e: Exception) {
-            ReelFrenLog.d("Client.get", "OkHttp EXCEPTION on fast-path: ${e.message}"); ""
+            ReelFrenLog.d("Client.get", "OkHttp EXCEPTION on fast-path: ${e.message}")
+        }
+
+        // Shield against false empty catalogs on gateway errors
+        if (isApiCall && statusCode in 502..504) {
+            throw ErrorLoadingException("Upstream server error (HTTP $statusCode)")
         }
 
         if (isApiCall && isVersionError(responseText) && url.contains("cv=")) {
-            ReelFrenLog.d("Client.get", "Version error detected on $currentApiVersion. Retrying without cv...")
+            ReelFrenLog.d("Client.get", "Version error detected. Retrying without cv...")
             omitCvParam = true
             val newUrl = url.replace(Regex("[?&]cv=[^&]+"), "").replace("?provider=&", "?provider=")
-            responseText = try { spoofedApp.get(newUrl, headers = headers(newUrl, true), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
+            try {
+                val (retryCode, retryText) = executeWithRetry(newUrl, true)
+                statusCode = retryCode
+                responseText = retryText
+            } catch (ce: CancellationException) { throw ce } catch (_: Exception) {}
+            if (isApiCall && statusCode in 502..504) throw ErrorLoadingException("Upstream server error (HTTP $statusCode)")
         }
 
         if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
         ReelFrenLog.d("Client.get", "Falling back to CF Mutex...")
         apiMutex.withLock {
-            responseText = try { spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
+            try {
+                val (code, text) = executeWithRetry(url, isApiCall)
+                statusCode = code
+                responseText = text
+            } catch (ce: CancellationException) { throw ce } catch (_: Exception) {}
+            
+            if (isApiCall && statusCode in 502..504) throw ErrorLoadingException("Upstream server error (HTTP $statusCode)")
 
             if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
@@ -450,22 +487,25 @@ object ReelFrenClient {
 
             delay(500L)
 
-            val finalResponse = try {
-                val r = spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L)
-                ReelFrenLog.d("Client.get", "MUTEX HTTP CODE: ${r.code}, SIZE: ${r.text.length}")
-                r.text
+            try {
+                val (code, text) = executeWithRetry(url, isApiCall)
+                statusCode = code
+                responseText = text
+                ReelFrenLog.d("Client.get", "MUTEX HTTP CODE: $statusCode, SIZE: ${responseText.length}")
             } catch (ce: CancellationException) {
-                ReelFrenLog.d("Client.get", "Coro Cancelled on Mutex fetch")
                 throw ce
             } catch (e: Exception) {
                 ReelFrenLog.t("Client.get", e)
-                ""
+                return ""
             }
-            if (finalResponse.isEmpty() || ReelFrenCloudflare.isChallengeResponse(finalResponse)) {
+
+            if (isApiCall && statusCode in 502..504) throw ErrorLoadingException("Upstream server error (HTTP $statusCode)")
+
+            if (responseText.isEmpty() || ReelFrenCloudflare.isChallengeResponse(responseText)) {
                 ReelFrenLog.d("Client.get", "Mutex fetch returned empty or challenge.")
                 return null
             }
-            return finalResponse
+            return responseText
         }
     }
 
@@ -477,11 +517,17 @@ object ReelFrenClient {
 
         val trimmed = rawResponse?.trimStart() ?: ""
         if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-            ReelFrenLog.d("Client.home", "API returned valid empty JSON (size ${trimmed.length}) for $slug on page=$page. End of catalog reached.")
+            // Guard against backend conflict caps by probing page 1
+            if (offset > 0 && page > 1) {
+                ReelFrenLog.d("Client.home", "Empty JSON at page=$page offset=$offset for $slug. Probing page=1 with offset=$offset...")
+                val retryRaw = get(homeUrl(slug, category, page = 1, offset = offset), isApiCall = true)
+                val retryItems = retryRaw?.let(ReelFrenParse::homeItems).orEmpty()
+                if (retryItems.isNotEmpty()) return retryItems
+            }
+            ReelFrenLog.d("Client.home", "API returned valid empty JSON (size ${trimmed.length}) for $slug on page=$page offset=$offset.")
             return emptyList()
         }
 
-        // Avoid pointless HTML fallback on pagination, as SSR pages only hold page 1 items.
         if (page > 1) {
             ReelFrenLog.d("Client.home", "API failed on page $page. Skipping HTML fallback to avoid unpaginated duplicate scrape.")
             return emptyList()
@@ -492,12 +538,11 @@ object ReelFrenClient {
         if (htmlStr.isNullOrEmpty()) return emptyList()
 
         val htmlItems = ReelFrenParse.homeHtml(htmlStr, slug)
-        ReelFrenLog.d("Client.home", "HTML home fallback found ${htmlItems.size} items for $slug page=$page.")
+        ReelFrenLog.d("Client.home", "HTML home fallback found ${htmlItems.size} items for $slug.")
         return htmlItems
     }
 
     suspend fun detail(slug: String, id: String): DetailInfo? {
-        // Officially relying on SSR HTML instead of the non-existent background API
         ReelFrenLog.d("Client.detail", "Fetching detail HTML (SSR)...")
 
         val htmlStr = get(detailHtmlUrl(slug, id), isApiCall = false)
@@ -519,18 +564,9 @@ object ReelFrenClient {
 
     suspend fun search(slug: String, term: String): List<HomeItem> {
         ReelFrenLog.d("Client.search", "Fetching search HTML (SSR)...")
-
         val htmlStr = get(searchHtmlUrl(slug, term), isApiCall = false)
-
-        if (htmlStr.isNullOrEmpty()) {
-            ReelFrenLog.d("Client.search", "FATAL: HTML search fetch returned null or empty.")
-            return emptyList()
-        }
-
-        val items = ReelFrenParse.searchHtml(htmlStr, slug, term)
-        ReelFrenLog.d("Client.search", "HTML search found ${items.size} items for $slug.")
-
-        return items
+        if (htmlStr.isNullOrEmpty()) return emptyList()
+        return ReelFrenParse.searchHtml(htmlStr, slug, term)
     }
 
     suspend fun playback(slug: String, id: String, ep: Int, serverId: Int): PlaybackInfo? {
@@ -556,6 +592,19 @@ object ReelFrenParse {
     private val SUB_URL_KEYS = arrayOf("url", "src", "file", "subUrl", "subtitleUrl", "vtt", "srt", "link", "path", "webvtt")
     private val SUB_LANG_KEYS = arrayOf("lang", "srclang", "srcLang", "language", "code", "locale", "langCode", "iso", "languageCode", "name")
     private val SUB_LABEL_KEYS = arrayOf("label", "name", "title", "display", "langName", "language")
+
+    // Pre-compiled Regexes for Performance
+    private val itemPatternRegex = Regex("""\{[^{}]*"(?:id|dramaId)":"[^"]+"[^{}]*"provider":"[^"]+"[^{}]*\}""")
+    private val schemaRegex = Regex("""<script type="application/ld\+json">\s*(\{.*?"@type":\s*"TVSeries".*?\})\s*</script>""", RegexOption.DOT_MATCHES_ALL)
+    private val epParamRegex = Regex("""[?&]ep=(\d+)""")
+    private val ogTitleRegex = Regex("""<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+    private val titleTagRegex = Regex("""<title[^>]*>(.*?)</title>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+    private val ogImageRegex = Regex("""<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+    private val metaDescRegex = Regex("""<meta[^>]*(?:name=["']description["']|property=["']og:description["'])[^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+    private val chipEpRegex = Regex("""(\d+)(?:<!-- -->)?\s*Episode""", RegexOption.IGNORE_CASE)
+    private val schemaEpCountRegex = Regex(""""numberOfEpisodes"\s*:\s*(\d+)""")
+    private val nextJsEpCountRegex = Regex(""""episodes"\s*:\s*(\d+)""")
+    private val totalEpCountRegex = Regex(""""totalEpisodes"\s*:\s*(\d+)""")
 
     private fun findValueRecursively(obj: JSONObject, vararg keysToFind: String): String {
         for (key in keysToFind) {
@@ -639,11 +688,9 @@ object ReelFrenParse {
     fun homeHtml(htmlBody: String, requestedSlug: String): List<HomeItem> {
         if (htmlBody.isBlank()) return emptyList()
         val unescapedBody = unescapeNextPayload(htmlBody)
-        // [FIX] Utilize non-capturing group to optimize extraction from Next.js state
-        val itemPattern = Regex("""\{[^{}]*"(?:id|dramaId)":"[^"]+"[^{}]*"provider":"[^"]+"[^{}]*\}""")
         val results = mutableListOf<HomeItem>()
 
-        for (match in itemPattern.findAll(unescapedBody)) {
+        for (match in itemPatternRegex.findAll(unescapedBody)) {
             val o = runCatching { JSONObject(match.value) }.getOrNull() ?: continue
             val id = clean(o, "id").ifEmpty { clean(o, "dramaId") }
             val title = clean(o, "title").ifEmpty { clean(o, "name") }
@@ -667,14 +714,10 @@ object ReelFrenParse {
 
     fun searchHtml(htmlBody: String, requestedSlug: String, query: String): List<HomeItem> {
         if (htmlBody.isBlank()) return emptyList()
-
         val results = mutableListOf<HomeItem>()
-        ReelFrenLog.d("Parse.searchHtml", "Hunting for Next.js chunks in search HTML...")
-
         val unescapedBody = unescapeNextPayload(htmlBody)
-        val itemPattern = Regex("""\{[^{}]*"(?:id|dramaId)":"[^"]+"[^{}]*"provider":"[^"]+"[^{}]*\}""")
 
-        for (match in itemPattern.findAll(unescapedBody)) {
+        for (match in itemPatternRegex.findAll(unescapedBody)) {
             val o = runCatching { JSONObject(match.value) }.getOrNull() ?: continue
             val id = clean(o, "id").ifEmpty { clean(o, "dramaId") }
             val title = clean(o, "title").ifEmpty { clean(o, "name") }
@@ -706,15 +749,7 @@ object ReelFrenParse {
         }
 
         if (filteredResults.isNotEmpty()) {
-            val uniqueResults = filteredResults.distinctBy { it.id }
-            ReelFrenLog.d("Parse.searchHtml", "Successfully parsed ${uniqueResults.size} unique items via Regex.")
-            return uniqueResults
-        }
-
-        if (htmlBody.length < 72000) {
-            ReelFrenLog.d("Parse.searchHtml", "Valid empty search page detected. (Size: ${htmlBody.length})")
-        } else {
-            ReelFrenLog.d("Parse.searchHtml", "Next.js chunk parse failed. Search results returning empty. (Size: ${htmlBody.length})")
+            return filteredResults.distinctBy { it.id }
         }
         return emptyList()
     }
@@ -781,27 +816,14 @@ object ReelFrenParse {
 
             for (i in objectStart until source.length) {
                 val ch = source[i]
-                if (isEscaped) {
-                    isEscaped = false
-                    continue
-                }
-                if (ch == '\\') {
-                    isEscaped = true
-                    continue
-                }
-                if (ch == '"') {
-                    isString = !isString
-                    continue
-                }
+                if (isEscaped) { isEscaped = false; continue }
+                if (ch == '\\') { isEscaped = true; continue }
+                if (ch == '"') { isString = !isString; continue }
                 if (!isString) {
-                    if (ch == '{') {
-                        braceCount++
-                    } else if (ch == '}') {
+                    if (ch == '{') braceCount++
+                    else if (ch == '}') {
                         braceCount--
-                        if (braceCount == 0) {
-                            endIndex = i + 1
-                            break
-                        }
+                        if (braceCount == 0) { endIndex = i + 1; break }
                     }
                 }
             }
@@ -837,76 +859,21 @@ object ReelFrenParse {
                                 continue
                             }
                         }
-                        sb.append(ch)
-                        i++
+                        sb.append(ch); i++
                     }
                     else -> { sb.append(ch).append(next); i += 2 }
                 }
             } else {
-                sb.append(ch)
-                i++
+                sb.append(ch); i++
             }
         }
         return sb.toString()
     }
 
     fun detailHtml(htmlBody: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
-        if (htmlBody.isBlank()) {
-            ReelFrenLog.d("Parse.detailHtml", "HTML Body is blank.")
-            return null
-        }
-
-        ReelFrenLog.d("Parse.detailHtml", "Parsing HTML of length: ${htmlBody.length}. Body Preview: ${htmlBody.take(1000).replace("\n", " ")}")
-
-        val schemaRegex = Regex("""<script type="application/ld\+json">\s*(\{.*?"@type":\s*"TVSeries".*?\})\s*</script>""", RegexOption.DOT_MATCHES_ALL)
-        val schemaMatch = schemaRegex.find(htmlBody)
-
-        if (schemaMatch != null) {
-            ReelFrenLog.d("Parse.detailHtml", "Found schema.org JSON-LD match!")
-            val schemaJsonText = schemaMatch.groupValues[1]
-            val schemaObj = runCatching { JSONObject(schemaJsonText) }.getOrNull()
-
-            if (schemaObj != null) {
-                val title = clean(schemaObj, "name").replace("Episode 1", "").trim()
-                if (title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
-                    val cover = ReelFrenClient.absUrl(clean(schemaObj, "image"))
-                    val intro = clean(schemaObj, "description").replace(Regex("""Watch Now: .*? as a free short drama on ReelFren."""), "").trim()
-
-                    val epNumbers = Regex("""[?&]ep=(\d+)""").findAll(htmlBody)
-                        .mapNotNull { it.groupValues.getOrNull(1)?.toIntOrNull() }
-                        .filter { it > 0 }
-                        .toMutableSet()
-
-                    val schemaEps = schemaObj.optInt("numberOfEpisodes", 0)
-                    val maxEp = maxOf(schemaEps, epNumbers.maxOrNull() ?: 0)
-
-                    if (maxEp > 0) {
-                        for (n in 1..maxEp) epNumbers += n
-                    }
-
-                    val videos = epNumbers.sorted().map { epNum ->
-                        VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true)
-                    }
-
-                    ReelFrenLog.d("Parse.detailHtml", "Successfully parsed detail using JSON-LD schema. Title='$title'")
-                    return DetailInfo(
-                        id = fallbackId,
-                        provider = fallbackSlug,
-                        title = title,
-                        cover = cover,
-                        intro = intro,
-                        episodes = maxOf(maxEp, videos.size),
-                        videos = videos
-                    )
-                } else {
-                    ReelFrenLog.d("Parse.detailHtml", "JSON-LD schema found but title was empty or generic 'ReelFren'.")
-                }
-            } else {
-                ReelFrenLog.d("Parse.detailHtml", "JSON-LD schema matched but failed JSONObject parsing.")
-            }
-        }
-
-        ReelFrenLog.d("Parse.detailHtml", "No valid JSON-LD found. Hunting for Next.js chunks...")
+        if (htmlBody.isBlank()) return null
+        
+        // 1. Next.js First (Richer state, checked with strict exact-ID mapping)
         val candidates = mutableListOf<String>()
         candidates += extractAllJsonObjectsForKey(htmlBody, "detail")
         val unescaped = unescapeNextPayload(htmlBody)
@@ -914,63 +881,67 @@ object ReelFrenParse {
             candidates += extractAllJsonObjectsForKey(unescaped, "detail")
         }
 
-        ReelFrenLog.d("Parse.detailHtml", "Found ${candidates.size} Next.js chunk candidates.")
-        for (rawJson in candidates) {
-            val obj = runCatching { JSONObject(rawJson) }.getOrNull() ?: continue
-            val parsed = buildDetailFromJson(obj, fallbackSlug, fallbackId)
-            if (parsed != null && parsed.title.isNotEmpty() && !parsed.title.equals("ReelFren", ignoreCase = true)) {
-                ReelFrenLog.d("Parse.detailHtml", "Successfully parsed detail from Next.js snippet. Title='${parsed.title}'")
-                return parsed
+        val parsedCandidates = candidates.mapNotNull { rawJson ->
+            val obj = runCatching { JSONObject(rawJson) }.getOrNull() ?: return@mapNotNull null
+            buildDetailFromJson(obj, fallbackSlug, fallbackId)?.takeIf { 
+                it.title.isNotEmpty() && !it.title.equals("ReelFren", ignoreCase = true) 
             }
         }
 
-        ReelFrenLog.d("Parse.detailHtml", "Next.js chunk parse failed. Executing absolute string fallback regexes...")
-        val ogTitle = Regex("""<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-            .find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
-        val pageTitle = Regex("""<title[^>]*>(.*?)</title>""", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
-            .find(htmlBody)?.groupValues?.getOrNull(1)?.substringBefore("|")?.trim().orEmpty()
+        parsedCandidates.firstOrNull { it.id.equals(fallbackId, ignoreCase = true) }?.let { matched ->
+            ReelFrenLog.d("Parse.detailHtml", "Matched exact Next.js detail id='${matched.id}'. Title='${matched.title}'")
+            return matched
+        }
+        parsedCandidates.firstOrNull()?.let { fallbackCandidate ->
+            ReelFrenLog.d("Parse.detailHtml", "Using fallback Next.js detail candidate. Title='${fallbackCandidate.title}'")
+            return fallbackCandidate
+        }
 
+        // 2. Schema.org JSON-LD Fallback
+        val schemaMatch = schemaRegex.find(htmlBody)
+        if (schemaMatch != null) {
+            val schemaObj = runCatching { JSONObject(schemaMatch.groupValues[1]) }.getOrNull()
+            if (schemaObj != null) {
+                val title = clean(schemaObj, "name").replace("Episode 1", "").trim()
+                if (title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
+                    val cover = ReelFrenClient.absUrl(clean(schemaObj, "image"))
+                    val intro = clean(schemaObj, "description").replace(Regex("""Watch Now: .*? as a free short drama on ReelFren."""), "").trim()
+
+                    val epNumbers = epParamRegex.findAll(htmlBody).mapNotNull { it.groupValues.getOrNull(1)?.toIntOrNull() }.filter { it > 0 }.toMutableSet()
+                    val schemaEps = schemaObj.optInt("numberOfEpisodes", 0)
+                    val maxEp = maxOf(schemaEps, epNumbers.maxOrNull() ?: 0)
+                    if (maxEp > 0) { for (n in 1..maxEp) epNumbers += n }
+
+                    val videos = epNumbers.sorted().map { epNum -> VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true) }
+                    return DetailInfo(id = fallbackId, provider = fallbackSlug, title = title, cover = cover, intro = intro, episodes = maxOf(maxEp, videos.size), videos = videos)
+                }
+            }
+        }
+
+        // 3. Raw Regex HTML Fallback
+        val ogTitle = ogTitleRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+        val pageTitle = titleTagRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.substringBefore("|")?.trim().orEmpty()
         val title = ogTitle.ifEmpty { pageTitle }.replace("Episode 1", "").trim()
 
-        ReelFrenLog.d("Parse.detailHtml", "Regex extracted title: '$title'")
-
         if (title.isEmpty() || title.contains("Just a moment", ignoreCase = true) || title.contains("Cloudflare", ignoreCase = true) || title.equals("ReelFren", ignoreCase = true)) {
-            ReelFrenLog.d("Parse.detailHtml", "FATAL: Extracted Title is empty, generic, or indicates CF block.")
             return null
         }
 
-        val rawCover = Regex("""<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-            .find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
+        val rawCover = ogImageRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
         val cover = ReelFrenClient.absUrl(rawCover)
+        val intro = metaDescRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
 
-        val intro = Regex("""<meta[^>]*(?:name=["']description["']|property=["']og:description["'])[^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-            .find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
-
-        val epNumbers = Regex("""[?&]ep=(\d+)""").findAll(htmlBody)
-            .mapNotNull { it.groupValues.getOrNull(1)?.toIntOrNull() }
-            .filter { it > 0 }
-            .toMutableSet()
-
-        val chipEps = Regex("""(\d+)(?:<!-- -->)?\s*Episode""", RegexOption.IGNORE_CASE)
-            .find(htmlBody)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-        val schemaEps = Regex(""""numberOfEpisodes"\s*:\s*(\d+)""").find(htmlBody)
-            ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-        val nextJsEps = Regex(""""episodes"\s*:\s*(\d+)""").find(htmlBody)
-            ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-        val nestedEps = Regex(""""totalEpisodes"\s*:\s*(\d+)""").find(htmlBody)
-            ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        val epNumbers = epParamRegex.findAll(htmlBody).mapNotNull { it.groupValues.getOrNull(1)?.toIntOrNull() }.filter { it > 0 }.toMutableSet()
+        val chipEps = chipEpRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        val schemaEps = schemaEpCountRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        val nextJsEps = nextJsEpCountRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        val nestedEps = totalEpCountRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
 
         val maxEp = maxOf(chipEps, schemaEps, nextJsEps, nestedEps, epNumbers.maxOrNull() ?: 0)
+        if (maxEp > 0) { for (n in 1..maxEp) epNumbers += n }
 
-        if (maxEp > 0) {
-            for (n in 1..maxEp) epNumbers += n
-        }
+        val videos = epNumbers.sorted().map { epNum -> VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true) }
 
-        val videos = epNumbers.sorted().map { epNum ->
-            VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true)
-        }
-
-        ReelFrenLog.d("Parse.detailHtml", "Successfully parsed detail using raw HTML Regex fallback. Title='$title'")
         return DetailInfo(
             id = fallbackId,
             provider = fallbackSlug,
