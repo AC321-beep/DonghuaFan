@@ -314,19 +314,24 @@ object ReelFrenClient {
     private fun apiBase() = ReelFrenStore.apiBase()
     private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
     
-    fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
+    fun homeUrl(slug: String, category: String = "", page: Int = 1, offset: Int = 0): String {
         val p = mutableListOf<String>()
         val isGlobal = slug == "all_dramas"
         if (!isGlobal && slug.isNotEmpty()) p += "provider=${query(slug)}"
         p += "lang=en"
         if (!omitCvParam) p += "cv=$currentApiVersion"
-        
         if (category.isNotEmpty()) p += "category=${query(category)}"
         p += "page=$page"
-        val offset = (page - 1) * 20
         if (offset > 0) p += "offset=$offset"
-        
         return "${apiBase()}/api/home?${p.joinToString("&")}"
+    }
+
+    fun homeHtmlUrl(slug: String, page: Int = 1): String {
+        val p = mutableListOf<String>()
+        if (slug.isNotEmpty() && slug != "all_dramas") p += "provider=${query(slug)}"
+        p += "page=$page"
+        p += "lang=en"
+        return "${ReelFrenConfig.REEL_SITE}/?${p.joinToString("&")}"
     }
 
     fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1): String {
@@ -464,8 +469,19 @@ object ReelFrenClient {
         }
     }
 
-    suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> = 
-        get(homeUrl(slug, category, page), isApiCall = true)?.let(ReelFrenParse::homeItems) ?: emptyList()
+    suspend fun home(slug: String, page: Int = 1, offset: Int = 0, category: String = ""): List<HomeItem> {
+        val apiItems = get(homeUrl(slug, category, page, offset), isApiCall = true)?.let(ReelFrenParse::homeItems).orEmpty()
+        
+        if (apiItems.isNotEmpty() || page <= 1 || category.isNotEmpty()) return apiItems
+
+        ReelFrenLog.d("Client.home", "API returned 0 items for $slug on page=$page; trying HTML fallback.")
+        val htmlStr = get(homeHtmlUrl(slug, page), isApiCall = false)
+        if (htmlStr.isNullOrEmpty()) return emptyList()
+
+        val htmlItems = ReelFrenParse.homeHtml(htmlStr, slug)
+        ReelFrenLog.d("Client.home", "HTML home fallback found ${htmlItems.size} items for $slug page=$page.")
+        return htmlItems
+    }
     
     suspend fun detail(slug: String, id: String): DetailInfo? {
         ReelFrenLog.d("Client.detail", "API detail is blocked (401). Skipping straight to HTML fetch.")
@@ -487,7 +503,6 @@ object ReelFrenClient {
         return parsed
     }
     
-    // Pass term through to searchHtml to filter out Recommended shelves
     suspend fun search(slug: String, term: String): List<HomeItem> {
         ReelFrenLog.d("Client.search", "API search is blocked (401). Skipping straight to HTML fetch.")
         
@@ -607,7 +622,34 @@ object ReelFrenParse {
         }
     }
     
-    // [FIX] Accept query, scrape all, and filter out Recommended shelves
+    fun homeHtml(htmlBody: String, requestedSlug: String): List<HomeItem> {
+        if (htmlBody.isBlank()) return emptyList()
+        val unescapedBody = unescapeNextPayload(htmlBody)
+        val itemPattern = Regex("""\{[^{}]*"id":"[^"]+"[^{}]*"provider":"[^"]+"[^{}]*\}""")
+        val results = mutableListOf<HomeItem>()
+
+        for (match in itemPattern.findAll(unescapedBody)) {
+            val o = runCatching { JSONObject(match.value) }.getOrNull() ?: continue
+            val id = clean(o, "id").ifEmpty { clean(o, "dramaId") }
+            val title = clean(o, "title").ifEmpty { clean(o, "name") }
+            val provider = clean(o, "provider")
+
+            if (requestedSlug.isNotEmpty() && requestedSlug != "all_dramas" && provider.isNotEmpty() && provider != requestedSlug) continue
+
+            if (id.isNotEmpty() && title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
+                results += HomeItem(
+                    id = id,
+                    provider = provider.ifEmpty { requestedSlug },
+                    title = title,
+                    cover = ReelFrenClient.absUrl(clean(o, "cover").ifEmpty { clean(o, "poster") }),
+                    intro = clean(o, "intro"),
+                    episodes = o.optInt("episodes")
+                )
+            }
+        }
+        return results.distinctBy { it.id }
+    }
+    
     fun searchHtml(htmlBody: String, requestedSlug: String, query: String): List<HomeItem> {
         if (htmlBody.isBlank()) return emptyList()
 
@@ -615,41 +657,34 @@ object ReelFrenParse {
         ReelFrenLog.d("Parse.searchHtml", "Hunting for Next.js chunks in search HTML...")
         
         val unescapedBody = unescapeNextPayload(htmlBody)
-        
         val itemPattern = Regex("""\{[^{}]*"id":"[^"]+"[^{}]*"provider":"[^"]+"[^{}]*\}""")
         
-        val matches = itemPattern.findAll(unescapedBody).toList()
-        if (matches.isNotEmpty()) {
-            for (match in matches) {
-                val o = runCatching { JSONObject(match.value) }.getOrNull() ?: continue
-                
-                val id = clean(o, "id").ifEmpty { clean(o, "dramaId") }
-                val title = clean(o, "title").ifEmpty { clean(o, "name") }
-                val provider = clean(o, "provider")
-                
-                if (requestedSlug.isNotEmpty() && requestedSlug != "all_dramas" && provider.isNotEmpty() && provider != requestedSlug) continue
-                
-                if (id.isNotEmpty() && title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
-                    results.add(HomeItem(
-                        id = id,
-                        provider = provider,
-                        title = title,
-                        cover = ReelFrenClient.absUrl(clean(o, "cover").ifEmpty { clean(o, "poster") }),
-                        intro = clean(o, "intro"),
-                        episodes = o.optInt("episodes")
-                    ))
-                }
+        for (match in itemPattern.findAll(unescapedBody)) {
+            val o = runCatching { JSONObject(match.value) }.getOrNull() ?: continue
+            val id = clean(o, "id").ifEmpty { clean(o, "dramaId") }
+            val title = clean(o, "title").ifEmpty { clean(o, "name") }
+            val provider = clean(o, "provider")
+            
+            if (requestedSlug.isNotEmpty() && requestedSlug != "all_dramas" && provider.isNotEmpty() && provider != requestedSlug) continue
+            
+            if (id.isNotEmpty() && title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
+                results.add(HomeItem(
+                    id = id,
+                    provider = provider.ifEmpty { requestedSlug },
+                    title = title,
+                    cover = ReelFrenClient.absUrl(clean(o, "cover").ifEmpty { clean(o, "poster") }),
+                    intro = clean(o, "intro"),
+                    episodes = o.optInt("episodes")
+                ))
             }
         }
         
-        // [FIX] Filter against query tokens to exclude Recommended shelves
         val cleanQuery = query.trim().lowercase(Locale.ROOT)
         val tokens = cleanQuery.split("\\s+".toRegex()).filter { it.length > 2 }
 
         val filteredResults = results.filter { item ->
             if (cleanQuery.isEmpty()) return@filter true
             val lowerTitle = item.title.lowercase(Locale.ROOT)
-            
             if (lowerTitle.contains(cleanQuery)) return@filter true
             if (tokens.isNotEmpty() && tokens.any { lowerTitle.contains(it) }) return@filter true
             false
@@ -661,7 +696,6 @@ object ReelFrenParse {
             return uniqueResults
         }
 
-        // [FIX] Differentiate empty search pages (~68KB) vs actual parse failures
         if (htmlBody.length < 72000) {
             ReelFrenLog.d("Parse.searchHtml", "Valid empty search page detected. (Size: ${htmlBody.length})")
         } else {
