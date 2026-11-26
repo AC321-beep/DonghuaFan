@@ -114,10 +114,13 @@ object ReelFrenConfig {
 // ----------------------------------------------------------------------
 // DATA STORE & UTILS
 // ----------------------------------------------------------------------
+
 object ReelFrenStore {
     @Volatile var appContext: Context? = null
         private set
-    @Volatile var defaultSystemUa: String = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        
+    // [FIX] Strictly enforce the static UA across the entire app stack.
+    @Volatile var defaultSystemUa: String = ReelFrenClient.GLOBAL_MOBILE_UA
         private set
 
     @Volatile private var storePrefs: SharedPreferences? = null
@@ -137,7 +140,10 @@ object ReelFrenStore {
         storePrefs = appContext?.getSharedPreferences("reelfren_store", Context.MODE_PRIVATE)
         providerPrefs = appContext?.getSharedPreferences("reelfren_prefs", Context.MODE_PRIVATE)
         ReelFrenLog.isVerbose = providerPrefs?.getBoolean("verbose_logging", false) ?: false
-        runCatching { normalizeUa(WebSettings.getDefaultUserAgent(ctx)) }.getOrNull()?.takeIf { it.isNotBlank() }?.let { ua -> defaultSystemUa = ua }
+        
+        // [FIX] REMOVED the WebSettings.getDefaultUserAgent(ctx) call.
+        // We no longer read the device UA. We 100% rely on ReelFrenClient.GLOBAL_MOBILE_UA 
+        // to mathematically match the OkHttp TLS fingerprint.
     }
 
     fun setVerboseLogging(enabled: Boolean) {
@@ -197,75 +203,6 @@ object ReelFrenStore {
         val cleaned = normalizeUa(ua)
         memoryUa[norm] = cleaned
         storePrefs?.edit()?.putString("ua_$norm", cleaned)?.apply()
-    }
-}
-
-object ReelFrenQuality {
-    private val heavy = Regex("(?i)\\b(h\\.?26[56]|hevc|x\\.?26[56]|av1)\\b")
-    private val resRegex = Regex("(?i)(\\d{3,4})\\s*p\\b")
-
-    fun label(raw: String) = raw.trim().ifEmpty { "Auto" }
-
-    fun inferFormat(url: String, explicitFormat: String = ""): String {
-        val cleanFormat = explicitFormat.trim().lowercase(Locale.ROOT)
-        if (cleanFormat.isNotEmpty()) {
-            return cleanFormat
-        }
-        return when {
-            url.contains(".m3u8", ignoreCase = true) -> "hls"
-            url.contains(".mpd", ignoreCase = true)  -> "dash"
-            url.contains(".mp4", ignoreCase = true) || url.contains("mime_type=video_mp4", ignoreCase = true) -> "mp4"
-            else -> "video"
-        }
-    }
-
-    fun linkType(url: String, format: String = ""): ExtractorLinkType {
-        val f = inferFormat(url, format)
-        return when (f) {
-            "hls" -> ExtractorLinkType.M3U8
-            "dash" -> ExtractorLinkType.DASH
-            else -> ExtractorLinkType.VIDEO
-        }
-    }
-
-    fun of(label: String): Int {
-        val lower = label.lowercase(Locale.ROOT)
-        val base = resRegex.find(label)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: when {
-            lower.contains("2160") || lower.contains("4k") || lower.contains("uhd") -> 2160
-            lower.contains("1080") -> 1080
-            lower.contains("720")  -> 720
-            lower.contains("480")  -> 480
-            lower.contains("360")  -> 360
-            else -> 400
-        }
-        return if (heavy.containsMatchIn(label)) demote(base) else base
-    }
-
-    private fun demote(q: Int) = when { q >= 2160 -> 1080; q >= 1080 -> 720; q >= 720 -> 480; else -> 360 }
-}
-
-object ReelFrenUrl {
-    private val pathRegex = Regex("/(?:drama|watch)/([^/?#|]+)/([^/?#|]+)")
-    private val epRegex = Regex("[?&]ep=(\\d+)")
-
-    fun page(slug: String, id: String) = "${ReelFrenConfig.REEL_SITE}/drama/$slug/$id"
-    fun episode(slug: String, id: String, ep: Int) = "${ReelFrenConfig.REEL_SITE}/watch/$slug/$id?ep=$ep"
-
-    fun parse(raw: String?): Triple<String, String, Int> {
-        val input = raw?.trim().orEmpty()
-        if (input.isEmpty()) return Triple("", "", 1)
-        pathRegex.find(input)?.let { m ->
-            val slug = m.groupValues[1].trim().lowercase(Locale.ROOT)
-            val id = m.groupValues[2].trim()
-            val ep = epRegex.find(input)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
-            if (slug.isNotEmpty() && id.isNotEmpty()) return Triple(slug, id, ep)
-        }
-        val body = input.substringAfter("://", input).substringAfter("/", "").substringBefore("?").substringBefore("#")
-        val parts = body.split("|")
-        val slug = parts.getOrNull(0)?.trim()?.lowercase(Locale.ROOT).orEmpty()
-        val id = parts.getOrNull(1)?.trim().orEmpty()
-        val ep = parts.getOrNull(2)?.trim()?.toIntOrNull() ?: 1
-        return if (slug.isNotEmpty() && id.isNotEmpty()) Triple(slug, id, ep) else Triple("", "", 1)
     }
 }
 
