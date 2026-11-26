@@ -47,8 +47,8 @@ class ReelFrenProvider : MainAPI() {
         private const val CACHE_EXPIRY_MS = 10 * 60 * 1000L
 
         private val bgSearchScope = CoroutineScope(Dispatchers.IO)
-        private val homeSemaphore = Semaphore(3)
-        private val slugOffsets = ConcurrentHashMap<String, Int>() // RESTORED
+        private val homeSemaphore = Semaphore(4)
+        private val slugOffsets = ConcurrentHashMap<String, Int>() // Essential for tracking dynamic pagination
         
         // Omni-Fetch Cache
         private val omniMutex = Mutex()
@@ -69,7 +69,7 @@ class ReelFrenProvider : MainAPI() {
         val isPageOne = page <= 1
 
         if (isPageOne) {
-            slugOffsets.remove(slug) // Reset tracking on refresh
+            slugOffsets.remove(slug) // Reset tracking on refresh/tab switch
             val now = System.currentTimeMillis()
 
             val cachedItems = omniMutex.withLock {
@@ -87,7 +87,7 @@ class ReelFrenProvider : MainAPI() {
 
             if (!cachedItems.isNullOrEmpty()) {
                 ReelFrenLog.d("Main/getMainPage", "INSTANT LOAD: $slug served ${cachedItems.size} items from RAM.")
-                slugOffsets[slug] = cachedItems.size // Track exact offset served from RAM
+                slugOffsets[slug] = cachedItems.size // Track the exact offset served from RAM
                 return mapToHomePageResponse(request.name, slug, cachedItems, hasNext = true)
             }
         }
@@ -106,7 +106,8 @@ class ReelFrenProvider : MainAPI() {
             return newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
 
-        slugOffsets[slug] = currentOffset + items.size // Update tracker for next page
+        // Update tracking for the next page fetch
+        slugOffsets[slug] = currentOffset + items.size 
         return mapToHomePageResponse(request.name, slug, items, hasNext = true)
     }
 
@@ -116,6 +117,7 @@ class ReelFrenProvider : MainAPI() {
         items: List<HomeItem>,
         hasNext: Boolean
     ): HomePageResponse {
+        // Optimized URL building without regex or distinctBy to prevent UI thread stutter
         val mapped = items.mapNotNull { item ->
             if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
             
@@ -140,7 +142,6 @@ class ReelFrenProvider : MainAPI() {
         return newHomePageResponse(name, mapped, hasNext = hasNext)
     }
 
-    // ... search, load, loadLinks remain perfectly unchanged (they were working flawlessly) ...
     override suspend fun search(query: String): List<SearchResponse>? {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
@@ -205,6 +206,7 @@ class ReelFrenProvider : MainAPI() {
             val allResults = (distinctFast + secondaryResults).distinctBy { it.url }
             if (cachedSearchQuery == cleanQuery) cachedSearchResults = allResults
         }
+
         return distinctFast
     }
 
