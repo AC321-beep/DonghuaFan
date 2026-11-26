@@ -321,7 +321,7 @@ object ReelFrenClient {
         if (!omitCvParam) p += "cv=$currentApiVersion"
         if (category.isNotEmpty()) p += "category=${query(category)}"
         p += "page=$page"
-        if (offset > 0) p += "offset=$offset"
+        if (offset > 0) p += "offset=$offset" // Restored: strictly required by backend for pagination
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
@@ -473,15 +473,21 @@ object ReelFrenClient {
         val rawResponse = get(homeUrl(slug, category, page, offset), isApiCall = true)
         val apiItems = rawResponse?.let(ReelFrenParse::homeItems).orEmpty()
 
-        if (apiItems.isNotEmpty() || page <= 1 || category.isNotEmpty()) return apiItems
+        if (apiItems.isNotEmpty() || category.isNotEmpty()) return apiItems
 
         val trimmed = rawResponse?.trimStart() ?: ""
         if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-            ReelFrenLog.d("Client.home", "API returned valid JSON but 0 items for $slug (offset $offset). End of catalog reached.")
+            ReelFrenLog.d("Client.home", "API returned valid empty JSON (size ${trimmed.length}) for $slug on page=$page. End of catalog reached.")
             return emptyList()
         }
 
-        ReelFrenLog.d("Client.home", "API failed or returned non-JSON for $slug on page=$page; trying HTML fallback.")
+        // Avoid pointless HTML fallback on pagination, as SSR pages only hold page 1 items.
+        if (page > 1) {
+            ReelFrenLog.d("Client.home", "API failed on page $page. Skipping HTML fallback to avoid unpaginated duplicate scrape.")
+            return emptyList()
+        }
+
+        ReelFrenLog.d("Client.home", "API failed on page 1; trying HTML fallback.")
         val htmlStr = get(homeHtmlUrl(slug, page), isApiCall = false)
         if (htmlStr.isNullOrEmpty()) return emptyList()
 
@@ -491,7 +497,8 @@ object ReelFrenClient {
     }
 
     suspend fun detail(slug: String, id: String): DetailInfo? {
-        ReelFrenLog.d("Client.detail", "API detail is blocked (401). Skipping straight to HTML fetch.")
+        // Officially relying on SSR HTML instead of the non-existent background API
+        ReelFrenLog.d("Client.detail", "Fetching detail HTML (SSR)...")
 
         val htmlStr = get(detailHtmlUrl(slug, id), isApiCall = false)
 
@@ -511,7 +518,7 @@ object ReelFrenClient {
     }
 
     suspend fun search(slug: String, term: String): List<HomeItem> {
-        ReelFrenLog.d("Client.search", "API search is blocked (401). Skipping straight to HTML fetch.")
+        ReelFrenLog.d("Client.search", "Fetching search HTML (SSR)...")
 
         val htmlStr = get(searchHtmlUrl(slug, term), isApiCall = false)
 
@@ -632,7 +639,8 @@ object ReelFrenParse {
     fun homeHtml(htmlBody: String, requestedSlug: String): List<HomeItem> {
         if (htmlBody.isBlank()) return emptyList()
         val unescapedBody = unescapeNextPayload(htmlBody)
-        val itemPattern = Regex("""\{[^{}]*"id":"[^"]+"[^{}]*"provider":"[^"]+"[^{}]*\}""")
+        // [FIX] Utilize non-capturing group to optimize extraction from Next.js state
+        val itemPattern = Regex("""\{[^{}]*"(?:id|dramaId)":"[^"]+"[^{}]*"provider":"[^"]+"[^{}]*\}""")
         val results = mutableListOf<HomeItem>()
 
         for (match in itemPattern.findAll(unescapedBody)) {
@@ -664,7 +672,7 @@ object ReelFrenParse {
         ReelFrenLog.d("Parse.searchHtml", "Hunting for Next.js chunks in search HTML...")
 
         val unescapedBody = unescapeNextPayload(htmlBody)
-        val itemPattern = Regex("""\{[^{}]*"id":"[^"]+"[^{}]*"provider":"[^"]+"[^{}]*\}""")
+        val itemPattern = Regex("""\{[^{}]*"(?:id|dramaId)":"[^"]+"[^{}]*"provider":"[^"]+"[^{}]*\}""")
 
         for (match in itemPattern.findAll(unescapedBody)) {
             val o = runCatching { JSONObject(match.value) }.getOrNull() ?: continue
