@@ -313,7 +313,7 @@ object ReelFrenClient {
     private fun apiBase() = ReelFrenStore.apiBase()
     private fun query(v: String) = URLEncoder.encode(v, "UTF-8")
 
-    fun homeUrl(slug: String, category: String = "", page: Int = 1): String {
+    fun homeUrl(slug: String, category: String = "", page: Int = 1, offset: Int = 0): String {
         val p = mutableListOf<String>()
         val isGlobal = slug == "all_dramas"
         if (!isGlobal && slug.isNotEmpty()) p += "provider=${query(slug)}"
@@ -321,7 +321,7 @@ object ReelFrenClient {
         if (!omitCvParam) p += "cv=$currentApiVersion"
         if (category.isNotEmpty()) p += "category=${query(category)}"
         p += "page=$page"
-        // Offset removed to prevent breaking API queries
+        if (offset > 0) p += "offset=$offset"
         return "${apiBase()}/api/home?${p.joinToString("&")}"
     }
 
@@ -442,7 +442,6 @@ object ReelFrenClient {
 
             if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
-            // [FIX] Explicitly pass the poisoned cookie to force a clean solver run
             val poisonedCookie = ReelFrenStore.cookie(targetHost)
             if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE, invalidatedCookie = poisonedCookie)) {
                 ReelFrenLog.d("Client.get", "CF Solve returned false.")
@@ -470,16 +469,15 @@ object ReelFrenClient {
         }
     }
 
-    suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> {
-        val rawResponse = get(homeUrl(slug, category, page), isApiCall = true)
+    suspend fun home(slug: String, page: Int = 1, offset: Int = 0, category: String = ""): List<HomeItem> {
+        val rawResponse = get(homeUrl(slug, category, page, offset), isApiCall = true)
         val apiItems = rawResponse?.let(ReelFrenParse::homeItems).orEmpty()
 
         if (apiItems.isNotEmpty() || page <= 1 || category.isNotEmpty()) return apiItems
 
-        // CRITICAL CHECK: Short-circuit if API returned a valid, empty JSON array (SIZE: ~23 bytes)
         val trimmed = rawResponse?.trimStart() ?: ""
         if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-            ReelFrenLog.d("Client.home", "API returned valid JSON but 0 items for $slug on page=$page. End of pagination reached.")
+            ReelFrenLog.d("Client.home", "API returned valid JSON but 0 items for $slug (offset $offset). End of catalog reached.")
             return emptyList()
         }
 
