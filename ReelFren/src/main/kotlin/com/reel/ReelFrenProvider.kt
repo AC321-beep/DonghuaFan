@@ -28,7 +28,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeout
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 
 class ReelFrenProvider : MainAPI() {
     override var name = "ReelFren"
@@ -48,9 +47,8 @@ class ReelFrenProvider : MainAPI() {
 
         private val bgSearchScope = CoroutineScope(Dispatchers.IO)
         private val homeSemaphore = Semaphore(3)
-        private val slugOffsets = ConcurrentHashMap<String, Int>()
-
-        // Omni-Fetch Cache
+        
+        // Omni-Fetch Cache (No more slugOffsets needed)
         private val omniMutex = Mutex()
         private var omniCache: Map<String, List<HomeItem>> = emptyMap()
         private var masterCacheList: List<HomeItem> = emptyList()
@@ -69,7 +67,6 @@ class ReelFrenProvider : MainAPI() {
         val isPageOne = page <= 1
 
         if (isPageOne) {
-            slugOffsets.remove(slug)
             val now = System.currentTimeMillis()
 
             val cachedItems = omniMutex.withLock {
@@ -87,49 +84,41 @@ class ReelFrenProvider : MainAPI() {
 
             if (!cachedItems.isNullOrEmpty()) {
                 ReelFrenLog.d("Main/getMainPage", "INSTANT LOAD: $slug served ${cachedItems.size} items from RAM.")
-                slugOffsets[slug] = cachedItems.size
                 return mapToHomePageResponse(request.name, slug, cachedItems, hasNext = true)
             }
         }
 
-        val currentOffset = if (isPageOne) 0 else slugOffsets[slug] ?: ((page - 1) * 20)
-        ReelFrenLog.d("Main/getMainPage", "NETWORK LOAD: page=$page offset=$currentOffset slug=$slug")
+        ReelFrenLog.d("Main/getMainPage", "NETWORK LOAD: page=$page slug=$slug")
 
         val items = homeSemaphore.withPermit {
-            ReelFrenClient.home(slug, page = page, offset = currentOffset)
+            ReelFrenClient.home(slug, page = page)
         }
 
         if (items.isEmpty()) {
-            slugOffsets.remove(slug)
             ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=0 added=0 hasNext=false")
             return newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
 
-        slugOffsets[slug] = currentOffset + items.size
         return mapToHomePageResponse(request.name, slug, items, hasNext = true)
     }
 
-   private fun mapToHomePageResponse(
+    private fun mapToHomePageResponse(
         name: String,
         fallbackSlug: String,
         items: List<HomeItem>,
         hasNext: Boolean
     ): HomePageResponse {
-        // [FIX] Removed .distinctBy{} entirely. ReelFren API handles uniqueness.
         val mapped = items.mapNotNull { item ->
             if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
             
-            // Fast string builder instead of Regex
             val actualSlug = if (item.provider.isNotEmpty()) item.provider else fallbackSlug
             val pageUrl = "${ReelFrenConfig.REEL_SITE}/drama/$actualSlug/${item.id}"
             
             newMovieSearchResponse(item.title, pageUrl, TvType.AsianDrama) {
-                // Only call absUrl if cover is valid
                 val rawCover = item.cover.trim()
                 if (rawCover.isNotEmpty()) {
                     val finalCover = if (rawCover.startsWith("http", ignoreCase = true)) rawCover else ReelFrenClient.absUrl(rawCover)
                     this.posterUrl = finalCover
-                    // Prevent memory allocation for headers unless absolutely necessary
                     if (finalCover.contains("volcengine-forward")) {
                         this.posterHeaders = mapOf(
                             "User-Agent" to ReelFrenClient.GLOBAL_MOBILE_UA,
