@@ -20,6 +20,7 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
@@ -48,19 +49,20 @@ class ReelFrenProvider : MainAPI() {
         private val bgSearchScope = CoroutineScope(Dispatchers.IO)
         private val homeSemaphore = Semaphore(3)
         private val slugOffsets = ConcurrentHashMap<String, Int>()
-        
-        // Omni-Fetch Cache Variables
+
+        // Omni-Fetch Cache
         private val omniMutex = Mutex()
         private var omniCache: Map<String, List<HomeItem>> = emptyMap()
         private var masterCacheList: List<HomeItem> = emptyList()
         private var omniCacheTime: Long = 0L
-        private const val OMNI_EXPIRY_MS = 5 * 60 * 1000L // Refresh master payload every 5 mins
+        private const val OMNI_EXPIRY_MS = 5 * 60 * 1000L
     }
 
-    override val mainPage get() = mainPageOf(
-        "all_dramas" to "All Dramas",
-        *ReelFrenStore.enabledProviders().map { it.value to it.key }.toTypedArray()
-    )
+    override val mainPage
+        get() = mainPageOf(
+            "all_dramas" to "All Dramas",
+            *ReelFrenStore.enabledProviders().map { it.value to it.key }.toTypedArray()
+        )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val slug = request.data
@@ -69,13 +71,10 @@ class ReelFrenProvider : MainAPI() {
         if (isPageOne) {
             slugOffsets.remove(slug)
             val now = System.currentTimeMillis()
-            
-            // OMNI-FETCH: Lock prevents 20 tabs from fetching the API simultaneously. 
-            // The first tab downloads the 1.1MB Master Payload, the other 19 tabs instantly read it from RAM.
+
             val cachedItems = omniMutex.withLock {
                 if (now - omniCacheTime > OMNI_EXPIRY_MS || omniCache.isEmpty()) {
-                    ReelFrenLog.d("Main/Omni", "Omni-Cache empty/expired. Fetching 1.1MB Master payload...")
-                    
+                    ReelFrenLog.d("Main/Omni", "Omni-Cache empty/expired. Fetching master payload...")
                     val masterList = ReelFrenClient.home("all_dramas", page = 1)
                     if (masterList.isNotEmpty()) {
                         omniCache = masterList.groupBy { it.provider.lowercase(Locale.ROOT) }
@@ -86,22 +85,20 @@ class ReelFrenProvider : MainAPI() {
                 if (slug == "all_dramas") masterCacheList else omniCache[slug.lowercase(Locale.ROOT)]
             }
 
-            // If the provider was in the master payload, return it instantly!
             if (!cachedItems.isNullOrEmpty()) {
-                ReelFrenLog.d("Main/getMainPage", "⚡ INSTANT LOAD: $slug served ${cachedItems.size} items from RAM.")
+                ReelFrenLog.d("Main/getMainPage", "INSTANT LOAD: $slug served ${cachedItems.size} items from RAM.")
                 slugOffsets[slug] = cachedItems.size
                 return mapToHomePageResponse(request.name, slug, cachedItems, hasNext = true)
             }
         }
 
-        // FALLBACK TO NETWORK: If it's Page 2+, or if a rare provider wasn't in the Omni-Cache
         val currentOffset = if (isPageOne) 0 else slugOffsets[slug] ?: ((page - 1) * 20)
-        ReelFrenLog.d("Main/getMainPage", "🌐 NETWORK LOAD: page=$page offset=$currentOffset slug=$slug")
+        ReelFrenLog.d("Main/getMainPage", "NETWORK LOAD: page=$page offset=$currentOffset slug=$slug")
 
         val items = homeSemaphore.withPermit {
             ReelFrenClient.home(slug, page = page, offset = currentOffset)
         }
-        
+
         if (items.isEmpty()) {
             slugOffsets.remove(slug)
             ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=0 added=0 hasNext=false")
@@ -112,8 +109,12 @@ class ReelFrenProvider : MainAPI() {
         return mapToHomePageResponse(request.name, slug, items, hasNext = true)
     }
 
-    // Helper function to keep code clean
-    private fun mapToHomePageResponse(name: String, fallbackSlug: String, items: List<HomeItem>, hasNext: Boolean): HomePageResponse {
+    private fun mapToHomePageResponse(
+        name: String,
+        fallbackSlug: String,
+        items: List<HomeItem>,
+        hasNext: Boolean
+    ): HomePageResponse {
         val mapped = items.mapNotNull { item ->
             if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
             val actualSlug = item.provider.ifEmpty { fallbackSlug }
@@ -122,7 +123,7 @@ class ReelFrenProvider : MainAPI() {
                 this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
             }
         }.distinctBy { it.url }
-        
+
         return newHomePageResponse(name, mapped, hasNext = hasNext)
     }
 
@@ -161,7 +162,7 @@ class ReelFrenProvider : MainAPI() {
                 }
             }
             try {
-                withTimeout(10000L) { fastResults.addAll(primarySearches.awaitAll().flatten()) }
+                withTimeout(10_000L) { fastResults.addAll(primarySearches.awaitAll().flatten()) }
             } catch (e: TimeoutCancellationException) {
                 fastResults.addAll(primarySearches.filter { it.isCompleted && !it.isCancelled }.flatMap { it.getCompleted() })
             }
@@ -177,13 +178,15 @@ class ReelFrenProvider : MainAPI() {
                 items.forEach { item ->
                     if (item.id.isNotEmpty() && item.title.isNotEmpty()) {
                         val actualSlug = item.provider.ifEmpty { slug }
-                        secondaryResults.add(newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
-                            this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
-                            this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
-                        })
+                        secondaryResults.add(
+                            newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
+                                this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
+                                this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
+                            }
+                        )
                     }
                 }
-                kotlinx.coroutines.delay(500)
+                delay(500L)
             }
             val allResults = (distinctFast + secondaryResults).distinctBy { it.url }
             if (cachedSearchQuery == cleanQuery) cachedSearchResults = allResults
@@ -197,9 +200,9 @@ class ReelFrenProvider : MainAPI() {
         if (id.isEmpty() || slug.isEmpty()) throw ErrorLoadingException("Invalid URL or missing ID")
         val d: DetailInfo = ReelFrenClient.detail(slug, id) ?: throw ErrorLoadingException("Failed to load detail")
         val coverUrl = ReelFrenClient.absUrl(d.cover).takeIf { it.isNotBlank() }
-        
-        if (d.videos.size > 1 || d.episodes > 1) {
-            return newTvSeriesLoadResponse(d.title, url, TvType.AsianDrama, d.videos.map { v ->
+
+        return if (d.videos.size > 1 || d.episodes > 1) {
+            newTvSeriesLoadResponse(d.title, url, TvType.AsianDrama, d.videos.map { v ->
                 newEpisode(ReelFrenUrl.episode(slug, id, v.episode)) {
                     this.name = "Episode ${v.episode}"
                     this.episode = v.episode
@@ -211,7 +214,7 @@ class ReelFrenProvider : MainAPI() {
                 this.plot = d.intro
             }
         } else {
-            return newMovieLoadResponse(d.title, url, TvType.Movie, ReelFrenUrl.episode(slug, id, d.videos.firstOrNull()?.episode ?: 1)) {
+            newMovieLoadResponse(d.title, url, TvType.Movie, ReelFrenUrl.episode(slug, id, d.videos.firstOrNull()?.episode ?: 1)) {
                 this.posterUrl = coverUrl
                 this.posterHeaders = ReelFrenClient.posterHeaders(coverUrl)
                 this.plot = d.intro
@@ -219,20 +222,27 @@ class ReelFrenProvider : MainAPI() {
         }
     }
 
-    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (com.lagradost.cloudstream3.utils.ExtractorLink) -> Unit): Boolean {
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (com.lagradost.cloudstream3.utils.ExtractorLink) -> Unit
+    ): Boolean = coroutineScope {
         val (slug, id, ep) = ReelFrenUrl.parse(data)
-        if (id.isEmpty() || slug.isEmpty()) return false
-        val foundLinks = AtomicBoolean(false)
+        if (id.isEmpty() || slug.isEmpty()) return@coroutineScope false
 
-        coroutineScope {
-            listOf(1, 2, 3, 4, 5).forEach { serverId ->
-                launch {
-                    val p = runCatching { ReelFrenClient.playback(slug, id, ep, serverId) }.getOrNull() ?: return@launch
-                    ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback)
-                    p.qualities.forEach { q ->
-                        val qUrl = ReelFrenClient.absUrl(q.url)
-                        if (qUrl.isNotBlank() && qUrl.startsWith("http")) {
-                            callback(com.lagradost.cloudstream3.utils.ExtractorLink(
+        val jobs = listOf(1, 2, 3).map { serverId ->
+            async {
+                val p = runCatching { ReelFrenClient.playback(slug, id, ep, serverId) }.getOrNull() ?: return@async false
+                var found = false
+
+                ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback)
+
+                p.qualities.forEach { q ->
+                    val qUrl = ReelFrenClient.absUrl(q.url)
+                    if (qUrl.isNotBlank() && qUrl.startsWith("http")) {
+                        callback(
+                            com.lagradost.cloudstream3.utils.ExtractorLink(
                                 source = name,
                                 name = if (p.server.toIntOrNull() != null) "Server ${p.server}" else p.server,
                                 url = qUrl,
@@ -240,13 +250,15 @@ class ReelFrenProvider : MainAPI() {
                                 quality = ReelFrenQuality.of(q.label),
                                 type = ReelFrenQuality.linkType(qUrl, q.format),
                                 headers = ReelFrenClient.videoHeaders(qUrl)
-                            ))
-                            foundLinks.set(true)
-                        }
+                            )
+                        )
+                        found = true
                     }
                 }
+                found
             }
         }
-        return foundLinks.get()
+
+        jobs.awaitAll().any { it }
     }
 }
