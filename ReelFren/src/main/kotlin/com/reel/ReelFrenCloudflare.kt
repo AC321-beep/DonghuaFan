@@ -89,12 +89,10 @@ object ReelFrenCloudflare {
 
     fun extractClearanceToken(cookieHeader: String?): String = cookieHeader?.let { clearanceRegex.find(it)?.groupValues?.getOrNull(1) }.orEmpty()
 
-    // [FIX] Reverted to single parameter to match ReelFrenUtils.kt calls
     fun isChallengeResponse(body: String): Boolean {
         if (body.isEmpty()) return false
         val trimmed = body.trimStart()
         if (trimmed.startsWith("{") || trimmed.startsWith("[")) return false
-        
         return isChallengeBody(trimmed)
     }
 
@@ -128,16 +126,6 @@ object ReelFrenCloudflare {
             depth++
         }
         return null
-    }
-
-    private fun resolveWebViewUa(activity: Activity, host: String): String {
-        val existing = ReelFrenStore.userAgent(host)
-        if (existing.isNotBlank() && existing != ReelFrenClient.GLOBAL_MOBILE_UA) return existing
-        val ua = runCatching {
-            ReelFrenStore.normalizeUa(WebSettings.getDefaultUserAgent(activity))
-        }.getOrNull()?.takeIf { it.isNotBlank() } ?: ReelFrenStore.defaultSystemUa
-        ReelFrenStore.setUserAgent(host, ua)
-        return ua
     }
 
     private fun handleSslError(targetHost: String, sslHandler: SslErrorHandler?, error: SslError?) {
@@ -175,7 +163,6 @@ object ReelFrenCloudflare {
             if (extractClearanceToken(cookie).isNotEmpty()) {
                 ReelFrenStore.saveCookie(host, cookie)
                 ReelFrenStore.setUserAgent(host, ua)
-                // [FIX] Removed recordPrewarmResult call
                 cm.flush()
                 ReelFrenLog.d("CF/cookie", "Persisted cf_clearance for $host (len=${cookie.length})")
             }
@@ -252,7 +239,9 @@ object ReelFrenCloudflare {
             var freshTokenCount = 0
             var mainFrameError: String? = null
             val handler = Handler(Looper.getMainLooper())
-            val ua = resolveWebViewUa(activity, host)
+            
+            // [FIX] Force exact match with Client's TLS fingerprint spoofing
+            val ua = ReelFrenClient.GLOBAL_MOBILE_UA
             val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
 
             val container = object : FrameLayout(activity) { override fun dispatchTouchEvent(ev: MotionEvent?) = false }.apply {
@@ -370,7 +359,9 @@ object ReelFrenCloudflare {
         var freshTokenCount = 0
         val handler = Handler(Looper.getMainLooper())
         var webRef: WebView? = null; var dialogRef: Dialog? = null
-        val ua = resolveWebViewUa(activity, host)
+        
+        // [FIX] Force exact match with Client's TLS fingerprint spoofing
+        val ua = ReelFrenClient.GLOBAL_MOBILE_UA
         val cookies = CookieManager.getInstance().apply { setAcceptCookie(true) }
 
         fun finish(success: Boolean) {
