@@ -21,11 +21,13 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeout
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
 
 class ReelFrenProvider : MainAPI() {
     override var name = "ReelFren"
@@ -46,6 +48,13 @@ class ReelFrenProvider : MainAPI() {
         private val bgSearchScope = CoroutineScope(Dispatchers.IO)
         private val homeSemaphore = Semaphore(3)
         private val slugOffsets = ConcurrentHashMap<String, Int>()
+        
+        // Omni-Fetch Cache Variables
+        private val omniMutex = Mutex()
+        private var omniCache: Map<String, List<HomeItem>> = emptyMap()
+        private var masterCacheList: List<HomeItem> = emptyList()
+        private var omniCacheTime: Long = 0L
+        private const val OMNI_EXPIRY_MS = 5 * 60 * 1000L // Refresh master payload every 5 mins
     }
 
     override val mainPage get() = mainPageOf(
@@ -55,12 +64,41 @@ class ReelFrenProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val slug = request.data
-        if (page <= 1) slugOffsets.remove(slug)
-        val currentOffset = if (page <= 1) 0 else slugOffsets[slug] ?: ((page - 1) * 20)
+        val isPageOne = page <= 1
 
-        ReelFrenLog.d("Main/getMainPage", "ENTRY page=$page offset=$currentOffset slug=$slug name=${request.name}")
+        if (isPageOne) {
+            slugOffsets.remove(slug)
+            val now = System.currentTimeMillis()
+            
+            // OMNI-FETCH: Lock prevents 20 tabs from fetching the API simultaneously. 
+            // The first tab downloads the 1.1MB Master Payload, the other 19 tabs instantly read it from RAM.
+            val cachedItems = omniMutex.withLock {
+                if (now - omniCacheTime > OMNI_EXPIRY_MS || omniCache.isEmpty()) {
+                    ReelFrenLog.d("Main/Omni", "Omni-Cache empty/expired. Fetching 1.1MB Master payload...")
+                    
+                    val masterList = ReelFrenClient.home("all_dramas", page = 1)
+                    if (masterList.isNotEmpty()) {
+                        omniCache = masterList.groupBy { it.provider.lowercase(Locale.ROOT) }
+                        masterCacheList = masterList
+                        omniCacheTime = now
+                    }
+                }
+                if (slug == "all_dramas") masterCacheList else omniCache[slug.lowercase(Locale.ROOT)]
+            }
 
-        val items: List<HomeItem> = homeSemaphore.withPermit {
+            // If the provider was in the master payload, return it instantly!
+            if (!cachedItems.isNullOrEmpty()) {
+                ReelFrenLog.d("Main/getMainPage", "⚡ INSTANT LOAD: $slug served ${cachedItems.size} items from RAM.")
+                slugOffsets[slug] = cachedItems.size
+                return mapToHomePageResponse(request.name, slug, cachedItems, hasNext = true)
+            }
+        }
+
+        // FALLBACK TO NETWORK: If it's Page 2+, or if a rare provider wasn't in the Omni-Cache
+        val currentOffset = if (isPageOne) 0 else slugOffsets[slug] ?: ((page - 1) * 20)
+        ReelFrenLog.d("Main/getMainPage", "🌐 NETWORK LOAD: page=$page offset=$currentOffset slug=$slug")
+
+        val items = homeSemaphore.withPermit {
             ReelFrenClient.home(slug, page = page, offset = currentOffset)
         }
         
@@ -71,18 +109,21 @@ class ReelFrenProvider : MainAPI() {
         }
 
         slugOffsets[slug] = currentOffset + items.size
+        return mapToHomePageResponse(request.name, slug, items, hasNext = true)
+    }
 
+    // Helper function to keep code clean
+    private fun mapToHomePageResponse(name: String, fallbackSlug: String, items: List<HomeItem>, hasNext: Boolean): HomePageResponse {
         val mapped = items.mapNotNull { item ->
             if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
-            val actualSlug = item.provider.ifEmpty { slug }
+            val actualSlug = item.provider.ifEmpty { fallbackSlug }
             newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
                 this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
                 this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
             }
-        }
+        }.distinctBy { it.url }
         
-        ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=${items.size} added=${mapped.size} hasNext=true")
-        return newHomePageResponse(request.name, mapped, hasNext = true)
+        return newHomePageResponse(name, mapped, hasNext = hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse>? {
