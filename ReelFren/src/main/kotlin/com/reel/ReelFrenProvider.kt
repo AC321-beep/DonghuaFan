@@ -28,6 +28,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeout
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 class ReelFrenProvider : MainAPI() {
     override var name = "ReelFren"
@@ -47,8 +48,9 @@ class ReelFrenProvider : MainAPI() {
 
         private val bgSearchScope = CoroutineScope(Dispatchers.IO)
         private val homeSemaphore = Semaphore(3)
+        private val slugOffsets = ConcurrentHashMap<String, Int>() // RESTORED
         
-        // Omni-Fetch Cache (No more slugOffsets needed)
+        // Omni-Fetch Cache
         private val omniMutex = Mutex()
         private var omniCache: Map<String, List<HomeItem>> = emptyMap()
         private var masterCacheList: List<HomeItem> = emptyList()
@@ -67,6 +69,7 @@ class ReelFrenProvider : MainAPI() {
         val isPageOne = page <= 1
 
         if (isPageOne) {
+            slugOffsets.remove(slug) // Reset tracking on refresh
             val now = System.currentTimeMillis()
 
             val cachedItems = omniMutex.withLock {
@@ -84,21 +87,26 @@ class ReelFrenProvider : MainAPI() {
 
             if (!cachedItems.isNullOrEmpty()) {
                 ReelFrenLog.d("Main/getMainPage", "INSTANT LOAD: $slug served ${cachedItems.size} items from RAM.")
+                slugOffsets[slug] = cachedItems.size // Track exact offset served from RAM
                 return mapToHomePageResponse(request.name, slug, cachedItems, hasNext = true)
             }
         }
 
-        ReelFrenLog.d("Main/getMainPage", "NETWORK LOAD: page=$page slug=$slug")
+        // Calculate dynamic offset based on actual items received so far
+        val currentOffset = if (isPageOne) 0 else slugOffsets[slug] ?: ((page - 1) * 20)
+        ReelFrenLog.d("Main/getMainPage", "NETWORK LOAD: page=$page offset=$currentOffset slug=$slug")
 
         val items = homeSemaphore.withPermit {
-            ReelFrenClient.home(slug, page = page)
+            ReelFrenClient.home(slug, page = page, offset = currentOffset)
         }
 
         if (items.isEmpty()) {
+            slugOffsets.remove(slug)
             ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=0 added=0 hasNext=false")
             return newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
 
+        slugOffsets[slug] = currentOffset + items.size // Update tracker for next page
         return mapToHomePageResponse(request.name, slug, items, hasNext = true)
     }
 
@@ -129,10 +137,10 @@ class ReelFrenProvider : MainAPI() {
                 }
             }
         }
-
         return newHomePageResponse(name, mapped, hasNext = hasNext)
     }
 
+    // ... search, load, loadLinks remain perfectly unchanged (they were working flawlessly) ...
     override suspend fun search(query: String): List<SearchResponse>? {
         val cleanQuery = query.trim()
         if (cleanQuery.isEmpty()) return emptyList()
@@ -197,7 +205,6 @@ class ReelFrenProvider : MainAPI() {
             val allResults = (distinctFast + secondaryResults).distinctBy { it.url }
             if (cachedSearchQuery == cleanQuery) cachedSearchResults = allResults
         }
-
         return distinctFast
     }
 
@@ -264,7 +271,6 @@ class ReelFrenProvider : MainAPI() {
                 found
             }
         }
-
         jobs.awaitAll().any { it }
     }
 }
