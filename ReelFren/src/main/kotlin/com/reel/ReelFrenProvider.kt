@@ -109,20 +109,37 @@ class ReelFrenProvider : MainAPI() {
         return mapToHomePageResponse(request.name, slug, items, hasNext = true)
     }
 
-    private fun mapToHomePageResponse(
+   private fun mapToHomePageResponse(
         name: String,
         fallbackSlug: String,
         items: List<HomeItem>,
         hasNext: Boolean
     ): HomePageResponse {
+        // [FIX] Removed .distinctBy{} entirely. ReelFren API handles uniqueness.
         val mapped = items.mapNotNull { item ->
             if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
-            val actualSlug = item.provider.ifEmpty { fallbackSlug }
-            newMovieSearchResponse(item.title, ReelFrenUrl.page(actualSlug, item.id), TvType.AsianDrama) {
-                this.posterUrl = ReelFrenClient.absUrl(item.cover).takeIf { it.isNotBlank() }
-                this.posterHeaders = ReelFrenClient.posterHeaders(this.posterUrl)
+            
+            // Fast string builder instead of Regex
+            val actualSlug = if (item.provider.isNotEmpty()) item.provider else fallbackSlug
+            val pageUrl = "${ReelFrenConfig.REEL_SITE}/drama/$actualSlug/${item.id}"
+            
+            newMovieSearchResponse(item.title, pageUrl, TvType.AsianDrama) {
+                // Only call absUrl if cover is valid
+                val rawCover = item.cover.trim()
+                if (rawCover.isNotEmpty()) {
+                    val finalCover = if (rawCover.startsWith("http", ignoreCase = true)) rawCover else ReelFrenClient.absUrl(rawCover)
+                    this.posterUrl = finalCover
+                    // Prevent memory allocation for headers unless absolutely necessary
+                    if (finalCover.contains("volcengine-forward")) {
+                        this.posterHeaders = mapOf(
+                            "User-Agent" to ReelFrenClient.GLOBAL_MOBILE_UA,
+                            "Referer" to "https://volcengine-forward.storyreel.life/",
+                            "Origin" to "https://volcengine-forward.storyreel.life"
+                        )
+                    }
+                }
             }
-        }.distinctBy { it.url }
+        }
 
         return newHomePageResponse(name, mapped, hasNext = hasNext)
     }
