@@ -48,8 +48,13 @@ class ReelFrenProvider : MainAPI() {
 
         private val bgSearchScope = CoroutineScope(Dispatchers.IO)
         private val homeSemaphore = Semaphore(4)
-        private val slugOffsets = ConcurrentHashMap<String, Int>() // Essential for tracking dynamic pagination
-        
+        private const val PAGE_SIZE = 20
+        private const val DIRECT_MODE_THRESHOLD = 5
+
+        private val slugOffsets = ConcurrentHashMap<String, Int>()
+        private val seenIdsBySlug = ConcurrentHashMap<String, MutableSet<String>>()
+        private val directShelfCache = ConcurrentHashMap<String, List<HomeItem>>()
+
         // Omni-Fetch Cache
         private val omniMutex = Mutex()
         private var omniCache: Map<String, List<HomeItem>> = emptyMap()
@@ -67,12 +72,57 @@ class ReelFrenProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
         val slug = request.data
         val isPageOne = page <= 1
+        val useDirectMode = ReelFrenStore.enabledProviders().size <= DIRECT_MODE_THRESHOLD
 
         if (isPageOne) {
-            slugOffsets.remove(slug) // Reset tracking on refresh/tab switch
-            val now = System.currentTimeMillis()
+            slugOffsets.remove(slug)
+            seenIdsBySlug.remove(slug)
+            directShelfCache.remove(slug)
+        }
 
-            val cachedItems = omniMutex.withLock {
+        val seenSet = seenIdsBySlug.computeIfAbsent(slug) { ConcurrentHashMap.newKeySet() }
+
+        // ------------------------------------------------------------------
+        // MODE A: Direct Per-Provider Fetching (<= 5 enabled providers)
+        // ------------------------------------------------------------------
+        if (useDirectMode) {
+            if (isPageOne) {
+                val items = homeSemaphore.withPermit {
+                    delay((80L..220L).random())
+                    ReelFrenClient.home(slug, page = 1, offset = 0)
+                }
+
+                if (items.isEmpty()) {
+                    ReelFrenLog.d("Main/Direct", "slug=$slug raw=0 hasNext=false")
+                    return newHomePageResponse(request.name, emptyList(), hasNext = false)
+                }
+
+                seenSet.addAll(items.map { it.id })
+                slugOffsets[slug] = items.size
+
+                if (items.size > PAGE_SIZE) {
+                    directShelfCache[slug] = items
+                    val firstSlice = items.subList(0, PAGE_SIZE).toList()
+                    ReelFrenLog.d("Main/Direct", "slug=$slug cached ${items.size} items, serving first $PAGE_SIZE.")
+                    return mapToHomePageResponse(request.name, slug, firstSlice, hasNext = true)
+                }
+
+                ReelFrenLog.d("Main/Direct", "slug=$slug served ${items.size} items directly.")
+                return mapToHomePageResponse(request.name, slug, items, hasNext = true)
+            }
+
+            val cachedDirect = directShelfCache[slug].orEmpty()
+            val startIndex = (page - 1) * PAGE_SIZE
+            if (cachedDirect.isNotEmpty() && startIndex < cachedDirect.size) {
+                val slice = cachedDirect.subList(startIndex, minOf(startIndex + PAGE_SIZE, cachedDirect.size)).toList()
+                return mapToHomePageResponse(request.name, slug, slice, hasNext = true)
+            }
+        } else {
+            // --------------------------------------------------------------
+            // MODE B: Omni-Cache (> 5 enabled providers)
+            // --------------------------------------------------------------
+            val now = System.currentTimeMillis()
+            omniMutex.withLock {
                 if (now - omniCacheTime > OMNI_EXPIRY_MS || omniCache.isEmpty()) {
                     ReelFrenLog.d("Main/Omni", "Omni-Cache empty/expired. Fetching master payload...")
                     val masterList = ReelFrenClient.home("all_dramas", page = 1)
@@ -82,33 +132,47 @@ class ReelFrenProvider : MainAPI() {
                         omniCacheTime = now
                     }
                 }
-                if (slug == "all_dramas") masterCacheList else omniCache[slug.lowercase(Locale.ROOT)]
             }
 
-            if (!cachedItems.isNullOrEmpty()) {
-                ReelFrenLog.d("Main/getMainPage", "INSTANT LOAD: $slug served ${cachedItems.size} items from RAM.")
-                slugOffsets[slug] = cachedItems.size // Track the exact offset served from RAM
-                return mapToHomePageResponse(request.name, slug, cachedItems, hasNext = true)
+            val fullRamList = if (slug == "all_dramas") masterCacheList else omniCache[slug.lowercase(Locale.ROOT)].orEmpty()
+            val startIndex = (page - 1) * PAGE_SIZE
+
+            if (fullRamList.isNotEmpty() && startIndex < fullRamList.size) {
+                val chunk = fullRamList.subList(startIndex, minOf(startIndex + PAGE_SIZE, fullRamList.size)).toList()
+                seenSet.addAll(chunk.map { it.id })
+                slugOffsets[slug] = startIndex + chunk.size
+                ReelFrenLog.d("Main/Omni", "RAM LOAD: $slug page=$page served ${chunk.size} items (idx=$startIndex).")
+                return mapToHomePageResponse(request.name, slug, chunk, hasNext = true)
             }
         }
 
-        // Calculate dynamic offset based on actual items received so far
-        val currentOffset = if (isPageOne) 0 else slugOffsets[slug] ?: ((page - 1) * 20)
-        ReelFrenLog.d("Main/getMainPage", "NETWORK LOAD: page=$page offset=$currentOffset slug=$slug")
+        // ------------------------------------------------------------------
+        // SHARED NETWORK PAGINATION
+        // ------------------------------------------------------------------
+        var currentOffset = slugOffsets[slug] ?: ((page - 1) * PAGE_SIZE)
 
-        val items = homeSemaphore.withPermit {
-            ReelFrenClient.home(slug, page = page, offset = currentOffset)
+        for (attempt in 0..1) {
+            ReelFrenLog.d("Main/Net", "NETWORK LOAD: page=$page offset=$currentOffset slug=$slug (attempt=${attempt + 1})")
+            val rawItems = homeSemaphore.withPermit {
+                ReelFrenClient.home(slug, page = page, offset = currentOffset)
+            }
+
+            if (rawItems.isEmpty()) {
+                slugOffsets.remove(slug)
+                ReelFrenLog.d("Main/Net", "slug=$slug raw=0 hasNext=false")
+                return newHomePageResponse(request.name, emptyList(), hasNext = false)
+            }
+
+            currentOffset += rawItems.size
+            slugOffsets[slug] = currentOffset
+
+            val freshItems = rawItems.filter { seenSet.add(it.id) }
+            if (freshItems.isNotEmpty()) {
+                return mapToHomePageResponse(request.name, slug, freshItems, hasNext = true)
+            }
         }
 
-        if (items.isEmpty()) {
-            slugOffsets.remove(slug)
-            ReelFrenLog.d("Main/getMainPage", "slug=$slug raw=0 added=0 hasNext=false")
-            return newHomePageResponse(request.name, emptyList(), hasNext = false)
-        }
-
-        // Update tracking for the next page fetch
-        slugOffsets[slug] = currentOffset + items.size 
-        return mapToHomePageResponse(request.name, slug, items, hasNext = true)
+        return newHomePageResponse(request.name, emptyList(), hasNext = false)
     }
 
     private fun mapToHomePageResponse(
@@ -117,25 +181,18 @@ class ReelFrenProvider : MainAPI() {
         items: List<HomeItem>,
         hasNext: Boolean
     ): HomePageResponse {
-        // Optimized URL building without regex or distinctBy to prevent UI thread stutter
         val mapped = items.mapNotNull { item ->
             if (item.id.isEmpty() || item.title.isEmpty()) return@mapNotNull null
-            
+
             val actualSlug = if (item.provider.isNotEmpty()) item.provider else fallbackSlug
             val pageUrl = "${ReelFrenConfig.REEL_SITE}/drama/$actualSlug/${item.id}"
-            
+
             newMovieSearchResponse(item.title, pageUrl, TvType.AsianDrama) {
                 val rawCover = item.cover.trim()
                 if (rawCover.isNotEmpty()) {
                     val finalCover = if (rawCover.startsWith("http", ignoreCase = true)) rawCover else ReelFrenClient.absUrl(rawCover)
                     this.posterUrl = finalCover
-                    if (finalCover.contains("volcengine-forward")) {
-                        this.posterHeaders = mapOf(
-                            "User-Agent" to ReelFrenClient.GLOBAL_MOBILE_UA,
-                            "Referer" to "https://volcengine-forward.storyreel.life/",
-                            "Origin" to "https://volcengine-forward.storyreel.life"
-                        )
-                    }
+                    this.posterHeaders = ReelFrenClient.posterHeaders(finalCover)
                 }
             }
         }
