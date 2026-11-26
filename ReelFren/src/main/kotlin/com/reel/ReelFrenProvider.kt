@@ -82,9 +82,6 @@ class ReelFrenProvider : MainAPI() {
 
         val seenSet = seenIdsBySlug.computeIfAbsent(slug) { ConcurrentHashMap.newKeySet() }
 
-        // ------------------------------------------------------------------
-        // MODE A: Direct Per-Provider Fetching (<= 5 enabled providers)
-        // ------------------------------------------------------------------
         if (useDirectMode) {
             if (isPageOne) {
                 val items = homeSemaphore.withPermit {
@@ -93,7 +90,6 @@ class ReelFrenProvider : MainAPI() {
                 }
 
                 if (items.isEmpty()) {
-                    ReelFrenLog.d("Main/Direct", "slug=$slug raw=0 hasNext=false")
                     return newHomePageResponse(request.name, emptyList(), hasNext = false)
                 }
 
@@ -103,11 +99,9 @@ class ReelFrenProvider : MainAPI() {
                 if (items.size > PAGE_SIZE) {
                     directShelfCache[slug] = items
                     val firstSlice = items.subList(0, PAGE_SIZE).toList()
-                    ReelFrenLog.d("Main/Direct", "slug=$slug cached ${items.size} items, serving first $PAGE_SIZE.")
                     return mapToHomePageResponse(request.name, slug, firstSlice, hasNext = true)
                 }
 
-                ReelFrenLog.d("Main/Direct", "slug=$slug served ${items.size} items directly.")
                 return mapToHomePageResponse(request.name, slug, items, hasNext = true)
             }
 
@@ -118,13 +112,9 @@ class ReelFrenProvider : MainAPI() {
                 return mapToHomePageResponse(request.name, slug, slice, hasNext = true)
             }
         } else {
-            // --------------------------------------------------------------
-            // MODE B: Omni-Cache (> 5 enabled providers)
-            // --------------------------------------------------------------
             val now = System.currentTimeMillis()
             omniMutex.withLock {
                 if (now - omniCacheTime > OMNI_EXPIRY_MS || omniCache.isEmpty()) {
-                    ReelFrenLog.d("Main/Omni", "Omni-Cache empty/expired. Fetching master payload...")
                     val masterList = ReelFrenClient.home("all_dramas", page = 1)
                     if (masterList.isNotEmpty()) {
                         omniCache = masterList.groupBy { it.provider.lowercase(Locale.ROOT) }
@@ -141,25 +131,19 @@ class ReelFrenProvider : MainAPI() {
                 val chunk = fullRamList.subList(startIndex, minOf(startIndex + PAGE_SIZE, fullRamList.size)).toList()
                 seenSet.addAll(chunk.map { it.id })
                 slugOffsets[slug] = startIndex + chunk.size
-                ReelFrenLog.d("Main/Omni", "RAM LOAD: $slug page=$page served ${chunk.size} items (idx=$startIndex).")
                 return mapToHomePageResponse(request.name, slug, chunk, hasNext = true)
             }
         }
 
-        // ------------------------------------------------------------------
-        // SHARED NETWORK PAGINATION
-        // ------------------------------------------------------------------
         var currentOffset = slugOffsets[slug] ?: ((page - 1) * PAGE_SIZE)
 
         for (attempt in 0..1) {
-            ReelFrenLog.d("Main/Net", "NETWORK LOAD: page=$page offset=$currentOffset slug=$slug (attempt=${attempt + 1})")
             val rawItems = homeSemaphore.withPermit {
                 ReelFrenClient.home(slug, page = page, offset = currentOffset)
             }
 
             if (rawItems.isEmpty()) {
                 slugOffsets.remove(slug)
-                ReelFrenLog.d("Main/Net", "slug=$slug raw=0 hasNext=false")
                 return newHomePageResponse(request.name, emptyList(), hasNext = false)
             }
 
@@ -303,8 +287,11 @@ class ReelFrenProvider : MainAPI() {
         val (slug, id, ep) = ReelFrenUrl.parse(data)
         if (id.isEmpty() || slug.isEmpty()) return@coroutineScope false
 
-        val jobs = listOf(1, 2, 3).map { serverId ->
+        // Stagger requests to bypass the 502 Rate Limiter ban
+        val jobs = listOf(1, 2, 3).mapIndexed { index, serverId ->
             async {
+                if (index > 0) delay(index * 400L)
+
                 val p = runCatching { ReelFrenClient.playback(slug, id, ep, serverId) }.getOrNull() ?: return@async false
                 var found = false
 
