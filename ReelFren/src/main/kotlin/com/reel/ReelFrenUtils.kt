@@ -436,13 +436,16 @@ object ReelFrenClient {
 
         if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
-        ReelFrenLog.d("Client.get", "Falling back to CF Mutex...")
+      ReelFrenLog.d("Client.get", "Falling back to CF Mutex...")
         apiMutex.withLock {
             responseText = try { spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { "" }
 
             if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
-            if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE)) {
+            // [FIX] Grab the poisoned cookie and pass it to the solver so it forces a fresh solve
+            val poisonedCookie = ReelFrenStore.cookie(targetHost)
+            
+            if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE, invalidatedCookie = poisonedCookie)) {
                 ReelFrenLog.d("Client.get", "CF Solve returned false.")
                 return null
             }
