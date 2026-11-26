@@ -9,12 +9,15 @@ import com.lagradost.cloudstream3.plugins.Plugin
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @CloudstreamPlugin
 class ReelFrenPlugin : Plugin() {
     override fun load(context: Context) {
+        // Initialize the Store (SharedPreferences & UAs)
         ReelFrenStore.init(context)
         
+        // Register the provider exactly once on boot
         registerMainAPI(ReelFrenProvider())
 
         openSettings = {
@@ -72,10 +75,8 @@ class ReelFrenPlugin : Plugin() {
                                 if (changed) {
                                     editor.apply()
                                     
-                                    // Update backend mapping in memory
-                                    registerMainAPI(ReelFrenProvider()) 
-                                    
-                                    // Let the user safely reload the page themselves
+                                    // [FIX] Removed registerMainAPI() here to prevent UI duplication.
+                                    // ReelFrenProvider uses `get() =` so changes apply automatically.
                                     Toast.makeText(activity, "Settings saved! Please reload the Home Page.", Toast.LENGTH_LONG).show()
                                 }
                             }
@@ -83,14 +84,17 @@ class ReelFrenPlugin : Plugin() {
                         .setNegativeButton("Cancel", null)
                         .setNeutralButton("Clear Cookies") { _, _ ->
                             CoroutineScope(Dispatchers.IO).launch {
+                                // 1. Wipe WebView Cookies
                                 android.webkit.CookieManager.getInstance().removeAllCookies(null)
                                 android.webkit.CookieManager.getInstance().flush()
                                 
+                                // 2. Wipe persistent SharedPreferences for the plugin
                                 val prefs = context.getSharedPreferences("reelfren_store", Context.MODE_PRIVATE)
                                 prefs.edit().clear().apply()
                                 
-                                CoroutineScope(Dispatchers.Main).launch {
-                                    Toast.makeText(activity, "Cookies and CF Clearance cleared.", Toast.LENGTH_SHORT).show()
+                                // 3. Notify user on Main thread
+                                withContext(Dispatchers.Main) {
+                                    Toast.makeText(activity, "Cookies and CF Clearance cleared. Please restart the app.", Toast.LENGTH_LONG).show()
                                 }
                             }
                         }
