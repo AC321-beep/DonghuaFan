@@ -5,7 +5,6 @@ import android.content.SharedPreferences
 import android.util.Base64
 import android.util.Log
 import android.webkit.CookieManager
-import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
@@ -448,8 +447,11 @@ object ReelFrenClient {
             ReelFrenLog.d("Client.get", "OkHttp EXCEPTION on fast-path: ${e.message}")
         }
 
+        // GRACEFUL DEGRADATION: Do not throw an exception on 502!
+        // Returning "" allows home() to fall back to the HTML scraper.
         if (isApiCall && statusCode in 502..504) {
-            throw ErrorLoadingException("Upstream server error (HTTP $statusCode)")
+            ReelFrenLog.d("Client.get", "API $statusCode on $url. Falling back.")
+            return ""
         }
 
         if (isApiCall && isVersionError(responseText) && url.contains("cv=")) {
@@ -460,7 +462,7 @@ object ReelFrenClient {
                 statusCode = retryCode
                 responseText = retryText
             } catch (ce: CancellationException) { throw ce } catch (_: Exception) {}
-            if (isApiCall && statusCode in 502..504) throw ErrorLoadingException("Upstream server error (HTTP $statusCode)")
+            if (isApiCall && statusCode in 502..504) return ""
         }
 
         if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
@@ -472,7 +474,7 @@ object ReelFrenClient {
                 responseText = text
             } catch (ce: CancellationException) { throw ce } catch (_: Exception) {}
             
-            if (isApiCall && statusCode in 502..504) throw ErrorLoadingException("Upstream server error (HTTP $statusCode)")
+            if (isApiCall && statusCode in 502..504) return ""
 
             if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
 
@@ -493,7 +495,7 @@ object ReelFrenClient {
                 return ""
             }
 
-            if (isApiCall && statusCode in 502..504) throw ErrorLoadingException("Upstream server error (HTTP $statusCode)")
+            if (isApiCall && statusCode in 502..504) return ""
 
             if (responseText.isEmpty() || ReelFrenCloudflare.isChallengeResponse(responseText)) {
                 return null
@@ -544,7 +546,6 @@ object ReelFrenClient {
             val match = searchResults.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: searchResults.firstOrNull()
 
             if (match != null) {
-                // Safeguard against 0-episode movies for failed Vigloo routes
                 val epCount = if (match.episodes > 0) match.episodes else 80
                 val videos = (1..epCount).map { epNum -> 
                     VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true) 
@@ -833,7 +834,6 @@ object ReelFrenParse {
     fun detailHtml(htmlBody: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
         if (htmlBody.isBlank()) return null
         
-        // --- 1. Smart Next.js Extraction ---
         val candidates = mutableListOf<String>()
         candidates += extractAllJsonObjectsForKey(htmlBody, "detail")
         val unescaped = unescapeNextPayload(htmlBody)
@@ -848,19 +848,15 @@ object ReelFrenParse {
             }
         }
 
-        // Target best Next.js base: 1st priority is Exact ID + Episodes. 2nd is Exact ID (even 0 eps). 3rd is Any with eps. 4th is first item.
         var bestNextJs = parsedCandidates.firstOrNull { it.id.equals(fallbackId, ignoreCase = true) && it.videos.size > 1 }
         if (bestNextJs == null) bestNextJs = parsedCandidates.firstOrNull { it.id.equals(fallbackId, ignoreCase = true) }
         if (bestNextJs == null) bestNextJs = parsedCandidates.firstOrNull { it.videos.size > 1 }
         if (bestNextJs == null) bestNextJs = parsedCandidates.firstOrNull()
 
-        // If we found a perfect Next.js payload with actual episodes, return immediately!
         if (bestNextJs != null && bestNextJs.videos.size > 1) {
-            ReelFrenLog.d("Parse.detailHtml", "Matched rich Next.js detail object. Title='${bestNextJs.title}' eps=${bestNextJs.videos.size}")
             return bestNextJs
         }
 
-        // --- 2. Hunt for Missing Episode Counts via HTML/JSON-LD ---
         val epNumbers = epParamRegex.findAll(htmlBody).mapNotNull { it.groupValues.getOrNull(1)?.toIntOrNull() }.filter { it > 0 }.toMutableSet()
         val schemaMatch = schemaRegex.find(htmlBody)
         var schemaEps = 0
@@ -886,23 +882,17 @@ object ReelFrenParse {
         if (maxEp > 0) { for (n in 1..maxEp) epNumbers += n }
         val finalVideos = epNumbers.sorted().map { epNum -> VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true) }
 
-        // --- 3. Smart Merge ---
-        // If we have a valid Next.js base but it had 0 episodes, upgrade its episode list from HTML discoveries
         if (bestNextJs != null) {
-            ReelFrenLog.d("Parse.detailHtml", "Merged Next.js detail with HTML episode count. Title='${bestNextJs.title}' eps=${finalVideos.size}")
             return bestNextJs.copy(
                 episodes = maxOf(bestNextJs.episodes, finalVideos.size),
                 videos = if (finalVideos.size > bestNextJs.videos.size) finalVideos else bestNextJs.videos
             )
         }
 
-        // If no Next.js at all, rely on JSON-LD
         if (schemaTitle.isNotEmpty() && !schemaTitle.equals("ReelFren", ignoreCase = true)) {
-            ReelFrenLog.d("Parse.detailHtml", "Used JSON-LD schema fallback. Title='$schemaTitle'")
             return DetailInfo(id = fallbackId, provider = fallbackSlug, title = schemaTitle, cover = schemaCover, intro = schemaIntro, episodes = finalVideos.size, videos = finalVideos)
         }
 
-        // --- 4. Raw Regex HTML Fallback ---
         val ogTitle = ogTitleRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
         val pageTitle = titleTagRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.substringBefore("|")?.trim().orEmpty()
         val title = ogTitle.ifEmpty { pageTitle }.replace("Episode 1", "").trim()
@@ -915,7 +905,6 @@ object ReelFrenParse {
         val cover = ReelFrenClient.absUrl(rawCover)
         val intro = metaDescRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
 
-        ReelFrenLog.d("Parse.detailHtml", "Used raw Regex HTML fallback. Title='$title'")
         return DetailInfo(
             id = fallbackId,
             provider = fallbackSlug,
