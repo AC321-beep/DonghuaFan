@@ -702,7 +702,7 @@ object ReelFrenParse {
         return DetailInfo(id = id, provider = provider, title = title, cover = cover, intro = intro, episodes = episodes, videos = sortedVideos)
     }
 
-    fun playback(body: String, requestedServerId: Int): PlaybackInfo? {
+  fun playback(body: String, requestedServerId: Int): PlaybackInfo? {
         if (body.isBlank()) return null
         val root = runCatching { JSONObject(body) }.getOrNull() ?: return null
         
@@ -747,7 +747,8 @@ object ReelFrenParse {
             locked = obj2.optBoolean("locked", obj2.optBoolean("isLocked")),
             qualities = qualities,
             subtitles = subs.distinctBy { "${it.lang.lowercase(Locale.ROOT)}|${it.url}" },
-            server = clean(obj2, "sourceServer").ifEmpty { requestedServerId.toString() }
+            // FIX: Ignore the API's hardcoded "1" and force it to the ID we requested
+            server = requestedServerId.toString()
         )
     }
 
