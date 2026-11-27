@@ -110,7 +110,6 @@ class ReelFrenProvider : MainAPI() {
             }
         }
 
-        // Exact decompiled pagination format (offset = page - 1 is handled in ReelFrenClient)
         val networkItems = homeSemaphore.withPermit {
             ReelFrenClient.home(slug, page)
         }
@@ -219,7 +218,6 @@ class ReelFrenProvider : MainAPI() {
         val (slug, id, _) = ReelFrenUrl.parse(url)
         if (id.isEmpty() || slug.isEmpty()) throw ErrorLoadingException("Invalid URL or missing ID")
         
-        // Native JSON Detail Fetch
         val d: DetailInfo = ReelFrenClient.detail(slug, id) ?: throw ErrorLoadingException("Failed to load detail")
         val coverUrl = ReelFrenClient.absUrl(d.cover).takeIf { it.isNotBlank() }
 
