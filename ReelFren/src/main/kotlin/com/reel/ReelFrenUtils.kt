@@ -335,7 +335,6 @@ object ReelFrenClient {
     }
 
     fun videoUrl(slug: String, id: String, ep: Int, server: Int = 1): String {
-        // ALWAYS append cv to Video URLs to prevent backend extraction failures
         return "${apiBase()}/api/video?provider=${query(slug)}&id=${query(id)}&ep=$ep&lang=en&server=$server&cv=$currentApiVersion"
     }
 
@@ -385,7 +384,6 @@ object ReelFrenClient {
         map["Accept"] = "*/*"
         map["Connection"] = "keep-alive"
 
-        // Strip Origin/Referer for raw storage buckets to bypass 403 blocks in ExoPlayer
         if (targetHost.contains("aliyuncs.com") || targetHost.contains("tiktokcdn.com") || targetHost.contains("amazonaws.com")) {
             return map
         }
@@ -540,15 +538,13 @@ object ReelFrenClient {
 
         var parsed = if (!is404) ReelFrenParse.detailHtml(htmlStr!!, slug, id) else null
 
-        // FALLBACK: Prevent Vigloo and other 404ing URLs from breaking details or manifesting as Movies
         if (parsed == null || parsed.title.isEmpty() || parsed.episodes == 0) {
-            ReelFrenLog.d("Client.detail", "Direct detail failed (404 or empty episodes). Attempting search fallback for ID: $id")
+            ReelFrenLog.d("Client.detail", "Direct detail failed (404 or missing episodes). Attempting search fallback for ID: $id")
             val searchResults = search(slug, id)
-            val match = searchResults.firstOrNull { it.id.equals(id, ignoreCase = true) } 
-                        ?: searchResults.firstOrNull()
+            val match = searchResults.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: searchResults.firstOrNull()
 
             if (match != null) {
-                // Hard-stop Vigloo from behaving like a Movie by forcing a minimum of 80 episodes
+                // Safeguard against 0-episode movies for failed Vigloo routes
                 val epCount = if (match.episodes > 0) match.episodes else 80
                 val videos = (1..epCount).map { epNum -> 
                     VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true) 
@@ -600,7 +596,6 @@ object ReelFrenParse {
     private val ogImageRegex = Regex("""<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
     private val metaDescRegex = Regex("""<meta[^>]*(?:name=["']description["']|property=["']og:description["'])[^>]+content=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
     private val chipEpRegex = Regex("""(\d+)(?:<!-- -->)?\s*Episode""", RegexOption.IGNORE_CASE)
-    private val schemaEpCountRegex = Regex(""""numberOfEpisodes"\s*:\s*(\d+)""")
     private val nextJsEpCountRegex = Regex(""""episodes"\s*:\s*(\d+)""")
     private val totalEpCountRegex = Regex(""""totalEpisodes"\s*:\s*(\d+)""")
 
@@ -673,20 +668,8 @@ object ReelFrenParse {
 
             if (id.isEmpty() || title.isEmpty()) null
             else {
-                // Aggressive episode extraction
-                val epCount = o.optInt("episodes").takeIf { it > 0 }
-                    ?: o.optInt("totalEpisodes").takeIf { it > 0 }
-                    ?: o.optInt("episodeCount").takeIf { it > 0 }
-                    ?: 0
-
-                HomeItem(
-                    id = id,
-                    provider = clean(o, "provider"),
-                    title = title,
-                    cover = ReelFrenClient.absUrl(clean(o, "cover").ifEmpty { clean(o, "poster") }),
-                    intro = clean(o, "intro"),
-                    episodes = epCount
-                )
+                val epCount = o.optInt("episodes").takeIf { it > 0 } ?: o.optInt("totalEpisodes").takeIf { it > 0 } ?: o.optInt("episodeCount").takeIf { it > 0 } ?: 0
+                HomeItem(id = id, provider = clean(o, "provider"), title = title, cover = ReelFrenClient.absUrl(clean(o, "cover").ifEmpty { clean(o, "poster") }), intro = clean(o, "intro"), episodes = epCount)
             }
         }
     }
@@ -705,19 +688,8 @@ object ReelFrenParse {
             if (requestedSlug.isNotEmpty() && requestedSlug != "all_dramas" && provider.isNotEmpty() && provider != requestedSlug) continue
 
             if (id.isNotEmpty() && title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
-                val epCount = o.optInt("episodes").takeIf { it > 0 }
-                    ?: o.optInt("totalEpisodes").takeIf { it > 0 }
-                    ?: o.optInt("episodeCount").takeIf { it > 0 }
-                    ?: 0
-
-                results += HomeItem(
-                    id = id,
-                    provider = provider.ifEmpty { requestedSlug },
-                    title = title,
-                    cover = ReelFrenClient.absUrl(clean(o, "cover").ifEmpty { clean(o, "poster") }),
-                    intro = clean(o, "intro"),
-                    episodes = epCount
-                )
+                val epCount = o.optInt("episodes").takeIf { it > 0 } ?: o.optInt("totalEpisodes").takeIf { it > 0 } ?: o.optInt("episodeCount").takeIf { it > 0 } ?: 0
+                results += HomeItem(id = id, provider = provider.ifEmpty { requestedSlug }, title = title, cover = ReelFrenClient.absUrl(clean(o, "cover").ifEmpty { clean(o, "poster") }), intro = clean(o, "intro"), episodes = epCount)
             }
         }
         return results.distinctBy { it.id }
@@ -737,19 +709,8 @@ object ReelFrenParse {
             if (requestedSlug.isNotEmpty() && requestedSlug != "all_dramas" && provider.isNotEmpty() && provider != requestedSlug) continue
 
             if (id.isNotEmpty() && title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
-                val epCount = o.optInt("episodes").takeIf { it > 0 }
-                    ?: o.optInt("totalEpisodes").takeIf { it > 0 }
-                    ?: o.optInt("episodeCount").takeIf { it > 0 }
-                    ?: 0
-
-                results.add(HomeItem(
-                    id = id,
-                    provider = provider.ifEmpty { requestedSlug },
-                    title = title,
-                    cover = ReelFrenClient.absUrl(clean(o, "cover").ifEmpty { clean(o, "poster") }),
-                    intro = clean(o, "intro"),
-                    episodes = epCount
-                ))
+                val epCount = o.optInt("episodes").takeIf { it > 0 } ?: o.optInt("totalEpisodes").takeIf { it > 0 } ?: o.optInt("episodeCount").takeIf { it > 0 } ?: 0
+                results.add(HomeItem(id = id, provider = provider.ifEmpty { requestedSlug }, title = title, cover = ReelFrenClient.absUrl(clean(o, "cover").ifEmpty { clean(o, "poster") }), intro = clean(o, "intro"), episodes = epCount))
             }
         }
 
@@ -786,12 +747,7 @@ object ReelFrenParse {
                 val v = arr.optJSONObject(i) ?: continue
                 val epNum = v.optInt("episode", v.optInt("ep", i + 1)).takeIf { it > 0 } ?: (i + 1)
                 val vid = clean(v, "vid").ifEmpty { clean(v, "id") }.ifEmpty { clean(v, "videoId") }.ifEmpty { "ep_$epNum" }
-                videos += VideoEntry(
-                    episode = epNum,
-                    duration = v.optInt("duration", v.optInt("length")),
-                    vid = vid,
-                    available = v.optBoolean("available", v.optBoolean("is_free", true))
-                )
+                videos += VideoEntry(episode = epNum, duration = v.optInt("duration", v.optInt("length")), vid = vid, available = v.optBoolean("available", v.optBoolean("is_free", true)))
             }
         }
 
@@ -804,15 +760,7 @@ object ReelFrenParse {
             }
         }
 
-        return DetailInfo(
-            id = id,
-            provider = provider,
-            title = title,
-            cover = cover,
-            intro = intro,
-            episodes = if (totalEps > 0) totalEps else videos.size,
-            videos = videos.distinctBy { it.episode }.sortedBy { it.episode }
-        )
+        return DetailInfo(id = id, provider = provider, title = title, cover = cover, intro = intro, episodes = if (totalEps > 0) totalEps else videos.size, videos = videos.distinctBy { it.episode }.sortedBy { it.episode })
     }
 
     private fun extractAllJsonObjectsForKey(source: String, key: String): List<String> {
@@ -869,11 +817,7 @@ object ReelFrenParse {
                     'u' -> {
                         if (i + 5 < raw.length) {
                             val hex = raw.substring(i + 2, i + 6).toIntOrNull(16)
-                            if (hex != null) {
-                                sb.append(hex.toChar())
-                                i += 6
-                                continue
-                            }
+                            if (hex != null) { sb.append(hex.toChar()); i += 6; continue }
                         }
                         sb.append(ch); i++
                     }
@@ -889,6 +833,7 @@ object ReelFrenParse {
     fun detailHtml(htmlBody: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
         if (htmlBody.isBlank()) return null
         
+        // --- 1. Smart Next.js Extraction ---
         val candidates = mutableListOf<String>()
         candidates += extractAllJsonObjectsForKey(htmlBody, "detail")
         val unescaped = unescapeNextPayload(htmlBody)
@@ -903,33 +848,61 @@ object ReelFrenParse {
             }
         }
 
-        parsedCandidates.firstOrNull { it.id.equals(fallbackId, ignoreCase = true) }?.let { matched ->
-            return matched
-        }
-        parsedCandidates.firstOrNull()?.let { fallbackCandidate ->
-            return fallbackCandidate
+        // Target best Next.js base: 1st priority is Exact ID + Episodes. 2nd is Exact ID (even 0 eps). 3rd is Any with eps. 4th is first item.
+        var bestNextJs = parsedCandidates.firstOrNull { it.id.equals(fallbackId, ignoreCase = true) && it.videos.size > 1 }
+        if (bestNextJs == null) bestNextJs = parsedCandidates.firstOrNull { it.id.equals(fallbackId, ignoreCase = true) }
+        if (bestNextJs == null) bestNextJs = parsedCandidates.firstOrNull { it.videos.size > 1 }
+        if (bestNextJs == null) bestNextJs = parsedCandidates.firstOrNull()
+
+        // If we found a perfect Next.js payload with actual episodes, return immediately!
+        if (bestNextJs != null && bestNextJs.videos.size > 1) {
+            ReelFrenLog.d("Parse.detailHtml", "Matched rich Next.js detail object. Title='${bestNextJs.title}' eps=${bestNextJs.videos.size}")
+            return bestNextJs
         }
 
+        // --- 2. Hunt for Missing Episode Counts via HTML/JSON-LD ---
+        val epNumbers = epParamRegex.findAll(htmlBody).mapNotNull { it.groupValues.getOrNull(1)?.toIntOrNull() }.filter { it > 0 }.toMutableSet()
         val schemaMatch = schemaRegex.find(htmlBody)
+        var schemaEps = 0
+        var schemaTitle = ""
+        var schemaCover = ""
+        var schemaIntro = ""
+
         if (schemaMatch != null) {
             val schemaObj = runCatching { JSONObject(schemaMatch.groupValues[1]) }.getOrNull()
             if (schemaObj != null) {
-                val title = clean(schemaObj, "name").replace("Episode 1", "").trim()
-                if (title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
-                    val cover = ReelFrenClient.absUrl(clean(schemaObj, "image"))
-                    val intro = clean(schemaObj, "description").replace(Regex("""Watch Now: .*? as a free short drama on ReelFren."""), "").trim()
-
-                    val epNumbers = epParamRegex.findAll(htmlBody).mapNotNull { it.groupValues.getOrNull(1)?.toIntOrNull() }.filter { it > 0 }.toMutableSet()
-                    val schemaEps = schemaObj.optInt("numberOfEpisodes", 0)
-                    val maxEp = maxOf(schemaEps, epNumbers.maxOrNull() ?: 0)
-                    if (maxEp > 0) { for (n in 1..maxEp) epNumbers += n }
-
-                    val videos = epNumbers.sorted().map { epNum -> VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true) }
-                    return DetailInfo(id = fallbackId, provider = fallbackSlug, title = title, cover = cover, intro = intro, episodes = maxOf(maxEp, videos.size), videos = videos)
-                }
+                schemaEps = schemaObj.optInt("numberOfEpisodes", 0)
+                schemaTitle = clean(schemaObj, "name").replace("Episode 1", "").trim()
+                schemaCover = ReelFrenClient.absUrl(clean(schemaObj, "image"))
+                schemaIntro = clean(schemaObj, "description").replace(Regex("""Watch Now: .*? as a free short drama on ReelFren."""), "").trim()
             }
         }
 
+        val chipEps = chipEpRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        val nextJsEps = nextJsEpCountRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+        val nestedEps = totalEpCountRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
+
+        val maxEp = maxOf(schemaEps, chipEps, nextJsEps, nestedEps, epNumbers.maxOrNull() ?: 0)
+        if (maxEp > 0) { for (n in 1..maxEp) epNumbers += n }
+        val finalVideos = epNumbers.sorted().map { epNum -> VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true) }
+
+        // --- 3. Smart Merge ---
+        // If we have a valid Next.js base but it had 0 episodes, upgrade its episode list from HTML discoveries
+        if (bestNextJs != null) {
+            ReelFrenLog.d("Parse.detailHtml", "Merged Next.js detail with HTML episode count. Title='${bestNextJs.title}' eps=${finalVideos.size}")
+            return bestNextJs.copy(
+                episodes = maxOf(bestNextJs.episodes, finalVideos.size),
+                videos = if (finalVideos.size > bestNextJs.videos.size) finalVideos else bestNextJs.videos
+            )
+        }
+
+        // If no Next.js at all, rely on JSON-LD
+        if (schemaTitle.isNotEmpty() && !schemaTitle.equals("ReelFren", ignoreCase = true)) {
+            ReelFrenLog.d("Parse.detailHtml", "Used JSON-LD schema fallback. Title='$schemaTitle'")
+            return DetailInfo(id = fallbackId, provider = fallbackSlug, title = schemaTitle, cover = schemaCover, intro = schemaIntro, episodes = finalVideos.size, videos = finalVideos)
+        }
+
+        // --- 4. Raw Regex HTML Fallback ---
         val ogTitle = ogTitleRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
         val pageTitle = titleTagRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.substringBefore("|")?.trim().orEmpty()
         val title = ogTitle.ifEmpty { pageTitle }.replace("Episode 1", "").trim()
@@ -942,25 +915,15 @@ object ReelFrenParse {
         val cover = ReelFrenClient.absUrl(rawCover)
         val intro = metaDescRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
 
-        val epNumbers = epParamRegex.findAll(htmlBody).mapNotNull { it.groupValues.getOrNull(1)?.toIntOrNull() }.filter { it > 0 }.toMutableSet()
-        val chipEps = chipEpRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-        val schemaEps = schemaEpCountRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-        val nextJsEps = nextJsEpCountRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-        val nestedEps = totalEpCountRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
-
-        val maxEp = maxOf(chipEps, schemaEps, nextJsEps, nestedEps, epNumbers.maxOrNull() ?: 0)
-        if (maxEp > 0) { for (n in 1..maxEp) epNumbers += n }
-
-        val videos = epNumbers.sorted().map { epNum -> VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true) }
-
+        ReelFrenLog.d("Parse.detailHtml", "Used raw Regex HTML fallback. Title='$title'")
         return DetailInfo(
             id = fallbackId,
             provider = fallbackSlug,
             title = title,
             cover = cover,
             intro = intro.replace(Regex("""Watch Now: .*? as a free short drama on ReelFren."""), "").trim(),
-            episodes = maxOf(maxEp, videos.size),
-            videos = videos
+            episodes = finalVideos.size,
+            videos = finalVideos
         )
     }
 
