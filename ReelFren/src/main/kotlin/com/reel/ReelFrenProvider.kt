@@ -242,7 +242,7 @@ class ReelFrenProvider : MainAPI() {
         }
     }
 
-   override suspend fun loadLinks(
+    override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -253,24 +253,18 @@ class ReelFrenProvider : MainAPI() {
 
         val jobs = listOf(1, 2, 3).mapIndexed { index, serverId ->
             async {
-                // Reduced stagger delay from 400ms to 150ms to prevent loadLinks timeout
-                if (index > 0) delay(index * 150L) 
+                if (index > 0) delay(index * 150L)
 
                 val p = runCatching { ReelFrenClient.playback(slug, id, ep, serverId) }.getOrNull() ?: return@async false
                 var found = false
 
-                ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback)
-
-               p.qualities.forEach { q ->
+                p.qualities.forEach { q ->
                     val qUrl = ReelFrenClient.absUrl(q.url)
                     if (qUrl.isNotBlank() && qUrl.startsWith("http")) {
-                        // FIX: Just use the Server ID. Cloudstream will automatically append the quality!
-                        val serverName = "Server $serverId"
-                        
                         callback(
                             com.lagradost.cloudstream3.utils.ExtractorLink(
                                 source = name,
-                                name = serverName,
+                                name = "Server $serverId",
                                 url = qUrl,
                                 referer = "${ReelFrenConfig.REEL_SITE}/",
                                 quality = ReelFrenQuality.of(q.label),
@@ -281,7 +275,13 @@ class ReelFrenProvider : MainAPI() {
                         found = true
                     }
                 }
+
+                if (found) {
+                    runCatching { ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback) }
+                }
+                found
+            }
+        }
         jobs.awaitAll().any { it }
     }
-    }
-   
+}
