@@ -261,12 +261,12 @@ class ReelFrenProvider : MainAPI() {
 
                 ReelFrenSubtitles.emit(p.subtitles, p.qualities, subtitleCallback)
 
-                p.qualities.forEach { q ->
+               p.qualities.forEach { q ->
                     val qUrl = ReelFrenClient.absUrl(q.url)
                     if (qUrl.isNotBlank() && qUrl.startsWith("http")) {
-                        // Force distinct names based on the server loop index
-                        val serverName = "Server $serverId" + if (q.label != "Auto" && q.label.isNotBlank()) " (${q.label})" else ""
-
+                        // FIX: Just use the Server ID. Cloudstream will automatically append the quality!
+                        val serverName = "Server $serverId"
+                        
                         callback(
                             com.lagradost.cloudstream3.utils.ExtractorLink(
                                 source = name,
@@ -281,9 +281,6 @@ class ReelFrenProvider : MainAPI() {
                         found = true
                     }
                 }
-                found
-            }
-        }
         jobs.awaitAll().any { it }
     }
     }
