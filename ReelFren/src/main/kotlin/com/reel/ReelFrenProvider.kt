@@ -51,10 +51,8 @@ class ReelFrenProvider : MainAPI() {
         private const val PAGE_SIZE = 20
         private const val DIRECT_MODE_THRESHOLD = 5
 
-        private val slugOffsets = ConcurrentHashMap<String, Int>()
         private val seenIdsBySlug = ConcurrentHashMap<String, MutableSet<String>>()
-        private val directShelfCache = ConcurrentHashMap<String, List<HomeItem>>()
-
+        
         // Omni-Fetch Cache
         private val omniMutex = Mutex()
         private var omniCache: Map<String, List<HomeItem>> = emptyMap()
@@ -75,43 +73,24 @@ class ReelFrenProvider : MainAPI() {
         val useDirectMode = ReelFrenStore.enabledProviders().size <= DIRECT_MODE_THRESHOLD
 
         if (isPageOne) {
-            slugOffsets.remove(slug)
             seenIdsBySlug.remove(slug)
-            directShelfCache.remove(slug)
         }
 
         val seenSet = seenIdsBySlug.computeIfAbsent(slug) { ConcurrentHashMap.newKeySet() }
 
         if (useDirectMode) {
-            if (isPageOne) {
-                val items = homeSemaphore.withPermit {
-                    delay((80L..220L).random())
-                    ReelFrenClient.home(slug, page = 1, offset = 0)
-                }
-
-                if (items.isEmpty()) {
-                    return newHomePageResponse(request.name, emptyList(), hasNext = false)
-                }
-
-                seenSet.addAll(items.map { it.id })
-                slugOffsets[slug] = items.size
-
-                if (items.size > PAGE_SIZE) {
-                    directShelfCache[slug] = items
-                    val firstSlice = items.subList(0, PAGE_SIZE).toList()
-                    return mapToHomePageResponse(request.name, slug, firstSlice, hasNext = true)
-                }
-
-                return mapToHomePageResponse(request.name, slug, items, hasNext = true)
+            val items = homeSemaphore.withPermit {
+                if (isPageOne) delay((80L..220L).random())
+                ReelFrenClient.home(slug, page)
             }
+            if (items.isEmpty()) return newHomePageResponse(request.name, emptyList(), hasNext = false)
+            
+            val freshItems = items.filter { seenSet.add(it.id) }
+            return mapToHomePageResponse(request.name, slug, freshItems, hasNext = freshItems.isNotEmpty())
+        }
 
-            val cachedDirect = directShelfCache[slug].orEmpty()
-            val startIndex = (page - 1) * PAGE_SIZE
-            if (cachedDirect.isNotEmpty() && startIndex < cachedDirect.size) {
-                val slice = cachedDirect.subList(startIndex, minOf(startIndex + PAGE_SIZE, cachedDirect.size)).toList()
-                return mapToHomePageResponse(request.name, slug, slice, hasNext = true)
-            }
-        } else {
+        // Omni-Cache for Page 1
+        if (isPageOne) {
             val now = System.currentTimeMillis()
             omniMutex.withLock {
                 if (now - omniCacheTime > OMNI_EXPIRY_MS || omniCache.isEmpty()) {
@@ -124,39 +103,24 @@ class ReelFrenProvider : MainAPI() {
                 }
             }
 
-            val fullRamList = if (slug == "all_dramas") masterCacheList else omniCache[slug.lowercase(Locale.ROOT)].orEmpty()
-            val startIndex = (page - 1) * PAGE_SIZE
-
-            if (fullRamList.isNotEmpty() && startIndex < fullRamList.size) {
-                val chunk = fullRamList.subList(startIndex, minOf(startIndex + PAGE_SIZE, fullRamList.size)).toList()
-                seenSet.addAll(chunk.map { it.id })
-                slugOffsets[slug] = startIndex + chunk.size
-                return mapToHomePageResponse(request.name, slug, chunk, hasNext = true)
-            }
-        }
-
-        var currentOffset = slugOffsets[slug] ?: ((page - 1) * PAGE_SIZE)
-
-        for (attempt in 0..1) {
-            val rawItems = homeSemaphore.withPermit {
-                ReelFrenClient.home(slug, page = page, offset = currentOffset)
-            }
-
-            if (rawItems.isEmpty()) {
-                slugOffsets.remove(slug)
-                return newHomePageResponse(request.name, emptyList(), hasNext = false)
-            }
-
-            currentOffset += rawItems.size
-            slugOffsets[slug] = currentOffset
-
-            val freshItems = rawItems.filter { seenSet.add(it.id) }
-            if (freshItems.isNotEmpty()) {
+            val ramList = if (slug == "all_dramas") masterCacheList else omniCache[slug.lowercase(Locale.ROOT)].orEmpty()
+            if (ramList.isNotEmpty()) {
+                val freshItems = ramList.filter { seenSet.add(it.id) }
                 return mapToHomePageResponse(request.name, slug, freshItems, hasNext = true)
             }
         }
 
-        return newHomePageResponse(request.name, emptyList(), hasNext = false)
+        // Exact decompiled pagination format (offset = page - 1 is handled in ReelFrenClient)
+        val networkItems = homeSemaphore.withPermit {
+            ReelFrenClient.home(slug, page)
+        }
+        
+        if (networkItems.isEmpty()) {
+            return newHomePageResponse(request.name, emptyList(), hasNext = false)
+        }
+        
+        val freshItems = networkItems.filter { seenSet.add(it.id) }
+        return mapToHomePageResponse(request.name, slug, freshItems, hasNext = freshItems.isNotEmpty())
     }
 
     private fun mapToHomePageResponse(
@@ -254,6 +218,8 @@ class ReelFrenProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse? {
         val (slug, id, _) = ReelFrenUrl.parse(url)
         if (id.isEmpty() || slug.isEmpty()) throw ErrorLoadingException("Invalid URL or missing ID")
+        
+        // Native JSON Detail Fetch
         val d: DetailInfo = ReelFrenClient.detail(slug, id) ?: throw ErrorLoadingException("Failed to load detail")
         val coverUrl = ReelFrenClient.absUrl(d.cover).takeIf { it.isNotBlank() }
 
