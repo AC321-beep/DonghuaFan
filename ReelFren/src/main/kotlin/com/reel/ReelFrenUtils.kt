@@ -482,7 +482,7 @@ object ReelFrenClient {
 
     suspend fun get(url: String, isApiCall: Boolean = true): String? {
         val res = getDetailed(url, isApiCall)
-        if (res.code in 502..504) return "" // Graceful degradation for 502s
+        if (res.code in 502..504) return "" 
         if (res.text.isEmpty()) return null
         return res.text
     }
@@ -755,7 +755,104 @@ object ReelFrenParse {
         )
     }
 
-    // --- HTML FALLBACK PARSERS ---
+    private fun extractAllJsonObjectsForKey(source: String, key: String): List<String> {
+        val results = mutableListOf<String>()
+        val token = "\"$key\":{"
+        var searchFrom = 0
+
+        while (searchFrom < source.length) {
+            val startIndex = source.indexOf(token, searchFrom)
+            if (startIndex == -1) break
+
+            val objectStart = startIndex + token.length - 1
+            var braceCount = 0
+            var isString = false
+            var isEscaped = false
+            var endIndex = -1
+
+            for (i in objectStart until source.length) {
+                val ch = source[i]
+                if (isEscaped) { isEscaped = false; continue }
+                if (ch == '\\') { isEscaped = true; continue }
+                if (ch == '"') { isString = !isString; continue }
+                if (!isString) {
+                    if (ch == '{') braceCount++
+                    else if (ch == '}') {
+                        braceCount--
+                        if (braceCount == 0) { endIndex = i + 1; break }
+                    }
+                }
+            }
+
+            if (endIndex > objectStart) {
+                results += source.substring(objectStart, endIndex)
+                searchFrom = endIndex
+            } else {
+                searchFrom = startIndex + token.length
+            }
+        }
+        return results
+    }
+
+    private fun unescapeNextPayload(raw: String): String {
+        val sb = StringBuilder(raw.length)
+        var i = 0
+        while (i < raw.length) {
+            val ch = raw[i]
+            if (ch == '\\' && i + 1 < raw.length) {
+                when (val next = raw[i + 1]) {
+                    '"' -> { sb.append('"'); i += 2 }
+                    '\\' -> { sb.append('\\'); i += 2 }
+                    'n' -> { sb.append('\n'); i += 2 }
+                    'r' -> { sb.append('\r'); i += 2 }
+                    't' -> { sb.append('\t'); i += 2 }
+                    'u' -> {
+                        if (i + 5 < raw.length) {
+                            val hex = raw.substring(i + 2, i + 6).toIntOrNull(16)
+                            if (hex != null) { sb.append(hex.toChar()); i += 6; continue }
+                        }
+                        sb.append(ch); i++
+                    }
+                    else -> { sb.append(ch).append(next); i += 2 }
+                }
+            } else {
+                sb.append(ch); i++
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun buildDetailFromJson(root: JSONObject, fallbackSlug: String, fallbackId: String): DetailInfo? {
+        val id = clean(root, "id", "dramaId").ifEmpty { fallbackId }
+        val title = clean(root, "title", "name", "dramaName")
+        if (title.isEmpty()) return null
+
+        val provider = clean(root, "provider").ifEmpty { fallbackSlug }
+        val cover = ReelFrenClient.absUrl(clean(root, "cover", "poster", "imageUrl"))
+        val intro = clean(root, "intro", "description", "summary")
+
+        val videos = mutableListOf<VideoEntry>()
+        val vArr = findArrayRecursively(root, "videos", "episodes", "list")
+        if (vArr != null) {
+            for (i in 0 until vArr.length()) {
+                val v = vArr.optJSONObject(i) ?: continue
+                val epNum = v.optInt("episode", v.optInt("ep", i + 1)).takeIf { it > 0 } ?: (i + 1)
+                val vid = clean(v, "vid", "id", "videoId").ifEmpty { "ep_$epNum" }
+                videos += VideoEntry(episode = epNum, duration = v.optInt("duration", v.optInt("length")), vid = vid, available = v.optBoolean("available", v.optBoolean("is_free", true)))
+            }
+        }
+
+        val parsedTotal = clean(root, "episodes", "total_episodes", "numberOfEpisodes").toIntOrNull() ?: 0
+        val totalEps = maxOf(parsedTotal, videos.size)
+
+        if (videos.isEmpty() && totalEps > 0) {
+            for (epNum in 1..totalEps) {
+                videos += VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true)
+            }
+        }
+
+        return DetailInfo(id = id, provider = provider, title = title, cover = cover, intro = intro, episodes = if (totalEps > 0) totalEps else videos.size, videos = videos.distinctBy { it.episode }.sortedBy { it.episode })
+    }
 
     fun detailHtml(htmlBody: String, fallbackSlug: String, fallbackId: String): DetailInfo? {
         if (htmlBody.isBlank()) return null
@@ -898,73 +995,6 @@ object ReelFrenParse {
             return filteredResults.distinctBy { it.id }
         }
         return emptyList()
-    }
-
-    private fun extractAllJsonObjectsForKey(source: String, key: String): List<String> {
-        val results = mutableListOf<String>()
-        val token = "\"$key\":{"
-        var searchFrom = 0
-
-        while (searchFrom < source.length) {
-            val startIndex = source.indexOf(token, searchFrom)
-            if (startIndex == -1) break
-
-            val objectStart = startIndex + token.length - 1
-            var braceCount = 0
-            var isString = false
-            var isEscaped = false
-            var endIndex = -1
-
-            for (i in objectStart until source.length) {
-                val ch = source[i]
-                if (isEscaped) { isEscaped = false; continue }
-                if (ch == '\\') { isEscaped = true; continue }
-                if (ch == '"') { isString = !isString; continue }
-                if (!isString) {
-                    if (ch == '{') braceCount++
-                    else if (ch == '}') {
-                        braceCount--
-                        if (braceCount == 0) { endIndex = i + 1; break }
-                    }
-                }
-            }
-
-            if (endIndex > objectStart) {
-                results += source.substring(objectStart, endIndex)
-                searchFrom = endIndex
-            } else {
-                searchFrom = startIndex + token.length
-            }
-        }
-        return results
-    }
-
-    private fun unescapeNextPayload(raw: String): String {
-        val sb = StringBuilder(raw.length)
-        var i = 0
-        while (i < raw.length) {
-            val ch = raw[i]
-            if (ch == '\\' && i + 1 < raw.length) {
-                when (val next = raw[i + 1]) {
-                    '"' -> { sb.append('"'); i += 2 }
-                    '\\' -> { sb.append('\\'); i += 2 }
-                    'n' -> { sb.append('\n'); i += 2 }
-                    'r' -> { sb.append('\r'); i += 2 }
-                    't' -> { sb.append('\t'); i += 2 }
-                    'u' -> {
-                        if (i + 5 < raw.length) {
-                            val hex = raw.substring(i + 2, i + 6).toIntOrNull(16)
-                            if (hex != null) { sb.append(hex.toChar()); i += 6; continue }
-                        }
-                        sb.append(ch); i++
-                    }
-                    else -> { sb.append(ch).append(next); i += 2 }
-                }
-            } else {
-                sb.append(ch); i++
-            }
-        }
-        return sb.toString()
     }
 
     private fun collectSubtitlesFromNode(node: JSONObject, out: MutableList<SubtitleEntry>) {
