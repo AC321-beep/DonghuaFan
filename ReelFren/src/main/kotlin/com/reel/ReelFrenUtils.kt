@@ -293,8 +293,9 @@ object ReelFrenClient {
     }
     private val apiMutex = Mutex()
 
-    @Volatile private var currentApiVersion = "v21"
-    @Volatile private var omitCvParam = true
+  @Volatile private var currentApiVersion = "v21"
+    // Set this back to FALSE so the WAF doesn't hand out 502 bans on pagination
+    @Volatile private var omitCvParam = false
 
     private val chromeSpec = ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
         .tlsVersions(TlsVersion.TLS_1_2, TlsVersion.TLS_1_3)
@@ -410,8 +411,12 @@ object ReelFrenClient {
         return headers
     }
 
-    private fun isVersionError(json: String): Boolean {
-        if (json.isEmpty()) return false
+ private fun isVersionError(json: String): Boolean {
+        // A real version error payload is tiny (usually < 200 bytes).
+        // If the payload is large (like a 1MB catalog), it's definitely not a version error.
+        // This completely eliminates the "1.2MB double-fetch penalty" false positive.
+        if (json.isEmpty() || json.length > 1000) return false 
+        
         val lower = json.lowercase(Locale.ROOT)
         return lower.contains("version") && (lower.contains("update") || lower.contains("invalid") || lower.contains("deprecated"))
     }
