@@ -287,7 +287,6 @@ class ReelFrenProvider : MainAPI() {
         val (slug, id, ep) = ReelFrenUrl.parse(data)
         if (id.isEmpty() || slug.isEmpty()) return@coroutineScope false
 
-        // Stagger requests to bypass the 502 Rate Limiter ban
         val jobs = listOf(1, 2, 3).mapIndexed { index, serverId ->
             async {
                 if (index > 0) delay(index * 400L)
