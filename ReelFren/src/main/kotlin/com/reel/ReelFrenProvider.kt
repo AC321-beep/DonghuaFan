@@ -242,7 +242,7 @@ class ReelFrenProvider : MainAPI() {
         }
     }
 
-    override suspend fun loadLinks(
+   override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -253,7 +253,8 @@ class ReelFrenProvider : MainAPI() {
 
         val jobs = listOf(1, 2, 3).mapIndexed { index, serverId ->
             async {
-                if (index > 0) delay(index * 400L)
+                // Reduced stagger delay from 400ms to 150ms to prevent loadLinks timeout
+                if (index > 0) delay(index * 150L) 
 
                 val p = runCatching { ReelFrenClient.playback(slug, id, ep, serverId) }.getOrNull() ?: return@async false
                 var found = false
@@ -263,10 +264,13 @@ class ReelFrenProvider : MainAPI() {
                 p.qualities.forEach { q ->
                     val qUrl = ReelFrenClient.absUrl(q.url)
                     if (qUrl.isNotBlank() && qUrl.startsWith("http")) {
+                        // Force distinct names based on the server loop index
+                        val serverName = "Server $serverId" + if (q.label != "Auto" && q.label.isNotBlank()) " (${q.label})" else ""
+
                         callback(
                             com.lagradost.cloudstream3.utils.ExtractorLink(
                                 source = name,
-                                name = if (p.server.toIntOrNull() != null) "Server ${p.server}" else p.server,
+                                name = serverName,
                                 url = qUrl,
                                 referer = "${ReelFrenConfig.REEL_SITE}/",
                                 quality = ReelFrenQuality.of(q.label),
@@ -282,4 +286,3 @@ class ReelFrenProvider : MainAPI() {
         }
         jobs.awaitAll().any { it }
     }
-}
