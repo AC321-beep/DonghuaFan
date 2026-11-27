@@ -5,7 +5,6 @@ import android.content.SharedPreferences
 import android.util.Base64
 import android.util.Log
 import android.webkit.CookieManager
-import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.newSubtitleFile
@@ -417,80 +416,74 @@ object ReelFrenClient {
         return lower.contains("version") && (lower.contains("update") || lower.contains("invalid") || lower.contains("deprecated"))
     }
 
-    private suspend fun executeWithRetry(url: String, isApiCall: Boolean): Pair<Int, String> {
-        var r = spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L)
-        if (r.code in 502..504) {
-            delay((300L..600L).random())
-            r = spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L)
+    class FetchResult(val code: Int, val text: String, val errorMsg: String = "")
+
+    private suspend fun executeWithRetry(url: String, isApiCall: Boolean): FetchResult {
+        return try {
+            var r = spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L)
+            if (r.code in 502..504) {
+                delay((300L..600L).random())
+                r = spoofedApp.get(url, headers = headers(url, isApiCall), timeout = 25L)
+            }
+            FetchResult(r.code, r.text)
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (e: Exception) {
+            FetchResult(0, "", e.message ?: "Unknown Exception")
         }
-        return r.code to r.text
     }
 
-    suspend fun get(url: String, isApiCall: Boolean = true): String? {
+    suspend fun getDetailed(url: String, isApiCall: Boolean = true): FetchResult {
         val targetHost = runCatching { URI(url).host }.getOrNull()?.lowercase(Locale.ROOT) ?: ""
         val isReelFrenHost = targetHost == apiHost || targetHost.contains("reelfren.net")
 
         if (!isReelFrenHost) {
-            return try { spoofedApp.get(url, headers = headers(url, false), timeout = 25L).text } catch (ce: CancellationException) { throw ce } catch (_: Exception) { null }
+            return try { 
+                val r = spoofedApp.get(url, headers = headers(url, false), timeout = 25L)
+                FetchResult(r.code, r.text)
+            } catch (ce: CancellationException) { throw ce } catch (e: Exception) { FetchResult(0, "", e.message ?: "") }
         }
 
-        var statusCode = 200
-        var responseText = ""
-        
-        try {
-            val (code, text) = executeWithRetry(url, isApiCall)
-            statusCode = code
-            responseText = text
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (e: Exception) { }
+        var result = executeWithRetry(url, isApiCall)
 
-        if (isApiCall && statusCode in 502..504) return ""
+        if (isApiCall && result.code in 502..504) return result
 
-        if (isApiCall && isVersionError(responseText) && url.contains("cv=")) {
+        if (isApiCall && isVersionError(result.text) && url.contains("cv=")) {
             omitCvParam = true
             val newUrl = url.replace(Regex("[?&]cv=[^&]+"), "").replace("?provider=&", "?provider=")
-            try {
-                val (retryCode, retryText) = executeWithRetry(newUrl, true)
-                statusCode = retryCode
-                responseText = retryText
-            } catch (ce: CancellationException) { throw ce } catch (_: Exception) {}
-            if (isApiCall && statusCode in 502..504) return ""
+            result = executeWithRetry(newUrl, true)
+            if (result.code in 502..504) return result
         }
 
-        if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
+        if (result.text.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(result.text)) return result
 
         apiMutex.withLock {
-            try {
-                val (code, text) = executeWithRetry(url, isApiCall)
-                statusCode = code
-                responseText = text
-            } catch (ce: CancellationException) { throw ce } catch (_: Exception) {}
+            result = executeWithRetry(url, isApiCall)
             
-            if (isApiCall && statusCode in 502..504) return ""
-            if (responseText.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(responseText)) return responseText
+            if (isApiCall && result.code in 502..504) return result
+            if (result.text.isNotEmpty() && !ReelFrenCloudflare.isChallengeResponse(result.text)) return result
 
             val poisonedCookie = ReelFrenStore.cookie(targetHost)
             if (!ReelFrenCloudflare.solve(ReelFrenConfig.REEL_SITE, invalidatedCookie = poisonedCookie)) {
-                return null
+                return FetchResult(0, "", "Cloudflare Solve Failed")
             }
 
             delay(500L)
-
-            try {
-                val (code, text) = executeWithRetry(url, isApiCall)
-                statusCode = code
-                responseText = text
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (e: Exception) {
-                return ""
+            result = executeWithRetry(url, isApiCall)
+            
+            if (isApiCall && result.code in 502..504) return result
+            if (result.text.isEmpty() || ReelFrenCloudflare.isChallengeResponse(result.text)) {
+                return FetchResult(result.code, "", "Cloudflare Challenge Blocked")
             }
-
-            if (isApiCall && statusCode in 502..504) return ""
-            if (responseText.isEmpty() || ReelFrenCloudflare.isChallengeResponse(responseText)) return null
-            return responseText
+            return result
         }
+    }
+
+    suspend fun get(url: String, isApiCall: Boolean = true): String? {
+        val res = getDetailed(url, isApiCall)
+        if (res.code in 502..504) return "" // Graceful degradation for 502s
+        if (res.text.isEmpty()) return null
+        return res.text
     }
 
     suspend fun home(slug: String, page: Int = 1, category: String = ""): List<HomeItem> {
@@ -521,17 +514,32 @@ object ReelFrenClient {
 
     suspend fun detail(slug: String, id: String): DetailInfo? {
         val apiUrl = detailUrl(slug, id)
-        val jsonStr = get(apiUrl, isApiCall = true)
-        var parsed = jsonStr?.let { ReelFrenParse.detail(it) }
+        ReelFrenLog.d("Client.detail", "Attempting API Detail: $apiUrl")
+        
+        val apiRes = getDetailed(apiUrl, isApiCall = true)
+        ReelFrenLog.d("Client.detail", "API Detail Response - Code: ${apiRes.code}, Size: ${apiRes.text.length}, Error: ${apiRes.errorMsg}")
+        
+        var parsed = apiRes.text.takeIf { it.isNotEmpty() }?.let { ReelFrenParse.detail(it) }
+
+        if (parsed != null) {
+            ReelFrenLog.d("Client.detail", "API Parse Result - Title: '${parsed.title}', Episodes: ${parsed.episodes}")
+        }
 
         if (parsed == null || parsed.title.isEmpty() || parsed.episodes == 0) {
             ReelFrenLog.d("Client.detail", "API detail failed/empty. Falling back to HTML.")
             val htmlUrl = detailHtmlUrl(slug, id)
-            val htmlStr = get(htmlUrl, isApiCall = false)
-            val is404 = htmlStr.isNullOrEmpty() || htmlStr.contains("404 Not Found", ignoreCase = true)
+            
+            val htmlRes = getDetailed(htmlUrl, isApiCall = false)
+            ReelFrenLog.d("Client.detail", "HTML Detail Response - Code: ${htmlRes.code}, Size: ${htmlRes.text.length}, Error: ${htmlRes.errorMsg}")
+            
+            val htmlStr = htmlRes.text
+            val is404 = htmlStr.isEmpty() || htmlStr.contains("404 Not Found", ignoreCase = true) || htmlRes.code == 404
             
             if (!is404) {
-                parsed = ReelFrenParse.detailHtml(htmlStr!!, slug, id)
+                parsed = ReelFrenParse.detailHtml(htmlStr, slug, id)
+                if (parsed != null) ReelFrenLog.d("Client.detail", "HTML Parse Result - Title: '${parsed.title}', Episodes: ${parsed.episodes}")
+            } else {
+                ReelFrenLog.d("Client.detail", "HTML Detail returned 404.")
             }
 
             if (parsed == null || parsed.title.isEmpty() || parsed.episodes == 0) {
@@ -540,6 +548,7 @@ object ReelFrenClient {
                 val match = searchResults.firstOrNull { it.id.equals(id, ignoreCase = true) } ?: searchResults.firstOrNull()
 
                 if (match != null) {
+                    ReelFrenLog.d("Client.detail", "Search Match Found - Title: '${match.title}', Episodes: ${match.episodes}")
                     val epCount = if (match.episodes > 0) match.episodes else 80
                     val videos = (1..epCount).map { epNum -> 
                         VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true) 
@@ -554,6 +563,8 @@ object ReelFrenClient {
                         episodes = maxOf(epCount, videos.size),
                         videos = videos
                     )
+                } else {
+                    ReelFrenLog.d("Client.detail", "Search Fallback Found No Matches.")
                 }
             }
         }
@@ -902,25 +913,6 @@ object ReelFrenParse {
         val nestedEps = totalEpCountRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
         val maxRegexEps = maxOf(chipEps, nextJsEps, nestedEps, epNumbers.maxOrNull() ?: 0)
 
-        val schemaMatch = schemaRegex.find(htmlBody)
-        if (schemaMatch != null) {
-            val schemaObj = runCatching { JSONObject(schemaMatch.groupValues[1]) }.getOrNull()
-            if (schemaObj != null) {
-                val title = clean(schemaObj, "name").replace("Episode 1", "").trim()
-                if (title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
-                    val cover = ReelFrenClient.absUrl(clean(schemaObj, "image"))
-                    val intro = clean(schemaObj, "description").replace(Regex("""Watch Now: .*? as a free short drama on ReelFren."""), "").trim()
-
-                    val schemaEps = schemaObj.optInt("numberOfEpisodes", 0)
-                    val maxEp = maxOf(schemaEps, maxRegexEps)
-                    if (maxEp > 0) { for (n in 1..maxEp) epNumbers += n }
-
-                    val videos = epNumbers.sorted().map { epNum -> VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true) }
-                    return DetailInfo(id = fallbackId, provider = fallbackSlug, title = title, cover = cover, intro = intro, episodes = maxOf(maxEp, videos.size), videos = videos)
-                }
-            }
-        }
-
         val candidates = mutableListOf<String>()
         candidates += extractAllJsonObjectsForKey(htmlBody, "detail")
         val unescaped = unescapeNextPayload(htmlBody)
@@ -951,6 +943,25 @@ object ReelFrenParse {
                  )
             }
             return bestNextJs
+        }
+
+        val schemaMatch = schemaRegex.find(htmlBody)
+        if (schemaMatch != null) {
+            val schemaObj = runCatching { JSONObject(schemaMatch.groupValues[1]) }.getOrNull()
+            if (schemaObj != null) {
+                val title = clean(schemaObj, "name").replace("Episode 1", "").trim()
+                if (title.isNotEmpty() && !title.equals("ReelFren", ignoreCase = true)) {
+                    val cover = ReelFrenClient.absUrl(clean(schemaObj, "image"))
+                    val intro = clean(schemaObj, "description").replace(Regex("""Watch Now: .*? as a free short drama on ReelFren."""), "").trim()
+
+                    val schemaEps = schemaObj.optInt("numberOfEpisodes", 0)
+                    val maxEp = maxOf(schemaEps, maxRegexEps)
+                    if (maxEp > 0) { for (n in 1..maxEp) epNumbers += n }
+
+                    val videos = epNumbers.sorted().map { epNum -> VideoEntry(episode = epNum, duration = 0, vid = "ep_$epNum", available = true) }
+                    return DetailInfo(id = fallbackId, provider = fallbackSlug, title = title, cover = cover, intro = intro, episodes = maxOf(maxEp, videos.size), videos = videos)
+                }
+            }
         }
 
         val ogTitle = ogTitleRegex.find(htmlBody)?.groupValues?.getOrNull(1)?.trim().orEmpty()
