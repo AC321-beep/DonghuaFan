@@ -376,13 +376,16 @@ object ReelFrenClient {
         return map
     }
 
-    fun videoHeaders(url: String): Map<String, String> {
+   fun videoHeaders(url: String): Map<String, String> {
         val targetHost = runCatching { URI(url).host }.getOrNull()?.lowercase(Locale.ROOT) ?: ""
         val map = linkedMapOf<String, String>()
-        map["User-Agent"] = ReelFrenStore.userAgent(targetHost)
+        
+        // CRITICAL: Always force the exact Global UA to prevent Aliyun S3 Signature/Token mismatches
+        map["User-Agent"] = GLOBAL_MOBILE_UA 
         map["Accept"] = "*/*"
         map["Connection"] = "keep-alive"
 
+        // Strip Origin/Referer for raw storage buckets to bypass CORS blocks
         if (targetHost.contains("aliyuncs.com") || targetHost.contains("tiktokcdn.com") || targetHost.contains("amazonaws.com")) {
             return map
         }
